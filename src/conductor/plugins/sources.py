@@ -1,0 +1,339 @@
+"""Parse the ``plugin_sources:`` source-string grammar.
+
+A source says *where a marketplace comes from*. The grammar is not
+invented here — it is the one the Copilot CLI already accepts in
+``PluginsMarketplacesAddRequest.source``, so a string a user has already
+written for their CLI works unchanged in a workflow:
+
+===========================  ==========================================
+Form                         Example
+===========================  ==========================================
+``owner/repo``               ``acme/agent-plugins``
+``owner/repo#ref``           ``acme/agent-plugins#v1.4.0``
+http/https URL, opt. ``#``   ``https://gitlab.com/acme/p.git#main``
+ssh URL, opt. ``#``          ``ssh://git@github.com/acme/p.git``
+scp-style                    ``git@github.com:acme/p.git#3f2a1c9``
+local path                   ``./vendor/plugins``, ``~/src/plugins``
+===========================  ==========================================
+
+The one trap worth naming: **this must not reuse**
+:func:`~conductor.skills.registry.is_path_entry`. That helper answers a
+different question ("is this ``skills:``/``plugins:`` entry a path?") and
+returns ``True`` for anything containing ``/`` — which is every remote
+form above. ``owner/repo`` would silently become a relative directory
+lookup against the workflow file. Here a local path is recognised by its
+*prefix* (``~``, ``.``, or absolute), and everything else is a remote.
+
+A leaf module: imports only :mod:`conductor.plugins.errors`, so it can be
+used from the config layer and the fetch layer without either depending
+on the other.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+from conductor.plugins.errors import PluginSourceError
+
+# A full 40-character git object name. Only an unabbreviated SHA is
+# treated as immutable: an abbreviation is ambiguous by construction (it
+# may grow a collision as the repo does), and `git ls-remote` cannot
+# expand one without a network round trip — which is exactly what pinning
+# is meant to avoid.
+FULL_SHA: re.Pattern[str] = re.compile(r"\A[0-9a-f]{40}\Z")
+
+# Explicit URL schemes. `git://` is included for completeness; `file://`
+# matters because it is how the test-suite builds real repositories
+# without a network.
+_URL_SCHEMES: tuple[str, ...] = ("https://", "http://", "ssh://", "git://", "file://")
+
+# scp-style remote: ``user@host:path``. Anchored on a ``:`` that is not
+# part of a scheme and not a Windows drive letter — ``C:\src\plugins`` has
+# a single-character "host", which no real hostname is. The path must not
+# begin with ``:``, which excludes git's ``transport::argument`` form —
+# ``ext::sh -c '...'`` would otherwise parse as host ``ext`` and hand git
+# a remote helper that runs an arbitrary shell command.
+_SCP_STYLE: re.Pattern[str] = re.compile(r"\A(?:[^/@:]+@)?(?P<host>[^/@:]{2,}):(?P<path>[^:].*)\Z")
+
+# ``owner/repo`` GitHub shorthand: exactly two non-empty segments of
+# ordinary repository characters.
+_OWNER_REPO: re.Pattern[str] = re.compile(r"\A[\w.-]+/[\w.-]+\Z")
+
+# Path components that would escape the cache root if they reached a
+# cache key. ``[\w.-]+`` matches both, so the shorthand pattern above
+# cannot be relied on to exclude them.
+_UNSAFE_SEGMENTS: frozenset[str] = frozenset({".", ".."})
+
+# Credentials embedded in a URL authority, for redaction in messages.
+# Matches the ``scheme://`` prefix and everything up to the ``@``.
+_CREDENTIAL: re.Pattern[str] = re.compile(r"(\w+://)[^/@]+@")
+
+# Host recorded for a local-path source, so its cache key cannot collide
+# with a real host. Not a valid DNS name, deliberately.
+_LOCAL_HOST = "_local"
+
+
+def redact_credentials(text: str) -> str:
+    """Remove any URL-embedded credential from ``text``.
+
+    Used on :attr:`PluginSource.display` and on ``git``'s own stderr,
+    which quotes the remote URL back on most failures. Exported because
+    the redaction must be identical in both places — a message that
+    scrubbed Conductor's copy of a URL while echoing git's would be worse
+    than not scrubbing at all.
+    """
+    return _CREDENTIAL.sub(r"\1***@", text)
+
+
+@dataclass(frozen=True)
+class PluginSource:
+    """A parsed ``plugin_sources:`` source.
+
+    Either a local directory (``is_local``) or a git remote. The two are
+    kept in one type because everything downstream — the resolution
+    table, the catalog reader, the validate summary — cares only about
+    "where do I read plugin roots from", and branching on a flag at the
+    one place that fetches is simpler than two parallel hierarchies.
+    """
+
+    raw: str
+    """The source exactly as written, for messages and cache metadata."""
+
+    location: str
+    """Git remote URL, or the path text for a local source.
+
+    For a local source this is the *unresolved* text: anchoring a
+    relative path needs the workflow file's directory, which the schema
+    layer does not have.
+    """
+
+    ref: str | None = None
+    """Git ref after ``#``, or ``None`` when the source named none.
+
+    ``None`` means "the remote's default branch", resolved at fetch time
+    rather than assumed to be ``main`` — a repo whose default is
+    ``master`` or ``trunk`` is not an error.
+    """
+
+    is_local: bool = False
+    """Whether this source is a directory on this machine."""
+
+    host: str = ""
+    """Host component of the cache key (e.g. ``github.com``)."""
+
+    owner: str = ""
+    """Owner/namespace component of the cache key."""
+
+    repo: str = ""
+    """Repository component of the cache key."""
+
+    @property
+    def is_pinned(self) -> bool:
+        """Whether the ref is an immutable full commit SHA.
+
+        A pinned source is fetched once and never re-checked; anything
+        else is floating and re-resolved on every run.
+        """
+        return self.ref is not None and bool(FULL_SHA.match(self.ref))
+
+    @property
+    def cache_key(self) -> PurePosixPath:
+        """Cache path segment for this source, ``<host>/<owner>/<repo>``.
+
+        A ``PurePosixPath`` rather than a string so callers join it
+        instead of concatenating, and so the segment count is fixed no
+        matter what the URL looked like.
+        """
+        return PurePosixPath(self.host) / self.owner / self.repo
+
+    @property
+    def display(self) -> str:
+        """The source as written, with any embedded credential redacted.
+
+        Every message a user can see goes through this rather than
+        :attr:`raw`. A source may legitimately carry a token
+        (``https://x-access-token:ghp_…@github.com/acme/p.git``), and the
+        failures that quote it — offline, expired credentials, a typo —
+        are exactly the ones a user pastes into an issue or a chat.
+
+        The cache key already discards credentials; this closes the other
+        half.
+        """
+        return redact_credentials(self.raw)
+
+    def describe(self) -> str:
+        """One-line description for validate output and error messages."""
+        if self.is_local:
+            return f"{self.location} (local path)"
+        return self.display
+
+
+def _split_ref(value: str) -> tuple[str, str | None]:
+    """Split a trailing ``#ref`` off a source string.
+
+    Splits on the **last** ``#``: a ref cannot contain one (git refuses
+    it), while a URL conceivably can.
+    """
+    if "#" not in value:
+        return value, None
+    location, _, ref = value.rpartition("#")
+    ref = ref.strip()
+    if not location.strip():
+        raise PluginSourceError(f"Source {value!r} has a ref but no location before the '#'.")
+    if not ref:
+        raise PluginSourceError(
+            f"Source {value!r} ends with an empty '#ref'. Drop the '#' to use the "
+            "repository's default branch."
+        )
+    return location.strip(), ref
+
+
+def _is_local_path(location: str) -> bool:
+    """Whether a source location denotes a directory on this machine.
+
+    Prefix-based on purpose — see the module docstring. ``owner/repo``
+    must not match, so containing a separator cannot be the test.
+    """
+    if location.startswith(("~", ".")):
+        return True
+    # Absolute on either platform. A bare Windows drive root ("C:\\") is
+    # caught by ntpath's isabs via PureWindowsPath, which PurePosixPath
+    # would call relative.
+    return Path(location).is_absolute() or bool(re.match(r"\A[A-Za-z]:[\\/]", location))
+
+
+def _strip_git_suffix(name: str) -> str:
+    """Drop a trailing ``.git`` from a repository name."""
+    return name[: -len(".git")] if name.endswith(".git") else name
+
+
+def _key_from_parts(raw: str, host: str, path: str) -> tuple[str, str, str]:
+    """Derive ``(host, owner, repo)`` from a remote's host and path.
+
+    An owner is not guaranteed — self-hosted forges nest arbitrarily
+    deep, and some serve repositories at the root. Deeper paths collapse
+    their intermediate segments into the owner slot with ``_`` so the
+    cache key stays exactly three segments; a repository at the root gets
+    a literal ``_`` owner rather than shifting the layout.
+
+    Every segment is checked against ``.`` and ``..``. The key is joined
+    into a filesystem path and the directory is created with
+    ``parents=True``, so a source of ``owner/..`` would otherwise write
+    outside the plugin cache root — into the sibling registry cache, for
+    instance. Refused rather than sanitised: a repository genuinely named
+    ``..`` does not exist, so this is always a malformed or hostile
+    source.
+
+    Raises:
+        PluginSourceError: If the path is empty or any derived segment is
+            a relative-path component.
+    """
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if not segments:
+        raise PluginSourceError(f"Source {raw!r} names a host but no repository path.")
+    repo = _strip_git_suffix(segments[-1])
+    if not repo:
+        raise PluginSourceError(f"Source {raw!r} has an empty repository name.")
+    owner = "_".join(segments[:-1]) or "_"
+    resolved = (host.lower(), owner, repo)
+    if any(segment in _UNSAFE_SEGMENTS for segment in (*segments, *resolved)):
+        raise PluginSourceError(
+            f"Source {raw!r} contains a '.' or '..' path component, which would "
+            "escape the plugin cache directory."
+        )
+    return resolved
+
+
+def _parse_url(raw: str, location: str, ref: str | None) -> PluginSource:
+    """Parse an explicit-scheme URL source."""
+    scheme, _, remainder = location.partition("://")
+    if scheme == "file":
+        # A file:// URL has no host worth keying on, and its path is
+        # already absolute. Treated as a remote (git can clone it) but
+        # keyed under the local host so it cannot collide with a forge.
+        host, owner, repo = _key_from_parts(raw, _LOCAL_HOST, remainder)
+        return PluginSource(raw=raw, location=location, ref=ref, host=host, owner=owner, repo=repo)
+
+    authority, _, path = remainder.partition("/")
+    # Strip credentials and port: neither identifies the repository, and
+    # a token in a URL must not end up as a directory name in the cache.
+    hostname = authority.rpartition("@")[2].partition(":")[0]
+    if not hostname:
+        raise PluginSourceError(f"Source {raw!r} has no host after {scheme}://.")
+    host, owner, repo = _key_from_parts(raw, hostname, path)
+    return PluginSource(raw=raw, location=location, ref=ref, host=host, owner=owner, repo=repo)
+
+
+def parse_plugin_source(value: str) -> PluginSource:
+    """Parse one ``plugin_sources:`` source string.
+
+    Args:
+        value: The source as written in YAML.
+
+    Returns:
+        The parsed source, with its cache key derived.
+
+    Raises:
+        PluginSourceError: If the string is empty, or matches none of the
+            recognised forms. Refused rather than guessed at: a
+            mistyped source that fell through to "treat it as a relative
+            path" would fail later with a message about a missing
+            directory the author never wrote.
+    """
+    text = value.strip()
+    if not text:
+        raise PluginSourceError("plugin_sources entries must be non-empty strings.")
+
+    location, ref = _split_ref(text)
+
+    if _is_local_path(location):
+        if ref is not None:
+            raise PluginSourceError(
+                f"Source {text!r} is a local path with a '#{ref}' ref. A local source "
+                "is read in place and has no ref to check out; point at a git remote "
+                "to pin one, or drop the ref."
+            )
+        return PluginSource(
+            raw=text,
+            location=location,
+            is_local=True,
+            host=_LOCAL_HOST,
+            owner="_",
+            repo=Path(location).name or "_",
+        )
+
+    if location.startswith(_URL_SCHEMES):
+        return _parse_url(text, location, ref)
+
+    if _OWNER_REPO.match(location):
+        owner, _, repo = location.partition("/")
+        repo = _strip_git_suffix(repo)
+        if owner in _UNSAFE_SEGMENTS or repo in _UNSAFE_SEGMENTS:
+            raise PluginSourceError(
+                f"Source {text!r} contains a '.' or '..' path component, which would "
+                "escape the plugin cache directory."
+            )
+        return PluginSource(
+            raw=text,
+            location=f"https://github.com/{owner}/{repo}.git",
+            ref=ref,
+            host="github.com",
+            owner=owner,
+            repo=repo,
+        )
+
+    scp = _SCP_STYLE.match(location)
+    if scp is not None:
+        host, owner, repo = _key_from_parts(raw=text, host=scp["host"], path=scp["path"])
+        return PluginSource(raw=text, location=location, ref=ref, host=host, owner=owner, repo=repo)
+
+    raise PluginSourceError(
+        f"Source {text!r} is not a recognised plugin source. Expected 'owner/repo', "
+        "'owner/repo#ref', an http/https/ssh URL, a git@host:path remote, or a local "
+        "path starting with '.', '~', or '/'."
+    )
+
+
+__all__ = ["FULL_SHA", "PluginSource", "parse_plugin_source", "redact_credentials"]

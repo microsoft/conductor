@@ -7,7 +7,7 @@ without executing them, displaying detailed error information.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -112,10 +112,30 @@ def _report_plugins(
 
     from conductor.plugins.errors import PluginError
     from conductor.plugins.registry import resolve_plugins
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
     from conductor.skills import SkillError
 
+    base_dir = workflow_path.resolve().parent
+    declared = config.workflow.runtime.plugin_sources
+    sources: dict[str, Any] = {}
+    if declared:
+        # Cache-only, like everything else in ``conductor validate``: this
+        # is a summary, and a summary must not clone. An unfetched source
+        # degrades to the same warning arm below, which already names
+        # ``conductor plugin fetch``.
+        try:
+            sources = resolve_plugin_sources(declared, base_dir=base_dir, allow_network=False)
+        except (PluginError, SkillError, OSError) as exc:
+            console.print(f"  [yellow]⚠[/yellow] Plugin sources could not be resolved: {exc}")
+            return
+
     try:
-        resolved = resolve_plugins(entries, base_dir=workflow_path.resolve().parent)
+        resolved = resolve_plugins(
+            entries,
+            base_dir=base_dir,
+            marketplaces=marketplaces_from(sources),
+            declared_sources=set(declared),
+        )
     except (PluginError, SkillError, OSError) as exc:
         # Narrow: a genuine bug in the plugin layer (AttributeError, KeyError)
         # should surface as a crash, not as a soft yellow line the reader
@@ -123,6 +143,16 @@ def _report_plugins(
         # — see the docstring — so it is not merely defensive.
         console.print(f"  [yellow]⚠[/yellow] Plugins could not be summarized: {exc}")
         return
+
+    if sources:
+        console.print(f"  [dim]Plugin sources: {len(sources)} declared[/dim]")
+        for name, entry in sources.items():
+            detail = entry.source.describe()
+            if entry.sha:
+                detail = f"{detail} @ {entry.sha[:12]}"
+            if entry.stale:
+                detail = f"{detail} (cached; ref not re-checked)"
+            console.print(f"    [dim]• {name} — {detail}[/dim]")
 
     console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
     for plugin in resolved:

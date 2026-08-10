@@ -22,7 +22,7 @@ for why handing the SDK a plugin root instead would not.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,6 +31,7 @@ from conductor.plugins.agents import AGENT_SUFFIX, PluginAgent, read_plugin_agen
 from conductor.plugins.errors import (
     PluginManifestError,
     PluginNotFoundError,
+    PluginSourceUnavailableError,
 )
 from conductor.plugins.manifest import (
     PLUGIN_AGENTS_DIR,
@@ -40,6 +41,7 @@ from conductor.plugins.manifest import (
     find_manifest,
     read_plugin_manifest,
 )
+from conductor.plugins.marketplace import Marketplace
 from conductor.skills.registry import (
     ResolvedSkill,
     WarningSink,
@@ -186,6 +188,99 @@ def _search_locations(home: Path) -> str:
     )
 
 
+def _installed_marketplace_root(marketplace: str, plugin: str, home: Path) -> Path | None:
+    """Find an installed plugin under a *named* marketplace.
+
+    The globs in :data:`_INSTALLED_PLUGIN_GLOBS` put the marketplace in
+    the ``*`` position, so naming it is just substituting that segment.
+    This is what lets ``prs@jason-tools`` resolve against a CLI-installed
+    marketplace with no ``plugin_sources`` entry at all — the same
+    reference works whether the source was declared or installed.
+    """
+    for pattern in _INSTALLED_PLUGIN_GLOBS:
+        candidate = home / pattern.format(name=plugin).replace("*", marketplace, 1)
+        try:
+            if candidate.is_dir() and find_manifest(candidate) is not None:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _installed_marketplace_names(home: Path) -> list[str]:
+    """List marketplaces installed on this machine, for error messages."""
+    names: set[str] = set()
+    for pattern in _INSTALLED_PLUGIN_GLOBS:
+        # Trim the trailing "/{name}" so the glob lands on the marketplace.
+        root_pattern = pattern.rsplit("/", 1)[0]
+        try:
+            for match in home.glob(root_pattern):
+                if match.is_dir():
+                    names.add(match.name)
+        except OSError:
+            continue
+    return sorted(names)
+
+
+def _resolve_marketplace_entry(
+    entry: str,
+    plugin: str,
+    marketplace: str,
+    home: Path,
+    marketplaces: Mapping[str, Marketplace] | None,
+    declared: Collection[str] | None = None,
+) -> Path:
+    """Resolve a ``plugin@marketplace`` entry to one plugin root.
+
+    Declared sources are consulted first, then the installed
+    marketplaces. Both populate one table on purpose: a reference means
+    the same thing regardless of how the marketplace got there, so
+    declaring a source in the YAML removes a machine dependency rather
+    than adding a second code path.
+
+    Args:
+        entry: The entry verbatim, for messages.
+        plugin: Left half of the reference.
+        marketplace: Right half of the reference.
+        home: Home directory installed marketplaces resolve against.
+        marketplaces: Successfully resolved marketplaces.
+        declared: Names present in ``runtime.plugin_sources``, whether or
+            not they resolved. Distinguishes "you never declared this"
+            from "you declared it and it is not on disk yet" — two
+            different mistakes with two different remedies, which one
+            message cannot cover.
+
+    Raises:
+        PluginNotFoundError: If the marketplace is neither declared nor
+            installed, is declared but unresolved, or ships no such
+            plugin.
+    """
+    resolved = (marketplaces or {}).get(marketplace)
+    if resolved is not None:
+        return resolved.resolve(plugin)
+
+    root = _installed_marketplace_root(marketplace, plugin, home)
+    if root is not None:
+        return root
+
+    if declared is not None and marketplace in declared:
+        raise PluginSourceUnavailableError(
+            f"Plugin entry {entry!r} names marketplace {marketplace!r}, which is "
+            "declared in 'runtime.plugin_sources' but has not been acquired on this "
+            "machine. Run 'conductor plugin fetch' to acquire it ('conductor run' "
+            "acquires it automatically)."
+        )
+
+    installed = _installed_marketplace_names(home)
+    known = sorted(set(marketplaces or {}) | set(declared or ()) | set(installed))
+    listed = ", ".join(known) if known else "none"
+    raise PluginNotFoundError(
+        f"Plugin entry {entry!r} names marketplace {marketplace!r}, which is neither "
+        f"declared in 'runtime.plugin_sources' nor installed. Known marketplaces: "
+        f"{listed}. Declare it with a source, or install it with your agent CLI."
+    )
+
+
 def _resolve_name_entry(entry: str, home: Path) -> Path:
     """Resolve a bare plugin name to exactly one installed root.
 
@@ -200,14 +295,18 @@ def _resolve_name_entry(entry: str, home: Path) -> Path:
     if not roots:
         raise PluginNotFoundError(
             f"Plugin {entry!r} is not installed. Looked in {_search_locations(home)}. "
-            "Install it with your agent CLI, or point at it with a path "
-            "(e.g. './tools/my-plugin')."
+            "Install it with your agent CLI, declare a source for it in "
+            "'runtime.plugin_sources' and reference it as 'plugin@marketplace', or "
+            "point at it with a path (e.g. './tools/my-plugin')."
         )
     if len(roots) > 1:
         listed = ", ".join(str(root) for root in roots)
+        marketplaces = sorted({root.parent.name for root in roots})
+        qualified = ", ".join(f"{entry}@{name}" for name in marketplaces)
         raise PluginNotFoundError(
             f"Plugin {entry!r} is ambiguous — {len(roots)} installed plugins share "
-            f"that name: {listed}. Reference the one you want by path."
+            f"that name: {listed}. Qualify it with the marketplace ({qualified}), or "
+            f"reference the one you want by path."
         )
     return roots[0]
 
@@ -329,6 +428,52 @@ def _dropped_components(root: Path) -> tuple[str, ...]:
     return tuple(present)
 
 
+def _resolve_entry_root(
+    entry: str,
+    *,
+    base_dir: Path | None,
+    home: Path,
+    marketplaces: Mapping[str, Marketplace] | None,
+    declared_sources: Collection[str] | None = None,
+) -> Path:
+    """Classify a ``plugins:`` entry and resolve it to a plugin root.
+
+    Three forms, checked in this order:
+
+    1. a **path** — ``./tools/my-plugin``;
+    2. a **``plugin@marketplace``** reference — ``prs@acme``;
+    3. a bare **installed plugin name** — ``prs``.
+
+    The path check comes first and is the same syntactic
+    :func:`~conductor.skills.registry.is_path_entry` rule ``skills:``
+    uses, so a directory whose name happens to contain ``@`` stays a
+    path rather than being split into a marketplace reference.
+    """
+    if is_path_entry(entry):
+        return _resolve_path_entry(entry, base_dir)
+
+    plugin, marketplace = _split_marketplace_entry(entry)
+    if marketplace is not None:
+        return _resolve_marketplace_entry(
+            entry, plugin, marketplace, home, marketplaces, declared_sources
+        )
+    return _resolve_name_entry(entry, home)
+
+
+def _split_marketplace_entry(entry: str) -> tuple[str, str | None]:
+    """Split a ``plugin@marketplace`` entry, or report there is no ``@``.
+
+    Splits on the last ``@`` so a plugin name containing one keeps it.
+    Mirrors ``config.schema._split_marketplace``, which shape-checks the
+    same grammar at load time; duplicated rather than imported because
+    this package sits below the config layer on purpose.
+    """
+    if "@" not in entry:
+        return entry, None
+    plugin, _, marketplace = entry.rpartition("@")
+    return plugin.strip(), marketplace.strip()
+
+
 def resolve_plugin(
     entry: str,
     *,
@@ -337,12 +482,15 @@ def resolve_plugin(
     want_mcp: bool = True,
     base_dir: Path | None = None,
     home: Path | None = None,
+    marketplaces: Mapping[str, Marketplace] | None = None,
+    declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
 ) -> ResolvedPlugin:
     """Resolve one ``plugins:`` entry to a plugin and its components.
 
     Args:
-        entry: A bare installed-plugin name or a filesystem path.
+        entry: An installed plugin name, a ``plugin@marketplace``
+            reference, or a filesystem path.
         want_skills: Whether to load the plugin's ``skills/``.
         want_agents: Whether to load the plugin's ``agents/``.
         want_mcp: Whether to load the plugin's MCP declarations.
@@ -351,6 +499,14 @@ def resolve_plugin(
         home: Home directory installed names resolve against. A
             parameter rather than a lookup so tests never read the
             developer's real ``~``.
+        marketplaces: Already-resolved marketplaces from
+            ``runtime.plugin_sources``, keyed by the name a
+            ``plugin@marketplace`` entry references. Consulted before the
+            installed roots, so a declared source shadows an installed
+            marketplace of the same name.
+        declared_sources: Names present in ``runtime.plugin_sources``,
+            resolved or not, so a reference to one that has not been
+            fetched is told to fetch rather than told it does not exist.
         on_warning: Optional sink for non-fatal diagnostics.
 
     Returns:
@@ -364,10 +520,12 @@ def resolve_plugin(
         SkillManifestError: If one of its skills has broken frontmatter.
     """
     home = Path.home() if home is None else home
-    root = (
-        _resolve_path_entry(entry, base_dir)
-        if is_path_entry(entry)
-        else _resolve_name_entry(entry, home)
+    root = _resolve_entry_root(
+        entry,
+        base_dir=base_dir,
+        home=home,
+        marketplaces=marketplaces,
+        declared_sources=declared_sources,
     )
     manifest = read_plugin_manifest(root)
 
@@ -448,6 +606,8 @@ def resolve_plugins(
     *,
     base_dir: Path | None = None,
     home: Path | None = None,
+    marketplaces: Mapping[str, Marketplace] | None = None,
+    declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
 ) -> list[ResolvedPlugin]:
     """Resolve a whole ``plugins:`` list.
@@ -457,6 +617,11 @@ def resolve_plugins(
             anything satisfying :class:`PluginEntry`.
         base_dir: Directory relative path entries resolve against.
         home: Home directory installed names resolve against.
+        marketplaces: Already-resolved marketplaces from
+            ``runtime.plugin_sources``, keyed by the name a
+            ``plugin@marketplace`` entry references.
+        declared_sources: Names present in ``runtime.plugin_sources``,
+            resolved or not.
         on_warning: Optional sink for non-fatal diagnostics.
 
     Returns:
@@ -492,6 +657,8 @@ def resolve_plugins(
             want_mcp=want_mcp,
             base_dir=base_dir,
             home=home,
+            marketplaces=marketplaces,
+            declared_sources=declared_sources,
             on_warning=on_warning,
         )
         if plugin.root in by_root:

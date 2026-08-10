@@ -238,3 +238,118 @@ class TestOneBadPathDoesNotSilenceOtherChecks:
         )
         with pytest.raises(ConfigurationError, match="which the workflow also"):
             _validate(config, None)
+
+
+def _source_config(
+    sources: dict[str, Any],
+    plugins: list[str],
+    *,
+    provider: str = "copilot",
+) -> WorkflowConfig:
+    """A workflow declaring ``plugin_sources`` alongside ``plugins``."""
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="wf",
+            entry_point="worker",
+            runtime=RuntimeConfig(provider=provider, plugin_sources=sources, plugins=plugins),
+        ),
+        agents=[
+            AgentDef(
+                name="worker",
+                prompt="Do it.",
+                output={"result": OutputField(type="string")},
+            )
+        ],
+        output={"result": "{{ worker.output.result }}"},
+    )
+
+
+class TestDeclaredSources:
+    """``runtime.plugin_sources`` cross-checks, all of them offline.
+
+    ``conductor validate`` must never clone, so every case here resolves
+    from cache or not at all.
+    """
+
+    def test_a_local_source_resolves(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs", skills=["review"])
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = _source_config({"acme": "./catalog"}, ["prs@acme"])
+
+        assert _validate(config, _wf_path(tmp_path)) == []
+
+    def test_an_unfetched_source_warns_rather_than_failing(self, tmp_path: Path) -> None:
+        """A freshly cloned repository must not fail validation for a
+        workflow that runs perfectly — ``conductor run`` fetches it."""
+        config = _source_config({"acme": "acme/plugins#v1.0.0"}, ["prs@acme"])
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert any("conductor plugin fetch" in warning for warning in warnings)
+
+    def test_the_warning_says_which_checks_were_skipped(self, tmp_path: Path) -> None:
+        """Reporting "valid" when whole categories of check never ran would
+        be the worse lie."""
+        config = _source_config({"acme": "acme/plugins"}, ["prs@acme"])
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert any("were not checked here" in warning for warning in warnings)
+
+    def test_an_undeclared_marketplace_is_an_error(self, tmp_path: Path) -> None:
+        config = _source_config({}, ["prs@nowhere"])
+
+        with pytest.raises(ConfigurationError, match="neither declared"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_an_unreferenced_source_is_reported_as_dead_config(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = _source_config({"acme": "./catalog", "unused": "other/repo"}, ["prs@acme"])
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert any(
+            "'unused'" in warning and "no 'plugins:' entry" in warning for warning in warnings
+        )
+
+    def test_a_source_referenced_only_by_one_agent_is_not_dead(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wf",
+                entry_point="worker",
+                runtime=RuntimeConfig(provider="copilot", plugin_sources={"acme": "./catalog"}),
+            ),
+            agents=[
+                AgentDef(
+                    name="worker",
+                    prompt="Do it.",
+                    output={"result": OutputField(type="string")},
+                    plugins=[PluginDef(name="prs@acme")],
+                )
+            ],
+            output={"result": "{{ worker.output.result }}"},
+        )
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert not any("no 'plugins:' entry" in warning for warning in warnings)
+
+    def test_provider_rejection_still_applies_to_sourced_plugins(self, tmp_path: Path) -> None:
+        """A git source does not change which providers can load a plugin."""
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = _source_config({"acme": "./catalog"}, ["prs@acme"], provider="claude")
+
+        with pytest.raises(ConfigurationError, match="cannot load them"):
+            _validate(config, _wf_path(tmp_path))

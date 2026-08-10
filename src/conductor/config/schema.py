@@ -854,6 +854,111 @@ class SandboxConfig(BaseModel):
     """
 
 
+class PluginSourceDef(BaseModel):
+    """One entry in a ``plugin_sources:`` mapping.
+
+    Accepts a string shorthand or an object, mirroring the
+    ``provider:`` and ``plugins:`` precedents::
+
+        plugin_sources:
+          acme: acme/agent-plugins#v1.4.0
+          beta:
+            source: git@github.com:beta/plugins.git#3f2a1c9
+            path: packages/plugins
+            plugin: reviewer
+
+    A source declares *where a marketplace comes from*; ``plugins:``
+    declares which of its plugins to enable. The split is not invented
+    here — it is the one the Copilot CLI already uses in its settings
+    (``extraKnownMarketplaces`` alongside ``enabledPlugins``), and it is
+    what stops a repository shared by eleven plugins being cloned eleven
+    times or pinned to eleven different refs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    """Where the marketplace comes from.
+
+    ``owner/repo``, ``owner/repo#ref``, an http/https/ssh URL with an
+    optional ``#ref``, a ``git@host:path`` remote, or a local path. The
+    grammar is the Copilot CLI's, so a source already written for that
+    works here unchanged.
+
+    A ref that is a full 40-character SHA is **pinned**: fetched once and
+    never re-checked. Anything else — a tag, a branch, or no ref at all —
+    floats, and is re-resolved on every run. Pinning is the only thing
+    that stops a source changing what it ships between two runs.
+    """
+
+    path: str | None = None
+    """Subdirectory within the source holding the marketplace.
+
+    For a repository that keeps its plugins somewhere other than the
+    root. Repo-relative and may not escape the checkout.
+    """
+
+    plugin: str | None = None
+    """Name of the single plugin this source provides.
+
+    Only needed when a repository is *both* a catalog and a plugin —
+    it holds a ``marketplace.json`` and a ``plugin.json`` at the same
+    level — which is otherwise refused rather than guessed at.
+    """
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, v: str) -> str:
+        """Reject a source string that matches none of the known forms.
+
+        Parsed eagerly so a typo fails at load time naming the source the
+        author wrote, rather than at fetch time naming a directory they
+        never typed.
+        """
+        from conductor.plugins.sources import parse_plugin_source
+
+        parse_plugin_source(v)
+        return v.strip()
+
+    @field_validator("path", "plugin")
+    @classmethod
+    def validate_optional_text(cls, v: str | None) -> str | None:
+        """Reject an empty or whitespace-only optional field."""
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("plugin_sources 'path' and 'plugin' must be non-empty when set")
+        return stripped
+
+
+def _coerce_plugin_sources(value: Any) -> Any:
+    """Expand string shorthands in a ``plugin_sources:`` mapping."""
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: {"source": entry} if isinstance(entry, str) else entry for key, entry in value.items()
+    }
+
+
+def _validate_plugin_source_names(value: dict[str, PluginSourceDef]) -> dict[str, PluginSourceDef]:
+    """Check each marketplace name is usable as a name and a path segment.
+
+    A marketplace name is written after ``@`` in a ``plugins:`` entry and
+    becomes a directory component in messages, so it is held to the same
+    :data:`~conductor.plugins.manifest.SAFE_NAME` pattern as a plugin.
+    """
+    from conductor.plugins.manifest import SAFE_NAME
+
+    for name in value:
+        if not SAFE_NAME.match(name):
+            raise ValueError(
+                f"plugin_sources key {name!r} must match {SAFE_NAME.pattern}. The name "
+                "is what a plugins entry references after '@'."
+            )
+    return value
+
+
 class PluginDef(BaseModel):
     """One entry in a ``plugins:`` list.
 
@@ -866,11 +971,13 @@ class PluginDef(BaseModel):
           - name: ado
             mcp: false               # skills and agents only
 
-    ``name`` is either an **installed plugin name** or a **filesystem
-    path**, classified by the same syntactic rule ``skills:`` uses (path
-    when it starts with ``~``/``.`` or contains a separator). Resolution
-    needs the workflow file's directory, which the schema does not have,
-    so only the entry's shape is checked here.
+    ``name`` is an **installed plugin name**, a
+    **``plugin@marketplace``** reference, or a **filesystem path**. The
+    first two are classified by the same syntactic rule ``skills:`` uses
+    (path when it starts with ``~``/``.`` or contains a separator).
+    Resolution needs the workflow file's directory and the declared
+    ``plugin_sources``, neither of which the schema has, so only the
+    entry's shape is checked here.
 
     Every component defaults to **on**. Defaulting one off would
     reproduce the partial-loading bug this feature exists to fix — a
@@ -881,7 +988,7 @@ class PluginDef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    """Installed plugin name, or a path to a plugin root."""
+    """Installed plugin name, ``plugin@marketplace``, or a path to a plugin root."""
 
     skills: bool = True
     """Load the plugin's ``skills/``."""
@@ -908,19 +1015,52 @@ class PluginDef(BaseModel):
         itself as *ambiguous across 13 plugins* rather than as the
         nonsense it is. Path entries are left alone — a glob character is
         legal in a directory name.
+
+        The ``plugin@marketplace`` form is split here too, so a malformed
+        half fails at load time rather than resolving to something odd.
         """
         stripped = v.strip()
         if not stripped:
             raise ValueError("plugins entries must be non-empty strings")
+        from conductor.plugins.manifest import SAFE_NAME
         from conductor.skills import is_path_entry
 
-        if not is_path_entry(stripped) and any(char in stripped for char in "*?[]"):
+        if is_path_entry(stripped):
+            return stripped
+
+        # Path check first, so './tools/my@plugin' stays a path.
+        plugin, marketplace = _split_marketplace(stripped)
+        if marketplace is not None and (
+            not SAFE_NAME.match(plugin) or not SAFE_NAME.match(marketplace)
+        ):
+            raise ValueError(
+                f"plugins entry {stripped!r} is not a valid 'plugin@marketplace' "
+                f"reference. Both halves must match {SAFE_NAME.pattern}."
+            )
+        if any(char in stripped for char in "*?[]"):
             raise ValueError(
                 f"plugins entry {stripped!r} contains a glob metacharacter. An entry is "
-                "either an installed plugin name or a path (starting with '.' or '~', "
-                "or containing a separator)."
+                "either an installed plugin name, a 'plugin@marketplace' reference, or "
+                "a path (starting with '.' or '~', or containing a separator)."
             )
         return stripped
+
+
+def _split_marketplace(entry: str) -> tuple[str, str | None]:
+    """Split a ``plugin@marketplace`` entry into its two halves.
+
+    Splits on the **last** ``@``, so a plugin name containing one keeps
+    it. Callers must establish that ``entry`` is not a path first — a
+    directory may legitimately contain ``@``.
+
+    Returns:
+        ``(plugin, marketplace)``, with ``marketplace`` ``None`` when the
+        entry named none.
+    """
+    if "@" not in entry:
+        return entry, None
+    plugin, _, marketplace = entry.rpartition("@")
+    return plugin.strip(), marketplace.strip()
 
 
 def _coerce_plugin_entries(value: Any) -> Any:
@@ -3290,6 +3430,44 @@ class RuntimeConfig(BaseModel):
     :class:`SkillDiscoveryConfig`.
     """
 
+    plugin_sources: dict[str, PluginSourceDef] = Field(default_factory=dict)
+    """Where the marketplaces named in ``plugins:`` come from.
+
+    This is what makes a workflow using plugins **standalone**. Without
+    it a ``plugins:`` entry resolves against machine state — an installed
+    plugin, or a path — so a shared workflow needs "first install these"
+    in a README, and a teammate who skips that gets an error rather than
+    a run.
+
+    Maps a marketplace name to a source. Entries take a string shorthand
+    or an object; see :class:`PluginSourceDef`. A ``plugins:`` entry then
+    references one as ``plugin@marketplace``.
+
+    A declared source registers its name into the *same* resolution table
+    the installed marketplaces populate, so ``prs@acme`` means the same
+    thing whether ``acme`` was declared here, installed via the CLI, or is
+    a local directory. A declared source wins over an installed
+    marketplace of the same name, with a warning when it shadows one.
+
+    Sources are fetched by ``conductor run`` (and by ``conductor plugin
+    fetch``); ``conductor validate`` never touches the network and reads
+    the cache only.
+
+    Example YAML::
+
+        runtime:
+            plugin_sources:
+              acme: acme/agent-plugins#v1.4.0
+              beta:
+                source: git@github.com:beta/plugins.git#3f2a1c9
+                path: packages/plugins
+              local-dev: ./vendor/plugins
+            plugins:
+              - prs@acme
+              - name: ado@acme
+                mcp: false
+    """
+
     plugins: list[PluginDef] = Field(default_factory=list)
     """Workflow-wide default plugins for every provider-backed agent.
 
@@ -3316,6 +3494,18 @@ class RuntimeConfig(BaseModel):
     def _coerce_plugins(cls, value: Any) -> Any:
         """Expand ``- prs`` string shorthands into ``{name: prs}``."""
         return _coerce_plugin_entries(value)
+
+    @field_validator("plugin_sources", mode="before")
+    @classmethod
+    def _coerce_plugin_sources(cls, value: Any) -> Any:
+        """Expand ``acme: owner/repo`` shorthands into ``{source: ...}``."""
+        return _coerce_plugin_sources(value)
+
+    @field_validator("plugin_sources")
+    @classmethod
+    def validate_plugin_sources(cls, v: dict[str, PluginSourceDef]) -> dict[str, PluginSourceDef]:
+        """Check each marketplace name is usable after an ``@``."""
+        return _validate_plugin_source_names(v)
 
     @field_validator("plugins")
     @classmethod

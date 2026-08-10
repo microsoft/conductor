@@ -36,7 +36,13 @@ control.
 
 Plugins are **never discovered**. An entry is always written in
 ``plugins:``, so nothing enters a run unasked and a missing plugin is a
-hard error rather than silently less capability.
+hard error rather than silently less capability. Declaring a git source
+in ``runtime.plugin_sources`` does not change that: cloning a source the
+author named is *resolution*, not discovery — see
+:mod:`conductor.plugins.sources`, :mod:`conductor.plugins.fetch` and
+:mod:`conductor.plugins.resolution`, which together let a workflow carry
+its own plugins instead of depending on what a machine happens to have
+installed.
 
 Layering note
 -------------

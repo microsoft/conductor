@@ -21,7 +21,7 @@ from conductor.plugins.errors import (
 from conductor.plugins.registry import resolve_plugin, resolve_plugins
 from conductor.skills.frontmatter import SkillManifestError
 
-from .conftest import make_plugin, write_skill
+from .conftest import make_marketplace, make_plugin, write_skill
 
 
 class Entry:
@@ -373,3 +373,113 @@ class TestSkillNameMustMatchItsDirectory:
         write_skill(root / "skills" / "on-disk", name="in-frontmatter")
         with pytest.raises(SkillPluginError, match="lives in a directory named"):
             resolve_skill_plugin(root / "skills" / "on-disk")
+
+
+class TestMarketplaceEntries:
+    """``plugin@marketplace`` — the reference that survives a machine change.
+
+    The load-bearing property is that one reference means the same thing
+    whether the marketplace was declared in ``plugin_sources``, installed
+    via a CLI, or is a local directory. Declared sources and installed
+    roots therefore populate one table rather than two code paths.
+    """
+
+    def test_resolves_against_a_declared_marketplace(self, tmp_path: Path, home: Path) -> None:
+        from conductor.plugins.marketplace import read_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs", skills=["review"])
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        table = {"acme": read_marketplace(tmp_path / "catalog", name="acme")}
+
+        plugin = resolve_plugin("prs@acme", home=home, marketplaces=table)
+
+        assert plugin.name == "prs"
+        assert plugin.source == "prs@acme"
+        assert [item.name for item in plugin.skills] == ["review"]
+
+    def test_resolves_against_an_installed_marketplace(self, installed, home: Path) -> None:
+        """No ``plugin_sources`` at all — the same reference still works."""
+        installed("prs", marketplace="jason-tools", agents=["code-reviewer"])
+
+        plugin = resolve_plugin("prs@jason-tools", home=home)
+
+        assert plugin.name == "prs"
+        assert [a.qualified_name for a in plugin.agents] == ["prs:code-reviewer"]
+
+    def test_a_declared_source_shadows_an_installed_marketplace(
+        self, installed, tmp_path: Path, home: Path
+    ) -> None:
+        from conductor.plugins.marketplace import read_marketplace
+
+        installed("prs", marketplace="acme", skills=["installed-skill"])
+        make_plugin(tmp_path / "declared", "prs", skills=["declared-skill"])
+        table = {"acme": read_marketplace(tmp_path / "declared", name="acme")}
+
+        plugin = resolve_plugin("prs@acme", home=home, marketplaces=table)
+
+        assert [item.name for item in plugin.skills] == ["declared-skill"]
+
+    def test_qualifying_resolves_an_otherwise_ambiguous_name(self, installed, home: Path) -> None:
+        """The second remedy the #378 ambiguity error gained."""
+        installed("git", marketplace="one", agents=["a"])
+        installed("git", marketplace="two", agents=["b"])
+
+        with pytest.raises(PluginNotFoundError, match="ambiguous"):
+            resolve_plugin("git", home=home)
+
+        assert resolve_plugin("git@two", home=home).agents[0].qualified_name == "git:b"
+
+    def test_the_ambiguity_error_names_the_qualified_form(self, installed, home: Path) -> None:
+        installed("git", marketplace="one")
+        installed("git", marketplace="two")
+
+        with pytest.raises(PluginNotFoundError, match=r"git@one, git@two"):
+            resolve_plugin("git", home=home)
+
+    def test_an_unknown_marketplace_lists_what_is_known(self, installed, home: Path) -> None:
+        installed("prs", marketplace="jason-tools")
+
+        with pytest.raises(PluginNotFoundError, match="Known marketplaces: jason-tools"):
+            resolve_plugin("prs@nowhere", home=home)
+
+    def test_a_declared_but_unfetched_marketplace_says_so(self, home: Path) -> None:
+        """A different mistake from "you never declared this", so a different
+        message: this one is fixed by fetching, not by editing the YAML."""
+        from conductor.plugins.errors import PluginSourceUnavailableError
+
+        with pytest.raises(PluginSourceUnavailableError, match="conductor plugin fetch"):
+            resolve_plugin("prs@acme", home=home, declared_sources={"acme"})
+
+    def test_a_marketplace_without_that_plugin_lists_its_contents(
+        self, tmp_path: Path, home: Path
+    ) -> None:
+        from conductor.plugins.marketplace import read_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        table = {"acme": read_marketplace(tmp_path / "catalog", name="acme")}
+
+        with pytest.raises(PluginNotFoundError, match="It provides: prs"):
+            resolve_plugin("ado@acme", home=home, marketplaces=table)
+
+    def test_a_path_containing_an_at_sign_stays_a_path(self, tmp_path: Path, home: Path) -> None:
+        """Path classification runs first, so a directory keeps its name."""
+        make_plugin(tmp_path / "my@plugin", "weird")
+
+        plugin = resolve_plugin("./my@plugin", base_dir=tmp_path, home=home)
+
+        assert plugin.name == "weird"
+
+    def test_resolve_plugins_forwards_the_table(self, tmp_path: Path, home: Path) -> None:
+        from conductor.plugins.marketplace import read_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_plugin(tmp_path / "catalog" / "ado", "ado")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs", "ado": "./ado"})
+        table = {"acme": read_marketplace(tmp_path / "catalog", name="acme")}
+
+        resolved = resolve_plugins(
+            [Entry("prs@acme"), Entry("ado@acme", mcp=False)], home=home, marketplaces=table
+        )
+
+        assert [item.name for item in resolved] == ["prs", "ado"]

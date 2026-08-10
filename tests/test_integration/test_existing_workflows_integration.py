@@ -204,6 +204,9 @@ async def test_schema_changes_dont_affect_copilot_provider():
         # subprocesses with the user's credentials, so it loads only when
         # a workflow names it.
         "plugins": [],
+        # No git-backed plugin sources declared (issue #380). Without any,
+        # plugin entries resolve against machine state exactly as before.
+        "plugin_sources": {},
     }
 
     # Verify provider can be instantiated

@@ -74,8 +74,11 @@ MAX_SUBWORKFLOW_DEPTH = 10
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
     from conductor.interrupt.listener import KeyboardListener
+    from conductor.plugins.marketplace import Marketplace
     from conductor.providers.base import AgentProvider
     from conductor.providers.registry import ProviderRegistry
     from conductor.web.server import WebDashboard
@@ -329,6 +332,7 @@ class WorkflowEngine:
         run_context: RunContext | None = None,
         _dashboard_context_path: list[str] | None = None,
         instructions_preamble: str | None = None,
+        plugin_marketplaces: Mapping[str, Marketplace] | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -369,6 +373,13 @@ class WorkflowEngine:
                 to every agent's rendered prompt. Built from auto-discovered
                 workspace files, YAML ``instructions`` field, and/or CLI
                 ``--instructions`` flags. Inherited by sub-workflows.
+            plugin_marketplaces: Marketplaces resolved from
+                ``runtime.plugin_sources``, keyed by the name a
+                ``plugin@marketplace`` entry references. Resolved once by
+                the CLI before the engine starts — acquiring a git source
+                mid-run would stall an agent on a network round trip, and
+                a failure there would surface as an agent error rather
+                than a configuration one. Inherited by sub-workflows.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -440,6 +451,14 @@ class WorkflowEngine:
         # loaded only because a workflow named it.
         self._workflow_plugins = list(config.workflow.runtime.plugins)
 
+        # Marketplaces declared in runtime.plugin_sources, resolved once
+        # up front by the CLI (`cli/run.py`) so no agent blocks on a
+        # network round trip mid-run. Empty when the CLI did not resolve
+        # them — a programmatic embedder can supply them via
+        # ``set_plugin_marketplaces``.
+        self._plugin_marketplaces: dict[str, Marketplace] = dict(plugin_marketplaces or {})
+        self._declared_plugin_sources = frozenset(config.workflow.runtime.plugin_sources)
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
@@ -452,6 +471,8 @@ class WorkflowEngine:
                 skill_injection=config.workflow.runtime.skill_injection,
                 skill_discovery=config.workflow.runtime.skill_discovery,
                 workflow_plugins=self._workflow_plugins,
+                plugin_marketplaces=self._plugin_marketplaces,
+                declared_plugin_sources=self._declared_plugin_sources,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -1146,6 +1167,8 @@ class WorkflowEngine:
                 skill_injection=self.config.workflow.runtime.skill_injection,
                 skill_discovery=self.config.workflow.runtime.skill_discovery,
                 workflow_plugins=self._workflow_plugins,
+                plugin_marketplaces=self._plugin_marketplaces,
+                declared_plugin_sources=self._declared_plugin_sources,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)
@@ -1695,6 +1718,14 @@ class WorkflowEngine:
                 else:
                     child_preamble = _wrap_preamble(sub_inner)
 
+        # Merge plugin marketplaces: the parent's resolved table, plus any
+        # source the sub-workflow declares itself (which wins on a name
+        # clash, since it is the one written in the file being run).
+        # Resolved here rather than in the constructor so acquisition
+        # stays off the hot path and out of __init__, and so a failure is
+        # reported as the sub-workflow's configuration error it is.
+        child_marketplaces = await self._resolve_child_marketplaces(sub_config, sub_path)
+
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
             config=sub_config,
@@ -1712,6 +1743,7 @@ class WorkflowEngine:
                 slot_key or agent.name,
             ],
             instructions_preamble=child_preamble,
+            plugin_marketplaces=child_marketplaces,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -1838,6 +1870,104 @@ class WorkflowEngine:
         # so a parent-level cost budget accounts for delegated sub-workflow cost.
         self.usage_tracker.merge(usage)
         return output, usage
+
+    async def _ensure_plugin_marketplaces(self) -> None:
+        """Resolve declared plugin sources if nobody else already did.
+
+        ``conductor run`` resolves them up front and passes the table in,
+        which is where the progress output and the concurrent fetch live.
+        An engine constructed directly — as the class docstring's own
+        example does — has no such caller, and without this every
+        ``plugin@marketplace`` entry would fail with "declared but not
+        acquired" no matter how many times the user fetched.
+
+        Empty-but-declared is unambiguous: ``resolve_plugin_sources``
+        returns one entry per declared source or raises, so an empty
+        table alongside declared sources can only mean nothing resolved
+        them yet. That makes this a no-op on the CLI path rather than a
+        second round of network calls.
+
+        Raises:
+            ExecutionError: If a declared source cannot be resolved.
+        """
+        declared = self.config.workflow.runtime.plugin_sources
+        if not declared or self._plugin_marketplaces:
+            return
+
+        from conductor.plugins.errors import PluginError
+        from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+        base_dir = Path(self._workflow_dir) if self._workflow_dir else None
+        try:
+            resolved = await asyncio.to_thread(
+                resolve_plugin_sources,
+                declared,
+                base_dir=base_dir,
+                on_warning=lambda message: logger.warning("Plugin sources: %s", message),
+            )
+        except PluginError as exc:
+            raise ExecutionError(
+                f"Plugin source could not be resolved: {exc}",
+                suggestion=(
+                    "Check 'runtime.plugin_sources', or run 'conductor plugin fetch' "
+                    "to prime the cache."
+                ),
+            ) from exc
+
+        self._plugin_marketplaces = marketplaces_from(resolved)
+        # The executor is built in __init__ on the single-provider path, so
+        # it already holds the empty table and must be told. The registry
+        # path builds one per agent and picks the new table up on its own.
+        if self.executor is not None:
+            self.executor.set_plugin_marketplaces(self._plugin_marketplaces)
+
+    async def _resolve_child_marketplaces(
+        self, sub_config: WorkflowConfig, sub_path: Path
+    ) -> dict[str, Marketplace]:
+        """Build the marketplace table a sub-workflow resolves against.
+
+        The parent's table is inherited so a sub-workflow can reference a
+        marketplace the root declared — the same inheritance
+        ``instructions_preamble`` gets, and for the same reason: the child
+        was invoked by the parent, not run standalone.
+
+        A source the sub-workflow declares itself is resolved here and
+        wins on a name clash, since it is the one written in the file
+        being run. Resolution goes through a thread because it shells out
+        to ``git``; without that a cold cache would block the event loop,
+        stalling every concurrent branch of the workflow rather than just
+        this one.
+
+        Raises:
+            ExecutionError: If the sub-workflow declares a source that
+                cannot be resolved. Surfaced as a configuration failure
+                naming the sub-workflow, rather than as an agent error
+                from whichever step happened to reference the plugin.
+        """
+        declared = sub_config.workflow.runtime.plugin_sources
+        if not declared:
+            return dict(self._plugin_marketplaces)
+
+        from conductor.plugins.errors import PluginError
+        from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+        try:
+            resolved = await asyncio.to_thread(
+                resolve_plugin_sources,
+                declared,
+                base_dir=sub_path.resolve().parent,
+                on_warning=lambda message: logger.warning("Plugin sources: %s", message),
+            )
+        except PluginError as exc:
+            raise ExecutionError(
+                f"Sub-workflow '{sub_config.workflow.name}' declares a plugin source "
+                f"that could not be resolved: {exc}",
+                suggestion=(
+                    "Check 'runtime.plugin_sources' in the sub-workflow, or run "
+                    "'conductor plugin fetch' on it to prime the cache."
+                ),
+            ) from exc
+        return {**self._plugin_marketplaces, **marketplaces_from(resolved)}
 
     async def _run_child_engine(
         self,
@@ -2062,6 +2192,8 @@ class WorkflowEngine:
             ValidationError: If agent output doesn't match schema.
             TemplateError: If template rendering fails.
         """
+        await self._ensure_plugin_marketplaces()
+
         # Apply defaults from input schema for optional inputs not provided
         merged_inputs = self._apply_input_defaults(inputs)
         self.context.set_workflow_inputs(merged_inputs)
@@ -2095,6 +2227,8 @@ class WorkflowEngine:
             MaxIterationsError: If max iterations limit is exceeded.
             TimeoutError: If timeout limit is exceeded.
         """
+        await self._ensure_plugin_marketplaces()
+
         # A questions node restores its partial answers only here. On an
         # ordinary loop-back the node must ask its new questions, not replay
         # the previous pass's answers under the same positional ids.

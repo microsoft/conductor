@@ -1701,6 +1701,10 @@ async def run_workflow_async(
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)
 
+        # Acquire declared plugin sources before anything runs, so a cold
+        # cache costs a visible startup step rather than a stalled agent.
+        plugin_marketplaces = await _prefetch_plugin_sources(config, workflow_path)
+
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(agent.provider is not None for agent in config.agents)
 
@@ -1742,6 +1746,7 @@ async def run_workflow_async(
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
                 instructions_preamble=instructions_preamble,
+                plugin_marketplaces=plugin_marketplaces,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -2233,6 +2238,12 @@ async def resume_workflow_async(
         # Build MCP servers config (same as run_workflow_async)
         mcp_servers = await _build_mcp_servers(config)
 
+        # Same acquisition step as run: the checkpoint records no plugin
+        # state, so a resumed run resolves its sources exactly as a fresh
+        # one does. A floating ref may therefore have moved since the
+        # original run — pin a SHA if that matters.
+        plugin_marketplaces = await _prefetch_plugin_sources(config, resolved_workflow_path)
+
         # Create engine and restore state
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
             verbose_log("Starting resumed workflow execution...")
@@ -2299,6 +2310,7 @@ async def resume_workflow_async(
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
                 instructions_preamble=cp.instructions_preamble,
+                plugin_marketplaces=plugin_marketplaces,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id,
                     log_file=str(event_log_subscriber.path),
@@ -2450,6 +2462,58 @@ async def resume_workflow_async(
         if log_file is not None and _file_console is not None:
             _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
         close_file_logging()
+
+
+async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str, Any]:
+    """Acquire ``runtime.plugin_sources`` before the engine starts.
+
+    Up front rather than lazily, for three reasons: a cold cache means a
+    ``git clone``, which would otherwise stall the first agent that
+    happens to reference the plugin; a failure is a configuration problem
+    and should be reported as one rather than as an agent error; and
+    resolving every source together lets them be fetched concurrently
+    instead of one round trip at a time.
+
+    Runs in a thread because acquisition shells out to ``git``. Blocking
+    the event loop here would be harmless (nothing else is running yet)
+    but the same helper is reached from a sub-workflow spawn, where it
+    would not be.
+
+    Args:
+        config: The workflow configuration.
+        workflow_path: Path to the workflow file, anchoring relative
+            local sources.
+
+    Returns:
+        Marketplaces keyed by the name a ``plugin@marketplace`` entry
+        references. Empty when the workflow declares no sources.
+
+    Raises:
+        PluginError: If a source cannot be acquired or is unusable.
+    """
+    declared = config.workflow.runtime.plugin_sources
+    if not declared:
+        return {}
+
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+    verbose_log(f"Resolving {len(declared)} plugin source(s): {', '.join(sorted(declared))}")
+    resolved = await asyncio.to_thread(
+        resolve_plugin_sources,
+        declared,
+        base_dir=workflow_path.resolve().parent,
+        on_warning=lambda message: verbose_log(f"  Plugin sources: {message}", style="yellow"),
+    )
+    for name, entry in resolved.items():
+        detail = entry.source.describe()
+        if entry.sha:
+            detail = f"{detail} @ {entry.sha[:12]}"
+        if entry.fetched:
+            detail = f"{detail} (fetched)"
+        if entry.stale:
+            detail = f"{detail} (cached; not re-checked)"
+        verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
+    return marketplaces_from(resolved)
 
 
 async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
