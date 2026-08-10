@@ -73,9 +73,16 @@ agents:
     routes:
       - to: $end
 
+# Templates render with StrictUndefined, so both of the fields below need a
+# guard: `notes` is nullable (an unguarded null renders the string "None"), and
+# `details.comments` is `required: false` (referencing it raises a template
+# error when the model omits it).
 output:
   verdict: "{{ audit_evaluator.output.verdict }}"
   ticket_ref: "{{ audit_evaluator.output.ticket_ref }}"
   score: "{{ audit_evaluator.output.score }}"
   summary: "{{ audit_evaluator.output.summary }}"
-  notes: "{{ audit_evaluator.output.notes }}"
+  notes: "{{ audit_evaluator.output.notes if audit_evaluator.output.notes is not none else '' }}"
+  comments: >-
+    {{ audit_evaluator.output.details.comments
+       if audit_evaluator.output.details.comments is defined else '' }}

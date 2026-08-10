@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Output field constraints — `enum`, `pattern`, `minimum`/`maximum`,
+  `minLength`/`maxLength`, `required`, `nullable`**
+  ([#372](https://github.com/microsoft/conductor/pull/372)). An `output:` field
+  could declare a type and nothing more, so "verdict is one of three values" or
+  "score is 0-100" lived in the prompt, where it was a suggestion rather than a
+  contract. The eight new keywords are emitted into the schema each provider
+  shows its model and enforced when the response comes back, and because a
+  violation raises the same `ValidationError` a type mismatch does, it lands
+  inside the existing in-session recovery loop — the model gets a chance to
+  correct itself before the workflow fails. Constraints are checked recursively,
+  so they hold inside object properties and array items too.
+
+  Illegal combinations are rejected at load time rather than at run time:
+  `pattern` on a number, an `enum` whose members do not match the declared type,
+  `minLength` above `maxLength`, a regex that does not compile. Unknown keys are
+  rejected as well, so a misspelled `minlength` fails validation instead of
+  quietly leaving the field unconstrained. `required: false` is allowed only
+  inside object properties — a root-level output field cannot be optional.
+
+  Two things worth knowing when using them. `pattern` runs under a one-second
+  deadline on a `re`-compatible engine, because model output is untrusted input
+  and a backtracking pattern would otherwise stall the event loop and every
+  agent sharing it; an exceeded deadline is a validation failure, not a hang.
+  And templates render with `StrictUndefined`, so a `nullable` field that came
+  back null renders as `None` and an omitted optional property raises — guard
+  both with `is not none` / `is defined`, as
+  [`examples/output-constraints.yaml`](examples/output-constraints.yaml) shows.
+  See [`docs/workflow-syntax.md`](docs/workflow-syntax.md) (Field Constraints).
+
 - **Plugins as the unit of opt-in** (#378). Conductor loaded a plugin's
   `skills/` and dropped everything else it shipped. That is a problem because
   a plugin's parts are written to work together: its `SKILL.md` routinely

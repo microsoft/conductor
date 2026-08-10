@@ -178,6 +178,14 @@ agents:
       <field_name>:
         type: string                # "string", "number", "boolean", "array", "object"
         description: string         # Field description
+        enum: [a, b]                # Allowed values (string/number/boolean only)
+        pattern: string             # Regex, string type only (Python re.search)
+        minimum: number             # Inclusive lower bound, number type only
+        maximum: number             # Inclusive upper bound, number type only
+        minLength: int              # Inclusive min length, string type only
+        maxLength: int              # Inclusive max length, string type only
+        nullable: bool              # Allow null (default false)
+        required: bool              # Default true; false only inside properties
         items:                      # For array types: schema of items
           type: string
         properties:                 # For object types: schema of properties
@@ -604,6 +612,39 @@ output:
       count:
         type: number
         description: Item count
+```
+
+### Field Constraints
+
+Optional keywords that turn a declared type into an enforced contract. They are
+advertised to the model in the generated schema and validated after the response
+comes back, so a violation drives the provider's output-recovery retry.
+Constraints apply recursively inside object properties and array items.
+
+| Keyword | Applies to | Meaning |
+|---------|-----------|---------|
+| `enum` | `string`, `number`, `boolean` | Allowed values. Cannot contain null — use `nullable: true`. |
+| `pattern` | `string` | Regex, Python `re.search` semantics on every provider. Unanchored unless you write `^`/`$`. Bounded to 1 second, so a backtracking pattern fails validation instead of hanging the run. |
+| `minimum` / `maximum` | `number` | Inclusive numeric bounds. |
+| `minLength` / `maxLength` | `string` | Inclusive length bounds. |
+| `nullable` | any | Permit null. Default `false`. |
+| `required` | object properties | Default `true`. Rejected on a root-level output field — valid only inside `properties`. |
+
+Illegal combinations fail at load time: `pattern` on a number, an `enum` member
+that does not match the declared type, `minLength` above `maxLength`, a regex
+that does not compile. Unknown keys are rejected too, so a misspelled
+`minlength` fails validation rather than silently leaving the field
+unconstrained.
+
+**Referencing optional and nullable fields in templates.** Templates render with
+`StrictUndefined`, so referencing an omitted `required: false` property raises a
+template error, and a `nullable` field that came back null renders the string
+`None`. Guard both:
+
+```yaml
+output:
+  notes: "{{ agent.output.notes if agent.output.notes is not none else '' }}"
+  comments: "{{ agent.output.details.comments if agent.output.details.comments is defined else '' }}"
 ```
 
 ## Template Syntax
