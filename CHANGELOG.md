@@ -18,6 +18,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run's dashboard URL, which is otherwise unrecoverable once the launching
   terminal is gone, and `--json` makes it scriptable. A malformed PID file is
   skipped with a warning rather than taking down the listing.
+- **Output field constraints — `enum`, `pattern`, `minimum`/`maximum`,
+  `minLength`/`maxLength`, `required`, `nullable`**
+  ([#372](https://github.com/microsoft/conductor/pull/372)). An `output:` field
+  could declare a type and nothing more, so "verdict is one of three values" or
+  "score is 0-100" lived in the prompt, where it was a suggestion rather than a
+  contract. The eight new keywords are emitted into the schema each provider
+  shows its model and enforced when the response comes back, and because a
+  violation raises the same `ValidationError` a type mismatch does, it lands
+  inside the existing in-session recovery loop — the model gets a chance to
+  correct itself before the workflow fails. Constraints are checked recursively,
+  so they hold inside object properties and array items too.
+
+  Illegal combinations are rejected at load time rather than at run time:
+  `pattern` on a number, an `enum` whose members do not match the declared type,
+  `minLength` above `maxLength`, a regex that does not compile. Unknown keys are
+  rejected as well, so a misspelled `minlength` fails validation instead of
+  quietly leaving the field unconstrained. `required: false` is allowed only
+  inside object properties — a root-level output field cannot be optional.
+
+  Two things worth knowing when using them. `pattern` runs under a one-second
+  deadline on a `re`-compatible engine, because model output is untrusted input
+  and a backtracking pattern would otherwise stall the event loop and every
+  agent sharing it; an exceeded deadline is a validation failure, not a hang.
+  And templates render with `StrictUndefined`, so a `nullable` field that came
+  back null renders as `None` and an omitted optional property raises — guard
+  both with `is not none` / `is defined`, as
+  [`examples/output-constraints.yaml`](examples/output-constraints.yaml) shows.
+  See [`docs/workflow-syntax.md`](docs/workflow-syntax.md) (Field Constraints).
+
+- **Plugins as the unit of opt-in** (#378). Conductor loaded a plugin's
+  `skills/` and dropped everything else it shipped. That is a problem because
+  a plugin's parts are written to work together: its `SKILL.md` routinely
+  tells the agent to hand work to `prs:code-reviewer`, or to call an `ado` MCP
+  tool. The skill loaded, the agent read those instructions, reached for a
+  subagent that was never registered — and said nothing. `runtime.plugins`
+  (and per-agent `plugins:`) now opts into the whole unit: skills,
+  `agents/*.agent.md` subagents, and declared MCP servers. Entries take a
+  string shorthand or an object with per-component switches (`skills`,
+  `agents`, `mcp`), all defaulting on, because defaulting one off would
+  recreate the partial load the feature exists to fix. An entry is an
+  installed plugin name or a path, classified by the same syntactic rule
+  `skills:` uses; an uninstalled name errors naming where it looked, and an
+  ambiguous one errors rather than picking a winner. Conductor
+  **deconstructs** a plugin rather than handing its root to the SDK: both
+  SDKs' whole-plugin surfaces are all-or-nothing, and on Copilot hiding an
+  MCP tool from the model does **not** stop its server subprocess launching
+  with the user's credentials — so `mcp: false` built that way would be a
+  guarantee that isn't one. Deconstructed, a plugin's MCP servers also pick
+  up the same `runtime.tool_output` limits, dashboard tool events, and
+  credential/`${VAR}` resolution as a workflow-declared server. Supported on `copilot` and
+  `claude-agent-sdk`; `claude`, `hermes` and `aca` reject `plugins:` at
+  validation time, since injecting text into a prompt cannot produce a
+  subagent or an MCP server. `conductor validate` prints what each plugin
+  contributes, including every subagent by name, so a change in what a plugin
+  ships is visible before the run rather than during it. See
+  `examples/plugins.yaml` and the Plugins section of `docs/workflow-syntax.md`.
+
+- **Copilot-convention plugin manifests are recognised** (#378).
+  `.github/plugin/plugin.json` now resolves alongside
+  `.claude-plugin/plugin.json`. Both have always worked at runtime, so
+  recognising only the latter was Conductor's own gap — on an ordinary
+  machine it stranded 12 of 13 installed plugins, which on
+  `claude-agent-sdk` meant a packaged skill was rejected outright and on
+  `copilot` meant it was silently demoted to a bare directory.
+
 - **`type: questions` — ask a human a set of questions in one step** (#376).
   `human_gate` handles a single decision; asking N questions previously meant
   hand-rolling a gate that loops back through a `set` step accumulating a
@@ -41,6 +106,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.` or EOF; the dashboard renders a textarea where Enter inserts a newline
   and Ctrl/Cmd+Enter submits. Previously a multi-paragraph answer to a
   `prompt_for` input was silently truncated at the first newline.
+
+### Removed
+
+- **`skill_discovery.sources: [plugins]`** (#378). The source scanned every
+  installed plugin's `skills/` directory — reaching into a plugin and taking
+  exactly one of the three things it ships, which is the bug `runtime.plugins`
+  fixes rather than a feature with a gap. It was also wrong more often than it
+  looked: of 13 plugins on an ordinary machine, 3 loaded their instructions
+  without the subagents those instructions dispatch to, and the 3 most
+  plugin-like — MCP and subagent toolkits with no `skills/` at all — were never
+  discovered by it. Nothing distinguished the working set from the broken set
+  at authoring time, on a machine the workflow author may not even be using.
+  `personal` and `project` are unchanged. Replace `sources: [plugins]` with
+  `runtime.plugins`, which brings the whole plugin and, unlike a scan,
+  reproduces on another machine.
 
 ### Fixed
 

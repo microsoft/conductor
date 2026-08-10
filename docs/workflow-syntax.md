@@ -114,8 +114,16 @@ agents:
     
     output:                         # Optional: Output schema for validation
       field_name:
-        type: string
+        type: string                # string | number | boolean | array | object
         description: "Field purpose"
+        enum: ["a", "b"]             # Optional: Allowed scalar values (string/number/boolean)
+        pattern: "^[a-z]+$"          # Optional: Regex pattern (string type only)
+        minimum: 0                   # Optional: Inclusive minimum (number type only)
+        maximum: 100                 # Optional: Inclusive maximum (number type only)
+        minLength: 1                 # Optional: Minimum string length (string type only)
+        maxLength: 50                # Optional: Maximum string length (string type only)
+        nullable: true               # Optional: Allow null value (default: false)
+        required: false              # Optional: Only inside object properties (default: true)
 
     output_mode: raw                # Optional: raw | envelope (default: inferred)
                                     # raw: skip JSON extraction, wrap response
@@ -206,6 +214,67 @@ A response that parses as JSON but isn't an object at all (a bare `42` or an arr
 This is useful when you know an agent's output is simple and a single attempt should suffice, or when you want to fail fast instead of burning tokens on recovery loops.
 
 When the budget runs out, a schema-shape failure raises the specific validation error naming the offending field and its expected type, while a syntax failure raises a provider error. Each recovery attempt emits an `agent_parse_recovery` event, visible in the dashboard activity stream and the structured event log.
+
+### Field Constraints
+
+Output field definitions support optional validation constraints to enforce value boundaries and formatting rules.
+
+| Field | Applicable Type | Description | Semantics |
+|-------|-----------------|-------------|-----------|
+| `enum` | `string`, `number`, `boolean` | List of allowed scalar values | Uses exact value comparison. Cannot contain `null` (use `nullable: true` instead). |
+| `pattern` | `string` | Regular expression pattern | Python `re.search` matching (unanchored by default; use `^` and `$` to anchor). Evaluated consistently on all providers. Matching is time-bounded (1 second); a pathological pattern fails validation instead of hanging the run. |
+| `minimum` | `number` | Inclusive minimum numeric bound | Value must be greater than or equal to `minimum`. |
+| `maximum` | `number` | Inclusive maximum numeric bound | Value must be less than or equal to `maximum`. |
+| `minLength` | `string` | Inclusive minimum string length | String length must be greater than or equal to `minLength`. |
+| `maxLength` | `string` | Inclusive maximum string length | String length must be less than or equal to `maxLength`. |
+| `required` | Any (object property only) | Whether the object property must be present | Default: `true`. **Must be `true` for root-level fields**; setting `required: false` at the root level is rejected by `conductor validate`. |
+| `nullable` | Any | Whether `null` is an acceptable value | Default: `false`. When `true`, renders as `type: [T, "null"]` in JSON Schema. |
+
+#### JSON Schema and Validation Semantics
+
+- **Inclusive Bounds**: `minimum`, `maximum`, `minLength`, and `maxLength` represent inclusive bounds.
+- **Regex Pattern Matching**: `pattern` uses Python `re.search` semantics across all providers (including Claude). It matches anywhere in the target string unless explicitly anchored with `^` and `$`. Matching runs on a `re`-compatible engine with a 1-second wall-clock deadline per check: model output is untrusted input, so a pattern with catastrophic backtracking raises a validation error (which drives the provider's output-recovery loop) instead of stalling the workflow.
+- **Nullable Fields**: Setting `nullable: true` renders the JSON Schema type as `type: [T, "null"]`, allowing the field to hold `null` or a value matching `type`.
+- **Optional Object Properties**: The `required: false` constraint is permitted **only inside nested object properties** (e.g. `properties.details.required: false`). All root-level output fields must be required, so setting `required: false` on a root-level agent output field will be rejected during workflow validation (`conductor validate`).
+
+#### Field Constraints Example
+
+```yaml
+agents:
+  - name: evaluator
+    prompt: "Evaluate the artifact and return structured metrics."
+    output:
+      status:
+        type: string
+        enum: ["passed", "failed", "pending"]
+        description: "Execution status"
+      score:
+        type: number
+        minimum: 0
+        maximum: 100
+        description: "Evaluation score between 0 and 100"
+      code:
+        type: string
+        pattern: "^ERR-[0-9]{3}$"
+        minLength: 7
+        maxLength: 7
+        description: "Error code in format ERR-123"
+      notes:
+        type: string
+        nullable: true
+        description: "Optional notes or null when absent"
+      metadata:
+        type: object
+        description: "Additional execution metadata"
+        properties:
+          reviewer:
+            type: string
+            description: "Reviewer identifier"
+          comments:
+            type: string
+            required: false
+            description: "Optional comments property inside object"
+```
 ### Choosing whether to declare `output:`
 
 Declaring `output:` does two things at once: it asks the model to return JSON matching the schema, and it parses the response as structured JSON. For some agents that's what you want. For others it produces parse-recovery loops and burns tokens.
@@ -1743,7 +1812,7 @@ one. It is **off by default**.
 workflow:
   runtime:
     skill_discovery:
-      sources: [personal, project, plugins]   # default: [] (disabled)
+      sources: [personal, project]            # default: [] (disabled)
       exclude: [scratch-notes]                # optional, by skill name
 ```
 
@@ -1755,7 +1824,6 @@ its own:
 |---|---|
 | `personal` | `~/.copilot/skills`, `~/.claude/skills` |
 | `project` | `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root — or that directory alone when it is not inside a repository |
-| `plugins` | the `skills/` directory of every installed plugin (`~/.copilot/installed-plugins/*/*/skills`, `~/.claude/plugins/*/*/skills`) |
 
 Conductor doing the scanning is the point rather than an implementation
 detail. Discovery locations are provider-specific, so a flag that asked each
@@ -1770,9 +1838,15 @@ Discovered skills join the workflow-level default set, so the per-agent
 tri-state is unchanged — an agent that declares its own `skills:` (including
 `skills: []`) overrides discovery along with `runtime.skills`.
 
-Ordering is fixed: `project`, then `personal`, then `plugins`, regardless of
-the order written in `sources`. Reordering the list therefore cannot change
-which of two same-named skills wins.
+Ordering is fixed: `project`, then `personal`, regardless of the order
+written in `sources`. Reordering the list therefore cannot change which of
+two same-named skills wins.
+
+There is no `plugins` source. Scanning a plugin's `skills/` took one of the
+three things a plugin ships and left its subagents and MCP servers behind —
+so a skill whose instructions dispatch to `prs:code-reviewer` loaded fine and
+then could not. Name plugins in [`runtime.plugins`](#plugins) instead, which
+brings the whole unit and reproduces on another machine.
 
 #### Declared skills win
 
@@ -1820,10 +1894,10 @@ Discovery is realistically a `copilot` feature today:
 from, and the total size if it were eagerly injected:
 
 ```
-Skill discovery (personal, plugins): 3 skill(s)
+Skill discovery (personal, project): 3 skill(s)
   • acme-widgets — /home/dev/.copilot/skills
   • release-notes — /home/dev/.copilot/skills
-  • triage — /home/dev/.copilot/installed-plugins/team/tools/skills
+  • triage — /home/dev/work/repo/.github/skills
   Total if eagerly injected: 41,204 bytes (~10,301 tokens)
 ```
 
@@ -1835,6 +1909,133 @@ convenience, leave discovery off and name the skills explicitly.
 
 See `examples/skills-self-improving-workflow.yaml` and
 `examples/skills-discovery.yaml` for complete examples.
+
+## Plugins
+
+A skill is one file of instructions. A **plugin** is the unit people
+actually install, and it ships up to three things Conductor can use:
+
+```
+<plugin>/
+  .claude-plugin/plugin.json   or  .github/plugin/plugin.json
+  skills/<skill>/SKILL.md      → instructions
+  agents/<agent>.agent.md      → subagents the model can dispatch to
+  .mcp.json                    → MCP servers
+```
+
+Enabling a plugin brings all three. That matters because they are written
+to work together: a plugin's `SKILL.md` routinely tells the agent to hand
+work to `prs:code-reviewer`, or to call an `ado` MCP tool. Loading only
+the instructions produces an agent that reads them correctly and then
+reaches for something that was never registered — and says nothing.
+
+```yaml
+workflow:
+  runtime:
+    plugins:
+      - prs                    # everything the plugin ships
+      - name: ado
+        mcp: false             # skills and agents only
+```
+
+Per-agent `plugins:` works the same way and follows the same tri-state as
+`skills:` — omitted inherits `runtime.plugins`, `[]` opts out, a list
+overrides.
+
+### Entry grammar
+
+| Form | Resolution |
+|---|---|
+| `prs` | An installed plugin, looked up under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`. An error if it is not installed, or if more than one marketplace ships that name |
+| `./tools/my-plugin` | A path, resolved against the workflow file's directory |
+
+Classification is syntactic — a path when the entry starts with `~` or `.`
+or contains a separator, otherwise a name. So a same-named local directory
+can never shadow an installed plugin, and resolution never depends on what
+happens to exist.
+
+### Components
+
+| Key | Default | Effect when `false` |
+|---|---|---|
+| `skills` | `true` | The plugin's `skills/` is not loaded |
+| `agents` | `true` | Its subagents are not registered |
+| `mcp` | `true` | Its MCP servers are not started |
+
+Every component defaults **on**, because defaulting one off would
+reproduce the partial load the feature exists to fix.
+
+`mcp: false` is worth knowing about, though: an MCP server is a subprocess
+launched with your credentials — the `ado` plugin authenticates through
+`az` at process start, before any tool is called. Conductor starts one
+only because a workflow named the plugin.
+
+`hooks/` and `commands/` are never loaded. `conductor validate` warns when
+a plugin ships them, rather than leaving the difference from the CLI
+invisible.
+
+Names must not collide. Two plugins shipping a same-named skill, or an MCP
+server name claimed by two plugins or by `runtime.mcp_servers`, is an error
+— one of the two would be unreachable, and dropping it quietly is the
+failure this feature exists to remove. Disable the component on one of them
+to resolve it. A plugin skill that collides with one you named in `skills:`
+is the exception: yours wins, and the plugin's copy is reported as shadowed.
+
+### Provider support
+
+| Provider | Plugins |
+|---|---|
+| `copilot` | Yes — each component registered individually |
+| `claude-agent-sdk` | Yes, with one carve-out below |
+| `claude`, `hermes`, `aca` | No — `conductor validate` rejects `plugins:` |
+
+Conductor **deconstructs** a plugin rather than handing its root to the
+SDK. Both native SDKs have a whole-plugin option, and both are
+all-or-nothing: on Copilot, hiding an MCP tool from the model does not
+stop its server from launching, so `mcp: false` would be a guarantee that
+isn't one. Registering the root also puts the two providers in opposition
+— plugin MCP is unavoidable on one and suppressed on the other.
+Deconstructed, a plugin's MCP servers also pick up the same
+`runtime.tool_output` limits, dashboard tool events, and credential and
+`${VAR}` resolution as a server the workflow declared itself. They are not
+`MCPServerDef`s, though, so there is no per-server `tools:` filter to
+author — `mcp: false` is the control you have.
+
+The carve-out: on `claude-agent-sdk`, the only way to reach a plugin's
+skills is to register the plugin root, which also contributes every
+subagent it ships and exposes its hooks. So `agents: false` cannot be
+honoured there alongside `skills: true` for the same plugin, and the
+combination is refused rather than silently granting more than the YAML
+declared. The identical config works on `copilot`.
+
+### Plugins are never discovered
+
+There is no plugin equivalent of `skill_discovery`. A plugin loads because
+a workflow named it, never because it happened to be installed — so a
+missing plugin is a hard error at validate time rather than quietly less
+capability.
+
+Resolving `plugins: [prs]` does read the installed plugin roots, but that
+is *resolution*, not discovery: the author wrote the name down, and
+nothing enters the run unasked.
+
+### Seeing what a plugin brings
+
+A plugin name says nothing about how much it carries, so `conductor
+validate` prints it:
+
+```
+Plugins: 2 enabled
+  • prs — 3 skill(s), 7 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/prs
+    agents: prs:code-reviewer, prs:code-simplifier, prs:comment-analyzer, ...
+  • ado — 0 skill(s), 1 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/ado
+    disabled by this workflow: mcp
+```
+
+Worth reading before committing. It is also how a change in what a plugin
+ships becomes visible on the next validate rather than at run time.
+
+See `examples/plugins.yaml` for a complete example.
 
 ## External File References
 

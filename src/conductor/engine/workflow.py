@@ -434,6 +434,12 @@ class WorkflowEngine:
         # its own ``skills`` field.
         self._workflow_skills = list(config.workflow.runtime.skills)
 
+        # Workflow-level default plugins (runtime.plugins) — inherited on
+        # the same tri-state as skills. Never discovered: a plugin can
+        # launch MCP subprocesses with the user's credentials, so it is
+        # loaded only because a workflow named it.
+        self._workflow_plugins = list(config.workflow.runtime.plugins)
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
@@ -445,6 +451,7 @@ class WorkflowEngine:
                 workflow_dir=self._workflow_dir,
                 skill_injection=config.workflow.runtime.skill_injection,
                 skill_discovery=config.workflow.runtime.skill_discovery,
+                workflow_plugins=self._workflow_plugins,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -1138,6 +1145,7 @@ class WorkflowEngine:
                 workflow_dir=self._workflow_dir,
                 skill_injection=self.config.workflow.runtime.skill_injection,
                 skill_discovery=self.config.workflow.runtime.skill_discovery,
+                workflow_plugins=self._workflow_plugins,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)

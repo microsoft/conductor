@@ -47,6 +47,8 @@ class _StubNonNativeProvider(AgentProvider, abstract=True):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         self.captured = skill_directories
         return AgentOutput(content={"echo": rendered_prompt}, raw_response=rendered_prompt)
@@ -98,6 +100,8 @@ class _CapturingNativeProvider(AgentProvider, abstract=True):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         self.captured = skill_directories
         return AgentOutput(content={"ok": True}, raw_response="ok")

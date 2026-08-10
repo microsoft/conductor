@@ -138,6 +138,11 @@ class ClaudeProvider(AgentProvider):
         # AgentExecutor (Claude's Messages API has no server-side skill
         # surface without adopting the container/code-execution beta).
         skills=True,
+        # No plugin support: eager injection can carry a skill's text
+        # into the prompt but cannot produce a subagent the model can
+        # dispatch to, and a plugin that loaded only its skills would be
+        # exactly the partial load ``plugins:`` exists to prevent.
+        plugins=False,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
@@ -750,6 +755,8 @@ class ClaudeProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Pydantic AI pipeline.
 
@@ -768,6 +775,10 @@ class ClaudeProvider(AgentProvider):
                 beta, so :class:`AgentExecutor` has already eager-injected
                 the skill content into ``rendered_prompt`` for this
                 provider (see :attr:`AgentProvider.supports_native_skills`).
+            custom_agents: Ignored. Declares ``plugins=False``, so
+                :class:`AgentExecutor` refuses ``plugins:`` on this
+                provider before reaching here and this is always ``None``.
+            extra_mcp_servers: Ignored, for the same reason.
 
         Returns:
             Normalized AgentOutput with structured content.

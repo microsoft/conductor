@@ -9,6 +9,8 @@ field descriptions are preserved as JSON-schema descriptions.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
@@ -17,6 +19,7 @@ from conductor.config.schema import OutputField
 from conductor.exceptions import ValidationError as ConductorValidationError
 from conductor.providers._pydantic_ai.converters import (
     _map_output_field_type,
+    _sanitize_json_schema,
     output_schema_to_pydantic_model,
 )
 
@@ -158,6 +161,47 @@ class TestOutputSchemaToPydanticModel:
 
         with pytest.raises(PydanticValidationError):
             model(name="Alice", count=True, active=True)
+
+    def test_nullable_object_array_item_accepted(self) -> None:
+        """Nullable object and array items must be accepted by the dynamic
+        model, matching ``validate_output`` behaviour."""
+        model = output_schema_to_pydantic_model(
+            "NullableItems",
+            {
+                "rows": OutputField(
+                    type="array",
+                    items=OutputField(
+                        type="object",
+                        nullable=True,
+                        properties={"name": OutputField(type="string")},
+                    ),
+                )
+            },
+        )
+        assert model is not None
+        instance = model(rows=[None, {"name": "x"}])
+        assert instance.rows[0] is None
+        assert instance.rows[1].name == "x"
+
+    def test_nullable_nested_array_item_accepted(self) -> None:
+        """A nullable array item that is itself an array must accept ``None``."""
+        model = output_schema_to_pydantic_model(
+            "NullableNestedArrays",
+            {
+                "grid": OutputField(
+                    type="array",
+                    items=OutputField(
+                        type="array",
+                        nullable=True,
+                        items=OutputField(type="string"),
+                    ),
+                )
+            },
+        )
+        assert model is not None
+        instance = model(grid=[None, ["a"]])
+        assert instance.grid[0] is None
+        assert instance.grid[1] == ["a"]
 
     def test_missing_field_raises(self) -> None:
         """All output fields are required by default; missing fields must raise."""
@@ -415,11 +459,13 @@ class TestDescriptionPreservation:
         schema = model.model_json_schema()
         findings = schema["properties"]["findings"]
         assert findings["description"] == "Top-level findings list."
-        item_ref = findings["items"]["$ref"]
-        item_key = item_ref.split("/")[-1]
-        item_schema = schema["$defs"][item_key]
+        _sanitize_json_schema(schema)
+        item_schema = findings["items"]
+        assert "description" in item_schema
         assert item_schema["description"] == "A single finding."
         assert item_schema["properties"]["title"]["description"] == "Finding title."
+        assert "$ref" not in schema
+        assert "$defs" not in schema
 
 
 class TestValidationParity:
@@ -473,3 +519,64 @@ class TestValidationParity:
 
         model(**content)
         validate_output(content, schema)
+
+
+class TestPatternTimeout:
+    """Regression tests for pattern matching with catastrophic-backtracking protection."""
+
+    def test_pattern_match_respects_timeout(self) -> None:
+        """A pathological regex input must raise ``ValidationError`` quickly
+        instead of hanging the event loop."""
+        model = output_schema_to_pydantic_model(
+            "Patterned",
+            {
+                "value": OutputField(
+                    type="string",
+                    pattern=r"^(a|aa)+$",
+                )
+            },
+        )
+        assert model is not None
+
+        start = time.monotonic()
+        with pytest.raises(PydanticValidationError):
+            model(value="a" * 60 + "b")
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0
+
+
+class TestNullableEnum:
+    """Tests for nullable enum advertisement and acceptance."""
+
+    def test_nullable_enum_includes_none_in_json_schema_extra(self) -> None:
+        """A nullable string enum must advertise ``None`` in the JSON Schema
+        ``enum`` so the model sees the same permitted values as the validator."""
+        model = output_schema_to_pydantic_model(
+            "NullableEnum",
+            {
+                "status": OutputField(
+                    type="string",
+                    enum=["A", "B"],
+                    nullable=True,
+                )
+            },
+        )
+        assert model is not None
+        field_info = model.model_fields["status"]
+        assert field_info.json_schema_extra == {"enum": ["A", "B", None]}
+
+    def test_nullable_enum_accepts_none(self) -> None:
+        """A nullable enum field must validate ``None`` at runtime."""
+        model = output_schema_to_pydantic_model(
+            "NullableEnum",
+            {
+                "status": OutputField(
+                    type="string",
+                    enum=["A", "B"],
+                    nullable=True,
+                )
+            },
+        )
+        assert model is not None
+        instance = model(status=None)
+        assert instance.status is None
