@@ -1,0 +1,66 @@
+# Claude provider with a custom / bring-your-own endpoint
+#
+# Demonstrates structured ``runtime.provider`` configuration for the Claude
+# provider (issue #353). Use this when you need to route Anthropic Claude API
+# calls through a custom gateway, proxy, or region-specific endpoint instead of
+# the default https://api.anthropic.com.
+#
+# Usage:
+#
+#   export ANTHROPIC_AUTH_TOKEN=sk-ant-...
+#   conductor run examples/claude-custom-endpoint.yaml --input question="What is Python?"
+#
+# Security: never commit real API keys or tokens in this file. Always pass
+# secrets via ``${ENV_VAR:-placeholder}`` interpolation so env-free static
+# validation can still pass. Literal values leak into the ``workflow_started``
+# event's embedded ``yaml_source`` and into checkpoints. Replace the
+# placeholder defaults at runtime by setting the corresponding environment
+# variable.
+
+workflow:
+  name: claude-custom-endpoint
+  description: Route the Claude provider through a custom Anthropic-compatible endpoint
+  version: "1.0.0"
+  entry_point: answerer
+
+  runtime:
+    provider:
+      name: claude
+      base_url: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      auth_token: ${ANTHROPIC_AUTH_TOKEN:-placeholder-token}
+    default_model: claude-sonnet-4
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question via the configured Claude endpoint
+    prompt: |
+      You are a helpful assistant. Please answer the following question
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+
+# Alternative BYOK variant using ``api_key`` instead of ``auth_token`` (commented out):
+#
+#   runtime:
+#     provider:
+#       name: claude
+#       base_url: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+#       api_key: ${ANTHROPIC_API_KEY:-placeholder-key}
+#     default_model: claude-sonnet-4
