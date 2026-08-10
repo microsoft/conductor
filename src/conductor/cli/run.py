@@ -26,7 +26,7 @@ from rich.table import Table
 from conductor.config.loader import load_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
-from conductor.mcp_auth import resolve_mcp_server_auth
+from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
@@ -81,9 +81,6 @@ _verbose_console = _SilentAwareConsole(highlight=False)
 _file_console: Console | None = None
 _file_handle: Any = None
 
-# Pattern for resolving ${VAR} and ${VAR:-default} in env values
-_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
-
 
 def generate_log_path(workflow_name: str) -> Path:
     """Generate auto log file path.
@@ -134,49 +131,6 @@ def close_file_logging() -> None:
     if _file_handle is not None:
         _file_handle.close()
         _file_handle = None
-
-
-def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
-    """Resolve ${VAR} and ${VAR:-default} patterns in env values.
-
-    Unlike the config loader which resolves at load time, this resolves
-    at runtime from the current process environment. This allows users
-    to reference environment variables (like API keys) in MCP server
-    configuration without hardcoding them in the YAML.
-
-    Syntax:
-        - ${VAR} - Replace with value of VAR, or empty string if not set
-        - ${VAR:-default} - Replace with value of VAR, or 'default' if not set
-
-    Args:
-        env: Dictionary of environment variable names to values,
-             where values may contain ${VAR} patterns.
-
-    Returns:
-        New dictionary with all ${VAR} patterns resolved.
-
-    Example:
-        >>> import os
-        >>> os.environ['MY_KEY'] = 'secret123'
-        >>> resolve_mcp_env_vars({'API_KEY': '${MY_KEY}', 'DEBUG': '${DEBUG:-false}'})
-        {'API_KEY': 'secret123', 'DEBUG': 'false'}
-    """
-
-    def replace_match(match: re.Match[str]) -> str:
-        var_name = match.group(1)
-        default_value = match.group(2)
-        env_value = os.environ.get(var_name)
-        if env_value is not None:
-            return env_value
-        elif default_value is not None:
-            return default_value
-        else:
-            return ""
-
-    resolved: dict[str, str] = {}
-    for key, value in env.items():
-        resolved[key] = _ENV_VAR_PATTERN.sub(replace_match, value)
-    return resolved
 
 
 def verbose_log(message: str, style: str = "dim") -> None:
@@ -1747,6 +1701,10 @@ async def run_workflow_async(
         # Convert MCP servers from workflow config to SDK format
         mcp_servers = await _build_mcp_servers(config)
 
+        # Acquire declared plugin sources before anything runs, so a cold
+        # cache costs a visible startup step rather than a stalled agent.
+        plugin_marketplaces = await _prefetch_plugin_sources(config, workflow_path)
+
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(agent.provider is not None for agent in config.agents)
 
@@ -1788,6 +1746,7 @@ async def run_workflow_async(
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
                 instructions_preamble=instructions_preamble,
+                plugin_marketplaces=plugin_marketplaces,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -2065,6 +2024,8 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             interrupt_signal: asyncio.Event | None = None,
             event_callback: Any = None,
             skill_directories: list[str] | None = None,
+            custom_agents: list[dict[str, Any]] | None = None,
+            extra_mcp_servers: dict[str, Any] | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 
@@ -2277,6 +2238,12 @@ async def resume_workflow_async(
         # Build MCP servers config (same as run_workflow_async)
         mcp_servers = await _build_mcp_servers(config)
 
+        # Same acquisition step as run: the checkpoint records no plugin
+        # state, so a resumed run resolves its sources exactly as a fresh
+        # one does. A floating ref may therefore have moved since the
+        # original run — pin a SHA if that matters.
+        plugin_marketplaces = await _prefetch_plugin_sources(config, resolved_workflow_path)
+
         # Create engine and restore state
         async with ProviderRegistry(config, mcp_servers=mcp_servers) as registry:
             verbose_log("Starting resumed workflow execution...")
@@ -2343,6 +2310,7 @@ async def resume_workflow_async(
                 keyboard_listener=listener,
                 web_dashboard=dashboard,
                 instructions_preamble=cp.instructions_preamble,
+                plugin_marketplaces=plugin_marketplaces,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id,
                     log_file=str(event_log_subscriber.path),
@@ -2496,6 +2464,71 @@ async def resume_workflow_async(
         close_file_logging()
 
 
+async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str, Any]:
+    """Acquire ``runtime.plugin_sources`` before the engine starts.
+
+    Up front rather than lazily, for three reasons: a cold cache means a
+    ``git clone``, which would otherwise stall the first agent that
+    happens to reference the plugin; a failure is a configuration problem
+    and should be reported as one rather than as an agent error; and
+    resolving every source together lets them be fetched concurrently
+    instead of one round trip at a time.
+
+    Runs in a thread because acquisition shells out to ``git``. Blocking
+    the event loop here would be harmless (nothing else is running yet)
+    but the same helper is reached from a sub-workflow spawn, where it
+    would not be.
+
+    Args:
+        config: The workflow configuration.
+        workflow_path: Path to the workflow file, anchoring relative
+            local sources.
+
+    Returns:
+        Marketplaces keyed by the name a ``plugin@marketplace`` entry
+        references. Empty when the workflow declares no sources.
+
+    Raises:
+        PluginError: If a source cannot be acquired or is unusable.
+    """
+    declared = config.workflow.runtime.plugin_sources
+    if not declared:
+        return {}
+
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+    verbose_log(f"Resolving {len(declared)} plugin source(s): {', '.join(sorted(declared))}")
+    try:
+        resolved = await asyncio.to_thread(
+            resolve_plugin_sources,
+            declared,
+            base_dir=workflow_path.resolve().parent,
+            on_warning=lambda message: verbose_log(f"  Plugin sources: {message}", style="yellow"),
+        )
+    except OSError as exc:
+        # The plugin cache is created here, so an unwritable home or a full
+        # disk arrives as a bare errno naming only a random temp directory.
+        from conductor.plugins.errors import PluginFetchError
+        from conductor.plugins.fetch import get_plugin_cache_base
+
+        raise PluginFetchError(
+            f"Plugin sources could not be acquired into {get_plugin_cache_base()}: {exc}"
+        ) from exc
+    for name, entry in resolved.items():
+        detail = entry.source.describe()
+        if entry.sha:
+            detail = f"{detail} @ {entry.sha[:12]}"
+        if entry.fetched:
+            detail = f"{detail} (fetched)"
+        if entry.stale:
+            # This line says the run used a plugin version nobody could
+            # verify, so it gets the marker rather than reading as one more
+            # startup progress line.
+            detail = f"{detail} [yellow]⚠ cached; ref not re-checked[/yellow]"
+        verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
+    return marketplaces_from(resolved)
+
+
 async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
     """Build MCP server configurations from workflow config.
 
@@ -2520,9 +2553,6 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
             }
             if server.headers:
                 server_config["headers"] = server.headers
-            if server.timeout:
-                server_config["timeout"] = server.timeout
-            server_config = await resolve_mcp_server_auth(name, server_config)
         else:
             server_config = {
                 "type": "stdio",
@@ -2531,9 +2561,11 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
                 "tools": server.tools,
             }
             if server.env:
-                server_config["env"] = resolve_mcp_env_vars(server.env)
-            if server.timeout:
-                server_config["timeout"] = server.timeout
-        mcp_servers[name] = server_config
+                server_config["env"] = server.env
+        if server.timeout:
+            server_config["timeout"] = server.timeout
+        # The same pipeline plugin-declared servers go through, so the two
+        # sources cannot drift apart on env expansion or OAuth discovery.
+        mcp_servers[name] = await resolve_mcp_server_config(name, server_config)
     verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
     return mcp_servers

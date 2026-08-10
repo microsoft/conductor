@@ -7,7 +7,7 @@ without executing them, displaying detailed error information.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -68,8 +68,128 @@ def validate_workflow(
         return False, None
 
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
+    _report_plugins(config, workflow_path, output_console)
 
     return True, config
+
+
+def _report_plugins(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+) -> None:
+    """Print what each enabled plugin actually contributes.
+
+    A plugin name in the YAML says nothing about how much it brings — the
+    installed plugins on one machine range from a single skill to seven
+    subagents plus an MCP server that authenticates with the user's own
+    credentials. Printing the component counts is what turns "I enabled
+    ``prs``" into something the author can review, and makes a change in
+    what a plugin ships visible on the next validate rather than at run
+    time.
+
+    Reports the workflow-level set only. Per-agent ``plugins:`` overrides
+    are resolved and *checked* by the validator, which knows each agent's
+    provider; repeating them here without that context would list
+    components a given agent never receives.
+
+    Never fatal, but not because the failure was already reported: the
+    validator resolves plugins per agent, so a workflow whose agents all
+    override ``plugins:`` (including with ``[]``) never resolves the
+    workflow-level list at all, and a failure surfaces here first. A
+    summary is still the wrong place to fail a workflow that is otherwise
+    valid — nothing inherits the list — so it degrades to a warning.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring relative
+            plugin paths.
+        console: Rich console for output.
+    """
+    entries = config.workflow.runtime.plugins
+    if not entries:
+        return
+
+    from conductor.plugins.errors import PluginError, PluginFetchError
+    from conductor.plugins.registry import resolve_plugins
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+    from conductor.skills import SkillError
+
+    base_dir = workflow_path.resolve().parent
+    declared = config.workflow.runtime.plugin_sources
+    sources: dict[str, Any] = {}
+    if declared:
+        # Cache-only, like everything else in ``conductor validate``: this
+        # is a summary, and a summary must not clone. Resolved one at a
+        # time so a single unfetched source degrades to one line rather
+        # than discarding the summary for every healthy source beside it.
+        for name, entry in declared.items():
+            try:
+                sources.update(
+                    resolve_plugin_sources({name: entry}, base_dir=base_dir, allow_network=False)
+                )
+            except PluginFetchError:
+                # Merely unfetched. Not reported here — the plugin lines
+                # below already name ``conductor plugin fetch`` for the
+                # entries that need it, and the validator said it once.
+                continue
+            except (PluginError, SkillError, OSError) as exc:
+                console.print(f"  [yellow]⚠[/yellow] Plugin source {name!r} is unusable: {exc}")
+
+    # Printed before resolution is attempted: what a source resolved to is
+    # worth seeing even when an entry referencing a *different* source
+    # cannot be resolved, and this listing is the only place the resolved
+    # commit appears.
+    if sources:
+        console.print(f"  [dim]Plugin sources: {len(sources)} declared[/dim]")
+        for name, entry in sources.items():
+            detail = entry.source.describe()
+            if entry.sha:
+                detail = f"{detail} @ {entry.sha[:12]}"
+            if entry.stale:
+                detail = f"{detail} (cached; ref not re-checked)"
+            console.print(f"    [dim]• {name} — {detail}[/dim]")
+
+    # Resolved one entry at a time, for the same reason the sources above
+    # are: ``resolve_plugins`` is all-or-nothing, so one entry whose source
+    # is unfetched would erase the component counts for every healthy
+    # plugin beside it — the listing this function exists to print.
+    resolved = []
+    for entry in entries:
+        try:
+            resolved.extend(
+                resolve_plugins(
+                    [entry],
+                    base_dir=base_dir,
+                    marketplaces=marketplaces_from(sources),
+                    declared_sources=set(declared) - set(sources),
+                )
+            )
+        except (PluginError, SkillError, OSError) as exc:
+            # Narrow: a genuine bug in the plugin layer (AttributeError,
+            # KeyError) should surface as a crash, not as a soft yellow line
+            # the reader scrolls past. This arm is reachable through ordinary
+            # configuration — see the docstring — so it is not merely
+            # defensive.
+            console.print(f"  [yellow]⚠[/yellow] Plugin {entry.name!r}: {exc}")
+
+    console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
+    for plugin in resolved:
+        parts = [
+            f"{len(plugin.skills)} skill(s)",
+            f"{len(plugin.agents)} agent(s)",
+            f"{len(plugin.mcp_servers)} MCP server(s)",
+        ]
+        console.print(f"    [dim]• {plugin.name} — {', '.join(parts)} — {plugin.root}[/dim]")
+        if plugin.agents:
+            names = ", ".join(item.qualified_name for item in plugin.agents)
+            console.print(f"      [dim]agents: {names}[/dim]")
+        if plugin.mcp_servers:
+            console.print(f"      [dim]mcp: {', '.join(sorted(plugin.mcp_servers))}[/dim]")
+        if plugin.disabled:
+            console.print(
+                f"      [dim]disabled by this workflow: {', '.join(plugin.disabled)}[/dim]"
+            )
 
 
 def _report_skill_discovery(
