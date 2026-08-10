@@ -1142,9 +1142,12 @@ def status(
     """
     import json
 
-    from conductor.cli.pid import read_pid_files
+    from conductor.cli.pid import scan_pid_files
 
-    running = read_pid_files()
+    # Deliberately not ``read_pid_files``: that one prunes as it reads, which
+    # would make the read-only command destructive — the exact trap this
+    # command exists to give people an alternative to.
+    running = scan_pid_files()
 
     if json_output:
         payload = [

@@ -39,6 +39,8 @@ uv run conductor run workflow.yaml --web --input question="What is Python?"
 uv run conductor run workflow.yaml --web-bg --input question="What is Python?"
 
 # Stop a background workflow
+uv run conductor status                 # list background workflows, never stops one
+uv run conductor status --json          # machine-readable
 uv run conductor stop                  # auto-stop if one running, list if multiple
 uv run conductor stop --port 8080      # stop specific port
 uv run conductor stop --all            # stop all background workflows
