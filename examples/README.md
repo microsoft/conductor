@@ -228,6 +228,21 @@ conductor run examples/copilot-local-llm.yaml --input question="What is Python?"
 See [Configuration → Custom Provider Routing](../docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
 for env-var fallbacks, validator rules, and the security rationale.
 
+### claude-custom-endpoint.yaml
+
+Route the Claude provider through a custom Anthropic-compatible endpoint or proxy. Demonstrates:
+- Object form of `runtime.provider` for the `claude` provider
+- `base_url` and `auth_token` (or `api_key`) forwarded to the Anthropic client
+- Secret hygiene via `${ANTHROPIC_AUTH_TOKEN:-placeholder-token}` / `${ANTHROPIC_API_KEY:-placeholder-key}` interpolation
+- BYOK `api_key` variant shown in a commented block
+
+```bash
+# Requires ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN to be set in the environment
+conductor run examples/claude-custom-endpoint.yaml --input question="What is Python?"
+```
+
+See [Claude Provider](../docs/providers/claude.md) for setup details.
+
 ## Step Types
 
 ### script-step.yaml
