@@ -9,6 +9,7 @@ rather than a quiet skip.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -281,7 +282,10 @@ class TestGithubConventionEndToEnd:
         assert list(plugin.mcp_servers) == ["srv"]
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="chmod does not restrict reads on Windows, and root ignores permission bits",
+)
 class TestUnreadableTrees:
     """Each of these carries a bespoke message that was previously unverified."""
 
