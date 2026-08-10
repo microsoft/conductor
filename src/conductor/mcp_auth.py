@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import urllib.request
 from typing import Any
@@ -167,3 +168,91 @@ async def resolve_mcp_server_auth(
         return updated_config
 
     return server_config
+
+
+# Pattern for resolving ${VAR} and ${VAR:-default} in MCP env values.
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+
+
+def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
+    """Resolve ${VAR} and ${VAR:-default} patterns in env values.
+
+    Unlike the config loader which resolves at load time, this resolves
+    at runtime from the current process environment. This allows users
+    to reference environment variables (like API keys) in MCP server
+    configuration without hardcoding them in the YAML.
+
+    Syntax:
+        - ${VAR} - Replace with value of VAR, or empty string if not set
+        - ${VAR:-default} - Replace with value of VAR, or 'default' if not set
+
+    Args:
+        env: Dictionary of environment variable names to values,
+             where values may contain ${VAR} patterns.
+
+    Returns:
+        New dictionary with all ${VAR} patterns resolved.
+
+    Example:
+        >>> import os
+        >>> os.environ['MY_KEY'] = 'secret123'
+        >>> resolve_mcp_env_vars({'API_KEY': '${MY_KEY}', 'DEBUG': '${DEBUG:-false}'})
+        {'API_KEY': 'secret123', 'DEBUG': 'false'}
+    """
+
+    def replace_match(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        default_value = match.group(2)
+        env_value = os.environ.get(var_name)
+        if env_value is not None:
+            return env_value
+        elif default_value is not None:
+            return default_value
+        else:
+            return ""
+
+    resolved: dict[str, str] = {}
+    for key, value in env.items():
+        resolved[key] = _ENV_VAR_PATTERN.sub(replace_match, value)
+    return resolved
+
+
+async def resolve_mcp_server_config(name: str, server_config: dict[str, Any]) -> dict[str, Any]:
+    """Apply Conductor's full resolution pipeline to one MCP server config.
+
+    The single place both server sources agree on. A workflow-declared
+    server (``runtime.mcp_servers``) and a plugin-declared one
+    (``.mcp.json``) reach the SDK by different routes, and before this
+    existed only the first was resolved — so a plugin's stdio server was
+    handed a literal ``${TOKEN}`` and its http server attached with no
+    ``Authorization`` header. The server loaded and did not work, which is
+    the silent-divergence failure plugins exist to remove.
+
+    Args:
+        name: Server name, used for OAuth token cache keying and messages.
+        server_config: Resolved-shape config dict (``type`` plus the
+            transport's own fields).
+
+    Returns:
+        A new dict with ``env`` placeholders expanded and, for http/sse,
+        any discovered OAuth ``Authorization`` header merged in. The input
+        is never mutated — plugin configs are shared across agents.
+    """
+    resolved = dict(server_config)
+    env = resolved.get("env")
+    if isinstance(env, dict) and env:
+        resolved["env"] = resolve_mcp_env_vars(env)
+    return await resolve_mcp_server_auth(name, resolved)
+
+
+async def resolve_mcp_servers(servers: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a whole name-keyed mapping of MCP server configs.
+
+    Args:
+        servers: Mapping of server name to config dict.
+
+    Returns:
+        A new mapping with every entry resolved by
+        :func:`resolve_mcp_server_config`.
+    """
+    return {name: await resolve_mcp_server_config(name, config) for name, config in servers.items()}

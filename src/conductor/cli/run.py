@@ -26,7 +26,7 @@ from rich.table import Table
 from conductor.config.loader import load_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
-from conductor.mcp_auth import resolve_mcp_server_auth
+from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.registry import ProviderRegistry
 
 if TYPE_CHECKING:
@@ -81,9 +81,6 @@ _verbose_console = _SilentAwareConsole(highlight=False)
 _file_console: Console | None = None
 _file_handle: Any = None
 
-# Pattern for resolving ${VAR} and ${VAR:-default} in env values
-_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
-
 
 def generate_log_path(workflow_name: str) -> Path:
     """Generate auto log file path.
@@ -134,49 +131,6 @@ def close_file_logging() -> None:
     if _file_handle is not None:
         _file_handle.close()
         _file_handle = None
-
-
-def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:
-    """Resolve ${VAR} and ${VAR:-default} patterns in env values.
-
-    Unlike the config loader which resolves at load time, this resolves
-    at runtime from the current process environment. This allows users
-    to reference environment variables (like API keys) in MCP server
-    configuration without hardcoding them in the YAML.
-
-    Syntax:
-        - ${VAR} - Replace with value of VAR, or empty string if not set
-        - ${VAR:-default} - Replace with value of VAR, or 'default' if not set
-
-    Args:
-        env: Dictionary of environment variable names to values,
-             where values may contain ${VAR} patterns.
-
-    Returns:
-        New dictionary with all ${VAR} patterns resolved.
-
-    Example:
-        >>> import os
-        >>> os.environ['MY_KEY'] = 'secret123'
-        >>> resolve_mcp_env_vars({'API_KEY': '${MY_KEY}', 'DEBUG': '${DEBUG:-false}'})
-        {'API_KEY': 'secret123', 'DEBUG': 'false'}
-    """
-
-    def replace_match(match: re.Match[str]) -> str:
-        var_name = match.group(1)
-        default_value = match.group(2)
-        env_value = os.environ.get(var_name)
-        if env_value is not None:
-            return env_value
-        elif default_value is not None:
-            return default_value
-        else:
-            return ""
-
-    resolved: dict[str, str] = {}
-    for key, value in env.items():
-        resolved[key] = _ENV_VAR_PATTERN.sub(replace_match, value)
-    return resolved
 
 
 def verbose_log(message: str, style: str = "dim") -> None:
@@ -2522,9 +2476,6 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
             }
             if server.headers:
                 server_config["headers"] = server.headers
-            if server.timeout:
-                server_config["timeout"] = server.timeout
-            server_config = await resolve_mcp_server_auth(name, server_config)
         else:
             server_config = {
                 "type": "stdio",
@@ -2533,9 +2484,11 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
                 "tools": server.tools,
             }
             if server.env:
-                server_config["env"] = resolve_mcp_env_vars(server.env)
-            if server.timeout:
-                server_config["timeout"] = server.timeout
-        mcp_servers[name] = server_config
+                server_config["env"] = server.env
+        if server.timeout:
+            server_config["timeout"] = server.timeout
+        # The same pipeline plugin-declared servers go through, so the two
+        # sources cannot drift apart on env expansion or OAuth discovery.
+        mcp_servers[name] = await resolve_mcp_server_config(name, server_config)
     verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
     return mcp_servers

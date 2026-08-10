@@ -198,3 +198,43 @@ class TestMcpNameCollisions:
             mcp_servers={"workflow-srv": MCPServerDef(command="other")},
         )
         _validate(config, _wf_path(tmp_path))
+
+
+class TestBrokenPluginContentSurfacesAsValidationError:
+    """A malformed plugin must not escape the CLI as a raw traceback.
+
+    ``_check_agent_plugins`` catches ``(PluginError, SkillError)`` — two
+    unrelated hierarchies, since a plugin's skills are resolved by the
+    skills layer. Narrowing that to ``PluginError`` alone leaves 1526
+    tests green and turns a broken ``SKILL.md`` into an unhandled crash.
+    """
+
+    def test_broken_skill_frontmatter_is_reported(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "p")
+        bad = root / "skills" / "bad"
+        bad.mkdir(parents=True)
+        (bad / "SKILL.md").write_text("---\nname: bad\ndescription: Oops. Triggers: a, b\n---\n")
+        config = _config(plugins=[PluginDef(name="./p")])
+        with pytest.raises(ConfigurationError, match="invalid YAML frontmatter"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_broken_agent_definition_is_reported(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "p")
+        (root / "agents").mkdir()
+        (root / "agents" / "broken.agent.md").write_text("no frontmatter at all\n")
+        config = _config(plugins=[PluginDef(name="./p")])
+        with pytest.raises(ConfigurationError, match="no YAML frontmatter"):
+            _validate(config, _wf_path(tmp_path))
+
+
+class TestOneBadPathDoesNotSilenceOtherChecks:
+    """An un-anchorable relative entry must not suppress the rest."""
+
+    def test_mcp_clash_still_reported_without_a_workflow_path(self, tmp_path: Path) -> None:
+        absolute = make_plugin(tmp_path / "abs", "abs", mcp={"shared": {"command": "npx"}})
+        config = _config(
+            plugins=[PluginDef(name="./unanchorable"), PluginDef(name=str(absolute))],
+            mcp_servers={"shared": MCPServerDef(command="other")},
+        )
+        with pytest.raises(ConfigurationError, match="which the workflow also"):
+            _validate(config, None)

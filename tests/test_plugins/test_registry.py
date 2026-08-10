@@ -8,6 +8,7 @@ rather than a quiet skip.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -217,7 +218,7 @@ class TestReviewFollowUps:
         (root / "agents").mkdir()
         (root / "agents" / "broken.agent.md").write_text("no frontmatter at all\n")
         plugin = resolve_plugin(str(root), want_agents=False)
-        assert plugin.agents == []
+        assert plugin.agents == ()
         assert plugin.disabled == ("agents",)
 
     def test_broken_agent_still_fails_when_agents_are_enabled(self, tmp_path: Path) -> None:
@@ -252,3 +253,119 @@ class TestReviewFollowUps:
         plugin = resolve_skill_plugin(root / "skills" / "thing")
         assert plugin is not None
         assert plugin.qualified_name == "demo:thing"
+
+
+class TestGithubConventionEndToEnd:
+    """The convention 12 of 13 installed plugins use, past the manifest layer.
+
+    ``test_manifest.py`` parametrizes both conventions, but only at parse
+    time — this covers a Copilot-convention plugin resolving all three
+    components, which is the configuration most users actually hit.
+    """
+
+    @pytest.mark.parametrize("manifest", [".claude-plugin", ".github/plugin"])
+    def test_all_components_resolve_under_either_convention(
+        self, tmp_path: Path, manifest: str
+    ) -> None:
+        make_plugin(
+            tmp_path / "p",
+            "demo",
+            manifest=manifest,
+            skills=["s"],
+            agents=["helper"],
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        plugin = resolve_plugin("./p", base_dir=tmp_path)
+        assert [s.name for s in plugin.skills] == ["s"]
+        assert [a.qualified_name for a in plugin.agents] == ["demo:helper"]
+        assert list(plugin.mcp_servers) == ["srv"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+class TestUnreadableTrees:
+    """Each of these carries a bespoke message that was previously unverified."""
+
+    def test_unreadable_skill_subdirectory_is_reported(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "p", skills=["ok"])
+        blocked = root / "skills" / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o000)
+        try:
+            with pytest.raises(PluginManifestError, match="could not be read"):
+                resolve_plugin(str(root))
+        finally:
+            blocked.chmod(0o755)
+
+    def test_blocked_claude_manifest_falls_through_to_github(self, tmp_path: Path) -> None:
+        # The stated premise of probing two conventions: an unreadable
+        # candidate must not stop a sibling convention resolving.
+        root = make_plugin(tmp_path / "p", "demo", manifest=".github/plugin", skills=["s"])
+        blocked = root / ".claude-plugin"
+        blocked.mkdir()
+        (blocked / "plugin.json").write_text("{}")
+        blocked.chmod(0o000)
+        try:
+            assert resolve_plugin(str(root)).name == "demo"
+        finally:
+            blocked.chmod(0o755)
+
+
+class TestConstructorInvariants:
+    """A relative root must fail as a plugin error, not leak from the skills layer."""
+
+    def test_relative_root_is_refused(self, tmp_path: Path) -> None:
+        from conductor.plugins.registry import ResolvedPlugin
+
+        with pytest.raises(PluginManifestError, match="must be absolute"):
+            ResolvedPlugin(name="x", root=Path("relative/root"), source="x")
+
+    def test_delimiter_bearing_agent_name_is_refused(self) -> None:
+        from conductor.plugins.agents import PluginAgent
+
+        with pytest.raises(PluginManifestError, match="must match"):
+            PluginAgent(
+                name="ok",
+                plugin_name="bad,name",
+                description="d",
+                prompt="p",
+                tools=None,
+                path=Path("/tmp/a.agent.md"),
+            )
+
+
+class TestPathObjectsAreNotSilentlyReclassified:
+    """``Path`` has a ``.name``, so duck-typing reduced it to a basename."""
+
+    def test_path_entry_fails_the_protocol(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", skills=["s"])
+        with pytest.raises(AttributeError):
+            resolve_plugins([tmp_path / "p"], base_dir=tmp_path)  # type: ignore[list-item]
+
+
+class TestDuplicateRootSwitchMismatch:
+    """One plugin reached twice with different switches has no correct merge."""
+
+    def test_conflicting_switches_are_refused(self, tmp_path: Path) -> None:
+        # Keeping the first silently would grant the MCP server the second
+        # entry declined — an over-grant, in the permissive direction.
+        root = make_plugin(tmp_path / "p", "p", mcp={"srv": {"command": "npx"}})
+        with pytest.raises(PluginNotFoundError, match="different components"):
+            resolve_plugins([Entry(str(root)), Entry(str(root) + "/", mcp=False)])
+
+    def test_identical_switches_are_a_harmless_repeat(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "p", mcp={"srv": {"command": "npx"}})
+        resolved = resolve_plugins([Entry(str(root)), Entry(str(root) + "/")])
+        assert [p.name for p in resolved] == ["p"]
+
+
+class TestSkillNameMustMatchItsDirectory:
+    """``resolve_skill_plugin`` sends the directory name; the CLI resolves the
+    frontmatter name. A divergence hides the skill rather than failing."""
+
+    def test_mismatched_frontmatter_name_is_refused(self, tmp_path: Path) -> None:
+        from conductor.skills import SkillPluginError, resolve_skill_plugin
+
+        root = make_plugin(tmp_path / "p", "demo")
+        write_skill(root / "skills" / "on-disk", name="in-frontmatter")
+        with pytest.raises(SkillPluginError, match="lives in a directory named"):
+            resolve_skill_plugin(root / "skills" / "on-disk")

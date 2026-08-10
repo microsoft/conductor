@@ -23,10 +23,16 @@ claude-agent-sdk, which Conductor runs with ``strict_mcp_config=True``.
 
 Deconstructed, each component travels the surface Conductor already uses
 for it: skills through ``skill_directories`` / :mod:`conductor.skills`,
-agents through the SDK's custom-agent option, and MCP servers through
-:class:`~conductor.config.schema.MCPServerDef` — so a plugin's server
-gets the same ``tools:`` filter, ``runtime.tool_output`` limits, and
-dashboard tool events as one declared in the workflow.
+agents through the SDK's custom-agent option, and MCP servers through the
+same session-level channel a workflow-declared server uses — so a
+plugin's server gets the same ``runtime.tool_output`` limits and
+dashboard tool events, and goes through the same credential and
+environment resolution (:func:`conductor.mcp_auth.resolve_mcp_servers`).
+
+A plugin server is *not* a :class:`~conductor.config.schema.MCPServerDef`
+and therefore carries no per-server ``tools:`` filter — there is nowhere
+to author one. ``mcp: false`` on the plugin entry is the available
+control.
 
 Plugins are **never discovered**. An entry is always written in
 ``plugins:``, so nothing enters a run unasked and a missing plugin is a

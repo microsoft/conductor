@@ -80,6 +80,33 @@ class PluginAgent:
     path: Path
     """Absolute path to the ``.agent.md`` file, for use in messages."""
 
+    def __post_init__(self) -> None:
+        """Enforce that :attr:`qualified_name` can safely reach an SDK.
+
+        Both halves are checked here rather than only in
+        :func:`read_plugin_agent`, because this is a public constructor
+        and ``plugin_name`` is taken on trust by every parsing entry
+        point. The name is joined with ``:`` and forwarded to
+        ``custom_agents`` / ``AgentDefinition``, so a stray ``:`` or ``,``
+        would split into something the SDK reads differently.
+
+        Raises:
+            PluginManifestError: If either name component is unusable, or
+                the description or prompt is empty.
+        """
+        for label, value in (("name", self.name), ("plugin_name", self.plugin_name)):
+            if not SAFE_NAME.match(value):
+                raise PluginManifestError(
+                    f"PluginAgent.{label} must match {SAFE_NAME.pattern} (it is joined "
+                    f"into a delimited identifier), got {value!r}"
+                )
+        if not self.description.strip() or not self.prompt.strip():
+            raise PluginManifestError(
+                f"PluginAgent {self.plugin_name}:{self.name} needs a non-empty "
+                "description and prompt — the model reads the first to decide whether "
+                "to dispatch, and the second is the agent's instructions."
+            )
+
     @property
     def qualified_name(self) -> str:
         """``<plugin>:<agent>`` — how both SDKs namespace a plugin agent.

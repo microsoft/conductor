@@ -28,7 +28,7 @@ from ruamel.yaml.error import YAMLError
 
 # The leading ``---`` fenced block. Anchored at the start of the file:
 # a ``---`` further down is a thematic break in the body, not metadata.
-FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+_FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 
 # Appended to parse failures by callers: the block-scalar form sidesteps
 # the colon-in-a-plain-scalar trap entirely, which is by far the most
@@ -72,7 +72,7 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any] | None, str]:
         FrontmatterShapeError: If the block parses to something other
             than a mapping.
     """
-    match = FRONTMATTER.match(text)
+    match = _FRONTMATTER.match(text)
     if match is None:
         return None, text
 

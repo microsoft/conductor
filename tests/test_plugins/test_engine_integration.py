@@ -29,12 +29,32 @@ from conductor.config.schema import (
 from conductor.engine.workflow import WorkflowEngine
 from conductor.plugins.errors import PluginNotFoundError
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.capabilities import ProviderCapabilities
 
 from .conftest import make_plugin
+
+_CAPS = ProviderCapabilities(
+    tier="stable",
+    mcp_tools=True,
+    workflow_tools_passthrough=True,
+    streaming_events=True,
+    agent_reasoning_events=True,
+    reasoning_effort=None,
+    structured_output="native",
+    interrupt=True,
+    max_session_seconds=True,
+    checkpoint_resume=True,
+    usage_tracking=True,
+    concurrent_safe=True,
+    skills=True,
+    plugins=True,
+)
 
 
 class _CapturingProvider(AgentProvider, abstract=True):
     """Records what the executor forwarded on the last ``execute`` call."""
+
+    CAPABILITIES = _CAPS
 
     def __init__(self) -> None:
         self.skill_directories: list[str] | None = None
@@ -95,8 +115,39 @@ def _config(
     )
 
 
-def _run(config: WorkflowConfig, provider: AgentProvider, workflow_path: Path | None) -> None:
-    engine = WorkflowEngine(config, provider, workflow_path=workflow_path)
+class _StubRegistry:
+    """Minimal stand-in for :class:`~conductor.providers.registry.ProviderRegistry`.
+
+    ``conductor run`` always constructs the engine with ``registry=``
+    (``cli/run.py``), never with a bare ``provider=`` — so the registry
+    branch of ``_get_executor_for_agent`` is the one production takes.
+    Only exercising the single-provider branch let the registry branch's
+    ``workflow_plugins=`` be deleted with the whole suite still green.
+    """
+
+    def __init__(self, provider: AgentProvider) -> None:
+        self._provider = provider
+
+    async def get_provider(self, agent: object) -> AgentProvider:
+        return self._provider
+
+    async def close(self) -> None:
+        return None
+
+
+def _run(
+    config: WorkflowConfig,
+    provider: AgentProvider,
+    workflow_path: Path | None,
+    *,
+    via_registry: bool = False,
+) -> None:
+    if via_registry:
+        engine = WorkflowEngine(
+            config, registry=_StubRegistry(provider), workflow_path=workflow_path
+        )
+    else:
+        engine = WorkflowEngine(config, provider, workflow_path=workflow_path)
     asyncio.run(engine.run({}))
 
 
@@ -176,3 +227,45 @@ class TestFailuresSurfaceThroughTheEngine:
         provider = _CapturingProvider()
         with pytest.raises(PluginNotFoundError, match="does not exist"):
             _run(_config([PluginDef(name="./gone")]), provider, _workflow_file(tmp_path))
+
+
+@pytest.mark.parametrize("via_registry", [False, True], ids=["single-provider", "registry"])
+class TestBothEngineProviderModes:
+    """Both engine branches must thread ``runtime.plugins`` through.
+
+    Parametrized rather than duplicated because the *registry* branch is
+    the one ``conductor run`` uses, and it was previously uncovered — its
+    ``workflow_plugins=`` argument could be deleted with 5107 tests still
+    passing.
+    """
+
+    def test_plugins_reach_the_provider(self, tmp_path: Path, via_registry: bool) -> None:
+        make_plugin(
+            tmp_path / "prs",
+            "prs",
+            skills=["review"],
+            agents=["code-reviewer"],
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        provider = _CapturingProvider()
+        _run(
+            _config([PluginDef(name="./prs")]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=via_registry,
+        )
+        assert provider.skill_directories == [str(tmp_path / "prs" / "skills" / "review")]
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+    def test_agent_override_reaches_the_provider(self, tmp_path: Path, via_registry: bool) -> None:
+        make_plugin(tmp_path / "wide", "wide", agents=["from-workflow"])
+        make_plugin(tmp_path / "narrow", "narrow", agents=["from-agent"])
+        provider = _CapturingProvider()
+        _run(
+            _config([PluginDef(name="./wide")], agent_plugins=[PluginDef(name="./narrow")]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=via_registry,
+        )
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["narrow:from-agent"]

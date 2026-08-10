@@ -11,7 +11,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -278,13 +278,23 @@ class AgentProvider(ABC):
         return False
 
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
-        """Enforce that every production subclass declares ``CAPABILITIES``.
+        """Enforce that a production subclass declares what it can honour.
 
         Converts a latent "lazily caught at validator/runtime" failure
         into an import-time error so missing or mistyped descriptors
         cannot ship. Test fakes opt out with ``abstract=True``:
 
             class _Fake(AgentProvider, abstract=True): ...
+
+        Also checks the one capability with no fallback. A provider
+        declaring ``plugins=True`` must accept all three delivery kwargs
+        on :meth:`execute` and declare
+        :attr:`supports_native_plugins` — a plugin's subagents and MCP
+        servers cannot be approximated by injecting text into a prompt,
+        so declaring support and dropping a channel silently reinstates
+        the partial load the feature exists to remove. Signature drift is
+        catchable here; "accepts the kwarg then ignores it" is not, and
+        is covered per-provider by ``tests/test_plugins/test_providers.py``.
         """
         super().__init_subclass__(**kwargs)
         if abstract:
@@ -300,6 +310,36 @@ class AgentProvider(ABC):
                 f"conductor.providers.capabilities). Test fakes can opt out "
                 f"with `class {cls.__name__}(AgentProvider, abstract=True)`."
             )
+
+        if caps.plugins:
+            import inspect
+
+            accepted = set(inspect.signature(cls.execute).parameters)
+            missing = sorted({"skill_directories", "custom_agents", "extra_mcp_servers"} - accepted)
+            if missing:
+                raise TypeError(
+                    f"{cls.__module__}.{cls.__name__} declares capabilities.plugins=True "
+                    f"but execute() does not accept {missing} — a plugin's components "
+                    f"would be dropped without a word."
+                )
+            declared = inspect.getattr_static(cls, "supports_native_plugins", None)
+            if isinstance(declared, property) and declared.fget is not None:
+                try:
+                    # Evaluated with no instance: these declarations are
+                    # constants. A getter that genuinely needs instance state
+                    # cannot be checked here, so it is left to the per-provider
+                    # tests rather than failing the import.
+                    resolved = declared.fget(cast("AgentProvider", None))
+                except (AttributeError, TypeError):
+                    resolved = True
+            else:
+                resolved = declared
+            if not resolved:
+                raise TypeError(
+                    f"{cls.__module__}.{cls.__name__} declares capabilities.plugins=True "
+                    f"but supports_native_plugins is falsy. The two describe the same "
+                    f"contract and must agree."
+                )
 
     @abstractmethod
     async def execute(

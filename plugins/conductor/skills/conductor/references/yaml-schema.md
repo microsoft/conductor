@@ -44,6 +44,13 @@ workflow:
                                     #             which expands to every immediate child holding one
                                     # Relative paths resolve against the workflow FILE's directory.
                                     # Every resolved SKILL.md must declare `name` and `description`
+                                    # in valid YAML frontmatter (use `description: |` if it contains
+                                    # a colon followed by a space) -- both CLIs skip
+                                    # an unparseable skill silently.
+                                    # Copilot loads natively via `skill_directories`;
+                                    # claude-agent-sdk loads natively via its plugin surface, so a
+                                    #   path skill OUTSIDE a Claude Code plugin is rejected there;
+                                    # Claude and hermes eagerly inject SKILL.md + references/*.md.
     plugins:                        # Whole plugins enabled for every provider-backed agent (default: [])
       - string                      #   String shorthand: everything the plugin ships
       - name: string                #   Installed plugin NAME, or a PATH (same syntactic rule as skills)
@@ -60,13 +67,6 @@ workflow:
                                     #   surface is the plugin root, which carries subagents too).
                                     # hooks/ and commands/ are never loaded (validate warns).
                                     # Never discovered — a plugin loads only when a workflow names it.
-                                    # in valid YAML frontmatter (use `description: |` if it contains
-                                    # a colon followed by a space) -- both CLIs skip
-                                    # an unparseable skill silently.
-                                    # Copilot loads natively via `skill_directories`;
-                                    # claude-agent-sdk loads natively via its plugin surface, so a
-                                    #   path skill OUTSIDE a Claude Code plugin is rejected there;
-                                    # Claude and hermes eagerly inject SKILL.md + references/*.md.
     skill_injection:                # Bounds EAGERLY injected skill content (claude, hermes only).
       warn_bytes: integer           # Warn above this many bytes (default: 65536; null disables)
       max_bytes: integer            # Fail above this many bytes (default: 131072; null disables)

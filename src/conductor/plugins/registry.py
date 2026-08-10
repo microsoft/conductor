@@ -26,11 +26,10 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from conductor.plugins.agents import AGENT_SUFFIX, PluginAgent, read_plugin_agents
 from conductor.plugins.errors import (
-    PluginError,
     PluginManifestError,
     PluginNotFoundError,
 )
@@ -58,10 +57,29 @@ logger = logging.getLogger(__name__)
 # Both CLIs' locations are searched, for the same reason discovery unions
 # them: a workflow must resolve the same plugin whichever provider each
 # of its agents happens to use, or one run would see two different sets.
-INSTALLED_PLUGIN_GLOBS: tuple[str, ...] = (
+_INSTALLED_PLUGIN_GLOBS: tuple[str, ...] = (
     ".copilot/installed-plugins/*/{name}",
     ".claude/plugins/*/{name}",
 )
+
+
+class PluginEntry(Protocol):
+    """The shape :func:`resolve_plugins` needs from a ``plugins:`` entry.
+
+    A structural type rather than a hard dependency on
+    :class:`~conductor.config.schema.PluginDef`, so this package stays
+    below the config layer — but a *typed* one rather than ``Any``.
+    ``getattr(entry, "name", entry)`` looked equivalent and was not:
+    :class:`pathlib.Path` has a ``.name`` attribute, so passing one
+    silently reduced a path entry to its basename and reclassified it as
+    an installed-plugin name, resolving a different plugin on disk
+    without a word. A ``Path`` fails this protocol instead.
+    """
+
+    name: str
+    skills: bool
+    agents: bool
+    mcp: bool
 
 
 @dataclass(frozen=True)
@@ -78,7 +96,7 @@ class ResolvedPlugin:
     """The ``plugins:`` entry verbatim, so messages can name what the
     author actually wrote rather than a path they never typed."""
 
-    skills: list[ResolvedSkill] = field(default_factory=list)
+    skills: tuple[ResolvedSkill, ...] = ()
     """Skills the plugin ships, already expanded and frontmatter-checked.
 
     Empty when the plugin ships none, or when the entry disabled them.
@@ -87,7 +105,7 @@ class ResolvedPlugin:
     downstream.
     """
 
-    agents: list[PluginAgent] = field(default_factory=list)
+    agents: tuple[PluginAgent, ...] = ()
     """Subagents the plugin ships, empty when none or when disabled."""
 
     mcp_servers: dict[str, Any] = field(default_factory=dict)
@@ -113,6 +131,21 @@ class ResolvedPlugin:
     """Components the plugin ships that the entry switched off, for
     reporting at ``conductor validate`` time."""
 
+    def __post_init__(self) -> None:
+        """Enforce that ``root`` is absolute.
+
+        Without this the invariant held only by accident, via
+        :class:`~conductor.skills.registry.ResolvedSkill`'s own check —
+        so a relative plugin root surfaced as a *skill* error in a class
+        the plugin layer's callers are not required to catch, and with
+        ``skills: false`` produced no error at all.
+
+        Raises:
+            PluginManifestError: If ``root`` is not absolute.
+        """
+        if not self.root.is_absolute():
+            raise PluginManifestError(f"ResolvedPlugin.root must be absolute, got {self.root!s}")
+
 
 def _installed_roots(name: str, home: Path) -> list[Path]:
     """Find installed plugin roots matching ``name``.
@@ -128,7 +161,7 @@ def _installed_roots(name: str, home: Path) -> list[Path]:
     """
     found: list[Path] = []
     seen: set[Path] = set()
-    for pattern in INSTALLED_PLUGIN_GLOBS:
+    for pattern in _INSTALLED_PLUGIN_GLOBS:
         try:
             matches = sorted(home.glob(pattern.format(name=name)))
         except OSError as exc:
@@ -149,7 +182,7 @@ def _installed_roots(name: str, home: Path) -> list[Path]:
 def _search_locations(home: Path) -> str:
     """Human-readable list of where a bare name is looked for."""
     return ", ".join(
-        str(home / pattern.format(name="<name>")) for pattern in INSTALLED_PLUGIN_GLOBS
+        str(home / pattern.format(name="<name>")) for pattern in _INSTALLED_PLUGIN_GLOBS
     )
 
 
@@ -359,16 +392,61 @@ def resolve_plugin(
         name=manifest.name,
         root=root,
         source=entry,
-        skills=skills,
-        agents=agents,
+        skills=tuple(skills),
+        agents=tuple(agents),
         mcp_servers=mcp_servers,
         dropped=_dropped_components(root),
         disabled=tuple(disabled),
     )
 
 
+def describe_dropped_components(plugin: ResolvedPlugin, *, root_is_registered: bool) -> str | None:
+    """Phrase what a plugin ships that Conductor does not load.
+
+    One builder so ``conductor validate`` and ``conductor run`` cannot
+    describe the same plugin differently — the paired checks exist
+    precisely so the two commands agree, and that is worth nothing if the
+    strings drift.
+
+    The wording turns on the *mechanism*, not on which component it is.
+    Where a provider can only reach a plugin's skills by registering the
+    whole plugin root, that registration carries ``hooks/`` and
+    ``commands/`` along with it — so saying "not loaded" would be exactly
+    backwards, and most dangerously so for hooks, which are arbitrary
+    shell run on tool events.
+
+    Args:
+        plugin: The resolved plugin.
+        root_is_registered: Whether this provider will register the
+            plugin root (true only when the provider has no bare
+            skill-directory surface *and* this plugin's skills are on).
+
+    Returns:
+        A sentence for the user, or ``None`` when the plugin ships
+        nothing Conductor drops.
+    """
+    if not plugin.dropped:
+        return None
+    listed = " and ".join(f"{name}/" for name in plugin.dropped)
+    if root_is_registered:
+        danger = (
+            " (hooks are arbitrary shell run on tool events)" if "hooks" in plugin.dropped else ""
+        )
+        return (
+            f"plugin {plugin.source!r} ships {listed}, and reaching its skills on this "
+            f"provider requires registering the plugin root — so {listed} are exposed "
+            f"to the CLI rather than dropped{danger}. Set 'skills: false' on the plugin "
+            f"to avoid registering the root, or run this agent on 'copilot', which "
+            f"loads each component individually."
+        )
+    return (
+        f"plugin {plugin.source!r} ships {listed}, which Conductor does not load. "
+        f"The plugin behaves differently here than it does in the CLI."
+    )
+
+
 def resolve_plugins(
-    entries: Sequence[Any],
+    entries: Sequence[PluginEntry],
     *,
     base_dir: Path | None = None,
     home: Path | None = None,
@@ -377,9 +455,8 @@ def resolve_plugins(
     """Resolve a whole ``plugins:`` list.
 
     Args:
-        entries: :class:`~conductor.config.schema.PluginDef` objects (or
-            anything exposing ``name`` / ``skills`` / ``agents`` / ``mcp``
-            attributes).
+        entries: :class:`~conductor.config.schema.PluginDef` objects, or
+            anything satisfying :class:`PluginEntry`.
         base_dir: Directory relative path entries resolve against.
         home: Home directory installed names resolve against.
         on_warning: Optional sink for non-fatal diagnostics.
@@ -395,6 +472,10 @@ def resolve_plugins(
             refused rather than merged because the name determines the
             tool names the model sees, so one plugin's tools would appear
             under the other's configuration.
+        SkillManifestError: If one of a plugin's skills has broken
+            frontmatter. A :class:`~conductor.skills.errors.SkillError`
+            subclass, *not* a :class:`PluginError` — catch both, as
+            ``config/validator.py`` does.
     """
     resolved: list[ResolvedPlugin] = []
     by_root: dict[Path, ResolvedPlugin] = {}
@@ -402,20 +483,32 @@ def resolve_plugins(
     servers: dict[str, ResolvedPlugin] = {}
     skill_names: dict[str, ResolvedPlugin] = {}
 
+    switches: dict[Path, tuple[bool, bool, bool]] = {}
     for entry in entries:
-        name = getattr(entry, "name", entry)
+        wanted = (bool(entry.skills), bool(entry.agents), bool(entry.mcp))
         plugin = resolve_plugin(
-            name,
-            want_skills=bool(getattr(entry, "skills", True)),
-            want_agents=bool(getattr(entry, "agents", True)),
-            want_mcp=bool(getattr(entry, "mcp", True)),
+            entry.name,
+            want_skills=wanted[0],
+            want_agents=wanted[1],
+            want_mcp=wanted[2],
             base_dir=base_dir,
             home=home,
             on_warning=on_warning,
         )
         if plugin.root in by_root:
-            # The same plugin reached twice — a name and its equivalent
-            # path. First wins, matching ``resolve_skills``.
+            # The same plugin reached twice — a name and its equivalent path,
+            # or two spellings of one path. Identical switches are a harmless
+            # repeat; differing ones have no correct merge, and keeping the
+            # first silently would grant a component the second entry
+            # declined. ``_validate_plugin_entries`` refuses the same thing
+            # by name; this is the by-root half it cannot see.
+            if switches[plugin.root] != wanted:
+                raise PluginNotFoundError(
+                    f"Plugin entries {by_root[plugin.root].source!r} and "
+                    f"{entry.name!r} both resolve to {plugin.root}, but enable "
+                    f"different components. List the plugin once with the "
+                    f"components you want."
+                )
             continue
         seen = by_name.get(plugin.name)
         if seen is not None:
@@ -450,6 +543,7 @@ def resolve_plugins(
                 )
             skill_names[skill.name] = plugin
         by_root[plugin.root] = plugin
+        switches[plugin.root] = wanted
         by_name[plugin.name] = plugin
         resolved.append(plugin)
 
@@ -457,11 +551,9 @@ def resolve_plugins(
 
 
 __all__ = [
-    "INSTALLED_PLUGIN_GLOBS",
-    "PluginError",
-    "PluginManifestError",
-    "PluginNotFoundError",
+    "PluginEntry",
     "ResolvedPlugin",
+    "describe_dropped_components",
     "resolve_plugin",
     "resolve_plugins",
 ]

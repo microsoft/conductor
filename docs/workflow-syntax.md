@@ -1926,9 +1926,11 @@ all-or-nothing: on Copilot, hiding an MCP tool from the model does not
 stop its server from launching, so `mcp: false` would be a guarantee that
 isn't one. Registering the root also puts the two providers in opposition
 — plugin MCP is unavoidable on one and suppressed on the other.
-Deconstructed, a plugin's MCP servers also pick up the same `tools:`
-filters, `runtime.tool_output` limits, and dashboard tool events as a
-server the workflow declared itself.
+Deconstructed, a plugin's MCP servers also pick up the same
+`runtime.tool_output` limits, dashboard tool events, and credential and
+`${VAR}` resolution as a server the workflow declared itself. They are not
+`MCPServerDef`s, though, so there is no per-server `tools:` filter to
+author — `mcp: false` is the control you have.
 
 The carve-out: on `claude-agent-sdk`, the only way to reach a plugin's
 skills is to register the plugin root, which also contributes every
@@ -1957,8 +1959,7 @@ validate` prints it:
 Plugins: 2 enabled
   • prs — 3 skill(s), 7 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/prs
     agents: prs:code-reviewer, prs:code-simplifier, prs:comment-analyzer, ...
-  • ado — 0 skill(s), 1 agent(s), 1 MCP server(s) — /home/dev/.copilot/installed-plugins/team/ado
-    mcp: ado
+  • ado — 0 skill(s), 1 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/ado
     disabled by this workflow: mcp
 ```
 

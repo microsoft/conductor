@@ -150,7 +150,11 @@ class TestComponentsReachTheProvider:
             provider, workflow_dir=tmp_path, workflow_plugins=[PluginDef(name="./p")]
         )
         _run(executor, _agent())
+        # Both halves: the body is not injected AND the directory arrived.
+        # The negative alone cannot tell a working native path from one that
+        # dropped the skill entirely.
         assert "<skills>" not in provider.rendered_prompt
+        assert provider.skill_directories == [str(tmp_path / "p" / "skills" / "s")]
 
     def test_nothing_is_forwarded_without_plugins(self, tmp_path: Path) -> None:
         provider = _CapturingProvider()
@@ -301,6 +305,9 @@ class TestReviewFollowUps:
             workflow_plugins=[PluginDef(name="./p", skills=False, agents=False)],
         )
         _run(executor, _agent())
+        # Not merely "does not raise" — both disabled components must be absent.
+        assert executor.provider.custom_agents is None  # type: ignore[attr-defined]
+        assert executor.provider.skill_directories is None  # type: ignore[attr-defined]
 
     def test_a_component_registering_provider_honours_the_same_config(self, tmp_path: Path) -> None:
         # The identical config must work on a provider that registers each
@@ -336,3 +343,52 @@ class TestReviewFollowUps:
         ):
             _run(executor, _agent())
         assert any("shadowed by the declared skill" in message for message in seen)
+
+
+class TestCacheKeyDistinguishesComponentSwitches:
+    """Two agents naming one plugin with different switches must not share a cache entry."""
+
+    def test_per_agent_switches_are_not_cached_together(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", agents=["helper"], mcp={"srv": {"command": "npx"}})
+        provider = _CapturingProvider()
+        executor = AgentExecutor(provider, workflow_dir=tmp_path)
+
+        _run(executor, _agent(plugins=[PluginDef(name="./p")]))
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+        # An over-grant would be the failure here: agent B opted out.
+        _run(executor, _agent(plugins=[PluginDef(name="./p", mcp=False)]))
+        assert provider.extra_mcp_servers is None
+
+
+class TestNamedPluginBeatsAmbientDiscovery:
+    """A plugin the author named outranks a skill that merely happened to be installed."""
+
+    def test_discovered_skill_does_not_shadow_a_plugin_skill(self, tmp_path: Path) -> None:
+        from conductor.config.schema import SkillDiscoveryConfig
+
+        make_plugin(tmp_path / "p", "p", skills=["shared"])
+        home = tmp_path / "home"
+        ambient = home / ".copilot" / "skills" / "shared"
+        ambient.mkdir(parents=True)
+        (ambient / "SKILL.md").write_text("---\nname: shared\ndescription: d\n---\nBody\n")
+
+        provider = _CapturingProvider()
+        seen: list[str] = []
+        executor = AgentExecutor(
+            provider,
+            workflow_dir=tmp_path,
+            workflow_plugins=[PluginDef(name="./p")],
+            skill_discovery=SkillDiscoveryConfig(sources=["personal"]),
+        )
+        with (
+            patch("pathlib.Path.home", return_value=home),
+            patch(
+                "conductor.executor.agent._verbose_log",
+                side_effect=lambda m, **k: seen.append(m),
+            ),
+        ):
+            _run(executor, _agent())
+
+        assert provider.skill_directories == [str(tmp_path / "p" / "skills" / "shared")]
+        assert any("superseded by the copy from plugin" in message for message in seen)

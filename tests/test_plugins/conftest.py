@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from conductor.providers.capabilities import ProviderCapabilities
+
 SKILL_FRONTMATTER = "---\nname: {name}\ndescription: A test skill.\n---\n\nBody.\n"
 
 AGENT_DEFINITION = "---\nname: {name}\ndescription: {description}\n{extra}---\n\n{prompt}\n"
@@ -121,3 +123,22 @@ def installed(home: Path):
         )
 
     return _install
+
+
+PLUGIN_CAPABLE_CAPS = ProviderCapabilities(
+    tier="stable",
+    mcp_tools=True,
+    workflow_tools_passthrough=True,
+    streaming_events=True,
+    agent_reasoning_events=True,
+    reasoning_effort=None,
+    structured_output="native",
+    interrupt=True,
+    max_session_seconds=True,
+    checkpoint_resume=True,
+    usage_tracking=True,
+    concurrent_safe=True,
+    skills=True,
+    plugins=True,
+)
+"""Descriptor for a fake provider that honours the whole plugin contract."""

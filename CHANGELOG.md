@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP tool from the model does **not** stop its server subprocess launching
   with the user's credentials — so `mcp: false` built that way would be a
   guarantee that isn't one. Deconstructed, a plugin's MCP servers also pick
-  up the same `tools:` filters, `runtime.tool_output` limits, and dashboard
-  tool events as a workflow-declared server. Supported on `copilot` and
+  up the same `runtime.tool_output` limits, dashboard tool events, and
+  credential/`${VAR}` resolution as a workflow-declared server. Supported on `copilot` and
   `claude-agent-sdk`; `claude`, `hermes` and `aca` reject `plugins:` at
   validation time, since injecting text into a prompt cannot produce a
   subagent or an MCP server. `conductor validate` prints what each plugin

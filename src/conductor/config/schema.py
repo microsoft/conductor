@@ -793,10 +793,26 @@ class PluginDef(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        """Reject an empty or whitespace-only entry."""
-        if not v.strip():
+        """Reject an empty entry, or a name carrying glob metacharacters.
+
+        A bare name is interpolated into the installed-plugin glob, so
+        ``plugins: ["*"]`` would match every installed plugin and report
+        itself as *ambiguous across 13 plugins* rather than as the
+        nonsense it is. Path entries are left alone — a glob character is
+        legal in a directory name.
+        """
+        stripped = v.strip()
+        if not stripped:
             raise ValueError("plugins entries must be non-empty strings")
-        return v.strip()
+        from conductor.skills import is_path_entry
+
+        if not is_path_entry(stripped) and any(char in stripped for char in "*?[]"):
+            raise ValueError(
+                f"plugins entry {stripped!r} contains a glob metacharacter. An entry is "
+                "either an installed plugin name or a path (starting with '.' or '~', "
+                "or containing a separator)."
+            )
+        return stripped
 
 
 def _coerce_plugin_entries(value: Any) -> Any:
@@ -1460,7 +1476,7 @@ class AgentDef(BaseModel):
         agents:
           - name: reviewer
             plugins:
-              - prs                           # skills + 7 subagents
+              - prs                           # everything the plugin ships
               - name: ado
                 mcp: false                    # skills and agents only
             prompt: "Review this pull request..."

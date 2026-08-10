@@ -89,13 +89,16 @@ def _report_plugins(
     time.
 
     Reports the workflow-level set only. Per-agent ``plugins:`` overrides
-    are resolved and reported by the validator, which knows each agent's
+    are resolved and *checked* by the validator, which knows each agent's
     provider; repeating them here without that context would list
     components a given agent never receives.
 
-    Never fatal — every resolution failure has already been reported as a
-    validation error by the time this runs, and turning a summary into a
-    second source of errors would be worse than an incomplete summary.
+    Never fatal, but not because the failure was already reported: the
+    validator resolves plugins per agent, so a workflow whose agents all
+    override ``plugins:`` (including with ``[]``) never resolves the
+    workflow-level list at all, and a failure surfaces here first. A
+    summary is still the wrong place to fail a workflow that is otherwise
+    valid — nothing inherits the list — so it degrades to a warning.
 
     Args:
         config: The validated workflow configuration.
@@ -107,11 +110,17 @@ def _report_plugins(
     if not entries:
         return
 
+    from conductor.plugins.errors import PluginError
     from conductor.plugins.registry import resolve_plugins
+    from conductor.skills import SkillError
 
     try:
         resolved = resolve_plugins(entries, base_dir=workflow_path.resolve().parent)
-    except Exception as exc:  # pragma: no cover - defensive; a report must not crash
+    except (PluginError, SkillError, OSError) as exc:
+        # Narrow: a genuine bug in the plugin layer (AttributeError, KeyError)
+        # should surface as a crash, not as a soft yellow line the reader
+        # scrolls past. This arm is reachable through ordinary configuration
+        # — see the docstring — so it is not merely defensive.
         console.print(f"  [yellow]⚠[/yellow] Plugins could not be summarized: {exc}")
         return
 

@@ -16,7 +16,7 @@ from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
 from conductor.plugins.errors import PluginError
-from conductor.plugins.registry import resolve_plugins
+from conductor.plugins.registry import describe_dropped_components, resolve_plugins
 from conductor.providers.capabilities import (
     ProviderCapabilities,
     get_capabilities,
@@ -1911,19 +1911,26 @@ def _validate_provider_capabilities(
                         f"well, drop 'agents: false', or run this agent on 'copilot'."
                     )
 
-        relative = [
-            entry.name
-            for entry in entries
-            if is_path_entry(entry.name) and not Path(entry.name).expanduser().is_absolute()
-        ]
-        if skill_base_dir is None and relative:
-            warnings.append(
-                f"Agent '{agent.name}': relative plugin path(s) {sorted(relative)!r} "
-                "were not checked because no workflow file path was supplied, so "
-                "there is no base directory to resolve them against. They are still "
-                "resolved at run time."
-            )
-            return
+        if skill_base_dir is None:
+            relative = [
+                entry.name
+                for entry in entries
+                if is_path_entry(entry.name) and not Path(entry.name).expanduser().is_absolute()
+            ]
+            if relative:
+                warnings.append(
+                    f"Agent '{agent.name}': relative plugin path(s) {sorted(relative)!r} "
+                    "were not checked because no workflow file path was supplied, so "
+                    "there is no base directory to resolve them against. They are still "
+                    "resolved at run time."
+                )
+                # Drop only the entries that cannot be resolved and check the
+                # rest. Returning here let one un-anchorable relative path
+                # silence the MCP-clash and dropped-component checks for every
+                # other plugin the agent named.
+                entries = [entry for entry in entries if entry.name not in set(relative)]
+                if not entries:
+                    return
 
         key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
         if key not in plugin_cache:
@@ -1962,32 +1969,17 @@ def _validate_provider_capabilities(
         does in the CLI is exactly the silent divergence this feature exists
         to remove, so the difference is named before the run rather than
         discovered after it.
+
+        The phrasing is shared with ``AgentExecutor`` rather than duplicated,
+        so the two commands cannot describe one plugin two ways.
         """
-        if not plugin.dropped:
-            return
-        listed = " and ".join(f"{name}/" for name in plugin.dropped)
-        if (
-            "hooks" in plugin.dropped
-            and plugin.skills
-            and requires_plugin_root_for_skills(provider_name)
-        ):
-            # Registering the plugin root is the only way to reach its skills
-            # on this provider, and the root carries hooks with it. Saying
-            # "not loaded" here would be false.
-            warnings.append(
-                f"Agent '{agent.name}': plugin {plugin.source!r} ships {listed}, and "
-                f"provider 'claude-agent-sdk' registers the plugin root to reach its "
-                f"skills — so its hooks (arbitrary shell run on tool events) are "
-                f"exposed to the CLI. Set 'skills: false' on the plugin to avoid "
-                f"registering the root, or run this agent on 'copilot', which loads "
-                f"each component individually."
-            )
-            return
-        warnings.append(
-            f"Agent '{agent.name}': plugin {plugin.source!r} ships {listed}, which "
-            f"Conductor does not load. The plugin behaves differently here than it "
-            f"does in the CLI."
+        message = describe_dropped_components(
+            plugin,
+            root_is_registered=bool(plugin.skills)
+            and bool(requires_plugin_root_for_skills(provider_name)),
         )
+        if message is not None:
+            warnings.append(f"Agent '{agent.name}': {message}")
 
     def _check_claude_agent_sdk_skill(agent: AgentDef, item: ResolvedSkill) -> None:
         """Check one resolved skill against ``claude-agent-sdk``'s plugin-only surface.

@@ -439,12 +439,11 @@ def resolve_skills(
 
 
 # What counts as a plugin root, and what its parts are called, is defined
-# once in :mod:`conductor.plugins.manifest` and imported here. Keeping a
-# second copy is what stranded Copilot-convention plugins: this module
-# used to hardcode ``.claude-plugin/plugin.json``, so a skill inside a
-# plugin using ``.github/plugin/plugin.json`` had no reachable plugin
-# root and claude-agent-sdk refused it — 12 of 13 plugins on an ordinary
-# machine.
+# once in :mod:`conductor.plugins.manifest` and imported here. A second
+# copy would strand Copilot-convention plugins: recognising only
+# ``.claude-plugin/plugin.json`` leaves a skill inside a plugin that uses
+# ``.github/plugin/plugin.json`` with no reachable plugin root, and
+# claude-agent-sdk refuses it — 12 of 13 plugins on an ordinary machine.
 _PLUGIN_SKILLS_DIR: str = PLUGIN_SKILLS_DIR
 
 # How far above a skill directory to look for the plugin manifest. The

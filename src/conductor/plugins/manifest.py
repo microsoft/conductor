@@ -9,9 +9,8 @@ Two conventions are recognised. Claude Code writes
 ``.claude-plugin/plugin.json``; the Copilot CLI writes
 ``.github/plugin/plugin.json``. Both resolve at runtime — verified
 against a live Copilot session with a synthetic plugin under each — so
-recognising only the former was Conductor's own gap, not an upstream
-one. On a fairly ordinary machine it stranded 12 of 13 installed
-plugins.
+recognising only the former is Conductor's own gap, not an upstream one.
+On a fairly ordinary machine that strands 12 of 13 installed plugins.
 
 Kept free of any :mod:`conductor.skills` import so the edge from
 ``skills.registry`` into this module cannot become a cycle — see the
@@ -72,8 +71,15 @@ class PluginManifest:
     """
 
     root: Path
-    """Absolute path to the plugin root (the directory holding the
-    manifest's parent directory)."""
+    """Absolute path to the plugin root — the directory containing
+    ``.claude-plugin/`` or ``.github/``, i.e. the directory a ``plugins:``
+    entry points at.
+
+    Deliberately not phrased as "the manifest's parent's parent": that
+    holds for ``.claude-plugin/plugin.json`` and is off by one level for
+    ``.github/plugin/plugin.json``, which is the convention most installed
+    plugins use.
+    """
 
     path: Path
     """Absolute path to the manifest file itself, for use in messages."""
@@ -88,6 +94,31 @@ class PluginManifest:
     server to avoid a collision would break the instructions that make
     the plugin worth enabling.
     """
+
+    def __post_init__(self) -> None:
+        """Enforce the invariants the field docstrings above assert.
+
+        Same reasoning as :class:`~conductor.skills.registry.SkillPlugin`:
+        ``name`` becomes the namespace half of a ``<plugin>:<skill>``
+        identifier that is joined into a delimiter-separated CLI argument,
+        so a name the producer failed to reject must not reach an SDK.
+        Documented-only invariants are the ones that quietly stop holding.
+
+        Deliberately no ``is_dir()`` probe — filesystem state checked in a
+        constructor is a TOCTOU illusion, and establishing it is the
+        producer's job.
+
+        Raises:
+            PluginManifestError: If ``name`` contains characters outside
+                :data:`SAFE_NAME`, or ``root`` is not absolute.
+        """
+        if not SAFE_NAME.match(self.name):
+            raise PluginManifestError(
+                f"PluginManifest.name must match {SAFE_NAME.pattern} (it is joined "
+                f"into a delimited identifier), got {self.name!r}"
+            )
+        if not self.root.is_absolute():
+            raise PluginManifestError(f"PluginManifest.root must be absolute, got {self.root!s}")
 
 
 def find_manifest(root: Path) -> Path | None:

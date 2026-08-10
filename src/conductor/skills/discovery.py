@@ -35,7 +35,7 @@ discovery unusable.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -67,10 +67,10 @@ There is deliberately no ``plugins`` source. Scanning a plugin's
 ``skills/`` reaches into a plugin and takes exactly one of the three
 things it ships, leaving its subagents and MCP servers behind — that is
 not a feature with a gap but the bug ``plugins:`` exists to fix (issue
-#378). It was also wrong more often than it looked: of 13 plugins on one
-ordinary machine, 3 were silently degraded and the 3 most plugin-like
-(MCP and subagent toolkits with no ``skills/`` at all) were never
-discovered by it. Name plugins in ``runtime.plugins`` instead, which
+#378). Scanning them is also wrong more often than it looks: of 13
+plugins on one ordinary machine, 3 would be silently degraded and the 3
+most plugin-like (MCP and subagent toolkits with no ``skills/`` at all)
+would never be discovered at all. Name plugins in ``runtime.plugins`` instead, which
 brings the whole unit and reproduces on another machine.
 """
 
@@ -175,17 +175,6 @@ def _has_repo_marker(directory: Path, on_warning: WarningSink | None = None) -> 
             "repository root may have been missed.",
         )
         return False
-
-
-def _unique(paths: Iterable[Path]) -> list[Path]:
-    """Deduplicate paths preserving order."""
-    seen: set[Path] = set()
-    out: list[Path] = []
-    for path in paths:
-        if path not in seen:
-            seen.add(path)
-            out.append(path)
-    return out
 
 
 def _roots_for_source(
