@@ -255,6 +255,10 @@ class AcaRuntimeProvider(AgentProvider):
         # `False` and let `conductor validate` reject `skills:` on an
         # `aca`-backed agent rather than silently dropping it.
         skills=False,
+        # No plugin surface for the same reason: subagent definitions and
+        # MCP declarations live in host-filesystem directories the
+        # in-sandbox runner cannot read.
+        plugins=False,
         upstream_pin="azure-identity>=1.19.0",
         maintainer=None,
     )
@@ -694,7 +698,10 @@ class AcaRuntimeProvider(AgentProvider):
         reasoning_effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
         working_dir = agent.sandbox.working_dir if agent.sandbox is not None else None
         output_schema = (
-            {name: field.model_dump(exclude_none=True) for name, field in agent.output.items()}
+            {
+                name: field.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+                for name, field in agent.output.items()
+            }
             if agent.output
             else None
         )
@@ -1008,6 +1015,8 @@ class AcaRuntimeProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Delegate execution to the in-sandbox runner over Branch S streaming.
 
@@ -1021,8 +1030,13 @@ class AcaRuntimeProvider(AgentProvider):
         `AgentProvider.execute` and ignored — the paths are host-side and
         unreadable from the sandbox, so `CAPABILITIES.skills` is `False`
         and `conductor validate` rejects `skills:` before this point.
+        `custom_agents` and `extra_mcp_servers` are ignored for the same
+        reason: a plugin's subagent definitions and MCP declarations are
+        host paths too, so `CAPABILITIES.plugins` is `False` and
+        `plugins:` is rejected before this point.
         """
         del skill_directories  # Host paths are meaningless in-sandbox (see docstring).
+        del custom_agents, extra_mcp_servers  # Same: host-side plugin content.
         logical_id = self.identifier_for(agent, context)
         # Reserve the wire identifier for the full lifetime of this request
         # (acquired before the request starts, released once it finishes —

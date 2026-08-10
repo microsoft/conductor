@@ -476,6 +476,7 @@ dependencies = [
     { name = "packaging" },
     { name = "pydantic" },
     { name = "pydantic-ai" },
+    { name = "regex" },
     { name = "rich" },
     { name = "ruamel-yaml" },
     { name = "simpleeval" },
@@ -516,6 +517,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=21.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-ai", specifier = ">=1.44.0" },
+    { name = "regex", specifier = ">=2024.11.6" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruamel-yaml", specifier = ">=0.18.0" },
     { name = "simpleeval", specifier = ">=1.0.0" },
@@ -2460,8 +2462,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography" },
-    { name = "jeepney" },
+    { name = "cryptography", marker = "sys_platform != 'win32'" },
+    { name = "jeepney", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [

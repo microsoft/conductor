@@ -480,6 +480,38 @@ class TestSetOutputSchemaValidation:
         # set_failed must be emitted on the validate_output failure path too.
         assert any(ev.type == "set_failed" for ev in received)
 
+    @pytest.mark.asyncio
+    async def test_set_step_extra_keys_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A set step that produces extra keys beyond its ``output:`` schema must
+        not emit an undeclared-fields warning."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="set-extra-keys",
+                entry_point="bind",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="bind",
+                    type="set",
+                    values={
+                        "ok": "{{ true }}",
+                        "extra": "{{ 42 }}",
+                    },
+                    output={"ok": OutputField(type="boolean")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"ok": "{{ bind.output.ok }}"},
+        )
+
+        with caplog.at_level("WARNING"):
+            await _make_engine(config).run({})
+
+        assert "undeclared fields" not in caplog.text
+
 
 class TestSetEvents:
     """The engine emits set_started / set_completed / set_failed."""

@@ -42,9 +42,11 @@ app = typer.Typer(
 # Register subcommand groups
 from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
 from conductor.cli.gate import gate_app  # noqa: E402
+from conductor.cli.plugin import plugin_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
 
 app.add_typer(registry_app, rich_help_panel="Environment")
+app.add_typer(plugin_app, rich_help_panel="Environment")
 app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 

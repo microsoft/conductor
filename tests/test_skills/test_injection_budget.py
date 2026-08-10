@@ -45,6 +45,8 @@ class _EagerProvider(AgentProvider, abstract=True):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         return AgentOutput(content={"ok": True}, raw_response="")
 

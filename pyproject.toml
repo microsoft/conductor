@@ -46,6 +46,9 @@ dependencies = [
     "websockets>=12.0",
     "httpx>=0.27.0",
     "packaging>=21.0",
+    # Timeout-bounded regex matching for output field constraints and provider
+    # response normalization. Ships typed stubs and supports per-match deadlines.
+    "regex>=2024.11.6",
 ]
 
 [project.optional-dependencies]

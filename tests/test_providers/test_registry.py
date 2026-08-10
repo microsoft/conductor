@@ -32,6 +32,8 @@ class MockProvider(AgentProvider, abstract=True):
         interrupt_signal: asyncio.Event | None = None,
         event_callback=None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         return AgentOutput(content={"result": "mock"}, raw_response="mock")
 
