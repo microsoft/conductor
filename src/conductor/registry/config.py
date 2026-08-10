@@ -175,7 +175,7 @@ def _format_toml(config: RegistriesConfig) -> str:
 
     for name, entry in config.registries.items():
         lines.append("")
-        lines.append(f"[registries.{name}]")
+        lines.append(f'[registries."{_toml_escape(name)}"]')
         lines.append(f'type = "{_toml_escape(entry.type)}"')
         lines.append(f'source = "{_toml_escape(entry.source)}"')
 
@@ -244,6 +244,15 @@ def add_registry(
 # directories and break adhoc/auto-fetch detection.
 _RESERVED_REGISTRY_NAMES = frozenset({"_adhoc", "_meta"})
 
+# A registry name is both a TOML table key and an on-disk cache directory name,
+# so it is restricted to characters that are safe in both. The table key is also
+# quoted when written, which is what makes '.' safe here: unquoted,
+# ``[registries.my.team]`` declares a nested table rather than a registry named
+# "my.team". Excluded characters include '"', ':', '*' and '?', which are illegal
+# in Windows filenames, and the TOML metacharacters (space, '=', '#') that would
+# corrupt the header.
+_REGISTRY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
 
 def _validate_registry_name(name: str) -> None:
     """Reject registry names that would conflict with cache namespaces.
@@ -270,6 +279,23 @@ def _validate_registry_name(name: str) -> None:
                 "Use a simple identifier without path separators. "
                 "For ad-hoc references to a GitHub repo, use the "
                 "'workflow@owner/repo[#ref]' syntax in the workflow ref instead."
+            ),
+        )
+    if not _REGISTRY_NAME_RE.match(name):
+        # Quoting the table key (see _dump_config) fixes TOML validity, but the
+        # name is also a cache directory name, so the charset is restricted too.
+        # Without this, `conductor registry add 'has"quote'` reported success and
+        # wrote a file that then failed to parse — and because add_registry,
+        # remove_registry and get_registry all load the config first, the user
+        # could not remove the entry that broke it, and every unrelated registry
+        # went down with it. '"', ':', '*' and '?' are also illegal in Windows
+        # filenames. This subsumes the '/' and '\\' cases above, which are kept
+        # for their more specific guidance.
+        raise RegistryError(
+            f"Registry name '{name}' may only contain letters, digits, '.', '_' and '-'",
+            suggestion=(
+                "Use a simple identifier such as 'team-a' or 'team_a'. "
+                "Other characters break the on-disk config and cache layout."
             ),
         )
     if name in _RESERVED_REGISTRY_NAMES:

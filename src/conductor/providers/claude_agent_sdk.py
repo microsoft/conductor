@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -782,11 +783,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             return False
 
-        import platform
         import shutil
         from pathlib import Path
 
-        is_windows = platform.system() == "Windows"
+        is_windows = sys.platform == "win32"
 
         # Bundled CLI takes precedence (matches the SDK's own resolution). The SDK names
         # the bundled binary per-platform — see _find_bundled_cli — so probing only
@@ -804,31 +804,32 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         if shutil.which("claude"):
             return True
-        # On Windows, PATH may hold npm's claude.cmd shim while the native claude.exe
-        # lives elsewhere; the SDK probes the .exe name explicitly for the same reason.
-        if is_windows and shutil.which("claude.exe"):
-            return True
 
         # SDK's hardcoded fallback locations — keep in sync with
         # claude_agent_sdk._internal.transport.subprocess_cli._find_cli.
         #
-        # The POSIX-shaped entries are deliberately NOT probed on Windows. A rooted but
-        # driveless path such as "/usr/local/bin/claude" resolves against the current
-        # drive (C:\usr\local\bin\claude) — a location any unprivileged local user can
-        # create — so probing it would let a planted file report the CLI as available.
-        # The SDK refuses these on Windows for exactly this reason.
-        fallbacks: tuple[Path, ...]
-        if is_windows:
-            fallbacks = (Path.home() / ".local/bin/claude.exe",)
-        else:
-            fallbacks = (
-                Path.home() / ".npm-global/bin/claude",
-                Path("/usr/local/bin/claude"),
-                Path.home() / ".local/bin/claude",
-                Path.home() / "node_modules/.bin/claude",
-                Path.home() / ".yarn/bin/claude",
-                Path.home() / ".claude/local/claude",
-            )
+        # Audited against claude-agent-sdk 0.2.87, the version uv.lock pins. That
+        # version has *no* platform branch in _find_cli: it probes all six of these
+        # on every OS, Windows included. So this narrows conductor's *report* only —
+        # the SDK will still spawn a planted binary even when this returns False.
+        # Later SDKs (>= 0.2.13x) refuse the driveless entry; this matches that
+        # behaviour ahead of the pin.
+        #
+        # Only "/usr/local/bin/claude" is driveless, so only it is dropped on
+        # Windows: a rooted but driveless path resolves against the current drive
+        # (C:\usr\local\bin\claude), which any unprivileged local user can create.
+        # The other five are Path.home()-anchored and carry no such risk — dropping
+        # those would report "no CLI" for a Windows user whose CLI sits at
+        # ~/.claude/local/claude, where Claude Code's own local installer puts it,
+        # and the SDK would find and run it.
+        fallbacks: tuple[Path, ...] = (
+            Path.home() / ".npm-global/bin/claude",
+            *(() if is_windows else (Path("/usr/local/bin/claude"),)),
+            Path.home() / ".local/bin/claude",
+            Path.home() / "node_modules/.bin/claude",
+            Path.home() / ".yarn/bin/claude",
+            Path.home() / ".claude/local/claude",
+        )
         for path in fallbacks:
             if path.exists() and path.is_file():
                 return True

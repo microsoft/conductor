@@ -344,3 +344,48 @@ class TestRegistriesConfigValidation:
     def test_none_default_always_valid(self) -> None:
         config = RegistriesConfig(default=None, registries={})
         assert config.default is None
+
+
+class TestRegistryNameCharset:
+    """The name is a TOML table key and a cache directory name.
+
+    Escaping the *values* left the key unescaped and the charset unchecked, so
+    ``conductor registry add 'has"quote'`` reported success and wrote a file that
+    then failed to parse. Because ``add_registry``, ``remove_registry`` and
+    ``get_registry`` all load the config first, the user could not remove the
+    entry that broke it, and every unrelated registry went down with it.
+    """
+
+    @pytest.mark.parametrize("name", ['has"quote', "with space", "a=b", "a#b"])
+    def test_toml_metacharacters_are_rejected(self, name: str) -> None:
+        from conductor.registry.config import _validate_registry_name
+
+        with pytest.raises(RegistryError):
+            _validate_registry_name(name)
+
+    @pytest.mark.parametrize("name", ["team-a", "team_a", "TeamA1", "my.team"])
+    def test_ordinary_names_are_accepted(self, name: str) -> None:
+        from conductor.registry.config import _validate_registry_name
+
+        _validate_registry_name(name)
+
+    def test_a_dotted_name_round_trips_as_one_key(self) -> None:
+        """Unquoted, ``[registries.my.team]`` declares a *nested table*.
+
+        The entry then silently vanishes on load rather than failing loudly,
+        which is why quoting the key is needed as well as the charset check.
+        """
+        import tomllib
+
+        from conductor.registry.config import (
+            RegistriesConfig,
+            RegistryEntry,
+            _format_toml,
+        )
+
+        cfg = RegistriesConfig(
+            default="my.team",
+            registries={"my.team": RegistryEntry(type="github", source="o/r")},
+        )
+        parsed = tomllib.loads(_format_toml(cfg))
+        assert list(parsed["registries"]) == ["my.team"]

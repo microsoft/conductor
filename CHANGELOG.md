@@ -35,6 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Registry names are validated before they can corrupt the config** — a name
+  containing a quote, a space, `=` or `#` was accepted, written into
+  `registries.toml` as an unescaped table key, and then failed to parse. Since
+  `registry add`, `remove` and `get` all load the config first, the user could
+  not remove the entry that broke it and every unrelated registry went down
+  with it. Names are now restricted to letters, digits, `.`, `_` and `-`, which
+  also keeps them legal as cache directory names on Windows, and the table key
+  is quoted so a dotted name stays one registry instead of becoming a nested
+  table.
+- **`conductor doctor` no longer reports a missing Claude CLI on Windows** —
+  the CLI probe dropped five `~`-anchored fallback locations on Windows,
+  including `~/.claude/local/claude` where Claude Code's own installer puts it,
+  so `validate_connection()` returned False for a CLI the SDK would find and
+  run. Only `/usr/local/bin/claude` is now skipped there: it is rooted but
+  driveless, so it resolves against the current drive, which any unprivileged
+  local user can write to.
+- **Registry TOML values are escaped** — a registry whose source or type
+  contained a quote or a backslash produced a file that could not be re-read.
 - **`conductor resume --web` no longer shows a running workflow as stopped** —
   a workflow that was paused from the dashboard (Stop, then Kill) recorded an
   `agent_paused` event in its event log with no `agent_resumed` counterpart.
