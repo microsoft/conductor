@@ -22,7 +22,10 @@ from pydantic_ai.output import ToolOutput
 from pydantic_ai.providers.anthropic import AnthropicProvider
 
 from conductor.exceptions import ValidationError
-from conductor.providers._pydantic_ai.converters import output_schema_to_pydantic_model
+from conductor.providers._pydantic_ai.converters import (
+    _sanitize_json_schema,
+    output_schema_to_pydantic_model,
+)
 from conductor.providers.reasoning import (
     ReasoningEffort,
     effort_to_budget_tokens,
@@ -375,4 +378,11 @@ def build_agent(
         toolsets=toolsets or [],
         tools=tools or [],
     )
+
+    if isinstance(pydantic_agent.output_type, ToolOutput):
+        toolset = pydantic_agent._output_schema.toolset
+        if toolset is not None:
+            for tool_def in toolset._tool_defs:
+                _sanitize_json_schema(tool_def.parameters_json_schema)
+
     return pydantic_agent

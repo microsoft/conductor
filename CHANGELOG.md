@@ -9,6 +9,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Git-backed plugin sources** (#380). `runtime.plugins` alone resolves
+  against machine state — an installed plugin name, or a path — so a workflow
+  shared with a teammate still needed "first install these plugins" in a
+  README, and a teammate who skipped that step got a hard error rather than a
+  working run. `runtime.plugin_sources` maps a marketplace name to where it
+  comes from (`owner/repo#v1.4.0`, any http/https/ssh or `git@host:path`
+  remote, or a local path), and `plugins:` entries reference it as
+  `prs@acme`. The split follows the Copilot CLI's own settings, which
+  separate `extraKnownMarketplaces` from `enabledPlugins` — eleven plugins
+  commonly come from one repository, so inlining a URL per entry would either
+  clone it eleven times or silently pick one of eleven refs. The load-bearing
+  property is that `prs@acme` means the same thing whether the marketplace
+  was declared, installed via a CLI, or is a local directory: a declared
+  source registers its name into the same resolution table the installed
+  roots populate, so git *feeds* resolution rather than adding a second code
+  path. It also gives the ambiguity error added in #378 a second remedy —
+  qualify `git` as `git@acme` instead of falling back to a path. Both
+  repository shapes are handled: a `marketplace.json` catalog or a
+  `plugin.json` single plugin, with a `plugin:` key for a repository that is
+  both. There is **no lockfile** — the YAML is the lock. A ref that is a full
+  40-character SHA is pinned and fetched once; a tag, branch, or absent ref
+  floats and is re-resolved every run, matching how workflow registries
+  already behave. `conductor run` acquires sources up front and in parallel;
+  `conductor plugin fetch` primes the cache as its own step, which is what
+  keeps `conductor validate` off the network entirely; `conductor plugin
+  list` reports what a run would load, including the component counts that
+  make a change in what a plugin ships visible. An unreachable remote with a
+  warm cache warns and reuses the checkout, so offline runs keep working.
+  Checkouts are cached under `$CONDUCTOR_HOME/cache/plugins/`, keyed by
+  resolved commit. Cloning shells out to `git`, so existing SSH keys and
+  credential helpers apply and self-hosted forges work.
+
+  Sources are resolved one at a time, so a source that is unfetched or
+  broken costs its own diagnostic rather than the report for every healthy
+  source beside it. The two are distinguished: an *unfetched* source is a
+  warning naming `conductor plugin fetch`, since `conductor run` heals it,
+  while a source that is itself wrong — a path that does not exist, a
+  `path:` that escapes the checkout, an unparseable catalog — is an error,
+  because no amount of fetching fixes it. A declared source that shadows a
+  same-named installed marketplace is reported, since the two can ship
+  different subagents or a different MCP server. See
+  `examples/plugin-sources.yaml` and the Plugins section of
+  `docs/workflow-syntax.md`.
+- **Output field constraints — `enum`, `pattern`, `minimum`/`maximum`,
+  `minLength`/`maxLength`, `required`, `nullable`**
+  ([#372](https://github.com/microsoft/conductor/pull/372)). An `output:` field
+  could declare a type and nothing more, so "verdict is one of three values" or
+  "score is 0-100" lived in the prompt, where it was a suggestion rather than a
+  contract. The eight new keywords are emitted into the schema each provider
+  shows its model and enforced when the response comes back, and because a
+  violation raises the same `ValidationError` a type mismatch does, it lands
+  inside the existing in-session recovery loop — the model gets a chance to
+  correct itself before the workflow fails. Constraints are checked recursively,
+  so they hold inside object properties and array items too.
+
+  Illegal combinations are rejected at load time rather than at run time:
+  `pattern` on a number, an `enum` whose members do not match the declared type,
+  `minLength` above `maxLength`, a regex that does not compile. Unknown keys are
+  rejected as well, so a misspelled `minlength` fails validation instead of
+  quietly leaving the field unconstrained. `required: false` is allowed only
+  inside object properties — a root-level output field cannot be optional.
+
+  Two things worth knowing when using them. `pattern` runs under a one-second
+  deadline on a `re`-compatible engine, because model output is untrusted input
+  and a backtracking pattern would otherwise stall the event loop and every
+  agent sharing it; an exceeded deadline is a validation failure, not a hang.
+  And templates render with `StrictUndefined`, so a `nullable` field that came
+  back null renders as `None` and an omitted optional property raises — guard
+  both with `is not none` / `is defined`, as
+  [`examples/output-constraints.yaml`](examples/output-constraints.yaml) shows.
+  See [`docs/workflow-syntax.md`](docs/workflow-syntax.md) (Field Constraints).
+
+- **Plugins as the unit of opt-in** (#378). Conductor loaded a plugin's
+  `skills/` and dropped everything else it shipped. That is a problem because
+  a plugin's parts are written to work together: its `SKILL.md` routinely
+  tells the agent to hand work to `prs:code-reviewer`, or to call an `ado` MCP
+  tool. The skill loaded, the agent read those instructions, reached for a
+  subagent that was never registered — and said nothing. `runtime.plugins`
+  (and per-agent `plugins:`) now opts into the whole unit: skills,
+  `agents/*.agent.md` subagents, and declared MCP servers. Entries take a
+  string shorthand or an object with per-component switches (`skills`,
+  `agents`, `mcp`), all defaulting on, because defaulting one off would
+  recreate the partial load the feature exists to fix. An entry is an
+  installed plugin name or a path, classified by the same syntactic rule
+  `skills:` uses; an uninstalled name errors naming where it looked, and an
+  ambiguous one errors rather than picking a winner. Conductor
+  **deconstructs** a plugin rather than handing its root to the SDK: both
+  SDKs' whole-plugin surfaces are all-or-nothing, and on Copilot hiding an
+  MCP tool from the model does **not** stop its server subprocess launching
+  with the user's credentials — so `mcp: false` built that way would be a
+  guarantee that isn't one. Deconstructed, a plugin's MCP servers also pick
+  up the same `runtime.tool_output` limits, dashboard tool events, and
+  credential/`${VAR}` resolution as a workflow-declared server. Supported on `copilot` and
+  `claude-agent-sdk`; `claude`, `hermes` and `aca` reject `plugins:` at
+  validation time, since injecting text into a prompt cannot produce a
+  subagent or an MCP server. `conductor validate` prints what each plugin
+  contributes, including every subagent by name, so a change in what a plugin
+  ships is visible before the run rather than during it. See
+  `examples/plugins.yaml` and the Plugins section of `docs/workflow-syntax.md`.
+
+- **Copilot-convention plugin manifests are recognised** (#378).
+  `.github/plugin/plugin.json` now resolves alongside
+  `.claude-plugin/plugin.json`. Both have always worked at runtime, so
+  recognising only the latter was Conductor's own gap — on an ordinary
+  machine it stranded 12 of 13 installed plugins, which on
+  `claude-agent-sdk` meant a packaged skill was rejected outright and on
+  `copilot` meant it was silently demoted to a bare directory.
+
 - **`type: questions` — ask a human a set of questions in one step** (#376).
   `human_gate` handles a single decision; asking N questions previously meant
   hand-rolling a gate that loops back through a `set` step accumulating a
@@ -32,6 +140,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.` or EOF; the dashboard renders a textarea where Enter inserts a newline
   and Ctrl/Cmd+Enter submits. Previously a multi-paragraph answer to a
   `prompt_for` input was silently truncated at the first newline.
+
+### Removed
+
+- **`skill_discovery.sources: [plugins]`** (#378). The source scanned every
+  installed plugin's `skills/` directory — reaching into a plugin and taking
+  exactly one of the three things it ships, which is the bug `runtime.plugins`
+  fixes rather than a feature with a gap. It was also wrong more often than it
+  looked: of 13 plugins on an ordinary machine, 3 loaded their instructions
+  without the subagents those instructions dispatch to, and the 3 most
+  plugin-like — MCP and subagent toolkits with no `skills/` at all — were never
+  discovered by it. Nothing distinguished the working set from the broken set
+  at authoring time, on a machine the workflow author may not even be using.
+  `personal` and `project` are unchanged. Replace `sources: [plugins]` with
+  `runtime.plugins`, which brings the whole plugin and, unlike a scan,
+  reproduces on another machine.
 
 ### Fixed
 

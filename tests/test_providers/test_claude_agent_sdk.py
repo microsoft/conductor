@@ -12,6 +12,7 @@ import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -2324,6 +2325,8 @@ class TestSkillsWiring:
     async def _capture_options(
         agent: AgentDef,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
         tools: list[str] | None = None,
     ):
         captured: dict = {}

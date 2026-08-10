@@ -200,6 +200,13 @@ async def test_schema_changes_dont_affect_copilot_provider():
         # Skill discovery is off by default (issue #362): ambient skills
         # would make the same YAML behave differently per machine.
         "skill_discovery": {"sources": (), "exclude": ()},
+        # Plugins are off by default (issue #378): a plugin can launch MCP
+        # subprocesses with the user's credentials, so it loads only when
+        # a workflow names it.
+        "plugins": [],
+        # No git-backed plugin sources declared (issue #380). Without any,
+        # plugin entries resolve against machine state exactly as before.
+        "plugin_sources": {},
     }
 
     # Verify provider can be instantiated
