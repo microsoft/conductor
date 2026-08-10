@@ -229,6 +229,7 @@ def _resolve_marketplace_entry(
     home: Path,
     marketplaces: Mapping[str, Marketplace] | None,
     declared: Collection[str] | None = None,
+    on_warning: WarningSink | None = None,
 ) -> Path:
     """Resolve a ``plugin@marketplace`` entry to one plugin root.
 
@@ -249,6 +250,12 @@ def _resolve_marketplace_entry(
             from "you declared it and it is not on disk yet" — two
             different mistakes with two different remedies, which one
             message cannot cover.
+        on_warning: Sink for the shadowing notice. A declared source
+            silently replacing an installed marketplace of the same name
+            is exactly the invisible divergence this feature exists to
+            remove: the two may ship different subagents or a different
+            MCP server, and the agent's capabilities would change with
+            nothing said.
 
     Raises:
         PluginNotFoundError: If the marketplace is neither declared nor
@@ -257,6 +264,12 @@ def _resolve_marketplace_entry(
     """
     resolved = (marketplaces or {}).get(marketplace)
     if resolved is not None:
+        if on_warning is not None and _installed_marketplace_root(marketplace, plugin, home):
+            on_warning(
+                f"marketplace {marketplace!r} is declared in 'runtime.plugin_sources' "
+                f"and is also installed on this machine; the declared source "
+                f"({resolved.root}) wins. Remove the source to use the installed one."
+            )
         return resolved.resolve(plugin)
 
     root = _installed_marketplace_root(marketplace, plugin, home)
@@ -435,6 +448,7 @@ def _resolve_entry_root(
     home: Path,
     marketplaces: Mapping[str, Marketplace] | None,
     declared_sources: Collection[str] | None = None,
+    on_warning: WarningSink | None = None,
 ) -> Path:
     """Classify a ``plugins:`` entry and resolve it to a plugin root.
 
@@ -455,7 +469,7 @@ def _resolve_entry_root(
     plugin, marketplace = _split_marketplace_entry(entry)
     if marketplace is not None:
         return _resolve_marketplace_entry(
-            entry, plugin, marketplace, home, marketplaces, declared_sources
+            entry, plugin, marketplace, home, marketplaces, declared_sources, on_warning
         )
     return _resolve_name_entry(entry, home)
 
@@ -526,6 +540,7 @@ def resolve_plugin(
         home=home,
         marketplaces=marketplaces,
         declared_sources=declared_sources,
+        on_warning=on_warning,
     )
     manifest = read_plugin_manifest(root)
 

@@ -1891,7 +1891,12 @@ class WorkflowEngine:
             ExecutionError: If a declared source cannot be resolved.
         """
         declared = self.config.workflow.runtime.plugin_sources
-        if not declared or self._plugin_marketplaces:
+        # Tested by coverage rather than emptiness: a sub-workflow inherits
+        # a non-empty table from its parent, and asking whether the table is
+        # empty would then skip the child's own declarations. Every declared
+        # name being present is the condition that actually means "already
+        # resolved".
+        if not declared or declared.keys() <= self._plugin_marketplaces.keys():
             return
 
         from conductor.plugins.errors import PluginError
@@ -1905,7 +1910,7 @@ class WorkflowEngine:
                 base_dir=base_dir,
                 on_warning=lambda message: logger.warning("Plugin sources: %s", message),
             )
-        except PluginError as exc:
+        except (PluginError, OSError) as exc:
             raise ExecutionError(
                 f"Plugin source could not be resolved: {exc}",
                 suggestion=(
@@ -1914,7 +1919,10 @@ class WorkflowEngine:
                 ),
             ) from exc
 
-        self._plugin_marketplaces = marketplaces_from(resolved)
+        # Merged, not replaced: the guard above now proceeds on a
+        # *partially* populated table, so overwriting would drop whatever a
+        # parent contributed.
+        self._plugin_marketplaces = {**self._plugin_marketplaces, **marketplaces_from(resolved)}
         # The executor is built in __init__ on the single-provider path, so
         # it already holds the empty table and must be told. The registry
         # path builds one per agent and picks the new table up on its own.
@@ -1958,7 +1966,7 @@ class WorkflowEngine:
                 base_dir=sub_path.resolve().parent,
                 on_warning=lambda message: logger.warning("Plugin sources: %s", message),
             )
-        except PluginError as exc:
+        except (PluginError, OSError) as exc:
             raise ExecutionError(
                 f"Sub-workflow '{sub_config.workflow.name}' declares a plugin source "
                 f"that could not be resolved: {exc}",

@@ -110,7 +110,7 @@ def _report_plugins(
     if not entries:
         return
 
-    from conductor.plugins.errors import PluginError
+    from conductor.plugins.errors import PluginError, PluginFetchError
     from conductor.plugins.registry import resolve_plugins
     from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
     from conductor.skills import SkillError
@@ -120,30 +120,26 @@ def _report_plugins(
     sources: dict[str, Any] = {}
     if declared:
         # Cache-only, like everything else in ``conductor validate``: this
-        # is a summary, and a summary must not clone. An unfetched source
-        # degrades to the same warning arm below, which already names
-        # ``conductor plugin fetch``.
-        try:
-            sources = resolve_plugin_sources(declared, base_dir=base_dir, allow_network=False)
-        except (PluginError, SkillError, OSError) as exc:
-            console.print(f"  [yellow]⚠[/yellow] Plugin sources could not be resolved: {exc}")
-            return
+        # is a summary, and a summary must not clone. Resolved one at a
+        # time so a single unfetched source degrades to one line rather
+        # than discarding the summary for every healthy source beside it.
+        for name, entry in declared.items():
+            try:
+                sources.update(
+                    resolve_plugin_sources({name: entry}, base_dir=base_dir, allow_network=False)
+                )
+            except PluginFetchError:
+                # Merely unfetched. Not reported here — the plugin lines
+                # below already name ``conductor plugin fetch`` for the
+                # entries that need it, and the validator said it once.
+                continue
+            except (PluginError, SkillError, OSError) as exc:
+                console.print(f"  [yellow]⚠[/yellow] Plugin source {name!r} is unusable: {exc}")
 
-    try:
-        resolved = resolve_plugins(
-            entries,
-            base_dir=base_dir,
-            marketplaces=marketplaces_from(sources),
-            declared_sources=set(declared),
-        )
-    except (PluginError, SkillError, OSError) as exc:
-        # Narrow: a genuine bug in the plugin layer (AttributeError, KeyError)
-        # should surface as a crash, not as a soft yellow line the reader
-        # scrolls past. This arm is reachable through ordinary configuration
-        # — see the docstring — so it is not merely defensive.
-        console.print(f"  [yellow]⚠[/yellow] Plugins could not be summarized: {exc}")
-        return
-
+    # Printed before resolution is attempted: what a source resolved to is
+    # worth seeing even when an entry referencing a *different* source
+    # cannot be resolved, and this listing is the only place the resolved
+    # commit appears.
     if sources:
         console.print(f"  [dim]Plugin sources: {len(sources)} declared[/dim]")
         for name, entry in sources.items():
@@ -153,6 +149,29 @@ def _report_plugins(
             if entry.stale:
                 detail = f"{detail} (cached; ref not re-checked)"
             console.print(f"    [dim]• {name} — {detail}[/dim]")
+
+    # Resolved one entry at a time, for the same reason the sources above
+    # are: ``resolve_plugins`` is all-or-nothing, so one entry whose source
+    # is unfetched would erase the component counts for every healthy
+    # plugin beside it — the listing this function exists to print.
+    resolved = []
+    for entry in entries:
+        try:
+            resolved.extend(
+                resolve_plugins(
+                    [entry],
+                    base_dir=base_dir,
+                    marketplaces=marketplaces_from(sources),
+                    declared_sources=set(declared) - set(sources),
+                )
+            )
+        except (PluginError, SkillError, OSError) as exc:
+            # Narrow: a genuine bug in the plugin layer (AttributeError,
+            # KeyError) should surface as a crash, not as a soft yellow line
+            # the reader scrolls past. This arm is reachable through ordinary
+            # configuration — see the docstring — so it is not merely
+            # defensive.
+            console.print(f"  [yellow]⚠[/yellow] Plugin {entry.name!r}: {exc}")
 
     console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
     for plugin in resolved:

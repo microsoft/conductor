@@ -38,7 +38,9 @@ class TestOwnerRepoShorthand:
 
     def test_cache_key_is_host_owner_repo(self):
         source = parse_plugin_source("acme/agent-plugins#v1.4.0")
-        assert source.cache_key == PurePosixPath("github.com/acme/agent-plugins")
+        assert source.cache_key.parts[:2] == ("github.com", "acme")
+        # The repo segment carries a disambiguating digest — see cache_key.
+        assert source.cache_key.name.startswith("agent-plugins-")
 
     def test_strips_a_git_suffix(self):
         assert parse_plugin_source("acme/plugins.git").repo == "plugins"
@@ -57,22 +59,25 @@ class TestUrlSources:
         ],
     )
     def test_cache_key(self, raw, expected):
-        assert parse_plugin_source(raw).cache_key == PurePosixPath(expected)
+        key = parse_plugin_source(raw).cache_key
+        host, owner, repo = PurePosixPath(expected).parts
+        assert key.parts[:2] == (host, owner)
+        assert key.name.startswith(f"{repo}-")
 
     def test_credentials_and_port_never_reach_the_cache_key(self):
         """A token in a URL must not become a directory name on disk."""
         source = parse_plugin_source("https://user:secret@git.internal:8443/acme/p.git")
-        assert source.cache_key == PurePosixPath("git.internal/acme/p")
+        assert source.cache_key.parts[:2] == ("git.internal", "acme")
         assert "secret" not in str(source.cache_key)
 
     def test_nested_paths_collapse_into_the_owner_slot(self):
         """Self-hosted forges nest arbitrarily; the key stays 3 segments."""
         source = parse_plugin_source("https://gitlab.internal/group/sub/team/p.git")
-        assert source.cache_key == PurePosixPath("gitlab.internal/group_sub_team/p")
+        assert source.cache_key.parts[:2] == ("gitlab.internal", "group_sub_team")
 
     def test_repository_at_the_host_root_gets_a_placeholder_owner(self):
         source = parse_plugin_source("https://git.internal/p.git")
-        assert source.cache_key == PurePosixPath("git.internal/_/p")
+        assert source.cache_key.parts[:2] == ("git.internal", "_")
 
     def test_ref_is_split_off(self):
         source = parse_plugin_source("https://github.com/acme/p.git#main")
@@ -91,7 +96,7 @@ class TestScpStyleSources:
     def test_parses(self):
         source = parse_plugin_source("git@github.com:acme/p.git")
         assert source.is_local is False
-        assert source.cache_key == PurePosixPath("github.com/acme/p")
+        assert source.cache_key.parts[:2] == ("github.com", "acme")
         assert source.location == "git@github.com:acme/p.git"
 
     def test_carries_a_ref(self):
@@ -271,3 +276,34 @@ class TestCredentialRedaction:
     def test_a_source_without_credentials_is_unchanged(self):
         source = parse_plugin_source("acme/p#v1.0.0")
         assert source.display == "acme/p#v1.0.0"
+
+
+class TestCacheKeyDisambiguation:
+    """Distinct remotes must never share a cache directory.
+
+    The three-segment key is lossy — deeper paths collapse into the owner
+    slot with ``_`` — and per-SHA checkouts would survive that, but the
+    ref pointer beside them would not: two repositories floating on
+    ``main`` would overwrite each other's record, and an offline run
+    would be served the wrong repository.
+    """
+
+    def test_collapsed_paths_stay_distinct(self):
+        a = parse_plugin_source("https://gitlab.com/group/subgroup/repo.git")
+        b = parse_plugin_source("https://gitlab.com/group_subgroup/repo.git")
+        assert a.cache_key != b.cache_key
+
+    def test_same_source_is_stable_across_calls(self):
+        first = parse_plugin_source("acme/p#v1.0.0").cache_key
+        second = parse_plugin_source("acme/p#v1.0.0").cache_key
+        assert first == second
+
+    def test_the_ref_does_not_change_the_key(self):
+        """Refs coexist under one repo directory, keyed per SHA below it."""
+        assert (
+            parse_plugin_source("acme/p#v1.0.0").cache_key
+            == parse_plugin_source("acme/p#main").cache_key
+        )
+
+    def test_key_is_still_three_segments(self):
+        assert len(parse_plugin_source("acme/p").cache_key.parts) == 3

@@ -39,7 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warm cache warns and reuses the checkout, so offline runs keep working.
   Checkouts are cached under `$CONDUCTOR_HOME/cache/plugins/`, keyed by
   resolved commit. Cloning shells out to `git`, so existing SSH keys and
-  credential helpers apply and self-hosted forges work. See
+  credential helpers apply and self-hosted forges work.
+
+  Sources are resolved one at a time, so a source that is unfetched or
+  broken costs its own diagnostic rather than the report for every healthy
+  source beside it. The two are distinguished: an *unfetched* source is a
+  warning naming `conductor plugin fetch`, since `conductor run` heals it,
+  while a source that is itself wrong — a path that does not exist, a
+  `path:` that escapes the checkout, an unparseable catalog — is an error,
+  because no amount of fetching fixes it. A declared source that shadows a
+  same-named installed marketplace is reported, since the two can ship
+  different subagents or a different MCP server. See
   `examples/plugin-sources.yaml` and the Plugins section of
   `docs/workflow-syntax.md`.
 - **Output field constraints — `enum`, `pattern`, `minimum`/`maximum`,

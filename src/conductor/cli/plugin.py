@@ -46,21 +46,47 @@ def _load(workflow: Path):  # noqa: ANN202  (WorkflowConfig, imported lazily)
         raise typer.Exit(code=1) from None
 
 
-def _resolve(config, workflow_path: Path, *, allow_network: bool):  # noqa: ANN001, ANN202
-    """Resolve declared sources, reporting failures as a CLI error."""
+def _resolve(config, workflow_path: Path, *, allow_network: bool, strict: bool = True):  # noqa: ANN001, ANN202
+    """Resolve declared sources, reporting failures as a CLI error.
+
+    ``strict`` distinguishes the two verbs. ``fetch`` exists to acquire
+    everything, so any failure is fatal. ``list`` is a report, and one
+    source that cannot be read should cost its own line rather than the
+    whole listing — including the healthy sources beside it.
+    """
     from conductor.plugins.errors import PluginError
     from conductor.plugins.resolution import resolve_plugin_sources
 
-    try:
-        return resolve_plugin_sources(
-            config.workflow.runtime.plugin_sources,
-            base_dir=workflow_path.parent,
-            allow_network=allow_network,
-            on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
-        )
-    except PluginError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
-        raise typer.Exit(code=1) from None
+    declared = config.workflow.runtime.plugin_sources
+    if strict:
+        try:
+            return resolve_plugin_sources(
+                declared,
+                base_dir=workflow_path.parent,
+                allow_network=allow_network,
+                on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
+            )
+        except (PluginError, OSError) as exc:
+            # OSError too: the cache is created during acquisition, so an
+            # unwritable home or a full disk surfaces here as a bare
+            # PermissionError and would otherwise print a raw traceback.
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            raise typer.Exit(code=1) from None
+
+    resolved: dict = {}
+    for name, entry in declared.items():
+        try:
+            resolved.update(
+                resolve_plugin_sources(
+                    {name: entry},
+                    base_dir=workflow_path.parent,
+                    allow_network=allow_network,
+                    on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
+                )
+            )
+        except (PluginError, OSError) as exc:
+            console.print(f"[yellow]⚠[/yellow] {name}: {exc}")
+    return resolved
 
 
 @plugin_app.command("fetch")
@@ -102,14 +128,23 @@ def fetch_plugins(
         detail = entry.source.describe()
         if entry.sha:
             detail = f"{detail} @ [cyan]{entry.sha[:12]}[/cyan]"
-        state = "fetched" if entry.fetched else "cached"
-        if entry.stale:
+        if entry.source.is_local:
+            state = "local"
+        elif entry.stale:
             state = "cached (ref not re-checked)"
+        else:
+            state = "fetched" if entry.fetched else "cached"
+        mark = "[yellow]⚠[/yellow]" if entry.stale else "[green]✓[/green]"
         output_console.print(
-            f"  [green]✓[/green] {name} — {detail} — {state}, "
-            f"{len(entry.marketplace.plugins)} plugin(s)"
+            f"  {mark} {name} — {detail} — {state}, {len(entry.marketplace.plugins)} plugin(s)"
         )
-    output_console.print(f"\n{len(sources)} source(s) ready ({fetched} newly fetched).")
+    stale = sum(1 for entry in sources.values() if entry.stale)
+    summary = f"\n{len(sources)} source(s) ready ({fetched} newly fetched)"
+    if stale:
+        # The command exists to acquire; a row it could not verify must not
+        # read as a green light, least of all in the CI step that gates on it.
+        summary += f", [yellow]{stale} not re-checked[/yellow]"
+    output_console.print(f"{summary}.")
 
 
 @plugin_app.command("list")
@@ -137,7 +172,7 @@ def list_plugins(
     """
     config, resolved_path = _load(workflow)
     sources = (
-        _resolve(config, resolved_path, allow_network=False)
+        _resolve(config, resolved_path, allow_network=False, strict=False)
         if config.workflow.runtime.plugin_sources
         else {}
     )
@@ -174,19 +209,31 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
     from conductor.skills import SkillError
 
     marketplaces = marketplaces_from(sources)
-    declared_names = set(config.workflow.runtime.plugin_sources)
+    declared_names = set(config.workflow.runtime.plugin_sources) - set(sources)
 
     # Group agents by the entry list they resolve, so a workflow whose
     # agents all inherit prints one section rather than one per agent.
     groups: dict[tuple[tuple[str, bool, bool, bool], ...], list[str]] = {}
-    for agent in config.agents:
+
+    def _record(name: str, agent) -> None:  # noqa: ANN001
         if agent.type not in (None, "agent"):
-            continue
+            return
         entries = agent.plugins if agent.plugins is not None else config.workflow.runtime.plugins
         if not entries:
-            continue
+            return
         key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
-        groups.setdefault(key, []).append(agent.name)
+        groups.setdefault(key, []).append(name)
+
+    for agent in config.agents:
+        _record(agent.name, agent)
+    # A for_each group's inline agent is a full AgentDef with its own
+    # ``plugins:``, and it is the one that starts N copies of whatever MCP
+    # server the plugin declares — so omitting it under-reports in exactly
+    # the place the counts matter most. ``config/validator.py`` walks
+    # ``for_each`` for the same reason.
+    for group in config.for_each:
+        if group.agent is not None:
+            _record(f"{group.name} (for_each)", group.agent)
 
     if not groups:
         output_console.print("No agent in this workflow enables plugins.")
@@ -208,7 +255,7 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
                 declared_sources=declared_names,
                 on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
             )
-        except (PluginError, SkillError) as exc:
+        except (PluginError, SkillError, OSError) as exc:
             output_console.print(f"  [yellow]⚠[/yellow] {exc}")
             continue
 

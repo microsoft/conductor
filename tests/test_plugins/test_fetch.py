@@ -17,6 +17,8 @@ import pytest
 
 from conductor.plugins.errors import PluginFetchError
 from conductor.plugins.fetch import (
+    _ref_slug,
+    _refuses_shallow_sha,
     fetch_source,
     fetch_sources,
     get_plugin_cache_base,
@@ -267,3 +269,179 @@ class TestFetchSources:
 
     def test_local_sources_are_left_out(self, plugin_cache_home: Path):
         assert fetch_sources([parse_plugin_source("./vendor/plugins")]) == {}
+
+
+class TestPinnedCacheOnly:
+    """Pinned source + ``allow_network=False`` — the CI configuration.
+
+    Pin a SHA, ``conductor plugin fetch`` in one step, then ``validate``
+    or ``plugin list`` in the next. That second step is cache-only, and
+    it takes a different path through ``_cached_sha`` than the floating
+    case every other test covers.
+    """
+
+    def test_a_pinned_source_resolves_from_a_warm_cache(self, repo, plugin_cache_home: Path):
+        """Without the ref pointer, so only the pinned path can satisfy it.
+
+        Leaving the pointer in place let the *floating* branch answer — it
+        records the same SHA — so this passed with the pinned fast-path
+        deleted.
+        """
+        root, sha = repo
+        source = parse_plugin_source(_url(root, sha))
+        fetch_source(source)
+        for pointer in get_plugin_cache_base().rglob("_refs/*.json"):
+            pointer.unlink()
+
+        result = fetch_source(source, allow_network=False)
+
+        assert result.sha == sha
+        assert result.fetched is False
+
+    def test_a_pinned_source_on_a_cold_cache_names_the_fetch_verb(
+        self, repo, plugin_cache_home: Path
+    ):
+        root, sha = repo
+
+        with pytest.raises(PluginFetchError, match="conductor plugin fetch"):
+            fetch_source(parse_plugin_source(_url(root, sha)), allow_network=False)
+
+
+class TestMultipleSourceFailures:
+    """``conductor run`` fetches every declared source at once."""
+
+    def test_every_failure_is_reported_not_just_the_first(
+        self, tmp_path: Path, plugin_cache_home: Path
+    ):
+        """Fixing three unreachable remotes should not cost three runs."""
+        sources = [
+            parse_plugin_source(f"file://{tmp_path}/missing-{name}")
+            for name in ("one", "two", "three")
+        ]
+
+        with pytest.raises(PluginFetchError) as excinfo:
+            fetch_sources(sources)
+
+        message = str(excinfo.value)
+        assert all(name in message for name in ("one", "two", "three"))
+
+    def test_a_duplicated_source_is_fetched_once(
+        self, repo, plugin_cache_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Two marketplace names may legitimately share one source.
+
+        Counts the *work*, not the result: the results dict is keyed by
+        ``raw``, so it collapses duplicates whether or not the dedupe
+        exists — asserting on it would pass with the dedupe deleted.
+        """
+        import conductor.plugins.fetch as fetch_module
+
+        root, sha = repo
+        source = parse_plugin_source(_url(root))
+        other = parse_plugin_source(_url(root, "v1.0.0"))
+        calls: list[str] = []
+        original = fetch_module.fetch_source
+
+        def _counting(src, **kwargs):
+            calls.append(src.raw)
+            return original(src, **kwargs)
+
+        monkeypatch.setattr(fetch_module, "fetch_source", _counting)
+        results = fetch_sources([source, source, other, other, other])
+
+        assert sorted(calls) == sorted({source.raw, other.raw})
+        assert results[source.raw].sha == sha
+
+
+class TestRefSlug:
+    """Ref pointers must not collide any more than cache keys do.
+
+    ``_refs/<slug>.json`` records what a floating ref last resolved to,
+    and it is the only input to the offline fallback. Two refs sharing one
+    file means an offline run is served the wrong commit — silently, since
+    the pointer's SHA is shape-checked but not attributed.
+    """
+
+    def test_a_separator_and_an_underscore_stay_distinct(self):
+        assert _ref_slug("release/1.x") != _ref_slug("release_1.x")
+
+    def test_a_branch_named_like_the_default_placeholder_stays_distinct(self):
+        assert _ref_slug("_default") != _ref_slug(None)
+
+    def test_the_same_ref_is_stable(self):
+        assert _ref_slug("main") == _ref_slug("main")
+
+    def test_the_slug_is_filename_safe(self):
+        assert "/" not in _ref_slug("refs/heads/main")
+
+
+class TestShallowRefusalClassifier:
+    """Only a genuine "won't serve a bare SHA" enters the unshallow retry.
+
+    A live refusal cannot be provoked over ``file://`` — the local
+    transport serves any SHA regardless of ``uploadpack.*`` — so the
+    branch logic is pinned against the strings git itself emits, taken
+    from the binary rather than guessed.
+    """
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "error: Server does not allow request for unadvertised object abc123",
+            "fatal: git upload-pack: not our ref abc123",
+            "fatal: no such remote ref abc123",
+            "fatal: protocol error: bad pack header",
+        ],
+    )
+    def test_refusals_are_recognised(self, stderr):
+        assert _refuses_shallow_sha(stderr) is True
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "fatal: could not read Username for 'https://github.com': prompts disabled",
+            "ssh: Could not resolve hostname nope.invalid",
+            "fatal: Authentication failed",
+            "",
+        ],
+    )
+    def test_other_failures_are_not(self, stderr):
+        """These must re-raise: retrying spends the budget twice and then
+        reports the second error, hiding the credential failure."""
+        assert _refuses_shallow_sha(stderr) is False
+
+    def test_a_marker_on_a_non_final_line_still_matches(self):
+        """The classifier reads git's whole stderr, not a summarised line."""
+        assert _refuses_shallow_sha(
+            "error: Server does not allow request for unadvertised object abc\n"
+            "fatal: the remote end hung up unexpectedly\n"
+        )
+
+
+class TestGitFailureMessages:
+    """A user must be told the cause, not git's closing prose.
+
+    git's stderr for an unreachable remote ends with "and the repository
+    exists." — taking the last line reported that as the error, naming no
+    cause and prescribing no remedy.
+    """
+
+    def test_the_message_names_the_cause(self, tmp_path: Path, plugin_cache_home: Path):
+        missing = tmp_path / "not-a-repo"
+
+        with pytest.raises(PluginFetchError) as excinfo:
+            fetch_source(parse_plugin_source(_url(missing)))
+
+        message = str(excinfo.value)
+        assert "does not appear to be a git repository" in message
+        assert "and the repository exists" not in message
+
+    def test_the_full_output_rides_along_for_classification(
+        self, tmp_path: Path, plugin_cache_home: Path
+    ):
+        missing = tmp_path / "not-a-repo"
+
+        with pytest.raises(PluginFetchError) as excinfo:
+            fetch_source(parse_plugin_source(_url(missing)))
+
+        assert getattr(excinfo.value, "git_output", "")

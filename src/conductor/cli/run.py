@@ -2498,12 +2498,22 @@ async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str
     from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
 
     verbose_log(f"Resolving {len(declared)} plugin source(s): {', '.join(sorted(declared))}")
-    resolved = await asyncio.to_thread(
-        resolve_plugin_sources,
-        declared,
-        base_dir=workflow_path.resolve().parent,
-        on_warning=lambda message: verbose_log(f"  Plugin sources: {message}", style="yellow"),
-    )
+    try:
+        resolved = await asyncio.to_thread(
+            resolve_plugin_sources,
+            declared,
+            base_dir=workflow_path.resolve().parent,
+            on_warning=lambda message: verbose_log(f"  Plugin sources: {message}", style="yellow"),
+        )
+    except OSError as exc:
+        # The plugin cache is created here, so an unwritable home or a full
+        # disk arrives as a bare errno naming only a random temp directory.
+        from conductor.plugins.errors import PluginFetchError
+        from conductor.plugins.fetch import get_plugin_cache_base
+
+        raise PluginFetchError(
+            f"Plugin sources could not be acquired into {get_plugin_cache_base()}: {exc}"
+        ) from exc
     for name, entry in resolved.items():
         detail = entry.source.describe()
         if entry.sha:
@@ -2511,7 +2521,10 @@ async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str
         if entry.fetched:
             detail = f"{detail} (fetched)"
         if entry.stale:
-            detail = f"{detail} (cached; not re-checked)"
+            # This line says the run used a plugin version nobody could
+            # verify, so it gets the marker rather than reading as one more
+            # startup progress line.
+            detail = f"{detail} [yellow]⚠ cached; ref not re-checked[/yellow]"
         verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
     return marketplaces_from(resolved)
 

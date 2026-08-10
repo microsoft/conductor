@@ -1996,7 +1996,9 @@ marketplaces populate, and wins on a clash.
 A source may be a **marketplace catalog** (a `marketplace.json` listing
 many plugins) or a **single plugin** (a `plugin.json` at the root). Both
 are detected automatically; a repository that is both needs a `plugin:`
-key to say which, rather than having one picked for it.
+key to say which, rather than having one picked for it. That key names
+either the root plugin or any plugin the catalog lists — it also narrows
+a pure catalog to a single entry.
 
 #### Source grammar
 
@@ -2048,9 +2050,21 @@ with no network is an error naming `conductor plugin fetch`.
 
 `conductor validate` reports an unfetched source as a *warning*, not an
 error, and says which checks it had to skip. The workflow is not wrong;
-the machine has simply not fetched yet, and `conductor run` heals it. A
-source declared but never referenced is reported too — dead config that
+the machine has simply not fetched yet, and `conductor run` heals it.
+
+A source that is *itself* wrong — a path that does not exist, a `path:`
+that escapes the checkout, a catalog that will not parse — is an **error**.
+No amount of fetching fixes it. Sources are checked one at a time, so a
+broken or unfetched source costs its own line rather than the report for
+every healthy source beside it.
+
+A source declared but never referenced is reported too — dead config that
 survives a refactor and then pins a repository nobody reads.
+
+If a declared source shadows a marketplace of the same name installed on
+your machine, the declared one wins and you are told. The two can ship
+different subagents, or a different MCP server, so a silent substitution
+would change what your agents can do without saying so.
 
 There is no `conductor plugin update`. A floating source updates itself and
 a pinned one is meant not to.

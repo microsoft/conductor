@@ -52,6 +52,8 @@ guarantee, for the same reason, as
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import logging
 import os
@@ -61,11 +63,11 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from conductor.plugins.errors import PluginFetchError
+from conductor.plugins.errors import PluginError, PluginFetchError, PluginSourceError
 from conductor.plugins.sources import FULL_SHA, PluginSource, redact_credentials
 
 logger = logging.getLogger(__name__)
@@ -100,8 +102,14 @@ class FetchResult:
     root: Path
     """Directory the marketplace should be read from."""
 
-    sha: str | None
-    """Full commit SHA of the checkout, or ``None`` for a local source."""
+    sha: str
+    """Full commit SHA of the checkout.
+
+    Never ``None``: a local source is refused by :func:`fetch_source`
+    and so never produces a result. The optionality is genuine one layer
+    up, on :class:`~conductor.plugins.resolution.ResolvedSource`, where
+    local sources do exist.
+    """
 
     stale: bool = False
     """Whether the ref could not be re-checked and a cached checkout was used.
@@ -141,8 +149,18 @@ def _sentinel(source: PluginSource, sha: str) -> Path:
 
 
 def _ref_slug(ref: str | None) -> str:
-    """Turn a ref into a filename-safe slug."""
-    return _REF_SLUG_UNSAFE.sub("_", ref) if ref else "_default"
+    """Turn a ref into a filename-safe, collision-free slug.
+
+    The sanitised name alone is lossy — ``release/1.x`` and
+    ``release_1.x`` are different refs that map to one filename, and a
+    branch literally named ``_default`` collides with the no-ref case. A
+    digest of the original settles all three, and is kept alongside the
+    readable form so the directory is still browsable.
+    """
+    if not ref:
+        return "_default"
+    digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:8]
+    return f"{_REF_SLUG_UNSAFE.sub('_', ref)}-{digest}"
 
 
 def _ref_pointer(source: PluginSource, ref: str | None) -> Path:
@@ -236,13 +254,41 @@ def _run_git(arguments: Sequence[str], *, timeout: int, context: str) -> str:
         raise PluginFetchError(f"{context}: git timed out after {timeout}s.") from exc
 
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        message = detail[-1] if detail else f"git exited {completed.returncode}"
-        # git quotes the remote URL back on most failures, credentials and
-        # all, so its own output is redacted before it reaches a console
-        # or a bug report.
-        raise PluginFetchError(f"{context}: {redact_credentials(message)}")
+        failure = PluginFetchError(f"{context}: {_summarize_git_failure(completed)}")
+        # The full output rides along so ``_clone`` can classify a shallow
+        # refusal on every line git printed, not just the one summarised
+        # into the message.
+        failure.git_output = redact_credentials(completed.stderr or completed.stdout or "")
+        raise failure
     return completed.stdout
+
+
+def _summarize_git_failure(completed: subprocess.CompletedProcess[str]) -> str:
+    """Pick the informative line out of a failed ``git`` invocation.
+
+    git's stderr for an unreachable remote is five lines, of which the
+    *first* names the cause and the last is prose:
+
+    .. code-block:: text
+
+        fatal: '/srv/nope' does not appear to be a git repository
+        fatal: Could not read from remote repository.
+
+        Please make sure you have the correct access rights
+        and the repository exists.
+
+    Taking the last line reported "and the repository exists." as the
+    error — naming no cause and prescribing no remedy, so a user could
+    not tell a typo from a dead host from expired credentials.
+
+    Credentials are redacted here rather than at the call sites: git
+    quotes the remote URL back on most failures, so its own output is the
+    half most likely to leak a token into a bug report.
+    """
+    lines = (completed.stderr or completed.stdout or "").strip().splitlines()
+    named = next((line for line in lines if line.startswith(("fatal:", "error:"))), None)
+    message = named or (lines[0] if lines else f"git exited {completed.returncode}")
+    return redact_credentials(message.strip())
 
 
 def resolve_ref(source: PluginSource) -> str:
@@ -328,13 +374,54 @@ def _select_sha(output: str, source: PluginSource) -> str:
     return next(iter(candidates.values()))
 
 
-def _clone(source: PluginSource, sha: str, destination: Path) -> None:
-    """Clone ``source`` at ``sha`` into ``destination``.
+# Substrings git emits when a remote will not serve a bare commit — taken
+# from the strings in the `git` binary itself rather than guessed:
+#
+#   "Server does not allow request for unadvertised object %s"
+#   "git upload-pack: not our ref %s"
+#   "no such remote ref %s"
+#
+# Only these enter the unshallowed retry. An auth failure, a DNS failure
+# or a timeout is re-raised as-is: retrying doubles the time budget and
+# then reports the second error, discarding the first — which is usually
+# the one naming the actual problem.
+_SHALLOW_REFUSED: tuple[str, ...] = (
+    "unadvertised object",
+    "not our ref",
+    "no such remote ref",
+    "protocol error",
+)
 
-    ``--depth 1`` on the specific ref where the server allows it, falling
-    back to a full clone plus checkout. Not every host enables
-    ``uploadpack.allowReachableSHA1InWant``, so fetching a bare SHA
-    shallowly fails on some remotes and the fallback is not optional.
+
+def _refuses_shallow_sha(text: str) -> bool:
+    """Whether git's output means "this remote won't serve a bare SHA".
+
+    Matched against the *whole* stderr rather than the single summarised
+    line: a transport that prints a trailing summary after the marker
+    would otherwise silently skip the fallback, turning a working pinned
+    fetch into a clone error.
+    """
+    lowered = text.lower()
+    return any(marker in lowered for marker in _SHALLOW_REFUSED)
+
+
+def _clone(source: PluginSource, sha: str, destination: Path) -> None:
+    """Populate ``destination`` with ``source`` checked out at ``sha``.
+
+    ``init`` + ``remote add`` + ``fetch --depth 1 <sha>`` rather than
+    ``git clone``, because a clone cannot be pointed at a bare commit.
+    Where the remote refuses to serve an arbitrary SHA shallowly — not
+    every host enables ``uploadpack.allowReachableSHA1InWant`` — this
+    falls back to fetching the default refspec and checking the commit
+    out of that. Note the fallback is a full *fetch*, not a full clone,
+    so a SHA reachable only from an unfetched ref (a PR head, say) fails
+    at checkout rather than at fetch.
+
+    The fallback is entered only for a failure that looks like that
+    refusal. Retrying after an auth failure, a DNS failure or a timeout
+    would spend the time budget twice and then report the *second* error,
+    discarding the first — which is usually the one that says
+    ``Permission denied (publickey)``.
     """
     destination.mkdir(parents=True, exist_ok=True)
     _run_git(
@@ -356,15 +443,25 @@ def _clone(source: PluginSource, sha: str, destination: Path) -> None:
             timeout=CLONE_TIMEOUT_SECONDS,
             context=context,
         )
-    except PluginFetchError:
-        # The remote refuses to serve an arbitrary SHA shallowly. Fetch
-        # the ref's history instead and check the commit out from it.
-        logger.debug("Shallow SHA fetch refused for %s; retrying unshallowed", source.display)
-        _run_git(
-            [*git_dir, "fetch", "--quiet", "origin"],
-            timeout=CLONE_TIMEOUT_SECONDS,
-            context=context,
+    except PluginFetchError as shallow_failure:
+        if not _refuses_shallow_sha(getattr(shallow_failure, "git_output", "")):
+            raise
+        logger.debug(
+            "Shallow SHA fetch refused for %s (%s); retrying unshallowed",
+            source.display,
+            shallow_failure,
         )
+        try:
+            _run_git(
+                [*git_dir, "fetch", "--quiet", "origin"],
+                timeout=CLONE_TIMEOUT_SECONDS,
+                context=context,
+            )
+        except PluginFetchError as full_failure:
+            raise PluginFetchError(
+                f"{context}: shallow fetch failed ({shallow_failure}); fetching the "
+                f"full history also failed ({full_failure})."
+            ) from shallow_failure
     _run_git(
         [*git_dir, "checkout", "--quiet", "--detach", sha],
         timeout=CLONE_TIMEOUT_SECONDS,
@@ -382,8 +479,11 @@ def _publish(temporary: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.replace(temporary, destination)
-    except OSError:
-        if destination.is_dir():
+    except OSError as exc:
+        # Only the lost-race errnos. Treating EACCES or ENOSPC as "someone
+        # else got there first" would report a broken checkout as a
+        # successful one, on the strength of the directory merely existing.
+        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST) and destination.is_dir():
             shutil.rmtree(temporary, ignore_errors=True)
             return
         raise
@@ -508,11 +608,18 @@ def fetch_sources(
     marketplaces should pay that once rather than three times in series.
     Threads rather than tasks because the work is a subprocess.
 
+    Duplicate sources are submitted once. Two marketplace names may
+    legitimately share a source string, and cloning the same commit twice
+    only to discard one copy is wasted network — and the discarded
+    future's exception would never be retrieved.
+
     Raises:
-        PluginFetchError: If any source cannot be acquired. The first
-            failure is raised; the rest are already complete or abandoned.
+        PluginFetchError: If any source cannot be acquired. **Every**
+            failure is reported, not just the first: a user fixing three
+            unreachable remotes should not have to rediscover them one
+            run at a time.
     """
-    remote = [source for source in sources if not source.is_local]
+    remote = list(dict.fromkeys(source for source in sources if not source.is_local))
     if not remote:
         return {}
     if len(remote) == 1:
@@ -522,14 +629,47 @@ def fetch_sources(
             )
         }
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(remote))) as pool:
+    results: dict[str, FetchResult] = {}
+    failures: list[str] = []
+    fatal = False
+    pool = ThreadPoolExecutor(max_workers=min(max_workers, len(remote)))
+    try:
         futures = {
-            source.raw: pool.submit(
+            pool.submit(
                 fetch_source, source, allow_network=allow_network, on_warning=on_warning
-            )
+            ): source
             for source in remote
         }
-        return {raw: future.result() for raw, future in futures.items()}
+        for future in as_completed(futures):
+            source = futures[future]
+            try:
+                results[source.raw] = future.result()
+            except PluginFetchError as exc:
+                failures.append(str(exc))
+            except PluginError as exc:
+                # A source fault, not a fetch fault. Kept aside so the
+                # combined error can be raised as the stronger class —
+                # callers treat a fetch failure as deferrable ("run
+                # conductor plugin fetch") and a source failure as broken,
+                # and collapsing the two would make the same fault
+                # deferrable only when the workflow names one marketplace.
+                failures.append(f"{source.display}: {exc}")
+                fatal = True
+            except OSError as exc:
+                failures.append(f"{source.display}: {exc}")
+                fatal = True
+    finally:
+        # ``cancel_futures`` drops the ones that have not started; the
+        # ones already running are not interruptible (git is a subprocess
+        # and ``ThreadPoolExecutor`` joins its workers at interpreter
+        # exit), so ``wait=False`` buys the caller its error message
+        # immediately rather than after the slowest clone.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if failures:
+        detail = failures[0] if len(failures) == 1 else "\n  - " + "\n  - ".join(sorted(failures))
+        raise (PluginSourceError if fatal else PluginFetchError)(detail)
+    return results
 
 
 def clear_resolution_memo() -> None:
@@ -542,8 +682,6 @@ def clear_resolution_memo() -> None:
 
 
 __all__ = [
-    "CLONE_TIMEOUT_SECONDS",
-    "LS_REMOTE_TIMEOUT_SECONDS",
     "FetchResult",
     "clear_resolution_memo",
     "fetch_source",

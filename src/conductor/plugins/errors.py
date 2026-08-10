@@ -58,6 +58,14 @@ class PluginFetchError(PluginError):
     workflow is right and the machine, network, or credentials are not.
     """
 
+    git_output: str = ""
+    """Full redacted output of the failing ``git`` command, when there was
+    one.
+
+    The message carries a single summarised line, which is what a user
+    should read; classifying a failure needs every line git printed.
+    """
+
 
 class PluginSourceUnavailableError(PluginNotFoundError):
     """Raised when a declared source has not been acquired on this machine.

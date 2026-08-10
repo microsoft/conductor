@@ -56,13 +56,25 @@ class Marketplace:
     workflow registered the source under for a single-plugin source."""
 
     root: Path
-    """Directory the marketplace was read from."""
+    """Directory the marketplace was read from.
+
+    Its identity, and the reason it is carried rather than derived: two
+    marketplaces can register the same *name* from different checkouts,
+    so ``AgentExecutor``'s plugin cache keys on this alongside the name.
+    Keying on names alone would let a differently-sourced ``prs@acme``
+    hit another table's cached answer.
+    """
 
     plugins: dict[str, Path]
     """Plugin name to absolute plugin root, for every plugin it lists."""
 
     is_catalog: bool
-    """Whether this came from a catalog manifest rather than a lone plugin."""
+    """Whether this came from a catalog manifest rather than a lone plugin.
+
+    Provenance for reporting, not a control-flow flag: nothing branches on
+    it to decide behaviour, and a non-catalog marketplace always holds
+    exactly one plugin, so it cannot stand in for "is this empty".
+    """
 
     def resolve(self, plugin: str) -> Path:
         """Return the root of ``plugin``, or raise naming what is available.
@@ -201,9 +213,13 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
         root: Directory the source was fetched or pointed at.
         name: Name the workflow registered this source under, used when
             the source is a single plugin rather than a catalog.
-        plugin: Explicit disambiguator from ``plugin_sources``. Names the
-            single plugin to use when ``root`` holds both a catalog and a
-            plugin manifest, and is otherwise a no-op assertion.
+        plugin: Explicit disambiguator from ``plugin_sources``. Names
+            which plugin to use when ``root`` holds both a catalog and a
+            plugin manifest, and narrows a catalog to a single entry
+            otherwise. Both candidates are consulted, so the key can name
+            either the root plugin or any plugin the catalog lists — the
+            ambiguity error recommends this key, and a remedy that worked
+            in only one of its two directions would be worse than none.
 
     Returns:
         The resolved marketplace.
@@ -235,12 +251,18 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
         from conductor.plugins.manifest import read_manifest_name
 
         declared = read_manifest_name(single)
-        if plugin is not None and plugin != declared:
+        if plugin is None or plugin == declared:
+            return Marketplace(name=name, root=root, plugins={declared: root}, is_catalog=False)
+        if catalog is None:
             raise PluginSourceError(
                 f"Source for marketplace {name!r} at {root} sets 'plugin: {plugin}' but "
                 f"the plugin there is named {declared!r}."
             )
-        return Marketplace(name=name, root=root, plugins={declared: root}, is_catalog=False)
+        # `plugin:` names neither the root plugin nor nothing — fall through
+        # to the catalog, which is the other thing this repository is. Without
+        # this, the root plugin's name is the only value the key can ever take,
+        # and the ambiguity error above sends every other user into a message
+        # claiming the catalog does not list a plugin it visibly does.
 
     if catalog is not None:
         # A catalog, with `plugin:` narrowing it to one entry. Narrowing
@@ -265,7 +287,6 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
 
 
 __all__ = [
-    "MARKETPLACE_MANIFESTS",
     "Marketplace",
     "find_marketplace_manifest",
     "read_marketplace",

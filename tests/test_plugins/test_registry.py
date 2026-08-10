@@ -483,3 +483,41 @@ class TestMarketplaceEntries:
         )
 
         assert [item.name for item in resolved] == ["prs", "ado"]
+
+
+class TestShadowWarning:
+    """A declared source replacing an installed marketplace must say so.
+
+    ``runtime.plugin_sources``' own docstring promises this. The two may
+    ship different subagents or a different MCP server, so a silent
+    substitution changes what the agent can do with nothing said — the
+    same invisible divergence issue #378 exists to remove.
+    """
+
+    def test_warns_when_a_declared_source_shadows_an_installed_marketplace(
+        self, installed, tmp_path: Path, home: Path
+    ) -> None:
+        from conductor.plugins.marketplace import read_marketplace
+
+        installed("prs", marketplace="acme")
+        make_plugin(tmp_path / "declared", "prs")
+        table = {"acme": read_marketplace(tmp_path / "declared", name="acme")}
+
+        warnings: list[str] = []
+        plugin = resolve_plugin(
+            "prs@acme", home=home, marketplaces=table, on_warning=warnings.append
+        )
+
+        assert plugin.root == tmp_path / "declared"
+        assert any("also installed on this machine" in warning for warning in warnings)
+
+    def test_no_warning_when_nothing_is_shadowed(self, tmp_path: Path, home: Path) -> None:
+        from conductor.plugins.marketplace import read_marketplace
+
+        make_plugin(tmp_path / "declared", "prs")
+        table = {"acme": read_marketplace(tmp_path / "declared", name="acme")}
+
+        warnings: list[str] = []
+        resolve_plugin("prs@acme", home=home, marketplaces=table, on_warning=warnings.append)
+
+        assert warnings == []

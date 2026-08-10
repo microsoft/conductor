@@ -265,7 +265,7 @@ class AgentExecutor:
         # resolving the same entry names against different tables must
         # not share a cached answer.
         self._plugin_cache: dict[
-            tuple[tuple[tuple[str, bool, bool, bool], ...], tuple[str, ...]],
+            tuple[tuple[tuple[str, bool, bool, bool], ...], tuple[tuple[str, str], ...]],
             list[ResolvedPlugin],
         ] = {}
         self.renderer = TemplateRenderer()
@@ -777,15 +777,18 @@ class AgentExecutor:
 
         Memoized per entry list, because resolving a plugin walks its
         ``skills/`` tree and parses every ``*.agent.md`` it ships, and
-        this runs once per agent per call. The marketplace table is part
-        of the key so a differently-sourced ``prs@acme`` cannot hit a
-        cached answer from another table.
+        this runs once per agent per call.
+
+        Each marketplace's *name and root* are part of the key, not just
+        its name: two tables can register one name from different
+        checkouts, and keying on names alone would serve one table's
+        answer to the other.
         """
         from conductor.plugins.registry import resolve_plugins
 
         key = (
             tuple((e.name, e.skills, e.agents, e.mcp) for e in entries),
-            tuple(sorted(self._plugin_marketplaces)),
+            tuple(sorted((name, str(m.root)) for name, m in self._plugin_marketplaces.items())),
         )
         cached = self._plugin_cache.get(key)
         if cached is not None:

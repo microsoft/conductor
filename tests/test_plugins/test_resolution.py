@@ -133,3 +133,41 @@ class TestMarketplacesFrom:
     def test_empty_input(self):
         assert resolve_plugin_sources({}) == {}
         assert marketplaces_from({}) == {}
+
+
+class TestStaleForwarding:
+    """``ResolvedSource.stale`` is how a caller knows the ref was not re-checked.
+
+    Asserted here as well as on ``FetchResult`` because the forwarding
+    between the two is what the CLI reads — without it an offline run
+    would use a stale checkout and say nothing.
+    """
+
+    def test_stale_survives_the_composition_layer(self, tmp_path: Path, plugin_cache_home: Path):
+        import shutil
+
+        from conductor.plugins.fetch import clear_resolution_memo
+
+        repo = tmp_path / "repo"
+        make_plugin(repo, "thing")
+        make_git_repo(repo, tag="v1.0.0")
+        entry = _entry(f"file://{repo}#v1.0.0")
+        resolve_plugin_sources({"acme": entry})
+
+        shutil.rmtree(repo)
+        clear_resolution_memo()
+        warnings: list[str] = []
+        resolved = resolve_plugin_sources({"acme": entry}, on_warning=warnings.append)
+
+        assert resolved["acme"].stale is True
+        assert any("cached checkout" in warning for warning in warnings)
+
+    def test_a_fresh_fetch_is_not_stale(self, tmp_path: Path, plugin_cache_home: Path):
+        repo = tmp_path / "repo"
+        make_plugin(repo, "thing")
+        make_git_repo(repo)
+
+        resolved = resolve_plugin_sources({"acme": _entry(f"file://{repo}")})
+
+        assert resolved["acme"].stale is False
+        assert resolved["acme"].fetched is True

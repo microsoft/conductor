@@ -219,3 +219,74 @@ class TestFindMarketplaceManifest:
 
     def test_absent(self, tmp_path: Path):
         assert find_marketplace_manifest(tmp_path) is None
+
+
+class TestCatalogNarrowing:
+    """``plugin:`` against a catalog, with and without a root plugin.
+
+    The ambiguity error recommends adding ``plugin:``, so that key has to
+    work in both directions — naming the root plugin *and* naming any
+    entry the catalog lists. Checking the root manifest first meant the
+    catalog was never consulted, and every catalog entry was answered
+    with "the plugin there is named <root>" about a manifest that
+    visibly lists it.
+    """
+
+    def test_narrows_a_pure_catalog_to_one_entry(self, tmp_path: Path):
+        make_plugin(tmp_path / "prs", "prs")
+        make_plugin(tmp_path / "ado", "ado")
+        make_marketplace(tmp_path, "acme", {"prs": "./prs", "ado": "./ado"})
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="prs")
+
+        assert marketplace.plugins == {"prs": tmp_path / "prs"}
+        assert marketplace.is_catalog is True
+
+    def test_a_catalog_that_no_longer_ships_the_named_plugin_says_so(self, tmp_path: Path):
+        make_plugin(tmp_path / "prs", "prs")
+        make_marketplace(tmp_path, "acme", {"prs": "./prs"})
+
+        with pytest.raises(PluginNotFoundError, match="It provides: prs"):
+            read_marketplace(tmp_path, name="acme", plugin="gone")
+
+    def test_plugin_key_reaches_a_catalog_entry_in_a_both_shaped_repo(self, tmp_path: Path):
+        make_plugin(tmp_path, "rootplug")
+        make_plugin(tmp_path / "listed", "listed")
+        make_marketplace(tmp_path, "acme", {"listed": "./listed"}, manifest=".github/plugin")
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="listed")
+
+        assert marketplace.plugins == {"listed": tmp_path / "listed"}
+        assert marketplace.is_catalog is True
+
+    def test_plugin_key_still_reaches_the_root_plugin(self, tmp_path: Path):
+        make_plugin(tmp_path, "rootplug")
+        make_plugin(tmp_path / "listed", "listed")
+        make_marketplace(tmp_path, "acme", {"listed": "./listed"}, manifest=".github/plugin")
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="rootplug")
+
+        assert marketplace.plugins == {"rootplug": tmp_path}
+        assert marketplace.is_catalog is False
+
+
+class TestManifestPrecedence:
+    """``.claude-plugin`` is probed before ``.github/plugin``."""
+
+    def test_claude_convention_wins_when_both_are_present(self, tmp_path: Path):
+        make_plugin(tmp_path / "from-claude", "from-claude")
+        make_plugin(tmp_path / "from-github", "from-github")
+        make_marketplace(
+            tmp_path, "claude-side", {"from-claude": "./from-claude"}, manifest=".claude-plugin"
+        )
+        make_marketplace(
+            tmp_path, "github-side", {"from-github": "./from-github"}, manifest=".github/plugin"
+        )
+
+        assert read_marketplace(tmp_path, name="acme").name == "claude-side"
+
+    @pytest.mark.parametrize("convention", [".claude-plugin", ".github/plugin"])
+    def test_found_at_its_exact_path(self, tmp_path: Path, convention: str):
+        make_marketplace(tmp_path, "acme", {}, manifest=convention)
+
+        assert find_marketplace_manifest(tmp_path) == tmp_path / convention / "marketplace.json"

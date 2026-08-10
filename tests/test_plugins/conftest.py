@@ -177,6 +177,30 @@ def make_git_repo(root: Path, *, tag: str | None = None) -> str:
     return completed.stdout.strip()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test in this package off the developer's real ``~``.
+
+    Autouse and package-wide rather than per-class, because the leak is
+    easy to reintroduce and invisible when it happens: resolution reaches
+    ``Path.home()`` from two places that take no fixture —
+    ``fetch.get_plugin_cache_base`` when ``CONDUCTOR_HOME`` is unset, and
+    ``resolve_plugins(home=None)`` for installed-marketplace lookup. A
+    developer with a marketplace installed under a name a fixture also
+    uses would see a test assert the opposite of what it means; the case
+    that caught this asserted a *missing* plugin and passed vacuously
+    because an ambient one satisfied it.
+
+    Tests that need to control the installed set still take the explicit
+    ``home`` fixture and pass it, which this does not interfere with.
+    """
+    home = tmp_path / "isolated-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home / ".conductor"))
+
+
 @pytest.fixture
 def plugin_cache_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the plugin cache at a temporary directory.

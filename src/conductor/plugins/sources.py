@@ -31,18 +31,21 @@ on the other.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from conductor.plugins.errors import PluginSourceError
 
-# A full 40-character git object name. Only an unabbreviated SHA is
-# treated as immutable: an abbreviation is ambiguous by construction (it
+# A full 40-character git object name, either case — a SHA copied from a
+# web UI is often upper-case, and treating it as a floating ref would
+# silently defeat the pin the user was reaching for. Only an
+# unabbreviated SHA is treated as immutable: an abbreviation is ambiguous by construction (it
 # may grow a collision as the repo does), and `git ls-remote` cannot
 # expand one without a network round trip — which is exactly what pinning
 # is meant to avoid.
-FULL_SHA: re.Pattern[str] = re.compile(r"\A[0-9a-f]{40}\Z")
+FULL_SHA: re.Pattern[str] = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 
 # Explicit URL schemes. `git://` is included for completeness; `file://`
 # matters because it is how the test-suite builds real repositories
@@ -87,7 +90,7 @@ def redact_credentials(text: str) -> str:
     return _CREDENTIAL.sub(r"\1***@", text)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class PluginSource:
     """A parsed ``plugin_sources:`` source.
 
@@ -120,13 +123,13 @@ class PluginSource:
     is_local: bool = False
     """Whether this source is a directory on this machine."""
 
-    host: str = ""
+    host: str
     """Host component of the cache key (e.g. ``github.com``)."""
 
-    owner: str = ""
+    owner: str
     """Owner/namespace component of the cache key."""
 
-    repo: str = ""
+    repo: str
     """Repository component of the cache key."""
 
     @property
@@ -145,8 +148,23 @@ class PluginSource:
         A ``PurePosixPath`` rather than a string so callers join it
         instead of concatenating, and so the segment count is fixed no
         matter what the URL looked like.
+
+        The repo segment carries a short digest of the remote URL, because
+        the three-segment shape is lossy: ``_key_from_parts`` joins deeper
+        path components with ``_``, so ``group/subgroup/repo`` and
+        ``group_subgroup/repo`` would otherwise share a directory. Per-SHA
+        checkouts would survive that, but the ref pointer beside them
+        would not — two different repositories floating on ``main`` would
+        overwrite each other's record, and an offline run would be handed
+        the wrong repository's checkout with only a "using the cached
+        checkout" notice.
         """
-        return PurePosixPath(self.host) / self.owner / self.repo
+        return PurePosixPath(self.host) / self.owner / f"{self.repo}-{self._digest}"
+
+    @property
+    def _digest(self) -> str:
+        """Short stable digest of the remote, disambiguating the cache key."""
+        return hashlib.sha256(self.location.encode("utf-8")).hexdigest()[:8]
 
     @property
     def display(self) -> str:
@@ -162,6 +180,33 @@ class PluginSource:
         half.
         """
         return redact_credentials(self.raw)
+
+    def __post_init__(self) -> None:
+        """Enforce that no cache-key segment can escape the cache root.
+
+        The key is joined into a filesystem path and the directory is
+        created with ``parents=True``, so a ``..`` reaching it writes
+        outside the plugin cache — into the sibling registry cache, for
+        instance. Each parse branch checks its own inputs, but a
+        documented-only invariant is the one that quietly stops holding;
+        the same reasoning put a ``__post_init__`` on
+        :class:`~conductor.plugins.manifest.PluginManifest` and
+        :class:`~conductor.plugins.registry.ResolvedPlugin`.
+
+        Deliberately no filesystem probe — establishing that is the
+        producer's job, and state checked in a constructor is a TOCTOU
+        illusion.
+
+        Raises:
+            PluginSourceError: If any key segment is empty or a
+                relative-path component.
+        """
+        for part in self.cache_key.parts:
+            if not part or part in _UNSAFE_SEGMENTS:
+                raise PluginSourceError(
+                    f"PluginSource cache key {self.cache_key} has an unusable segment "
+                    f"{part!r} (it is joined into the plugin cache path), from {self.raw!r}"
+                )
 
     def describe(self) -> str:
         """One-line description for validate output and error messages."""
@@ -288,6 +333,16 @@ def parse_plugin_source(value: str) -> PluginSource:
 
     location, ref = _split_ref(text)
 
+    if location.startswith("-"):
+        # The location is passed to ``git`` as its own argv element, so a
+        # leading dash makes it an option rather than a remote
+        # (``--upload-pack=...``, ``-oProxyCommand=...``). The scp-style
+        # pattern below would otherwise accept both.
+        raise PluginSourceError(
+            f"Source {text!r} starts with '-', which git would read as an option "
+            "rather than a repository."
+        )
+
     if _is_local_path(location):
         if ref is not None:
             raise PluginSourceError(
@@ -295,13 +350,19 @@ def parse_plugin_source(value: str) -> PluginSource:
                 "is read in place and has no ref to check out; point at a git remote "
                 "to pin one, or drop the ref."
             )
+        repo = Path(location).name or "_"
+        if repo in _UNSAFE_SEGMENTS:
+            raise PluginSourceError(
+                f"Source {text!r} ends in a '.' or '..' path component, which would "
+                "escape the plugin cache directory."
+            )
         return PluginSource(
             raw=text,
             location=location,
             is_local=True,
             host=_LOCAL_HOST,
             owner="_",
-            repo=Path(location).name or "_",
+            repo=repo,
         )
 
     if location.startswith(_URL_SCHEMES):

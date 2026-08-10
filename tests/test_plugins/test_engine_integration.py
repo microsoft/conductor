@@ -468,3 +468,104 @@ class TestSubworkflowSources:
         _run(self._parent(tmp_path, {}), provider, _workflow_file(tmp_path), via_registry=True)
 
         assert [spec["name"] for spec in provider.custom_agents or []] == ["ado:work-items"]
+
+
+class TestSourcedPluginsInSingleProviderMode:
+    """The single-provider engine path (issue #380 review follow-up).
+
+    ``WorkflowEngine(config, provider)`` builds its executor in the
+    constructor, before ``run()`` can resolve ``plugin_sources`` — so the
+    table arrives afterwards via ``set_plugin_marketplaces``. Every other
+    sourced-plugin test passes ``via_registry=True``, which builds a fresh
+    executor per agent and never exercises that seam. It is the documented
+    embedding API (see the ``WorkflowEngine`` class docstring), and
+    without a test the whole method could be deleted with the suite green.
+    """
+
+    def test_components_arrive_without_a_registry(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(
+            tmp_path / "catalog" / "prs",
+            "prs",
+            skills=["review"],
+            agents=["code-reviewer"],
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        provider = _CapturingProvider()
+
+        _run(
+            _sourced_config({"acme": "./catalog"}, ["prs@acme"]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=False,
+        )
+
+        assert provider.skill_directories == [
+            str(tmp_path / "catalog" / "prs" / "skills" / "review")
+        ]
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+
+class TestSubworkflowMarketplaceMerge:
+    """Both halves of the parent/child merge (issue #380 review follow-up).
+
+    The existing pair of tests each reach only one side: one child
+    declares nothing (so ``_resolve_child_marketplaces`` returns early),
+    the other has an empty parent table (so the child's own sources are
+    resolved by ``_ensure_plugin_marketplaces`` instead). Neither runs the
+    merge itself.
+    """
+
+    def test_child_sees_both_its_own_and_the_parents_sources(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "parent" / "prs", "prs", agents=["code-reviewer"])
+        make_marketplace(tmp_path / "parent", "acme", {"prs": "./prs"})
+        make_plugin(tmp_path / "own" / "ado", "ado", agents=["work-items"])
+        make_marketplace(tmp_path / "own", "mine", {"ado": "./ado"})
+        TestSubworkflowSources._write_child(
+            tmp_path,
+            "    plugin_sources:\n      mine: ./own\n",
+            "    plugins:\n      - ado@mine\n      - prs@acme\n",
+        )
+        provider = _CapturingProvider()
+
+        _run(
+            TestSubworkflowSources._parent(tmp_path, {"acme": "./parent"}),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=True,
+        )
+
+        assert sorted(spec["name"] for spec in provider.custom_agents or []) == [
+            "ado:work-items",
+            "prs:code-reviewer",
+        ]
+
+    def test_a_child_source_wins_a_name_clash_with_its_parent(self, tmp_path: Path) -> None:
+        """The child is the file being run, so its declaration is the one
+        the author of that file wrote."""
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "parent" / "prs", "prs", agents=["parent-agent"])
+        make_marketplace(tmp_path / "parent", "acme", {"prs": "./prs"})
+        make_plugin(tmp_path / "child" / "prs", "prs", agents=["child-agent"])
+        make_marketplace(tmp_path / "child", "acme", {"prs": "./prs"})
+        TestSubworkflowSources._write_child(
+            tmp_path,
+            "    plugin_sources:\n      acme: ./child\n",
+            "    plugins:\n      - prs@acme\n",
+        )
+        provider = _CapturingProvider()
+
+        _run(
+            TestSubworkflowSources._parent(tmp_path, {"acme": "./parent"}),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=True,
+        )
+
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:child-agent"]

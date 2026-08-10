@@ -21,10 +21,23 @@ runner = CliRunner()
 
 @pytest.fixture(autouse=True)
 def _isolated_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Point the plugin cache at a temp directory, never the real ``~``."""
+    """Point the plugin cache *and* the home directory at temp dirs.
+
+    ``CONDUCTOR_HOME`` alone is not enough: ``resolve_plugins(home=None)``
+    still globs ``~/.copilot/installed-plugins``, so a marketplace the
+    developer has installed could satisfy a reference these tests expect
+    to fail. The memo is cleared on both sides of the test so a resolved
+    ref cannot leak in either direction.
+    """
     from conductor.plugins.fetch import clear_resolution_memo
 
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor-home"))
+    clear_resolution_memo()
+    yield
     clear_resolution_memo()
 
 
@@ -177,7 +190,13 @@ class TestList:
         assert "prs:code-reviewer" in result.output
 
     def test_never_fetches(self, tmp_path: Path) -> None:
-        """The whole reason ``fetch`` is a separate verb."""
+        """The whole reason ``fetch`` is a separate verb.
+
+        A cold cache is reported, not repaired: nothing is cloned, and
+        the message names the verb that would. Exit stays 0 because this
+        is a listing — it prints what it could read, and a source it
+        could not read costs one line rather than the whole report.
+        """
         repo = tmp_path / "repo"
         _plugin(repo / "prs", "prs")
         _catalog(repo, "acme", {"prs": "./prs"})
@@ -186,8 +205,25 @@ class TestList:
 
         result = runner.invoke(app, ["plugin", "list", str(workflow)])
 
-        assert result.exit_code == 1
+        assert result.exit_code == 0, result.output
         assert "conductor plugin fetch" in result.output
+        cache = tmp_path / "conductor-home" / "cache" / "plugins"
+        assert not cache.exists() or not any(cache.rglob("*.ready"))
+
+    def test_one_unreadable_source_does_not_hide_the_others(self, tmp_path: Path) -> None:
+        """A report must not lose its healthy rows to a broken sibling."""
+        _plugin(tmp_path / "vendor" / "mine", "mine", agents=["helper"])
+        workflow = _workflow(
+            tmp_path / "wf.yaml",
+            {"local": "./vendor/mine", "broken": "./does-not-exist"},
+            ["mine@local"],
+        )
+
+        result = runner.invoke(app, ["plugin", "list", str(workflow)])
+
+        assert result.exit_code == 0, result.output
+        assert "mine:helper" in result.output
+        assert "broken" in result.output
 
     def test_works_with_a_local_source(self, tmp_path: Path) -> None:
         _plugin(tmp_path / "vendor" / "mine", "mine", agents=["helper"])
@@ -268,3 +304,48 @@ class TestRunPrefetch:
 
         with pytest.raises(PluginError):
             asyncio.run(_prefetch_plugin_sources(config, workflow))
+
+
+class TestValidateReportsSources:
+    """``conductor validate``'s plugin summary (issue #380 review follow-up).
+
+    ``cli/validate.py::_report_plugins`` holds its own copy of the
+    per-source resolution loop, and it is the only place the resolved
+    commit is printed. No test invoked ``conductor validate`` against a
+    workflow declaring ``plugin_sources``, so the same all-or-nothing bug
+    could live on there with the suite green.
+    """
+
+    def test_the_summary_lists_sources_and_component_counts(self, tmp_path: Path) -> None:
+        _plugin(tmp_path / "vendor" / "mine", "mine", agents=["helper"])
+        workflow = _workflow(tmp_path / "wf.yaml", {"local": "./vendor/mine"}, ["mine@local"])
+
+        result = runner.invoke(app, ["validate", str(workflow)])
+
+        assert result.exit_code == 0, result.output
+        assert "Plugin sources: 1 declared" in result.output
+        assert "mine:helper" in result.output
+
+    def test_one_unfetched_source_does_not_erase_the_summary(self, tmp_path: Path) -> None:
+        """The healthy plugin's counts must survive a broken sibling."""
+        _plugin(tmp_path / "vendor" / "mine", "mine", agents=["helper"])
+        workflow = _workflow(
+            tmp_path / "wf.yaml",
+            {"local": "./vendor/mine", "remote": "acme/never-fetched#v1.0.0"},
+            ["mine@local", "prs@remote"],
+        )
+
+        result = runner.invoke(app, ["validate", str(workflow)])
+
+        assert "mine:helper" in result.output
+        assert "conductor plugin fetch" in result.output
+
+    def test_a_broken_source_fails_validation(self, tmp_path: Path) -> None:
+        """A path that does not exist is the author's mistake, not the
+        machine's — so it must not pass with exit 0."""
+        workflow = _workflow(tmp_path / "wf.yaml", {"gone": "./nowhere"}, ["thing@gone"])
+
+        result = runner.invoke(app, ["validate", str(workflow)])
+
+        assert result.exit_code == 1
+        assert "unusable" in result.output
