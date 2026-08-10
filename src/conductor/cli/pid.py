@@ -164,7 +164,20 @@ def write_pid_file(
         "log_file": log_file,
     }
 
-    filepath.write_text(json.dumps(data, indent=2))
+    # Written atomically. ``write_text`` truncates and then streams, so a reader
+    # landing inside that window sees a partial file — and every reader here
+    # treats unparseable JSON as a dead run and unlinks it, which silently
+    # deregisters a live workflow. Rename is atomic on POSIX and on Windows for
+    # a same-directory replace, so a reader sees either the old file or the new
+    # one and never a half-written one. The temp name ends in ``.tmp`` so it is
+    # not picked up by the ``*.pid`` glob in :func:`read_pid_files`.
+    tmp = filepath.with_name(f"{filepath.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, filepath)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     logger.debug("Wrote PID file: %s", filepath)
     return filepath
 
@@ -185,13 +198,18 @@ def read_pid_files() -> list[dict]:
     for f in d.glob("*.pid"):
         try:
             data = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            # Corrupted or unreadable — remove silently
+        except (json.JSONDecodeError, OSError) as exc:
+            # Deleting a file we could not read is a destructive act taken on
+            # incomplete information, so it says so. The write side is atomic
+            # now, which removes the common cause, but a genuinely corrupt file
+            # still costs someone a background run they will want to explain.
+            logger.warning("Removing unreadable PID file %s: %s", f, exc)
             f.unlink(missing_ok=True)
             continue
 
         pid = data.get("pid")
         if pid is None:
+            logger.warning("Removing PID file with no 'pid' field: %s", f)
             f.unlink(missing_ok=True)
             continue
 

@@ -35,6 +35,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`conductor stop` now confirms the process actually stopped, and never
+  stops the wrong one** (#344). `stop` sent one signal and reported success
+  without checking, so a workflow that ignored it was reported as stopped and
+  its PID file deleted — leaving a live run untracked, invisible to `stop`,
+  and holding its port. Termination is now a ladder (ask the dashboard to
+  cancel, then signal, then force-terminate), each rung confirmed before the
+  next, and the PID file is removed only once the process is confirmed gone.
+  Every PID-directed rung is gated on the dashboard confirming its own PID,
+  because between a PID file being written and `stop` reading it the OS may
+  have recycled that PID onto an unrelated process. `--force` overrides
+  *uncertainty* only: a positive identity mismatch blocks every rung, force
+  included. PID files are written atomically, so a concurrent `stop` can no
+  longer read a half-written file and deregister a live run, and the reader
+  logs before deleting anything it cannot parse. `--force` can clear an entry
+  whose liveness cannot be probed, which would otherwise wedge `stop --all`
+  at exit 2 permanently (#166).
 - **`conductor resume --web` no longer shows a running workflow as stopped** —
   a workflow that was paused from the dashboard (Stop, then Kill) recorded an
   `agent_paused` event in its event log with no `agent_resumed` counterpart.

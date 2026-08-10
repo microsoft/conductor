@@ -1245,6 +1245,26 @@ def stop(
             # Identity-checked: only remove the file if it still describes the
             # process we just stopped, never merely "the file for this port".
             remove_pid_file_at(entry["file"], entry["pid"])
+        elif force and result["outcome"] == "unconfirmed" and result["rung"] == "terminate":
+            # The #166 escape hatch. Reaching here means the liveness probe
+            # itself failed, so we genuinely cannot say whether the process
+            # died. Left in place the entry is permanent: bare ``stop`` stays
+            # ambiguous and ``stop --all`` exits 2 for good, so a CI teardown
+            # never recovers. ``--force`` is the operator accepting that risk,
+            # so honour it — loudly, because the process may still be alive.
+            #
+            # Deliberately narrow. It does not fire for ``refused`` (we chose
+            # not to act), for ``mismatched`` (the PID is someone else's), or
+            # for ``survived`` (the process is demonstrably alive, and removing
+            # its file would orphan it).
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] removing the PID file for workflow "
+                f"[cyan]'{result['workflow']}'[/cyan] (PID {result['pid']}, port "
+                f"{result['port']}) without confirming it stopped, because --force was "
+                f"given and its liveness could not be probed. If that process is still "
+                f"alive it is now untracked and must be stopped by hand."
+            )
+            remove_pid_file_at(entry["file"], entry["pid"])
 
     if json_output:
         payload = {
@@ -1427,18 +1447,20 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
         )
         return _result("stopped", "api-kill")
 
-    # Rung 2 — polite signal. Best-effort on both platforms. Skipped only on a
-    # positive mismatch: an unconfirmable identity is not evidence of anything,
-    # and refusing to signal there would be a regression for PID files written
-    # by older versions, where a signal is all the previous code ever sent.
-    if identity is Identity.MISMATCHED and not force:
+    # Rung 2 — polite signal. Best-effort on both platforms. Skipped on a
+    # positive mismatch, and ``--force`` does not lift that: ``--force``
+    # overrides *uncertainty*, never positive evidence that this PID belongs to
+    # someone else. An unconfirmable identity is not evidence of anything, and
+    # refusing to signal there would be a regression for PID files written by
+    # older versions, where a signal is all the previous code ever sent.
+    if identity is Identity.MISMATCHED:
         con.print(
             f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
             f"(PID {pid}, port {port}): the process on that port is a different run, "
             f"so nothing was signalled."
         )
         con.print("[dim]The PID file has been left in place.[/dim]")
-        return _result("unconfirmed", "refused")
+        return _result("mismatched", "refused")
 
     _signal_process(pid)
     if wait_for_exit(pid, _SIGNAL_TIMEOUT) is Liveness.DEAD:
@@ -1448,11 +1470,20 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
         return _result("stopped", "signal")
 
     # Rung 3 — forceful, and irreversible. Re-confirm identity immediately
-    # beforehand: several seconds of waiting have elapsed since the first
-    # check, and if the target died in that window its PID could now belong to
-    # an unrelated process.
-    if not force:
-        identity = _confirm_identity(entry, con)
+    # beforehand, *including* under ``--force``: several seconds of waiting have
+    # elapsed since the first check, and if the target died in that window its
+    # PID could now belong to an unrelated process. That window is precisely
+    # what ``--force`` must not paper over, because this is the rung that cannot
+    # be taken back.
+    identity = _confirm_identity(entry, con)
+    if identity is Identity.MISMATCHED:
+        con.print(
+            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
+            f"(PID {pid}, port {port}): the process on that port is a different run, "
+            f"so it was not force-terminated."
+        )
+        con.print("[dim]The PID file has been left in place.[/dim]")
+        return _result("mismatched", "refused")
     if not (identity is Identity.CONFIRMED or force):
         con.print(
             f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "

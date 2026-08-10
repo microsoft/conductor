@@ -149,6 +149,60 @@ class TestSurvivingRunIsNotOrphaned:
         remaining = sorted(json.loads(p.read_text())["port"] for p in pid_tmpdir.glob("*.pid"))
         assert remaining == [9090], "only the confirmed-dead run should be deregistered"
 
+    def test_force_can_clear_an_entry_whose_liveness_cannot_be_probed(
+        self, pid_tmpdir: Path
+    ) -> None:
+        """Otherwise an unprobeable entry wedges ``stop`` permanently (#166).
+
+        When the liveness probe itself fails we cannot say whether the process
+        died, so the file is kept — correctly. But nothing could then ever
+        remove it: bare ``stop`` stays ambiguous and ``stop --all`` exits 2 for
+        good, so a CI teardown never recovers. ``--force`` is the operator
+        accepting that risk.
+        """
+        write_pid_file(4242, 8080, "/tmp/my-workflow.yaml", run_id=_RUN_ID)
+
+        with (
+            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.UNKNOWN),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=True),
+            patch("conductor.cli.app._signal_process"),
+        ):
+            result = runner.invoke(app, ["stop", "--port", "8080", "--force"])
+
+        assert list(pid_tmpdir.glob("*.pid")) == [], (
+            "--force must be able to clear an entry the probe cannot resolve, or "
+            "the entry is permanent"
+        )
+        # Still a failure: we cleared the record, we did not confirm a stop.
+        assert result.exit_code == 2
+
+    def test_force_does_not_clear_a_demonstrably_surviving_run(self, pid_tmpdir: Path) -> None:
+        """The escape hatch is for *uncertainty*, not for a live process.
+
+        ``survived`` means terminate ran and the process is still there.
+        Removing its file would orphan it — the exact bug this PR fixes — so
+        ``--force`` must not widen into that case.
+        """
+        write_pid_file(4242, 8080, "/tmp/my-workflow.yaml", run_id=_RUN_ID)
+
+        with (
+            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=True),
+            patch("conductor.cli.app._signal_process"),
+        ):
+            result = runner.invoke(app, ["stop", "--port", "8080", "--force"])
+
+        assert result.exit_code == 2
+        assert list(pid_tmpdir.glob("*.pid")), "a live process must stay tracked even under --force"
+
 
 class TestLadderOutcomes:
     """Each rung reports honestly which one actually worked."""
@@ -271,6 +325,57 @@ class TestForcefulTerminationRequiresIdentity:
         assert result["rung"] == "terminate"
         terminate.assert_called_once()
 
+    def test_force_does_not_override_a_positive_mismatch(self) -> None:
+        """``--force`` overrides uncertainty, never evidence of the wrong PID.
+
+        A MISMATCHED identity is not "we could not tell" — it is the dashboard
+        on that port reporting a different PID than the file records, which is
+        positive proof the PID was recycled onto an unrelated process. Killing
+        it is the exact failure this PR exists to prevent, so ``--force`` must
+        not reach it. Without this test the ladder signalled *and* force-killed
+        that process while printing "Refusing to act on it", then reported
+        ``stopped`` and exited 0.
+        """
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.MISMATCHED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=True) as graceful,
+            patch("conductor.cli.app._signal_process") as sig,
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD) as terminate,
+        ):
+            result = _stop_process(_entry(), _quiet(), force=True)
+
+        assert result["outcome"] == "mismatched"
+        assert result["rung"] == "refused"
+        graceful.assert_not_called()
+        sig.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_force_reconfirms_identity_before_the_irreversible_rung(self) -> None:
+        """The recycle window is not something ``--force`` may skip.
+
+        Rung 3 is irreversible, and seconds of waiting elapse before it. If the
+        target dies in that window its PID can land on an unrelated process, so
+        the re-check must happen under ``--force`` too — previously it was
+        skipped precisely when the consequences were worst.
+        """
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch(
+                "conductor.cli.app._confirm_identity",
+                side_effect=[Identity.UNCONFIRMED, Identity.MISMATCHED],
+            ) as ident,
+            patch("conductor.cli.app._signal_process"),
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD) as terminate,
+        ):
+            result = _stop_process(_entry(), _quiet(), force=True)
+
+        assert ident.call_count == 2
+        assert result["outcome"] == "mismatched"
+        terminate.assert_not_called()
+
     def test_confirmed_identity_escalates_to_terminate(self) -> None:
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
@@ -314,7 +419,10 @@ class TestForcefulTerminationRequiresIdentity:
         ):
             result = _stop_process(_entry(), _quiet())
 
-        assert result["outcome"] == "unconfirmed"
+        # ``mismatched`` rather than ``unconfirmed``: this outcome carries
+        # positive evidence about the PID, and reporting it as "could not
+        # confirm" understates what the identity probe actually established.
+        assert result["outcome"] == "mismatched"
         sig.assert_not_called()
         term.assert_not_called()
 
@@ -358,7 +466,10 @@ class TestForcefulTerminationRequiresIdentity:
             result = _stop_process(_entry(), _quiet())
 
         assert ident.call_count == 2
-        assert result["outcome"] == "unconfirmed"
+        # ``mismatched`` rather than ``unconfirmed``: the second probe returned
+        # positive evidence the PID belongs to someone else, which is knowledge,
+        # not the absence of it.
+        assert result["outcome"] == "mismatched"
         term.assert_not_called()
 
 
