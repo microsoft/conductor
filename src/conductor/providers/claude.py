@@ -274,7 +274,14 @@ class ClaudeProvider(AgentProvider):
             client_kwargs["auth_token"] = self._auth_token
         if self._base_url is not None:
             client_kwargs["base_url"] = self._base_url
-        if "api_key" in client_kwargs and "auth_token" in client_kwargs:
+        both_passed = "api_key" in client_kwargs and "auth_token" in client_kwargs
+        both_from_env = (
+            self._api_key is None
+            and self._auth_token is None
+            and bool(os.environ.get("ANTHROPIC_API_KEY"))
+            and bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+        )
+        if both_passed or both_from_env:
             logger.warning(
                 "Both api_key and auth_token are set; the Anthropic SDK sends both "
                 "X-Api-Key and Authorization: Bearer headers on every request, so "

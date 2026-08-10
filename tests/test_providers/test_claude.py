@@ -137,6 +137,32 @@ class TestClaudeProviderInitialization:
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
     @patch("conductor.providers.claude.anthropic")
+    def test_init_with_both_env_credentials_warns(
+        self,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Both credentials from the environment alone must also warn."""
+        # Requirement: the SDK resolves env credentials internally, so an
+        # env-only dual setup would otherwise send both headers before any
+        # agent execution warning could fire.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        with caplog.at_level("WARNING"):
+            ClaudeProvider()
+
+        assert any("Both api_key and auth_token" in r.message for r in caplog.records)
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
     @patch("conductor.providers.claude.logger")
     def test_sdk_version_warning_old_version(
         self,
