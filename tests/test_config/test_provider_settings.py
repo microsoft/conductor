@@ -94,6 +94,34 @@ class TestProviderSettingsValidation:
         assert s.base_url == "https://my-gateway.example.com/api/v1"
         assert s.auth_token.get_secret_value() == "dapi-abc123"
 
+    def test_claude_structured_fields_accepted(self) -> None:
+        # ProviderSettings accepts base_url and api_key for name="claude".
+        s = ProviderSettings(
+            name="claude",
+            base_url="https://example.com/api/v1",
+            api_key="sk-secret",
+        )
+        assert s.base_url == "https://example.com/api/v1"
+        assert isinstance(s.api_key, SecretStr)
+        assert s.api_key.get_secret_value() == "sk-secret"
+        assert s.has_custom_routing()
+
+    def test_claude_api_key_and_auth_token_coexist(self) -> None:
+        # api_key and auth_token may both be set for name="claude" without conflict.
+        s = ProviderSettings(
+            name="claude",
+            base_url="https://example.com/api/v1",
+            api_key="sk-secret",
+            auth_token="bt-secret",
+        )
+        assert s.api_key.get_secret_value() == "sk-secret"
+        assert s.auth_token.get_secret_value() == "bt-secret"
+
+    def test_claude_empty_api_key_rejected(self) -> None:
+        # Empty api_key must raise ValidationError rather than silently normalize to None.
+        with pytest.raises(ValidationError, match="'api_key' is empty"):
+            ProviderSettings(name="claude", api_key="")
+
     def test_auth_token_on_non_claude_rejected(self) -> None:
         with pytest.raises(ValidationError, match="only supported when name='claude'"):
             ProviderSettings(name="copilot", auth_token="some-token", base_url="http://x/v1")
@@ -199,6 +227,15 @@ class TestProviderSettingsSerialization:
         dumped = rc.model_dump(mode="json", exclude_none=True)
         # Pydantic SecretStr renders as "**********" in model_dump
         assert dumped["provider"]["api_key"] == "**********"
+
+    def test_claude_api_key_redacted_in_json_dump(self) -> None:
+        # SecretStr redaction covers model_dump output only; literal secrets in
+        # YAML still leak via yaml_source in workflow_started, so ${ENV_VAR}
+        # interpolation is required for true secrecy.
+        s = ProviderSettings(name="claude", api_key="sk-secret")
+        dumped = s.model_dump(mode="json")
+        assert dumped["api_key"] == "**********"
+        assert "sk-secret" not in str(dumped)
 
 
 class TestHermesProviderSettings:
