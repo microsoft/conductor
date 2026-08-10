@@ -61,9 +61,15 @@ output:
 # with the following. Note that supplying auth_token means ANTHROPIC_API_KEY
 # is ignored.
 #
+# base_url note: the Anthropic SDK appends ``/v1/messages`` itself, so whether
+# the suffix belongs in base_url depends on the proxy. LiteLLM-style gateways
+# expect base_url WITHOUT ``/v1`` (otherwise requests land on
+# ``/v1/v1/messages``); some gateways (e.g. Databricks AI Gateway) require
+# the ``/v1`` prefix in base_url. Check your gateway's docs.
+#
 #   runtime:
 #     provider:
 #       name: claude
-#       base_url: ${ANTHROPIC_BASE_URL:-https://gateway.example.com/v1}
+#       base_url: ${ANTHROPIC_BASE_URL:-https://gateway.example.com}
 #       auth_token: ${ANTHROPIC_AUTH_TOKEN:-placeholder-token}
 #     default_model: claude-sonnet-4-5

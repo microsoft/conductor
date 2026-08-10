@@ -136,7 +136,7 @@ workflow:
   runtime:
     provider:
       name: claude
-      base_url: "https://gateway.example.com/v1"
+      base_url: "https://gateway.example.com"
       auth_token: "${GATEWAY_TOKEN}"
       # For an endpoint that expects an Anthropic key instead, use api_key
       # and omit auth_token. Do not set both.
@@ -145,13 +145,14 @@ workflow:
 
 | Field | Description | Env Fallback |
 |-------|-------------|--------------|
-| `base_url` | Custom Anthropic-compatible endpoint URL | `ANTHROPIC_BASE_URL` |
+| `base_url` | Custom Anthropic-compatible endpoint URL. The SDK appends `/v1/messages` itself — whether the `/v1` prefix belongs in `base_url` depends on the gateway (see the note below) | `ANTHROPIC_BASE_URL` |
 | `api_key` | Key sent in `x-api-key` header | `ANTHROPIC_API_KEY` |
 | `auth_token` | Token sent in `Authorization: Bearer` header | `ANTHROPIC_AUTH_TOKEN` |
 
 ### Configuration Rules and Precedence
 
 - **`base_url` precedence**: YAML `base_url` overrides `ANTHROPIC_BASE_URL`; when omitted, the env var is used.
+- **`base_url` and the `/v1` prefix**: the Anthropic SDK appends `/v1/messages` (and `/v1/...` for other endpoints) to `base_url` itself. LiteLLM-style gateways therefore expect `base_url` **without** `/v1` — a `base_url` of `https://gateway.example.com/v1` would send requests to `/v1/v1/messages`. Some gateways (e.g. Databricks AI Gateway) do require the `/v1` prefix in `base_url`. Check your gateway's documentation.
 - **Credential precedence**: `api_key` and `auth_token` are resolved together, not independently. Setting **either** in YAML makes the Anthropic SDK skip environment-variable credential resolution entirely, so a YAML `auth_token` also suppresses `ANTHROPIC_API_KEY`, and vice versa. If you set one credential in YAML and expect the other from the environment, it resolves to `None` with no warning.
 - **Authentication header selection**: Use `api_key` for standard Anthropic keys (`x-api-key` header). Use `auth_token` for gateways expecting bearer authentication (`Authorization: Bearer` header). **Set exactly one.** If both are configured, the Anthropic SDK does not choose between them: it sends `X-Api-Key` and `Authorization: Bearer` on every request, so your Anthropic key reaches whatever `base_url` points at. Conductor forwards both without arbitrating and logs a warning.
 
@@ -171,7 +172,7 @@ workflow:
   runtime:
     provider:
       name: claude
-      base_url: "https://litellm.internal.company.com/v1"
+      base_url: "https://litellm.internal.company.com"
       auth_token: "${GATEWAY_BEARER_TOKEN}"
     default_model: claude-sonnet-4.5
 
