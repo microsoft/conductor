@@ -8,6 +8,7 @@ The Claude provider enables Conductor workflows to use Anthropic's Claude models
 - [Architecture & Internal Design](#architecture--internal-design)
 - [Behavioral & Migration Notes](#behavioral--migration-notes)
 - [API Key Setup](#api-key-setup)
+- [Custom Endpoints and Gateways](#custom-endpoints-and-gateways)
 - [Model Selection](#model-selection)
 - [Runtime Configuration](#runtime-configuration)
 - [System Prompt](#system-prompt)
@@ -122,6 +123,80 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 ```bash
 echo '.env' >> .gitignore
+```
+
+## Custom Endpoints and Gateways
+
+You can route Claude requests through custom API gateways, LiteLLM proxies, or enterprise endpoints such as Databricks AI Gateway. Configure these targets by passing a structured `provider` object under `runtime`.
+
+### Provider Options
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude
+      base_url: "https://gateway.example.com/v1"
+      api_key: "${ANTHROPIC_API_KEY}"
+      auth_token: "${GATEWAY_TOKEN}"
+```
+
+| Field | Description | Env Fallback |
+|-------|-------------|--------------|
+| `base_url` | Custom Anthropic-compatible endpoint URL | `ANTHROPIC_BASE_URL` |
+| `api_key` | Key sent in `x-api-key` header | `ANTHROPIC_API_KEY` |
+| `auth_token` | Token sent in `Authorization: Bearer` header | `ANTHROPIC_AUTH_TOKEN` |
+
+### Configuration Rules and Precedence
+
+- **YAML precedence over environment variables**: Setting a field in YAML overrides its corresponding environment variable (`api_key` in YAML overrides `ANTHROPIC_API_KEY`, `auth_token` overrides `ANTHROPIC_AUTH_TOKEN`, and `base_url` overrides `ANTHROPIC_BASE_URL`).
+- **Authentication header selection**: Use `api_key` for standard Anthropic keys (`x-api-key` header). Use `auth_token` for gateways expecting bearer authentication (`Authorization: Bearer` header). If both `api_key` and `auth_token` are configured, Conductor passes both parameters directly to the Anthropic SDK, which handles client authorization. Pick the single option your endpoint requires; `auth_token` is designed for bearer proxies.
+
+### Security Warning
+
+Secrets must always use environment variable interpolation (such as `${ANTHROPIC_API_KEY}` or `${GATEWAY_TOKEN}`), never literal string values. Conductor embeds raw workflow source code inside the `yaml_source` attribute of `workflow_started` events. Hardcoding a literal secret key in YAML exposes it in JSONL event logs and the web dashboard.
+
+### Example Configurations
+
+#### Example 1: LiteLLM or Enterprise Gateway (Bearer Auth)
+
+To route requests through a LiteLLM proxy or Databricks AI Gateway using `base_url` and `auth_token`:
+
+```yaml
+workflow:
+  name: gateway-workflow
+  runtime:
+    provider:
+      name: claude
+      base_url: "https://litellm.internal.company.com/v1"
+      auth_token: "${GATEWAY_BEARER_TOKEN}"
+    default_model: claude-sonnet-4.5
+
+agents:
+  - name: processor
+    prompt: "Process this input: {{ workflow.input.text }}"
+    routes:
+      - to: $end
+```
+
+#### Example 2: Direct Anthropic Endpoint with YAML Key
+
+To target the standard Anthropic endpoint while managing `api_key` in YAML:
+
+```yaml
+workflow:
+  name: direct-anthropic-workflow
+  runtime:
+    provider:
+      name: claude
+      api_key: "${ANTHROPIC_API_KEY}"
+    default_model: claude-sonnet-4.5
+
+agents:
+  - name: processor
+    prompt: "Summarize: {{ workflow.input.text }}"
+    routes:
+      - to: $end
 ```
 
 ## Model Selection
