@@ -18,6 +18,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run's dashboard URL, which is otherwise unrecoverable once the launching
   terminal is gone, and `--json` makes it scriptable. A malformed PID file is
   skipped with a warning rather than taking down the listing.
+- **Git-backed plugin sources** (#380). `runtime.plugins` alone resolves
+  against machine state — an installed plugin name, or a path — so a workflow
+  shared with a teammate still needed "first install these plugins" in a
+  README, and a teammate who skipped that step got a hard error rather than a
+  working run. `runtime.plugin_sources` maps a marketplace name to where it
+  comes from (`owner/repo#v1.4.0`, any http/https/ssh or `git@host:path`
+  remote, or a local path), and `plugins:` entries reference it as
+  `prs@acme`. The split follows the Copilot CLI's own settings, which
+  separate `extraKnownMarketplaces` from `enabledPlugins` — eleven plugins
+  commonly come from one repository, so inlining a URL per entry would either
+  clone it eleven times or silently pick one of eleven refs. The load-bearing
+  property is that `prs@acme` means the same thing whether the marketplace
+  was declared, installed via a CLI, or is a local directory: a declared
+  source registers its name into the same resolution table the installed
+  roots populate, so git *feeds* resolution rather than adding a second code
+  path. It also gives the ambiguity error added in #378 a second remedy —
+  qualify `git` as `git@acme` instead of falling back to a path. Both
+  repository shapes are handled: a `marketplace.json` catalog or a
+  `plugin.json` single plugin, with a `plugin:` key for a repository that is
+  both. There is **no lockfile** — the YAML is the lock. A ref that is a full
+  40-character SHA is pinned and fetched once; a tag, branch, or absent ref
+  floats and is re-resolved every run, matching how workflow registries
+  already behave. `conductor run` acquires sources up front and in parallel;
+  `conductor plugin fetch` primes the cache as its own step, which is what
+  keeps `conductor validate` off the network entirely; `conductor plugin
+  list` reports what a run would load, including the component counts that
+  make a change in what a plugin ships visible. An unreachable remote with a
+  warm cache warns and reuses the checkout, so offline runs keep working.
+  Checkouts are cached under `$CONDUCTOR_HOME/cache/plugins/`, keyed by
+  resolved commit. Cloning shells out to `git`, so existing SSH keys and
+  credential helpers apply and self-hosted forges work.
+
+  Sources are resolved one at a time, so a source that is unfetched or
+  broken costs its own diagnostic rather than the report for every healthy
+  source beside it. The two are distinguished: an *unfetched* source is a
+  warning naming `conductor plugin fetch`, since `conductor run` heals it,
+  while a source that is itself wrong — a path that does not exist, a
+  `path:` that escapes the checkout, an unparseable catalog — is an error,
+  because no amount of fetching fixes it. A declared source that shadows a
+  same-named installed marketplace is reported, since the two can ship
+  different subagents or a different MCP server. See
+  `examples/plugin-sources.yaml` and the Plugins section of
+  `docs/workflow-syntax.md`.
 - **Output field constraints — `enum`, `pattern`, `minimum`/`maximum`,
   `minLength`/`maxLength`, `required`, `nullable`**
   ([#372](https://github.com/microsoft/conductor/pull/372)). An `output:` field

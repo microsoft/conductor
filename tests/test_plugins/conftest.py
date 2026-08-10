@@ -8,7 +8,9 @@ choice :mod:`conductor.skills.discovery` made for discovery.
 
 from __future__ import annotations
 
+import functools
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -101,6 +103,120 @@ def make_plugin(
     if commands:
         (root / "commands").mkdir(exist_ok=True)
     return root
+
+
+def make_marketplace(
+    root: Path,
+    name: str,
+    plugins: dict[str, str],
+    *,
+    manifest: str = ".claude-plugin",
+    plugin_root: str | None = None,
+) -> Path:
+    """Write a marketplace *catalog* manifest and return its root.
+
+    Only the manifest — callers create the plugin trees themselves, which
+    is what lets a test point ``source`` at a directory that does or does
+    not hold a plugin.
+
+    Args:
+        root: Directory to write the catalog into.
+        name: Marketplace name.
+        plugins: Plugin name to the ``source`` string recorded for it.
+        manifest: ``".claude-plugin"`` or ``".github/plugin"``. The two
+            conventions anchor ``source`` differently in the wild, which
+            is why both are exercised.
+        plugin_root: Optional ``metadata.pluginRoot``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    metadata: dict = {}
+    if plugin_root is not None:
+        metadata["pluginRoot"] = plugin_root
+    document = {
+        "name": name,
+        "metadata": metadata,
+        "plugins": [{"name": key, "source": value} for key, value in plugins.items()],
+    }
+    manifest_dir = root / manifest
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "marketplace.json").write_text(json.dumps(document), encoding="utf-8")
+    return root
+
+
+def make_git_repo(root: Path, *, tag: str | None = None) -> str:
+    """Commit whatever is under ``root`` and return the commit SHA.
+
+    Tests fetch over ``file://`` against real repositories built here, so
+    the git shell-out is exercised for real without a network. Mocking
+    ``subprocess`` instead would test the mock: the behaviours that
+    matter (annotated tags dereferencing, shallow fetch of a bare SHA,
+    an unreachable remote) are all properties of git itself.
+    """
+    run = functools.partial(subprocess.run, cwd=root, check=True, capture_output=True)
+    # An explicit initial branch, so a test naming a branch is not at the
+    # mercy of the developer's `init.defaultBranch`.
+    run(["git", "init", "-q", "-b", "main", "."])
+    run(["git", "add", "-A"])
+    run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "initial",
+        ]
+    )
+    if tag is not None:
+        run(["git", "tag", tag])
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    )
+    return completed.stdout.strip()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test in this package off the developer's real ``~``.
+
+    Autouse and package-wide rather than per-class, because the leak is
+    easy to reintroduce and invisible when it happens: resolution reaches
+    ``Path.home()`` from two places that take no fixture —
+    ``fetch.get_plugin_cache_base`` when ``CONDUCTOR_HOME`` is unset, and
+    ``resolve_plugins(home=None)`` for installed-marketplace lookup. A
+    developer with a marketplace installed under a name a fixture also
+    uses would see a test assert the opposite of what it means; the case
+    that caught this asserted a *missing* plugin and passed vacuously
+    because an ambient one satisfied it.
+
+    Tests that need to control the installed set still take the explicit
+    ``home`` fixture and pass it, which this does not interfere with.
+    """
+    home = tmp_path / "isolated-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home / ".conductor"))
+
+
+@pytest.fixture
+def plugin_cache_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the plugin cache at a temporary directory.
+
+    ``CONDUCTOR_HOME`` rather than patching the resolver, so the env-var
+    contract itself is exercised — and so no test can write into the
+    developer's real ``~/.conductor``.
+    """
+    from conductor.plugins.fetch import clear_resolution_memo
+
+    home = tmp_path / "conductor-home"
+    home.mkdir()
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+    clear_resolution_memo()
+    yield home
+    clear_resolution_memo()
 
 
 @pytest.fixture

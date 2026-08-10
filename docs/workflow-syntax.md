@@ -1947,12 +1947,136 @@ overrides.
 | Form | Resolution |
 |---|---|
 | `prs` | An installed plugin, looked up under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`. An error if it is not installed, or if more than one marketplace ships that name |
+| `prs@acme` | The `prs` plugin from marketplace `acme` — declared in `plugin_sources`, or installed under that marketplace |
 | `./tools/my-plugin` | A path, resolved against the workflow file's directory |
 
 Classification is syntactic — a path when the entry starts with `~` or `.`
 or contains a separator, otherwise a name. So a same-named local directory
 can never shadow an installed plugin, and resolution never depends on what
-happens to exist.
+happens to exist. The path check runs first, so a directory called
+`my@plugin` stays a path.
+
+`prs@acme` is also the answer to the ambiguity error above: when two
+marketplaces ship a `git` plugin, qualify it rather than falling back to a
+path.
+
+### Declaring where plugins come from
+
+An entry like `prs` or `prs@acme` still resolves against machine state, so
+a workflow shared with a teammate needs "first install these plugins" in a
+README. `runtime.plugin_sources` removes that step:
+
+```yaml
+workflow:
+  runtime:
+    plugin_sources:
+      acme: acme/agent-plugins#v1.4.0          # string shorthand
+      beta:                                     # object form
+        source: git@github.com:beta/plugins.git#3f2a1c9
+        path: packages/plugins                  # subdir, if not at the root
+      local-dev: ./vendor/plugins               # a local path is a valid source
+    plugins:
+      - prs@acme
+      - name: ado@acme
+        mcp: false
+```
+
+Two concerns, two keys: `plugin_sources` is acquisition, `plugins` is
+activation. That split is not invented here — the Copilot CLI's own
+settings separate `extraKnownMarketplaces` from `enabledPlugins`, for the
+reason that eleven plugins commonly come from one repository. Inlining a
+URL per entry would either clone it eleven times or silently pick one of
+eleven refs.
+
+The load-bearing property: **`prs@acme` means the same thing** whether
+`acme` was declared here, installed via a CLI, or is a local directory. A
+declared source registers its name into the same table the installed
+marketplaces populate, and wins on a clash.
+
+A source may be a **marketplace catalog** (a `marketplace.json` listing
+many plugins) or a **single plugin** (a `plugin.json` at the root). Both
+are detected automatically; a repository that is both needs a `plugin:`
+key to say which, rather than having one picked for it. That key names
+either the root plugin or any plugin the catalog lists — it also narrows
+a pure catalog to a single entry.
+
+#### Source grammar
+
+The Copilot CLI's, so a source string you have already written works
+unchanged:
+
+| Form | Example |
+|---|---|
+| `owner/repo` | `acme/agent-plugins` |
+| `owner/repo#ref` | `acme/agent-plugins#v1.4.0` |
+| http/https/ssh URL | `https://gitlab.com/acme/p.git#main` |
+| scp-style remote | `git@github.com:acme/p.git#3f2a1c9` |
+| local path | `./vendor/plugins`, `~/src/plugins` |
+
+Cloning shells out to `git`, so existing SSH keys, credential helpers and
+host configuration apply, and self-hosted forges work.
+
+#### Pinned and floating refs
+
+There is no lockfile. The YAML is the lock:
+
+| Ref | Behaviour |
+|---|---|
+| A full 40-character SHA | **Pinned** — fetched once, never re-checked |
+| A tag, a branch, or no ref | **Floating** — re-resolved on every run; a moved ref is fetched |
+
+Worth knowing before leaving a source unpinned: tags move, so a floating
+source can gain a subagent or an MCP server between two runs of the same
+file. An MCP server is a subprocess launched with your credentials. Pin a
+SHA when that matters — it is a one-character edit — and read `conductor
+plugin list` before committing.
+
+#### Network behaviour
+
+| Command | Behaviour |
+|---|---|
+| `conductor run` / `resume` | Acquires sources up front, in parallel, before the first agent |
+| `conductor plugin fetch <workflow>` | Acquires them explicitly — the CI step |
+| `conductor plugin list <workflow>` | Reads the cache; reports what a run would load |
+| `conductor validate` | **Never** touches the network |
+
+Checkouts are cached under `$CONDUCTOR_HOME/cache/plugins/` (default
+`~/.conductor/cache/plugins/`), keyed by resolved commit, so different refs
+coexist and a checkout is immutable once written.
+
+When a floating ref cannot be re-checked — offline, VPN, expired
+credentials — the cached checkout is used and you are told. A cold cache
+with no network is an error naming `conductor plugin fetch`.
+
+`conductor validate` reports an unfetched source as a *warning*, not an
+error, and says which checks it had to skip. The workflow is not wrong;
+the machine has simply not fetched yet, and `conductor run` heals it.
+
+A source that is *itself* wrong — a path that does not exist, a `path:`
+that escapes the checkout, a catalog that will not parse — is an **error**.
+No amount of fetching fixes it. Sources are checked one at a time, so a
+broken or unfetched source costs its own line rather than the report for
+every healthy source beside it.
+
+A source declared but never referenced is reported too — dead config that
+survives a refactor and then pins a repository nobody reads.
+
+If a declared source shadows a marketplace of the same name installed on
+your machine, the declared one wins and you are told. The two can ship
+different subagents, or a different MCP server, so a silent substitution
+would change what your agents can do without saying so.
+
+There is no `conductor plugin update`. A floating source updates itself and
+a pinned one is meant not to.
+
+#### Trust
+
+Declaring a source is the consent. There is no prompt and no allowlist,
+matching how a plugin path is already treated — the same YAML can run
+arbitrary shell via `type: script`. But a git source goes a step further:
+the code is not in your tree when you review the workflow, and enabling a
+plugin can start an MCP server with your credentials. Pin a SHA, and use
+`conductor plugin list` to see what a source actually brings.
 
 ### Components
 
@@ -2017,7 +2141,10 @@ capability.
 
 Resolving `plugins: [prs]` does read the installed plugin roots, but that
 is *resolution*, not discovery: the author wrote the name down, and
-nothing enters the run unasked.
+nothing enters the run unasked. Cloning a declared `plugin_sources` entry
+is resolution too — a miss is a hard error, not silently less capability.
+With sources declared, even the machine dependency of resolving an
+installed name goes away.
 
 ### Seeing what a plugin brings
 
@@ -2025,8 +2152,10 @@ A plugin name says nothing about how much it carries, so `conductor
 validate` prints it:
 
 ```
+Plugin sources: 1 declared
+  • acme — acme/agent-plugins#v1.4.0 @ 9c4e1f2a8b3d
 Plugins: 2 enabled
-  • prs — 3 skill(s), 7 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/prs
+  • prs — 3 skill(s), 7 agent(s), 0 MCP server(s) — /home/dev/.conductor/cache/plugins/github.com/acme/agent-plugins/9c4e1f2a8b3d/prs
     agents: prs:code-reviewer, prs:code-simplifier, prs:comment-analyzer, ...
   • ado — 0 skill(s), 1 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/ado
     disabled by this workflow: mcp
@@ -2034,8 +2163,11 @@ Plugins: 2 enabled
 
 Worth reading before committing. It is also how a change in what a plugin
 ships becomes visible on the next validate rather than at run time.
+`conductor plugin list <workflow>` prints the same thing on demand, per
+agent, without validating anything else.
 
-See `examples/plugins.yaml` for a complete example.
+See `examples/plugins.yaml` and `examples/plugin-sources.yaml` for complete
+examples.
 
 ## External File References
 

@@ -8,14 +8,15 @@ tool references.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jinja2
 from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
-from conductor.plugins.errors import PluginError
+from conductor.plugins.errors import PluginError, PluginSourceUnavailableError
 from conductor.plugins.registry import describe_dropped_components, resolve_plugins
 from conductor.providers.capabilities import (
     ProviderCapabilities,
@@ -116,6 +117,137 @@ INPUT_REF_PATTERN = re.compile(
     r"(?P<shorthand>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<sh_field>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"
     r")(?P<optional>\?)?$"
 )
+
+
+@dataclass(frozen=True)
+class _DeferredPluginCheck:
+    """A plugin check that could not run without network access.
+
+    Distinct from the cached-failure ``str`` in the same slot, because
+    the two mean opposite things: a ``str`` is "this workflow is wrong",
+    this is "this machine has not fetched yet, and the run will".
+    """
+
+    reason: str
+
+
+def _resolve_declared_sources(
+    config: WorkflowConfig, base_dir: Path | None
+) -> tuple[dict[str, Any], list[str], list[str], set[str]]:
+    """Resolve ``runtime.plugin_sources`` from cache, never over the network.
+
+    ``conductor validate`` must not clone. A git source that has never
+    been fetched on this machine is therefore reported as a *warning*
+    naming ``conductor plugin fetch``: the workflow is not wrong, the
+    machine simply has not fetched yet, and ``conductor run`` heals it
+    automatically.
+
+    A source that is *itself* wrong — a path that does not exist, a
+    ``path:`` that escapes the checkout, a catalog that will not parse —
+    is an **error**. No amount of fetching fixes it, and reporting it as
+    a warning blamed the network for the author's typo and then
+    prescribed a command that fails on the same input.
+
+    Sources are resolved **one at a time**. Resolving them as a batch
+    meant a single unfetched source discarded the whole table, so every
+    other declared source — including a local directory sitting on disk —
+    was reported as "has not been acquired". That also emptied the table
+    for the per-agent checks, silently skipping the MCP-clash and
+    dropped-component reporting this feature exists to provide.
+
+    A source that is declared but never referenced is dead config and is
+    reported too — it is the kind of thing that survives a refactor and
+    then quietly pins a repository nobody reads any more.
+
+    Returns:
+        ``(marketplaces, warnings, errors, declared_names, unusable)``.
+        The marketplace table holds every source that resolved.
+        ``declared_names`` covers every source the workflow declared but
+        that is not in the table, so a reference to one is told it was
+        declared-but-unavailable rather than the false "neither declared
+        nor installed". ``unusable`` is the subset that is broken rather
+        than merely unfetched, so the caller can suppress a second,
+        misleading "run conductor plugin fetch" line for it.
+    """
+    declared = config.workflow.runtime.plugin_sources
+    if not declared:
+        return {}, [], [], set()
+
+    from conductor.plugins.errors import PluginError, PluginFetchError
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+    warnings: list[str] = []
+    errors: list[str] = []
+    deferred: set[str] = set()
+    unusable: set[str] = set()
+    marketplaces: dict[str, Any] = {}
+
+    referenced = _referenced_marketplaces(config)
+    for name in sorted(set(declared) - referenced):
+        warnings.append(
+            f"Plugin source {name!r} is declared in 'runtime.plugin_sources' but no "
+            f"'plugins:' entry references it. Reference it as '<plugin>@{name}', or "
+            "remove the source."
+        )
+
+    for name, entry in declared.items():
+        try:
+            resolved = resolve_plugin_sources(
+                {name: entry},
+                base_dir=base_dir,
+                allow_network=False,
+                on_warning=warnings.append,
+            )
+        except PluginFetchError as exc:
+            deferred.add(name)
+            warnings.append(
+                f"Plugin source {name!r} has not been fetched on this machine: {exc} "
+                "('conductor validate' never fetches; 'conductor run' will.)"
+            )
+        except (PluginError, OSError) as exc:
+            # OSError is caught alongside: resolution stats the filesystem
+            # (``find_manifest``, ``is_plugin_root``), so an unreadable
+            # checkout would otherwise escape as a bare traceback.
+            unusable.add(name)
+            errors.append(f"Plugin source {name!r} is unusable: {exc}")
+        else:
+            marketplaces.update(marketplaces_from(resolved))
+            for source_name, source in resolved.items():
+                if not source.marketplace.plugins:
+                    warnings.append(
+                        f"Plugin source {source_name!r} resolved to a marketplace "
+                        f"listing no usable plugins ({source.source.describe()})."
+                    )
+    return marketplaces, warnings, errors, deferred | unusable
+
+
+def _referenced_marketplaces(config: WorkflowConfig) -> set[str]:
+    """Collect every marketplace named after an ``@`` in a plugins entry.
+
+    Covers the workflow default and every agent's own list, including
+    for_each inline agents, so a source used by exactly one agent is not
+    reported as dead.
+    """
+    from conductor.config.schema import _split_marketplace
+    from conductor.skills import is_path_entry
+
+    def _names(entries: Any) -> set[str]:
+        found: set[str] = set()
+        for entry in entries or []:
+            if is_path_entry(entry.name):
+                continue
+            _, marketplace = _split_marketplace(entry.name)
+            if marketplace:
+                found.add(marketplace)
+        return found
+
+    referenced = _names(config.workflow.runtime.plugins)
+    for agent in config.agents:
+        referenced |= _names(agent.plugins)
+    for group in config.for_each:
+        if group.agent is not None:
+            referenced |= _names(group.agent.plugins)
+    return referenced
 
 
 def validate_workflow_config(
@@ -1675,7 +1807,18 @@ def _validate_provider_capabilities(
     # Keyed by the entries themselves (name plus the three component
     # switches), because resolving a plugin walks its skills tree and parses
     # every agent definition it ships. A ``str`` value is a cached failure.
-    plugin_cache: dict[tuple[tuple[str, bool, bool, bool], ...], list[ResolvedPlugin] | str] = {}
+    plugin_cache: dict[
+        tuple[tuple[str, bool, bool, bool], ...],
+        list[ResolvedPlugin] | str | _DeferredPluginCheck,
+    ] = {}
+    (
+        plugin_marketplaces,
+        plugin_source_problems,
+        plugin_source_errors,
+        unavailable_sources,
+    ) = _resolve_declared_sources(config, skill_base_dir)
+    warnings.extend(plugin_source_problems)
+    errors.extend(plugin_source_errors)
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1936,11 +2079,36 @@ def _validate_provider_capabilities(
         if key not in plugin_cache:
             try:
                 plugin_cache[key] = resolve_plugins(
-                    entries, base_dir=skill_base_dir, on_warning=warnings.append
+                    entries,
+                    base_dir=skill_base_dir,
+                    marketplaces=plugin_marketplaces,
+                    # Only the *deferred* sources, not every declared name. A
+                    # source that failed because it is broken must report as
+                    # broken; telling the user to fetch it would prescribe a
+                    # command that fails on the same input.
+                    declared_sources=unavailable_sources,
+                    on_warning=warnings.append,
                 )
+            except PluginSourceUnavailableError as exc:
+                # The one plugin failure that is not a problem with the
+                # workflow: the source is declared and well-formed, and
+                # ``conductor run`` will fetch it. Erroring here would make
+                # ``conductor validate`` fail on a freshly cloned repository
+                # for a workflow that runs perfectly. Kept as a *deferred*
+                # marker rather than a plain warning so the message can say
+                # which checks were skipped — reporting "valid" when whole
+                # categories of check never ran would be the worse lie.
+                plugin_cache[key] = _DeferredPluginCheck(str(exc))
             except (PluginError, SkillError) as exc:
                 plugin_cache[key] = str(exc)
         resolved = plugin_cache[key]
+        if isinstance(resolved, _DeferredPluginCheck):
+            warnings.append(
+                f"Agent '{agent.name}': {resolved.reason} Its plugins were not "
+                "checked here, so MCP server name clashes and dropped components "
+                "will surface at run time instead."
+            )
+            return
         if isinstance(resolved, str):
             errors.append(f"Agent '{agent.name}': {resolved}")
             return

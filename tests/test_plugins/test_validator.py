@@ -238,3 +238,223 @@ class TestOneBadPathDoesNotSilenceOtherChecks:
         )
         with pytest.raises(ConfigurationError, match="which the workflow also"):
             _validate(config, None)
+
+
+def _source_config(
+    sources: dict[str, Any],
+    plugins: list[str],
+    *,
+    provider: str = "copilot",
+) -> WorkflowConfig:
+    """A workflow declaring ``plugin_sources`` alongside ``plugins``."""
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="wf",
+            entry_point="worker",
+            runtime=RuntimeConfig(provider=provider, plugin_sources=sources, plugins=plugins),
+        ),
+        agents=[
+            AgentDef(
+                name="worker",
+                prompt="Do it.",
+                output={"result": OutputField(type="string")},
+            )
+        ],
+        output={"result": "{{ worker.output.result }}"},
+    )
+
+
+class TestDeclaredSources:
+    """``runtime.plugin_sources`` cross-checks, all of them offline.
+
+    ``conductor validate`` must never clone, so every case here resolves
+    from cache or not at all.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep these cases off the developer's real home directory.
+
+        Source resolution reaches ``Path.home()`` twice without going
+        through a fixture — ``fetch.get_plugin_cache_base`` when
+        ``CONDUCTOR_HOME`` is unset, and ``resolve_plugins(home=None)``
+        for installed-marketplace lookup. Without this, a marketplace
+        the developer happens to have installed, or a checkout left in
+        their plugin cache, decides whether these assertions hold.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home / ".conductor"))
+
+    def test_a_local_source_resolves(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs", skills=["review"])
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = _source_config({"acme": "./catalog"}, ["prs@acme"])
+
+        assert _validate(config, _wf_path(tmp_path)) == []
+
+    def test_an_unfetched_source_warns_rather_than_failing(self, tmp_path: Path) -> None:
+        """A freshly cloned repository must not fail validation for a
+        workflow that runs perfectly — ``conductor run`` fetches it."""
+        config = _source_config({"acme": "acme/plugins#v1.0.0"}, ["prs@acme"])
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert any("conductor plugin fetch" in warning for warning in warnings)
+
+    def test_the_warning_says_which_checks_were_skipped(self, tmp_path: Path) -> None:
+        """Reporting "valid" when whole categories of check never ran would
+        be the worse lie."""
+        config = _source_config({"acme": "acme/plugins"}, ["prs@acme"])
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert any("were not checked here" in warning for warning in warnings)
+
+    def test_an_undeclared_marketplace_is_an_error(self, tmp_path: Path) -> None:
+        config = _source_config({}, ["prs@nowhere"])
+
+        with pytest.raises(ConfigurationError, match="neither declared"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_an_unreferenced_source_is_reported_as_dead_config(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        make_plugin(tmp_path / "spare" / "thing", "thing")
+        make_marketplace(tmp_path / "spare", "unused", {"thing": "./thing"})
+        config = _source_config({"acme": "./catalog", "unused": "./spare"}, ["prs@acme"])
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert any(
+            "'unused'" in warning and "no 'plugins:' entry" in warning for warning in warnings
+        )
+        # Both sources resolve, so the dead-config notice must be the *only*
+        # thing reported. Asserting a single `any(...)` let this pass while
+        # the same call misreported a healthy sibling as unacquired.
+        assert len(warnings) == 1, warnings
+
+    def test_a_source_referenced_only_by_one_agent_is_not_dead(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wf",
+                entry_point="worker",
+                runtime=RuntimeConfig(provider="copilot", plugin_sources={"acme": "./catalog"}),
+            ),
+            agents=[
+                AgentDef(
+                    name="worker",
+                    prompt="Do it.",
+                    output={"result": OutputField(type="string")},
+                    plugins=[PluginDef(name="prs@acme")],
+                )
+            ],
+            output={"result": "{{ worker.output.result }}"},
+        )
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert not any("no 'plugins:' entry" in warning for warning in warnings)
+
+    def test_provider_rejection_still_applies_to_sourced_plugins(self, tmp_path: Path) -> None:
+        """A git source does not change which providers can load a plugin."""
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs")
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = _source_config({"acme": "./catalog"}, ["prs@acme"], provider="claude")
+
+        with pytest.raises(ConfigurationError, match="cannot load them"):
+            _validate(config, _wf_path(tmp_path))
+
+
+class TestPartialSourceResolution:
+    """One unusable source must not misreport its healthy neighbours.
+
+    Resolving the declared sources as a batch meant a single failure
+    discarded the whole table, so a local directory sitting on disk was
+    reported as "has not been acquired" and the user was sent to a
+    command that could never help it. It also emptied the table for the
+    per-agent checks, silently skipping the MCP-clash and
+    dropped-component reporting that this feature exists to provide.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home / ".conductor"))
+
+    def test_a_resolvable_source_is_not_blamed_for_an_unfetched_sibling(
+        self, tmp_path: Path
+    ) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "mine", "mine")
+        make_marketplace(tmp_path / "catalog", "local", {"mine": "./mine"})
+        config = _source_config(
+            {"local": "./catalog", "acme": "acme/never-fetched#v1.0.0"},
+            ["mine@local", "prs@acme"],
+        )
+
+        warnings = _validate(config, _wf_path(tmp_path))
+
+        assert not any("mine@local" in warning for warning in warnings)
+        assert any("prs@acme" in warning for warning in warnings)
+
+    def test_a_source_path_that_does_not_exist_is_an_error(self, tmp_path: Path) -> None:
+        """Not a warning: no amount of fetching fixes a wrong path, and
+        reporting it as one blamed the network and prescribed a command
+        that fails on the same input."""
+        config = _source_config({"acme": "./nope"}, ["prs@acme"])
+
+        with pytest.raises(ConfigurationError, match="is unusable"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_a_path_escaping_the_checkout_is_an_error(self, tmp_path: Path) -> None:
+        """A traversal attempt must not read as an advisory note."""
+        make_plugin(tmp_path / "vendor", "thing")
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wf",
+                entry_point="worker",
+                runtime=RuntimeConfig(
+                    provider="copilot",
+                    plugin_sources={"acme": {"source": "./vendor", "path": "../../etc"}},
+                    plugins=["prs@acme"],
+                ),
+            ),
+            agents=[
+                AgentDef(
+                    name="worker",
+                    prompt="Do it.",
+                    output={"result": OutputField(type="string")},
+                )
+            ],
+            output={"result": "{{ worker.output.result }}"},
+        )
+
+        with pytest.raises(ConfigurationError, match="escapes the source directory"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_a_broken_source_does_not_also_advise_fetching(self, tmp_path: Path) -> None:
+        """The hard error already names the real cause; a second line
+        saying 'run conductor plugin fetch' would be the wrong remedy."""
+        config = _source_config({"acme": "./nope"}, ["prs@acme"])
+
+        with pytest.raises(ConfigurationError) as excinfo:
+            _validate(config, _wf_path(tmp_path))
+
+        assert "conductor plugin fetch" not in str(excinfo.value)

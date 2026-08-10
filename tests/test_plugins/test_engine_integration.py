@@ -269,3 +269,303 @@ class TestBothEngineProviderModes:
             via_registry=via_registry,
         )
         assert [spec["name"] for spec in provider.custom_agents or []] == ["narrow:from-agent"]
+
+
+def _sourced_config(
+    sources: dict[str, Any],
+    plugins: list[str],
+) -> WorkflowConfig:
+    """A workflow whose plugins come from ``runtime.plugin_sources``."""
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="wf",
+            entry_point="worker",
+            runtime=RuntimeConfig(provider="copilot", plugin_sources=sources, plugins=plugins),
+        ),
+        agents=[
+            AgentDef(
+                name="worker",
+                prompt="Do the thing.",
+                output={"result": OutputField(type="string")},
+            )
+        ],
+        output={"result": "{{ worker.output.result }}"},
+    )
+
+
+class TestSourcedPluginsReachTheProvider:
+    """A sourced plugin's components must arrive at ``execute`` (issue #380).
+
+    This is the load-bearing test for the feature. A plugin's subagents
+    and MCP servers have no fallback delivery path — if they do not reach
+    the provider they are simply gone, and a negative assertion could not
+    tell a working path from a dropped one. Resolution succeeding in
+    isolation proves nothing about the engine actually handing the
+    marketplace table to the executor.
+    """
+
+    def test_all_three_components_arrive(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(
+            tmp_path / "catalog" / "prs",
+            "prs",
+            skills=["review"],
+            agents=["code-reviewer"],
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        provider = _CapturingProvider()
+
+        _run(
+            _sourced_config({"acme": "./catalog"}, ["prs@acme"]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=True,
+        )
+
+        assert provider.skill_directories == [
+            str(tmp_path / "catalog" / "prs" / "skills" / "review")
+        ]
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+    def test_component_switches_still_apply(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(
+            tmp_path / "catalog" / "prs",
+            "prs",
+            skills=["review"],
+            agents=["code-reviewer"],
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wf",
+                entry_point="worker",
+                runtime=RuntimeConfig(
+                    provider="copilot",
+                    plugin_sources={"acme": "./catalog"},
+                    plugins=[PluginDef(name="prs@acme", mcp=False)],
+                ),
+            ),
+            agents=[
+                AgentDef(
+                    name="worker",
+                    prompt="Do it.",
+                    output={"result": OutputField(type="string")},
+                )
+            ],
+            output={"result": "{{ worker.output.result }}"},
+        )
+        provider = _CapturingProvider()
+
+        _run(config, provider, _workflow_file(tmp_path), via_registry=True)
+
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert not provider.extra_mcp_servers
+
+    def test_a_sourced_plugin_is_unreachable_without_the_declaration(self, tmp_path: Path) -> None:
+        """Removing ``plugin_sources`` must break the reference, not fall
+        back to whatever happens to be installed."""
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs", skills=["review"])
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+
+        with pytest.raises(PluginNotFoundError, match="neither declared"):
+            _run(
+                _sourced_config({}, ["prs@acme"]),
+                _CapturingProvider(),
+                _workflow_file(tmp_path),
+                via_registry=True,
+            )
+
+
+class TestSubworkflowSources:
+    """A sub-workflow's plugin sources (issue #380).
+
+    A sub-workflow is a separate file with its own ``runtime``, so its
+    ``plugin_sources`` are its own and nothing at the CLI resolves them.
+    It also inherits the parent's table, matching how
+    ``instructions_preamble`` is inherited: the child was invoked by the
+    parent, not run standalone.
+    """
+
+    @staticmethod
+    def _parent(tmp_path: Path, sources: dict[str, Any]) -> WorkflowConfig:
+        from conductor.config.schema import RouteDef
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="delegate",
+                runtime=RuntimeConfig(provider="copilot", plugin_sources=sources),
+            ),
+            agents=[
+                AgentDef(
+                    name="delegate",
+                    type="workflow",
+                    workflow="child.yaml",
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+            output={"result": "{{ delegate.output.result }}"},
+        )
+
+    @staticmethod
+    def _write_child(tmp_path: Path, sources: str, plugins: str) -> None:
+        (tmp_path / "child.yaml").write_text(
+            "workflow:\n"
+            "  name: child\n"
+            "  entry_point: worker\n"
+            "  runtime:\n"
+            "    provider: copilot\n"
+            f"{sources}"
+            f"{plugins}"
+            "agents:\n"
+            "  - name: worker\n"
+            '    prompt: "Do it."\n'
+            "    output:\n"
+            "      result:\n"
+            "        type: string\n"
+            "output:\n"
+            '  result: "{{ worker.output.result }}"\n',
+            encoding="utf-8",
+        )
+
+    def test_a_child_inherits_the_parent_table(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "catalog" / "prs", "prs", agents=["code-reviewer"])
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        self._write_child(tmp_path, "", "    plugins:\n      - prs@acme\n")
+        provider = _CapturingProvider()
+
+        _run(
+            self._parent(tmp_path, {"acme": "./catalog"}),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=True,
+        )
+
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+
+    def test_a_child_resolves_a_source_it_declares_itself(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "own" / "ado", "ado", agents=["work-items"])
+        make_marketplace(tmp_path / "own", "mine", {"ado": "./ado"})
+        self._write_child(
+            tmp_path,
+            "    plugin_sources:\n      mine: ./own\n",
+            "    plugins:\n      - ado@mine\n",
+        )
+        provider = _CapturingProvider()
+
+        _run(self._parent(tmp_path, {}), provider, _workflow_file(tmp_path), via_registry=True)
+
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["ado:work-items"]
+
+
+class TestSourcedPluginsInSingleProviderMode:
+    """The single-provider engine path (issue #380 review follow-up).
+
+    ``WorkflowEngine(config, provider)`` builds its executor in the
+    constructor, before ``run()`` can resolve ``plugin_sources`` — so the
+    table arrives afterwards via ``set_plugin_marketplaces``. Every other
+    sourced-plugin test passes ``via_registry=True``, which builds a fresh
+    executor per agent and never exercises that seam. It is the documented
+    embedding API (see the ``WorkflowEngine`` class docstring), and
+    without a test the whole method could be deleted with the suite green.
+    """
+
+    def test_components_arrive_without_a_registry(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(
+            tmp_path / "catalog" / "prs",
+            "prs",
+            skills=["review"],
+            agents=["code-reviewer"],
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        make_marketplace(tmp_path / "catalog", "acme", {"prs": "./prs"})
+        provider = _CapturingProvider()
+
+        _run(
+            _sourced_config({"acme": "./catalog"}, ["prs@acme"]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=False,
+        )
+
+        assert provider.skill_directories == [
+            str(tmp_path / "catalog" / "prs" / "skills" / "review")
+        ]
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+
+class TestSubworkflowMarketplaceMerge:
+    """Both halves of the parent/child merge (issue #380 review follow-up).
+
+    The existing pair of tests each reach only one side: one child
+    declares nothing (so ``_resolve_child_marketplaces`` returns early),
+    the other has an empty parent table (so the child's own sources are
+    resolved by ``_ensure_plugin_marketplaces`` instead). Neither runs the
+    merge itself.
+    """
+
+    def test_child_sees_both_its_own_and_the_parents_sources(self, tmp_path: Path) -> None:
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "parent" / "prs", "prs", agents=["code-reviewer"])
+        make_marketplace(tmp_path / "parent", "acme", {"prs": "./prs"})
+        make_plugin(tmp_path / "own" / "ado", "ado", agents=["work-items"])
+        make_marketplace(tmp_path / "own", "mine", {"ado": "./ado"})
+        TestSubworkflowSources._write_child(
+            tmp_path,
+            "    plugin_sources:\n      mine: ./own\n",
+            "    plugins:\n      - ado@mine\n      - prs@acme\n",
+        )
+        provider = _CapturingProvider()
+
+        _run(
+            TestSubworkflowSources._parent(tmp_path, {"acme": "./parent"}),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=True,
+        )
+
+        assert sorted(spec["name"] for spec in provider.custom_agents or []) == [
+            "ado:work-items",
+            "prs:code-reviewer",
+        ]
+
+    def test_a_child_source_wins_a_name_clash_with_its_parent(self, tmp_path: Path) -> None:
+        """The child is the file being run, so its declaration is the one
+        the author of that file wrote."""
+        from .conftest import make_marketplace
+
+        make_plugin(tmp_path / "parent" / "prs", "prs", agents=["parent-agent"])
+        make_marketplace(tmp_path / "parent", "acme", {"prs": "./prs"})
+        make_plugin(tmp_path / "child" / "prs", "prs", agents=["child-agent"])
+        make_marketplace(tmp_path / "child", "acme", {"prs": "./prs"})
+        TestSubworkflowSources._write_child(
+            tmp_path,
+            "    plugin_sources:\n      acme: ./child\n",
+            "    plugins:\n      - prs@acme\n",
+        )
+        provider = _CapturingProvider()
+
+        _run(
+            TestSubworkflowSources._parent(tmp_path, {"acme": "./parent"}),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=True,
+        )
+
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:child-agent"]

@@ -40,6 +40,7 @@ def _verbose_log_section(title: str, content: str) -> None:
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
     from pathlib import Path
 
     from conductor.config.schema import (
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
         SkillDiscoveryConfig,
         SkillInjectionConfig,
     )
+    from conductor.plugins.marketplace import Marketplace
     from conductor.plugins.registry import ResolvedPlugin
     from conductor.providers.base import AgentProvider
     from conductor.skills import ResolvedSkill
@@ -198,6 +200,8 @@ class AgentExecutor:
         skill_injection: SkillInjectionConfig | None = None,
         skill_discovery: SkillDiscoveryConfig | None = None,
         workflow_plugins: list[PluginDef] | None = None,
+        plugin_marketplaces: Mapping[str, Marketplace] | None = None,
+        declared_plugin_sources: Iterable[str] | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
@@ -224,6 +228,15 @@ class AgentExecutor:
             workflow_plugins: Workflow-level default plugins (from
                 ``runtime.plugins``). Inherited on the same tri-state as
                 ``workflow_skills``.
+            plugin_marketplaces: Marketplaces already resolved from
+                ``runtime.plugin_sources``, keyed by the name a
+                ``plugin@marketplace`` entry references. Acquisition
+                happens once at run start rather than here, so an agent
+                never blocks on a network round trip mid-run.
+            declared_plugin_sources: Every name in
+                ``runtime.plugin_sources``, whether or not it resolved,
+                so a reference to one that failed to fetch is told to
+                fetch rather than told the marketplace does not exist.
         """
         self.provider = provider
         self.workflow_tools = workflow_tools or []
@@ -246,13 +259,31 @@ class AgentExecutor:
             tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[ResolvedSkill]
         ] = {}
         self._workflow_plugins: list[PluginDef] = list(workflow_plugins or [])
-        # Keyed by the entries themselves: resolving a plugin walks the
-        # filesystem and parses every agent definition it ships, and this
-        # runs once per agent per call.
+        self._plugin_marketplaces: dict[str, Marketplace] = dict(plugin_marketplaces or {})
+        self._declared_plugin_sources: frozenset[str] = frozenset(declared_plugin_sources or ())
+        # Keyed by the entries *and* the marketplace table: two agents
+        # resolving the same entry names against different tables must
+        # not share a cached answer.
         self._plugin_cache: dict[
-            tuple[tuple[str, bool, bool, bool], ...], list[ResolvedPlugin]
+            tuple[tuple[tuple[str, bool, bool, bool], ...], tuple[tuple[str, str], ...]],
+            list[ResolvedPlugin],
         ] = {}
         self.renderer = TemplateRenderer()
+
+    def set_plugin_marketplaces(self, marketplaces: Mapping[str, Marketplace]) -> None:
+        """Replace the marketplace table plugin entries resolve against.
+
+        Exists for the engine, which builds this executor in its
+        constructor but may only resolve ``runtime.plugin_sources`` once
+        ``run()`` is awaited — acquisition shells out to ``git``, which
+        has no business happening in a constructor.
+
+        Clears the plugin cache: entries resolved against the previous
+        table would otherwise be served from it, which is the one thing
+        the table being part of the cache key exists to prevent.
+        """
+        self._plugin_marketplaces = dict(marketplaces)
+        self._plugin_cache.clear()
 
     def _render_enum_field(
         self,
@@ -747,10 +778,18 @@ class AgentExecutor:
         Memoized per entry list, because resolving a plugin walks its
         ``skills/`` tree and parses every ``*.agent.md`` it ships, and
         this runs once per agent per call.
+
+        Each marketplace's *name and root* are part of the key, not just
+        its name: two tables can register one name from different
+        checkouts, and keying on names alone would serve one table's
+        answer to the other.
         """
         from conductor.plugins.registry import resolve_plugins
 
-        key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
+        key = (
+            tuple((e.name, e.skills, e.agents, e.mcp) for e in entries),
+            tuple(sorted((name, str(m.root)) for name, m in self._plugin_marketplaces.items())),
+        )
         cached = self._plugin_cache.get(key)
         if cached is not None:
             return list(cached)
@@ -758,6 +797,8 @@ class AgentExecutor:
         resolved = resolve_plugins(
             entries,
             base_dir=self._workflow_dir,
+            marketplaces=self._plugin_marketplaces,
+            declared_sources=self._declared_plugin_sources,
             on_warning=lambda message: _verbose_log(f"  Plugins: {message}", style="yellow"),
         )
         self._plugin_cache[key] = list(resolved)

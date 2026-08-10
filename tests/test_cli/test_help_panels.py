@@ -76,6 +76,7 @@ class TestHelpPanels:
             "gate": "Interact",
             "checkpoint": "State",
             "registry": "Environment",
+            "plugin": "Environment",
             "update": "Environment",
             "doctor": "Environment",
         }
@@ -95,6 +96,11 @@ class TestNounGroupBareInvocation:
 
     def test_checkpoint_bare_invocation_shows_usage(self) -> None:
         result = runner.invoke(app, ["checkpoint"], env=_WIDE)
+        assert result.exit_code == 2
+        assert "Usage" in result.output
+
+    def test_plugin_bare_invocation_shows_usage(self) -> None:
+        result = runner.invoke(app, ["plugin"], env=_WIDE)
         assert result.exit_code == 2
         assert "Usage" in result.output
 

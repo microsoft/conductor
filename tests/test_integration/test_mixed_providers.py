@@ -112,6 +112,8 @@ agents:
             # MCP subprocesses with the user's credentials, so it loads only
             # when a workflow names it.
             "plugins": [],
+            # No git-backed plugin sources declared (issue #380).
+            "plugin_sources": {},
         }
 
     def test_provider_parameter_isolation(self, tmp_path):
