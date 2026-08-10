@@ -15,9 +15,12 @@ import jinja2
 from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
+from conductor.plugins.errors import PluginError
+from conductor.plugins.registry import describe_dropped_components, resolve_plugins
 from conductor.providers.capabilities import (
     ProviderCapabilities,
     get_capabilities,
+    requires_plugin_root_for_skills,
     uses_native_skills,
 )
 from conductor.skills import (
@@ -33,6 +36,7 @@ from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.plugins.registry import ResolvedPlugin
     from conductor.skills import ResolvedSkill
 
 
@@ -178,6 +182,20 @@ def validate_workflow_config(
                             f"routes to unknown agent or parallel group '{option.route}'"
                         )
 
+        # Validate the questions abort route. It is a real graph edge taken
+        # only after the human has worked through the node, so an unknown
+        # target must not wait until then to surface.
+        if (
+            agent.type == "questions"
+            and agent.abort_route is not None
+            and agent.abort_route != "$end"
+            and agent.abort_route not in all_names
+        ):
+            errors.append(
+                f"Agent '{agent.name}' abort_route targets unknown agent or "
+                f"parallel group '{agent.abort_route}'"
+            )
+
         # Validate input references
         input_errors, input_warnings = _validate_input_references(
             agent.name,
@@ -236,6 +254,13 @@ def validate_workflow_config(
                 f"For-each group '{for_each_group.name}' uses a terminate step as its "
                 "inline agent. Terminate steps cannot run inside a for_each iteration; "
                 "route to a terminate step from the for_each group's routes instead."
+            )
+        if for_each_group.agent.type == "questions":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a questions step as its "
+                "inline agent. Concurrent iterations would compete for one terminal and "
+                "one dashboard prompt slot; route to a questions step from the for_each "
+                "group's routes instead."
             )
 
     # Validate sub-workflow references (local paths and registry refs).
@@ -522,6 +547,15 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                     "Human gates cannot be used in parallel groups."
                 )
 
+            # Validate no questions steps in parallel groups. Concurrent
+            # prompts would compete for one terminal and one dashboard gate
+            # slot, for the same reason human gates are refused above.
+            if agent.type == "questions":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a questions step. "
+                    "Questions steps cannot be used in parallel groups."
+                )
+
             # Validate no script steps in parallel groups
             if agent.type == "script":
                 errors.append(
@@ -639,6 +673,10 @@ def _build_routing_graph(config: WorkflowConfig) -> dict[str, list[tuple[str, bo
         elif agent.type == "human_gate" and agent.options:
             for option in agent.options:
                 edges.append((option.route, True))
+        # An abort route is a conditional edge like any other; without it an
+        # agent reachable only via abort is invisible to path analysis.
+        if agent.type == "questions" and agent.allow_abort:
+            edges.append((agent.abort_route or "$end", True))
         graph[agent.name] = edges
     for pg in config.parallel:
         graph[pg.name] = [(r.to, r.when is not None) for r in pg.routes]
@@ -1071,6 +1109,16 @@ def _collect_template_strings(
             for key, expr in agent.output_template.items():
                 templates.append((f"agent '{agent.name}' output_template.{key}", expr))
 
+    # Questions steps: text/hint/choices are Jinja2-rendered by the engine, so
+    # bad refs must fail at validate-time like every other rendered field.
+    if isinstance(agent, _AgentDef) and agent.questions:
+        for i, question in enumerate(agent.questions):
+            templates.append((f"agent '{agent.name}' questions[{i}].text", question.text))
+            if question.hint:
+                templates.append((f"agent '{agent.name}' questions[{i}].hint", question.hint))
+            for j, choice in enumerate(question.choices or []):
+                templates.append((f"agent '{agent.name}' questions[{i}].choices[{j}]", choice))
+
     return templates
 
 
@@ -1371,8 +1419,9 @@ def _validate_template_references(
             refs = _extract_template_refs(template)
 
             # Explicit-mode exclusions:
-            # - human_gate prompts render with the full accumulated context
-            #   (engine uses ``WorkflowContext.get_for_template()`` which forces
+            # - human_gate and questions prompts render with the full
+            #   accumulated context (engine uses
+            #   ``WorkflowContext.get_for_template()`` which forces
             #   ``mode="accumulate"``), so they're never subject to
             #   explicit-mode warnings.
             # - script and workflow (sub-workflow) agents are excluded only for
@@ -1382,7 +1431,10 @@ def _validate_template_references(
             #   Their ``agent.output`` references still require declaration —
             #   the engine raises ``KeyError`` via ``_add_explicit_input`` if
             #   an undeclared agent output is accessed.
-            agent_output_warning_allowed = is_explicit and agent.type != "human_gate"
+            agent_output_warning_allowed = is_explicit and agent.type not in (
+                "human_gate",
+                "questions",
+            )
 
             # --- Agent-output references (``a.output[.field]``) ---
             for ref_root, ref_fields in refs.agent_output_fields.items():
@@ -1509,7 +1561,8 @@ def _validate_template_references(
                     )
                 elif (
                     is_explicit
-                    and agent.type not in ("script", "set", "workflow", "human_gate", "wait")
+                    and agent.type
+                    not in ("script", "set", "workflow", "human_gate", "questions", "wait")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(
@@ -1542,9 +1595,9 @@ def _validate_template_references(
 # Provider capability cross-checks (issue #241)
 # ---------------------------------------------------------------------------
 
-# Agent types that drive a provider. All other types (human_gate, script,
-# set, terminate, wait, workflow) do not invoke a provider directly and are
-# skipped by every capability check.
+# Agent types that drive a provider. All other types (human_gate, questions,
+# script, set, terminate, wait, workflow) do not invoke a provider directly and
+# are skipped by every capability check.
 _LLM_AGENT_TYPES = frozenset({None, "agent"})
 
 
@@ -1618,6 +1671,11 @@ def _validate_provider_capabilities(
     skill_cache: dict[
         tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[ResolvedSkill] | str
     ] = {}
+    runtime_plugins = config.workflow.runtime.plugins
+    # Keyed by the entries themselves (name plus the three component
+    # switches), because resolving a plugin walks its skills tree and parses
+    # every agent definition it ships. A ``str`` value is a cached failure.
+    plugin_cache: dict[tuple[tuple[str, bool, bool, bool], ...], list[ResolvedPlugin] | str] = {}
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1800,6 +1858,128 @@ def _validate_provider_capabilities(
         # drops above cannot affect it, since that provider is native.
         if uses_native_skills(provider_name) is False:
             _check_skill_injection_budget(agent, provider_name, resolved)
+
+    def _check_agent_plugins(
+        agent: AgentDef, provider_name: str, caps: ProviderCapabilities
+    ) -> None:
+        """Resolve an agent's effective plugins and check them against its provider.
+
+        Plugins are strict throughout — there is no discovered counterpart to
+        be lenient about. Every entry was written by the author, so a plugin
+        that is missing, ambiguous, or broken is an error rather than a skip.
+
+        Two provider-shaped failures are reported here rather than at run
+        time, when the agent would already be mid-flight:
+
+        * The provider cannot load plugins at all. Unlike skills there is no
+          eager-injection fallback, so the plugin would arrive with only the
+          component that happens to work.
+        * ``claude-agent-sdk`` cannot honour ``agents: false`` for a plugin
+          whose skills are enabled. Its only skill surface is registering the
+          plugin root, which the SDK documents as also providing "custom
+          commands, agents, skills, and hooks" — with a filter for skills and
+          none for the rest. Granting more than the workflow declared is the
+          same regression that justifies refusing a narrowed per-server
+          ``tools:`` filter on that provider, so the combination is refused.
+        """
+        entries = list(agent.plugins) if agent.plugins is not None else list(runtime_plugins)
+        if not entries:
+            return
+
+        if not caps.plugins:
+            named = ", ".join(repr(entry.name) for entry in entries)
+            errors.append(
+                f"Agent '{agent.name}' declares plugins ({named}) but provider "
+                f"'{provider_name}' cannot load them (capabilities.plugins=False). "
+                f"A plugin's subagents and MCP servers have no equivalent there, so "
+                f"it would run with only part of what the plugin ships. Reference "
+                f"the plugin's skills directly with 'skills:' (by path), opt out "
+                f"with 'plugins: []', or override the agent to 'copilot' or "
+                f"'claude-agent-sdk'."
+            )
+            return
+
+        if requires_plugin_root_for_skills(provider_name):
+            for entry in entries:
+                if entry.skills and not entry.agents:
+                    errors.append(
+                        f"Agent '{agent.name}': plugin {entry.name!r} sets "
+                        f"'agents: false' with skills enabled, which provider "
+                        f"'claude-agent-sdk' cannot honour — its only skill surface "
+                        f"is registering the plugin root, which also contributes "
+                        f"every subagent the plugin ships. Set 'skills: false' as "
+                        f"well, drop 'agents: false', or run this agent on 'copilot'."
+                    )
+
+        if skill_base_dir is None:
+            relative = [
+                entry.name
+                for entry in entries
+                if is_path_entry(entry.name) and not Path(entry.name).expanduser().is_absolute()
+            ]
+            if relative:
+                warnings.append(
+                    f"Agent '{agent.name}': relative plugin path(s) {sorted(relative)!r} "
+                    "were not checked because no workflow file path was supplied, so "
+                    "there is no base directory to resolve them against. They are still "
+                    "resolved at run time."
+                )
+                # Drop only the entries that cannot be resolved and check the
+                # rest. Returning here let one un-anchorable relative path
+                # silence the MCP-clash and dropped-component checks for every
+                # other plugin the agent named.
+                entries = [entry for entry in entries if entry.name not in set(relative)]
+                if not entries:
+                    return
+
+        key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
+        if key not in plugin_cache:
+            try:
+                plugin_cache[key] = resolve_plugins(
+                    entries, base_dir=skill_base_dir, on_warning=warnings.append
+                )
+            except (PluginError, SkillError) as exc:
+                plugin_cache[key] = str(exc)
+        resolved = plugin_cache[key]
+        if isinstance(resolved, str):
+            errors.append(f"Agent '{agent.name}': {resolved}")
+            return
+
+        for plugin in resolved:
+            _report_dropped_components(agent, plugin, provider_name)
+            for server in plugin.mcp_servers:
+                if server in config.workflow.runtime.mcp_servers:
+                    errors.append(
+                        f"Agent '{agent.name}': plugin {plugin.source!r} declares an "
+                        f"MCP server named {server!r}, which the workflow also "
+                        f"declares in 'runtime.mcp_servers'. The server name prefixes "
+                        f"the tool names the model sees, so it must be unique. Rename "
+                        f"the workflow's server, or set 'mcp: false' on the plugin."
+                    )
+
+    def _report_dropped_components(
+        agent: AgentDef, plugin: ResolvedPlugin, provider_name: str
+    ) -> None:
+        """Warn about plugin components Conductor does not load.
+
+        ``hooks/`` is arbitrary shell run on tool events and ``commands/`` is
+        a CLI-only surface; neither has anything in Conductor's model to map
+        onto, and neither SDK offers a per-item filter. Reporting them is the
+        point — a plugin that behaves differently inside a workflow than it
+        does in the CLI is exactly the silent divergence this feature exists
+        to remove, so the difference is named before the run rather than
+        discovered after it.
+
+        The phrasing is shared with ``AgentExecutor`` rather than duplicated,
+        so the two commands cannot describe one plugin two ways.
+        """
+        message = describe_dropped_components(
+            plugin,
+            root_is_registered=bool(plugin.skills)
+            and bool(requires_plugin_root_for_skills(provider_name)),
+        )
+        if message is not None:
+            warnings.append(f"Agent '{agent.name}': {message}")
 
     def _check_claude_agent_sdk_skill(agent: AgentDef, item: ResolvedSkill) -> None:
         """Check one resolved skill against ``claude-agent-sdk``'s plugin-only surface.
@@ -2010,6 +2190,7 @@ def _validate_provider_capabilities(
             )
 
         _check_agent_skills(agent, provider_name, caps)
+        _check_agent_plugins(agent, provider_name, caps)
 
     # All provider-backed agents that run at workflow scope: top-level agents
     # PLUS for_each inline agents (``ForEachDef.agent``), which inherit the

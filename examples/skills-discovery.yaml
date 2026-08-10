@@ -18,11 +18,17 @@
 #   personal → ~/.copilot/skills, ~/.claude/skills
 #   project  → .github/skills and .claude/skills, in THIS FILE's directory
 #              and each ancestor up to the repository root
-#   plugins  → the skills/ directory of every installed plugin
 #
-# Scanned in a fixed order (project, personal, plugins) whatever order they
-# are written in, so reordering `sources` cannot change which of two
-# same-named skills wins.
+# Scanned in a fixed order (project, then personal) whatever order they are
+# written in, so reordering `sources` cannot change which of two same-named
+# skills wins.
+#
+# There is deliberately no `plugins` source. Scanning a plugin's skills/
+# took one of the three things a plugin ships and dropped its subagents and
+# MCP servers, so a skill whose instructions dispatch to `prs:code-reviewer`
+# loaded fine and then could not. Name plugins in `runtime.plugins` instead
+# (see examples/plugins.yaml) — that brings the whole unit and, unlike a
+# scan, reproduces on another machine.
 #
 # Provider support — discovery is realistically a `copilot` feature today:
 #   * copilot           → fully supported
@@ -57,16 +63,14 @@ workflow:
     max_agent_iterations: 20
 
     # Declared skills are authoritative. A discovered skill with the same
-    # name is skipped with a warning — which happens as soon as you add
-    # `plugins` below, since installing Conductor's own plugin puts a
-    # second `conductor` skill on the machine.
+    # name is skipped with a warning.
     skills:
       - conductor
 
     skill_discovery:
-      # Starts with `personal` alone. Add `project` and `plugins` once you
-      # have seen what `conductor validate` reports for them — every source
-      # warns when it finds nothing, so enable the ones you have skills in.
+      # Starts with `personal` alone. Add `project` once you have seen what
+      # `conductor validate` reports for it — every source warns when it
+      # finds nothing, so enable the ones you have skills in.
       sources:
         - personal
       # Drop individual skills by name. Useful for a large skill you do not

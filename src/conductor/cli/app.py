@@ -160,13 +160,21 @@ def print_error(error: Exception) -> None:
         console.print(panel)
 
 
+_INTERACTIVE_STEP_TYPES = ("human_gate", "questions")
+"""Step types that park the workflow waiting on a human."""
+
+
 def _workflow_has_human_gate(workflow_path: Path) -> bool:
-    """Return True if the workflow defines any ``human_gate`` agent.
+    """Return True if the workflow defines any step that waits on a human.
 
     Used to decide whether to print the ``--web-bg`` gate-resolution notice
     after forking the background child (issue #286). Config-load failures
     return ``False`` so the normal run path surfaces the real error instead
     of this best-effort probe.
+
+    Covers ``questions`` as well as ``human_gate`` — both park the run on the
+    dashboard, so omitting either would leave a ``--web-bg`` user with a
+    silently stalled workflow and no notice explaining why.
     """
     try:
         from conductor.config.loader import load_config
@@ -175,8 +183,9 @@ def _workflow_has_human_gate(workflow_path: Path) -> bool:
     except Exception:  # noqa: BLE001 — defer real validation to the loader path
         logger.debug("Best-effort human_gate probe failed to load %s", workflow_path, exc_info=True)
         return False
-    return any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
-        getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
+    return any(getattr(a, "type", None) in _INTERACTIVE_STEP_TYPES for a in config.agents) or any(
+        getattr(getattr(fe, "agent", None), "type", None) in _INTERACTIVE_STEP_TYPES
+        for fe in config.for_each
     )
 
 
@@ -200,7 +209,8 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     port = urlparse(url).port
     port_hint = str(port) if port is not None else "<port>"
     console.print(
-        "[yellow]This workflow contains human_gate steps.[/yellow] Resolve them from "
+        "[yellow]This workflow contains steps that wait for you[/yellow] "
+        "(human_gate / questions). Resolve them from "
         "the dashboard above, or run "
         f"[bold]conductor gate respond --port {port_hint} --choice <value>[/bold]."
     )

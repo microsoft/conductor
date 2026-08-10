@@ -51,20 +51,37 @@ workflow:
                                     # claude-agent-sdk loads natively via its plugin surface, so a
                                     #   path skill OUTSIDE a Claude Code plugin is rejected there;
                                     # Claude and hermes eagerly inject SKILL.md + references/*.md.
+    plugins:                        # Whole plugins enabled for every provider-backed agent (default: [])
+      - string                      #   String shorthand: everything the plugin ships
+      - name: string                #   Installed plugin NAME, or a PATH (same syntactic rule as skills)
+        skills: boolean             #   Load its skills/            (default: true)
+        agents: boolean             #   Register its subagents      (default: true)
+        mcp: boolean                #   Start its MCP servers       (default: true)
+                                    # A plugin ships skills, agents/*.agent.md subagents, and MCP
+                                    #   servers; enabling it brings all three because they are
+                                    #   written to work together.
+                                    # Names resolve under ~/.copilot/installed-plugins/*/ and
+                                    #   ~/.claude/plugins/*/; uninstalled or ambiguous is an error.
+                                    # copilot and claude-agent-sdk only. On claude-agent-sdk,
+                                    #   `agents: false` with `skills: true` is refused (its skill
+                                    #   surface is the plugin root, which carries subagents too).
+                                    # hooks/ and commands/ are never loaded (validate warns).
+                                    # Never discovered — a plugin loads only when a workflow names it.
     skill_injection:                # Bounds EAGERLY injected skill content (claude, hermes only).
       warn_bytes: integer           # Warn above this many bytes (default: 65536; null disables)
       max_bytes: integer            # Fail above this many bytes (default: 131072; null disables)
     skill_discovery:                # Pick up skills already installed on the machine (OFF by default)
-      sources: [string]             # personal | project | plugins (default: [] = disabled)
+      sources: [string]             # personal | project (default: [] = disabled)
                                     #   personal -> ~/.copilot/skills, ~/.claude/skills
                                     #   project  -> .github/skills and .claude/skills, from the
                                     #               workflow file's dir up to the repo root (or that
                                     #               dir alone when not inside a repository)
-                                    #   plugins  -> every installed plugin's skills/ directory
                                     # Conductor scans the union of both CLIs' locations itself, so
                                     #   every agent sees the same set whatever provider it uses.
-                                    # Scanned in a fixed order (project, personal, plugins) whatever
+                                    # Scanned in a fixed order (project, then personal) whatever
                                     #   order they are written in.
+                                    # No `plugins` source: taking a plugin's skills/ and leaving
+                                    #   its agents/ and MCP behind is what runtime.plugins fixes.
                                     # Discovered skills join runtime.skills, so an agent's own
                                     #   `skills:` (including []) overrides them too.
                                     # A skill named in `skills:` beats a discovered one of the same
@@ -198,6 +215,12 @@ agents:
     #   - skills: [a, b]  explicit set, replaces the workflow default
     skills: [string]                # Built-in names and/or paths (see runtime.skills above)
                                     # e.g. [conductor, ./team-skills/acme-widgets]
+
+    # Plugins (optional, only on provider-backed agents)
+    # Same tri-state as skills: omit inherits runtime.plugins, [] opts out,
+    # a list replaces the workflow default. See runtime.plugins above.
+    plugins:
+      - string                      # e.g. [prs] or [{name: ado, mcp: false}]
 
     # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:

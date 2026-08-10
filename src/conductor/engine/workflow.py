@@ -41,6 +41,7 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
+from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
 from conductor.executor.output import validate_output
@@ -53,10 +54,14 @@ from conductor.executor.set_step import (
 from conductor.executor.template import TemplateRenderer
 from conductor.executor.wait import WaitExecutor, WaitOutput
 from conductor.gates.human import (
+    GateChoice,
+    GatePrompt,
+    GateResponse,
     GateResult,
     HumanGateHandler,
     MaxIterationsHandler,
     MaxIterationsPromptResult,
+    option_for_value,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 from conductor.providers.base import AgentOutput, EventCallback
@@ -266,6 +271,25 @@ class ExecutionPlan:
     """Possible execution paths through the workflow."""
 
 
+_ANSWER_SOURCES = frozenset({"choice", "free_text", "default", "skipped"})
+"""Legal ``AnswerRecord.source`` values, for validating restored checkpoints."""
+
+
+def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
+    """Project a questions output down to the counts events carry.
+
+    Args:
+        output: A questions node output.
+
+    Returns:
+        The answered/skipped counts.
+    """
+    return {
+        "answered_count": output["answered_count"],
+        "skipped_count": output["skipped_count"],
+    }
+
+
 class WorkflowEngine:
     """Orchestrates multi-agent workflow execution.
 
@@ -410,6 +434,12 @@ class WorkflowEngine:
         # its own ``skills`` field.
         self._workflow_skills = list(config.workflow.runtime.skills)
 
+        # Workflow-level default plugins (runtime.plugins) — inherited on
+        # the same tri-state as skills. Never discovered: a plugin can
+        # launch MCP subprocesses with the user's credentials, so it is
+        # loaded only because a workflow named it.
+        self._workflow_plugins = list(config.workflow.runtime.plugins)
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
@@ -421,6 +451,7 @@ class WorkflowEngine:
                 workflow_dir=self._workflow_dir,
                 skill_injection=config.workflow.runtime.skill_injection,
                 skill_discovery=config.workflow.runtime.skill_discovery,
+                workflow_plugins=self._workflow_plugins,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -460,6 +491,10 @@ class WorkflowEngine:
         # (issue #244) also set _last_checkpoint_path, so it can no longer
         # double as "the dashboard-stop handler already ran".
         self._dashboard_stop_handled: bool = False
+
+        # True only for the first questions node reached via resume(), so a
+        # loop-back re-asks rather than replaying the prior pass's answers.
+        self._resuming_questions: bool = False
         # Monotonic timestamp of the last periodic checkpoint (issue #244),
         # used to evaluate the runtime.checkpoint.every_seconds throttle at
         # step boundaries. None until the first periodic checkpoint is saved.
@@ -1110,6 +1145,7 @@ class WorkflowEngine:
                 workflow_dir=self._workflow_dir,
                 skill_injection=self.config.workflow.runtime.skill_injection,
                 skill_discovery=self.config.workflow.runtime.skill_discovery,
+                workflow_plugins=self._workflow_plugins,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)
@@ -2059,6 +2095,11 @@ class WorkflowEngine:
             MaxIterationsError: If max iterations limit is exceeded.
             TimeoutError: If timeout limit is exceeded.
         """
+        # A questions node restores its partial answers only here. On an
+        # ordinary loop-back the node must ask its new questions, not replay
+        # the previous pass's answers under the same positional ids.
+        self._resuming_questions = True
+
         # Fresh timeout window for resumed execution
         self.limits.start_time = _time.monotonic()
 
@@ -2419,12 +2460,452 @@ class WorkflowEngine:
         if self._keyboard_listener is not None:
             await self._keyboard_listener.resume()
 
+    async def _run_questions_step(self, agent: AgentDef) -> dict[str, Any]:
+        """Present a set of questions to a human and collect their answers.
+
+        Runs the whole cursor loop inside one engine step (issue #376).
+
+        Partial answers are committed to the workflow context after every
+        response, so a checkpoint taken while the node is parked on a human —
+        a dashboard stop, Ctrl-C, or an unhandled failure — already carries
+        them and a resumed run continues at the right question. They live in
+        the node's ordinary context entry, which ``WorkflowContext.to_dict()``
+        already serializes. Note a *periodic* checkpoint cannot fire here: it
+        is taken at the top of the execution loop, which this step has not
+        returned to.
+
+        Args:
+            agent: The questions node definition.
+
+        Returns:
+            The node output (see ``executor/questions.py::build_output``).
+
+        Raises:
+            ExecutionError: If the question source cannot be resolved or an
+                entry is malformed.
+        """
+        agent_context = self.context.get_for_template()
+
+        def _render(text: str) -> str:
+            return self.renderer.render(text, agent_context)
+
+        if agent.source:
+            raw = self._resolve_array_reference(agent.source)
+            definitions = questions_mod.coerce_questions(raw, agent_name=agent.name)
+            trusted = False
+        else:
+            definitions = list(agent.questions or [])
+            trusted = True
+
+        order = questions_mod.resolve_questions(
+            definitions, render=_render, agent_name=agent.name, trusted=trusted
+        )
+
+        intro: str | None = None
+        if agent.prompt:
+            intro = linkify_markdown(_render(agent.prompt), base_dir=self._workflow_dir)
+
+        # Resume support: prior answers for this node survive in context.
+        # Consumed once, so a later loop-back re-asks instead of replaying —
+        # question ids default to positional q1..qN, so a new question set
+        # would otherwise silently inherit the previous pass's answers.
+        records: dict[str, questions_mod.AnswerRecord] = {}
+        if self._resuming_questions:
+            self._resuming_questions = False
+            prior = self.context.agent_outputs.get(agent.name)
+            if isinstance(prior, dict):
+                records = self._restore_question_records(prior, order)
+
+        # Emitted before the empty-set early return below, so a node whose
+        # source resolved to [] still completes on the dashboard instead of
+        # sitting at 'pending' forever.
+        self._emit(
+            "questions_presented",
+            {
+                "agent_name": agent.name,
+                "total": len(order),
+                "prompt": intro,
+                "questions": [
+                    {"id": q.id, "text": q.text, "hint": q.hint, "choices": q.choices}
+                    for q in order
+                ],
+            },
+        )
+
+        if not order:
+            output = questions_mod.build_output(records, order, questions_mod.OUTCOME_COMPLETED)
+            self._emit(
+                "questions_completed",
+                {
+                    "agent_name": agent.name,
+                    "outcome": output["outcome"],
+                    **_answer_counts(output),
+                },
+            )
+            return output
+
+        # --skip-gates must not auto-select a suggested answer: those come from
+        # the upstream agent, so recording one would feed invented human input
+        # back as real. Skipping honestly is the only safe automation.
+        if self.gate_handler.skip_gates:
+            for question in order:
+                records.setdefault(
+                    question.id,
+                    questions_mod.AnswerRecord.for_skip(question),
+                )
+            output = questions_mod.build_output(
+                records, order, questions_mod.OUTCOME_SKIPPED_REMAINING
+            )
+            self._emit(
+                "questions_completed",
+                {"agent_name": agent.name, "outcome": output["outcome"], **_answer_counts(output)},
+            )
+            return output
+
+        outcome = await self._run_questions_loop(agent, order, records, intro)
+        output = questions_mod.build_output(records, order, outcome)
+        self._emit(
+            "questions_completed",
+            {"agent_name": agent.name, "outcome": outcome, **_answer_counts(output)},
+        )
+        return output
+
+    async def _run_questions_loop(
+        self,
+        agent: AgentDef,
+        order: list[questions_mod.ResolvedQuestion],
+        records: dict[str, questions_mod.AnswerRecord],
+        intro: str | None,
+    ) -> questions_mod.QuestionsOutcome:
+        """Drive the question cursor until the user finishes, skips, or aborts.
+
+        Args:
+            agent: The questions node definition.
+            order: Resolved questions in presentation order.
+            records: Answer store, mutated in place so partial progress
+                survives even if this raises.
+            intro: Optional rendered node-level intro.
+
+        Returns:
+            The terminal outcome string.
+        """
+        cursor = 0
+        # Resume at the first unanswered question rather than restarting.
+        while cursor < len(order) and order[cursor].id in records:
+            cursor += 1
+
+        nav = questions_mod.NavFlags.resolve(agent)
+        presentation = 0
+        rejection: str | None = None
+
+        def _next_prompt_id() -> str:
+            return f"{agent.name}:{self._run_id}:{presentation}"
+
+        while True:
+            answered = sum(1 for r in records.values() if not r.skipped)
+            skipped = sum(1 for r in records.values() if r.skipped)
+            presentation += 1
+
+            # Past the last question: confirm before finishing, so Back stays
+            # reachable from the final question.
+            at_review = cursor >= len(order)
+            if at_review:
+                # The review exists solely to keep Back reachable from the last
+                # question; with Back disabled it would be a pointless extra
+                # click, so finish immediately.
+                if not nav.back:
+                    return questions_mod.OUTCOME_COMPLETED
+                gate_prompt = questions_mod.build_review_prompt(
+                    agent, records, order, nav=nav, prompt_id=_next_prompt_id()
+                )
+            else:
+                gate_prompt = questions_mod.build_prompt(
+                    agent,
+                    order[cursor],
+                    nav=nav,
+                    cursor=cursor,
+                    total=len(order),
+                    answered=answered,
+                    skipped=skipped,
+                    prompt_id=_next_prompt_id(),
+                    intro=intro,
+                    rejection=rejection,
+                )
+            rejection = None
+
+            await self._suspend_listener()
+            try:
+                # Reuse the gate response channel rather than adding a second
+                # one: the progress header and nav controls travel inside the
+                # prompt and choices. The client still had to learn prompt_id,
+                # since a questions node presents repeatedly under one name.
+                self._emit(
+                    "gate_presented",
+                    {
+                        "agent_name": agent.name,
+                        "options": [c.value for c in gate_prompt.choices],
+                        "option_details": [
+                            {
+                                "label": c.label,
+                                "value": c.value,
+                                "route": "",
+                                "prompt_for": c.prompt_for,
+                                "multiline": c.multiline,
+                            }
+                            for c in gate_prompt.choices
+                        ],
+                        "prompt": gate_prompt.prompt,
+                        "prompt_id": gate_prompt.prompt_id,
+                        "step_type": "questions",
+                    },
+                )
+                response = await self._resolve_human_prompt(gate_prompt)
+            finally:
+                await self._resume_listener()
+
+            if response.value == questions_mod.NAV_FINISH:
+                return questions_mod.OUTCOME_COMPLETED
+
+            if response.value == questions_mod.NAV_BACK:
+                # Back is only offered from question 2 onward and at the review;
+                # a duplicate or late click could still deliver it at cursor 0,
+                # where decrementing is a no-op and the pop would silently
+                # discard an answer the user already gave.
+                if cursor == 0:
+                    continue
+                # Clear the answer being revisited so the resume scan above and
+                # the "answered" counter both reflect reality.
+                cursor -= 1
+                records.pop(order[cursor].id, None)
+                self._store_questions_progress(agent, records, order)
+                continue
+
+            if response.value == questions_mod.NAV_ABORT:
+                return questions_mod.OUTCOME_ABORTED
+
+            if response.value == questions_mod.NAV_SKIP_ALL:
+                # Skip-all must honour `required` too, or it is a one-click
+                # bypass of the per-question check below and `required` means
+                # nothing. The user can still answer, or abort when enabled.
+                blocking = [q for q in order[cursor:] if q.required and q.default is None]
+                if blocking:
+                    rejection = (
+                        f"{len(blocking)} required question(s) still need an answer "
+                        "and cannot be skipped."
+                    )
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": blocking[0].id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
+                for remaining in order[cursor:]:
+                    records.setdefault(
+                        remaining.id,
+                        questions_mod.AnswerRecord.for_skip(remaining),
+                    )
+                self._store_questions_progress(agent, records, order)
+                return questions_mod.OUTCOME_SKIPPED_REMAINING
+
+            if at_review:
+                # build_review_prompt offers only Finish/Back/Abort, all handled
+                # above, so this is unreachable today. Fail loudly rather than
+                # falling through — order[cursor] would IndexError here, and
+                # silently re-presenting would hide a future choice added to
+                # the review without a matching handler.
+                raise AssertionError(
+                    f"Unhandled review response {response.value!r} for '{agent.name}'"
+                )
+
+            question = order[cursor]
+            if response.value == questions_mod.NAV_SKIP:
+                if question.required and question.default is None:
+                    rejection = "This question is required and cannot be skipped."
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": question.id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
+                records[question.id] = questions_mod.AnswerRecord.for_skip(question)
+            elif response.value == questions_mod.FREE_TEXT:
+                text = response.additional_input.get(questions_mod.FREE_TEXT_FIELD, "").strip()
+                if question.required and not text:
+                    rejection = "This question is required; please provide an answer."
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": question.id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=text,
+                    source="free_text",
+                )
+            else:
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=response.value,
+                    source="choice",
+                )
+
+            self._emit(
+                "questions_answered",
+                {
+                    "agent_name": agent.name,
+                    "question_id": question.id,
+                    "cursor": cursor,
+                    "total": len(order),
+                    "source": records[question.id].source,
+                    "skipped": records[question.id].skipped,
+                },
+            )
+            self._store_questions_progress(agent, records, order)
+            cursor += 1
+
+    def _store_questions_progress(
+        self,
+        agent: AgentDef,
+        records: dict[str, questions_mod.AnswerRecord],
+        order: list[questions_mod.ResolvedQuestion],
+    ) -> None:
+        """Commit partial answers to context so a checkpoint captures them.
+
+        Args:
+            agent: The questions node definition.
+            records: Answers collected so far.
+            order: All questions, in presentation order.
+        """
+        # Assign directly rather than via ``store``: this fires after every
+        # answer, and ``store`` appends to execution_history and bumps
+        # current_iteration, which would leak N entries into downstream
+        # prompts, the interrupt panel, and the dashboard's synthetic replay.
+        # The main loop's single ``store`` remains the node's one history entry.
+        self.context.agent_outputs[agent.name] = questions_mod.build_output(
+            records, order, questions_mod.OUTCOME_IN_PROGRESS
+        )
+
+    @staticmethod
+    def _restore_question_records(
+        prior: dict[str, Any],
+        order: list[questions_mod.ResolvedQuestion],
+    ) -> dict[str, questions_mod.AnswerRecord]:
+        """Rebuild answer records from a resumed node's stored output.
+
+        A record is kept only when both its id **and** its question text still
+        match. Ids default to positional ``q1..qN``, so matching on id alone
+        would re-attach an old answer to a different question whenever the
+        workflow was edited or an upstream agent produced a different set —
+        the common case, not an exotic one. Every drop is logged, because a
+        silently unanswered question is asked again while a silently
+        *misattached* one never is.
+
+        Args:
+            prior: The node's previously stored output.
+            order: The current resolved questions.
+
+        Returns:
+            Restored answer records keyed by question id.
+        """
+        current = {q.id: q.text for q in order}
+        restored: dict[str, questions_mod.AnswerRecord] = {}
+        for item in prior.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if item_id not in current:
+                logger.info(
+                    "Dropping restored answer %r: that question is no longer in the set.",
+                    item_id,
+                )
+                continue
+            if item.get("question") != current[item_id]:
+                logger.warning(
+                    "Dropping restored answer for %r: the question text changed since "
+                    "the checkpoint (was %r, now %r). It will be asked again.",
+                    item_id,
+                    item.get("question"),
+                    current[item_id],
+                )
+                continue
+            # Validate against the literal set: a hand-edited or partially
+            # written checkpoint must not smuggle an unknown source through to
+            # the dashboard, and `skipped` is derived from it.
+            source = item.get("source")
+            if source not in _ANSWER_SOURCES:
+                logger.warning(
+                    "Restored answer %r has unknown source %r; treating it as skipped.",
+                    item_id,
+                    source,
+                )
+                source = "skipped"
+            restored[item_id] = questions_mod.AnswerRecord(
+                id=item_id,
+                question=item.get("question", ""),
+                answer=None if source == "skipped" else item.get("answer"),
+                source=source,
+            )
+        return restored
+
     async def _handle_gate_with_web(
         self,
         agent: AgentDef,
         agent_context: dict[str, Any],
     ) -> GateResult:
-        """Handle a human gate, choosing CLI / web / race per environment.
+        """Handle a ``human_gate``, mapping the shared prompt back onto routes.
+
+        Thin adapter over :meth:`_resolve_human_prompt`, which owns the
+        environment policy. Routing stays here because it is a workflow-graph
+        concern that the shared interaction layer deliberately knows nothing
+        about.
+
+        Args:
+            agent: The human_gate agent definition.
+            agent_context: Current workflow context for template rendering.
+
+        Returns:
+            GateResult with the selected option, route, and any additional
+            input.
+
+        Raises:
+            HumanGateError: If the gate has no options, if bg mode is active
+                with no web dashboard attached, or if the response value
+                matches no declared option.
+        """
+        from conductor.exceptions import HumanGateError
+
+        if not agent.options:
+            raise HumanGateError(
+                f"Human gate '{agent.name}' has no options defined",
+                suggestion="Add 'options' list to the human_gate agent",
+            )
+
+        gate_prompt = self.gate_handler.build_gate_prompt(
+            agent, agent_context, base_dir=self._workflow_dir
+        )
+        response = await self._resolve_human_prompt(gate_prompt)
+
+        selected = option_for_value(agent, response.value)
+        return GateResult(
+            selected_option=selected,
+            route=selected.route,
+            additional_input=response.additional_input,
+        )
+
+    async def _resolve_human_prompt(self, gate_prompt: GatePrompt) -> GateResponse:
+        """Resolve one human prompt, choosing CLI / web / race per environment.
 
         Resolution policy (issue #286, extending the #198/#202 max-iterations
         gate fix in ``_resolve_max_iterations_gate``):
@@ -2451,11 +2932,10 @@ class WorkflowEngine:
           ``wait_for_stop()`` race is needed here.
 
         Args:
-            agent: The human_gate agent definition.
-            agent_context: Current workflow context for template rendering.
+            gate_prompt: The prompt to resolve.
 
         Returns:
-            GateResult from whichever input source responded first.
+            GateResponse from whichever input source responded first.
 
         Raises:
             HumanGateError: If bg mode is active and no web dashboard is
@@ -2466,26 +2946,24 @@ class WorkflowEngine:
                 from conductor.exceptions import HumanGateError
 
                 raise HumanGateError(
-                    f"Cannot resolve human_gate '{agent.name}': no web dashboard is "
+                    f"Cannot resolve human_gate '{gate_prompt.name}': no web dashboard is "
                     "available and stdin cannot be prompted in background mode.",
                     suggestion=(
                         "Restart with --web in the foreground, or resolve the gate "
                         "with `conductor gate respond` once the dashboard is reachable."
                     ),
-                    gate_name=agent.name,
+                    gate_name=gate_prompt.name,
                 )
             # Not bg mode: use CLI only (foreground, or non-TTY without a
             # dashboard — e.g. piped stdin, tests).
-            return await self.gate_handler.handle_gate(
-                agent, agent_context, base_dir=self._workflow_dir
-            )
+            return await self.gate_handler.prompt(gate_prompt)
 
         # Web dashboard + bg or non-TTY → web-only wait (skip the CLI arm; it
         # would EOFError-and-crash on a DEVNULL stdin, cancelling the web arm
         # before a dashboard user could respond).
         cli_usable = not self._bg_mode and sys.stdin.isatty()
         if not cli_usable:
-            return await self._wait_for_web_gate(agent)
+            return await self._wait_for_web_gate(gate_prompt)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens
@@ -2494,11 +2972,11 @@ class WorkflowEngine:
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
         cli_task = asyncio.create_task(
-            self.gate_handler.handle_gate(agent, agent_context, base_dir=self._workflow_dir),
+            self.gate_handler.prompt(gate_prompt),
             name="gate_cli",
         )
         web_task = asyncio.create_task(
-            self._wait_for_web_gate(agent),
+            self._wait_for_web_gate(gate_prompt),
             name="gate_web",
         )
 
@@ -2517,45 +2995,79 @@ class WorkflowEngine:
         winner = done.pop()
         return winner.result()
 
-    async def _wait_for_web_gate(self, agent: AgentDef) -> GateResult:
+    @staticmethod
+    def _coerce_additional_input(raw: Any, choice: GateChoice) -> dict[str, str]:
+        """Normalize a client's ``additional_input`` into a field mapping.
+
+        ``conductor gate respond --input`` sends a bare string, which used to
+        be dropped on the floor: for a ``human_gate`` that lost an occasional
+        ``prompt_for``, but for a ``questions`` node free text *is* the primary
+        answer, so the operator's typed answer vanished and the CLI still
+        printed success. A string is mapped onto the selected choice's declared
+        field instead. Values are stringified because the payload is untrusted:
+        a JSON number would otherwise reach ``.strip()`` and raise mid-node.
+
+        Args:
+            raw: The client-supplied value.
+            choice: The choice that was selected.
+
+        Returns:
+            A field-name to text mapping, empty when there is nothing to carry.
+        """
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+        if isinstance(raw, str) and raw and choice.prompt_for:
+            return {choice.prompt_for: raw}
+        if raw is not None and not isinstance(raw, (dict, str)):
+            logger.warning(
+                "Discarding additional_input of unsupported type %s for choice %r",
+                type(raw).__name__,
+                choice.value,
+            )
+        return {}
+
+    async def _wait_for_web_gate(self, gate_prompt: GatePrompt) -> GateResponse:
         """Wait for a gate response from the web dashboard.
 
         Translates the raw JSON message from the web client into a
-        ``GateResult`` by matching ``selected_value`` against the
-        agent's options.
+        ``GateResponse`` by matching ``selected_value`` against the
+        prompt's choices.
 
         Args:
-            agent: The human_gate agent definition with options.
+            gate_prompt: The prompt awaiting a response.
 
         Returns:
-            GateResult with the selected option, route, and any
-            additional input from the web client.
+            GateResponse with the selected choice and any additional input
+            from the web client.
 
         Raises:
-            HumanGateError: If the selected value doesn't match any option.
+            HumanGateError: If the selected value doesn't match any choice.
         """
         from conductor.exceptions import HumanGateError
 
         assert self._web_dashboard is not None  # noqa: S101
 
-        msg = await self._web_dashboard.wait_for_gate_response(agent.name)
+        msg = await self._web_dashboard.wait_for_gate_response(
+            gate_prompt.name, gate_prompt.prompt_id
+        )
         selected_value = msg.get("selected_value", "")
 
-        # Find matching option
-        for option in agent.options or []:
-            if option.value == selected_value:
-                additional_input = msg.get("additional_input", {})
-                if not isinstance(additional_input, dict):
-                    additional_input = {}
-                return GateResult(
-                    selected_option=option,
-                    route=option.route,
+        # Find matching choice
+        for choice in gate_prompt.choices:
+            if choice.value == selected_value:
+                additional_input = self._coerce_additional_input(
+                    msg.get("additional_input"), choice
+                )
+                return GateResponse(
+                    value=choice.value,
+                    label=choice.label,
                     additional_input=additional_input,
+                    prompt_id=gate_prompt.prompt_id,
                 )
 
         raise HumanGateError(
             f"Web gate response value '{selected_value}' does not match any option "
-            f"for gate '{agent.name}'",
+            f"for gate '{gate_prompt.name}'",
             suggestion="Check the option values in the workflow YAML",
         )
 
@@ -3538,6 +4050,7 @@ class WorkflowEngine:
                                     "value": o.value,
                                     "route": o.route,
                                     "prompt_for": o.prompt_for,
+                                    "multiline": o.multiline,
                                 }
                                 for o in (agent.options or [])
                             ]
@@ -3600,6 +4113,46 @@ class WorkflowEngine:
                                 self._execute_hook("on_complete", result=result)
                                 return result
                             current_agent_name = gate_result.route
+                            continue
+
+                        # Handle questions steps. N human prompts inside ONE
+                        # engine step, so the cursor can move backwards and the
+                        # node costs 1 iteration rather than 2N.
+                        if agent.type == "questions":
+                            questions_output = await self._run_questions_step(agent)
+                            self.context.store(agent.name, questions_output)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            if questions_output["outcome"] == questions_mod.OUTCOME_ABORTED:
+                                route_target = agent.abort_route or "$end"
+                                output_transform = None
+                            else:
+                                route_result = self._evaluate_routes(agent, questions_output)
+                                route_target = route_result.target
+                                output_transform = route_result.output_transform
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_target,
+                                },
+                            )
+
+                            if route_target == "$end":
+                                result = self._build_final_output(output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_target
                             continue
 
                         # Handle script steps

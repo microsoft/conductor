@@ -11,7 +11,9 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+
+from conductor.exceptions import ProviderError
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -26,6 +28,41 @@ EventCallback = Callable[[str, dict[str, Any]], None]
 # Suffixes that providers may strip when matching aliased model names against
 # their SDK's canonical IDs (e.g. "claude-3-5-sonnet-latest" -> base name).
 _VERSION_SUFFIX_RE = re.compile(r"-(\d{8}|latest|preview)$")
+
+
+def refuse_mcp_server_clashes(
+    plugin_servers: Iterable[str], workflow_servers: Iterable[str]
+) -> None:
+    """Refuse a plugin MCP server whose name a workflow server already claims.
+
+    One phrasing for every provider, so two providers cannot describe the
+    same clash two ways — the same reason
+    :func:`~conductor.plugins.registry.describe_dropped_components` is
+    shared between ``conductor validate`` and ``conductor run``.
+
+    A collision is refused, not resolved by precedence: the server name
+    prefixes the tool names the model sees, so one of the two would be
+    unreachable, and silently dropping a declared component is the
+    failure plugins exist to remove. ``conductor validate`` reports the
+    same clash, but ``conductor run`` never invokes the static
+    validator, so the guard has to exist at the provider seam too.
+
+    Args:
+        plugin_servers: Server names contributed by enabled plugins.
+        workflow_servers: Server names from ``runtime.mcp_servers``.
+
+    Raises:
+        ProviderError: If any name appears in both.
+    """
+    clashes = sorted(set(plugin_servers) & set(workflow_servers))
+    if clashes:
+        raise ProviderError(
+            f"MCP server name(s) {clashes!r} are declared by both an enabled "
+            f"plugin and the workflow's 'runtime.mcp_servers'. The server name "
+            f"prefixes the tool names the model sees, so one would be unreachable.",
+            suggestion="Rename the workflow's server, or set 'mcp: false' on the plugin.",
+            is_retryable=False,
+        )
 
 
 def match_model_id(requested: str, known_ids: Iterable[str]) -> str | None:
@@ -240,14 +277,61 @@ class AgentProvider(ABC):
         """
         return False
 
+    @property
+    def supports_native_plugins(self) -> bool:
+        """Whether the provider can register a plugin's subagents.
+
+        Plugins are **deconstructed** rather than handed to the SDK
+        whole: skills reach the provider through ``skill_directories``
+        (which :attr:`supports_native_skills` already governs), MCP
+        servers through ``extra_mcp_servers``, and subagents through
+        ``custom_agents``. This property covers the last of those,
+        because it is the one surface with no fallback — a subagent
+        cannot be approximated by injecting text into a prompt.
+
+        Providers MUST also declare ``plugins=True`` on their
+        :class:`ProviderCapabilities` descriptor. As with skills, the
+        capability flag asserts the user-facing contract and this
+        property selects the mechanism.
+        """
+        return False
+
+    @property
+    def skills_require_plugin_root(self) -> bool:
+        """Whether reaching a skill means registering its whole plugin root.
+
+        ``True`` on providers whose SDK has no bare skill-directory
+        surface (``claude-agent-sdk``), where a skill is enabled by
+        registering the plugin that owns it. That registration is not
+        filterable — the SDK documents it as also providing the plugin's
+        commands, agents, and hooks — so on such a provider a plugin's
+        subagents cannot be declined while its skills are enabled, and
+        its hooks are exposed rather than dropped.
+
+        Both :mod:`conductor.config.validator` and
+        :class:`~conductor.executor.agent.AgentExecutor` branch on this
+        so the two agree about what a plugin actually delivers.
+        """
+        return False
+
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
-        """Enforce that every production subclass declares ``CAPABILITIES``.
+        """Enforce that a production subclass declares what it can honour.
 
         Converts a latent "lazily caught at validator/runtime" failure
         into an import-time error so missing or mistyped descriptors
         cannot ship. Test fakes opt out with ``abstract=True``:
 
             class _Fake(AgentProvider, abstract=True): ...
+
+        Also checks the one capability with no fallback. A provider
+        declaring ``plugins=True`` must accept all three delivery kwargs
+        on :meth:`execute` and declare
+        :attr:`supports_native_plugins` — a plugin's subagents and MCP
+        servers cannot be approximated by injecting text into a prompt,
+        so declaring support and dropping a channel silently reinstates
+        the partial load the feature exists to remove. Signature drift is
+        catchable here; "accepts the kwarg then ignores it" is not, and
+        is covered per-provider by ``tests/test_plugins/test_providers.py``.
         """
         super().__init_subclass__(**kwargs)
         if abstract:
@@ -264,6 +348,36 @@ class AgentProvider(ABC):
                 f"with `class {cls.__name__}(AgentProvider, abstract=True)`."
             )
 
+        if caps.plugins:
+            import inspect
+
+            accepted = set(inspect.signature(cls.execute).parameters)
+            missing = sorted({"skill_directories", "custom_agents", "extra_mcp_servers"} - accepted)
+            if missing:
+                raise TypeError(
+                    f"{cls.__module__}.{cls.__name__} declares capabilities.plugins=True "
+                    f"but execute() does not accept {missing} — a plugin's components "
+                    f"would be dropped without a word."
+                )
+            declared = inspect.getattr_static(cls, "supports_native_plugins", None)
+            if isinstance(declared, property) and declared.fget is not None:
+                try:
+                    # Evaluated with no instance: these declarations are
+                    # constants. A getter that genuinely needs instance state
+                    # cannot be checked here, so it is left to the per-provider
+                    # tests rather than failing the import.
+                    resolved = declared.fget(cast("AgentProvider", None))
+                except (AttributeError, TypeError):
+                    resolved = True
+            else:
+                resolved = declared
+            if not resolved:
+                raise TypeError(
+                    f"{cls.__module__}.{cls.__name__} declares capabilities.plugins=True "
+                    f"but supports_native_plugins is falsy. The two describe the same "
+                    f"contract and must agree."
+                )
+
     @abstractmethod
     async def execute(
         self,
@@ -274,6 +388,8 @@ class AgentProvider(ABC):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -299,6 +415,18 @@ class AgentProvider(ABC):
                 may ignore this parameter (the executor will have
                 eager-injected the skill content into
                 ``rendered_prompt`` instead).
+            custom_agents: Optional subagent definitions resolved from
+                the agent's effective ``plugins`` list, each shaped like
+                the Copilot SDK's ``CustomAgentConfig`` and named
+                ``<plugin>:<agent>``. Providers that set
+                :attr:`supports_native_plugins` to ``True`` should
+                register these so the model can dispatch to them.
+            extra_mcp_servers: Optional MCP servers contributed by the
+                agent's effective ``plugins`` list, merged on top of the
+                workflow-level ``runtime.mcp_servers`` for this call
+                only. Per-call rather than per-provider because
+                ``plugins:`` is a per-agent field and providers are
+                cached per type.
 
         Returns:
             Normalized AgentOutput with structured content.

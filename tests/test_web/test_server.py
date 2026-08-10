@@ -937,6 +937,85 @@ class TestWaitForGateResponse:
         assert dashboard._gate_response_queue.empty()
 
 
+class TestGatePromptIdStaleness:
+    """prompt_id staleness filtering for questions nodes (issue #376).
+
+    A questions node presents every question under the SAME agent name, so
+    the name alone cannot tell one prompt from the next.
+    """
+
+    @pytest.mark.asyncio
+    async def test_discards_a_response_for_an_earlier_prompt(self) -> None:
+        """A click on Q3 landing after Q4 opened must not resolve Q4."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "stale", "prompt_id": "ask:run:2"}
+        )
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "fresh", "prompt_id": "ask:run:3"}
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_gate_response("ask", "ask:run:3"), timeout=1.0
+        )
+
+        assert msg["selected_value"] == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_response_carrying_no_token(self) -> None:
+        """`conductor gate respond` sends no prompt_id and must still work."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "from_cli"}
+        )
+
+        msg = await asyncio.wait_for(
+            dashboard.wait_for_gate_response("ask", "ask:run:3"), timeout=1.0
+        )
+
+        assert msg["selected_value"] == "from_cli"
+
+    @pytest.mark.asyncio
+    async def test_waiting_prompt_id_is_cleared_after_resolution(self) -> None:
+        """A resolved prompt must not leave its token latched."""
+        _, dashboard = _make_dashboard()
+        await dashboard._gate_response_queue.put(
+            {"agent_name": "ask", "selected_value": "x", "prompt_id": "ask:run:1"}
+        )
+
+        await asyncio.wait_for(dashboard.wait_for_gate_response("ask", "ask:run:1"), timeout=1.0)
+
+        assert dashboard._gate_waiting_prompt_id is None
+        assert dashboard._gate_waiting_agent is None
+
+    def test_validate_rejects_a_mismatched_prompt_id(self) -> None:
+        """The HTTP path refuses a response aimed at a superseded prompt."""
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "ask"
+        dashboard._gate_waiting_prompt_id = "ask:run:3"
+
+        error = dashboard._validate_gate_target("ask", "ask:run:2")
+
+        assert error is not None
+        assert "ask:run:2" in error
+
+    def test_validate_accepts_a_matching_prompt_id(self) -> None:
+        """The matching token passes."""
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "ask"
+        dashboard._gate_waiting_prompt_id = "ask:run:3"
+
+        assert dashboard._validate_gate_target("ask", "ask:run:3") is None
+
+    def test_validate_accepts_a_missing_prompt_id(self) -> None:
+        """A token-less response stays valid so the CLI keeps working."""
+        _, dashboard = _make_dashboard()
+        dashboard._gate_waiting_agent = "ask"
+        dashboard._gate_waiting_prompt_id = "ask:run:3"
+
+        assert dashboard._validate_gate_target("ask", None) is None
+
+
 class TestWaitForIterationLimitResponse:
     """Tests for WebDashboard.wait_for_iteration_limit_response (issue #198)."""
 
@@ -1208,6 +1287,143 @@ class TestReplayEventsFromJsonl:
             "agent_started",
             "agent_completed",
         ]
+
+    def test_skips_paused_events_so_resume_does_not_look_stopped(self, tmp_path: Path) -> None:
+        """A pause left unresolved in the original log must not replay.
+
+        ``agent_paused`` latches the frontend's global ``isPaused`` flag,
+        which swaps the header's Stop button for Resume/Kill. Its only
+        counterparts (``agent_resumed``, root ``workflow_completed`` /
+        ``workflow_failed``) are absent from a killed run's log or filtered
+        here, so replaying it makes a healthy resumed run look stopped and
+        leaves it with no way to be stopped.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}},
+                {
+                    "type": "agent_paused",
+                    "timestamp": 1.5,
+                    "data": {"agent_name": "a", "partial_content": "{}"},
+                },
+                {"type": "workflow_failed", "timestamp": 2.0, "data": {"error": "stopped"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["agent_started"]
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "agent_paused",
+            "agent_resumed",
+            "iteration_limit_reached",
+            "iteration_limit_resolved",
+            "dialog_started",
+            "dialog_completed",
+        ],
+    )
+    @pytest.mark.parametrize("sub_path", [None, ["sub"], ["sub", "deeper"]])
+    def test_skips_interactive_events_at_every_depth(
+        self, tmp_path: Path, event_type: str, sub_path: list[str] | None
+    ) -> None:
+        """Interaction events are dropped regardless of ``subworkflow_path``.
+
+        The pause/gate/dialog control channel belongs to the root dashboard
+        no matter which engine emitted the event, so — unlike the root
+        lifecycle events — depth must never exempt them. Folding any of these
+        into the depth-gated set reinstates the latch for subworkflow-emitted
+        pauses, gates, and dialogs.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        data: dict[str, object] = {"agent_name": "a"}
+        if sub_path is not None:
+            data["subworkflow_path"] = sub_path
+        self._write_jsonl(
+            log,
+            [
+                {"type": event_type, "timestamp": 1.0, "data": data},
+                {"type": "agent_completed", "timestamp": 2.0, "data": {"agent_name": "a"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["agent_completed"]
+
+    def test_skip_sets_are_disjoint(self) -> None:
+        """The two skip sets have different depth semantics.
+
+        Membership in both is ambiguous, and moving an interaction event into
+        the depth-gated set silently exempts it at subworkflow depth.
+        """
+        assert WebDashboard._REPLAY_INTERACTIVE_SKIP_TYPES.isdisjoint(
+            WebDashboard._REPLAY_ROOT_SKIP_TYPES
+        )
+
+    @pytest.mark.parametrize("event_type", ["gate_presented", "gate_resolved", "dialog_message"])
+    def test_preserves_events_with_only_node_local_state(
+        self, tmp_path: Path, event_type: str
+    ) -> None:
+        """Events that set only *node-local* state are deliberately replayed.
+
+        ``gate_presented`` sets ``status: 'waiting'`` on its own node rather
+        than a global store latch, so it cannot latch the resumed run — and
+        dropping it would erase a genuine pending gate, its prompt, and its
+        options from the resumed timeline. Widening the interactive skip set
+        to cover these is a regression, not a tightening.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log, [{"type": event_type, "timestamp": 1.0, "data": {"agent_name": "a"}}]
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == [event_type]
+
+    def test_preserves_dialog_message_when_dialog_started_is_skipped(self, tmp_path: Path) -> None:
+        """Only the dialog's lifecycle bookends are skipped, not every dialog event.
+
+        ``dialog_message`` carries no global latch, so the skip set stays as
+        narrow as the bug requires. The replayed messages are inert rather
+        than useful: with ``dialog_started`` filtered, nothing renders
+        ``node.dialog_messages`` (both renderers gate on ``dialog_active`` /
+        ``activeDialog``, which only ``dialog_started`` sets). This pins the
+        filter's boundary, not a visible transcript.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "dialog_started",
+                    "timestamp": 1.0,
+                    "data": {"agent_name": "a", "dialog_id": "d1"},
+                },
+                {
+                    "type": "dialog_message",
+                    "timestamp": 1.1,
+                    "data": {"agent_name": "a", "role": "agent", "content": "hi"},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["dialog_message"]
 
     def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
         """Subworkflow-level workflow_started/completed (identified by a non-empty

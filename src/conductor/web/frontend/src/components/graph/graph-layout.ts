@@ -489,7 +489,7 @@ function layoutContext(
     let flowNodeType = 'agentNode';
     if (nodeType === 'script') flowNodeType = 'scriptNode';
     else if (nodeType === 'set') flowNodeType = 'setNode';
-    else if (nodeType === 'human_gate') flowNodeType = 'gateNode';
+    else if (nodeType === 'human_gate' || nodeType === 'questions') flowNodeType = 'gateNode';
     else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
     else if (nodeType === 'wait') flowNodeType = 'waitNode';
     else if (nodeType === 'terminate') flowNodeType = 'terminateNode';

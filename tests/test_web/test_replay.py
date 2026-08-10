@@ -130,6 +130,18 @@ class TestReplayDashboardApi:
         path = _write_json(tmp_path / "log.json", events)
         return ReplayDashboard(path)
 
+    @pytest.mark.parametrize("route", ["/api/stop", "/api/resume", "/api/kill"])
+    def test_live_control_endpoints_are_not_served(self, tmp_path: Path, route: str) -> None:
+        """A recorded-log server exposes no live workflow controls.
+
+        ``Header.tsx`` hides Stop/Resume/Kill in replay mode precisely because
+        these endpoints do not exist here. If they are ever added, that guard
+        becomes wrong — this forces the decision to be deliberate.
+        """
+        dashboard = self._make_dashboard(tmp_path)
+        with TestClient(dashboard.app) as client:
+            assert client.post(route).status_code in (404, 405)
+
     def test_get_state_returns_all_events(self, tmp_path: Path) -> None:
         """GET /api/state returns all loaded events."""
         events = _make_events(5)

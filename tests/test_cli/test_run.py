@@ -22,8 +22,8 @@ from conductor.cli.run import (
     InputCollector,
     coerce_value,
     parse_input_flags,
-    resolve_mcp_env_vars,
 )
+from conductor.mcp_auth import resolve_mcp_env_vars
 
 runner = CliRunner()
 

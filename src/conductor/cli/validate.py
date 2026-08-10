@@ -68,8 +68,79 @@ def validate_workflow(
         return False, None
 
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
+    _report_plugins(config, workflow_path, output_console)
 
     return True, config
+
+
+def _report_plugins(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+) -> None:
+    """Print what each enabled plugin actually contributes.
+
+    A plugin name in the YAML says nothing about how much it brings — the
+    installed plugins on one machine range from a single skill to seven
+    subagents plus an MCP server that authenticates with the user's own
+    credentials. Printing the component counts is what turns "I enabled
+    ``prs``" into something the author can review, and makes a change in
+    what a plugin ships visible on the next validate rather than at run
+    time.
+
+    Reports the workflow-level set only. Per-agent ``plugins:`` overrides
+    are resolved and *checked* by the validator, which knows each agent's
+    provider; repeating them here without that context would list
+    components a given agent never receives.
+
+    Never fatal, but not because the failure was already reported: the
+    validator resolves plugins per agent, so a workflow whose agents all
+    override ``plugins:`` (including with ``[]``) never resolves the
+    workflow-level list at all, and a failure surfaces here first. A
+    summary is still the wrong place to fail a workflow that is otherwise
+    valid — nothing inherits the list — so it degrades to a warning.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring relative
+            plugin paths.
+        console: Rich console for output.
+    """
+    entries = config.workflow.runtime.plugins
+    if not entries:
+        return
+
+    from conductor.plugins.errors import PluginError
+    from conductor.plugins.registry import resolve_plugins
+    from conductor.skills import SkillError
+
+    try:
+        resolved = resolve_plugins(entries, base_dir=workflow_path.resolve().parent)
+    except (PluginError, SkillError, OSError) as exc:
+        # Narrow: a genuine bug in the plugin layer (AttributeError, KeyError)
+        # should surface as a crash, not as a soft yellow line the reader
+        # scrolls past. This arm is reachable through ordinary configuration
+        # — see the docstring — so it is not merely defensive.
+        console.print(f"  [yellow]⚠[/yellow] Plugins could not be summarized: {exc}")
+        return
+
+    console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
+    for plugin in resolved:
+        parts = [
+            f"{len(plugin.skills)} skill(s)",
+            f"{len(plugin.agents)} agent(s)",
+            f"{len(plugin.mcp_servers)} MCP server(s)",
+        ]
+        console.print(f"    [dim]• {plugin.name} — {', '.join(parts)} — {plugin.root}[/dim]")
+        if plugin.agents:
+            names = ", ".join(item.qualified_name for item in plugin.agents)
+            console.print(f"      [dim]agents: {names}[/dim]")
+        if plugin.mcp_servers:
+            console.print(f"      [dim]mcp: {', '.join(sorted(plugin.mcp_servers))}[/dim]")
+        if plugin.disabled:
+            console.print(
+                f"      [dim]disabled by this workflow: {', '.join(plugin.disabled)}[/dim]"
+            )
 
 
 def _report_skill_discovery(
@@ -213,6 +284,7 @@ def display_validation_success(
     # Build summary info
     agent_count = len(config.agents)
     human_gate_count = sum(1 for a in config.agents if a.type == "human_gate")
+    questions_count = sum(1 for a in config.agents if a.type == "questions")
     parallel_group_count = len(config.parallel)
     for_each_group_count = len(config.for_each)
 
@@ -243,6 +315,9 @@ def display_validation_success(
     if human_gate_count > 0:
         patterns.append("human gates")
 
+    if questions_count > 0:
+        patterns.append("questions")
+
     if config.tools:
         patterns.append("tools")
 
@@ -258,6 +333,8 @@ def display_validation_success(
     table.add_row("Agents", str(agent_count))
     if human_gate_count > 0:
         table.add_row("Human Gates", str(human_gate_count))
+    if questions_count > 0:
+        table.add_row("Questions", str(questions_count))
     if parallel_group_count > 0:
         table.add_row("Parallel Groups", str(parallel_group_count))
     if for_each_group_count > 0:

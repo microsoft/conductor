@@ -1,0 +1,93 @@
+# Questions node — asking a human a set of questions
+#
+# `type: questions` presents N prompts inside ONE engine step. Because the
+# cursor and answers live inside the step, the user can go back and revise an
+# answer — impossible with a gate/loop, since a workflow step cannot be
+# un-executed — and the node costs 1 iteration instead of 2 per question.
+#
+# Run it:
+#   uv run conductor run examples/questions.yaml --input topic="rate limiting"
+
+workflow:
+  name: questions-demo
+  description: Collect answers to an agent's open questions, then use them.
+  entry_point: architect
+
+  limits:
+    max_iterations: 20
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: What to design.
+
+agents:
+  # Emits questions as objects so it can propose candidate answers. A plain
+  # `array of string` works too — each string becomes a question with no
+  # choices, so existing workflows migrate without touching the agent.
+  - name: architect
+    prompt: |
+      Design an approach for: {{ workflow.input.topic }}
+
+      List up to 4 open questions you need a human to settle. For each,
+      suggest 2-3 candidate answers where you can.
+    output:
+      summary:
+        type: string
+        description: Your proposed approach.
+      open_questions:
+        type: array
+        description: "Objects: {question, choices}."
+    routes:
+      - to: ask_questions
+
+  - name: ask_questions
+    type: questions
+    # Dotted path, same convention as for_each. Use `questions:` instead to
+    # hard-code them inline.
+    source: architect.output.open_questions
+    # Optional intro, rendered once above the first question.
+    prompt: |
+      **{{ workflow.input.topic }}**
+
+      {{ architect.output.summary }}
+
+      Unanswered questions become silent assumptions — answer what you can.
+    allow_back: true       # revise the previous answer (default: true)
+    allow_skip: true       # skip one question (default: true)
+    allow_skip_all: true   # skip everything remaining (default: true)
+    allow_abort: false     # abandon the node entirely (default: false)
+    routes:
+      # Routes evaluate against the node's output, so you can branch on
+      # whether the human engaged at all.
+      - to: finalize
+        when: "{{ ask_questions.output.answered_any }}"
+      - to: $end
+
+  - name: finalize
+    prompt: |
+      Revise the approach using the human's answers.
+
+      ## Original
+      {{ architect.output.summary }}
+
+      ## Answers
+      {{ ask_questions.output.transcript }}
+    output:
+      final:
+        type: string
+        description: The revised approach.
+    routes:
+      - to: $end
+
+output:
+  # `finalize` is skipped when nobody answered, so guard the reference.
+  approach: "{% if finalize is defined %}{{ finalize.output.final }}{% else %}{{ architect.output.summary }}{% endif %}"
+  # Answers are a keyed dict, so a specific one is addressable. Ids default to
+  # q1..qN; set `id:` on an inline question to keep a key stable when the
+  # question list changes.
+  answers: "{{ ask_questions.output.answers | tojson }}"
+  answered: "{{ ask_questions.output.answered_count }}"
+  skipped: "{{ ask_questions.output.skipped_count }}"
+  outcome: "{{ ask_questions.output.outcome }}"
