@@ -35,6 +35,7 @@ from conductor.providers.base import (
     EventCallback,
     ModelCapabilityInfo,
     match_model_id,
+    refuse_mcp_server_clashes,
 )
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.context_tier import ContextTier, resolve_context_tier
@@ -2878,15 +2879,9 @@ class CopilotProvider(AgentProvider):
 
         Both go through :meth:`_stamp_cwd`'s rules, so a plugin's stdio
         server picks up the agent's working directory exactly as a
-        workflow-declared one does.
-
-        A name collision is **refused**, not resolved by precedence. The
-        server name prefixes the tool names the model sees, so one of the
-        two would be unreachable — and silently dropping a declared
-        component is the failure this feature exists to remove.
-        ``conductor validate`` reports the same clash, but ``conductor
-        run`` never invokes the static validator, so the guard has to
-        exist here too.
+        workflow-declared one does. A name collision is refused rather
+        than resolved by precedence — see
+        :func:`~conductor.providers.base.refuse_mcp_server_clashes`.
 
         Args:
             resolved_cwd: Absolute working directory resolved by the engine.
@@ -2901,22 +2896,10 @@ class CopilotProvider(AgentProvider):
                 a name.
         """
         if not extra:
-            return self._mcp_servers_for_cwd(resolved_cwd) if self._mcp_servers else {}
-
-        clashes = sorted(set(extra) & set(self._mcp_servers))
-        if clashes:
-            raise ProviderError(
-                f"MCP server name(s) {clashes!r} are declared by both an enabled "
-                f"plugin and the workflow's 'runtime.mcp_servers'. The server name "
-                f"prefixes the tool names the model sees, so one would be unreachable.",
-                suggestion="Rename the workflow's server, or set 'mcp: false' on the plugin.",
-                is_retryable=False,
-            )
-
-        merged: dict[str, Any] = self._stamp_cwd(extra, resolved_cwd)
-        if self._mcp_servers:
-            merged.update(self._mcp_servers_for_cwd(resolved_cwd))
-        return merged
+            return self._mcp_servers_for_cwd(resolved_cwd)
+        refuse_mcp_server_clashes(extra, self._mcp_servers)
+        # Order is immaterial once clashes are refused: no key is overwritten.
+        return self._stamp_cwd({**extra, **self._mcp_servers}, resolved_cwd)
 
     @staticmethod
     def _stamp_cwd(servers: dict[str, Any], resolved_cwd: str) -> dict[str, Any]:

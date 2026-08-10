@@ -290,12 +290,13 @@ def read_plugin_agents(root: Path, plugin_name: str) -> list[PluginAgent]:
                 f"Agent definition at {entry} could not be read: {exc}"
             ) from exc
         agent = read_plugin_agent(entry, plugin_name)
-        prior = claimed.setdefault(agent.name, entry)
-        if prior != entry:
+        prior = claimed.get(agent.name)
+        if prior is not None:
             raise PluginManifestError(
                 f"Plugin {plugin_name!r} declares two agents named {agent.name!r} "
                 f"({prior} and {entry}). Agent names are namespaced per plugin, so "
                 "one would silently shadow the other."
             )
+        claimed[agent.name] = entry
         agents.append(agent)
     return agents

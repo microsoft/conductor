@@ -13,6 +13,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from conductor.exceptions import ProviderError
+
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
     from conductor.engine.pricing import ModelPricing
@@ -26,6 +28,41 @@ EventCallback = Callable[[str, dict[str, Any]], None]
 # Suffixes that providers may strip when matching aliased model names against
 # their SDK's canonical IDs (e.g. "claude-3-5-sonnet-latest" -> base name).
 _VERSION_SUFFIX_RE = re.compile(r"-(\d{8}|latest|preview)$")
+
+
+def refuse_mcp_server_clashes(
+    plugin_servers: Iterable[str], workflow_servers: Iterable[str]
+) -> None:
+    """Refuse a plugin MCP server whose name a workflow server already claims.
+
+    One phrasing for every provider, so two providers cannot describe the
+    same clash two ways — the same reason
+    :func:`~conductor.plugins.registry.describe_dropped_components` is
+    shared between ``conductor validate`` and ``conductor run``.
+
+    A collision is refused, not resolved by precedence: the server name
+    prefixes the tool names the model sees, so one of the two would be
+    unreachable, and silently dropping a declared component is the
+    failure plugins exist to remove. ``conductor validate`` reports the
+    same clash, but ``conductor run`` never invokes the static
+    validator, so the guard has to exist at the provider seam too.
+
+    Args:
+        plugin_servers: Server names contributed by enabled plugins.
+        workflow_servers: Server names from ``runtime.mcp_servers``.
+
+    Raises:
+        ProviderError: If any name appears in both.
+    """
+    clashes = sorted(set(plugin_servers) & set(workflow_servers))
+    if clashes:
+        raise ProviderError(
+            f"MCP server name(s) {clashes!r} are declared by both an enabled "
+            f"plugin and the workflow's 'runtime.mcp_servers'. The server name "
+            f"prefixes the tool names the model sees, so one would be unreachable.",
+            suggestion="Rename the workflow's server, or set 'mcp: false' on the plugin.",
+            is_retryable=False,
+        )
 
 
 def match_model_id(requested: str, known_ids: Iterable[str]) -> str | None:

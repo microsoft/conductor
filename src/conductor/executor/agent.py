@@ -453,22 +453,26 @@ class AgentExecutor:
         # have already had the skill content eager-injected into
         # rendered_prompt above and ignore this).
         skill_dirs: list[str] | None = None
+        effective_skills: list[ResolvedSkill] = []
         if getattr(self.provider, "supports_native_skills", False):
-            resolved = self._merge_skills_and_plugin_skills(agent, plugin_skills)
-            if resolved:
-                skill_dirs = [str(item.directory) for item in resolved]
-                _verbose_log(f"  Skills: {[item.name for item in resolved]}")
+            effective_skills = self._merge_skills_and_plugin_skills(agent, plugin_skills)
+            if effective_skills:
+                skill_dirs = [str(item.directory) for item in effective_skills]
+                _verbose_log(f"  Skills: {[item.name for item in effective_skills]}")
 
         if plugins:
             # Counted from what is actually being forwarded, not from what the
             # plugins ship. This line is what a user checks to confirm a plugin
-            # loaded, so a count that overstates delivery is worse than none.
-            delivered_skills = {
-                item.name for item in (self._merge_skills_and_plugin_skills(agent, plugin_skills))
-            } & {item.name for item in plugin_skills}
+            # loaded, so a count that overstates delivery is worse than none —
+            # hence by directory: a plugin skill shadowed by a declared one of
+            # the same name keeps the name in ``effective_skills`` but is not
+            # itself forwarded.
+            forwarded = {item.directory for item in effective_skills} & {
+                item.directory for item in plugin_skills
+            }
             _verbose_log(
                 f"  Plugins: {len(plugins)} enabled — "
-                f"{len(delivered_skills) if skill_dirs is not None else 0} skill(s), "
+                f"{len(forwarded)} skill(s), "
                 f"{len(custom_agents or [])} agent(s), "
                 f"{len(extra_mcp_servers or {})} MCP server(s) forwarded"
             )
@@ -642,6 +646,8 @@ class AgentExecutor:
         self._reject_unsupported_plugins(agent, entries)
         self._reject_unfilterable_agents(agent, entries)
         resolved = self._resolve_plugins(entries)
+        # Reported here rather than inside the memoized resolve, so a second
+        # agent naming the same plugin is told about its dropped components too.
         self._report_dropped(resolved)
         return resolved
 
@@ -754,8 +760,6 @@ class AgentExecutor:
             base_dir=self._workflow_dir,
             on_warning=lambda message: _verbose_log(f"  Plugins: {message}", style="yellow"),
         )
-        # Reported outside the cache lookup below, so a second agent naming
-        # the same plugin is told about its dropped components too.
         self._plugin_cache[key] = list(resolved)
         return resolved
 

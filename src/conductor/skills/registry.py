@@ -226,6 +226,33 @@ def is_path_entry(entry: str) -> bool:
     return entry.startswith(("~", ".")) or "/" in entry or "\\" in entry
 
 
+def normalize_entry_path(entry: str, base_dir: Path | None) -> Path:
+    """Turn a path entry into an absolute path, without touching disk.
+
+    The other half of :func:`is_path_entry`: that decides *whether* an
+    entry is a path, this decides *which* path it is. Shared by
+    ``skills:`` and ``plugins:`` so the two cannot drift — a workflow
+    naming the same directory under both must reach the same place.
+
+    ``~`` is expanded, a relative entry is anchored on the workflow
+    file's directory, and the result is normalised with ``normpath``
+    rather than ``resolve()``, so symlink aliases stay distinct —
+    matching ``WorkflowEngine._resolve_agent_working_dir``.
+
+    Args:
+        entry: The raw path as written in ``skills:`` or ``plugins:``.
+        base_dir: Directory a relative entry resolves against. Falls back
+            to the process working directory.
+
+    Returns:
+        The anchored, normalised path. Existence is not checked.
+    """
+    path = Path(entry).expanduser()
+    if not path.is_absolute():
+        path = (base_dir if base_dir is not None else Path.cwd()) / path
+    return Path(os.path.normpath(path))
+
+
 def expand_skills_root(root: Path) -> tuple[list[Path], list[str], list[str]]:
     """Split a skills root into the skill directories it holds.
 
@@ -306,12 +333,7 @@ def _resolve_path_entry(
             directory, cannot be read, or is a directory holding neither
             a ``SKILL.md`` nor any child that does.
     """
-    path = Path(entry).expanduser()
-    if not path.is_absolute():
-        path = (base_dir if base_dir is not None else Path.cwd()) / path
-    # normpath, not resolve(): symlink aliases stay distinct, matching
-    # WorkflowEngine._resolve_agent_working_dir.
-    resolved = Path(os.path.normpath(path))
+    resolved = normalize_entry_path(entry, base_dir)
 
     try:
         if not resolved.exists():

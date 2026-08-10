@@ -18,7 +18,12 @@ from conductor.providers._schema import (
     build_json_schema_field,
     build_json_schema_properties,
 )
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.base import (
+    AgentOutput,
+    AgentProvider,
+    EventCallback,
+    refuse_mcp_server_clashes,
+)
 from conductor.providers.capabilities import ProviderCapabilities
 
 if TYPE_CHECKING:
@@ -766,22 +771,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             session_servers = dict(self._mcp_servers)
             if extra_mcp_servers:
                 translated = _translate_mcp_servers(extra_mcp_servers)
-                # Refused rather than resolved by precedence: the server name
-                # prefixes the tool names the model sees, so one of the two
-                # would be unreachable, and dropping a declared component
-                # silently is the failure plugins exist to remove.
-                clashes = sorted(set(translated) & set(session_servers))
-                if clashes:
-                    raise ProviderError(
-                        f"MCP server name(s) {clashes!r} are declared by both an "
-                        f"enabled plugin and the workflow's 'runtime.mcp_servers'. "
-                        f"The server name prefixes the tool names the model sees, so "
-                        f"one would be unreachable.",
-                        suggestion=(
-                            "Rename the workflow's server, or set 'mcp: false' on the plugin."
-                        ),
-                        is_retryable=False,
-                    )
+                refuse_mcp_server_clashes(translated, session_servers)
                 session_servers.update(translated)
             if session_servers:
                 mcp_config_path = _write_mcp_config(session_servers)

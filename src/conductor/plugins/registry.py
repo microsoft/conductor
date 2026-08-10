@@ -22,7 +22,6 @@ for why handing the SDK a plugin root instead would not.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +45,7 @@ from conductor.skills.registry import (
     WarningSink,
     expand_skills_root,
     is_path_entry,
+    normalize_entry_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,18 +216,16 @@ def _resolve_path_entry(entry: str, base_dir: Path | None) -> Path:
     """Resolve a path entry to a plugin root.
 
     Relative paths resolve against the workflow file's directory,
-    mirroring ``skills:`` and ``working_dir``. ``normpath`` rather than
-    ``resolve()``, so symlink aliases stay distinct.
+    mirroring ``skills:`` and ``working_dir`` — the anchoring rule itself
+    is :func:`~conductor.skills.registry.normalize_entry_path`, shared
+    with ``skills:``.
 
     Raises:
         PluginNotFoundError: If the path does not exist, is not a
             directory, or cannot be read.
         PluginManifestError: If it exists but holds no plugin manifest.
     """
-    path = Path(entry).expanduser()
-    if not path.is_absolute():
-        path = (base_dir if base_dir is not None else Path.cwd()) / path
-    resolved = Path(os.path.normpath(path))
+    resolved = normalize_entry_path(entry, base_dir)
 
     try:
         if not resolved.exists():
@@ -486,11 +484,12 @@ def resolve_plugins(
     switches: dict[Path, tuple[bool, bool, bool]] = {}
     for entry in entries:
         wanted = (bool(entry.skills), bool(entry.agents), bool(entry.mcp))
+        want_skills, want_agents, want_mcp = wanted
         plugin = resolve_plugin(
             entry.name,
-            want_skills=wanted[0],
-            want_agents=wanted[1],
-            want_mcp=wanted[2],
+            want_skills=want_skills,
+            want_agents=want_agents,
+            want_mcp=want_mcp,
             base_dir=base_dir,
             home=home,
             on_warning=on_warning,
