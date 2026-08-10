@@ -462,6 +462,15 @@ class TestValidateOutputParity:
 class TestAcaWireBoundary:
     """ACA host->runner serialization must preserve every constraint field."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_credential_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # _build_request resolves the runner's inner Copilot credential from the
+        # host environment (BYOK base_url -> GitHub token env vars -> `gh auth
+        # token`). Pin the BYOK branch so the result does not depend on machine
+        # auth state: CI has no credential while a dev box usually does (the
+        # same trap TestAcaCredentialPrecedence._clear_credential_env guards).
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
+
     def _make_provider(self) -> Any:
         from conductor.config.schema import ProviderSettings
         from conductor.providers.aca import AcaRuntimeProvider
