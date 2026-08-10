@@ -429,13 +429,12 @@ class WorkflowEngine:
         # cost and the broken live pricing is invisible (see #265).
         self._pricing_hook_failed_warned = False
         # The companion case: a hook that never raises but returns ``None`` for
-        # everything. That is what happens when the provider SDK stops
-        # publishing the field the hook reads — ``github-copilot-sdk`` 1.0.1
-        # dropped ``ModelBilling.token_prices``, so the hook resolves ``None``
-        # for all models and every run silently falls back to the static table.
-        # A single ``None`` is ordinary (one unknown model); ``None`` for
-        # everything with nothing ever priced means the mechanism is dead, and
-        # the two are indistinguishable without this. See #386.
+        # everything, which is indistinguishable from "these models are simply
+        # unpriced" unless it is tracked. Live today on Copilot: the SDK's
+        # hand-written ``client.ModelBilling`` parses only ``multiplier`` and
+        # discards the ``tokenPrices`` wire field, so the hook resolves ``None``
+        # for every model. Verified against the pinned 1.0.1; 1.0.9 parses the
+        # field, so a version bump may be the real fix. See #386.
         self._pricing_hook_none_models: set[str] = set()
         self._pricing_hook_priced_any = False
         self._pricing_hook_silent_warned = False
@@ -2070,20 +2069,19 @@ class WorkflowEngine:
                 return None
         return self._single_provider
 
-    def _note_pricing_hook_result(self, model: str, pricing: object | None) -> None:
-        """Warn once if the provider pricing hook is silent for everything.
+    def _note_pricing_hook_result(self, model: str, pricing: ModelPricing | None) -> None:
+        """Record what the provider pricing hook returned for ``model``.
 
-        A hook returning ``None`` for a single model is ordinary — that model
-        simply is not priced, and the static table covers it. A hook returning
-        ``None`` for *every* model it is asked about, having priced nothing, is
-        a different condition: the mechanism is not working, and every cost in
-        the run is coming from the static fallback table.
+        Pure bookkeeping — deliberately no verdict here. Whether the hook is
+        systemically silent is only answerable once the run has finished asking
+        it: a hook that declines A and B and then prices C is working fine, and
+        deciding on the second ``None`` would already have warned. Because
+        :meth:`_ensure_pricing_resolved` locks per model rather than globally,
+        arrival order varies under parallel and ``for_each`` groups, so an early
+        verdict is also nondeterministic — the same workflow warns on one run
+        and stays quiet on the next.
 
-        Those two are indistinguishable today, which is how a provider SDK
-        dropping the field the hook reads (``github-copilot-sdk`` 1.0.1 removed
-        ``ModelBilling.token_prices``) can go unnoticed — nothing raises,
-        nothing logs, and table-priced models still report a plausible cost.
-        See #386.
+        The conclusion is drawn once in :meth:`_warn_if_pricing_hook_silent`.
 
         Args:
             model: The model whose pricing was just resolved.
@@ -2094,23 +2092,51 @@ class WorkflowEngine:
             return
 
         self._pricing_hook_none_models.add(model)
-        # Require more than one distinct model before concluding the hook is
-        # systemically silent, so a single unpriced model stays quiet.
+
+    def _warn_if_pricing_hook_silent(self) -> None:
+        """Conclude, once per run, whether live pricing was ever available.
+
+        A hook returning ``None`` for a single model is ordinary — that model
+        simply is not priced, and the static table covers it. A hook that
+        returned ``None`` for *every* model it was asked about, having priced
+        nothing, is a different condition: the mechanism is not working, and
+        every cost in the run came from the static fallback table.
+
+        No minimum-model floor. Running to completion having priced nothing is
+        the evidence; a single-model workflow is the common case (most shipped
+        examples resolve exactly one model, and #386's own reproduction is a
+        single-model run), so a floor of two would exempt precisely the runs
+        most likely to hit this.
+        """
         if (
             self._pricing_hook_silent_warned
             or self._pricing_hook_priced_any
-            or len(self._pricing_hook_none_models) < 2
+            or not self._pricing_hook_none_models
         ):
             return
 
         self._pricing_hook_silent_warned = True
+        models = ", ".join(sorted(self._pricing_hook_none_models))
+        count = len(self._pricing_hook_none_models)
         logger.warning(
-            "Provider pricing hook returned no pricing for any of %d models (%s); "
-            "live pricing is unavailable and costs fall back to the static table "
-            "or show as unpriced. This usually means the provider SDK no longer "
-            "publishes the pricing field the hook reads.",
-            len(self._pricing_hook_none_models),
-            ", ".join(sorted(self._pricing_hook_none_models)),
+            "Provider pricing hook returned no pricing for any of the %d models "
+            "resolved so far (%s). Costs for models in the static pricing table "
+            "are estimates from that table; models missing from it are reported "
+            "as unpriced. Set `cost.pricing` in the workflow to supply rates.",
+            count,
+            models,
+        )
+        # Conductor installs no logging handlers, so the line above reaches
+        # ``logging.lastResort`` as unattributed stderr — absent from the JSONL
+        # log and the dashboard, and under ``--web-bg`` written to a temp file
+        # nobody was told to read. Emit it as an event too, the same shape
+        # ``checkpoint_save_failed`` uses.
+        self._emit(
+            "pricing_hook_silent",
+            {
+                "models": sorted(self._pricing_hook_none_models),
+                "model_count": count,
+            },
         )
 
     async def _ensure_pricing_resolved(self, agent: AgentDef, model: str | None) -> None:
@@ -2183,7 +2209,22 @@ class WorkflowEngine:
                         )
                 else:
                     self.usage_tracker.set_provider_pricing(model, pricing)
-                    self._note_pricing_hook_result(model, pricing)
+                    # Only track providers that actually implement the hook.
+                    # ``AgentProvider.get_model_pricing`` returns ``None`` by
+                    # design and ``providers/base.py`` documents that as the
+                    # correct behaviour for a provider whose SDK exposes no
+                    # pricing; only Copilot overrides it. Without this check,
+                    # four of the five providers get told their SDK broke for
+                    # doing exactly what the base class prescribes.
+                    #
+                    # Imported here rather than at module scope: the
+                    # top-level import is ``TYPE_CHECKING``-only.
+                    from conductor.providers.base import (
+                        AgentProvider as _AgentProviderBase,
+                    )
+
+                    if type(provider).get_model_pricing is not _AgentProviderBase.get_model_pricing:
+                        self._note_pricing_hook_result(model, pricing)
             # Mark resolved only now — after the attempt completes — even on a
             # provider-None / failure / None result, so it isn't retried on every
             # record and the model stays unpriced via the static-table fallback.
@@ -6853,12 +6894,22 @@ class WorkflowEngine:
             summary["parallel_agents_count"] = parallel_agents_count
 
         # Add usage/cost information
+        # Draw the pricing-hook verdict here rather than mid-run: this is the
+        # point at which the run has finished asking the hook, so "it priced
+        # nothing" is finally answerable. It also puts the caveat next to the
+        # cost total it qualifies.
+        self._warn_if_pricing_hook_silent()
         usage = self.usage_tracker.get_summary()
         summary["usage"] = {
             "total_input_tokens": usage.total_input_tokens,
             "total_output_tokens": usage.total_output_tokens,
             "total_tokens": usage.total_tokens,
             "total_cost_usd": usage.total_cost_usd,
+            # A model priced from the static table has a ``cost_usd`` and so
+            # never appears in ``unpriced_models``. Without this flag the
+            # summary prints a confident number sourced from a possibly stale
+            # table while the explanation goes only to stderr.
+            "live_pricing_degraded": self._pricing_hook_silent_warned,
             "unpriced_agent_count": len(usage.unpriced_agents),
             "unpriced_models": usage.unpriced_models,
             "agents": [
