@@ -39,7 +39,15 @@ _CROSS = "[red]✗[/red]"
 _DASH = "[dim]—[/dim]"
 _OPTIONAL_MARK = "○"
 """Neutral glyph for an absent *optional* credential — deliberately not the
-red ``✗`` used for a genuinely missing required credential (issue #319)."""
+red ``✗`` used for a genuinely missing required credential (issue #319).
+
+.. note::
+   ``✓``, ``✗`` and ``○`` are not encodable in cp1252, so the default *table*
+   output of ``conductor doctor`` still fails on such a console — see #401.
+   This module's ``--json`` path is safe (``ensure_ascii=True``); the table path
+   is deliberately out of scope here because every glyph consumer would need the
+   console threaded through it. The em-dash is encodable in cp1252.
+"""
 
 
 def run_doctor(
