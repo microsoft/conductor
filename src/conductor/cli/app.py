@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -1888,8 +1889,48 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     return _result("unconfirmed", "terminate")
 
 
+def _format_started_at(value: object) -> str:
+    """Render a PID file's ``started_at`` for the running-list table.
+
+    ``write_pid_file`` records a full microsecond-precision ISO timestamp
+    (32 characters), which crowds out the ``Dashboard`` column at a default
+    80-column terminal width. This trims it to minute precision in UTC —
+    the table is a glance-at listing, not an audit log; ``--json`` continues
+    to report the exact recorded value untouched.
+
+    Args:
+        value: The raw ``started_at`` value read from the PID file JSON.
+
+    Returns:
+        ``"%Y-%m-%d %H:%MZ"`` in UTC, the raw string unchanged if it cannot
+        be parsed as an ISO timestamp or normalized to UTC, or ``"?"`` if
+        missing/empty/non-string.
+    """
+    if not isinstance(value, str) or not value:
+        return "?"
+    try:
+        parsed = datetime.fromisoformat(value)
+        # write_pid_file always writes a tz-aware UTC value; a naive one
+        # implies an externally-written or hand-edited file. Treat it as
+        # UTC rather than guessing the local timezone.
+        parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        return parsed.strftime("%Y-%m-%d %H:%MZ")
+    except (ValueError, OverflowError):
+        # ValueError: not a parseable ISO timestamp. OverflowError: parsed
+        # fine but astimezone() pushed a near-datetime.min/max value out of
+        # range. Either way, one malformed entry must not crash the whole
+        # listing (see pid.py's scan_pid_files for the same principle) —
+        # fall back to the raw value rather than raise.
+        logger.warning("Could not render started_at value %r as UTC; showing it as-is", value)
+        return value
+
+
 def _print_running_list(entries: list[dict], con: Console, show_url: bool = False) -> None:
     """Print a table of running background workflows.
+
+    ``Started`` is rendered to minute precision (``_format_started_at``)
+    regardless of ``show_url`` — ``conductor stop`` shares this function and
+    gets the shorter timestamp too.
 
     Args:
         entries: List of PID-file dicts.
@@ -1897,7 +1938,9 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
         show_url: Append a Dashboard URL column. Defaults to False;
             ``conductor status`` passes True, since discovery is its whole
             purpose and the URL is otherwise unrecoverable once the launching
-            terminal is gone.
+            terminal is gone. That column folds rather than crops (see
+            below), so a long workflow stem plus this column can wrap the
+            row onto two lines rather than lose part of the URL.
     """
     from rich.table import Table
 
@@ -1905,16 +1948,23 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
     table.add_column("Port", style="cyan")
     table.add_column("PID", style="yellow")
     table.add_column("Workflow", style="white")
-    table.add_column("Started", style="dim")
+    # Folds rather than crops: _format_started_at's happy path is a fixed
+    # 17 characters, but its fallback for an unparseable/out-of-range value
+    # returns the raw string unbounded, which could otherwise reproduce the
+    # exact cropping bug this PR fixes for Dashboard, one column over.
+    table.add_column("Started", style="dim", overflow="fold")
     if show_url:
-        table.add_column("Dashboard", style="blue")
+        # Folds onto a second line instead of cropping. A cropped URL is
+        # unrecoverable from the output — the one thing this column exists
+        # to surface — whereas a folded one is complete, just wrapped.
+        table.add_column("Dashboard", style="blue", overflow="fold")
 
     for e in entries:
         row = [
             str(e["port"]),
             str(e["pid"]),
             Path(e.get("workflow", "unknown")).stem,
-            e.get("started_at", "?"),
+            _format_started_at(e.get("started_at")),
         ]
         if show_url:
             row.append(f"http://127.0.0.1:{e['port']}")

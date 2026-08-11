@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -207,6 +209,25 @@ class TestStopAutoDetect:
         assert "Multiple background workflows" in result.output
         assert "8080" in result.output
         assert "9090" in result.output
+
+    def test_lists_started_at_minute_precision(self, pid_tmpdir: Path) -> None:
+        """``stop``'s ambiguous listing shares ``_print_running_list`` with
+        ``status``, so it should render ``Started`` at the same minute
+        precision rather than a raw microsecond timestamp.
+        """
+        from conductor.cli.pid import write_pid_file
+
+        pid = os.getpid()
+        first = write_pid_file(pid, 8080, "/tmp/wf1.yaml")
+        write_pid_file(pid, 9090, "/tmp/wf2.yaml")
+        on_disk = json.loads(first.read_text())["started_at"]
+
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop"])
+
+        assert result.exit_code == 1
+        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}Z", result.output)
+        assert on_disk not in result.output
 
 
 class TestStopProcessGone:

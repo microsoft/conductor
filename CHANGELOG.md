@@ -274,6 +274,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file predating this fix is distinguishable from one that legitimately has
   no run id. `conductor status` is unreleased, so the `log_file` →
   `stderr_log`/`stdout_log` rename costs no released contract.
+- **`conductor status`'s dashboard URL no longer gets cropped at a default
+  80-column terminal** (#405). At that width, the `Dashboard` column — the
+  one field the command exists to surface — was the one rich elided,
+  leaving `http://127.0.0.1:…` reconstructable only by hand from the `Port`
+  column. Both the `Started` and `Dashboard` columns now fold onto a second
+  line instead of cropping — a folded value is complete and readable, a
+  cropped one is unrecoverable from the output. `Started` also renders to
+  minute precision in UTC (`2026-08-11 12:48Z`, down from a 32-character
+  microsecond-precision timestamp), leaving more room for `Workflow` before
+  folding is ever needed. The table is a glance-at listing, not an audit
+  log, so `--json` keeps reporting the exact recorded timestamp untouched —
+  only the human-readable rendering changed. `_print_running_list` is
+  shared with `conductor stop`, so its listing gets the shorter timestamp
+  too. The test fixture that let this through built its own PID-file JSON by
+  hand with a 19-character naive `started_at`, well short of production's
+  32-character value — it now goes through the real `write_pid_file`, so the
+  widths under test match the widths production writes.
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
