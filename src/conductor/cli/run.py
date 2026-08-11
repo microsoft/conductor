@@ -1698,7 +1698,9 @@ async def run_workflow_async(
         emitter.subscribe(console_subscriber.on_event)
 
         if inputs:
-            verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2))
+            # ``ensure_ascii=False`` so the panel shows real non-ASCII input values
+            # rather than ``\uXXXX`` escapes (issue #356).
+            verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2, ensure_ascii=False))
 
         # Apply provider override if specified.
         # Reassigning ``runtime.provider`` to a string re-triggers the
