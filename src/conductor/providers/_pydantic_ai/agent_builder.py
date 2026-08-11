@@ -22,7 +22,10 @@ from pydantic_ai.output import ToolOutput
 from pydantic_ai.providers.anthropic import AnthropicProvider
 
 from conductor.exceptions import ValidationError
-from conductor.providers._pydantic_ai.converters import output_schema_to_pydantic_model
+from conductor.providers._pydantic_ai.converters import (
+    _sanitize_json_schema,
+    output_schema_to_pydantic_model,
+)
 from conductor.providers.reasoning import (
     ReasoningEffort,
     effort_to_budget_tokens,
@@ -80,11 +83,13 @@ def _resolve_anthropic_model(
     Args:
         agent: The Conductor agent definition.
         default_model: Fallback model identifier when ``agent.model`` is unset.
-        api_key: Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
+        api_key: Anthropic API key. When either credential is passed
+            explicitly, neither ``ANTHROPIC_API_KEY`` nor
+            ``ANTHROPIC_AUTH_TOKEN`` is consulted (SDK unit semantics).
         base_url: Optional custom API endpoint.
         auth_token: Optional bearer-auth token for gateway / LiteLLM
-            endpoints. Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var handled by
-            the SDK when omitted here.
+            endpoints. Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var only
+            when no credential is passed explicitly.
         timeout: Request timeout in seconds. ``None`` lets the Anthropic SDK
             apply its own default.
 
@@ -94,8 +99,25 @@ def _resolve_anthropic_model(
     Raises:
         ValidationError: If no API key or auth token is available.
     """
-    effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    effective_auth_token = auth_token or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    # The Anthropic SDK resolves credentials as a unit: passing either
+    # credential explicitly disables env-var resolution for both. Mirror that
+    # here so an explicit credential never mixes with an ambient env
+    # credential — otherwise e.g. a YAML auth_token plus an ambient
+    # ANTHROPIC_API_KEY would send both headers to whatever base_url points
+    # at, leaking the user's Anthropic key to a gateway.
+    if api_key is not None or auth_token is not None:
+        effective_api_key = api_key
+        effective_auth_token = auth_token
+    else:
+        effective_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        effective_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+
+    if effective_api_key and effective_auth_token:
+        logger.warning(
+            "Both api_key and auth_token are set; the Anthropic SDK sends both "
+            "X-Api-Key and Authorization: Bearer headers on every request, so "
+            "the api_key reaches whatever base_url points at. Set exactly one."
+        )
 
     if not effective_api_key and not effective_auth_token:
         raise ValidationError(
@@ -375,4 +397,11 @@ def build_agent(
         toolsets=toolsets or [],
         tools=tools or [],
     )
+
+    if isinstance(pydantic_agent.output_type, ToolOutput):
+        toolset = pydantic_agent._output_schema.toolset
+        if toolset is not None:
+            for tool_def in toolset._tool_defs:
+                _sanitize_json_schema(tool_def.parameters_json_schema)
+
     return pydantic_agent

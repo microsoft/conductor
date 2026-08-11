@@ -42,9 +42,11 @@ app = typer.Typer(
 # Register subcommand groups
 from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
 from conductor.cli.gate import gate_app  # noqa: E402
+from conductor.cli.plugin import plugin_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
 
 app.add_typer(registry_app, rich_help_panel="Environment")
+app.add_typer(plugin_app, rich_help_panel="Environment")
 app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 
@@ -1122,6 +1124,71 @@ def replay(
 
 
 @app.command(rich_help_panel="Run & Recover")
+def status(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit machine-readable output instead of a table.",
+        ),
+    ] = False,
+) -> None:
+    """List background workflows without stopping any of them.
+
+    \b
+    `conductor stop` also lists running workflows, but it stops one when
+    exactly one is running -- so the natural "what's running?" reflex is
+    destructive precisely when there is a single run to lose. This command is
+    read-only and always safe.
+
+    The dashboard URL is included because there is otherwise no supported way
+    to recover it once the launching terminal is gone.
+
+    \b
+    Exit codes:
+        0  listed successfully (including when nothing is running)
+
+    \b
+    Examples:
+        conductor status
+        conductor status --json
+    """
+    import json
+
+    from conductor.cli.pid import scan_pid_files
+
+    # Deliberately not ``read_pid_files``: that one prunes as it reads, which
+    # would make the read-only command destructive — the exact trap this
+    # command exists to give people an alternative to.
+    running = scan_pid_files()
+
+    if json_output:
+        payload = [
+            {
+                "pid": e["pid"],
+                "port": e["port"],
+                "workflow": str(e.get("workflow", "")),
+                "run_id": e.get("run_id", ""),
+                "started_at": e.get("started_at", ""),
+                "log_file": e.get("log_file", ""),
+                "url": f"http://127.0.0.1:{e['port']}",
+            }
+            for e in running
+        ]
+        output_console.print_json(json.dumps({"running": payload}), ensure_ascii=True)
+        return
+
+    if not running:
+        console.print("[dim]No background workflows are currently running.[/dim]")
+        return
+
+    _print_running_list(running, console, show_url=True)
+    console.print(
+        f"\n[dim]{len(running)} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]"
+    )
+
+
+@app.command(rich_help_panel="Run & Recover")
 def stop(
     port: Annotated[
         int | None,
@@ -1522,12 +1589,16 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     return _result("unconfirmed", "terminate")
 
 
-def _print_running_list(entries: list[dict], con: Console) -> None:
+def _print_running_list(entries: list[dict], con: Console, show_url: bool = False) -> None:
     """Print a table of running background workflows.
 
     Args:
         entries: List of PID-file dicts.
         con: Rich Console for output.
+        show_url: Append a Dashboard URL column. Defaults to False;
+            ``conductor status`` passes True, since discovery is its whole
+            purpose and the URL is otherwise unrecoverable once the launching
+            terminal is gone.
     """
     from rich.table import Table
 
@@ -1536,14 +1607,19 @@ def _print_running_list(entries: list[dict], con: Console) -> None:
     table.add_column("PID", style="yellow")
     table.add_column("Workflow", style="white")
     table.add_column("Started", style="dim")
+    if show_url:
+        table.add_column("Dashboard", style="blue")
 
     for e in entries:
-        table.add_row(
+        row = [
             str(e["port"]),
             str(e["pid"]),
             Path(e.get("workflow", "unknown")).stem,
             e.get("started_at", "?"),
-        )
+        ]
+        if show_url:
+            row.append(f"http://127.0.0.1:{e['port']}")
+        table.add_row(*row)
 
     con.print(table)
 

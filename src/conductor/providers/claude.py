@@ -138,6 +138,11 @@ class ClaudeProvider(AgentProvider):
         # AgentExecutor (Claude's Messages API has no server-side skill
         # surface without adopting the container/code-execution beta).
         skills=True,
+        # No plugin support: eager injection can carry a skill's text
+        # into the prompt but cannot produce a subagent the model can
+        # dispatch to, and a plugin that loaded only its skills would be
+        # exactly the partial load ``plugins:`` exists to prevent.
+        plugins=False,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
@@ -269,6 +274,19 @@ class ClaudeProvider(AgentProvider):
             client_kwargs["auth_token"] = self._auth_token
         if self._base_url is not None:
             client_kwargs["base_url"] = self._base_url
+        both_passed = "api_key" in client_kwargs and "auth_token" in client_kwargs
+        both_from_env = (
+            self._api_key is None
+            and self._auth_token is None
+            and bool(os.environ.get("ANTHROPIC_API_KEY"))
+            and bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+        )
+        if both_passed or both_from_env:
+            logger.warning(
+                "Both api_key and auth_token are set; the Anthropic SDK sends both "
+                "X-Api-Key and Authorization: Bearer headers on every request, so "
+                "the api_key reaches whatever base_url points at. Set exactly one."
+            )
         self._client = AsyncAnthropic(**client_kwargs)
 
         # Log SDK version
@@ -750,6 +768,8 @@ class ClaudeProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Pydantic AI pipeline.
 
@@ -768,6 +788,10 @@ class ClaudeProvider(AgentProvider):
                 beta, so :class:`AgentExecutor` has already eager-injected
                 the skill content into ``rendered_prompt`` for this
                 provider (see :attr:`AgentProvider.supports_native_skills`).
+            custom_agents: Ignored. Declares ``plugins=False``, so
+                :class:`AgentExecutor` refuses ``plugins:`` on this
+                provider before reaching here and this is always ``None``.
+            extra_mcp_servers: Ignored, for the same reason.
 
         Returns:
             Normalized AgentOutput with structured content.

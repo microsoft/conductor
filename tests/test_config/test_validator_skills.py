@@ -503,15 +503,20 @@ class TestDiscoveryOnClaudeAgentSdk:
         with pytest.raises(ConfigurationError, match="not inside a Claude Code"):
             _validate(config, _wf_path(tmp_path))
 
-    def test_discovered_plugin_skill_is_accepted(self, tmp_path: Path, fake_home: Path) -> None:
-        _make_plugin(
+    def test_packaged_skill_reached_by_path_is_accepted(
+        self, tmp_path: Path, fake_home: Path
+    ) -> None:
+        # The `plugins` discovery source was removed with issue #378, so a
+        # plugin-packaged skill now arrives by path (or via `runtime.plugins`).
+        # It must still resolve to its owning plugin for claude-agent-sdk.
+        skill = _make_plugin(
             fake_home / ".copilot" / "installed-plugins" / "market" / "tools",
             "tools",
             "packaged",
         )
         config = _workflow(
             provider="claude-agent-sdk",
-            skill_discovery=SkillDiscoveryConfig(sources=["plugins"]),
+            runtime_skills=[str(skill)],
         )
         warnings = _validate(config, _wf_path(tmp_path))
         assert not any("packaged" in w and "skipped" in w for w in warnings)

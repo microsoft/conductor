@@ -119,11 +119,15 @@ async def create_provider(
                 )
             claude_auth_token: str | None = None
             claude_base_url: str | None = None
+            claude_api_key: str | None = None
             if provider_settings is not None and provider_settings.name == "claude":
                 if provider_settings.auth_token is not None:
                     claude_auth_token = provider_settings.auth_token.get_secret_value()
+                if provider_settings.api_key is not None:
+                    claude_api_key = provider_settings.api_key.get_secret_value()
                 claude_base_url = provider_settings.base_url
             provider = ClaudeProvider(
+                api_key=claude_api_key,
                 model=default_model,
                 temperature=temperature,
                 max_tokens=max_tokens,

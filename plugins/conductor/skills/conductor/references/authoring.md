@@ -279,9 +279,8 @@ Conductor scans the locations itself and unions both CLIs' conventions, rather t
 
 - `personal` → `~/.copilot/skills`, `~/.claude/skills`
 - `project` → `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root
-- `plugins` → the `skills/` directory of every installed plugin
 
-Discovered skills join `runtime.skills`, so the tri-state is unchanged: an agent that declares its own `skills:` overrides discovery too. Sources are scanned in a fixed order (`project`, `personal`, `plugins`) whatever order they are written in, so reordering cannot change which of two same-named skills wins. A skill named in `skills:` always beats a discovered one of the same name — which comes up immediately, since installing Conductor's own plugin puts a second `conductor` skill on the machine.
+Discovered skills join `runtime.skills`, so the tri-state is unchanged: an agent that declares its own `skills:` overrides discovery too. Sources are scanned in a fixed order (`project`, then `personal`) whatever order they are written in, so reordering cannot change which of two same-named skills wins. A skill named in `skills:` always beats a discovered one of the same name — which comes up immediately, since installing Conductor's own plugin puts a second `conductor` skill on the machine.
 
 Discovered content is held to a laxer standard than declared content: broken frontmatter, a taken name, an unreadable directory, or a skill `claude-agent-sdk` cannot load are all errors for a declared skill and warning-plus-skip for a discovered one. The exception is a provider with no native skill surface at all (`claude`, `hermes`), where skipping would drop the whole discovered set — that combination is an error either way. The author asked for one by name and not the other.
 
@@ -289,7 +288,33 @@ Provider support is narrower than for declared skills. `copilot` is fully suppor
 
 Run `conductor validate` to see what discovery found — it lists every skill, the location it came from, and the total size if eagerly injected.
 
+There is deliberately no `plugins` source. Scanning a plugin's `skills/` reached into a plugin and took one of the three things it ships, leaving its subagents and MCP servers behind — the bug `runtime.plugins` exists to fix. Name plugins there instead; that brings the whole unit and, unlike a scan, reproduces on another machine.
+
 See `examples/skills-self-improving-workflow.yaml` and `examples/skills-discovery.yaml` for complete examples.
+
+## Plugins
+
+A skill is instructions. A **plugin** is the unit people install, and it ships up to three things Conductor uses: `skills/`, `agents/*.agent.md` subagents, and MCP servers declared in `.mcp.json` or the manifest. `runtime.plugins` (and per-agent `plugins:`) opts into all three, on the same tri-state as `skills:` — omitted inherits, `[]` opts out, a list overrides.
+
+```yaml
+runtime:
+  plugins:
+    - prs                    # installed plugin: everything it ships
+    - name: ./tools/mine     # path, relative to the workflow file
+      mcp: false             # skills and subagents only
+```
+
+Enabling all three matters because they are written together: a plugin's `SKILL.md` routinely tells the agent to dispatch to `prs:code-reviewer` or call an `ado` MCP tool. Loading only the instructions produces an agent that reads them correctly, reaches for something never registered, and says nothing — which is why every component defaults **on**.
+
+An entry is an installed plugin name (searched under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`) or a path, classified syntactically exactly as `skills:` entries are. An uninstalled or ambiguous name is a hard error.
+
+`mcp: false` is the switch worth knowing: an MCP server is a subprocess launched with the user's credentials, started at session creation rather than at first tool call. `hooks/` and `commands/` are never loaded, and `conductor validate` warns when a plugin ships them.
+
+Supported on `copilot` and `claude-agent-sdk` only; `claude`, `hermes` and `aca` reject `plugins:` at validation time, since injecting text into a prompt cannot produce a subagent or an MCP server. Conductor deconstructs a plugin rather than registering its root, because both SDKs' whole-plugin surfaces are all-or-nothing — on Copilot, hiding an MCP tool does not stop its server launching. The one carve-out: on `claude-agent-sdk`, reaching a plugin's skills requires registering the root, which carries every subagent with it, so `agents: false` alongside `skills: true` is refused there.
+
+Plugins are never discovered — a plugin loads because a workflow named it. `conductor validate` prints what each contributes, including every subagent by name.
+
+See `examples/plugins.yaml` for a complete example.
 
 ## Routing Patterns
 

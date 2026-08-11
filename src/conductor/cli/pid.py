@@ -182,6 +182,54 @@ def write_pid_file(
     return filepath
 
 
+def scan_pid_files() -> list[dict]:
+    """Read every PID file **without modifying anything on disk**.
+
+    :func:`read_pid_files` is the maintenance path: it prunes as it goes, which
+    is right for ``stop`` and wrong for anything whose contract is to observe.
+    A reader that deletes turns a diagnostic command into the one that loses the
+    run it was asked about — and because ``write_pid_file`` is not atomic, a
+    scan landing inside a launch can see a half-written file and treat a live
+    workflow as garbage.
+
+    Malformed entries are skipped rather than raised on: one unparseable file in
+    the directory must not take down the listing of every other run. Entries
+    without an integer ``pid`` and ``port`` are skipped too, because every
+    caller indexes both.
+
+    Returns:
+        List of dicts for processes that are still alive, in filename order,
+        each with the PID file's contents plus ``file``.
+    """
+    d = pid_dir()
+    results: list[dict] = []
+
+    # Sorted rather than raw glob order: the listing is user-facing, and
+    # ``Path.glob`` order is filesystem-dependent.
+    for f in sorted(d.glob("*.pid")):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Skipping unreadable PID file %s: %s", f, exc)
+            continue
+
+        if not isinstance(data, dict):
+            logger.warning("Skipping PID file whose contents are not an object: %s", f)
+            continue
+
+        pid = data.get("pid")
+        port = data.get("port")
+        if not isinstance(pid, int) or not isinstance(port, int):
+            logger.warning("Skipping PID file without an integer pid and port: %s", f)
+            continue
+
+        if _is_process_alive(pid):
+            data["file"] = str(f)
+            results.append(data)
+
+    return results
+
+
 def read_pid_files() -> list[dict]:
     """Read all PID files and return info for processes that are still alive.
 

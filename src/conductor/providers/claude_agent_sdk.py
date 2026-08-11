@@ -18,7 +18,12 @@ from conductor.providers._schema import (
     build_json_schema_field,
     build_json_schema_properties,
 )
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.base import (
+    AgentOutput,
+    AgentProvider,
+    EventCallback,
+    refuse_mcp_server_clashes,
+)
 from conductor.providers.capabilities import ProviderCapabilities
 
 if TYPE_CHECKING:
@@ -28,15 +33,86 @@ if TYPE_CHECKING:
     from conductor.skills import SkillPlugin
 
 try:
-    from claude_agent_sdk import ClaudeAgentOptions, query  # ty: ignore[unresolved-import]
+    from claude_agent_sdk import (  # ty: ignore[unresolved-import]
+        AgentDefinition,
+        ClaudeAgentOptions,
+        query,
+    )
 
     CLAUDE_AGENT_SDK_AVAILABLE = True
 except ImportError:
     CLAUDE_AGENT_SDK_AVAILABLE = False
     query: Any = None
     ClaudeAgentOptions: Any = None
+    AgentDefinition: Any = None
 
 logger = logging.getLogger(__name__)
+
+
+def _build_sdk_agents(custom_agents: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Translate plugin subagent specs into SDK ``AgentDefinition`` objects.
+
+    The specs arrive in the Copilot SDK's ``CustomAgentConfig`` shape —
+    :class:`~conductor.plugins.agents.PluginAgent` renders one canonical
+    form and each provider adapts it, rather than the plugin layer
+    growing a per-provider renderer.
+
+    ``AgentDefinition`` has no ``name`` field: the SDK keys the mapping
+    by name instead. ``infer`` has no counterpart and is dropped — it is
+    Copilot's switch for "may the model dispatch to this", which is
+    unconditionally true for a plugin agent Conductor registered on
+    purpose.
+
+    Args:
+        custom_agents: Specs from the executor, or ``None``.
+
+    Returns:
+        A name-keyed mapping for ``ClaudeAgentOptions.agents``, or
+        ``None`` when there are none. ``None`` rather than ``{}``
+        deliberately: unlike ``skills``, an empty mapping here has no
+        opt-out meaning, so leaving the field at its default keeps the
+        option out of the request entirely.
+    """
+    if not custom_agents:
+        return None
+    if AgentDefinition is None:
+        raise ProviderError(
+            "Plugin subagents were requested but the installed claude-agent-sdk "
+            "does not provide AgentDefinition.",
+            suggestion="Upgrade claude-agent-sdk, or run this agent on 'copilot'.",
+            is_retryable=False,
+        )
+    agents: dict[str, Any] = {}
+    for spec in custom_agents:
+        name = spec["name"]
+        if spec.get("tools") is not None:
+            # A plugin's ``tools:`` frontmatter is written in its authoring
+            # CLI's vocabulary. Copilot writes ``read`` / ``execute``; this
+            # CLI's identifiers are ``Read`` / ``Bash``. Conductor searches
+            # both CLIs' install roots and recognises both manifest
+            # conventions, so a Copilot-authored plugin genuinely arrives
+            # here — and forwarding its list unchanged hands the subagent a
+            # tool set containing no valid identifier. Dropping the list
+            # instead would silently widen the agent to the session default.
+            # Both are wrong, and the same reasoning already refuses a
+            # narrowing per-server MCP filter and the per-agent allowlist.
+            raise ProviderError(
+                f"Plugin subagent '{name}' declares tools={spec['tools']!r}, which "
+                f"claude-agent-sdk cannot honour — a plugin's tool names are written "
+                f"in its authoring CLI's vocabulary and do not translate to Claude CLI "
+                f"tool IDs.",
+                suggestion=(
+                    f"Set 'agents: false' on the plugin shipping '{name}', remove the "
+                    f"'tools:' line from its agent definition to inherit the session "
+                    f"default, or run this agent on 'copilot'."
+                ),
+                is_retryable=False,
+            )
+        agents[name] = AgentDefinition(
+            description=spec["description"],
+            prompt=spec["prompt"],
+        )
+    return agents
 
 
 def _build_field_schema(field: OutputField, depth: int = 0) -> dict[str, Any]:
@@ -95,6 +171,14 @@ _DEFAULT_TOOL_PRESET: dict[str, str] = {"type": "preset", "preset": "claude_code
 # declared skill unreachable, so this one tool is granted back when skills are
 # enabled.
 _SKILL_TOOL: Final[str] = "Skill"
+
+# Keys ``_translate_mcp_servers`` can carry onto the SDK's config shapes.
+# ``tools`` and ``timeout`` are handled explicitly above (refused / warned),
+# so they count as recognised even though they are not forwarded.
+_STDIO_KEYS: Final[frozenset[str]] = frozenset(
+    {"type", "command", "args", "env", "tools", "timeout"}
+)
+_REMOTE_KEYS: Final[frozenset[str]] = frozenset({"type", "url", "headers", "tools", "timeout"})
 
 # Display-only previews for the verbose CLI pretty-printer (NOT surfaced
 # in events — see ``_TOOL_RESULT_PREVIEW_LEN`` below for the on-the-wire
@@ -182,6 +266,28 @@ def _translate_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
                 "support; the CLI's own default will apply instead.",
                 name,
                 config["timeout"],
+            )
+
+        # Fail closed on anything this translation cannot carry. The function
+        # was written for ``MCPServerDef``'s closed field set; a plugin's
+        # ``.mcp.json`` is arbitrary third-party JSON, and dropping a key it
+        # declares starts a server configured differently from what its author
+        # wrote — an ``oauth`` block silently becoming an unauthenticated
+        # request, or ``disabled: true`` becoming a launched subprocess. Same
+        # standard the narrowing ``tools:`` filter is held to just below.
+        recognised = _STDIO_KEYS if server_type == "stdio" else _REMOTE_KEYS
+        unknown = sorted(set(config) - recognised)
+        if unknown:
+            raise ProviderError(
+                f"MCP server '{name}' declares key(s) {unknown!r} that claude-agent-sdk's "
+                f"config has no equivalent for. Forwarding it without them would start a "
+                f"server configured differently from what was declared.",
+                suggestion=(
+                    f"Set 'mcp: false' on the plugin shipping '{name}', declare the "
+                    f"server in 'runtime.mcp_servers' where Conductor resolves it in "
+                    f"full, or run this agent on 'copilot'."
+                ),
+                is_retryable=False,
             )
 
         if server_type == "stdio":
@@ -444,6 +550,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # the workflow declares none — see the option block in ``execute``
         # for why that empty list is what makes ``skills: []`` an opt-out.
         skills=True,
+        # Whole plugins are supported by deconstruction: skills through the
+        # plugin/qualified-name path below, subagents through
+        # ``ClaudeAgentOptions.agents``, MCP through the same temp-file
+        # config the workflow's own servers use.
+        plugins=True,
         upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
     )
@@ -483,6 +594,32 @@ class ClaudeAgentSdkProvider(AgentProvider):
         """
         return True
 
+    @property
+    def supports_native_plugins(self) -> bool:
+        """Plugin subagents register as ``ClaudeAgentOptions.agents``.
+
+        The SDK takes inline agent definitions keyed by name, so a
+        plugin's subagents are registered individually rather than being
+        inherited from the plugin root.
+
+        That distinction matters because registering a root is *not*
+        filterable: the SDK documents ``plugins`` as providing "custom
+        commands, agents, skills, and hooks", with a ``skills`` filter and
+        no equivalent for the rest. Conductor still has to register the
+        root when a plugin's skills are enabled — the SDK has no bare
+        skill-directory surface — so on this provider ``agents: false``
+        cannot be honored alongside ``skills: true`` for the same plugin.
+        :func:`conductor.config.validator.validate_workflow_config`
+        refuses that combination rather than quietly granting more than
+        the workflow declared.
+        """
+        return True
+
+    @property
+    def skills_require_plugin_root(self) -> bool:
+        """This SDK has no bare skill-directory surface — see above."""
+        return True
+
     async def execute(
         self,
         agent: AgentDef,
@@ -492,6 +629,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
@@ -531,7 +670,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         )
 
         sdk_tools, permission_mode = self._resolve_tool_config(
-            tools, agent, skills_enabled=bool(skill_names)
+            tools,
+            agent,
+            skills_enabled=bool(skill_names),
+            agents_enabled=bool(custom_agents),
         )
 
         # ``os.getcwd()`` raises ``OSError`` when the process cwd has been
@@ -591,6 +733,15 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # Unlike `skills`, [] is already this field's default and means
             # nothing special.
             plugins=skill_plugins,
+            # Plugin subagents are registered inline rather than inherited
+            # from a plugin root, so a plugin whose skills are disabled can
+            # still contribute agents. The reverse is refused — reaching a
+            # plugin's skills here means registering its root, which carries
+            # the subagents with it, so `agents: false` alongside enabled
+            # skills cannot be honoured. Keyed by the qualified
+            # ``<plugin>:<agent>`` name so two plugins shipping a same-named
+            # agent do not collide.
+            agents=_build_sdk_agents(custom_agents),
         )
 
         content_parts: list[str] = []
@@ -610,8 +761,20 @@ class ClaudeAgentSdkProvider(AgentProvider):
         agen: Any = None
 
         try:
-            if self._mcp_servers:
-                mcp_config_path = _write_mcp_config(self._mcp_servers)
+            # Plugin-contributed servers merge on top for this call only:
+            # ``plugins:`` is a per-agent field while providers are cached per
+            # type. They are translated here rather than in ``__init__`` for
+            # the same reason. Note ``strict_mcp_config=True`` above suppresses
+            # servers a registered plugin root would otherwise contribute, so
+            # a plugin's servers reach the CLI only through this path — which
+            # is what makes ``mcp: false`` mean something on this provider.
+            session_servers = dict(self._mcp_servers)
+            if extra_mcp_servers:
+                translated = _translate_mcp_servers(extra_mcp_servers)
+                refuse_mcp_server_clashes(translated, session_servers)
+                session_servers.update(translated)
+            if session_servers:
+                mcp_config_path = _write_mcp_config(session_servers)
                 options.mcp_servers = mcp_config_path
 
             # Signal "awaiting model" before entering the SDK iterator: the
@@ -828,6 +991,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         agent: AgentDef,
         *,
         skills_enabled: bool,
+        agents_enabled: bool = False,
     ) -> tuple[Any, str | None]:
         """Resolve the SDK ``tools`` and ``permission_mode`` for an agent.
 
@@ -890,6 +1054,24 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # it loads declared skill content and grants nothing else. The
             # SDK auto-allows it via `Skill(<name>)` in allowed_tools, so it
             # does not need the permission bypass either.
+            if agents_enabled:
+                # `--tools ""` leaves the model no tool to dispatch with, so
+                # the registered subagents would be unreachable — the same
+                # failure the Skill carve-out above exists to prevent. Unlike
+                # `Skill`, this SDK exposes no verifiable identifier for the
+                # dispatch tool, so there is nothing to grant back; guessing
+                # a name is what this provider refuses to do elsewhere.
+                raise ProviderError(
+                    f"Agent '{agent.name}' sets 'tools: []' while its plugins ship "
+                    f"subagents. An empty tool set leaves the model no way to dispatch "
+                    f"to them, so they would be registered and unreachable.",
+                    suggestion=(
+                        "Omit 'tools:' to grant the full claude_code preset, set "
+                        "'agents: false' on the plugins, or run this agent on "
+                        "'copilot'."
+                    ),
+                    is_retryable=False,
+                )
             if skills_enabled:
                 return [_SKILL_TOOL], None
             return [], None

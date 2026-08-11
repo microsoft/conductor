@@ -8,16 +8,20 @@ tool references.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jinja2
 from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
+from conductor.plugins.errors import PluginError, PluginSourceUnavailableError
+from conductor.plugins.registry import describe_dropped_components, resolve_plugins
 from conductor.providers.capabilities import (
     ProviderCapabilities,
     get_capabilities,
+    requires_plugin_root_for_skills,
     uses_native_skills,
 )
 from conductor.skills import (
@@ -33,6 +37,7 @@ from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.plugins.registry import ResolvedPlugin
     from conductor.skills import ResolvedSkill
 
 
@@ -112,6 +117,137 @@ INPUT_REF_PATTERN = re.compile(
     r"(?P<shorthand>[a-zA-Z_][a-zA-Z0-9_]*)\.(?P<sh_field>[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"
     r")(?P<optional>\?)?$"
 )
+
+
+@dataclass(frozen=True)
+class _DeferredPluginCheck:
+    """A plugin check that could not run without network access.
+
+    Distinct from the cached-failure ``str`` in the same slot, because
+    the two mean opposite things: a ``str`` is "this workflow is wrong",
+    this is "this machine has not fetched yet, and the run will".
+    """
+
+    reason: str
+
+
+def _resolve_declared_sources(
+    config: WorkflowConfig, base_dir: Path | None
+) -> tuple[dict[str, Any], list[str], list[str], set[str]]:
+    """Resolve ``runtime.plugin_sources`` from cache, never over the network.
+
+    ``conductor validate`` must not clone. A git source that has never
+    been fetched on this machine is therefore reported as a *warning*
+    naming ``conductor plugin fetch``: the workflow is not wrong, the
+    machine simply has not fetched yet, and ``conductor run`` heals it
+    automatically.
+
+    A source that is *itself* wrong — a path that does not exist, a
+    ``path:`` that escapes the checkout, a catalog that will not parse —
+    is an **error**. No amount of fetching fixes it, and reporting it as
+    a warning blamed the network for the author's typo and then
+    prescribed a command that fails on the same input.
+
+    Sources are resolved **one at a time**. Resolving them as a batch
+    meant a single unfetched source discarded the whole table, so every
+    other declared source — including a local directory sitting on disk —
+    was reported as "has not been acquired". That also emptied the table
+    for the per-agent checks, silently skipping the MCP-clash and
+    dropped-component reporting this feature exists to provide.
+
+    A source that is declared but never referenced is dead config and is
+    reported too — it is the kind of thing that survives a refactor and
+    then quietly pins a repository nobody reads any more.
+
+    Returns:
+        ``(marketplaces, warnings, errors, declared_names, unusable)``.
+        The marketplace table holds every source that resolved.
+        ``declared_names`` covers every source the workflow declared but
+        that is not in the table, so a reference to one is told it was
+        declared-but-unavailable rather than the false "neither declared
+        nor installed". ``unusable`` is the subset that is broken rather
+        than merely unfetched, so the caller can suppress a second,
+        misleading "run conductor plugin fetch" line for it.
+    """
+    declared = config.workflow.runtime.plugin_sources
+    if not declared:
+        return {}, [], [], set()
+
+    from conductor.plugins.errors import PluginError, PluginFetchError
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+    warnings: list[str] = []
+    errors: list[str] = []
+    deferred: set[str] = set()
+    unusable: set[str] = set()
+    marketplaces: dict[str, Any] = {}
+
+    referenced = _referenced_marketplaces(config)
+    for name in sorted(set(declared) - referenced):
+        warnings.append(
+            f"Plugin source {name!r} is declared in 'runtime.plugin_sources' but no "
+            f"'plugins:' entry references it. Reference it as '<plugin>@{name}', or "
+            "remove the source."
+        )
+
+    for name, entry in declared.items():
+        try:
+            resolved = resolve_plugin_sources(
+                {name: entry},
+                base_dir=base_dir,
+                allow_network=False,
+                on_warning=warnings.append,
+            )
+        except PluginFetchError as exc:
+            deferred.add(name)
+            warnings.append(
+                f"Plugin source {name!r} has not been fetched on this machine: {exc} "
+                "('conductor validate' never fetches; 'conductor run' will.)"
+            )
+        except (PluginError, OSError) as exc:
+            # OSError is caught alongside: resolution stats the filesystem
+            # (``find_manifest``, ``is_plugin_root``), so an unreadable
+            # checkout would otherwise escape as a bare traceback.
+            unusable.add(name)
+            errors.append(f"Plugin source {name!r} is unusable: {exc}")
+        else:
+            marketplaces.update(marketplaces_from(resolved))
+            for source_name, source in resolved.items():
+                if not source.marketplace.plugins:
+                    warnings.append(
+                        f"Plugin source {source_name!r} resolved to a marketplace "
+                        f"listing no usable plugins ({source.source.describe()})."
+                    )
+    return marketplaces, warnings, errors, deferred | unusable
+
+
+def _referenced_marketplaces(config: WorkflowConfig) -> set[str]:
+    """Collect every marketplace named after an ``@`` in a plugins entry.
+
+    Covers the workflow default and every agent's own list, including
+    for_each inline agents, so a source used by exactly one agent is not
+    reported as dead.
+    """
+    from conductor.config.schema import _split_marketplace
+    from conductor.skills import is_path_entry
+
+    def _names(entries: Any) -> set[str]:
+        found: set[str] = set()
+        for entry in entries or []:
+            if is_path_entry(entry.name):
+                continue
+            _, marketplace = _split_marketplace(entry.name)
+            if marketplace:
+                found.add(marketplace)
+        return found
+
+    referenced = _names(config.workflow.runtime.plugins)
+    for agent in config.agents:
+        referenced |= _names(agent.plugins)
+    for group in config.for_each:
+        if group.agent is not None:
+            referenced |= _names(group.agent.plugins)
+    return referenced
 
 
 def validate_workflow_config(
@@ -1667,6 +1803,22 @@ def _validate_provider_capabilities(
     skill_cache: dict[
         tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[ResolvedSkill] | str
     ] = {}
+    runtime_plugins = config.workflow.runtime.plugins
+    # Keyed by the entries themselves (name plus the three component
+    # switches), because resolving a plugin walks its skills tree and parses
+    # every agent definition it ships. A ``str`` value is a cached failure.
+    plugin_cache: dict[
+        tuple[tuple[str, bool, bool, bool], ...],
+        list[ResolvedPlugin] | str | _DeferredPluginCheck,
+    ] = {}
+    (
+        plugin_marketplaces,
+        plugin_source_problems,
+        plugin_source_errors,
+        unavailable_sources,
+    ) = _resolve_declared_sources(config, skill_base_dir)
+    warnings.extend(plugin_source_problems)
+    errors.extend(plugin_source_errors)
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1849,6 +2001,153 @@ def _validate_provider_capabilities(
         # drops above cannot affect it, since that provider is native.
         if uses_native_skills(provider_name) is False:
             _check_skill_injection_budget(agent, provider_name, resolved)
+
+    def _check_agent_plugins(
+        agent: AgentDef, provider_name: str, caps: ProviderCapabilities
+    ) -> None:
+        """Resolve an agent's effective plugins and check them against its provider.
+
+        Plugins are strict throughout — there is no discovered counterpart to
+        be lenient about. Every entry was written by the author, so a plugin
+        that is missing, ambiguous, or broken is an error rather than a skip.
+
+        Two provider-shaped failures are reported here rather than at run
+        time, when the agent would already be mid-flight:
+
+        * The provider cannot load plugins at all. Unlike skills there is no
+          eager-injection fallback, so the plugin would arrive with only the
+          component that happens to work.
+        * ``claude-agent-sdk`` cannot honour ``agents: false`` for a plugin
+          whose skills are enabled. Its only skill surface is registering the
+          plugin root, which the SDK documents as also providing "custom
+          commands, agents, skills, and hooks" — with a filter for skills and
+          none for the rest. Granting more than the workflow declared is the
+          same regression that justifies refusing a narrowed per-server
+          ``tools:`` filter on that provider, so the combination is refused.
+        """
+        entries = list(agent.plugins) if agent.plugins is not None else list(runtime_plugins)
+        if not entries:
+            return
+
+        if not caps.plugins:
+            named = ", ".join(repr(entry.name) for entry in entries)
+            errors.append(
+                f"Agent '{agent.name}' declares plugins ({named}) but provider "
+                f"'{provider_name}' cannot load them (capabilities.plugins=False). "
+                f"A plugin's subagents and MCP servers have no equivalent there, so "
+                f"it would run with only part of what the plugin ships. Reference "
+                f"the plugin's skills directly with 'skills:' (by path), opt out "
+                f"with 'plugins: []', or override the agent to 'copilot' or "
+                f"'claude-agent-sdk'."
+            )
+            return
+
+        if requires_plugin_root_for_skills(provider_name):
+            for entry in entries:
+                if entry.skills and not entry.agents:
+                    errors.append(
+                        f"Agent '{agent.name}': plugin {entry.name!r} sets "
+                        f"'agents: false' with skills enabled, which provider "
+                        f"'claude-agent-sdk' cannot honour — its only skill surface "
+                        f"is registering the plugin root, which also contributes "
+                        f"every subagent the plugin ships. Set 'skills: false' as "
+                        f"well, drop 'agents: false', or run this agent on 'copilot'."
+                    )
+
+        if skill_base_dir is None:
+            relative = [
+                entry.name
+                for entry in entries
+                if is_path_entry(entry.name) and not Path(entry.name).expanduser().is_absolute()
+            ]
+            if relative:
+                warnings.append(
+                    f"Agent '{agent.name}': relative plugin path(s) {sorted(relative)!r} "
+                    "were not checked because no workflow file path was supplied, so "
+                    "there is no base directory to resolve them against. They are still "
+                    "resolved at run time."
+                )
+                # Drop only the entries that cannot be resolved and check the
+                # rest. Returning here let one un-anchorable relative path
+                # silence the MCP-clash and dropped-component checks for every
+                # other plugin the agent named.
+                entries = [entry for entry in entries if entry.name not in set(relative)]
+                if not entries:
+                    return
+
+        key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
+        if key not in plugin_cache:
+            try:
+                plugin_cache[key] = resolve_plugins(
+                    entries,
+                    base_dir=skill_base_dir,
+                    marketplaces=plugin_marketplaces,
+                    # Only the *deferred* sources, not every declared name. A
+                    # source that failed because it is broken must report as
+                    # broken; telling the user to fetch it would prescribe a
+                    # command that fails on the same input.
+                    declared_sources=unavailable_sources,
+                    on_warning=warnings.append,
+                )
+            except PluginSourceUnavailableError as exc:
+                # The one plugin failure that is not a problem with the
+                # workflow: the source is declared and well-formed, and
+                # ``conductor run`` will fetch it. Erroring here would make
+                # ``conductor validate`` fail on a freshly cloned repository
+                # for a workflow that runs perfectly. Kept as a *deferred*
+                # marker rather than a plain warning so the message can say
+                # which checks were skipped — reporting "valid" when whole
+                # categories of check never ran would be the worse lie.
+                plugin_cache[key] = _DeferredPluginCheck(str(exc))
+            except (PluginError, SkillError) as exc:
+                plugin_cache[key] = str(exc)
+        resolved = plugin_cache[key]
+        if isinstance(resolved, _DeferredPluginCheck):
+            warnings.append(
+                f"Agent '{agent.name}': {resolved.reason} Its plugins were not "
+                "checked here, so MCP server name clashes and dropped components "
+                "will surface at run time instead."
+            )
+            return
+        if isinstance(resolved, str):
+            errors.append(f"Agent '{agent.name}': {resolved}")
+            return
+
+        for plugin in resolved:
+            _report_dropped_components(agent, plugin, provider_name)
+            for server in plugin.mcp_servers:
+                if server in config.workflow.runtime.mcp_servers:
+                    errors.append(
+                        f"Agent '{agent.name}': plugin {plugin.source!r} declares an "
+                        f"MCP server named {server!r}, which the workflow also "
+                        f"declares in 'runtime.mcp_servers'. The server name prefixes "
+                        f"the tool names the model sees, so it must be unique. Rename "
+                        f"the workflow's server, or set 'mcp: false' on the plugin."
+                    )
+
+    def _report_dropped_components(
+        agent: AgentDef, plugin: ResolvedPlugin, provider_name: str
+    ) -> None:
+        """Warn about plugin components Conductor does not load.
+
+        ``hooks/`` is arbitrary shell run on tool events and ``commands/`` is
+        a CLI-only surface; neither has anything in Conductor's model to map
+        onto, and neither SDK offers a per-item filter. Reporting them is the
+        point — a plugin that behaves differently inside a workflow than it
+        does in the CLI is exactly the silent divergence this feature exists
+        to remove, so the difference is named before the run rather than
+        discovered after it.
+
+        The phrasing is shared with ``AgentExecutor`` rather than duplicated,
+        so the two commands cannot describe one plugin two ways.
+        """
+        message = describe_dropped_components(
+            plugin,
+            root_is_registered=bool(plugin.skills)
+            and bool(requires_plugin_root_for_skills(provider_name)),
+        )
+        if message is not None:
+            warnings.append(f"Agent '{agent.name}': {message}")
 
     def _check_claude_agent_sdk_skill(agent: AgentDef, item: ResolvedSkill) -> None:
         """Check one resolved skill against ``claude-agent-sdk``'s plugin-only surface.
@@ -2059,6 +2358,7 @@ def _validate_provider_capabilities(
             )
 
         _check_agent_skills(agent, provider_name, caps)
+        _check_agent_plugins(agent, provider_name, caps)
 
     # All provider-backed agents that run at workflow scope: top-level agents
     # PLUS for_each inline agents (``ForEachDef.agent``), which inherit the

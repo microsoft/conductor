@@ -1,0 +1,135 @@
+# Git-backed plugin sources — a workflow that carries its own plugins
+#
+# `runtime.plugins` alone resolves against MACHINE STATE: an installed
+# plugin name, or a path. So a workflow shared with a teammate still needs
+# "first install these plugins" in a README, and a teammate who skips that
+# step gets a hard error rather than a working run.
+#
+# `runtime.plugin_sources` declares where a marketplace comes from, so the
+# YAML says everything needed to run.
+#
+# TWO CONCERNS, TWO KEYS
+#   plugin_sources:  marketplace name -> where it comes from   (acquisition)
+#   plugins:         which plugins, and how much of each        (activation)
+#
+# That split is not invented here. The Copilot CLI's own settings.json
+# separates `extraKnownMarketplaces` from `enabledPlugins` for the same
+# reason: eleven plugins commonly come from one repository, so inlining a
+# URL per entry would either clone it eleven times or silently pick one of
+# eleven refs.
+#
+# ENTRY GRAMMAR
+#   prs                 an installed plugin; an error if two marketplaces
+#                       ship that name
+#   prs@acme            the `prs` plugin from marketplace `acme` — declared
+#                       below, OR installed via a CLI, OR a local directory.
+#                       The reference means the same thing either way.
+#   ./tools/my-plugin   a path, resolved against THIS FILE's directory
+#
+# SOURCE GRAMMAR (the Copilot CLI's, so a source you already wrote works)
+#   owner/repo                          GitHub shorthand
+#   owner/repo#v1.4.0                   ...at a tag, branch, or commit
+#   https://gitlab.com/acme/p.git#main  any http/https/ssh URL
+#   git@github.com:acme/p.git#3f2a1c9   scp-style remote
+#   ./vendor/plugins                    a local directory
+#
+# PINNED vs FLOATING — the thing worth understanding
+#   A ref that is a full 40-character SHA is PINNED: fetched once, never
+#   re-checked. Anything else — a tag, a branch, or no ref — FLOATS, and is
+#   re-resolved on every run. Tags move; a floating source can therefore
+#   gain a subagent, or an MCP server, between two runs of the same file.
+#   An MCP server is a subprocess launched with your credentials. Pin a SHA
+#   when that matters. `conductor plugin list` prints the counts.
+#
+# NETWORK
+#   conductor run             acquires sources up front, in parallel
+#   conductor plugin fetch    acquires them explicitly — the CI step
+#   conductor plugin list     reads the cache, reports what a run would load
+#   conductor validate        NEVER touches the network; an unfetched source
+#                             is a warning naming `conductor plugin fetch`
+#
+#   Offline with a warm cache, a floating ref cannot be re-checked, so the
+#   cached checkout is used and you are told. Offline with a cold cache is
+#   an error.
+#
+# TRUST
+#   Declaring a source is the consent. There is no prompt and no allowlist,
+#   matching the existing treatment of a plugin path — the same YAML can
+#   already run arbitrary shell via `type: script`. But a git source goes a
+#   step further: the code is NOT in your tree when you review the workflow.
+#   Pin a SHA, and read `conductor plugin list` before committing.
+#
+# Usage:
+#   conductor plugin fetch examples/plugin-sources.yaml
+#   conductor plugin list  examples/plugin-sources.yaml
+#   conductor run examples/plugin-sources.yaml \
+#     --input changes="Resume now restores dashboard state"
+#
+# This example uses a LOCAL source (examples/demo-plugin) so it runs
+# anywhere with no network. The git forms are shown commented out below.
+
+workflow:
+  name: plugin-sources
+  description: Declare where plugins come from, so the workflow is standalone
+  version: 1.0.0
+  entry_point: reviewer
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.5
+    max_agent_iterations: 30
+
+    plugin_sources:
+      # String shorthand. A local directory is a valid source: the plugin
+      # here ships one skill and one subagent, so `demo@examples` resolves.
+      examples: ./demo-plugin
+
+      # Object form, for a repository that keeps its plugins in a
+      # subdirectory. Uncomment with a repository you can reach:
+      # acme:
+      #   source: acme/agent-plugins#v1.4.0
+      #   path: packages/plugins
+
+      # Pinned to a commit — this one cannot change underneath you:
+      # frozen: acme/agent-plugins#9c4e1f2a8b3d5e7091a2c4b6d8e0f1a3c5b7d9e1
+
+      # An ssh remote, using your existing keys and credential helpers:
+      # internal: git@github.com:acme/internal-plugins.git#main
+
+    # Which plugins to enable, and how much of each. Every component
+    # defaults ON — defaulting one off would reproduce the partial load
+    # that whole-plugin opt-in exists to fix.
+    plugins:
+      - demo@examples
+
+      # Object form, to take only part of a plugin:
+      # - name: ado@acme
+      #   mcp: false     # skills and subagents, but do not start its server
+
+  input:
+    changes:
+      type: string
+      description: What changed in this release
+      required: true
+
+agents:
+  - name: reviewer
+    # No `plugins:` here, so this agent inherits the workflow default.
+    # `plugins: []` would opt out; a list would replace rather than extend.
+    prompt: |
+      Write release notes for these changes:
+
+      {{ changes }}
+
+      Use the release-notes skill. It will tell you to hand the draft to
+      the `demo:editor` subagent before returning it — do that. If the
+      subagent is not available, say so explicitly rather than editing the
+      draft yourself, so a dropped plugin component is visible instead of
+      silently worked around.
+    output:
+      notes:
+        type: string
+        description: The finished release notes
+
+output:
+  notes: "{{ reviewer.output.notes }}"

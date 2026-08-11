@@ -2818,6 +2818,8 @@ class _RecordingReasoningProvider:
         interrupt_signal=None,
         event_callback=None,
         skill_directories=None,
+        custom_agents=None,
+        extra_mcp_servers=None,
     ):
         from conductor.providers.base import AgentOutput
         from conductor.providers.reasoning import resolve_reasoning_effort
@@ -3826,6 +3828,8 @@ class _RecordingWorkingDirProvider:
         interrupt_signal=None,
         event_callback=None,
         skill_directories=None,
+        custom_agents=None,
+        extra_mcp_servers=None,
     ):
         self.calls += 1
         self.seen.append((agent.name, agent.working_dir))
