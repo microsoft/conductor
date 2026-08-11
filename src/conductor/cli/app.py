@@ -42,9 +42,11 @@ app = typer.Typer(
 # Register subcommand groups
 from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
 from conductor.cli.gate import gate_app  # noqa: E402
+from conductor.cli.plugin import plugin_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
 
 app.add_typer(registry_app, rich_help_panel="Environment")
+app.add_typer(plugin_app, rich_help_panel="Environment")
 app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 
@@ -160,13 +162,21 @@ def print_error(error: Exception) -> None:
         console.print(panel)
 
 
+_INTERACTIVE_STEP_TYPES = ("human_gate", "questions")
+"""Step types that park the workflow waiting on a human."""
+
+
 def _workflow_has_human_gate(workflow_path: Path) -> bool:
-    """Return True if the workflow defines any ``human_gate`` agent.
+    """Return True if the workflow defines any step that waits on a human.
 
     Used to decide whether to print the ``--web-bg`` gate-resolution notice
     after forking the background child (issue #286). Config-load failures
     return ``False`` so the normal run path surfaces the real error instead
     of this best-effort probe.
+
+    Covers ``questions`` as well as ``human_gate`` — both park the run on the
+    dashboard, so omitting either would leave a ``--web-bg`` user with a
+    silently stalled workflow and no notice explaining why.
     """
     try:
         from conductor.config.loader import load_config
@@ -175,8 +185,9 @@ def _workflow_has_human_gate(workflow_path: Path) -> bool:
     except Exception:  # noqa: BLE001 — defer real validation to the loader path
         logger.debug("Best-effort human_gate probe failed to load %s", workflow_path, exc_info=True)
         return False
-    return any(getattr(a, "type", None) == "human_gate" for a in config.agents) or any(
-        getattr(getattr(fe, "agent", None), "type", None) == "human_gate" for fe in config.for_each
+    return any(getattr(a, "type", None) in _INTERACTIVE_STEP_TYPES for a in config.agents) or any(
+        getattr(getattr(fe, "agent", None), "type", None) in _INTERACTIVE_STEP_TYPES
+        for fe in config.for_each
     )
 
 
@@ -200,7 +211,8 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     port = urlparse(url).port
     port_hint = str(port) if port is not None else "<port>"
     console.print(
-        "[yellow]This workflow contains human_gate steps.[/yellow] Resolve them from "
+        "[yellow]This workflow contains steps that wait for you[/yellow] "
+        "(human_gate / questions). Resolve them from "
         "the dashboard above, or run "
         f"[bold]conductor gate respond --port {port_hint} --choice <value>[/bold]."
     )
@@ -1101,6 +1113,71 @@ def replay(
 
 
 @app.command(rich_help_panel="Run & Recover")
+def status(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit machine-readable output instead of a table.",
+        ),
+    ] = False,
+) -> None:
+    """List background workflows without stopping any of them.
+
+    \b
+    `conductor stop` also lists running workflows, but it stops one when
+    exactly one is running -- so the natural "what's running?" reflex is
+    destructive precisely when there is a single run to lose. This command is
+    read-only and always safe.
+
+    The dashboard URL is included because there is otherwise no supported way
+    to recover it once the launching terminal is gone.
+
+    \b
+    Exit codes:
+        0  listed successfully (including when nothing is running)
+
+    \b
+    Examples:
+        conductor status
+        conductor status --json
+    """
+    import json
+
+    from conductor.cli.pid import scan_pid_files
+
+    # Deliberately not ``read_pid_files``: that one prunes as it reads, which
+    # would make the read-only command destructive — the exact trap this
+    # command exists to give people an alternative to.
+    running = scan_pid_files()
+
+    if json_output:
+        payload = [
+            {
+                "pid": e["pid"],
+                "port": e["port"],
+                "workflow": str(e.get("workflow", "")),
+                "run_id": e.get("run_id", ""),
+                "started_at": e.get("started_at", ""),
+                "log_file": e.get("log_file", ""),
+                "url": f"http://127.0.0.1:{e['port']}",
+            }
+            for e in running
+        ]
+        output_console.print_json(json.dumps({"running": payload}), ensure_ascii=True)
+        return
+
+    if not running:
+        console.print("[dim]No background workflows are currently running.[/dim]")
+        return
+
+    _print_running_list(running, console, show_url=True)
+    console.print(
+        f"\n[dim]{len(running)} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]"
+    )
+
+
+@app.command(rich_help_panel="Run & Recover")
 def stop(
     port: Annotated[
         int | None,
@@ -1217,12 +1294,16 @@ def _stop_process(entry: dict, con: Console) -> None:
         )
 
 
-def _print_running_list(entries: list[dict], con: Console) -> None:
+def _print_running_list(entries: list[dict], con: Console, show_url: bool = False) -> None:
     """Print a table of running background workflows.
 
     Args:
         entries: List of PID-file dicts.
         con: Rich Console for output.
+        show_url: Append a Dashboard URL column. Defaults to False;
+            ``conductor status`` passes True, since discovery is its whole
+            purpose and the URL is otherwise unrecoverable once the launching
+            terminal is gone.
     """
     from rich.table import Table
 
@@ -1231,14 +1312,19 @@ def _print_running_list(entries: list[dict], con: Console) -> None:
     table.add_column("PID", style="yellow")
     table.add_column("Workflow", style="white")
     table.add_column("Started", style="dim")
+    if show_url:
+        table.add_column("Dashboard", style="blue")
 
     for e in entries:
-        table.add_row(
+        row = [
             str(e["port"]),
             str(e["pid"]),
             Path(e.get("workflow", "unknown")).stem,
             e.get("started_at", "?"),
-        )
+        ]
+        if show_url:
+            row.append(f"http://127.0.0.1:{e['port']}")
+        table.add_row(*row)
 
     con.print(table)
 

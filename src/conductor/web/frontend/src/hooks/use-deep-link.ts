@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { useReactFlow } from '@xyflow/react';
+import { claimCameraForAnimation } from '@/lib/camera-authority';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { SubworkflowContext } from '@/stores/workflow-store';
 import { nodeKey } from '@/lib/node-id';
 import { expansionKeysForContextPath } from '@/components/graph/graph-layout';
+
+/** Duration of the deep-link fit animation, during which it owns the camera. */
+const DEEP_LINK_FIT_DURATION_MS = 400;
 
 /** Parse deep-link params from the current URL. */
 function getDeepLinkParams(): { subworkflowPath: string | null; agent: string | null } {
@@ -232,7 +236,8 @@ export function useDeepLink(): DeepLinkError | null {
         centerRaf = null;
         const measured = getInternalNode(fitId)?.measured;
         if (measured?.width && measured?.height) {
-          fitView({ nodes: [{ id: fitId }], padding: 0.5, duration: 400 });
+          claimCameraForAnimation(DEEP_LINK_FIT_DURATION_MS);
+          fitView({ nodes: [{ id: fitId }], padding: 0.5, duration: DEEP_LINK_FIT_DURATION_MS });
         } else if (attempts++ < maxAttempts) {
           centerRaf = requestAnimationFrame(tick);
         } else {
@@ -243,7 +248,8 @@ export function useDeepLink(): DeepLinkError | null {
             `[use-deep-link] node "${fitId}" was not measured in time; ` +
               'fitting the whole graph instead',
           );
-          fitView({ padding: 0.2, duration: 400 });
+          claimCameraForAnimation(DEEP_LINK_FIT_DURATION_MS);
+          fitView({ padding: 0.2, duration: DEEP_LINK_FIT_DURATION_MS });
         }
       };
       centerRaf = requestAnimationFrame(tick);

@@ -1,6 +1,6 @@
 [project]
 name = "conductor-cli"
-version = "0.1.26"
+version = "0.1.27"
 description = "A CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,12 +39,16 @@ dependencies = [
     "simpleeval>=1.0.0",
     "github-copilot-sdk>=1.0.0",
     "anthropic>=0.77.0,<1.0.0",
+    "pydantic-ai>=1.44.0",
     "mcp>=1.28.1",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "websockets>=12.0",
     "httpx>=0.27.0",
     "packaging>=21.0",
+    # Timeout-bounded regex matching for output field constraints and provider
+    # response normalization. Ships typed stubs and supports per-match deadlines.
+    "regex>=2024.11.6",
 ]
 
 [project.optional-dependencies]
@@ -85,6 +89,12 @@ exclude = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "plugins/conductor/skills/conductor" = "plugins/conductor/skills/conductor"
+# The plugin manifest, not just the skill body: the claude-agent-sdk provider
+# loads skills by registering `plugins/conductor` as a Claude Code plugin
+# (`--plugin-dir`), which requires `.claude-plugin/plugin.json` to be present.
+# Without it no plugin root resolves, so the skill works from a source checkout
+# and every skills-enabled agent fails with a ProviderError on a wheel install.
+"plugins/conductor/.claude-plugin" = "plugins/conductor/.claude-plugin"
 
 [dependency-groups]
 dev = [

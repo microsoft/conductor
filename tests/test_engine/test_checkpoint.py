@@ -16,6 +16,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import sys
@@ -237,6 +238,45 @@ class TestSaveCheckpoint:
             result = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", error, {})
 
         assert result is None
+
+    def test_save_checkpoint_failure_logs_concise_warning_and_debug_traceback(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement (issue #357): the handled fail-open path must not print a
+        traceback at WARNING level — a concise warning names the exception, and
+        the full traceback is only available at DEBUG level."""
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        error = RuntimeError("err")
+
+        fake_dir = tmp_path / "no" / "such" / "dir"
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=fake_dir),
+            caplog.at_level(logging.DEBUG, logger="conductor.engine.checkpoint"),
+        ):
+            result = CheckpointManager.save_checkpoint(wf, ctx, limits, "a", error, {})
+
+        assert result is None
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.checkpoint"
+            and r.levelno == logging.WARNING
+            and "Failed to save checkpoint" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is None
+        # The warning names the exception type so the cause is identifiable
+        # without a traceback (e.g. FileNotFoundError from the bad directory).
+        assert "FileNotFoundError" in warnings[0].getMessage()
+        debugs = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.checkpoint" and r.levelno == logging.DEBUG
+        ]
+        assert any(r.exc_info is not None for r in debugs)
 
     def test_handles_non_serializable_inputs(self, tmp_path: Path) -> None:
         wf = _write_workflow(tmp_path)
@@ -948,6 +988,45 @@ class TestRotatePeriodicCheckpoints:
             remaining = CheckpointManager.list_checkpoints(wf)
 
         assert len(remaining) == 3
+
+    def test_listing_failure_logs_run_context_and_debug_traceback(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement (issue #357): when checkpoint rotation fails to list, the
+        WARNING must name the run and workflow so the leak is actionable without
+        DEBUG, and the traceback lives only at DEBUG level."""
+        wf = _write_workflow(tmp_path, "name: wf\n")
+
+        with (
+            patch.object(
+                CheckpointManager,
+                "_periodic_checkpoints_for_run",
+                side_effect=OSError("disk gone"),
+            ),
+            caplog.at_level(logging.DEBUG, logger="conductor.engine.checkpoint"),
+        ):
+            CheckpointManager.rotate_periodic_checkpoints(wf, "run-42", keep_last=1)
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.checkpoint"
+            and r.levelno == logging.WARNING
+            and "Failed to list checkpoints" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is None
+        message = warnings[0].getMessage()
+        assert "run-42" in message
+        assert str(wf) in message
+        assert "OSError" in message
+        assert "disk gone" in message
+        debugs = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.checkpoint" and r.levelno == logging.DEBUG
+        ]
+        assert any(r.exc_info is not None for r in debugs)
 
 
 class TestCleanupPeriodicForRun:

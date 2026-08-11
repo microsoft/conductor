@@ -194,6 +194,19 @@ async def test_schema_changes_dont_affect_copilot_provider():
         # None and excluded by exclude_none.
         "checkpoint": {"every_agent": False, "keep_last": 5},
         "skills": [],
+        # Eager skill-injection budget (issue #350). Bounds only providers
+        # without progressive disclosure; copilot is unaffected.
+        "skill_injection": {"warn_bytes": 65536, "max_bytes": 131072},
+        # Skill discovery is off by default (issue #362): ambient skills
+        # would make the same YAML behave differently per machine.
+        "skill_discovery": {"sources": (), "exclude": ()},
+        # Plugins are off by default (issue #378): a plugin can launch MCP
+        # subprocesses with the user's credentials, so it loads only when
+        # a workflow names it.
+        "plugins": [],
+        # No git-backed plugin sources declared (issue #380). Without any,
+        # plugin entries resolve against machine state exactly as before.
+        "plugin_sources": {},
     }
 
     # Verify provider can be instantiated

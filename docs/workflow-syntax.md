@@ -11,6 +11,7 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Inputs and Outputs](#inputs-and-outputs)
 - [Limits and Safety](#limits-and-safety)
 - [Tools](#tools)
+- [Skills](#skills)
 - [External File References](#external-file-references)
 - [Hooks](#hooks)
 
@@ -97,7 +98,7 @@ Agents are defined in the `agents` list. Each agent represents a unit of work.
 agents:
   - name: string                    # Required: Unique agent identifier
     description: string             # Optional: Purpose description
-    type: agent                     # agent | human_gate | script | workflow | wait | terminate (default: agent)
+    type: agent                     # agent | human_gate | questions | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
     
     prompt: |                       # Required for type=agent: Agent instructions
@@ -113,8 +114,16 @@ agents:
     
     output:                         # Optional: Output schema for validation
       field_name:
-        type: string
+        type: string                # string | number | boolean | array | object
         description: "Field purpose"
+        enum: ["a", "b"]             # Optional: Allowed scalar values (string/number/boolean)
+        pattern: "^[a-z]+$"          # Optional: Regex pattern (string type only)
+        minimum: 0                   # Optional: Inclusive minimum (number type only)
+        maximum: 100                 # Optional: Inclusive maximum (number type only)
+        minLength: 1                 # Optional: Minimum string length (string type only)
+        maxLength: 50                # Optional: Maximum string length (string type only)
+        nullable: true               # Optional: Allow null value (default: false)
+        required: false              # Optional: Only inside object properties (default: true)
 
     output_mode: raw                # Optional: raw | envelope (default: inferred)
                                     # raw: skip JSON extraction, wrap response
@@ -131,7 +140,7 @@ agents:
       effort: high                  # low | medium | high | xhigh | max
                                     # Overrides runtime.default_reasoning_effort.
                                     # Only valid on type=agent (rejected on
-                                    # script, human_gate, workflow).
+                                    # script, human_gate, questions, workflow).
                                     # See docs/configuration.md#reasoning-effort.
 
     retry:                          # Optional: per-agent retry policy
@@ -148,7 +157,7 @@ agents:
                                     # Overrides runtime.default_context_tier.
                                     # Composes with reasoning. Only valid on
                                     # type=agent (rejected on script,
-                                    # human_gate, workflow).
+                                    # human_gate, questions, workflow).
                                     # See docs/configuration.md#context-tier.
 
     routes:                         # Optional: Routing logic
@@ -205,6 +214,67 @@ A response that parses as JSON but isn't an object at all (a bare `42` or an arr
 This is useful when you know an agent's output is simple and a single attempt should suffice, or when you want to fail fast instead of burning tokens on recovery loops.
 
 When the budget runs out, a schema-shape failure raises the specific validation error naming the offending field and its expected type, while a syntax failure raises a provider error. Each recovery attempt emits an `agent_parse_recovery` event, visible in the dashboard activity stream and the structured event log.
+
+### Field Constraints
+
+Output field definitions support optional validation constraints to enforce value boundaries and formatting rules.
+
+| Field | Applicable Type | Description | Semantics |
+|-------|-----------------|-------------|-----------|
+| `enum` | `string`, `number`, `boolean` | List of allowed scalar values | Uses exact value comparison. Cannot contain `null` (use `nullable: true` instead). |
+| `pattern` | `string` | Regular expression pattern | Python `re.search` matching (unanchored by default; use `^` and `$` to anchor). Evaluated consistently on all providers. Matching is time-bounded (1 second); a pathological pattern fails validation instead of hanging the run. |
+| `minimum` | `number` | Inclusive minimum numeric bound | Value must be greater than or equal to `minimum`. |
+| `maximum` | `number` | Inclusive maximum numeric bound | Value must be less than or equal to `maximum`. |
+| `minLength` | `string` | Inclusive minimum string length | String length must be greater than or equal to `minLength`. |
+| `maxLength` | `string` | Inclusive maximum string length | String length must be less than or equal to `maxLength`. |
+| `required` | Any (object property only) | Whether the object property must be present | Default: `true`. **Must be `true` for root-level fields**; setting `required: false` at the root level is rejected by `conductor validate`. |
+| `nullable` | Any | Whether `null` is an acceptable value | Default: `false`. When `true`, renders as `type: [T, "null"]` in JSON Schema. |
+
+#### JSON Schema and Validation Semantics
+
+- **Inclusive Bounds**: `minimum`, `maximum`, `minLength`, and `maxLength` represent inclusive bounds.
+- **Regex Pattern Matching**: `pattern` uses Python `re.search` semantics across all providers (including Claude). It matches anywhere in the target string unless explicitly anchored with `^` and `$`. Matching runs on a `re`-compatible engine with a 1-second wall-clock deadline per check: model output is untrusted input, so a pattern with catastrophic backtracking raises a validation error (which drives the provider's output-recovery loop) instead of stalling the workflow.
+- **Nullable Fields**: Setting `nullable: true` renders the JSON Schema type as `type: [T, "null"]`, allowing the field to hold `null` or a value matching `type`.
+- **Optional Object Properties**: The `required: false` constraint is permitted **only inside nested object properties** (e.g. `properties.details.required: false`). All root-level output fields must be required, so setting `required: false` on a root-level agent output field will be rejected during workflow validation (`conductor validate`).
+
+#### Field Constraints Example
+
+```yaml
+agents:
+  - name: evaluator
+    prompt: "Evaluate the artifact and return structured metrics."
+    output:
+      status:
+        type: string
+        enum: ["passed", "failed", "pending"]
+        description: "Execution status"
+      score:
+        type: number
+        minimum: 0
+        maximum: 100
+        description: "Evaluation score between 0 and 100"
+      code:
+        type: string
+        pattern: "^ERR-[0-9]{3}$"
+        minLength: 7
+        maxLength: 7
+        description: "Error code in format ERR-123"
+      notes:
+        type: string
+        nullable: true
+        description: "Optional notes or null when absent"
+      metadata:
+        type: object
+        description: "Additional execution metadata"
+        properties:
+          reviewer:
+            type: string
+            description: "Reviewer identifier"
+          comments:
+            type: string
+            required: false
+            description: "Optional comments property inside object"
+```
 ### Choosing whether to declare `output:`
 
 Declaring `output:` does two things at once: it asks the model to return JSON matching the schema, and it parses the response as structured JSON. For some agents that's what you want. For others it produces parse-recovery loops and burns tokens.
@@ -288,7 +358,7 @@ agents:
         type: number
 ```
 
-`output_mode` is only valid on provider-backed agents (the default type). It cannot be set on `script`, `human_gate`, or `workflow` agents.
+`output_mode` is only valid on provider-backed agents (the default type). It cannot be set on `script`, `human_gate`, `questions`, or `workflow` agents.
 
 ### Working Directory
 
@@ -319,7 +389,7 @@ Because paths are normalized lexically instead of resolving to their real paths:
 
 #### Key Restrictions and Exclusions
 
-- **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
+- **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, `questions`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
 - **Script Steps:** `script` steps honor only their own `working_dir` field, rendered as a Jinja2 template. `workflow.runtime.working_dir` is not applied; relative paths are passed to the subprocess as-is and therefore resolve against the Conductor process cwd, not the workflow file directory; missing directories surface as subprocess startup `ExecutionError`s rather than the LLM-agent pre-provider working-dir check.
 - **Dialog Turns:** The working directory isn't applied to dialog turns in the current version. Multi-turn interactions run in the process default directory.
 - **Sub-Workflows:** A sub-workflow doesn't inherit the parent's working directory configuration. Instead, any relative paths in the child workflow resolve against the child workflow's own file directory.
@@ -517,6 +587,171 @@ agents:
 ```
 
 The auto-linkify processor is Markdown-aware: it skips fenced code blocks, inline code spans, and existing markdown links. File paths are validated against the workflow root directory (path traversal is blocked).
+
+#### Collecting text with `prompt_for`
+
+An option may collect free text after it is selected:
+
+```yaml
+    options:
+      - label: "Request revisions"
+        value: revise
+        route: reviser
+        prompt_for: feedback     # field name; stored under additional_input
+        multiline: true          # optional, default false
+```
+
+The collected text is available as
+`{{ approval_gate.output.additional_input.feedback }}`.
+
+`multiline` is opt-in so existing gates keep single-line behavior. When
+enabled, the terminal reads until a line containing only `.` (or EOF —
+Ctrl-D, Ctrl-Z then Enter on Windows) and the dashboard renders a textarea
+where Enter inserts a newline and Ctrl/Cmd+Enter submits. Without a TTY the
+single-line path is used regardless, since multi-line editing is meaningless
+on a pipe.
+
+For asking a *set* of questions rather than collecting one blob of text, see
+[Questions](#questions).
+
+### Questions
+
+A `questions` step asks a human a **set** of questions inside one workflow step,
+holding the cursor and the answers internally.
+
+That "one step" property is the whole point. The obvious alternative — a
+`human_gate` that loops back through a `set` step accumulating a transcript —
+cannot support going back, because a workflow step cannot be un-executed and a
+concatenated transcript has no addressable per-question answer to overwrite. It
+also costs 2 iterations per question against `limits.max_iterations`, where a
+`questions` node costs 1 for the whole set.
+
+**Use a gate when the choice changes where the workflow goes; use `questions`
+when you just need the answers recorded.** `human_gate` *routes* on the
+selection, `questions` *records* it.
+
+```yaml
+agents:
+  - name: ask_questions
+    type: questions
+
+    # Exactly one of `source:` or `questions:`.
+    source: architect.output.open_questions   # dotted path, same as for_each
+    # questions:
+    #   - text: "Server-side or client-side?"
+    #     choices: ["Server-side", "Client-side"]
+    #   - id: rollout                          # stable answer key
+    #     text: "How should this roll out?"
+    #     hint: "Think about the migration window."
+    #     required: true
+    #     default: "Behind a flag"
+    #     multiline: true
+    #     allow_free_text: true
+
+    prompt: |                                 # Optional intro, shown once
+      Unanswered questions become silent assumptions.
+
+    allow_back: true          # revise the previous answer (default: true)
+    allow_skip: true          # skip one question (default: true)
+    allow_skip_all: true      # skip everything remaining (default: true)
+    allow_abort: false        # abandon the node (default: false)
+    # abort_route: rescue     # where to go on abort; requires allow_abort: true
+
+    routes:
+      - to: finalize
+```
+
+#### Question fields
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `id` | `q1`..`qN` | Answer key. Set it explicitly so inserting a question upstream doesn't renumber the keys below it. |
+| `text` | required | The question. Jinja2-rendered. |
+| `hint` | — | Clarifying text shown beneath the question. |
+| `choices` | — | Suggested answers, offered as selectable options. |
+| `allow_free_text` | `true` | Offer "write your own" alongside `choices`. |
+| `default` | — | Recorded when the question is skipped. Counts as answered. |
+| `required` | `false` | Blocks *submission*, never navigation — a user is never trapped on one question. Skip and skip-all are both refused while a required question is unanswered. A question with a `default` is always skippable, since the default answers it. |
+| `multiline` | `true` | Whether the free-text path accepts multi-line input. Inert when `allow_free_text: false`. |
+
+#### Resolving questions from an agent
+
+`source:` uses the same dotted-path convention as `for_each`. Entries may be
+plain strings **or** objects:
+
+```yaml
+open_questions: ["Why?", "When?"]                            # each becomes a question
+open_questions: [{question: "Why?", choices: ["A", "B"]}]    # with candidate answers
+```
+
+Question text from `source:` is used **verbatim**, not rendered as a template —
+`Should this use {{ user.id }}?` is an ordinary question for a developer tool,
+and rendering it would abort the step. Inline `questions:` are author-written
+and validated at `conductor validate` time, so they keep full Jinja2 support.
+
+Because plain strings work, an agent already emitting `open_questions` as an
+`array of string` needs no changes; adding `choices` later is a
+backward-compatible upgrade that turns "answer this" into "pick one, or write
+your own" — a far lower-effort interaction.
+
+#### Output
+
+Stored under the node name:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `answers` | `dict` | `{question_id: answer}`, skipped questions omitted. |
+| `items` | `list` | `{id, question, answer, source, skipped}` in presentation order. `source` is `choice` / `free_text` / `default` / `skipped`. |
+| `transcript` | `string` | Pre-formatted `Q1. ...\nA: ...` block for prompts. |
+| `answered_count` / `skipped_count` | `int` | Counts. |
+| `answered_any` | `bool` | Cheap check for "did the human engage at all". |
+| `outcome` | `string` | `completed` / `skipped_remaining` / `aborted`. A mid-node checkpoint additionally carries `in_progress`. |
+
+`answers` being a keyed dict rather than an appended string is what makes going
+back work: revisiting question 3 overwrites `answers.q3`.
+
+```yaml
+routes:
+  - to: finalize
+    when: "{{ ask_questions.output.answered_any }}"
+  - to: $end
+```
+
+#### Navigation
+
+Questions are presented one at a time. After the last one, a closing review
+lists every answer and offers **Finish** or **Back** — without it, answering
+the final question would end the node instantly and Back would be unusable
+exactly where it is most wanted. The review is skipped when `allow_back: false`.
+
+#### Partial answers survive a checkpoint
+
+Answers are committed to the workflow context after each response, so a
+checkpoint taken mid-node already carries them and `conductor resume` continues
+at the first unanswered question. Answers whose questions no longer exist (the
+workflow was edited between the checkpoint and the resume) are dropped rather
+than resurrected.
+
+#### `--skip-gates`
+
+`--skip-gates` **never selects a suggested answer.** Those come from the
+upstream agent, so recording one would feed invented input back as though a
+human had provided it. Questions with a `default` take that default; the rest
+are skipped, and `outcome` is `skipped_remaining`.
+
+#### Restrictions
+
+- Cannot be used inside parallel or for-each groups (concurrent prompts would
+  compete for one terminal and one dashboard prompt slot, the same reason gates
+  are refused). Route to a `questions` step from the group's `routes:` instead.
+- Cannot set `options`, `model`, `provider`, `tools`, `output`, `dialog`,
+  `validator`, `reasoning`, `skills`, `plugins`, `context_tier`,
+  `input_mapping`, `sandbox`, `max_depth`, `timeout_seconds`, `session_key`,
+  `output_mode`, or `working_dir` — no provider is invoked. Note `timeout_seconds` in particular: there is no
+  bound on how long a human may take.
+- `abort_route` requires `allow_abort: true`.
+
+See [`examples/questions.yaml`](../examples/questions.yaml).
 
 ### Script Steps
 
@@ -974,7 +1209,7 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 | `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
 
 **Behavior notes:**
-- Dialog is supported on regular `agent` type only (not `human_gate`, `script`, `workflow`, or `wait`)
+- Dialog is supported on regular `agent` type only (not `human_gate`, `questions`, `script`, `workflow`, or `wait`)
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
@@ -1015,7 +1250,7 @@ agents:
 | `validator.max_retries` | int | No | Re-runs on failure. Default `1`, **hard-capped at 1**. `0` = validate-and-report without re-running. |
 
 **Behavior notes:**
-- Supported on provider-backed `agent` steps only (not `human_gate`, `script`, `workflow`, `wait`, `set`, or `terminate`). Works in the main loop, parallel groups, and for-each loops.
+- Supported on provider-backed `agent` steps only (not `human_gate`, `questions`, `script`, `workflow`, `wait`, `set`, or `terminate`). Works in the main loop, parallel groups, and for-each loops.
 - The validator uses the primary agent's provider; only `model` is overridable.
 - **Fail-open:** if the validator call errors or returns unparseable output, it is treated as a pass (with a logged warning) so a flaky grader never blocks the workflow.
 - The validator sees only the agent's prompt + output + criteria, not other agents' outputs — keeping validation focused and cheap.
@@ -1502,6 +1737,521 @@ agents:
 ```
 
 For full MCP configuration details, see the [MCP Tools guide](mcp-tools.md).
+
+## Skills
+
+A **skill** is a directory of reusable knowledge an agent can opt into: a
+`SKILL.md` describing what the skill covers, plus an optional `references/`
+tree of supporting docs. Conductor consumes the same format the GitHub
+Copilot CLI and Anthropic Claude Code use, so a skill written for either
+generally works here unchanged. Conductor adds two constraints neither CLI
+enforces: the frontmatter must actually parse (that is the point of this —
+see below), and on `claude-agent-sdk` the frontmatter `name` must match the
+directory basename, since the skill is enabled by name.
+
+### Enabling skills
+
+Set a workflow-wide default and override it per agent:
+
+```yaml
+workflow:
+  runtime:
+    skills:
+      - conductor                     # built-in, ships in the wheel
+      - ./team-skills/acme-widgets    # versioned alongside the workflow
+      - ~/scratch/skills              # a skills root — every skill directly inside
+
+agents:
+  - name: reviewer
+    prompt: "Review this workflow."
+    # inherits runtime.skills
+
+  - name: summarizer
+    prompt: "Summarize the review."
+    skills: []                        # explicit opt-out — no skills
+
+  - name: widget_expert
+    prompt: "Check the widget conventions."
+    skills: [./team-skills/acme-widgets]   # overrides the workflow default
+```
+
+The per-agent field is tri-state:
+
+| Value | Meaning |
+|---|---|
+| omitted | inherit `runtime.skills` |
+| `[]` | explicit opt-out — no skills, ignores the workflow default |
+| `[...]` | explicit set — replaces the workflow default |
+
+Skills apply only to provider-backed agents. They are rejected on `script`,
+`wait`, `set`, `terminate`, `workflow`, `human_gate`, and `questions` steps.
+
+### Names and paths
+
+Each entry is either a **registered built-in name** or a **filesystem path**.
+The distinction is syntactic — an entry is a path when it starts with `.` or
+`~`, or contains `/` or `\`. Everything else must be a
+built-in name, so a bare `conductor` can never be shadowed by a directory
+that happens to share its name.
+
+Conductor ships one built-in skill:
+
+| Name | Contents |
+|---|---|
+| `conductor` | Conductor's YAML schema, execution model, authoring patterns, and CLI commands |
+
+A path may point at either granularity:
+
+* a **skill directory** — one containing `SKILL.md`
+* a **skills root** — a directory of skill directories, which expands to
+  every immediate child containing a `SKILL.md` (not recursive)
+
+Relative paths resolve against the **workflow file's directory**, the same
+rule `working_dir` uses, so a workflow validates and runs identically from
+any working directory. This is what lets a team version a skill next to the
+workflow that uses it, with no per-developer install step.
+
+> **Trust:** a `SKILL.md` is injected into the agent's context, so treat
+> skill paths as trusted input. Conductor applies no additional allowlist —
+> the same workflow file can already declare `type: script` steps that run
+> arbitrary shell, so a skill path grants strictly less.
+
+### `SKILL.md` frontmatter
+
+Every resolved skill must declare a `name` and a `description` in valid YAML
+frontmatter:
+
+```yaml
+---
+name: acme-widgets
+description: |
+  Internal ACME widget conventions. Triggers: widget, acme widget.
+---
+```
+
+Use a block scalar (`description: |`) whenever the text contains a colon
+followed by a space — without one the value is invalid YAML, and this is the
+single most common mistake:
+
+```yaml
+# Wrong — 'Triggers:' makes this unparseable
+description: Internal ACME widget conventions. Triggers: widget, acme widget.
+```
+
+Both the Copilot CLI and Claude Code **silently skip** a skill whose
+frontmatter fails to parse — no warning, no error, the skill is simply
+absent. Conductor parses it itself and fails loudly instead, both at
+`conductor validate` and at run time.
+
+### How skills reach the model
+
+The contract is the same everywhere — *the agent has access to the named
+skill* — but the mechanism and its cost differ:
+
+| Provider | Mechanism | Cost |
+|---|---|---|
+| `copilot` | `skill_directories` on the SDK session | progressive — frontmatter only, body loaded on demand |
+| `claude-agent-sdk` | owning plugin registered, skill enabled by `<plugin>:<skill>` | progressive |
+| `claude` | eager injection into the rendered prompt | **full body on every call** |
+| `hermes` | eager injection into the rendered prompt | **full body on every call** |
+| `aca` | not supported (`skills=False`) — rejected by `conductor validate` and by the executor at run time | n/a |
+
+Two consequences worth knowing:
+
+* **`claude-agent-sdk` requires a plugin.** The SDK has no bare
+  skill-directory option, so a skill must live inside a Claude Code plugin
+  (a `.claude-plugin/plugin.json` with the skill under `<plugin>/skills/`).
+  `conductor validate` reports a path skill that is not, rather than letting
+  it fail mid-run. The same skill works on `copilot` untouched.
+* **Eager injection is expensive.** The bundled `conductor` skill alone is
+  ~117KB (~29K tokens), prepended to *every* call and every retry.
+
+### Limiting eager injection
+
+`runtime.skill_injection` bounds what eager-injection providers prepend. It
+has no effect on providers with progressive disclosure.
+
+```yaml
+workflow:
+  runtime:
+    skill_injection:
+      warn_bytes: 65536      # Default: 65536 (64KB). null disables the warning.
+      max_bytes: 131072      # Default: 131072 (128KB). null disables the limit.
+```
+
+Exceeding `warn_bytes` logs a warning and reports it from `conductor
+validate`; exceeding `max_bytes` fails the agent. Both are measured against
+the exact string being prepended and report a per-skill breakdown, so the
+offender is named. The defaults sit either side of the bundled `conductor`
+skill: enabling it on `claude` warns rather than breaking, while
+accumulating several large skills errors.
+
+### Discovering installed skills
+
+`runtime.skill_discovery` picks up skills already installed on the machine,
+so a workflow can use a personal or team skill library without listing each
+one. It is **off by default**.
+
+```yaml
+workflow:
+  runtime:
+    skill_discovery:
+      sources: [personal, project]            # default: [] (disabled)
+      exclude: [scratch-notes]                # optional, by skill name
+```
+
+Each source is a category of location. Conductor scans them itself and
+unions both CLIs' conventions, rather than asking each provider to discover
+its own:
+
+| Source | Locations scanned |
+|---|---|
+| `personal` | `~/.copilot/skills`, `~/.claude/skills` |
+| `project` | `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root — or that directory alone when it is not inside a repository |
+
+Conductor doing the scanning is the point rather than an implementation
+detail. Discovery locations are provider-specific, so a flag that asked each
+provider to find its own would give a `copilot` agent and a `claude-agent-sdk` agent
+**different skill sets inside a single run**. Scanning centrally means every
+agent sees the same set whatever provider it resolves to. It also keeps the
+providers' own discovery switched off, which matters because Copilot's would
+additionally auto-load MCP servers from any `.mcp.json` in the working
+directory.
+
+Discovered skills join the workflow-level default set, so the per-agent
+tri-state is unchanged — an agent that declares its own `skills:` (including
+`skills: []`) overrides discovery along with `runtime.skills`.
+
+Ordering is fixed: `project`, then `personal`, regardless of the order
+written in `sources`. Reordering the list therefore cannot change which of
+two same-named skills wins.
+
+There is no `plugins` source. Scanning a plugin's `skills/` took one of the
+three things a plugin ships and left its subagents and MCP servers behind —
+so a skill whose instructions dispatch to `prs:code-reviewer` loaded fine and
+then could not. Name plugins in [`runtime.plugins`](#plugins) instead, which
+brings the whole unit and reproduces on another machine.
+
+#### Declared skills win
+
+A skill named in `skills:` always beats a discovered one of the same name —
+the discovered copy is skipped, with a warning unless both resolve to the same
+directory, in which case there is nothing to report. This comes up immediately:
+installing Conductor's own plugin puts a second `conductor` skill on the
+machine, and `skills: [conductor]` must keep meaning the built-in one.
+
+#### Discovered skills are held to a laxer standard
+
+The author asked for the entries in `skills:`; they did not ask for whatever
+happens to be installed. So the same problem is reported differently:
+
+| Problem | Declared skill | Discovered skill |
+|---|---|---|
+| Broken `SKILL.md` frontmatter | error | warning, skipped |
+| Name already taken | error | warning, skipped |
+| Directory unreadable | error | warning, skipped |
+| `claude-agent-sdk` cannot load it | error | warning, skipped |
+
+The one exception is a provider with **no native skill surface at all**
+(`claude`, `hermes`). Skipping there would drop the entire discovered set, so
+that combination is an error either way — see below.
+
+#### Provider support
+
+Discovery is realistically a `copilot` feature today:
+
+* **`copilot`** — fully supported.
+* **`claude-agent-sdk`** — only loads a discovered skill that lives inside a
+  Claude Code plugin, because the SDK has no bare skill-directory option.
+  Most installed Copilot plugins are not Claude Code plugins, so expect a
+  warning per skipped skill. Use `exclude` to silence the ones you know
+  about.
+* **`claude` / `hermes`** — **rejected by `conductor validate`.** These
+  inject every skill body into every prompt, and a discovered set is
+  unbounded and varies by machine, so there is no limit to tune that makes
+  it work. Name the skills you want in `runtime.skills` instead, or run
+  those agents on a provider with progressive disclosure.
+
+#### Seeing what was found
+
+`conductor validate` lists every discovered skill, the location it came
+from, and the total size if it were eagerly injected:
+
+```
+Skill discovery (personal, project): 3 skill(s)
+  • acme-widgets — /home/dev/.copilot/skills
+  • release-notes — /home/dev/.copilot/skills
+  • triage — /home/dev/work/repo/.github/skills
+  Total if eagerly injected: 41,204 bytes (~10,301 tokens)
+```
+
+Worth running before committing a workflow that uses discovery. An ambient
+set is the one part of a workflow that is not captured by the YAML, so the
+same file can behave differently on a teammate's machine or in CI — listing
+it is how that stays visible. If reproducibility matters more than
+convenience, leave discovery off and name the skills explicitly.
+
+See `examples/skills-self-improving-workflow.yaml` and
+`examples/skills-discovery.yaml` for complete examples.
+
+## Plugins
+
+A skill is one file of instructions. A **plugin** is the unit people
+actually install, and it ships up to three things Conductor can use:
+
+```
+<plugin>/
+  .claude-plugin/plugin.json   or  .github/plugin/plugin.json
+  skills/<skill>/SKILL.md      → instructions
+  agents/<agent>.agent.md      → subagents the model can dispatch to
+  .mcp.json                    → MCP servers
+```
+
+Enabling a plugin brings all three. That matters because they are written
+to work together: a plugin's `SKILL.md` routinely tells the agent to hand
+work to `prs:code-reviewer`, or to call an `ado` MCP tool. Loading only
+the instructions produces an agent that reads them correctly and then
+reaches for something that was never registered — and says nothing.
+
+```yaml
+workflow:
+  runtime:
+    plugins:
+      - prs                    # everything the plugin ships
+      - name: ado
+        mcp: false             # skills and agents only
+```
+
+Per-agent `plugins:` works the same way and follows the same tri-state as
+`skills:` — omitted inherits `runtime.plugins`, `[]` opts out, a list
+overrides.
+
+### Entry grammar
+
+| Form | Resolution |
+|---|---|
+| `prs` | An installed plugin, looked up under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`. An error if it is not installed, or if more than one marketplace ships that name |
+| `prs@acme` | The `prs` plugin from marketplace `acme` — declared in `plugin_sources`, or installed under that marketplace |
+| `./tools/my-plugin` | A path, resolved against the workflow file's directory |
+
+Classification is syntactic — a path when the entry starts with `~` or `.`
+or contains a separator, otherwise a name. So a same-named local directory
+can never shadow an installed plugin, and resolution never depends on what
+happens to exist. The path check runs first, so a directory called
+`my@plugin` stays a path.
+
+`prs@acme` is also the answer to the ambiguity error above: when two
+marketplaces ship a `git` plugin, qualify it rather than falling back to a
+path.
+
+### Declaring where plugins come from
+
+An entry like `prs` or `prs@acme` still resolves against machine state, so
+a workflow shared with a teammate needs "first install these plugins" in a
+README. `runtime.plugin_sources` removes that step:
+
+```yaml
+workflow:
+  runtime:
+    plugin_sources:
+      acme: acme/agent-plugins#v1.4.0          # string shorthand
+      beta:                                     # object form
+        source: git@github.com:beta/plugins.git#3f2a1c9
+        path: packages/plugins                  # subdir, if not at the root
+      local-dev: ./vendor/plugins               # a local path is a valid source
+    plugins:
+      - prs@acme
+      - name: ado@acme
+        mcp: false
+```
+
+Two concerns, two keys: `plugin_sources` is acquisition, `plugins` is
+activation. That split is not invented here — the Copilot CLI's own
+settings separate `extraKnownMarketplaces` from `enabledPlugins`, for the
+reason that eleven plugins commonly come from one repository. Inlining a
+URL per entry would either clone it eleven times or silently pick one of
+eleven refs.
+
+The load-bearing property: **`prs@acme` means the same thing** whether
+`acme` was declared here, installed via a CLI, or is a local directory. A
+declared source registers its name into the same table the installed
+marketplaces populate, and wins on a clash.
+
+A source may be a **marketplace catalog** (a `marketplace.json` listing
+many plugins) or a **single plugin** (a `plugin.json` at the root). Both
+are detected automatically; a repository that is both needs a `plugin:`
+key to say which, rather than having one picked for it. That key names
+either the root plugin or any plugin the catalog lists — it also narrows
+a pure catalog to a single entry.
+
+#### Source grammar
+
+The Copilot CLI's, so a source string you have already written works
+unchanged:
+
+| Form | Example |
+|---|---|
+| `owner/repo` | `acme/agent-plugins` |
+| `owner/repo#ref` | `acme/agent-plugins#v1.4.0` |
+| http/https/ssh URL | `https://gitlab.com/acme/p.git#main` |
+| scp-style remote | `git@github.com:acme/p.git#3f2a1c9` |
+| local path | `./vendor/plugins`, `~/src/plugins` |
+
+Cloning shells out to `git`, so existing SSH keys, credential helpers and
+host configuration apply, and self-hosted forges work.
+
+#### Pinned and floating refs
+
+There is no lockfile. The YAML is the lock:
+
+| Ref | Behaviour |
+|---|---|
+| A full 40-character SHA | **Pinned** — fetched once, never re-checked |
+| A tag, a branch, or no ref | **Floating** — re-resolved on every run; a moved ref is fetched |
+
+Worth knowing before leaving a source unpinned: tags move, so a floating
+source can gain a subagent or an MCP server between two runs of the same
+file. An MCP server is a subprocess launched with your credentials. Pin a
+SHA when that matters — it is a one-character edit — and read `conductor
+plugin list` before committing.
+
+#### Network behaviour
+
+| Command | Behaviour |
+|---|---|
+| `conductor run` / `resume` | Acquires sources up front, in parallel, before the first agent |
+| `conductor plugin fetch <workflow>` | Acquires them explicitly — the CI step |
+| `conductor plugin list <workflow>` | Reads the cache; reports what a run would load |
+| `conductor validate` | **Never** touches the network |
+
+Checkouts are cached under `$CONDUCTOR_HOME/cache/plugins/` (default
+`~/.conductor/cache/plugins/`), keyed by resolved commit, so different refs
+coexist and a checkout is immutable once written.
+
+When a floating ref cannot be re-checked — offline, VPN, expired
+credentials — the cached checkout is used and you are told. A cold cache
+with no network is an error naming `conductor plugin fetch`.
+
+`conductor validate` reports an unfetched source as a *warning*, not an
+error, and says which checks it had to skip. The workflow is not wrong;
+the machine has simply not fetched yet, and `conductor run` heals it.
+
+A source that is *itself* wrong — a path that does not exist, a `path:`
+that escapes the checkout, a catalog that will not parse — is an **error**.
+No amount of fetching fixes it. Sources are checked one at a time, so a
+broken or unfetched source costs its own line rather than the report for
+every healthy source beside it.
+
+A source declared but never referenced is reported too — dead config that
+survives a refactor and then pins a repository nobody reads.
+
+If a declared source shadows a marketplace of the same name installed on
+your machine, the declared one wins and you are told. The two can ship
+different subagents, or a different MCP server, so a silent substitution
+would change what your agents can do without saying so.
+
+There is no `conductor plugin update`. A floating source updates itself and
+a pinned one is meant not to.
+
+#### Trust
+
+Declaring a source is the consent. There is no prompt and no allowlist,
+matching how a plugin path is already treated — the same YAML can run
+arbitrary shell via `type: script`. But a git source goes a step further:
+the code is not in your tree when you review the workflow, and enabling a
+plugin can start an MCP server with your credentials. Pin a SHA, and use
+`conductor plugin list` to see what a source actually brings.
+
+### Components
+
+| Key | Default | Effect when `false` |
+|---|---|---|
+| `skills` | `true` | The plugin's `skills/` is not loaded |
+| `agents` | `true` | Its subagents are not registered |
+| `mcp` | `true` | Its MCP servers are not started |
+
+Every component defaults **on**, because defaulting one off would
+reproduce the partial load the feature exists to fix.
+
+`mcp: false` is worth knowing about, though: an MCP server is a subprocess
+launched with your credentials — the `ado` plugin authenticates through
+`az` at process start, before any tool is called. Conductor starts one
+only because a workflow named the plugin.
+
+`hooks/` and `commands/` are never loaded. `conductor validate` warns when
+a plugin ships them, rather than leaving the difference from the CLI
+invisible.
+
+Names must not collide. Two plugins shipping a same-named skill, or an MCP
+server name claimed by two plugins or by `runtime.mcp_servers`, is an error
+— one of the two would be unreachable, and dropping it quietly is the
+failure this feature exists to remove. Disable the component on one of them
+to resolve it. A plugin skill that collides with one you named in `skills:`
+is the exception: yours wins, and the plugin's copy is reported as shadowed.
+
+### Provider support
+
+| Provider | Plugins |
+|---|---|
+| `copilot` | Yes — each component registered individually |
+| `claude-agent-sdk` | Yes, with one carve-out below |
+| `claude`, `hermes`, `aca` | No — `conductor validate` rejects `plugins:` |
+
+Conductor **deconstructs** a plugin rather than handing its root to the
+SDK. Both native SDKs have a whole-plugin option, and both are
+all-or-nothing: on Copilot, hiding an MCP tool from the model does not
+stop its server from launching, so `mcp: false` would be a guarantee that
+isn't one. Registering the root also puts the two providers in opposition
+— plugin MCP is unavoidable on one and suppressed on the other.
+Deconstructed, a plugin's MCP servers also pick up the same
+`runtime.tool_output` limits, dashboard tool events, and credential and
+`${VAR}` resolution as a server the workflow declared itself. They are not
+`MCPServerDef`s, though, so there is no per-server `tools:` filter to
+author — `mcp: false` is the control you have.
+
+The carve-out: on `claude-agent-sdk`, the only way to reach a plugin's
+skills is to register the plugin root, which also contributes every
+subagent it ships and exposes its hooks. So `agents: false` cannot be
+honoured there alongside `skills: true` for the same plugin, and the
+combination is refused rather than silently granting more than the YAML
+declared. The identical config works on `copilot`.
+
+### Plugins are never discovered
+
+There is no plugin equivalent of `skill_discovery`. A plugin loads because
+a workflow named it, never because it happened to be installed — so a
+missing plugin is a hard error at validate time rather than quietly less
+capability.
+
+Resolving `plugins: [prs]` does read the installed plugin roots, but that
+is *resolution*, not discovery: the author wrote the name down, and
+nothing enters the run unasked. Cloning a declared `plugin_sources` entry
+is resolution too — a miss is a hard error, not silently less capability.
+With sources declared, even the machine dependency of resolving an
+installed name goes away.
+
+### Seeing what a plugin brings
+
+A plugin name says nothing about how much it carries, so `conductor
+validate` prints it:
+
+```
+Plugin sources: 1 declared
+  • acme — acme/agent-plugins#v1.4.0 @ 9c4e1f2a8b3d
+Plugins: 2 enabled
+  • prs — 3 skill(s), 7 agent(s), 0 MCP server(s) — /home/dev/.conductor/cache/plugins/github.com/acme/agent-plugins/9c4e1f2a8b3d/prs
+    agents: prs:code-reviewer, prs:code-simplifier, prs:comment-analyzer, ...
+  • ado — 0 skill(s), 1 agent(s), 0 MCP server(s) — /home/dev/.copilot/installed-plugins/team/ado
+    disabled by this workflow: mcp
+```
+
+Worth reading before committing. It is also how a change in what a plugin
+ships becomes visible on the next validate rather than at run time.
+`conductor plugin list <workflow>` prints the same thing on demand, per
+agent, without validating anything else.
+
+See `examples/plugins.yaml` and `examples/plugin-sources.yaml` for complete
+examples.
 
 ## External File References
 

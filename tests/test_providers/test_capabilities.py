@@ -5,9 +5,11 @@ from __future__ import annotations
 import pytest
 
 from conductor.providers.capabilities import (
+    _NOT_YET_IMPLEMENTED_PROVIDERS,
     ProviderCapabilities,
     get_capabilities,
     known_provider_names,
+    uses_native_skills,
 )
 
 
@@ -206,6 +208,10 @@ class TestResolver:
         caps = get_capabilities(provider_name)
         assert isinstance(caps, ProviderCapabilities)
 
+    def test_claude_declares_incremental_streaming(self) -> None:
+        # Requirement: Claude's capability matches its Pydantic AI event stream.
+        assert get_capabilities("claude").streaming_events is True
+
     @pytest.mark.parametrize(
         ("provider_name", "expected"),
         [
@@ -305,3 +311,68 @@ class TestSubclassEnforcement:
 
         # No exception — abstract=True bypasses the check.
         assert _Fake.CAPABILITIES is None
+
+
+class TestDeclaredSkillsSupport:
+    """``skills`` is not an allowed experimental carve-out: a provider gets it
+    natively, or via ``AgentExecutor``'s provider-agnostic eager injection.
+    ``False`` is only accurate when neither path can work.
+    """
+
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [
+            ("copilot", True),
+            ("claude", True),
+            ("claude-agent-sdk", True),
+            # Issue #350: hermes previously omitted ``skills``, defaulting to
+            # False, so the validator rejected ``skills:`` on it -- while its
+            # own execute() docstring described eager injection working.
+            ("hermes", True),
+            # aca is the one honest False: skill directories are host paths
+            # the in-sandbox runner cannot read.
+            ("aca", False),
+        ],
+    )
+    def test_declared_skills_support(self, provider: str, expected: bool) -> None:
+        assert get_capabilities(provider).skills is expected
+
+    @pytest.mark.parametrize(
+        ("provider", "expected"),
+        [
+            ("copilot", True),
+            ("claude-agent-sdk", True),
+            ("claude", False),
+            ("hermes", False),
+        ],
+    )
+    def test_native_skill_mechanism_resolves_without_instantiating(
+        self, provider: str, expected: bool
+    ) -> None:
+        """``conductor validate`` reads this to decide whether the eager
+        injection budget applies, and must not construct a provider to do it."""
+        assert uses_native_skills(provider) is expected
+
+    def test_unknown_provider_is_undetermined_not_a_guess(self) -> None:
+        """``None`` makes callers skip the mechanism-specific check rather than
+        assume a branch."""
+        assert uses_native_skills("no-such-provider") is None
+
+    def test_every_implemented_provider_resolves_its_mechanism(self) -> None:
+        """A ``None`` here means ``conductor validate`` silently stops applying
+        the skill-injection budget to that provider while ``AgentExecutor``
+        keeps enforcing it — a validate/run disagreement with no other signal.
+
+        Pinned as a completeness check rather than a name list so a newly added
+        provider, or a ``supports_native_skills`` property refactored to read
+        ``self``, fails here instead of degrading quietly.
+        """
+        undetermined = [
+            name
+            for name in known_provider_names()
+            if name not in _NOT_YET_IMPLEMENTED_PROVIDERS and uses_native_skills(name) is None
+        ]
+        assert not undetermined, (
+            f"providers {undetermined} escape static skill-budget checks; "
+            "uses_native_skills must resolve without instantiating them"
+        )

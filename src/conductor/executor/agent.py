@@ -8,15 +8,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, get_args
 
-from conductor.exceptions import ValidationError
+from conductor.exceptions import ExecutionError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
+from conductor.mcp_auth import resolve_mcp_servers
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.skills import BYTES_PER_TOKEN_ESTIMATE
 from conductor.templating import is_jinja_template
+
+logger = logging.getLogger(__name__)
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -34,8 +40,96 @@ def _verbose_log_section(title: str, content: str) -> None:
 
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef
+    from collections.abc import Iterable, Mapping
+    from pathlib import Path
+
+    from conductor.config.schema import (
+        AgentDef,
+        PluginDef,
+        SkillDiscoveryConfig,
+        SkillInjectionConfig,
+    )
+    from conductor.plugins.marketplace import Marketplace
+    from conductor.plugins.registry import ResolvedPlugin
     from conductor.providers.base import AgentProvider
+    from conductor.skills import ResolvedSkill
+
+
+def _merge_skills(
+    declared: list[ResolvedSkill],
+    from_plugins: list[ResolvedSkill],
+    on_warning: Callable[[str], None] | None = None,
+) -> list[ResolvedSkill]:
+    """Combine a name-collision between explicit skills and plugin skills.
+
+    Both reach the provider through one ``skill_directories`` list, so a
+    name claimed twice has to be resolved here. Deduplication is by skill
+    **name**, not directory, because every downstream consumer is
+    name-keyed — the eager preamble emits ``<skill name="...">`` per skill
+    and both CLIs resolve by name, so two directories claiming one name
+    would silently shadow each other.
+
+    Precedence follows how much the author said, not which list a skill
+    arrived in:
+
+    * A skill **declared** in ``skills:`` beats a plugin's copy. Both were
+      written down; the more specific statement wins. This is the common
+      case — installing Conductor's plugin puts a second ``conductor``
+      skill on the machine.
+    * A **named plugin's** skill beats a **discovered** one. Discovery is
+      ambient and varies per machine; a plugin entry was typed by the
+      author. Letting a stray directory in ``~/.copilot/skills`` displace
+      a component of a plugin someone asked for by name would invert the
+      whole resolution-versus-discovery distinction this feature rests on.
+
+    Only these collisions reach here — two *plugins* claiming one skill
+    name is refused outright by
+    :func:`~conductor.plugins.registry.resolve_plugins`, since neither
+    entry is more authoritative than the other.
+
+    Args:
+        declared: The agent's effective skills — entries from ``skills:``
+            / ``runtime.skills`` **plus** anything ``skill_discovery``
+            turned up. ``ResolvedSkill.discovered`` distinguishes them.
+        from_plugins: Skills contributed by enabled plugins.
+        on_warning: Sink for the shadowing notice. Reported rather than
+            logged, because Conductor installs no logging handlers, so a
+            dropped skill would otherwise be invisible.
+
+    Returns:
+        One entry per skill name, explicit entries first in their original
+        order, then the plugin skills that survived.
+    """
+    merged = list(declared)
+    claimed = {skill.name: skill for skill in declared}
+    for skill in from_plugins:
+        shadowing = claimed.get(skill.name)
+        if shadowing is None:
+            claimed[skill.name] = skill
+            merged.append(skill)
+            continue
+        if shadowing.directory == skill.directory:
+            # The same directory reached twice — a plugin skill also named
+            # by path. Nothing is lost, so nothing to report.
+            continue
+        if shadowing.discovered:
+            # Ambient loses to something the author named. ``source`` on a
+            # discovered skill is the scanned root, so name it as such.
+            merged[merged.index(shadowing)] = skill
+            claimed[skill.name] = skill
+            if on_warning is not None:
+                on_warning(
+                    f"skill {skill.name!r} discovered in {shadowing.source!r} was "
+                    f"superseded by the copy from plugin {skill.source!r}, which this "
+                    f"workflow names explicitly."
+                )
+            continue
+        if on_warning is not None:
+            on_warning(
+                f"skill {skill.name!r} from plugin {skill.source!r} is shadowed by "
+                f"the declared skill {shadowing.source!r} and was not enabled."
+            )
+    return merged
 
 
 def resolve_agent_tools(
@@ -102,6 +196,12 @@ class AgentExecutor:
         workflow_tools: list[str] | None = None,
         instructions_preamble: str | None = None,
         workflow_skills: list[str] | None = None,
+        workflow_dir: Path | None = None,
+        skill_injection: SkillInjectionConfig | None = None,
+        skill_discovery: SkillDiscoveryConfig | None = None,
+        workflow_plugins: list[PluginDef] | None = None,
+        plugin_marketplaces: Mapping[str, Marketplace] | None = None,
+        declared_plugin_sources: Iterable[str] | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
@@ -114,12 +214,76 @@ class AgentExecutor:
                 ``runtime.skills``). Agents inherit this list unless they
                 set their own ``skills:`` field — ``[]`` opts out
                 explicitly, ``[name, ...]`` overrides the default.
+            workflow_dir: Directory of the workflow file, used as the base
+                for relative skill paths (consistent with ``working_dir``).
+                Falls back to the process working directory.
+            skill_injection: Size limits for eager skill-content injection
+                (from ``runtime.skill_injection``). Defaults apply when
+                omitted.
+            skill_discovery: Which categories of installed skill to pick up
+                (from ``runtime.skill_discovery``). Applies only to agents
+                that inherit the workflow-level list, so it is part of the
+                default set rather than a separate axis. Disabled when
+                omitted.
+            workflow_plugins: Workflow-level default plugins (from
+                ``runtime.plugins``). Inherited on the same tri-state as
+                ``workflow_skills``.
+            plugin_marketplaces: Marketplaces already resolved from
+                ``runtime.plugin_sources``, keyed by the name a
+                ``plugin@marketplace`` entry references. Acquisition
+                happens once at run start rather than here, so an agent
+                never blocks on a network round trip mid-run.
+            declared_plugin_sources: Every name in
+                ``runtime.plugin_sources``, whether or not it resolved,
+                so a reference to one that failed to fetch is told to
+                fetch rather than told the marketplace does not exist.
         """
         self.provider = provider
         self.workflow_tools = workflow_tools or []
         self.instructions_preamble = instructions_preamble
         self._workflow_skills: list[str] = list(workflow_skills or [])
+        self._workflow_dir = workflow_dir
+        if skill_injection is None:
+            from conductor.config.schema import SkillInjectionConfig
+
+            skill_injection = SkillInjectionConfig()
+        self._skill_injection = skill_injection
+        if skill_discovery is None:
+            from conductor.config.schema import SkillDiscoveryConfig
+
+            skill_discovery = SkillDiscoveryConfig()
+        self._skill_discovery = skill_discovery
+        # Keyed by (entries, sources, exclude): discovery globs the
+        # filesystem and resolution runs once per agent per call.
+        self._skill_cache: dict[
+            tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[ResolvedSkill]
+        ] = {}
+        self._workflow_plugins: list[PluginDef] = list(workflow_plugins or [])
+        self._plugin_marketplaces: dict[str, Marketplace] = dict(plugin_marketplaces or {})
+        self._declared_plugin_sources: frozenset[str] = frozenset(declared_plugin_sources or ())
+        # Keyed by the entries *and* the marketplace table: two agents
+        # resolving the same entry names against different tables must
+        # not share a cached answer.
+        self._plugin_cache: dict[
+            tuple[tuple[tuple[str, bool, bool, bool], ...], tuple[tuple[str, str], ...]],
+            list[ResolvedPlugin],
+        ] = {}
         self.renderer = TemplateRenderer()
+
+    def set_plugin_marketplaces(self, marketplaces: Mapping[str, Marketplace]) -> None:
+        """Replace the marketplace table plugin entries resolve against.
+
+        Exists for the engine, which builds this executor in its
+        constructor but may only resolve ``runtime.plugin_sources`` once
+        ``run()`` is awaited — acquisition shells out to ``git``, which
+        has no business happening in a constructor.
+
+        Clears the plugin cache: entries resolved against the previous
+        table would otherwise be served from it, which is the one thing
+        the table being part of the cache key exists to prevent.
+        """
+        self._plugin_marketplaces = dict(marketplaces)
+        self._plugin_cache.clear()
 
     def _render_enum_field(
         self,
@@ -248,7 +412,7 @@ class AgentExecutor:
         rendered_prompt = self.renderer.render(agent.prompt, context)
 
         # Prepend prompt prefix (workspace instructions + optional skills)
-        prefix = self._build_prompt_prefix(agent)
+        prefix = self._build_prompt_prefix(agent, event_callback)
         if prefix:
             rendered_prompt = prefix + rendered_prompt
 
@@ -291,17 +455,58 @@ class AgentExecutor:
         if resolved_tools:
             _verbose_log(f"  Tools: {resolved_tools}")
 
-        # Resolve skill directories for providers with native skill support
-        # (Copilot passes these on session_kwargs; Claude has already had
-        # the skill content eager-injected into rendered_prompt above and
-        # ignores this).
-        skill_dirs: list[str] | None = None
-        if getattr(self.provider, "supports_native_skills", False):
-            skill_names = self._resolve_skills_for_agent(agent)
-            if skill_names:
-                from conductor.skills import resolve_skill_directories
+        # Resolve the agent's effective plugins. Each is deconstructed:
+        # its skills join the same ``skill_directories`` channel that
+        # ``skills:`` entries use, its subagents and MCP servers travel
+        # their own kwargs. Resolved before skills so a plugin skill and a
+        # declared skill can be checked against each other.
+        plugins = self._resolve_plugins_for_agent(agent)
+        plugin_skills = [skill for plugin in plugins for skill in plugin.skills]
+        custom_agents: list[dict[str, Any]] | None = None
+        extra_mcp_servers: dict[str, Any] | None = None
+        if plugins:
+            agent_specs = [
+                spec.to_custom_agent_config() for plugin in plugins for spec in plugin.agents
+            ]
+            custom_agents = agent_specs or None
+            servers = {
+                name: config for plugin in plugins for name, config in plugin.mcp_servers.items()
+            }
+            # Plugin servers get the same treatment workflow-declared ones do:
+            # ``${VAR}`` expanded, OAuth discovered. Skipping it handed the SDK
+            # a literal placeholder or an unauthenticated URL, so the server
+            # attached and then did not work — silently.
+            extra_mcp_servers = await resolve_mcp_servers(servers) if servers else None
 
-                skill_dirs = [str(p) for p in resolve_skill_directories(skill_names)]
+        # Resolve skill directories for providers with native skill support
+        # (Copilot passes these on session_kwargs, claude-agent-sdk maps them
+        # to plugin + skill-name options; providers without native support
+        # have already had the skill content eager-injected into
+        # rendered_prompt above and ignore this).
+        skill_dirs: list[str] | None = None
+        effective_skills: list[ResolvedSkill] = []
+        if getattr(self.provider, "supports_native_skills", False):
+            effective_skills = self._merge_skills_and_plugin_skills(agent, plugin_skills)
+            if effective_skills:
+                skill_dirs = [str(item.directory) for item in effective_skills]
+                _verbose_log(f"  Skills: {[item.name for item in effective_skills]}")
+
+        if plugins:
+            # Counted from what is actually being forwarded, not from what the
+            # plugins ship. This line is what a user checks to confirm a plugin
+            # loaded, so a count that overstates delivery is worse than none —
+            # hence by directory: a plugin skill shadowed by a declared one of
+            # the same name keeps the name in ``effective_skills`` but is not
+            # itself forwarded.
+            forwarded = {item.directory for item in effective_skills} & {
+                item.directory for item in plugin_skills
+            }
+            _verbose_log(
+                f"  Plugins: {len(plugins)} enabled — "
+                f"{len(forwarded)} skill(s), "
+                f"{len(custom_agents or [])} agent(s), "
+                f"{len(extra_mcp_servers or {})} MCP server(s) forwarded"
+            )
 
         # Execute via provider
         output = await self.provider.execute(
@@ -312,6 +517,8 @@ class AgentExecutor:
             interrupt_signal=interrupt_signal,
             event_callback=event_callback,
             skill_directories=skill_dirs,
+            custom_agents=custom_agents,
+            extra_mcp_servers=extra_mcp_servers,
         )
 
         # Ensure output.content is a dict
@@ -335,7 +542,7 @@ class AgentExecutor:
 
         # Validate output against schema (skip for partial output from interrupts)
         if agent.output and not output.partial:
-            validate_output(output.content, agent.output)
+            validate_output(output.content, agent.output, warn_undeclared_keys=True)
 
         return output
 
@@ -343,6 +550,12 @@ class AgentExecutor:
         """Render an agent's prompt template including workspace instructions.
 
         This is useful for debugging or dry-run mode.
+
+        No ``event_callback``: the only caller is the ``validator:`` block's
+        re-render of the primary prompt, and the agent's own ``execute`` has
+        already emitted any ``skill_injection_warning`` for the same content.
+        The warning still reaches the log from here; only the duplicate event
+        is suppressed.
 
         Args:
             agent: Agent definition from workflow config.
@@ -354,6 +567,11 @@ class AgentExecutor:
 
         Raises:
             TemplateError: If prompt rendering fails.
+            SkillNotFoundError: If an enabled skill entry cannot be resolved.
+            SkillManifestError: If a resolved skill's ``SKILL.md`` is missing,
+                unparseable, or incomplete.
+            ExecutionError: If the provider does not support skills, or the
+                eagerly injected content exceeds ``runtime.skill_injection``.
         """
         rendered = self.renderer.render(agent.prompt, context)
         prefix = self._build_prompt_prefix(agent)
@@ -361,27 +579,420 @@ class AgentExecutor:
             rendered = prefix + rendered
         return rendered
 
-    def _resolve_skills_for_agent(self, agent: AgentDef) -> list[str]:
-        """Resolve the effective skill list for an agent.
+    def _resolve_skills_for_agent(self, agent: AgentDef) -> list[ResolvedSkill]:
+        """Resolve the effective, on-disk skills for an agent.
 
         Resolution order:
         - If the agent explicitly sets ``skills`` (including ``[]``),
-          that value wins.
-        - Otherwise, inherit the workflow-level default
-          (``runtime.skills``).
+          that value wins and discovery does not apply. An agent that
+          names its skills has said which ones it wants.
+        - Otherwise it inherits the workflow-level default
+          (``runtime.skills``) *plus* anything ``runtime.skill_discovery``
+          turns up. Discovery joins the default set rather than forming a
+          second axis, so ``skills: []`` remains the one opt-out.
+
+        Note the inherited case can produce skills from an *empty*
+        ``runtime.skills``: discovery alone is enough to enable them.
 
         Returns an empty list when no skills are enabled, or when the
         agent is not a provider-backed type (script / wait / set /
         terminate / human_gate / workflow — schema rejects ``skills``
         on these so this is defensive only).
+
+        The ``capabilities.skills`` check lives here rather than in
+        :meth:`_build_prompt_prefix` so it covers **both** delivery paths.
+        Native providers never reach the eager-injection branch, so a
+        provider that declared ``skills=False`` while supporting native
+        loading would otherwise skip the check entirely.
+
+        Raises:
+            ExecutionError: If skills are enabled for an agent whose
+                provider declares ``capabilities.skills=False``, or if
+                discovery is enabled for a provider with no native skill
+                surface.
+            SkillNotFoundError: If an explicit entry cannot be resolved.
+            SkillManifestError: If an explicit entry's ``SKILL.md`` is
+                missing, unparseable, or incomplete.
         """
         if agent.type not in (None, "agent"):
             return []
-        if agent.skills is not None:
-            return list(agent.skills)
-        return list(self._workflow_skills)
+        overridden = agent.skills is not None
+        # Repeat the ``is not None`` rather than reusing ``overridden``: the
+        # type checker does not narrow through an intermediate boolean.
+        entries = list(agent.skills) if agent.skills is not None else list(self._workflow_skills)
+        discovery = (
+            self._skill_discovery if not overridden and self._skill_discovery.is_enabled else None
+        )
+        if not entries and discovery is None:
+            return []
+        self._reject_unsupported_skills(agent, entries, discovery is not None)
+        if discovery is not None:
+            self._reject_discovery_without_native_skills(agent, discovery)
+        return self._resolve_skills(entries, discovery)
 
-    def _build_prompt_prefix(self, agent: AgentDef) -> str:
+    def _merge_skills_and_plugin_skills(
+        self, agent: AgentDef, plugin_skills: list[ResolvedSkill]
+    ) -> list[ResolvedSkill]:
+        """The agent's declared skills plus the ones its plugins ship.
+
+        Both reach the provider through one ``skill_directories`` list,
+        so the two sets are combined here — see :func:`_merge_skills` for
+        how a name claimed by both is resolved.
+        """
+        return _merge_skills(
+            self._resolve_skills_for_agent(agent),
+            plugin_skills,
+            on_warning=lambda message: _verbose_log(f"  Plugins: {message}", style="yellow"),
+        )
+
+    def _resolve_plugins_for_agent(self, agent: AgentDef) -> list[ResolvedPlugin]:
+        """Resolve the effective, on-disk plugins for an agent.
+
+        Tri-state resolution mirrors :meth:`_resolve_skills_for_agent`:
+        an agent that sets ``plugins`` (including ``[]``) overrides the
+        workflow default, otherwise it inherits ``runtime.plugins``.
+        Discovery has no plugin equivalent by design — a plugin can
+        launch MCP subprocesses with the user's credentials, so it is
+        loaded only because a workflow named it.
+
+        Returns an empty list when no plugins are enabled, or when the
+        agent is not a provider-backed type (the schema rejects
+        ``plugins`` on those, so that arm is defensive only).
+
+        Raises:
+            ExecutionError: If plugins are enabled for an agent whose
+                provider cannot load them. Checked here as well as in
+                :func:`conductor.config.validator.validate_workflow_config`
+                because ``conductor run`` never invokes the static
+                validator — the same reason
+                :meth:`_reject_unsupported_skills` exists.
+            PluginError: If an entry cannot be resolved, or a resolved
+                plugin is unusable.
+        """
+        if agent.type not in (None, "agent"):
+            return []
+        entries = list(agent.plugins) if agent.plugins is not None else list(self._workflow_plugins)
+        if not entries:
+            return []
+        self._reject_unsupported_plugins(agent, entries)
+        self._reject_unfilterable_agents(agent, entries)
+        resolved = self._resolve_plugins(entries)
+        # Reported here rather than inside the memoized resolve, so a second
+        # agent naming the same plugin is told about its dropped components too.
+        self._report_dropped(resolved)
+        return resolved
+
+    def _reject_unfilterable_agents(self, agent: AgentDef, entries: list[PluginDef]) -> None:
+        """Refuse ``agents: false`` where the provider cannot honour it.
+
+        On a provider whose only skill surface is registering the plugin
+        root, that registration also contributes every subagent the
+        plugin ships. Running anyway would grant *more* than the workflow
+        declared, which is worse than the silent drop this feature
+        removes — so it is refused, matching the same check in
+        :func:`conductor.config.validator.validate_workflow_config`.
+
+        Duplicated here for the reason
+        :meth:`_reject_unsupported_plugins` is: ``conductor run`` never
+        invokes the static validator.
+
+        Raises:
+            ExecutionError: If a plugin disables agents while enabling
+                skills on such a provider.
+        """
+        if not self.provider.skills_require_plugin_root:
+            return
+        for entry in entries:
+            if entry.skills and not entry.agents:
+                raise ExecutionError(
+                    f"Agent '{agent.name}': plugin {entry.name!r} sets 'agents: false' "
+                    f"with skills enabled, which provider "
+                    f"'{type(self.provider).__name__}' cannot honour — its only skill "
+                    f"surface is registering the plugin root, which also contributes "
+                    f"every subagent the plugin ships.",
+                    agent_name=agent.name,
+                    suggestion=(
+                        "Set 'skills: false' as well, drop 'agents: false', or run "
+                        "this agent on 'copilot', which registers each component "
+                        "individually."
+                    ),
+                )
+
+    def _reject_unsupported_plugins(self, agent: AgentDef, entries: list[PluginDef]) -> None:
+        """Refuse plugins on a provider that cannot load them.
+
+        Unlike skills, there is no provider-agnostic fallback: the
+        executor can inject a skill's text into a prompt, but it cannot
+        produce a subagent the model can dispatch to or an MCP server it
+        can call. Loading only the skills would be the partial load this
+        feature exists to remove, so the combination is refused.
+
+        Raises:
+            ExecutionError: If the provider declares
+                ``capabilities.plugins=False``, does not declare
+                capabilities at all, or declares plugin support it cannot
+                deliver.
+        """
+        provider = type(self.provider).__name__
+        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        supported = getattr(capabilities, "plugins", False) if capabilities is not None else False
+        if not supported:
+            named = ", ".join(repr(entry.name) for entry in entries)
+            # Fails *closed*, unlike the skills equivalent: a provider with
+            # no capability declaration cannot be assumed to honour three
+            # kwargs, and skills have an eager-injection fallback where
+            # plugins have none.
+            raise ExecutionError(
+                f"Agent '{agent.name}': provider '{provider}' cannot load plugins, but "
+                f"plugins are enabled ({named}). A plugin's subagents and MCP servers "
+                f"have no equivalent on this provider, so it would run with only part "
+                f"of what the plugin ships.",
+                agent_name=agent.name,
+                suggestion=(
+                    "Reference the plugin's skills directly with 'skills:' (by path), "
+                    "or run this agent on a provider that loads plugins (copilot, "
+                    "claude-agent-sdk)."
+                ),
+            )
+
+        # A provider may only declare plugin support if it can carry every
+        # component. Without this the skills half is dropped on the floor by
+        # the ``supports_native_skills`` gate below while agents and MCP are
+        # still forwarded, and the run reports success.
+        if not self.provider.supports_native_skills:
+            raise ExecutionError(
+                f"Agent '{agent.name}': provider '{provider}' declares "
+                f"capabilities.plugins=True but has no native skill surface, so the "
+                f"skills its plugins ship cannot be registered.",
+                agent_name=agent.name,
+                suggestion=(
+                    "This is a provider declaration bug — a provider may only declare "
+                    "plugins=True if it honours skill_directories, custom_agents and "
+                    "extra_mcp_servers."
+                ),
+            )
+
+    def _resolve_plugins(self, entries: list[PluginDef]) -> list[ResolvedPlugin]:
+        """Resolve plugin entries against the workflow file's directory.
+
+        Memoized per entry list, because resolving a plugin walks its
+        ``skills/`` tree and parses every ``*.agent.md`` it ships, and
+        this runs once per agent per call.
+
+        Each marketplace's *name and root* are part of the key, not just
+        its name: two tables can register one name from different
+        checkouts, and keying on names alone would serve one table's
+        answer to the other.
+        """
+        from conductor.plugins.registry import resolve_plugins
+
+        key = (
+            tuple((e.name, e.skills, e.agents, e.mcp) for e in entries),
+            tuple(sorted((name, str(m.root)) for name, m in self._plugin_marketplaces.items())),
+        )
+        cached = self._plugin_cache.get(key)
+        if cached is not None:
+            return list(cached)
+
+        resolved = resolve_plugins(
+            entries,
+            base_dir=self._workflow_dir,
+            marketplaces=self._plugin_marketplaces,
+            declared_sources=self._declared_plugin_sources,
+            on_warning=lambda message: _verbose_log(f"  Plugins: {message}", style="yellow"),
+        )
+        self._plugin_cache[key] = list(resolved)
+        return resolved
+
+    def _report_dropped(self, plugins: list[ResolvedPlugin]) -> None:
+        """Warn about components a plugin ships that Conductor does not load."""
+        from conductor.plugins.registry import describe_dropped_components
+
+        for plugin in plugins:
+            message = describe_dropped_components(
+                plugin,
+                root_is_registered=bool(plugin.skills) and self.provider.skills_require_plugin_root,
+            )
+            if message is not None:
+                _verbose_log(f"  Plugins: {message}", style="yellow")
+
+    def _reject_discovery_without_native_skills(
+        self, agent: AgentDef, discovery: SkillDiscoveryConfig
+    ) -> None:
+        """Refuse discovery on a provider that eagerly injects skill bodies.
+
+        Mirrors the same check in
+        :func:`conductor.config.validator.validate_workflow_config`.
+        ``conductor validate`` rejects the combination, but ``conductor
+        run`` never invokes the static validator — so without this the
+        refusal holds in one command while the other quietly injects the
+        whole ambient set into every prompt. ``runtime.skill_injection``
+        is not a backstop: it only fires above ``max_bytes``, so a set
+        under the limit passes silently and a set over it reports a budget
+        problem rather than the real one.
+
+        Raises:
+            ExecutionError: If discovery is enabled for this agent and the
+                provider has no native skill surface.
+        """
+        if getattr(self.provider, "supports_native_skills", False):
+            return
+        raise ExecutionError(
+            f"Agent '{agent.name}': provider '{type(self.provider).__name__}' has no "
+            f"native skill surface, but 'runtime.skill_discovery' is enabled "
+            f"(sources={list(discovery.sources)!r}). Discovered skills would be injected "
+            f"in full into every prompt, and the discovered set varies by machine, so "
+            f"its size cannot be bounded.",
+            agent_name=agent.name,
+            suggestion=(
+                "Name the skills you want in 'runtime.skills' (or this agent's "
+                "'skills:'), or run this agent on a provider with progressive "
+                "disclosure (copilot, claude-agent-sdk)."
+            ),
+        )
+
+    def _resolve_skills(
+        self, entries: list[str], discovery: SkillDiscoveryConfig | None
+    ) -> list[ResolvedSkill]:
+        """Resolve entries and discovery against the workflow file's directory.
+
+        Both delivery paths — native ``skill_directories`` and eager
+        preamble injection — go through here so names, paths,
+        ``skills/`` roots and discovered skills behave identically
+        regardless of provider.
+
+        The result is memoized per ``(entries, discovery)`` because
+        discovery globs the filesystem and this runs once per agent.
+        """
+        from conductor.skills import resolve_effective_skills
+
+        sources = tuple(discovery.sources) if discovery else ()
+        exclude = tuple(discovery.exclude) if discovery else ()
+        key = (tuple(entries), sources, exclude)
+        cached = self._skill_cache.get(key)
+        if cached is not None:
+            return list(cached)
+
+        resolved = resolve_effective_skills(
+            entries,
+            sources=sources,
+            exclude=exclude,
+            base_dir=self._workflow_dir,
+            on_warning=lambda message: _verbose_log(f"  Skills: {message}", style="yellow"),
+        )
+        if sources:
+            _verbose_log(
+                f"  Skills: discovery enabled ({', '.join(sources)}) — "
+                f"{len(resolved)} skill(s) in effect: "
+                f"{', '.join(item.name for item in resolved) or '(none)'}",
+                style="dim",
+            )
+        self._skill_cache[key] = list(resolved)
+        return resolved
+
+    def _enforce_injection_budget(
+        self,
+        agent: AgentDef,
+        resolved: list[ResolvedSkill],
+        content: str,
+        event_callback: EventCallback | None = None,
+    ) -> None:
+        """Apply ``runtime.skill_injection`` limits to eager skill content.
+
+        Measured against the exact string being prepended, so the number
+        reported is the number actually paid — on every call to this
+        agent and on every retry. (A ``validator:`` block's own grading
+        call bypasses prompt rendering and embeds only a truncated
+        excerpt, so it does not re-pay this.)
+
+        Args:
+            agent: The agent the content is being injected for.
+            resolved: The skills that produced the content, used to give
+                a per-skill breakdown when a limit is hit.
+            content: The rendered skill preamble.
+            event_callback: Optional sink for ``skill_injection_warning``
+                when the content exceeds ``warn_bytes``. The warning is
+                also logged, but Conductor installs no logging handlers,
+                so this is the channel that actually reaches the user.
+
+        Raises:
+            ExecutionError: If the content exceeds ``max_bytes``.
+        """
+        limits = self._skill_injection
+        size = len(content.encode("utf-8"))
+        approx_tokens = size // BYTES_PER_TOKEN_ESTIMATE
+        provider = type(self.provider).__name__
+        if limits.max_bytes is not None and size > limits.max_bytes:
+            raise ExecutionError(
+                f"Agent '{agent.name}': eagerly injected skill content is "
+                f"{size:,} bytes (~{approx_tokens:,} tokens), over the "
+                f"runtime.skill_injection.max_bytes limit of {limits.max_bytes:,}. "
+                f"Provider '{provider}' has no native skill surface, so "
+                f"this is prepended to every call and every retry.\n"
+                f"{self._skill_size_breakdown(resolved)}",
+                agent_name=agent.name,
+                suggestion=(
+                    "Enable fewer skills on this agent, trim the skills' "
+                    "references/ trees, run it on a provider with progressive "
+                    "disclosure (copilot, claude-agent-sdk), or raise "
+                    "runtime.skill_injection.max_bytes."
+                ),
+            )
+        if limits.warn_bytes is not None and size > limits.warn_bytes:
+            breakdown = self._skill_size_breakdown(resolved)
+            logger.warning(
+                "Agent %r: eagerly injecting %s bytes (~%s tokens) of skill content "
+                "on every call — provider %r has no progressive disclosure. %s",
+                agent.name,
+                f"{size:,}",
+                f"{approx_tokens:,}",
+                provider,
+                breakdown,
+            )
+            # The log alone reaches nobody: Conductor installs no logging
+            # handlers, so this surfaces via logging.lastResort as an
+            # unattributed line on stderr, interleaved with console output and
+            # absent from the JSONL log and the dashboard. Since the defaults
+            # trip this for the bundled skill on every eager-provider call, it
+            # has to travel the event channel too — same both-halves pattern as
+            # ``checkpoint_save_failed`` in engine/workflow.py.
+            if event_callback is not None:
+                event_callback(
+                    "skill_injection_warning",
+                    {
+                        "agent_name": agent.name,
+                        "bytes": size,
+                        "approx_tokens": approx_tokens,
+                        "warn_bytes": limits.warn_bytes,
+                        "provider": provider,
+                        "breakdown": breakdown,
+                    },
+                )
+
+    @staticmethod
+    def _skill_size_breakdown(resolved: list[ResolvedSkill]) -> str:
+        """Summarise each skill's on-disk injected size, largest first.
+
+        Sizes are raw file bytes, so they total slightly below the measured
+        rendered size, which also carries the ``<skills>`` envelope and one
+        ``<skill>`` tag per entry.
+        """
+        sizes: list[tuple[str, int]] = []
+        for item in resolved:
+            total = 0
+            for path in (
+                item.directory / "SKILL.md",
+                *sorted((item.directory / "references").glob("*.md")),
+            ):
+                with contextlib.suppress(OSError):
+                    total += path.stat().st_size
+            sizes.append((item.name, total))
+        sizes.sort(key=lambda pair: pair[1], reverse=True)
+        return "Per skill: " + ", ".join(f"{name} {size:,}B" for name, size in sizes)
+
+    def _build_prompt_prefix(
+        self, agent: AgentDef, event_callback: EventCallback | None = None
+    ) -> str:
         """Build the prefix to prepend before an agent's rendered prompt.
 
         Combines workspace instructions and (on providers that lack
@@ -394,17 +1005,74 @@ class AgentExecutor:
         (:attr:`AgentProvider.supports_native_skills`), the skill
         directories are passed to the SDK on the provider side and we
         skip preamble injection to avoid double-loading.
+
+        Raises:
+            ExecutionError: If the injected content exceeds
+                ``runtime.skill_injection``, or (via
+                :meth:`_resolve_skills_for_agent`) if the provider
+                declares it does not support skills.
         """
         parts: list[str] = []
         if self.instructions_preamble:
             parts.append(self.instructions_preamble)
         if not getattr(self.provider, "supports_native_skills", False):
-            skill_names = self._resolve_skills_for_agent(agent)
-            if skill_names:
-                from conductor.skills import load_skill_content, resolve_skill_directories
+            resolved = self._resolve_skills_for_agent(agent)
+            if resolved:
+                from conductor.skills import load_skill_content
 
-                dirs = resolve_skill_directories(skill_names)
-                content = load_skill_content(list(zip(skill_names, dirs, strict=True)))
+                content = load_skill_content([(item.name, item.directory) for item in resolved])
                 if content:
+                    self._enforce_injection_budget(agent, resolved, content, event_callback)
                     parts.append(content)
         return "".join(parts)
+
+    def _reject_unsupported_skills(
+        self, agent: AgentDef, skill_entries: list[str], discovery_on: bool = False
+    ) -> None:
+        """Refuse skills on a provider that declares it does not support them.
+
+        Mirrors the ``capabilities.skills`` check in
+        :func:`conductor.config.validator.validate_workflow_config`.
+        ``conductor validate`` already rejects the combination, but
+        ``conductor run`` never invokes the static validator — so without
+        this the declaration holds in one command and is silently
+        contradicted in the other.
+
+        A provider with no ``CAPABILITIES`` is left alone. That set is
+        exactly the abstract ones: ``AgentProvider.__init_subclass__``
+        raises at import time unless a subclass either declares
+        ``CAPABILITIES`` or opts out with ``abstract=True``, so a real
+        provider cannot reach this branch by forgetting to declare one.
+
+        Args:
+            agent: The agent whose skills are enabled.
+            skill_entries: The declared entries, which may be empty when
+                discovery alone enabled skills.
+            discovery_on: Whether discovery contributed. Changes the
+                message, because reporting ``skills=[]`` would name the
+                documented *opt-out* syntax as the cause and suggest a
+                remedy that is already in effect.
+
+        Raises:
+            ExecutionError: If the provider declares
+                ``capabilities.skills=False``.
+        """
+        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        if capabilities is None or capabilities.skills:
+            return
+        if skill_entries:
+            cause = f"declares skills={skill_entries!r}"
+            remedy = "Remove the skills, opt out with 'skills: []', or override the "
+        else:
+            cause = "has skills enabled via 'runtime.skill_discovery'"
+            remedy = "Disable runtime.skill_discovery, or override the "
+        raise ExecutionError(
+            f"Agent '{agent.name}' {cause} but provider "
+            f"'{type(self.provider).__name__}' does not support skills "
+            f"(capabilities.skills=False).",
+            agent_name=agent.name,
+            suggestion=(
+                f"{remedy}agent to a skill-aware provider. 'conductor validate' "
+                "reports this before a run starts."
+            ),
+        )

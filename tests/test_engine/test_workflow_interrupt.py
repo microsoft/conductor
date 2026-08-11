@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -695,6 +696,34 @@ class TestCheckInterruptMethod:
         )
         assert preview is None
 
+    @pytest.mark.asyncio
+    async def test_output_preview_serializes_non_ascii_unescaped(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        # Requirement: the interrupt preview shown to the user must render
+        # non-ASCII agent output as real text, not \uXXXX escapes (issue #356,
+        # PR #359 review).
+        event = asyncio.Event()
+        event.set()
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(two_agent_config, provider, interrupt_event=event)
+
+        engine.context.store("planner", {"plan": "план 你好"})
+
+        cancel_result = InterruptResult(action=InterruptAction.CANCEL)
+        with patch.object(
+            engine._interrupt_handler,
+            "handle_interrupt",
+            return_value=cancel_result,
+        ) as mock_handle:
+            await engine._check_interrupt("executor")
+
+        call_kwargs = mock_handle.call_args
+        preview = call_kwargs[1].get("last_output_preview") or call_kwargs[0][2]
+        assert "план 你好" in preview
+        assert "\\u4f60" not in preview
+        assert "\\u043f" not in preview
+
 
 class TestGetTopLevelAgentNames:
     """Tests for _get_top_level_agent_names helper."""
@@ -958,6 +987,8 @@ class TestPartialOutputHandling:
                 interrupt_signal: asyncio.Event | None = None,
                 event_callback=None,
                 skill_directories: list[str] | None = None,
+                custom_agents: list[dict[str, Any]] | None = None,
+                extra_mcp_servers: dict[str, Any] | None = None,
             ) -> AgentOutput:
                 return AgentOutput(content={"result": "mock"}, raw_response="mock")
 

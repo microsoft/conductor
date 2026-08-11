@@ -65,14 +65,37 @@ def build_json_schema_field(
 
     schema: dict[str, Any] = {"type": field.type}
 
+    if field.nullable:
+        schema["type"] = [field.type, "null"]
+
     if field.description:
         schema["description"] = field.description
+
+    if field.enum is not None:
+        # YAML `enum` cannot contain null (schema.py rejects it); append None
+        # here so the generated schema is honest when type is ["string", "null"].
+        schema["enum"] = [*field.enum, None] if field.nullable else field.enum
+
+    if field.type == "string":
+        if field.pattern is not None:
+            schema["pattern"] = field.pattern
+        if field.minLength is not None:
+            schema["minLength"] = field.minLength
+        if field.maxLength is not None:
+            schema["maxLength"] = field.maxLength
+    elif field.type == "number":
+        if field.minimum is not None:
+            schema["minimum"] = field.minimum
+        if field.maximum is not None:
+            schema["maximum"] = field.maximum
 
     if field.type == "object" and field.properties:
         schema["properties"] = build_json_schema_properties(
             field.properties, depth=depth + 1, max_depth=max_depth
         )
-        schema["required"] = list(field.properties.keys())
+        required = [name for name, prop in field.properties.items() if prop.required]
+        if required:
+            schema["required"] = required
 
     if field.type == "array" and field.items:
         schema["items"] = build_json_schema_field(field.items, depth=depth + 1, max_depth=max_depth)
@@ -129,14 +152,40 @@ def build_prompt_schema_field(
     _check_depth(depth, max_depth)
 
     schema: dict[str, Any] = {"type": field.type}
-    if field.description:
-        schema["description"] = field.description
+    if field.nullable:
+        schema["type"] = [field.type, "null"]
+
+    description = field.description
+    if description and field.required is False:
+        description += " (optional)"
+    if description:
+        schema["description"] = description
+
+    if field.enum is not None:
+        # YAML `enum` cannot contain null (schema.py rejects it); append None
+        # here so the generated schema is honest when type is ["string", "null"].
+        schema["enum"] = [*field.enum, None] if field.nullable else field.enum
+
+    if field.type == "string":
+        if field.pattern is not None:
+            schema["pattern"] = field.pattern
+        if field.minLength is not None:
+            schema["minLength"] = field.minLength
+        if field.maxLength is not None:
+            schema["maxLength"] = field.maxLength
+    elif field.type == "number":
+        if field.minimum is not None:
+            schema["minimum"] = field.minimum
+        if field.maximum is not None:
+            schema["maximum"] = field.maximum
 
     if field.type == "object" and field.properties:
         schema["properties"] = build_prompt_schema_properties(
             field.properties, depth=depth + 1, max_depth=max_depth
         )
-        schema["required"] = list(field.properties.keys())
+        required = [name for name, prop in field.properties.items() if prop.required]
+        if required:
+            schema["required"] = required
 
     if field.type == "array" and field.items:
         schema["items"] = build_prompt_schema_field(

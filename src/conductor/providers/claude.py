@@ -19,34 +19,17 @@ This distinction ensures clear error classification and appropriate retry behavi
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
 import os
-import random
-import re
-import time
-from typing import Any, Literal, NamedTuple, Protocol, get_args
+from typing import Any, get_args
 
 from pydantic import BaseModel
 
 from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.executor.output import validate_output
 from conductor.mcp.manager import (
-    FS_HINT,
-    GENERIC_HINT,
-    TAIL_WINDOW,
-    TRUNCATION_MARKER_PREFIX,
     MCPManager,
 )
-from conductor.providers._event_format import (
-    emit_parse_recovery_event,
-    extract_tool_result_text,
-    format_tool_arguments,
-)
-from conductor.providers._output_shape import normalize_agent_output
-from conductor.providers._schema import SchemaDepthError, build_json_schema_properties
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -56,12 +39,9 @@ from conductor.providers.base import (
 )
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import (
-    CLAUDE_ANSWER_HEADROOM_TOKENS,
-    CLAUDE_EXTENDED_THINKING_OUTPUT_CAP,
     ReasoningEffort,
     effort_to_budget_tokens,
     is_claude_thinking_model,
-    resolve_reasoning_effort,
 )
 
 # Try to import the Anthropic SDK
@@ -77,61 +57,6 @@ except ImportError:
     AnthropicError = Exception  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
-
-StructuredOutcome = Literal["success", "mcp_tools", "schema_error", "parse_error"]
-"""How a response scored against the declared output schema.
-
-``mcp_tools`` is not a final answer: the agentic loop still has tools to run,
-so that response is deliberately not validated.
-"""
-
-
-class _StructuredEvaluation(NamedTuple):
-    """Verdict on one structured-output attempt, plus what recovery needs next.
-
-    The failure fields are populated together with the outcome so the recovery
-    loop never has to re-derive them, and are left at their defaults for the
-    two success outcomes, which end the loop.
-
-    Attributes:
-        outcome: How the response scored.
-        replay_text: Text to replay as the assistant turn on the next attempt.
-        failure_reason: Human-readable diagnosis, logged and sent to the model.
-        schema_error: The validation error, set only for ``schema_error``. It
-            names the offending field and type, so it is re-raised verbatim
-            once the recovery budget runs out.
-    """
-
-    outcome: StructuredOutcome
-    replay_text: str = ""
-    failure_reason: str = ""
-    schema_error: ValidationError | None = None
-
-    @property
-    def is_schema_failure(self) -> bool:
-        """True when the response parsed cleanly but violated the schema."""
-        return self.outcome == "schema_error"
-
-
-# Protocol for Claude API response structure (improves type safety)
-class ClaudeContentBlock(Protocol):
-    """Protocol for Claude response content blocks."""
-
-    type: str
-    text: str  # for text blocks
-    id: str  # for tool_use blocks
-    name: str  # for tool_use blocks
-    input: dict[str, Any]  # for tool_use blocks
-    thinking: str  # for thinking blocks
-    signature: str  # for thinking blocks (optional)
-    data: str  # for redacted_thinking blocks
-
-
-class ClaudeResponse(Protocol):
-    """Protocol for Claude API response structure."""
-
-    content: list[ClaudeContentBlock]
-    usage: Any  # Usage object with input_tokens, output_tokens
 
 
 class RetryConfig(BaseModel):
@@ -165,8 +90,8 @@ class ClaudeProvider(AgentProvider):
     normalizes responses into AgentOutput format. Uses tool-based
     structured output extraction for reliable JSON responses.
 
-    Supports non-streaming message execution with error handling,
-    retry logic, and temperature validation.
+    Supports incremental event streaming with error handling, retry logic,
+    and temperature validation.
 
     Example:
         >>> provider = ClaudeProvider(api_key="sk-...")
@@ -182,9 +107,7 @@ class ClaudeProvider(AgentProvider):
         mcp_tools=True,
         # Per-agent ``tools:`` allowlists are forwarded to the SDK.
         workflow_tools_passthrough=True,
-        # The Claude provider buffers the API response before emitting any
-        # events. Flip to True if/when a streaming codepath is wired up.
-        streaming_events=False,
+        streaming_events=True,
         # ``agent_reasoning`` events fire for extended-thinking content
         # when the model returns it.
         agent_reasoning_events=True,
@@ -195,10 +118,10 @@ class ClaudeProvider(AgentProvider):
         # Tool-based structured output: schema is enforced via a forced
         # tool call rather than prompt injection.
         structured_output="native",
-        # ``interrupt_signal`` is monitored between agentic iterations and
-        # triggers ``_request_partial_output``.
+        # ``interrupt_signal`` is monitored by the Pydantic AI interrupt helper
+        # and triggers a partial output request.
         interrupt=True,
-        # ``max_session_seconds`` is enforced at each agentic-loop iteration.
+        # ``max_session_seconds`` is enforced by the Pydantic AI interrupt helper.
         max_session_seconds=True,
         # Anthropic's API is stateless per-request — no session state to
         # persist across ``conductor resume``.
@@ -215,6 +138,11 @@ class ClaudeProvider(AgentProvider):
         # AgentExecutor (Claude's Messages API has no server-side skill
         # surface without adopting the container/code-execution beta).
         skills=True,
+        # No plugin support: eager injection can carry a skill's text
+        # into the prompt but cannot produce a subagent the model can
+        # dispatch to, and a plugin that loaded only its skills would be
+        # exactly the partial load ``plugins:`` exists to prevent.
+        plugins=False,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
@@ -346,6 +274,19 @@ class ClaudeProvider(AgentProvider):
             client_kwargs["auth_token"] = self._auth_token
         if self._base_url is not None:
             client_kwargs["base_url"] = self._base_url
+        both_passed = "api_key" in client_kwargs and "auth_token" in client_kwargs
+        both_from_env = (
+            self._api_key is None
+            and self._auth_token is None
+            and bool(os.environ.get("ANTHROPIC_API_KEY"))
+            and bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+        )
+        if both_passed or both_from_env:
+            logger.warning(
+                "Both api_key and auth_token are set; the Anthropic SDK sends both "
+                "X-Api-Key and Authorization: Bearer headers on every request, so "
+                "the api_key reaches whatever base_url points at. Set exactly one."
+            )
         self._client = AsyncAnthropic(**client_kwargs)
 
         # Log SDK version
@@ -406,41 +347,6 @@ class ClaudeProvider(AgentProvider):
                 f"max_tokens must be between 1 and 200000 (schema validation), got {max_tokens}",
                 suggestion="Adjust max_tokens to be within the valid range",
             )
-
-    def _resolve_thinking_for_agent(self, agent: AgentDef, model: str) -> dict[str, Any] | None:
-        """Resolve effective extended-thinking kwargs for an agent.
-
-        Combines the per-agent ``reasoning`` config with the workflow-wide
-        ``default_reasoning_effort`` and validates that the chosen model
-        supports Anthropic extended thinking.
-
-        Args:
-            agent: Agent definition (may declare ``reasoning.effort``).
-            model: Resolved model id for this execution.
-
-        Returns:
-            ``{"type": "enabled", "budget_tokens": N}`` when reasoning is
-            requested, or ``None`` when neither agent nor runtime default
-            sets it.
-
-        Raises:
-            ValidationError: If reasoning effort is requested for a model
-                that does not support extended thinking.
-        """
-        effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
-        if effort is None:
-            return None
-        if not is_claude_thinking_model(model):
-            raise ValidationError(
-                f"Model {model!r} does not support extended thinking, but "
-                f"reasoning.effort={effort!r} was requested for agent "
-                f"{agent.name!r}.",
-                suggestion=(
-                    "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
-                    "claude-sonnet-4-20250514) or remove the reasoning config."
-                ),
-            )
-        return {"type": "enabled", "budget_tokens": effort_to_budget_tokens(effort)}
 
     def get_retry_history(self) -> list[dict[str, Any]]:
         """Get the retry history for debugging purposes.
@@ -715,43 +621,6 @@ class ClaudeProvider(AgentProvider):
                 )
             return manager
 
-    def _convert_mcp_tools_to_claude(
-        self,
-        tool_filter: list[str] | None = None,
-        manager: MCPManager | None = None,
-    ) -> list[dict[str, Any]]:
-        """Convert MCP tools to Claude tool format.
-
-        Args:
-            tool_filter: Optional list of tool names to include (prefixed names).
-                If None, all tools are included.
-            manager: The pooled MCPManager for this agent's working directory.
-                The manager is passed explicitly (never read from shared
-                mutable provider state) so parallel agents with different
-                cwds cannot observe each other's tools.
-
-        Returns:
-            List of tool definitions in Claude's expected format.
-        """
-        if not manager:
-            return []
-
-        claude_tools: list[dict[str, Any]] = []
-        for tool in manager.get_all_tools():
-            # Apply filter if specified
-            if tool_filter and tool["name"] not in tool_filter:
-                continue
-
-            claude_tools.append(
-                {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "input_schema": tool["input_schema"],
-                }
-            )
-
-        return claude_tools
-
     async def close(self) -> None:
         """Release provider resources and close connections.
 
@@ -789,10 +658,7 @@ class ClaudeProvider(AgentProvider):
         history: list[dict[str, str]] | None = None,
         model: str | None = None,
     ) -> str:
-        """Execute a single dialog turn using the Claude messages API.
-
-        Creates a lightweight message call with the conversation context
-        and returns the agent's response text.
+        """Execute a single dialog turn using a Pydantic AI agent.
 
         Args:
             system_prompt: System prompt providing dialog context.
@@ -806,78 +672,85 @@ class ClaudeProvider(AgentProvider):
         Raises:
             ProviderError: If the dialog turn fails.
         """
-        if self._client is None:
-            raise ProviderError(
-                "Claude client not initialized",
-                suggestion="Call validate_connection() first",
-            )
+        from anthropic.types.beta.beta_thinking_config_enabled_param import (
+            BetaThinkingConfigEnabledParam,
+        )
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+        from pydantic_ai.models.anthropic import AnthropicModelSettings
 
-        # Build messages list from history + current message
-        messages: list[dict[str, str]] = []
+        from conductor.config.schema import AgentDef
+        from conductor.providers._pydantic_ai.agent_builder import (
+            _coerce_for_thinking,
+            _resolve_anthropic_model,
+        )
+
+        resolved_model = model or self._default_model
+
+        pydantic_history: list[ModelRequest | ModelResponse] = []
         for msg in history or []:
-            messages.append(
-                {
-                    "role": msg["role"],
-                    "content": msg["content"],
-                }
+            if msg["role"] == "user":
+                pydantic_history.append(
+                    ModelRequest(parts=[UserPromptPart(content=msg["content"])])
+                )
+            elif msg["role"] == "assistant":
+                pydantic_history.append(ModelResponse(parts=[TextPart(content=msg["content"])]))
+
+        model_settings = AnthropicModelSettings()
+        max_tokens = 4096
+
+        if self._default_reasoning_effort is not None:
+            if not is_claude_thinking_model(resolved_model):
+                raise ValidationError(
+                    f"Model {resolved_model!r} does not support extended thinking, "
+                    f"but default_reasoning_effort={self._default_reasoning_effort!r} "
+                    "was configured.",
+                    suggestion=(
+                        "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
+                        "claude-sonnet-4-20250514) or remove the reasoning config."
+                    ),
+                )
+            budget = effort_to_budget_tokens(self._default_reasoning_effort)
+            thinking = BetaThinkingConfigEnabledParam(type="enabled", budget_tokens=budget)
+            _, coerced_max = _coerce_for_thinking(
+                temperature=None,
+                max_tokens=max_tokens,
+                thinking={"type": "enabled", "budget_tokens": budget},
+                model=resolved_model,
             )
-        messages.append({"role": "user", "content": user_message})
+            coerced_max = coerced_max or max_tokens
+            model_settings["max_tokens"] = coerced_max
+            model_settings["anthropic_thinking"] = thinking
+        else:
+            model_settings["max_tokens"] = max_tokens
 
         try:
-            kwargs: dict[str, Any] = {
-                "model": model or self._default_model,
-                "max_tokens": 4096,
-                "system": system_prompt,
-                "messages": messages,
-            }
+            dummy_agent = AgentDef(
+                name="dialog_agent",
+                model=resolved_model,
+                prompt="",
+            )
+            pydantic_model = _resolve_anthropic_model(
+                agent=dummy_agent,
+                default_model=self._default_model,
+                api_key=self._api_key,
+                base_url=self._base_url,
+                auth_token=self._auth_token,
+                timeout=self._timeout,
+            )
 
-            # Apply workflow-wide default reasoning effort if configured.
-            # Per-agent reasoning is not available here (no AgentDef in scope).
-            # Mirrors _resolve_thinking_for_agent: raise ValidationError when
-            # the resolved model does not support extended thinking, rather
-            # than silently dropping the reasoning request.
-            if self._default_reasoning_effort is not None:
-                resolved_model = kwargs["model"]
-                if not is_claude_thinking_model(resolved_model):
-                    raise ValidationError(
-                        f"Model {resolved_model!r} does not support extended thinking, "
-                        f"but default_reasoning_effort={self._default_reasoning_effort!r} "
-                        "was configured.",
-                        suggestion=(
-                            "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
-                            "claude-sonnet-4-20250514) or remove the reasoning config."
-                        ),
-                    )
-                budget = effort_to_budget_tokens(self._default_reasoning_effort)
-                thinking = {"type": "enabled", "budget_tokens": budget}
-                kwargs["thinking"] = thinking
-                # Reuse the same clamp/validate logic as the main agentic-loop
-                # path (_coerce_for_thinking) instead of duplicating the
-                # budget + headroom arithmetic here — this keeps dialog turns
-                # subject to the same 64000-token per-model cap and the same
-                # defensive raise if a future budget ever collapses below it.
-                # No temperature kwarg is sent for dialog turns (omitting it
-                # satisfies the Anthropic "1.0 or omitted" requirement), so
-                # only the max_tokens half of the returned tuple is used.
-                _, kwargs["max_tokens"] = self._coerce_for_thinking(
-                    temperature=None,
-                    max_tokens=kwargs["max_tokens"],
-                    model=resolved_model,
-                    thinking=thinking,
-                )
-
-            response = await self._client.messages.create(**kwargs)
-
-            # Extract text from response (skip thinking blocks)
-            text_parts = []
-            for block in response.content:
-                if hasattr(block, "type") and block.type == "thinking":
-                    continue
-                if hasattr(block, "text"):
-                    text_parts.append(block.text)
-
-            return "\n".join(text_parts) if text_parts else ""
-
+            pydantic_agent = Agent(
+                model=pydantic_model,
+                output_type=str,
+                system_prompt=system_prompt,
+                model_settings=model_settings,
+                retries=0,
+            )
+            result = await pydantic_agent.run(
+                user_prompt=user_message,
+                message_history=pydantic_history,
+            )
+            return str(result.output)
         except ValidationError:
             raise
         except Exception as exc:
@@ -895,23 +768,30 @@ class ClaudeProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
-        """Execute an agent using the Claude SDK.
+        """Execute an agent using the Pydantic AI pipeline.
 
         Args:
             agent: Agent definition from workflow config.
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
-            tools: List of tool names available to this agent (currently unused).
+            tools: List of tool names available to this agent. ``None`` grants
+                all MCP tools, ``[]`` grants none, and a list filters to the
+                named tools.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
-                When set during the agentic loop, Claude is asked to emit
-                partial output via the ``emit_output`` tool, and the result
-                is returned with ``partial=True``.
+                When set during the agentic loop, the agent is asked for a
+                partial result and the output is returned with ``partial=True``.
             skill_directories: Ignored. Claude has no server-side skill
                 surface without adopting the container/code-execution
                 beta, so :class:`AgentExecutor` has already eager-injected
                 the skill content into ``rendered_prompt`` for this
                 provider (see :attr:`AgentProvider.supports_native_skills`).
+            custom_agents: Ignored. Declares ``plugins=False``, so
+                :class:`AgentExecutor` refuses ``plugins:`` on this
+                provider before reaching here and this is always ``None``.
+            extra_mcp_servers: Ignored, for the same reason.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -921,1859 +801,166 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories  # Claude relies on eager preamble injection (see docstring).
-        # Use retry logic wrapper for execution
-        return await self._execute_with_retry(
-            agent,
-            context,
-            rendered_prompt,
-            tools,
-            interrupt_signal=interrupt_signal,
-            event_callback=event_callback,
+        from pydantic_ai import UsageLimits
+
+        from conductor.providers._pydantic_ai.agent_builder import build_agent
+        from conductor.providers._pydantic_ai.interrupt import run_with_interrupt
+        from conductor.providers._pydantic_ai.mcp_toolset import MCPManagerToolset
+        from conductor.providers._pydantic_ai.retry import (
+            RetryConfig as PydanticRetryConfig,
         )
+        from conductor.providers._pydantic_ai.retry import (
+            _resolve_retry_config,
+            execute_with_retry,
+        )
+        from conductor.providers._pydantic_ai.structured_output import extract_content
+        from conductor.providers._pydantic_ai.usage import build_agent_output
 
-    def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
-        """Resolve the retry config for an agent.
+        resolved_cwd = agent.working_dir or os.getcwd()
+        manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
-        If the agent has a per-agent retry policy, build a RetryConfig from it.
-        Otherwise, fall back to the provider-level default.
+        toolsets: list[Any] = []
+        if manager is not None:
+            tool_names = None if agent.tools is None and not tools else tools
+            toolsets.append(
+                MCPManagerToolset(
+                    manager,
+                    tool_names,
+                    self._tool_output_config,
+                    event_callback=event_callback,
+                )
+            )
 
-        Args:
-            agent: Agent definition that may contain a retry policy.
-
-        Returns:
-            RetryConfig to use for this agent's execution.
-        """
-        from conductor.config.schema import RetryPolicy
-
-        retry = getattr(agent, "retry", None)
-        if not isinstance(retry, RetryPolicy):
-            return self._retry_config
-
-        return RetryConfig(
-            max_attempts=retry.max_attempts,
-            base_delay=retry.delay_seconds,
-            max_delay=self._retry_config.max_delay,
-            jitter=self._retry_config.jitter,
-            backoff=retry.backoff,
-            retry_on=list(retry.retry_on),
-            max_parse_recovery_attempts=(
-                retry.max_parse_recovery_attempts
-                if retry.max_parse_recovery_attempts is not None
-                else self._retry_config.max_parse_recovery_attempts
+        retry_cfg = _resolve_retry_config(
+            agent,
+            PydanticRetryConfig(
+                max_attempts=self._retry_config.max_attempts,
+                base_delay=self._retry_config.base_delay,
+                max_delay=self._retry_config.max_delay,
+                jitter=self._retry_config.jitter,
+                backoff=self._retry_config.backoff,
+                retry_on=(
+                    list(self._retry_config.retry_on)
+                    if self._retry_config.retry_on is not None
+                    else None
+                ),
+                max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
             ),
         )
 
-    @staticmethod
-    def _classify_error(error: Exception) -> str:
-        """Classify an error into a retry category.
+        pydantic_agent = build_agent(
+            agent=agent,
+            system_prompt=agent.system_prompt or "",
+            rendered_prompt=rendered_prompt,
+            default_model=self._default_model,
+            default_temperature=self._default_temperature,
+            default_max_tokens=self._default_max_tokens,
+            default_reasoning_effort=self._default_reasoning_effort,
+            max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
+            api_key=self._api_key,
+            auth_token=self._auth_token,
+            base_url=self._base_url,
+            timeout=self._timeout,
+            toolsets=toolsets,
+        )
 
-        Maps exception types to the retry_on categories used in per-agent
-        retry policies.
-
-        Args:
-            error: The exception to classify.
-
-        Returns:
-            Error category string: "provider_error" or "timeout".
-        """
-        from conductor.exceptions import ProviderError
-        from conductor.exceptions import TimeoutError as ConductorTimeoutError
-
-        if isinstance(error, (ConductorTimeoutError, asyncio.TimeoutError)):
-            return "timeout"
-        if isinstance(error, ProviderError):
-            if error.status_code == 408:
-                return "timeout"
-            if "timeout" in str(error).lower():
-                return "timeout"
-        return "provider_error"
-
-    def _is_retryable_error(self, exception: Exception) -> bool:
-        """Determine if an error should trigger a retry.
-
-        Args:
-            exception: The exception to check.
-
-        Returns:
-            True if the error is transient and should be retried.
-        """
-        # A ProviderError carries its own retry classification (e.g. parse
-        # exhaustion is raised with is_retryable=False). Honor it directly
-        # rather than falling through to SDK-type heuristics that would never
-        # match it.
-        if isinstance(exception, ProviderError):
-            return exception.is_retryable
-
-        if anthropic is None:
-            return False
-
-        # Always retry these (use try-except to handle mocked exceptions)
-        try:
-            if isinstance(
-                exception,
-                (
-                    anthropic.APIConnectionError,
-                    anthropic.RateLimitError,
-                    anthropic.APITimeoutError,
-                ),
-            ):
-                return True
-        except TypeError:
-            # Handle mocked anthropic module in tests
-            # Check by class name instead (includes Mock versions for testing)
-            error_type_name = type(exception).__name__
-            if error_type_name in (
-                "APIConnectionError",
-                "RateLimitError",
-                "APITimeoutError",
-                "MockRateLimitError",  # For testing
-                "MockAPIConnectionError",  # For testing
-                "MockAPITimeoutError",  # For testing
-            ):
-                return True
-
-        # Check HTTP status codes for APIStatusError
-        try:
-            if isinstance(exception, anthropic.APIStatusError):
-                # 5xx errors are retryable
-                if 500 <= exception.status_code < 600:
-                    return True
-                # 429 is also retryable (though RateLimitError should catch this)
-                if exception.status_code == 429:
-                    return True
-        except (TypeError, AttributeError):
-            # Handle mocked exceptions - check by name and attributes
-            error_type_name = type(exception).__name__
-            is_api_status = error_type_name in ("APIStatusError", "MockAPIStatusError")
-            if is_api_status and hasattr(exception, "status_code"):
-                status_code: int = int(exception.status_code)  # type: ignore[attr-defined]
-                if 500 <= status_code < 600 or status_code == 429:
-                    return True
-
-        # Everything else is non-retryable
-        return False
-
-    def _get_retry_after(self, exception: Exception) -> float | None:
-        """Extract retry-after value from rate limit exception.
-
-        Validated against Anthropic SDK exception structure via Context7 docs.
-        RateLimitError inherits from APIStatusError which provides response attribute.
-
-        Args:
-            exception: The exception to check for retry-after header.
-
-        Returns:
-            Retry-after delay in seconds, or None if not present.
-        """
-        if anthropic is None:
-            return None
-
-        # Check if this is a RateLimitError (handle both real and mocked)
-        is_rate_limit = False
-        try:
-            is_rate_limit = isinstance(exception, anthropic.RateLimitError)
-        except TypeError:
-            # Handle mocked exceptions
-            is_rate_limit = type(exception).__name__ in ("RateLimitError", "MockRateLimitError")
-
-        if is_rate_limit and hasattr(exception, "response") and exception.response:
-            # Check response headers for retry-after
-            # Anthropic SDK APIStatusError provides .response attribute with headers dict
-            headers = getattr(exception.response, "headers", {})
-            retry_after = headers.get("retry-after") or headers.get("Retry-After")
-            if retry_after:
-                try:
-                    return float(retry_after)
-                except ValueError:
-                    pass
-        return None
-
-    def _calculate_delay(self, attempt: int, config: RetryConfig) -> float:
-        """Calculate delay with backoff and jitter.
-
-        Supports both exponential and fixed backoff strategies.
-
-        Args:
-            attempt: Current attempt number (1-indexed).
-            config: Retry configuration.
-
-        Returns:
-            Delay in seconds before next retry.
-        """
-        if config.backoff == "fixed":
-            delay = config.base_delay
-        else:
-            # Exponential backoff: base * 2^(attempt-1)
-            delay = config.base_delay * (2 ** (attempt - 1))
-
-        # Cap at max delay
-        delay = min(delay, config.max_delay)
-
-        # Add jitter (random fraction of delay)
-        if config.jitter > 0:
-            jitter_amount = delay * config.jitter * random.random()
-            delay += jitter_amount
-
-        return delay
-
-    async def _execute_with_retry(
-        self,
-        agent: AgentDef,
-        context: dict[str, Any],
-        rendered_prompt: str,
-        tools: list[str] | None = None,
-        interrupt_signal: asyncio.Event | None = None,
-        event_callback: EventCallback | None = None,
-    ) -> AgentOutput:
-        """Execute with exponential backoff retry logic and MCP tool support.
-
-        This method implements an agentic loop that:
-        1. Sends the initial prompt to Claude
-        2. If Claude returns tool_use blocks (other than emit_output), executes them
-        3. Sends tool results back to Claude and continues the loop
-        4. Terminates when Claude returns emit_output or a final text response
-
-        Args:
-            agent: Agent definition from workflow config.
-            context: Accumulated workflow context.
-            rendered_prompt: Jinja2-rendered user prompt.
-            tools: List of tool names available to this agent (for MCP tool filtering).
-            interrupt_signal: Optional event for mid-agent interrupt signaling.
-            event_callback: Optional callback for streaming SDK events upstream.
-
-        Returns:
-            Normalized AgentOutput with structured content.
-
-        Raises:
-            ProviderError: If execution fails after all retry attempts.
-            ValidationError: If output validation fails.
-        """
-        if self._client is None:
-            raise ProviderError("Claude client not initialized")
-
-        # Resolve this agent's MCP manager from the cwd pool (lazy connect).
-        # The manager is a LOCAL variable threaded through the whole agentic
-        # loop — never stored as shared mutable provider state — so parallel
-        # agents with different working directories stay isolated.
-        resolved_cwd = agent.working_dir or os.getcwd()
-        mcp_manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
-
-        last_error: Exception | None = None
-        config = self._resolve_retry_config(agent)
-
-        # Build messages
-        messages = self._build_messages(rendered_prompt)
-
-        # Get model and parameters
-        model = agent.model or self._default_model
-        temperature = self._default_temperature
-        max_tokens = self._default_max_tokens
-
-        # Resolve per-agent iteration and session limits
-        max_agent_iterations = (
+        max_iterations = (
             agent.max_agent_iterations
             if agent.max_agent_iterations is not None
             else self._default_max_agent_iterations
         )
-        max_session_seconds = (
+        max_session = (
             agent.max_session_seconds
             if agent.max_session_seconds is not None
             else self._default_max_session_seconds
         )
 
-        # Resolve extended-thinking kwarg (validates model compatibility).
-        # Done before the per-model max_tokens warning so the warning logic
-        # accounts for thinking-aware caps.
-        thinking = self._resolve_thinking_for_agent(agent, model)
-        # Use strip() only as a blank-prompt predicate: the rendered value is
-        # forwarded verbatim for cross-provider parity (Copilot, Claude Agent
-        # SDK, and Hermes all pass agent.system_prompt through unchanged).
-        raw_system_prompt = agent.system_prompt
-        system_prompt = (
-            raw_system_prompt if raw_system_prompt and raw_system_prompt.strip() else None
-        )
-
-        # Validate max_tokens against model-specific limits.
-        # Skip the warning when extended thinking is enabled — the per-call
-        # cap is bumped to at least ``budget_tokens + 4096`` (capped at
-        # 64000) by _coerce_for_thinking() to satisfy the
-        # ``max_tokens > budget_tokens`` constraint.
-        if thinking is None:
-            if "haiku" in model.lower():
-                if max_tokens > 4096:
-                    logger.warning(
-                        f"max_tokens={max_tokens} exceeds Haiku model limit of 4096. "
-                        "API may reject request."
-                    )
-            elif max_tokens > 8192:
-                logger.warning(
-                    f"max_tokens={max_tokens} exceeds Sonnet/Opus model limit of 8192. "
-                    "API may reject request."
-                )
-
-        # Build tools list: emit_output (for structured output) + MCP tools
-        all_tools: list[dict[str, Any]] = []
-
-        # Effective schema check: skip structured output when output_mode is raw
-        output_schema = agent.effective_output_schema()
-        has_output_schema = output_schema is not None
-
-        # Add emit_output tool if agent has effective output schema
-        if output_schema is not None:
-            all_tools.extend(self._build_tools_for_structured_output(output_schema))
-            # Append instruction to use the tool
-            messages[-1]["content"] += (
-                "\n\nPlease use the 'emit_output' tool to return your response "
-                "in the required structured format."
-            )
-
-        # Add MCP tools if available
-        if mcp_manager and mcp_manager.has_servers():
-            mcp_tools = self._convert_mcp_tools_to_claude(tools, mcp_manager)  # tools is the filter
-            all_tools.extend(mcp_tools)
-            if mcp_tools:
-                logger.debug(f"Added {len(mcp_tools)} MCP tools to request")
-
-        # Use tools if any are defined
-        request_tools: list[dict[str, Any]] | None = all_tools if all_tools else None
-
-        for attempt in range(1, config.max_attempts + 1):
-            try:
-                # Execute with agentic tool loop
-                response, total_tokens, is_partial = await self._execute_agentic_loop(
-                    messages=messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=request_tools,
-                    output_schema=output_schema,
-                    has_output_schema=has_output_schema,
-                    max_iterations=max_agent_iterations,
-                    max_session_seconds=max_session_seconds,
-                    interrupt_signal=interrupt_signal,
-                    event_callback=event_callback,
-                    thinking=thinking,
-                    max_parse_recovery_attempts=config.max_parse_recovery_attempts,
-                    system_prompt=system_prompt,
-                    mcp_manager=mcp_manager,
-                )
-
-                # Handle partial output from mid-agent interrupt
-                if is_partial:
-                    partial_content: dict[str, Any]
-                    try:
-                        partial_content = self._extract_output(response, agent.output)
-                    except Exception:
-                        # Best-effort extraction; fall back to text content
-                        partial_content = self._extract_text_content(response)
-
-                    tokens_used = (
-                        total_tokens if total_tokens else self._extract_token_usage(response)
-                    )
-                    return AgentOutput(
-                        content=partial_content,
-                        raw_response=response,
-                        tokens_used=tokens_used,
-                        model=model,
-                        partial=True,
-                    )
-
-                # Extract structured output
-                content = self._extract_output(response, output_schema)
-
-                # Validate output if schema is defined
-                if output_schema is not None:
-                    validate_output(content, output_schema)
-
-                # Use total_tokens from the agentic loop (includes all turns)
-                # If available, use it; otherwise fall back to extracting from final response
-                tokens_used = total_tokens if total_tokens else self._extract_token_usage(response)
-
-                # Extract detailed token breakdown from final response
-                # Note: For multi-turn conversations, this only shows the final turn's breakdown
-                input_tokens = None
-                output_tokens = None
-                cache_read_tokens = None
-                cache_write_tokens = None
-
-                if hasattr(response, "usage"):
-                    usage = response.usage
-                    input_tokens = getattr(usage, "input_tokens", None)
-                    output_tokens = getattr(usage, "output_tokens", None)
-                    cache_read_tokens = getattr(usage, "cache_read_input_tokens", None)
-                    cache_write_tokens = getattr(usage, "cache_creation_input_tokens", None)
-
-                return AgentOutput(
-                    content=content,
-                    raw_response=response,
-                    tokens_used=tokens_used,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_write_tokens=cache_write_tokens,
-                    model=model,
-                )
-
-            except ValidationError:
-                # Re-raise ValidationError without wrapping (non-retryable)
-                raise
-
-            except Exception as e:
-                last_error = e
-
-                # Check if it's a BadRequestError from temperature validation
-                if anthropic is not None:
-                    try:
-                        has_attr = hasattr(anthropic, "BadRequestError")
-                        is_bad_request = has_attr and isinstance(e, anthropic.BadRequestError)
-                        if is_bad_request and "temperature" in str(e).lower():
-                            raise ValidationError(
-                                f"Temperature validation failed: {e}",
-                                suggestion=(
-                                    "Temperature must be between 0.0 and 1.0 "
-                                    "(enforced by Claude SDK)"
-                                ),
-                            ) from e
-                    except TypeError:
-                        # isinstance can fail if BadRequestError is not a proper type
-                        pass
-
-                # Determine if error is retryable
-                is_retryable = self._is_retryable_error(e)
-
-                # Track retry history with consistent metadata
-                retry_entry = {
-                    "attempt": attempt,
-                    "agent_name": agent.name,
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                    "is_retryable": is_retryable,
-                }
-                self._retry_history.append(retry_entry)
-
-                # Log retry information
-                logger.debug(
-                    f"Execution attempt {attempt} failed: {type(e).__name__}: {e} "
-                    f"(retryable={is_retryable})"
-                )
-
-                # Don't retry non-retryable errors
-                if not is_retryable:
-                    # Extract status code consistently
-                    status_code = self._extract_status_code(e)
-
-                    # Wrap as ProviderError with proper metadata
-                    if status_code is not None:
-                        raise ProviderError(
-                            f"Claude API error: {e}",
-                            suggestion="Check API key, model name, and request parameters",
-                            status_code=status_code,
-                            is_retryable=False,
-                        ) from e
-                    else:
-                        raise ProviderError(
-                            f"Claude API call failed: {e}",
-                            suggestion="Check API key, model name, and request parameters",
-                            is_retryable=False,
-                        ) from e
-
-                # Check retry_on filter if per-agent retry is configured
-                if config.retry_on is not None:
-                    error_category = self._classify_error(e)
-                    if error_category not in config.retry_on:
-                        raise
-
-                # Don't retry if this was the last attempt
-                if attempt >= config.max_attempts:
-                    break
-
-                # Check for retry-after header (overrides calculated delay)
-                retry_after = self._get_retry_after(e)
-                if retry_after is not None:
-                    delay = retry_after
-                    logger.warning(
-                        f"Rate limit hit (HTTP 429), respecting retry-after header: {delay}s"
-                    )
-                else:
-                    # Calculate delay with backoff
-                    delay = self._calculate_delay(attempt, config)
-                    logger.info(f"Calculated backoff delay: {delay:.2f}s for attempt {attempt}")
-
-                # Log retry attempt with full context
-                logger.warning(
-                    f"[Retry {attempt}/{config.max_attempts}] Retrying after {delay:.2f}s "
-                    f"due to {type(e).__name__}: {e}"
-                )
-                retry_entry["delay"] = delay
-
-                # Emit agent_retry event
-                if event_callback is not None:
-                    with contextlib.suppress(Exception):
-                        event_callback(
-                            "agent_retry",
-                            {
-                                "agent_name": agent.name,
-                                "attempt": attempt,
-                                "max_attempts": config.max_attempts,
-                                "error": str(e),
-                                "error_type": type(e).__name__,
-                                "delay": delay,
-                            },
-                        )
-
-                await asyncio.sleep(delay)
-
-        # All retries exhausted
-        raise ProviderError(
-            f"Claude API call failed after {config.max_attempts} attempts: {last_error}",
-            suggestion=(f"Check API connectivity and rate limits. Last error: {last_error}"),
-            is_retryable=False,
-        )
-
-    def _extract_status_code(self, exception: Exception) -> int | None:
-        """Extract HTTP status code from exception if available.
-
-        Args:
-            exception: Exception to extract status code from.
-
-        Returns:
-            HTTP status code or None if not available.
-        """
-        # Try to extract from APIStatusError
-        try:
-            if anthropic and isinstance(exception, anthropic.APIStatusError):
-                return exception.status_code
-        except TypeError:
-            # Handle mocked exceptions - check by attribute
-            if hasattr(exception, "status_code"):
-                status_code = getattr(exception, "status_code", None)
-                if status_code is not None:
-                    return int(status_code)
-
-        return None
-
-    def _coerce_for_thinking(
-        self,
-        temperature: float | None,
-        max_tokens: int,
-        model: str,
-        thinking: dict[str, Any] | None,
-    ) -> tuple[float | None, int]:
-        """Adjust temperature and max_tokens to satisfy thinking constraints.
-
-        When extended thinking is enabled the Anthropic API requires:
-
-        - ``temperature == 1.0`` (or omitted)
-        - ``max_tokens > budget_tokens``
-
-        We force temperature to 1.0 (logging an info note if the caller
-        configured a different non-1.0 value) and bump ``max_tokens`` to
-        at least ``budget_tokens + 4096``, clamped to a per-model cap.
-        Extended-thinking models accept up to 64000 output tokens, which
-        is what we use here.
-
-        When ``thinking`` is ``None`` the inputs are returned unchanged.
-
-        Args:
-            temperature: User-configured temperature (may be ``None``).
-            max_tokens: User-configured max output tokens.
-            model: Resolved model identifier.
-            thinking: Resolved thinking kwarg or ``None``.
-
-        Returns:
-            Tuple of ``(effective_temperature, effective_max_tokens)``.
-        """
-        if thinking is None:
-            return temperature, max_tokens
-
-        budget = int(thinking.get("budget_tokens", 0))
-        # Per-model cap when thinking is enabled. Extended-thinking models
-        # accept up to CLAUDE_EXTENDED_THINKING_OUTPUT_CAP output tokens.
-        per_model_cap = CLAUDE_EXTENDED_THINKING_OUTPUT_CAP
-        required = budget + CLAUDE_ANSWER_HEADROOM_TOKENS
-        effective_max_tokens = max(max_tokens, required)
-        if effective_max_tokens > per_model_cap:
-            logger.info(
-                "Clamping max_tokens %s to %s for extended thinking on model %s "
-                "(Anthropic API per-model cap)",
-                effective_max_tokens,
-                per_model_cap,
-                model,
-            )
-            effective_max_tokens = per_model_cap
-        if effective_max_tokens <= budget:
-            # Defensive: if cap collapses below budget+1, this would still
-            # violate the API constraint. Raise rather than silently send a
-            # request the API will reject.
-            raise ValidationError(
-                f"Cannot satisfy thinking budget_tokens={budget} on model "
-                f"{model!r}: per-model cap {per_model_cap} is not greater "
-                f"than the requested budget.",
-                suggestion="Lower reasoning.effort or use a model with a higher cap.",
-            )
-
-        if temperature is not None and temperature != 1.0:
-            logger.info(
-                "Coercing temperature %s to 1.0 for extended thinking on model %s "
-                "(Anthropic API requirement)",
-                temperature,
-                model,
-            )
-
-        return 1.0, effective_max_tokens
-
-    async def _execute_api_call(
-        self,
-        messages: list[dict[str, str]],
-        model: str,
-        temperature: float | None,
-        max_tokens: int,
-        tools: list[dict[str, Any]] | None = None,
-        thinking: dict[str, Any] | None = None,
-        system_prompt: str | None = None,
-    ) -> ClaudeResponse:
-        """Execute non-streaming Claude API call using AsyncAnthropic.
-
-        This method makes an asynchronous (non-streaming) call to the Claude
-        messages.create() API endpoint. It does not handle streaming responses.
-
-        Args:
-            messages: Message history to send.
-            model: Model identifier.
-            temperature: Temperature setting (0.0-1.0, enforced by SDK).
-            max_tokens: Maximum output tokens.
-            tools: Optional tool definitions for structured output.
-            thinking: Optional extended-thinking kwarg for the SDK. When
-                supplied, ``temperature`` is forced to 1.0 and ``max_tokens``
-                is bumped to satisfy the API constraint
-                ``max_tokens > budget_tokens``.
-            system_prompt: Optional rendered system prompt passed as the
-                top-level Anthropic ``system`` parameter.
-
-        Returns:
-            Claude API response object with content blocks and usage metadata.
-
-        Raises:
-            ProviderError: If client not initialized or API call fails.
-
-        Note:
-            This is a non-streaming implementation. Streaming support is
-            deferred to Phase 2+ of the Claude SDK integration.
-        """
-        if self._client is None:
-            raise ProviderError("Claude client not initialized")
-
-        effective_temperature, effective_max_tokens = self._coerce_for_thinking(
-            temperature, max_tokens, model, thinking
-        )
-
-        # Build API call kwargs
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": effective_max_tokens,
-        }
-
-        if effective_temperature is not None:
-            kwargs["temperature"] = effective_temperature
-
-        if tools:
-            kwargs["tools"] = tools
-
-        if thinking is not None:
-            kwargs["thinking"] = thinking
-
-        if system_prompt:
-            kwargs["system"] = system_prompt
-
-        # Execute non-streaming API call (async)
-        logger.debug(
-            f"Executing non-streaming Claude API call: model={model}, "
-            f"max_tokens={effective_max_tokens}, timeout={self._timeout}s, "
-            f"thinking={'enabled' if thinking else 'disabled'}"
-        )
-        response = await self._client.messages.create(**kwargs)
-
-        return response
-
-    async def _execute_agentic_loop(
-        self,
-        messages: list[dict[str, Any]],
-        model: str,
-        temperature: float | None,
-        max_tokens: int,
-        tools: list[dict[str, Any]] | None,
-        output_schema: dict[str, OutputField] | None,
-        has_output_schema: bool,
-        max_iterations: int = 50,
-        max_session_seconds: float | None = None,
-        interrupt_signal: asyncio.Event | None = None,
-        event_callback: EventCallback | None = None,
-        thinking: dict[str, Any] | None = None,
-        max_parse_recovery_attempts: int | None = None,
-        system_prompt: str | None = None,
-        mcp_manager: MCPManager | None = None,
-    ) -> tuple[ClaudeResponse, int | None, bool]:
-        """Execute an agentic loop that handles MCP tool calls.
-
-        This method implements a tool-use loop:
-        1. Call the Claude API
-        2. If Claude returns tool_use blocks (other than emit_output), execute them
-        3. Send tool results back and continue the loop
-        4. Terminate when Claude returns emit_output or a final text response
-
-        If ``interrupt_signal`` is set at the start of an iteration, the loop
-        appends a user message asking Claude to call ``emit_output`` with its
-        best partial result. The response is returned with ``partial=True``.
-
-        Args:
-            messages: Initial message history.
-            model: Model identifier.
-            temperature: Temperature setting.
-            max_tokens: Maximum output tokens.
-            tools: Tool definitions (emit_output + MCP tools).
-            output_schema: Expected output schema.
-            has_output_schema: Whether agent has output schema defined.
-            max_iterations: Maximum number of tool-use iterations to prevent infinite loops.
-            max_session_seconds: Maximum wall-clock duration for this agentic loop.
-                None means no time limit.
-            interrupt_signal: Optional event that signals a mid-agent interrupt.
-            event_callback: Optional callback for streaming SDK events upstream.
-            thinking: Optional extended-thinking kwarg forwarded to every API call.
-            max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
-                None means use the provider-level default.
-            system_prompt: Optional rendered system prompt forwarded to every API call.
-            mcp_manager: Pooled MCPManager for this agent's working directory.
-                Passed explicitly (never read from shared provider state) so
-                parallel agents with different cwds execute their tool calls
-                against the correct per-cwd connection pool.
-
-        Returns:
-            Tuple of (final_response, total_tokens_used, is_partial).
-
-        Raises:
-            ProviderError: If execution fails or max iterations exceeded.
-        """
-        # Make a copy of messages to avoid mutating the original
-        working_messages = list(messages)
-        total_tokens = 0
-        iteration = 0
-        session_start = time.monotonic()
-
-        while iteration < max_iterations:
-            iteration += 1
-            logger.debug(f"Agentic loop iteration {iteration}/{max_iterations}")
-
-            # Check wall-clock session timeout
-            if max_session_seconds is not None:
-                elapsed = time.monotonic() - session_start
-                if elapsed > max_session_seconds:
-                    raise ProviderError(
-                        f"Agent exceeded maximum session duration of {max_session_seconds:.0f}s "
-                        f"after {iteration} tool-use iterations",
-                        is_retryable=False,
-                    )
-
-            # Emit turn start event
-            if event_callback:
-                try:
-                    event_callback("agent_turn_start", {"turn": iteration})
-                except Exception:
-                    logger.debug("Error in event_callback for agent_turn_start", exc_info=True)
-
-            # Check for mid-agent interrupt at top of each iteration
-            if interrupt_signal is not None and interrupt_signal.is_set():
-                interrupt_signal.clear()
-                logger.info("Mid-agent interrupt detected in Claude agentic loop")
-
-                # Ask Claude to emit partial output via a user message
-                interrupt_response, interrupt_tokens = await self._request_partial_output(
-                    working_messages=working_messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    has_output_schema=has_output_schema,
-                    thinking=thinking,
-                    system_prompt=system_prompt,
-                )
-                total_tokens += interrupt_tokens
-                return interrupt_response, total_tokens, True
-
-            # Execute API call (with parse recovery for structured output)
-            if event_callback:
-                try:
-                    event_callback("agent_turn_start", {"turn": "awaiting_model"})
-                except Exception:
-                    logger.debug("Error in event_callback for awaiting_model", exc_info=True)
-
-            # Race API call against interrupt signal so user can abort
-            # a long-running API call (not just between iterations).
-            # Applied to both structured-output and regular paths for
-            # provider parity.
-            if interrupt_signal is not None:
-                if has_output_schema:
-                    api_task = asyncio.create_task(
-                        self._execute_with_parse_recovery(
-                            messages=working_messages,
-                            model=model,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            tools=tools,
-                            output_schema=output_schema,
-                            thinking=thinking,
-                            max_parse_recovery_attempts=max_parse_recovery_attempts,
-                            system_prompt=system_prompt,
-                            event_callback=event_callback,
-                        )
-                    )
-                else:
-                    api_task = asyncio.create_task(
-                        self._execute_api_call(
-                            messages=working_messages,
-                            model=model,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            tools=tools,
-                            thinking=thinking,
-                            system_prompt=system_prompt,
-                        )
-                    )
-                interrupt_task = asyncio.create_task(interrupt_signal.wait())
-                try:
-                    finished, pending = await asyncio.wait(
-                        {api_task, interrupt_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for t in pending:
-                        t.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await t
-                except Exception:
-                    for t in (api_task, interrupt_task):
-                        if not t.done():
-                            t.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await t
-                    raise
-
-                if interrupt_task in finished:
-                    logger.info("Mid-agent interrupt during Claude API call")
-                    interrupt_signal.clear()
-                    partial_resp, partial_tokens = await self._request_partial_output(
-                        working_messages=working_messages,
-                        model=model,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        has_output_schema=has_output_schema,
-                        thinking=thinking,
-                        system_prompt=system_prompt,
-                    )
-                    total_tokens += partial_tokens
-                    return partial_resp, total_tokens, True
-
-                response = await api_task
-            elif has_output_schema:
-                response = await self._execute_with_parse_recovery(
-                    messages=working_messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    output_schema=output_schema,
-                    thinking=thinking,
-                    max_parse_recovery_attempts=max_parse_recovery_attempts,
-                    system_prompt=system_prompt,
-                    event_callback=event_callback,
-                )
-            else:
-                response = await self._execute_api_call(
-                    messages=working_messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    thinking=thinking,
-                    system_prompt=system_prompt,
-                )
-
-            # Accumulate token usage
-            if hasattr(response, "usage"):
-                input_tokens = getattr(response.usage, "input_tokens", 0)
-                output_tokens = getattr(response.usage, "output_tokens", 0)
-                total_tokens += input_tokens + output_tokens
-
-            # Emit agent_message events for text blocks in the response
-            if event_callback:
-                for block in response.content:
-                    if hasattr(block, "type") and block.type == "text" and block.text:
-                        try:
-                            event_callback("agent_message", {"content": block.text})
-                        except Exception:
-                            logger.debug("Error in event_callback for agent_message", exc_info=True)
-                    elif hasattr(block, "type") and block.type == "thinking":
-                        thinking_text = getattr(block, "thinking", None) or getattr(
-                            block, "text", None
-                        )
-                        if thinking_text:
-                            try:
-                                event_callback("agent_reasoning", {"content": thinking_text})
-                            except Exception:
-                                logger.debug(
-                                    "Error in event_callback for agent_reasoning",
-                                    exc_info=True,
-                                )
-
-            # Check for tool_use blocks
-            tool_uses = [
-                block
-                for block in response.content
-                if hasattr(block, "type") and block.type == "tool_use"
-            ]
-
-            if not tool_uses:
-                # No tool calls, we're done
-                logger.debug("No tool_use in response, exiting agentic loop")
-                return response, total_tokens, False
-
-            # Check if emit_output was called (structured output)
-            emit_output = next((t for t in tool_uses if t.name == "emit_output"), None)
-            if emit_output:
-                # Final output received, we're done
-                logger.debug("emit_output tool called, exiting agentic loop")
-                return response, total_tokens, False
-
-            # Handle MCP tool calls
-            mcp_tool_uses = [t for t in tool_uses if t.name != "emit_output"]
-
-            if not mcp_tool_uses:
-                # No MCP tools to execute
-                return response, total_tokens, False
-
-            if not mcp_manager:
-                logger.warning(
-                    f"Claude called MCP tools but no MCP manager available: "
-                    f"{[t.name for t in mcp_tool_uses]}"
-                )
-                return response, total_tokens, False
-
-            logger.info(
-                f"Executing {len(mcp_tool_uses)} MCP tool call(s): "
-                f"{[t.name for t in mcp_tool_uses]}"
-            )
-
-            # Execute each MCP tool call
-            tool_results: list[dict[str, Any]] = []
-            for tool_use in mcp_tool_uses:
-                # Emit tool start event
-                if event_callback:
-                    try:
-                        arguments = (
-                            format_tool_arguments(dict(tool_use.input))
-                            if hasattr(tool_use, "input") and tool_use.input
-                            else None
-                        )
-                        event_callback(
-                            "agent_tool_start",
-                            {"tool_name": tool_use.name, "arguments": arguments},
-                        )
-                    except Exception:
-                        logger.debug("Error in event_callback for agent_tool_start", exc_info=True)
-
-                try:
-                    result = await mcp_manager.call_tool(
-                        tool_use.name, dict(tool_use.input) if hasattr(tool_use, "input") else {}
-                    )
-                    result = self._maybe_rewrite_truncation_hint(result, tools)
-
-                    truncation_info = self._parse_truncation_marker(result)
-                    if truncation_info is not None and event_callback:
-                        try:
-                            event_callback(
-                                "agent_tool_output_truncated",
-                                {
-                                    "tool_name": tool_use.name,
-                                    "original_chars": truncation_info["original_chars"],
-                                    "kept_chars": truncation_info["kept_chars"],
-                                    "spill_path": truncation_info["spill_path"],
-                                },
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Error in event_callback for agent_tool_output_truncated",
-                                exc_info=True,
-                            )
-
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": result,
-                        }
-                    )
-                    logger.debug(f"MCP tool '{tool_use.name}' succeeded")
-
-                    # Emit tool complete event (success)
-                    if event_callback:
-                        try:
-                            event_callback(
-                                "agent_tool_complete",
-                                {
-                                    "tool_name": tool_use.name,
-                                    "result": extract_tool_result_text(result),
-                                },
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Error in event_callback for agent_tool_complete",
-                                exc_info=True,
-                            )
-
-                except Exception as e:
-                    logger.error(f"MCP tool '{tool_use.name}' failed: {e}")
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": f"Error executing tool: {e}",
-                            "is_error": True,
-                        }
-                    )
-
-                    # Emit tool complete event (failure)
-                    if event_callback:
-                        try:
-                            event_callback(
-                                "agent_tool_complete",
-                                {
-                                    "tool_name": tool_use.name,
-                                    "result": f"Error: {e}",
-                                },
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Error in event_callback for agent_tool_complete",
-                                exc_info=True,
-                            )
-
-            # Build assistant message with the tool_use content
-            # We need to serialize the content blocks properly
-            assistant_content: list[dict[str, Any]] = []
-            for block in response.content:
-                if hasattr(block, "type"):
-                    if block.type == "text":
-                        assistant_content.append(
-                            {
-                                "type": "text",
-                                "text": block.text,
-                            }
-                        )
-                    elif block.type == "tool_use":
-                        assistant_content.append(
-                            {
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": dict(block.input) if hasattr(block, "input") else {},
-                            }
-                        )
-                    elif block.type == "thinking":
-                        # Extended thinking requires the unmodified thinking
-                        # blocks (with signature) to be echoed back before
-                        # any tool_use blocks they preceded — otherwise the
-                        # API rejects the next request with a 400.
-                        block_dict: dict[str, Any] = {
-                            "type": "thinking",
-                            "thinking": block.thinking,
-                        }
-                        sig = getattr(block, "signature", None)
-                        if sig is not None:
-                            block_dict["signature"] = sig
-                        assistant_content.append(block_dict)
-                    elif block.type == "redacted_thinking":
-                        assistant_content.append({"type": "redacted_thinking", "data": block.data})
-
-            # Add assistant response and tool results to message history
-            working_messages.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_content,
-                }
-            )
-            working_messages.append(
-                {
-                    "role": "user",
-                    "content": tool_results,
-                }
-            )
-
-        # Max iterations exceeded
-        raise ProviderError(
-            f"Agentic loop exceeded maximum iterations ({max_iterations})",
-            suggestion="The agent may be stuck in a tool-use loop. Check your MCP tools.",
-        )
-
-    async def _request_partial_output(
-        self,
-        working_messages: list[dict[str, Any]],
-        model: str,
-        temperature: float | None,
-        max_tokens: int,
-        tools: list[dict[str, Any]] | None,
-        has_output_schema: bool,
-        thinking: dict[str, Any] | None = None,
-        system_prompt: str | None = None,
-    ) -> tuple[Any, int]:
-        """Send a final API call requesting partial output after interrupt.
-
-        Appends a user message asking Claude to call ``emit_output`` with
-        its best partial result. If ``emit_output`` is not available (no
-        output schema), asks for a text summary instead.
-
-        Uses a copy of ``working_messages`` so the caller's history is
-        not mutated by the interrupt prompt.
-
-        Args:
-            working_messages: Current message history (not modified).
-            model: Model identifier.
-            temperature: Temperature setting.
-            max_tokens: Maximum output tokens.
-            tools: Tool definitions (may include emit_output).
-            has_output_schema: Whether the agent defines an output schema.
-            thinking: Optional extended-thinking kwarg forwarded to the API call.
-            system_prompt: Optional rendered system prompt forwarded to the API call.
-
-        Returns:
-            Tuple of (response, tokens_used_in_this_call).
-        """
-        if has_output_schema:
-            interrupt_prompt = (
-                "The user has interrupted execution. Please immediately call the "
-                "'emit_output' tool with your best partial result based on the work "
-                "completed so far. Return whatever you have, even if incomplete."
-            )
-        else:
-            interrupt_prompt = (
-                "The user has interrupted execution. Please immediately provide "
-                "your best partial result based on the work completed so far. "
-                "Return whatever you have, even if incomplete."
-            )
-
-        messages_copy = list(working_messages)
-        messages_copy.append({"role": "user", "content": interrupt_prompt})
-
-        response = await self._execute_api_call(
-            messages=messages_copy,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            thinking=thinking,
-            system_prompt=system_prompt,
-        )
-
-        call_tokens = 0
-        if hasattr(response, "usage"):
-            call_tokens = getattr(response.usage, "input_tokens", 0) + getattr(
-                response.usage, "output_tokens", 0
-            )
-
-        return response, call_tokens
-
-    async def _execute_with_parse_recovery(
-        self,
-        messages: list[dict[str, str]],
-        model: str,
-        temperature: float | None,
-        max_tokens: int,
-        tools: list[dict[str, Any]] | None,
-        output_schema: dict[str, OutputField] | None,
-        thinking: dict[str, Any] | None = None,
-        max_parse_recovery_attempts: int | None = None,
-        system_prompt: str | None = None,
-        event_callback: EventCallback | None = None,
-    ) -> ClaudeResponse:
-        """Execute API call with recovery for unusable structured output.
-
-        Covers two failure kinds under the same budget: a response with no
-        parseable JSON, and a response that parses cleanly — including a valid
-        ``emit_output`` tool_use — but violates the declared schema. Each
-        attempt re-prompts with wording specific to the failure kind.
-
-        Args:
-            messages: Message history to send.
-            model: Model identifier.
-            temperature: Temperature setting.
-            max_tokens: Maximum output tokens.
-            tools: Tool definitions for structured output.
-            output_schema: Expected output schema (None if no schema).
-            thinking: Optional extended-thinking kwarg forwarded to every API call.
-            max_parse_recovery_attempts: Resolved per-agent parse recovery limit.
-                None means use the provider-level default.
-            system_prompt: Optional rendered system prompt forwarded to every API call.
-            event_callback: Optional callback used to surface recovery attempts.
-
-        Returns:
-            Claude API response.
-
-        Raises:
-            ProviderError: If all retry attempts fail with context about attempts.
-            ValidationError: If the final attempt parsed cleanly but failed
-                schema validation. The specific field error is preserved
-                rather than collapsed into a generic parse error.
-        """
-        effective_max_recovery = (
-            max_parse_recovery_attempts
-            if max_parse_recovery_attempts is not None
-            else self._retry_config.max_parse_recovery_attempts
-        )
-        # Track recovery attempts for error reporting
-        recovery_history: list[str] = []
-
-        # Initial attempt using non-streaming API call
-        response = await self._execute_api_call(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            thinking=thinking,
-            system_prompt=system_prompt,
-        )
-
-        # If no output schema, return immediately (no recovery needed)
-        if not output_schema:
-            return response
-
-        evaluation = self._evaluate_structured_response(response, output_schema)
-        if evaluation.outcome in ("success", "mcp_tools"):
-            return response
-
-        recovery_history.append(f"Attempt 0 (initial): {evaluation.failure_reason}")
-        logger.warning(
-            f"Initial structured output failed ({evaluation.outcome}): "
-            f"{evaluation.failure_reason}. "
-            f"Starting parse recovery (max {effective_max_recovery} attempts)"
-        )
-
-        for attempt in range(1, effective_max_recovery + 1):
-            logger.info(f"Parse recovery attempt {attempt}/{effective_max_recovery}")
-
-            emit_parse_recovery_event(
-                event_callback,
-                attempt=attempt,
-                max_attempts=effective_max_recovery,
-                is_schema_failure=evaluation.is_schema_failure,
-                error=evaluation.failure_reason,
-            )
-
-            # Append recovery message with specific error context
-            recovery_messages = messages.copy()
-            recovery_messages.append(
-                {
-                    "role": "assistant",
-                    "content": evaluation.replay_text,
-                }
-            )
-            recovery_messages.append(
-                {
-                    "role": "user",
-                    "content": self._build_recovery_instruction(
-                        evaluation.failure_reason,
-                        is_schema_failure=evaluation.is_schema_failure,
-                    ),
-                }
-            )
-
-            # Retry API call using non-streaming method
-            response = await self._execute_api_call(
-                messages=recovery_messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                thinking=thinking,
-                system_prompt=system_prompt,
-            )
-
-            evaluation = self._evaluate_structured_response(response, output_schema)
-            if evaluation.outcome == "success":
-                logger.info(f"Parse recovery succeeded on attempt {attempt}")
-                return response
-            if evaluation.outcome == "mcp_tools":
-                logger.debug(
-                    f"Recovery attempt {attempt} returned MCP tool calls, returning to agentic loop"
-                )
-                return response
-
-            recovery_history.append(f"Attempt {attempt}: {evaluation.failure_reason}")
-            logger.warning(f"Parse recovery attempt {attempt} failed: {evaluation.failure_reason}")
-
-        # All recovery attempts exhausted - raise detailed error
-        logger.error(
-            f"Parse recovery exhausted after {effective_max_recovery} attempts. "
-            f"History: {'; '.join(recovery_history)}"
-        )
-        # A schema-shape failure keeps its own error: it names the offending
-        # field and type, which the generic parse error would discard.
-        if evaluation.schema_error is not None:
-            raise evaluation.schema_error
-        # is_retryable=False marks this as terminal: _is_retryable_error()
-        # honors the flag directly for ProviderError, so the outer retry loop
-        # will not retry parse exhaustion.
-        raise ProviderError(
-            f"Failed to extract valid JSON after {effective_max_recovery} recovery attempts",
-            suggestion=(
-                "Claude did not use the emit_output tool and returned invalid JSON. "
-                f"Recovery history: {'; '.join(recovery_history)}. "
-                "Tip: if this agent produces large or free-form output, "
-                "add 'output_mode: raw' to skip JSON extraction."
+        self._retry_history.clear()
+
+        def intercepting_callback(event_type: str, data: dict[str, Any]) -> None:
+            if event_type == "agent_retry":
+                self._retry_history.append(data)
+            if event_callback is not None:
+                event_callback(event_type, data)
+
+        outcome = await execute_with_retry(
+            coro_factory=lambda: run_with_interrupt(
+                agent=pydantic_agent,
+                user_prompt=rendered_prompt,
+                interrupt_signal=interrupt_signal,
+                event_callback=intercepting_callback,
+                has_output_schema=bool(agent.output),
+                usage_limits=UsageLimits(request_limit=max_iterations),
+                max_session_seconds=max_session,
+                max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
             ),
-            is_retryable=False,
+            retry_config=retry_cfg,
+            event_callback=intercepting_callback,
+            agent_name=agent.name,
         )
 
-    def _build_recovery_instruction(self, failure_reason: str, *, is_schema_failure: bool) -> str:
-        """Build the user-turn instruction sent on a recovery attempt.
+        if outcome.is_cancelled:
+            raise asyncio.CancelledError()
 
-        Args:
-            failure_reason: Diagnosis of what went wrong on the last attempt.
-            is_schema_failure: True when the response parsed cleanly but a
-                field had the wrong type, which needs different wording from
-                a syntax error.
+        model_name = self._model_name_from_pydantic_agent(pydantic_agent)
 
-        Returns:
-            The instruction text for the recovery user message.
-        """
-        if is_schema_failure:
-            return (
-                f"Your previous response was valid JSON but did not match the required "
-                f"output schema. {failure_reason} Please correct the field types and "
-                "respond again.\n\n"
-                "IMPORTANT: Use the 'emit_output' tool to return your response in the "
-                "required structured format. Return scalar values directly rather than "
-                "wrapping them in an object."
+        if outcome.is_partial:
+            content = self._build_partial_content(outcome.partial_output, agent.output, agent.name)
+            total_usage = outcome.total_usage or {}
+            return AgentOutput(
+                content=content,
+                raw_response=outcome.partial_output,
+                tokens_used=total_usage.get("total_tokens"),
+                input_tokens=total_usage.get("request_tokens"),
+                output_tokens=total_usage.get("response_tokens"),
+                partial=True,
+                model=model_name,
             )
-        return (
-            f"Your previous response did not contain valid JSON. {failure_reason} "
-            "Please provide your response in valid JSON format.\n\n"
-            "IMPORTANT: Use the 'emit_output' tool to return your response "
-            "in the required structured format."
+
+        if outcome.result is None:
+            raise ProviderError(
+                f"Agent '{agent.name}' produced no result",
+                suggestion="Check the model and prompt configuration.",
+                is_retryable=False,
+            )
+
+        content = extract_content(outcome.result.output, agent.output, agent.name)
+        return build_agent_output(
+            content=content,
+            raw_response=outcome.result,
+            usage=outcome.result.usage,
+            model=model_name,
         )
 
-    def _evaluate_structured_response(
+    def _model_name_from_pydantic_agent(self, pydantic_agent: Any) -> str:
+        """Return a resolved model name from a Pydantic AI agent instance."""
+        model = pydantic_agent.model
+        if model is None:
+            return self._default_model
+        if hasattr(model, "model_name"):
+            return model.model_name
+        if hasattr(model, "name"):
+            return model.name
+        return str(model)
+
+    def _build_partial_content(
         self,
-        response: Any,
-        output_schema: dict[str, OutputField],
-    ) -> _StructuredEvaluation:
-        """Classify a response against the declared output schema.
-
-        Schema validation runs here, inside the recovery loop, so a
-        wrong-shaped field is re-prompted like any other contract violation
-        rather than escaping to the caller as a terminal error.
-
-        MCP tool calls are deliberately not validated: that response is not a
-        final answer, and the agentic loop still has tools to execute.
-
-        Args:
-            response: Claude API response.
-            output_schema: Expected output schema.
-
-        Returns:
-            An evaluation carrying everything the recovery loop needs: the
-            outcome, the text to replay as the assistant turn, the failure
-            description to log and re-prompt with, and the validation error to
-            re-raise once the budget runs out.
-        """
-        raw_content = self._extract_structured_output(response)
-        from_tool_use = raw_content is not None
-
-        if raw_content is None:
-            if self._has_mcp_tool_use(response):
-                return _StructuredEvaluation("mcp_tools")
-            raw_content = self._extract_json_fallback(response)
-            if raw_content is not None:
-                logger.warning(
-                    "Claude returned text instead of tool_use, but JSON extraction "
-                    "succeeded via fallback parsing. Consider reviewing prompt to "
-                    "encourage tool usage."
-                )
-
-        if raw_content is None:
-            text = self._extract_text_from_response(response)
-            return _StructuredEvaluation(
-                "parse_error",
-                replay_text=text,
-                failure_reason=self._diagnose_json_failure(text),
-            )
-
-        try:
-            normalized = normalize_agent_output(raw_content, output_schema)
-            validate_output(normalized, output_schema)
-        except ValidationError as exc:
-            # Replay the bad answer as plain text. Appending a real tool_use
-            # block without a matching tool_result would violate the Anthropic
-            # message contract.
-            if from_tool_use:
-                replay_text = json.dumps(raw_content, default=str)
-            else:
-                replay_text = self._extract_text_from_response(response)
-            return _StructuredEvaluation(
-                "schema_error",
-                replay_text=replay_text,
-                failure_reason=str(exc),
-                schema_error=exc,
-            )
-
-        return _StructuredEvaluation("success")
-
-    def _diagnose_json_failure(self, text: str) -> str:
-        """Diagnose why JSON extraction failed from text response.
-
-        Args:
-            text: The text content that failed to parse.
-
-        Returns:
-            Human-readable diagnosis of the failure.
-        """
-        if not text.strip():
-            return "Response was empty."
-
-        # Check for incomplete JSON patterns
-        if "{" in text and "}" not in text:
-            return "Found incomplete JSON (opening brace without closing)."
-        if "[" in text and "]" not in text:
-            return "Found incomplete JSON (opening bracket without closing)."
-
-        # Check if it looks like JSON but has syntax errors
-        if text.strip().startswith(("{", "[")):
-            return "Found malformed JSON (syntax error in structure)."
-
-        # Try to find JSON code block
-        if "```" in text:
-            if "```json" not in text:
-                return "Found code block but not marked as JSON."
-            return "Found JSON code block but it contains syntax errors."
-
-        # No JSON-like content found
-        return "No JSON content found in response text."
-
-    def _process_response_content_blocks(
-        self, response: Any
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        """Process content blocks from Claude response for debugging.
-
-        RETENTION RATIONALE: Reserved for Phase 2 MCP tool integration where
-        detailed tool_use block inspection will be required for tool call tracing
-        and debugging. Tested to ensure API contract remains stable.
-
-        Args:
-            response: Claude API response with content blocks.
-
-        Returns:
-            Tuple of (all_blocks, tool_use_data) where:
-                - all_blocks: List of dicts describing each content block
-                - tool_use_data: Dict from emit_output tool_use, or None
-        """
-        blocks = []
-        tool_use_data = None
-
-        for block in response.content:
-            if hasattr(block, "type"):
-                if block.type == "text":
-                    blocks.append(
-                        {
-                            "type": "text",
-                            "text": block.text,
-                        }
-                    )
-                elif block.type == "tool_use":
-                    blocks.append(
-                        {
-                            "type": "tool_use",
-                            "name": block.name,
-                            "id": getattr(block, "id", None),
-                        }
-                    )
-                    # Capture emit_output tool data
-                    if block.name == "emit_output":
-                        tool_use_data = dict(block.input)
-
-        logger.debug(f"Processed {len(blocks)} content blocks from response")
-        return blocks, tool_use_data
-
-    def _extract_token_usage(self, response: Any) -> int | None:
-        """Extract token usage from Claude response.
-
-        Args:
-            response: Claude API response with usage metadata.
-
-        Returns:
-            Total tokens used (input + output), or None if not available.
-
-        Note:
-            Claude response.usage contains input_tokens and output_tokens.
-            This method sums both to provide total usage.
-        """
-        if not hasattr(response, "usage"):
-            logger.debug("Response does not contain usage metadata")
-            return None
-
-        usage = response.usage
-        input_tokens = getattr(usage, "input_tokens", 0)
-        output_tokens = getattr(usage, "output_tokens", 0)
-        total = input_tokens + output_tokens
-
-        logger.debug(f"Token usage: {input_tokens} input + {output_tokens} output = {total} total")
-        return total
-
-    def _build_messages(self, rendered_prompt: str) -> list[dict[str, str]]:
-        """Build message list for Claude API.
-
-        Args:
-            rendered_prompt: The user prompt to send.
-
-        Returns:
-            List of message dicts with role and content.
-        """
-        return [
-            {
-                "role": "user",
-                "content": rendered_prompt,
-            }
-        ]
-
-    def _build_tools_for_structured_output(
-        self, output_schema: dict[str, OutputField]
-    ) -> list[dict[str, Any]]:
-        """Convert output schema to Claude tool definition.
-
-        Args:
-            output_schema: Agent's output schema.
-
-        Returns:
-            List containing single tool definition for structured output.
-        """
-        # Build JSON schema from OutputField definitions
-        properties = self._build_json_schema_properties(output_schema)
-        required = list(output_schema.keys())
-
-        return [
-            {
-                "name": "emit_output",
-                "description": "Emit the structured output for this task",
-                "input_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
-            }
-        ]
-
-    def _build_json_schema_properties(
-        self, schema: dict[str, OutputField], depth: int = 0
+        partial_output: Any,
+        output_schema: dict[str, OutputField] | None,
+        agent_name: str,
     ) -> dict[str, Any]:
-        """Build JSON Schema properties from OutputField definitions.
+        """Build a content dict from a partial/interrupted output."""
+        from conductor.executor.output import parse_json_output
 
-        Args:
-            schema: Dictionary mapping field names to OutputField definitions.
-            depth: Current nesting depth (for recursion safety).
+        if isinstance(partial_output, BaseModel):
+            return partial_output.model_dump()
 
-        Returns:
-            Dictionary of JSON Schema property definitions.
+        if isinstance(partial_output, str):
+            if output_schema is not None:
+                try:
+                    return parse_json_output(partial_output)
+                except ValidationError:
+                    pass
+            return {"result": partial_output}
 
-        Raises:
-            ValidationError: If schema nesting exceeds max depth.
-        """
-        try:
-            return build_json_schema_properties(
-                schema, depth=depth, max_depth=self._max_schema_depth
-            )
-        except SchemaDepthError as exc:
-            raise ValidationError(
-                f"Schema nesting depth exceeds maximum of {self._max_schema_depth} levels",
-                suggestion="Simplify your output schema to reduce nesting depth",
-            ) from exc
-
-    def _extract_output(
-        self, response: Any, output_schema: dict[str, OutputField] | None
-    ) -> dict[str, Any]:
-        """Extract structured output from Claude response.
-
-        Tries tool_use blocks first, falls back to text parsing. Wrapper-shaped
-        scalars are normalized here so the content returned to the caller
-        matches what the recovery loop validated.
-
-        Args:
-            response: Claude API response.
-            output_schema: Expected output schema (None if no schema).
-
-        Returns:
-            Extracted content as dict.
-
-        Raises:
-            ProviderError: If extraction fails.
-            ValidationError: If the response is JSON but not an object.
-        """
-        # If no schema, extract text content
-        if not output_schema:
-            return self._extract_text_content(response)
-
-        # Try to extract from tool_use blocks
-        content = self._extract_structured_output(response)
-        if content is not None:
-            return normalize_agent_output(content, output_schema)
-
-        # Fallback: try to parse JSON from text
-        content = self._extract_json_fallback(response)
-        if content is not None:
-            return normalize_agent_output(content, output_schema)
-
-        # If both failed, raise error
-        raise ProviderError(
-            "Failed to extract structured output from Claude response",
-            suggestion="Ensure the agent is using the emit_output tool or returning valid JSON",
-        )
-
-    def _extract_text_content(self, response: Any) -> dict[str, Any]:
-        """Extract plain text content when no schema is defined.
-
-        Args:
-            response: Claude API response.
-
-        Returns:
-            Dict with 'result' key containing the response text.
-            Uses 'result' (not 'text') to maintain parity with CopilotProvider.
-        """
-        text_parts = []
-        for block in response.content:
-            if hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
-
-        return {"result": "\n".join(text_parts)}
-
-    def _maybe_rewrite_truncation_hint(
-        self,
-        result: str,
-        tools: list[dict[str, Any]] | None,
-    ) -> str:
-        """Replace the generic truncation hint with an fs hint when applicable.
-
-        Truncation is detected by the presence of the ``[output truncated:``
-        marker in the trailing part of the result string. The generic hint is
-        only replaced when the marker also advertises a spill file (i.e. the
-        marker contains the ``full output saved to:`` text), so the model is not
-        told to read a file that does not exist.
-
-        The replacement is an exact string substitution so no shared mutable
-        state or placeholder mechanism is required.
-
-        Args:
-            result: The possibly truncated MCP tool result string.
-            tools: The tool definitions sent to the model (may be None).
-
-        Returns:
-            The result string, possibly with the hint rewritten.
-        """
-        truncation_info = self._parse_truncation_marker(result)
-        if truncation_info is None:
-            return result
-        if not self._has_fs_like_tool(tools):
-            return result
-        if not truncation_info.get("spill_path"):
-            return result
-        idx = result.rfind(GENERIC_HINT)
-        if idx == -1:
-            return result
-        return result[:idx] + FS_HINT + result[idx + len(GENERIC_HINT) :]
-
-    def _parse_truncation_marker(
-        self,
-        result: str,
-    ) -> dict[str, Any] | None:
-        """Parse truncation metadata from the marker appended to a result.
-
-        The marker is generated in ``MCPManager._maybe_truncate_response`` and
-        always has the form::
-
-            [output truncated: {original} chars -> {kept} kept{; optional path}. {HINT}]
-
-        This method detects the marker only in the trailing 8192 characters of
-        ``result`` to avoid matching unrelated text while still accommodating
-        long POSIX spill file paths (PATH_MAX ~4096 + marker overhead). The
-        marker is parsed from the local string so no shared mutable state is
-        needed, which keeps the parser safe when the same MCP manager is reused
-        across parallel agents.
-
-        Args:
-            result: The possibly truncated MCP tool result string.
-
-        Returns:
-            A dict with ``original_chars``, ``kept_chars``, and ``spill_path``
-            (``None`` when the marker omits a path), or ``None`` when the
-            result is not truncated.
-        """
-        if not result or TRUNCATION_MARKER_PREFIX not in result[-TAIL_WINDOW:]:
-            return None
-
-        tail = result[-TAIL_WINDOW:]
-        match = re.search(
-            r".*"
-            + re.escape(TRUNCATION_MARKER_PREFIX)
-            + r"\s*(\d+)\s*chars\s*-\u003e\s*(\d+)\s*kept"
-            + r"(?:;\s*full output saved to:\s*(.+?))?\."
-            + r"\s*"
-            + r"(?:"
-            + re.escape(GENERIC_HINT)
-            + r"|"
-            + re.escape(FS_HINT)
-            + r")"
-            + r"\]\s*$",
-            tail,
-            re.DOTALL,
-        )
-
-        if not match:
-            return None
-
-        original_chars = int(match.group(1))
-        kept_chars = int(match.group(2))
-        spill_path = match.group(3).strip() if match.group(3) else None
-
-        return {
-            "original_chars": original_chars,
-            "kept_chars": kept_chars,
-            "spill_path": spill_path,
-        }
-
-    # Keywords marking a tool that can read a file's contents from a known
-    # path. The agent already has the exact spill path from the marker, so the
-    # only capability it needs is reading/grepping by path — not searching for
-    # files (find/ls/glob) or writing them (edit/write). Whole-name substring
-    # containment would trip on any tool whose name merely contains "ls" or
-    # "file" (e.g. "translate", "fileupload"), rewriting the hint to advertise
-    # filesystem tools the agent does not actually have, so a keyword must
-    # equal a complete underscore/dash segment ("read_file" -> "read").
-    _FS_TOOL_KEYWORDS = frozenset(
-        {
-            "read",
-            "grep",
-            "view",
-            "cat",
-            "open",
-            "load",
-            "file",
-            "bash",
-            "shell",
-        }
-    )
-
-    def _has_fs_like_tool(self, tools: list[dict[str, Any]] | None) -> bool:
-        """Return True if any tool looks like a filesystem/shell tool.
-
-        The check is heuristic: after stripping the ``server__`` prefix, the
-        tool name is split on non-alphanumeric characters and each resulting
-        segment is compared (case-insensitively) against common
-        filesystem/shell keywords. A keyword must equal an entire segment, so
-        "translate" or "fileupload" do not match while "ls", "read_file" and
-        "view_code" still do. A None tool list means no tools were allowed,
-        so filesystem-like tools are not available.
-        """
-        if not tools:
-            return False
-
-        for tool in tools:
-            name = tool.get("name", "")
-            if "__" in name:
-                name = name.split("__", 1)[1]
-            segments = re.split(r"[^A-Za-z0-9]+", name.lower())
-            if any(segment in self._FS_TOOL_KEYWORDS for segment in segments):
-                return True
-        return False
-
-    def _extract_structured_output(self, response: Any) -> dict[str, Any] | None:
-        """Extract structured output from tool_use content blocks.
-
-        Args:
-            response: Claude API response.
-
-        Returns:
-            Extracted content dict, or None if no tool_use found.
-        """
-        for block in response.content:
-            is_tool_use = hasattr(block, "type") and block.type == "tool_use"
-            if is_tool_use and block.name == "emit_output":
-                return dict(block.input)
-        return None
-
-    def _has_mcp_tool_use(self, response: Any) -> bool:
-        """Check if response contains non-emit_output tool_use blocks (MCP tool calls).
-
-        Args:
-            response: Claude API response.
-
-        Returns:
-            True if response contains MCP tool calls that the agentic loop should handle.
-        """
-        return any(
-            hasattr(block, "type") and block.type == "tool_use" and block.name != "emit_output"
-            for block in response.content
-        )
-
-    def _extract_json_fallback(self, response: Any) -> dict[str, Any] | None:
-        """Fallback: parse JSON from text content.
-
-        Args:
-            response: Claude API response.
-
-        Returns:
-            Parsed JSON dict, or None if parsing fails.
-        """
-        text_parts = []
-        for block in response.content:
-            if hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
-
-        text = "\n".join(text_parts)
-
-        # Try to find and parse JSON
-        try:
-            # Look for JSON code blocks
-            if "```json" in text:
-                start_idx = text.find("```json")
-                if start_idx != -1:
-                    start = start_idx + 7
-                    end = text.find("```", start)
-                    if end != -1:
-                        json_str = text[start:end].strip()
-                        try:
-                            return json.loads(json_str)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"JSON code block parsing failed: {e}")
-                            # Fall through to try whole text
-
-            # Try parsing the whole text
-            result = json.loads(text)
-            logger.debug("Successfully parsed JSON from text response")
-            return result
-        except json.JSONDecodeError as e:
-            logger.debug(f"JSON fallback parsing failed: {e}")
-            return None
-
-    def _extract_text_from_response(self, response: Any) -> str:
-        """Extract raw text content from Claude response.
-
-        Used for building message history during parse recovery.
-
-        Args:
-            response: Claude API response.
-
-        Returns:
-            Combined text content from all text blocks.
-        """
-        text_parts = []
-        for block in response.content:
-            if hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
-
-        return "\n".join(text_parts)
+        return {"result": partial_output}

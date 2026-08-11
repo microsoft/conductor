@@ -126,15 +126,9 @@ agents:
 
     max_agent_iterations: 100    # Override workflow default for this agent (optional)
     max_session_seconds: 60      # Wall-clock timeout for this agent (optional, soft, between iterations)
-    session_key: investigation   # Continue ONE provider session across every execution tagged with
-                                 # this key — loop-backs and cross-agent hand-off (optional).
-                                 # Static literal label: never Jinja2-rendered, stripped, non-empty.
-                                 # Only the claude-agent-sdk provider consumes it; sessions are scoped
-                                 # per working directory. Sharing a key across concurrent executions
-                                 # (two parallel members, or for_each with max_concurrent > 1) is a
-                                 # validation error. Forbidden on
-                                 # script/human_gate/workflow/wait/set/terminate types.
-                                 # See docs/workflow-syntax.md "Session Continuity (`session_key`)".
+    session_key: investigation   # Optional. Executions sharing this key continue ONE provider
+                                 # session (loop-backs, cross-agent hand-off). Static label, never
+                                 # rendered. claude-agent-sdk only. See workflow-syntax.md.
     timeout_seconds: 120         # Hard wall-clock cancellation for this agent (provider-backed only).
                                  # Engine wraps execution in asyncio.wait_for(); raises AgentTimeoutError.
                                  # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
@@ -229,6 +223,18 @@ See `examples/validator.yaml` for a complete example.
 
 `skills` enables reusable knowledge or capability bundles for provider-backed agents. The Conductor distribution ships one built-in skill — `conductor` — which packages the YAML schema, execution model, and authoring patterns (the same content this reference doc covers) so an agent can evaluate, improve, debug, or generate Conductor workflows.
 
+**Names and paths.** Each entry is either a registered built-in name or a filesystem path. The distinction is syntactic: an entry is a path when it starts with `.` or `~`, or contains `/` or `\` — everything else must be a built-in name, so a bare `conductor` is never shadowed by a same-named local directory. A path points at either a single skill directory (one holding `SKILL.md`) or a root of them, which expands to every immediate child holding one (not recursive). Relative paths resolve against the **workflow file's directory**, the same rule `working_dir` uses, so a skill can be versioned alongside the workflow with no per-developer install step and the workflow behaves identically from any working directory. Skill paths are trusted input — no allowlist applies, since the same file can already run arbitrary shell via `type: script`.
+
+**`SKILL.md` frontmatter.** Every resolved skill must declare a non-empty `name` and `description` in valid YAML frontmatter. Use a block scalar whenever the text contains a colon followed by a space — `description: Does things. Triggers: a, b` is invalid YAML, and both the Copilot CLI and Claude Code skip such a skill *silently*. Conductor parses it and fails loudly instead, at validate time and at run time:
+
+```yaml
+---
+name: acme-widgets
+description: |
+  Internal ACME widget conventions. Triggers: widget, acme widget.
+---
+```
+
 **Tri-state per-agent field (resolved via list presence):**
 - Omit `skills:` — inherit from `runtime.skills`
 - `skills: []` — explicit opt-out (no skills for this agent, regardless of workflow default)
@@ -238,18 +244,31 @@ See `examples/validator.yaml` for a complete example.
 
 **Provider mechanism (same observable contract — "the agent has access to the named skill"):**
 - **Copilot** — the resolved skill directory is registered on the SDK session via `skill_directories`, so the agent discovers and loads skill content natively (progressive disclosure via `SKILL.md` frontmatter). This is more token-efficient than eager injection.
-- **Claude** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
+- **Claude Agent SDK** — also native, through the Claude Code plugin surface: the plugin owning the skill is registered on the session and the skill enabled by its `<plugin>:<skill>` name. Skills the workflow did not declare are suppressed, so `skills: []` really is an opt-out and ambient skills from the machine never load.
+- **Claude** and **hermes** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
 
-Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown skill names fail at workflow validation time.
+**Two provider-specific limits worth knowing:**
+- `claude-agent-sdk` has **no bare skill-directory option** — a skill is enabled by name through the plugin that ships it. A path skill outside a Claude Code plugin is therefore rejected at validation time, with both remedies named (package it as a plugin, or run that agent on `copilot`, which accepts the identical skill untouched).
+- Eager injection has no progressive disclosure: the whole body is prepended on every call and every retry. The bundled `conductor` skill alone is ~117KB (~29K tokens). `runtime.skill_injection` bounds it — `warn_bytes` (default 64KB) warns, `max_bytes` (default 128KB) fails the agent, either can be `null` to disable. Providers with progressive disclosure are unaffected.
+
+Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown built-in names fail when the config loads; unresolvable paths and malformed `SKILL.md` files fail at workflow validation time and again at run time.
 
 ```yaml
 workflow:
   runtime:
-    skills: [conductor]             # all provider-backed agents get the conductor skill
+    skills:
+      - conductor                   # built-in: ships in the wheel
+      - ./team-skills/acme-widgets  # path: versioned next to this workflow
+    skill_injection:                # only bounds eager-injection providers
+      warn_bytes: 65536
+      max_bytes: 131072
+    skill_discovery:                # off by default
+      sources: [personal, project]
+      exclude: [scratch-notes]
 
 agents:
   - name: workflow_reviewer
-    skills: [conductor]             # per-agent opt-in (redundant here, kept for clarity)
+    skills: [conductor]             # explicit set, replaces the workflow default
     prompt: "Review this workflow for correctness..."
 
   - name: simple_agent
@@ -257,7 +276,48 @@ agents:
     prompt: "Do something simple."
 ```
 
-See `examples/skills-self-improving-workflow.yaml` for a complete example.
+**Discovering installed skills.** `runtime.skill_discovery` picks up skills already installed on the machine so a workflow need not enumerate a personal or team library. It is **off by default**, because an ambient set is the one part of a workflow the YAML does not capture — the same file can behave differently on a teammate's machine or in CI.
+
+Conductor scans the locations itself and unions both CLIs' conventions, rather than asking each provider to discover its own. That is the substance of the feature, not an implementation detail: discovery locations are provider-specific, so a per-provider flag would give a `copilot` agent and a `claude-agent-sdk` agent **different skill sets inside a single run**. Scanning centrally also keeps the providers' own discovery off, which matters because Copilot's would additionally auto-load MCP servers from any `.mcp.json` in the working directory.
+
+- `personal` → `~/.copilot/skills`, `~/.claude/skills`
+- `project` → `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root
+
+Discovered skills join `runtime.skills`, so the tri-state is unchanged: an agent that declares its own `skills:` overrides discovery too. Sources are scanned in a fixed order (`project`, then `personal`) whatever order they are written in, so reordering cannot change which of two same-named skills wins. A skill named in `skills:` always beats a discovered one of the same name — which comes up immediately, since installing Conductor's own plugin puts a second `conductor` skill on the machine.
+
+Discovered content is held to a laxer standard than declared content: broken frontmatter, a taken name, an unreadable directory, or a skill `claude-agent-sdk` cannot load are all errors for a declared skill and warning-plus-skip for a discovered one. The exception is a provider with no native skill surface at all (`claude`, `hermes`), where skipping would drop the whole discovered set — that combination is an error either way. The author asked for one by name and not the other.
+
+Provider support is narrower than for declared skills. `copilot` is fully supported. `claude-agent-sdk` only loads a discovered skill that lives inside a Claude Code plugin, and most installed Copilot plugins are not — expect a warning per skipped skill, silenced with `exclude`. `claude` and `hermes` **reject discovery at validation time**: they inject every body into every prompt, and a discovered set is unbounded and machine-dependent, so no `skill_injection` limit makes it safe.
+
+Run `conductor validate` to see what discovery found — it lists every skill, the location it came from, and the total size if eagerly injected.
+
+There is deliberately no `plugins` source. Scanning a plugin's `skills/` reached into a plugin and took one of the three things it ships, leaving its subagents and MCP servers behind — the bug `runtime.plugins` exists to fix. Name plugins there instead; that brings the whole unit and, unlike a scan, reproduces on another machine.
+
+See `examples/skills-self-improving-workflow.yaml` and `examples/skills-discovery.yaml` for complete examples.
+
+## Plugins
+
+A skill is instructions. A **plugin** is the unit people install, and it ships up to three things Conductor uses: `skills/`, `agents/*.agent.md` subagents, and MCP servers declared in `.mcp.json` or the manifest. `runtime.plugins` (and per-agent `plugins:`) opts into all three, on the same tri-state as `skills:` — omitted inherits, `[]` opts out, a list overrides.
+
+```yaml
+runtime:
+  plugins:
+    - prs                    # installed plugin: everything it ships
+    - name: ./tools/mine     # path, relative to the workflow file
+      mcp: false             # skills and subagents only
+```
+
+Enabling all three matters because they are written together: a plugin's `SKILL.md` routinely tells the agent to dispatch to `prs:code-reviewer` or call an `ado` MCP tool. Loading only the instructions produces an agent that reads them correctly, reaches for something never registered, and says nothing — which is why every component defaults **on**.
+
+An entry is an installed plugin name (searched under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`) or a path, classified syntactically exactly as `skills:` entries are. An uninstalled or ambiguous name is a hard error.
+
+`mcp: false` is the switch worth knowing: an MCP server is a subprocess launched with the user's credentials, started at session creation rather than at first tool call. `hooks/` and `commands/` are never loaded, and `conductor validate` warns when a plugin ships them.
+
+Supported on `copilot` and `claude-agent-sdk` only; `claude`, `hermes` and `aca` reject `plugins:` at validation time, since injecting text into a prompt cannot produce a subagent or an MCP server. Conductor deconstructs a plugin rather than registering its root, because both SDKs' whole-plugin surfaces are all-or-nothing — on Copilot, hiding an MCP tool does not stop its server launching. The one carve-out: on `claude-agent-sdk`, reaching a plugin's skills requires registering the root, which carries every subagent with it, so `agents: false` alongside `skills: true` is refused there.
+
+Plugins are never discovered — a plugin loads because a workflow named it. `conductor validate` prints what each contributes, including every subagent by name.
+
+See `examples/plugins.yaml` for a complete example.
 
 ## Routing Patterns
 

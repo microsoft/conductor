@@ -15,6 +15,7 @@ part of the returned string.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -35,13 +36,13 @@ try:
     from mcp.client.stdio import StdioServerParameters, stdio_client
     from mcp.types import TextContent
 
-    MCP_SDK_AVAILABLE = True
 except ImportError:
-    MCP_SDK_AVAILABLE = False
     ClientSession = None  # type: ignore[misc, assignment]
     StdioServerParameters = None  # type: ignore[misc, assignment]
     stdio_client = None  # type: ignore[misc, assignment]
     TextContent = None  # type: ignore[misc, assignment]
+
+MCP_SDK_AVAILABLE = ClientSession is not None
 
 
 # Marker constants. The generic hint is embedded by the manager and replaced
@@ -119,11 +120,11 @@ class MCPManager:
         if not MCP_SDK_AVAILABLE:
             raise ImportError("MCP SDK not installed. Install with: uv add 'mcp>=1.0.0'")
 
-        self.sessions: dict[str, ClientSession] = {}
+        self.sessions: dict[str, Any] = {}
         self.tools: dict[str, list[dict[str, Any]]] = {}  # server -> tools
         self.tool_to_server: dict[str, str] = {}  # prefixed_name -> server
-        self._exit_stack = AsyncExitStack()
-        self._initialized = False
+        self._connection_tasks: dict[str, asyncio.Task[None]] = {}
+        self._connection_stops: dict[str, asyncio.Event] = {}
         self._tool_output = tool_output or ToolOutputConfig()
 
     async def connect_server(
@@ -163,59 +164,111 @@ class MCPManager:
         """
         if not MCP_SDK_AVAILABLE:
             raise RuntimeError("MCP SDK not available")
+        assert StdioServerParameters is not None
+        assert stdio_client is not None
+        assert ClientSession is not None
+        server_parameters_type = StdioServerParameters
+        open_stdio = stdio_client
+        session_type = ClientSession
+        if name in self._connection_tasks:
+            raise RuntimeError(f"MCP server '{name}' is already connected or connecting")
 
         logger.info(f"Connecting to MCP server '{name}': {command} {args or []}")
 
         # Build server parameters
-        server_params = StdioServerParameters(
+        server_params = server_parameters_type(
             command=command,
             args=args or [],
             env=env,
             cwd=cwd,
         )
 
+        ready: asyncio.Future[list[dict[str, Any]]] = asyncio.get_running_loop().create_future()
+        stop = asyncio.Event()
+
+        async def own_connection_lifecycle() -> None:
+            try:
+                async with AsyncExitStack() as stack:
+                    transport = await stack.enter_async_context(open_stdio(server_params))
+                    read_stream, write_stream = transport
+                    session = await stack.enter_async_context(
+                        session_type(read_stream, write_stream)
+                    )
+                    await session.initialize()
+
+                    response = await session.list_tools()
+                    tools: list[dict[str, Any]] = []
+                    for tool in response.tools:
+                        prefixed_name = f"{name}__{tool.name}"
+                        tools.append(
+                            {
+                                "name": prefixed_name,
+                                "description": tool.description or "",
+                                "input_schema": tool.inputSchema,
+                                "server": name,
+                                "original_name": tool.name,
+                            }
+                        )
+                        self.tool_to_server[prefixed_name] = name
+
+                    self.sessions[name] = session
+                    self.tools[name] = tools
+                    ready.set_result(tools)
+                    await stop.wait()
+            except asyncio.CancelledError:
+                if not ready.done():
+                    ready.cancel()
+                raise
+            except Exception as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+
+        task = asyncio.create_task(
+            own_connection_lifecycle(),
+            name=f"mcp-lifecycle-{name}",
+        )
+        self._connection_tasks[name] = task
+        self._connection_stops[name] = stop
+
         try:
-            # Enter the stdio_client context
-            transport = await self._exit_stack.enter_async_context(stdio_client(server_params))
-            read_stream, write_stream = transport
+            tools = await asyncio.shield(ready)
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.cancel()
+            task.cancel()
+            cleanup = asyncio.gather(task, return_exceptions=True)
+            # Await the owner task's teardown under a re-shielding loop: a
+            # repeated cancellation of connect_server() lands on the shield
+            # instead of the gather, so cleanup still completes and the
+            # bookkeeping below always runs.
+            results: list[BaseException | None] | None = None
+            while results is None:
+                try:
+                    results = list(await asyncio.shield(cleanup))
+                except asyncio.CancelledError:
+                    if cleanup.done():
+                        results = list(cleanup.result())
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Error cancelling MCP connection '{name}': {result}")
+            self._connection_tasks.pop(name, None)
+            self._connection_stops.pop(name, None)
+            self._discard_server_state(name)
+            raise
+        except Exception as exc:
+            await asyncio.gather(task, return_exceptions=True)
+            self._connection_tasks.pop(name, None)
+            self._connection_stops.pop(name, None)
+            self._discard_server_state(name)
+            logger.error(f"Failed to connect to MCP server '{name}': {exc}", exc_info=exc)
+            raise RuntimeError(f"Failed to connect to MCP server '{name}': {exc}") from exc
 
-            # Create and initialize session
-            session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await session.initialize()
-
-            self.sessions[name] = session
-            self._initialized = True
-
-            # Fetch and store tools
-            response = await session.list_tools()
-            tools: list[dict[str, Any]] = []
-
-            for tool in response.tools:
-                # Prefix tool name with server name to avoid collisions
-                prefixed_name = f"{name}__{tool.name}"
-                tool_def = {
-                    "name": prefixed_name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema,
-                    "server": name,
-                    "original_name": tool.name,
-                }
-                tools.append(tool_def)
-                self.tool_to_server[prefixed_name] = name
-
-            self.tools[name] = tools
-            logger.info(
-                f"Connected to MCP server '{name}' with {len(tools)} tools: "
-                f"{[t['original_name'] for t in tools]}"
-            )
-
-            return tools
-
-        except Exception as e:
-            logger.error(f"Failed to connect to MCP server '{name}': {e}")
-            raise RuntimeError(f"Failed to connect to MCP server '{name}': {e}") from e
+        logger.info(
+            f"Connected to MCP server '{name}' with {len(tools)} tools: "
+            f"{[tool['original_name'] for tool in tools]}"
+        )
+        return tools
 
     async def call_tool(
         self,
@@ -491,25 +544,52 @@ class MCPManager:
         """
         return len(self.sessions) > 0
 
+    def _discard_server_state(self, server_name: str) -> None:
+        self.sessions.pop(server_name, None)
+        self.tools.pop(server_name, None)
+        stale_tools = [
+            tool_name
+            for tool_name, mapped_server in self.tool_to_server.items()
+            if mapped_server == server_name
+        ]
+        for tool_name in stale_tools:
+            self.tool_to_server.pop(tool_name, None)
+
     async def close(self) -> None:
         """Close all server connections and clean up resources.
 
         This method should be called when the manager is no longer needed.
         It properly closes all stdio connections and cleans up internal state.
+        Cancellation is deliberately absorbed until owner-task teardown
+        completes, so task-affine MCP contexts are never orphaned.
         """
-        if not self._initialized:
+        if not self._connection_tasks:
             return
 
-        logger.debug(f"Closing {len(self.sessions)} MCP server connection(s)")
+        logger.debug(f"Closing {len(self._connection_tasks)} MCP server connection(s)")
 
-        try:
-            await self._exit_stack.aclose()
-        except Exception as e:
-            logger.warning(f"Error closing MCP connections: {e}")
+        for stop in self._connection_stops.values():
+            stop.set()
+
+        cleanup = asyncio.gather(*self._connection_tasks.values(), return_exceptions=True)
+        # Await teardown under a re-shielding loop: a repeated cancellation of
+        # close() lands on the shield instead of the gather, so cleanup still
+        # completes before bookkeeping is cleared.
+        results: list[BaseException | None] | None = None
+        while results is None:
+            try:
+                results = list(await asyncio.shield(cleanup))
+            except asyncio.CancelledError:
+                if cleanup.done():
+                    results = list(cleanup.result())
 
         self.sessions.clear()
         self.tools.clear()
         self.tool_to_server.clear()
-        self._initialized = False
+        self._connection_tasks.clear()
+        self._connection_stops.clear()
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Error closing MCP connections: {result}")
 
         logger.debug("MCP manager closed")

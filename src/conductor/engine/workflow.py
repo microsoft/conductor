@@ -41,6 +41,7 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
+from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
 from conductor.executor.output import validate_output
@@ -53,10 +54,14 @@ from conductor.executor.set_step import (
 from conductor.executor.template import TemplateRenderer
 from conductor.executor.wait import WaitExecutor, WaitOutput
 from conductor.gates.human import (
+    GateChoice,
+    GatePrompt,
+    GateResponse,
     GateResult,
     HumanGateHandler,
     MaxIterationsHandler,
     MaxIterationsPromptResult,
+    option_for_value,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 from conductor.providers.base import AgentOutput, EventCallback
@@ -69,8 +74,11 @@ MAX_SUBWORKFLOW_DEPTH = 10
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
     from conductor.interrupt.listener import KeyboardListener
+    from conductor.plugins.marketplace import Marketplace
     from conductor.providers.base import AgentProvider
     from conductor.providers.registry import ProviderRegistry
     from conductor.web.server import WebDashboard
@@ -266,6 +274,25 @@ class ExecutionPlan:
     """Possible execution paths through the workflow."""
 
 
+_ANSWER_SOURCES = frozenset({"choice", "free_text", "default", "skipped"})
+"""Legal ``AnswerRecord.source`` values, for validating restored checkpoints."""
+
+
+def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
+    """Project a questions output down to the counts events carry.
+
+    Args:
+        output: A questions node output.
+
+    Returns:
+        The answered/skipped counts.
+    """
+    return {
+        "answered_count": output["answered_count"],
+        "skipped_count": output["skipped_count"],
+    }
+
+
 class WorkflowEngine:
     """Orchestrates multi-agent workflow execution.
 
@@ -305,6 +332,7 @@ class WorkflowEngine:
         run_context: RunContext | None = None,
         _dashboard_context_path: list[str] | None = None,
         instructions_preamble: str | None = None,
+        plugin_marketplaces: Mapping[str, Marketplace] | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -345,6 +373,13 @@ class WorkflowEngine:
                 to every agent's rendered prompt. Built from auto-discovered
                 workspace files, YAML ``instructions`` field, and/or CLI
                 ``--instructions`` flags. Inherited by sub-workflows.
+            plugin_marketplaces: Marketplaces resolved from
+                ``runtime.plugin_sources``, keyed by the name a
+                ``plugin@marketplace`` entry references. Resolved once by
+                the CLI before the engine starts — acquiring a git source
+                mid-run would stall an agent on a network round trip, and
+                a failure there would surface as an agent error rather
+                than a configuration one. Inherited by sub-workflows.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -410,6 +445,20 @@ class WorkflowEngine:
         # its own ``skills`` field.
         self._workflow_skills = list(config.workflow.runtime.skills)
 
+        # Workflow-level default plugins (runtime.plugins) — inherited on
+        # the same tri-state as skills. Never discovered: a plugin can
+        # launch MCP subprocesses with the user's credentials, so it is
+        # loaded only because a workflow named it.
+        self._workflow_plugins = list(config.workflow.runtime.plugins)
+
+        # Marketplaces declared in runtime.plugin_sources, resolved once
+        # up front by the CLI (`cli/run.py`) so no agent blocks on a
+        # network round trip mid-run. Empty when the CLI did not resolve
+        # them — a programmatic embedder can supply them via
+        # ``set_plugin_marketplaces``.
+        self._plugin_marketplaces: dict[str, Marketplace] = dict(plugin_marketplaces or {})
+        self._declared_plugin_sources = frozenset(config.workflow.runtime.plugin_sources)
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
@@ -418,6 +467,12 @@ class WorkflowEngine:
                 workflow_tools=config.tools,
                 instructions_preamble=self._instructions_preamble,
                 workflow_skills=self._workflow_skills,
+                workflow_dir=self._workflow_dir,
+                skill_injection=config.workflow.runtime.skill_injection,
+                skill_discovery=config.workflow.runtime.skill_discovery,
+                workflow_plugins=self._workflow_plugins,
+                plugin_marketplaces=self._plugin_marketplaces,
+                declared_plugin_sources=self._declared_plugin_sources,
             )
             self.provider = provider  # Keep for backward compatibility
         else:
@@ -457,6 +512,10 @@ class WorkflowEngine:
         # (issue #244) also set _last_checkpoint_path, so it can no longer
         # double as "the dashboard-stop handler already ran".
         self._dashboard_stop_handled: bool = False
+
+        # True only for the first questions node reached via resume(), so a
+        # loop-back re-asks rather than replaying the prior pass's answers.
+        self._resuming_questions: bool = False
         # Monotonic timestamp of the last periodic checkpoint (issue #244),
         # used to evaluate the runtime.checkpoint.every_seconds throttle at
         # step boundaries. None until the first periodic checkpoint is saved.
@@ -468,6 +527,11 @@ class WorkflowEngine:
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
+        # Memoizes `_resolve_subworkflow_path` per (base_dir, agent_workflow)
+        # for this engine's lifetime; see `_resolve_subworkflow_path` and
+        # `_resolve_subworkflow_path_uncached` for the full rationale and
+        # resume semantics.
+        self._subworkflow_path_cache: dict[tuple[str, str], Path] = {}
 
         # System metadata fields (set by CLI, used in workflow_started event)
         self._dashboard_port = self._run_context.dashboard_port
@@ -721,7 +785,116 @@ class WorkflowEngine:
 
         return system
 
-    def build_workflow_started_data(self) -> dict[str, Any]:
+    async def _build_static_subworkflow_topology(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+        depth: int,
+        visited: frozenset[Path],
+    ) -> dict[str, Any] | None:
+        """Best-effort eager resolution of a sub-workflow's topology.
+
+        Lets the dashboard render — and let the user expand — a sub-workflow's
+        internal DAG before the parent engine ever reaches that step. This is
+        safe to do eagerly because ``workflow:`` is a plain string field,
+        never Jinja-templated (``_execute_subworkflow``/
+        ``_execute_subworkflow_with_inputs`` pass ``agent.workflow`` to
+        ``_resolve_subworkflow_path`` unrendered).
+
+        Purely advisory: any failure (missing file, registry fetch error,
+        parse error, cyclic reference, depth limit, or a malformed/unexpected
+        sub-config shape while building the returned dict) is swallowed and
+        returns ``None`` — the sub-workflow still resolves normally,
+        synchronously, when the engine actually reaches it. The entire body
+        (including the recursive call and the final dict construction, not
+        just the initial file/config resolution) is covered by the single
+        broad ``except`` below so this guarantee holds at every recursion
+        depth.
+
+        Args:
+            agent_workflow: The ``workflow:`` field value from the agent def.
+            agent_name: Name of the containing agent (for error messages).
+            base_dir: Directory of the parent workflow file for relative
+                path resolution.
+            depth: Current recursion depth (mirrors ``_subworkflow_depth``).
+            visited: Resolved paths already seen on this recursion chain,
+                to guard against cyclic sub-workflow references.
+
+        Returns:
+            A dict with the same ``agents``/``routes``/``parallel_groups``/
+            ``for_each_groups``/``name``/``entry_point`` shape as the main
+            ``workflow_started`` payload, or ``None`` if it could not be
+            resolved statically.
+        """
+        from conductor.config.loader import load_config
+
+        if depth >= MAX_SUBWORKFLOW_DEPTH:
+            return None
+        try:
+            sub_path = await self._resolve_subworkflow_path(agent_workflow, agent_name, base_dir)
+            if not sub_path.is_file():
+                return None
+            resolved = sub_path.resolve()
+            if resolved in visited:
+                return None
+            sub_config = load_config(sub_path)
+
+            next_visited = visited | {resolved}
+            next_base_dir = resolved.parent
+
+            agents_out: list[dict[str, Any]] = []
+            for a in sub_config.agents:
+                entry: dict[str, Any] = {"name": a.name, "type": a.type or "agent"}
+                if a.type == "workflow" and a.workflow:
+                    entry["subworkflow"] = await self._build_static_subworkflow_topology(
+                        a.workflow, a.name, next_base_dir, depth + 1, next_visited
+                    )
+                agents_out.append(entry)
+
+            return {
+                "name": sub_config.workflow.name,
+                "entry_point": sub_config.workflow.entry_point,
+                "agents": agents_out,
+                "parallel_groups": [
+                    {"name": p.name, "agents": p.agents} for p in sub_config.parallel
+                ],
+                "for_each_groups": [
+                    {"name": f.name, "source": f.source} for f in sub_config.for_each
+                ],
+                "routes": [
+                    {"from": a.name, "to": r.to, "when": r.when}
+                    for a in sub_config.agents
+                    for r in a.routes
+                ]
+                + [
+                    {"from": a.name, "to": o.route, "when": f"selection == '{o.value}'"}
+                    for a in sub_config.agents
+                    if a.type == "human_gate" and a.options
+                    for o in a.options
+                ]
+                + [
+                    {"from": p.name, "to": r.to, "when": r.when}
+                    for p in sub_config.parallel
+                    for r in p.routes
+                ]
+                + [
+                    {"from": f.name, "to": r.to, "when": r.when}
+                    for f in sub_config.for_each
+                    for r in f.routes
+                ],
+            }
+        except Exception:  # noqa: BLE001 — defensive preview, see docstring
+            logger.debug(
+                "Could not eagerly resolve sub-workflow '%s' (agent '%s') for the dashboard "
+                "preview; it will still resolve normally when the engine reaches this step.",
+                agent_workflow,
+                agent_name,
+                exc_info=True,
+            )
+            return None
+
+    async def build_workflow_started_data(self) -> dict[str, Any]:
         """Build the ``workflow_started`` event payload from the current config.
 
         Extracted from :meth:`_execute_loop` so the CLI resume path can
@@ -818,28 +991,50 @@ class WorkflowEngine:
         for fe in self.config.for_each:
             _record_provider(fe.agent.provider or default_provider_name)
 
+        # Base dir for eager sub-workflow resolution (relative `workflow:`
+        # paths are resolved against the parent workflow file's directory).
+        subworkflow_base_dir = (
+            Path(self.workflow_path).resolve().parent if self.workflow_path else Path.cwd()
+        )
+        subworkflow_visited: frozenset[Path] = (
+            frozenset({Path(self.workflow_path).resolve()}) if self.workflow_path else frozenset()
+        )
+
+        agents_list: list[dict[str, Any]] = []
+        for a in self.config.agents:
+            entry: dict[str, Any] = {
+                "name": a.name,
+                "type": a.type or "agent",
+                "model": a.model,
+                # Provider that this agent will actually use at runtime
+                # — populated for every agent (including non-LLM types
+                # for consistency; consumers can filter on `type`).
+                "provider_name": _provider_for(a.name),
+                "reasoning_effort": (
+                    a.reasoning.effort if a.reasoning is not None else default_effort
+                ),
+                "context_tier": (a.context_tier if a.context_tier is not None else default_tier),
+            }
+            if a.type == "workflow" and a.workflow:
+                # Eagerly resolve the sub-workflow's topology so the
+                # dashboard can render it (and let the user expand it)
+                # before the engine ever reaches this step. Best-effort:
+                # `None` on any failure, in which case the dashboard falls
+                # back to its existing "not started yet" behavior.
+                entry["subworkflow"] = await self._build_static_subworkflow_topology(
+                    a.workflow,
+                    a.name,
+                    subworkflow_base_dir,
+                    self._subworkflow_depth,
+                    subworkflow_visited,
+                )
+            agents_list.append(entry)
+
         return {
             "name": self.config.workflow.name,
             "version": self._conductor_version(),
             "entry_point": self.config.workflow.entry_point,
-            "agents": [
-                {
-                    "name": a.name,
-                    "type": a.type or "agent",
-                    "model": a.model,
-                    # Provider that this agent will actually use at runtime
-                    # — populated for every agent (including non-LLM types
-                    # for consistency; consumers can filter on `type`).
-                    "provider_name": _provider_for(a.name),
-                    "reasoning_effort": (
-                        a.reasoning.effort if a.reasoning is not None else default_effort
-                    ),
-                    "context_tier": (
-                        a.context_tier if a.context_tier is not None else default_tier
-                    ),
-                }
-                for a in self.config.agents
-            ],
+            "agents": agents_list,
             "parallel_groups": [
                 {
                     "name": p.name,
@@ -968,6 +1163,12 @@ class WorkflowEngine:
                 workflow_tools=self.config.tools,
                 instructions_preamble=self._instructions_preamble,
                 workflow_skills=self._workflow_skills,
+                workflow_dir=self._workflow_dir,
+                skill_injection=self.config.workflow.runtime.skill_injection,
+                skill_discovery=self.config.workflow.runtime.skill_discovery,
+                workflow_plugins=self._workflow_plugins,
+                plugin_marketplaces=self._plugin_marketplaces,
+                declared_plugin_sources=self._declared_plugin_sources,
             )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)
@@ -1275,6 +1476,33 @@ class WorkflowEngine:
     ) -> Path:
         """Resolve a sub-workflow reference to a local filesystem path.
 
+        Thin memoizing wrapper around :meth:`_resolve_subworkflow_path_uncached`
+        (keyed by ``(base_dir, agent_workflow)`` for this engine instance's
+        lifetime). Both the eager dashboard-preview resolution in
+        :meth:`build_workflow_started_data` and the real sub-workflow
+        execution path call this method for the same agent, and without
+        memoization that would fetch every registry-backed sub-workflow
+        twice per run. See :meth:`_resolve_subworkflow_path_uncached` for
+        the full resolution algorithm and error semantics.
+        """
+        cache_key = (str(base_dir), agent_workflow)
+        cached = self._subworkflow_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        resolved = await self._resolve_subworkflow_path_uncached(
+            agent_workflow, agent_name, base_dir
+        )
+        self._subworkflow_path_cache[cache_key] = resolved
+        return resolved
+
+    async def _resolve_subworkflow_path_uncached(
+        self,
+        agent_workflow: str,
+        agent_name: str,
+        base_dir: Path,
+    ) -> Path:
+        """Resolve a sub-workflow reference to a local filesystem path.
+
         Handles both local file paths and registry references
         (``workflow[@registry][#ref]`` syntax).
 
@@ -1299,14 +1527,14 @@ class WorkflowEngine:
         4. For registry refs, fetch the workflow (with caching) and return
            the cached local path.
 
-        Note on checkpoint/resume: this helper is called on every
-        sub-workflow execution, including after :meth:`resume`. Pinned
-        registry refs (``name@registry#v1.2.3`` or ``name@registry#<sha>``)
-        always resolve to the same cached path. Mutable refs
-        (``name@registry#main`` or no ``#ref`` defaulting to "latest") may
-        resolve to a different commit on resume if the upstream branch has
-        moved. Use pinned tags or commit SHAs in production workflows when
-        deterministic resume is required.
+        Note on checkpoint/resume: this helper is called (memoized once per
+        run, see ``_resolve_subworkflow_path``) on every sub-workflow
+        execution, including after :meth:`resume`. Pinned registry refs
+        (``name@registry#v1.2.3`` or ``name@registry#<sha>``) always resolve
+        to the same cached path. Mutable refs (``name@registry#main`` or no
+        ``#ref`` defaulting to "latest") may resolve to a different commit on
+        resume if the upstream branch has moved. Use pinned tags or commit
+        SHAs in production workflows when deterministic resume is required.
 
         Args:
             agent_workflow: The ``workflow:`` field value from the agent def.
@@ -1490,6 +1718,14 @@ class WorkflowEngine:
                 else:
                     child_preamble = _wrap_preamble(sub_inner)
 
+        # Merge plugin marketplaces: the parent's resolved table, plus any
+        # source the sub-workflow declares itself (which wins on a name
+        # clash, since it is the one written in the file being run).
+        # Resolved here rather than in the constructor so acquisition
+        # stays off the hot path and out of __init__, and so a failure is
+        # reported as the sub-workflow's configuration error it is.
+        child_marketplaces = await self._resolve_child_marketplaces(sub_config, sub_path)
+
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
             config=sub_config,
@@ -1507,6 +1743,7 @@ class WorkflowEngine:
                 slot_key or agent.name,
             ],
             instructions_preamble=child_preamble,
+            plugin_marketplaces=child_marketplaces,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -1633,6 +1870,112 @@ class WorkflowEngine:
         # so a parent-level cost budget accounts for delegated sub-workflow cost.
         self.usage_tracker.merge(usage)
         return output, usage
+
+    async def _ensure_plugin_marketplaces(self) -> None:
+        """Resolve declared plugin sources if nobody else already did.
+
+        ``conductor run`` resolves them up front and passes the table in,
+        which is where the progress output and the concurrent fetch live.
+        An engine constructed directly — as the class docstring's own
+        example does — has no such caller, and without this every
+        ``plugin@marketplace`` entry would fail with "declared but not
+        acquired" no matter how many times the user fetched.
+
+        Empty-but-declared is unambiguous: ``resolve_plugin_sources``
+        returns one entry per declared source or raises, so an empty
+        table alongside declared sources can only mean nothing resolved
+        them yet. That makes this a no-op on the CLI path rather than a
+        second round of network calls.
+
+        Raises:
+            ExecutionError: If a declared source cannot be resolved.
+        """
+        declared = self.config.workflow.runtime.plugin_sources
+        # Tested by coverage rather than emptiness: a sub-workflow inherits
+        # a non-empty table from its parent, and asking whether the table is
+        # empty would then skip the child's own declarations. Every declared
+        # name being present is the condition that actually means "already
+        # resolved".
+        if not declared or declared.keys() <= self._plugin_marketplaces.keys():
+            return
+
+        from conductor.plugins.errors import PluginError
+        from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+        base_dir = Path(self._workflow_dir) if self._workflow_dir else None
+        try:
+            resolved = await asyncio.to_thread(
+                resolve_plugin_sources,
+                declared,
+                base_dir=base_dir,
+                on_warning=lambda message: logger.warning("Plugin sources: %s", message),
+            )
+        except (PluginError, OSError) as exc:
+            raise ExecutionError(
+                f"Plugin source could not be resolved: {exc}",
+                suggestion=(
+                    "Check 'runtime.plugin_sources', or run 'conductor plugin fetch' "
+                    "to prime the cache."
+                ),
+            ) from exc
+
+        # Merged, not replaced: the guard above now proceeds on a
+        # *partially* populated table, so overwriting would drop whatever a
+        # parent contributed.
+        self._plugin_marketplaces = {**self._plugin_marketplaces, **marketplaces_from(resolved)}
+        # The executor is built in __init__ on the single-provider path, so
+        # it already holds the empty table and must be told. The registry
+        # path builds one per agent and picks the new table up on its own.
+        if self.executor is not None:
+            self.executor.set_plugin_marketplaces(self._plugin_marketplaces)
+
+    async def _resolve_child_marketplaces(
+        self, sub_config: WorkflowConfig, sub_path: Path
+    ) -> dict[str, Marketplace]:
+        """Build the marketplace table a sub-workflow resolves against.
+
+        The parent's table is inherited so a sub-workflow can reference a
+        marketplace the root declared — the same inheritance
+        ``instructions_preamble`` gets, and for the same reason: the child
+        was invoked by the parent, not run standalone.
+
+        A source the sub-workflow declares itself is resolved here and
+        wins on a name clash, since it is the one written in the file
+        being run. Resolution goes through a thread because it shells out
+        to ``git``; without that a cold cache would block the event loop,
+        stalling every concurrent branch of the workflow rather than just
+        this one.
+
+        Raises:
+            ExecutionError: If the sub-workflow declares a source that
+                cannot be resolved. Surfaced as a configuration failure
+                naming the sub-workflow, rather than as an agent error
+                from whichever step happened to reference the plugin.
+        """
+        declared = sub_config.workflow.runtime.plugin_sources
+        if not declared:
+            return dict(self._plugin_marketplaces)
+
+        from conductor.plugins.errors import PluginError
+        from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+
+        try:
+            resolved = await asyncio.to_thread(
+                resolve_plugin_sources,
+                declared,
+                base_dir=sub_path.resolve().parent,
+                on_warning=lambda message: logger.warning("Plugin sources: %s", message),
+            )
+        except (PluginError, OSError) as exc:
+            raise ExecutionError(
+                f"Sub-workflow '{sub_config.workflow.name}' declares a plugin source "
+                f"that could not be resolved: {exc}",
+                suggestion=(
+                    "Check 'runtime.plugin_sources' in the sub-workflow, or run "
+                    "'conductor plugin fetch' on it to prime the cache."
+                ),
+            ) from exc
+        return {**self._plugin_marketplaces, **marketplaces_from(resolved)}
 
     async def _run_child_engine(
         self,
@@ -1857,6 +2200,8 @@ class WorkflowEngine:
             ValidationError: If agent output doesn't match schema.
             TemplateError: If template rendering fails.
         """
+        await self._ensure_plugin_marketplaces()
+
         # Apply defaults from input schema for optional inputs not provided
         merged_inputs = self._apply_input_defaults(inputs)
         self.context.set_workflow_inputs(merged_inputs)
@@ -1890,6 +2235,13 @@ class WorkflowEngine:
             MaxIterationsError: If max iterations limit is exceeded.
             TimeoutError: If timeout limit is exceeded.
         """
+        await self._ensure_plugin_marketplaces()
+
+        # A questions node restores its partial answers only here. On an
+        # ordinary loop-back the node must ask its new questions, not replay
+        # the previous pass's answers under the same positional ids.
+        self._resuming_questions = True
+
         # Fresh timeout window for resumed execution
         self.limits.start_time = _time.monotonic()
 
@@ -1987,8 +2339,13 @@ class WorkflowEngine:
                 if merged_ids:
                     copilot_session_ids = merged_ids
                     copilot_session_cwds = merged_cwds
-        except Exception:
-            logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "Failed to collect provider session IDs for checkpoint (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug("Session ID collection traceback", exc_info=True)
             copilot_session_ids = None
             copilot_session_cwds = None
 
@@ -2257,12 +2614,452 @@ class WorkflowEngine:
         if self._keyboard_listener is not None:
             await self._keyboard_listener.resume()
 
+    async def _run_questions_step(self, agent: AgentDef) -> dict[str, Any]:
+        """Present a set of questions to a human and collect their answers.
+
+        Runs the whole cursor loop inside one engine step (issue #376).
+
+        Partial answers are committed to the workflow context after every
+        response, so a checkpoint taken while the node is parked on a human —
+        a dashboard stop, Ctrl-C, or an unhandled failure — already carries
+        them and a resumed run continues at the right question. They live in
+        the node's ordinary context entry, which ``WorkflowContext.to_dict()``
+        already serializes. Note a *periodic* checkpoint cannot fire here: it
+        is taken at the top of the execution loop, which this step has not
+        returned to.
+
+        Args:
+            agent: The questions node definition.
+
+        Returns:
+            The node output (see ``executor/questions.py::build_output``).
+
+        Raises:
+            ExecutionError: If the question source cannot be resolved or an
+                entry is malformed.
+        """
+        agent_context = self.context.get_for_template()
+
+        def _render(text: str) -> str:
+            return self.renderer.render(text, agent_context)
+
+        if agent.source:
+            raw = self._resolve_array_reference(agent.source)
+            definitions = questions_mod.coerce_questions(raw, agent_name=agent.name)
+            trusted = False
+        else:
+            definitions = list(agent.questions or [])
+            trusted = True
+
+        order = questions_mod.resolve_questions(
+            definitions, render=_render, agent_name=agent.name, trusted=trusted
+        )
+
+        intro: str | None = None
+        if agent.prompt:
+            intro = linkify_markdown(_render(agent.prompt), base_dir=self._workflow_dir)
+
+        # Resume support: prior answers for this node survive in context.
+        # Consumed once, so a later loop-back re-asks instead of replaying —
+        # question ids default to positional q1..qN, so a new question set
+        # would otherwise silently inherit the previous pass's answers.
+        records: dict[str, questions_mod.AnswerRecord] = {}
+        if self._resuming_questions:
+            self._resuming_questions = False
+            prior = self.context.agent_outputs.get(agent.name)
+            if isinstance(prior, dict):
+                records = self._restore_question_records(prior, order)
+
+        # Emitted before the empty-set early return below, so a node whose
+        # source resolved to [] still completes on the dashboard instead of
+        # sitting at 'pending' forever.
+        self._emit(
+            "questions_presented",
+            {
+                "agent_name": agent.name,
+                "total": len(order),
+                "prompt": intro,
+                "questions": [
+                    {"id": q.id, "text": q.text, "hint": q.hint, "choices": q.choices}
+                    for q in order
+                ],
+            },
+        )
+
+        if not order:
+            output = questions_mod.build_output(records, order, questions_mod.OUTCOME_COMPLETED)
+            self._emit(
+                "questions_completed",
+                {
+                    "agent_name": agent.name,
+                    "outcome": output["outcome"],
+                    **_answer_counts(output),
+                },
+            )
+            return output
+
+        # --skip-gates must not auto-select a suggested answer: those come from
+        # the upstream agent, so recording one would feed invented human input
+        # back as real. Skipping honestly is the only safe automation.
+        if self.gate_handler.skip_gates:
+            for question in order:
+                records.setdefault(
+                    question.id,
+                    questions_mod.AnswerRecord.for_skip(question),
+                )
+            output = questions_mod.build_output(
+                records, order, questions_mod.OUTCOME_SKIPPED_REMAINING
+            )
+            self._emit(
+                "questions_completed",
+                {"agent_name": agent.name, "outcome": output["outcome"], **_answer_counts(output)},
+            )
+            return output
+
+        outcome = await self._run_questions_loop(agent, order, records, intro)
+        output = questions_mod.build_output(records, order, outcome)
+        self._emit(
+            "questions_completed",
+            {"agent_name": agent.name, "outcome": outcome, **_answer_counts(output)},
+        )
+        return output
+
+    async def _run_questions_loop(
+        self,
+        agent: AgentDef,
+        order: list[questions_mod.ResolvedQuestion],
+        records: dict[str, questions_mod.AnswerRecord],
+        intro: str | None,
+    ) -> questions_mod.QuestionsOutcome:
+        """Drive the question cursor until the user finishes, skips, or aborts.
+
+        Args:
+            agent: The questions node definition.
+            order: Resolved questions in presentation order.
+            records: Answer store, mutated in place so partial progress
+                survives even if this raises.
+            intro: Optional rendered node-level intro.
+
+        Returns:
+            The terminal outcome string.
+        """
+        cursor = 0
+        # Resume at the first unanswered question rather than restarting.
+        while cursor < len(order) and order[cursor].id in records:
+            cursor += 1
+
+        nav = questions_mod.NavFlags.resolve(agent)
+        presentation = 0
+        rejection: str | None = None
+
+        def _next_prompt_id() -> str:
+            return f"{agent.name}:{self._run_id}:{presentation}"
+
+        while True:
+            answered = sum(1 for r in records.values() if not r.skipped)
+            skipped = sum(1 for r in records.values() if r.skipped)
+            presentation += 1
+
+            # Past the last question: confirm before finishing, so Back stays
+            # reachable from the final question.
+            at_review = cursor >= len(order)
+            if at_review:
+                # The review exists solely to keep Back reachable from the last
+                # question; with Back disabled it would be a pointless extra
+                # click, so finish immediately.
+                if not nav.back:
+                    return questions_mod.OUTCOME_COMPLETED
+                gate_prompt = questions_mod.build_review_prompt(
+                    agent, records, order, nav=nav, prompt_id=_next_prompt_id()
+                )
+            else:
+                gate_prompt = questions_mod.build_prompt(
+                    agent,
+                    order[cursor],
+                    nav=nav,
+                    cursor=cursor,
+                    total=len(order),
+                    answered=answered,
+                    skipped=skipped,
+                    prompt_id=_next_prompt_id(),
+                    intro=intro,
+                    rejection=rejection,
+                )
+            rejection = None
+
+            await self._suspend_listener()
+            try:
+                # Reuse the gate response channel rather than adding a second
+                # one: the progress header and nav controls travel inside the
+                # prompt and choices. The client still had to learn prompt_id,
+                # since a questions node presents repeatedly under one name.
+                self._emit(
+                    "gate_presented",
+                    {
+                        "agent_name": agent.name,
+                        "options": [c.value for c in gate_prompt.choices],
+                        "option_details": [
+                            {
+                                "label": c.label,
+                                "value": c.value,
+                                "route": "",
+                                "prompt_for": c.prompt_for,
+                                "multiline": c.multiline,
+                            }
+                            for c in gate_prompt.choices
+                        ],
+                        "prompt": gate_prompt.prompt,
+                        "prompt_id": gate_prompt.prompt_id,
+                        "step_type": "questions",
+                    },
+                )
+                response = await self._resolve_human_prompt(gate_prompt)
+            finally:
+                await self._resume_listener()
+
+            if response.value == questions_mod.NAV_FINISH:
+                return questions_mod.OUTCOME_COMPLETED
+
+            if response.value == questions_mod.NAV_BACK:
+                # Back is only offered from question 2 onward and at the review;
+                # a duplicate or late click could still deliver it at cursor 0,
+                # where decrementing is a no-op and the pop would silently
+                # discard an answer the user already gave.
+                if cursor == 0:
+                    continue
+                # Clear the answer being revisited so the resume scan above and
+                # the "answered" counter both reflect reality.
+                cursor -= 1
+                records.pop(order[cursor].id, None)
+                self._store_questions_progress(agent, records, order)
+                continue
+
+            if response.value == questions_mod.NAV_ABORT:
+                return questions_mod.OUTCOME_ABORTED
+
+            if response.value == questions_mod.NAV_SKIP_ALL:
+                # Skip-all must honour `required` too, or it is a one-click
+                # bypass of the per-question check below and `required` means
+                # nothing. The user can still answer, or abort when enabled.
+                blocking = [q for q in order[cursor:] if q.required and q.default is None]
+                if blocking:
+                    rejection = (
+                        f"{len(blocking)} required question(s) still need an answer "
+                        "and cannot be skipped."
+                    )
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": blocking[0].id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
+                for remaining in order[cursor:]:
+                    records.setdefault(
+                        remaining.id,
+                        questions_mod.AnswerRecord.for_skip(remaining),
+                    )
+                self._store_questions_progress(agent, records, order)
+                return questions_mod.OUTCOME_SKIPPED_REMAINING
+
+            if at_review:
+                # build_review_prompt offers only Finish/Back/Abort, all handled
+                # above, so this is unreachable today. Fail loudly rather than
+                # falling through — order[cursor] would IndexError here, and
+                # silently re-presenting would hide a future choice added to
+                # the review without a matching handler.
+                raise AssertionError(
+                    f"Unhandled review response {response.value!r} for '{agent.name}'"
+                )
+
+            question = order[cursor]
+            if response.value == questions_mod.NAV_SKIP:
+                if question.required and question.default is None:
+                    rejection = "This question is required and cannot be skipped."
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": question.id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
+                records[question.id] = questions_mod.AnswerRecord.for_skip(question)
+            elif response.value == questions_mod.FREE_TEXT:
+                text = response.additional_input.get(questions_mod.FREE_TEXT_FIELD, "").strip()
+                if question.required and not text:
+                    rejection = "This question is required; please provide an answer."
+                    self._emit(
+                        "questions_answer_rejected",
+                        {
+                            "agent_name": agent.name,
+                            "question_id": question.id,
+                            "reason": rejection,
+                        },
+                    )
+                    continue
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=text,
+                    source="free_text",
+                )
+            else:
+                records[question.id] = questions_mod.AnswerRecord(
+                    id=question.id,
+                    question=question.text,
+                    answer=response.value,
+                    source="choice",
+                )
+
+            self._emit(
+                "questions_answered",
+                {
+                    "agent_name": agent.name,
+                    "question_id": question.id,
+                    "cursor": cursor,
+                    "total": len(order),
+                    "source": records[question.id].source,
+                    "skipped": records[question.id].skipped,
+                },
+            )
+            self._store_questions_progress(agent, records, order)
+            cursor += 1
+
+    def _store_questions_progress(
+        self,
+        agent: AgentDef,
+        records: dict[str, questions_mod.AnswerRecord],
+        order: list[questions_mod.ResolvedQuestion],
+    ) -> None:
+        """Commit partial answers to context so a checkpoint captures them.
+
+        Args:
+            agent: The questions node definition.
+            records: Answers collected so far.
+            order: All questions, in presentation order.
+        """
+        # Assign directly rather than via ``store``: this fires after every
+        # answer, and ``store`` appends to execution_history and bumps
+        # current_iteration, which would leak N entries into downstream
+        # prompts, the interrupt panel, and the dashboard's synthetic replay.
+        # The main loop's single ``store`` remains the node's one history entry.
+        self.context.agent_outputs[agent.name] = questions_mod.build_output(
+            records, order, questions_mod.OUTCOME_IN_PROGRESS
+        )
+
+    @staticmethod
+    def _restore_question_records(
+        prior: dict[str, Any],
+        order: list[questions_mod.ResolvedQuestion],
+    ) -> dict[str, questions_mod.AnswerRecord]:
+        """Rebuild answer records from a resumed node's stored output.
+
+        A record is kept only when both its id **and** its question text still
+        match. Ids default to positional ``q1..qN``, so matching on id alone
+        would re-attach an old answer to a different question whenever the
+        workflow was edited or an upstream agent produced a different set —
+        the common case, not an exotic one. Every drop is logged, because a
+        silently unanswered question is asked again while a silently
+        *misattached* one never is.
+
+        Args:
+            prior: The node's previously stored output.
+            order: The current resolved questions.
+
+        Returns:
+            Restored answer records keyed by question id.
+        """
+        current = {q.id: q.text for q in order}
+        restored: dict[str, questions_mod.AnswerRecord] = {}
+        for item in prior.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if item_id not in current:
+                logger.info(
+                    "Dropping restored answer %r: that question is no longer in the set.",
+                    item_id,
+                )
+                continue
+            if item.get("question") != current[item_id]:
+                logger.warning(
+                    "Dropping restored answer for %r: the question text changed since "
+                    "the checkpoint (was %r, now %r). It will be asked again.",
+                    item_id,
+                    item.get("question"),
+                    current[item_id],
+                )
+                continue
+            # Validate against the literal set: a hand-edited or partially
+            # written checkpoint must not smuggle an unknown source through to
+            # the dashboard, and `skipped` is derived from it.
+            source = item.get("source")
+            if source not in _ANSWER_SOURCES:
+                logger.warning(
+                    "Restored answer %r has unknown source %r; treating it as skipped.",
+                    item_id,
+                    source,
+                )
+                source = "skipped"
+            restored[item_id] = questions_mod.AnswerRecord(
+                id=item_id,
+                question=item.get("question", ""),
+                answer=None if source == "skipped" else item.get("answer"),
+                source=source,
+            )
+        return restored
+
     async def _handle_gate_with_web(
         self,
         agent: AgentDef,
         agent_context: dict[str, Any],
     ) -> GateResult:
-        """Handle a human gate, choosing CLI / web / race per environment.
+        """Handle a ``human_gate``, mapping the shared prompt back onto routes.
+
+        Thin adapter over :meth:`_resolve_human_prompt`, which owns the
+        environment policy. Routing stays here because it is a workflow-graph
+        concern that the shared interaction layer deliberately knows nothing
+        about.
+
+        Args:
+            agent: The human_gate agent definition.
+            agent_context: Current workflow context for template rendering.
+
+        Returns:
+            GateResult with the selected option, route, and any additional
+            input.
+
+        Raises:
+            HumanGateError: If the gate has no options, if bg mode is active
+                with no web dashboard attached, or if the response value
+                matches no declared option.
+        """
+        from conductor.exceptions import HumanGateError
+
+        if not agent.options:
+            raise HumanGateError(
+                f"Human gate '{agent.name}' has no options defined",
+                suggestion="Add 'options' list to the human_gate agent",
+            )
+
+        gate_prompt = self.gate_handler.build_gate_prompt(
+            agent, agent_context, base_dir=self._workflow_dir
+        )
+        response = await self._resolve_human_prompt(gate_prompt)
+
+        selected = option_for_value(agent, response.value)
+        return GateResult(
+            selected_option=selected,
+            route=selected.route,
+            additional_input=response.additional_input,
+        )
+
+    async def _resolve_human_prompt(self, gate_prompt: GatePrompt) -> GateResponse:
+        """Resolve one human prompt, choosing CLI / web / race per environment.
 
         Resolution policy (issue #286, extending the #198/#202 max-iterations
         gate fix in ``_resolve_max_iterations_gate``):
@@ -2289,11 +3086,10 @@ class WorkflowEngine:
           ``wait_for_stop()`` race is needed here.
 
         Args:
-            agent: The human_gate agent definition.
-            agent_context: Current workflow context for template rendering.
+            gate_prompt: The prompt to resolve.
 
         Returns:
-            GateResult from whichever input source responded first.
+            GateResponse from whichever input source responded first.
 
         Raises:
             HumanGateError: If bg mode is active and no web dashboard is
@@ -2304,26 +3100,24 @@ class WorkflowEngine:
                 from conductor.exceptions import HumanGateError
 
                 raise HumanGateError(
-                    f"Cannot resolve human_gate '{agent.name}': no web dashboard is "
+                    f"Cannot resolve human_gate '{gate_prompt.name}': no web dashboard is "
                     "available and stdin cannot be prompted in background mode.",
                     suggestion=(
                         "Restart with --web in the foreground, or resolve the gate "
                         "with `conductor gate respond` once the dashboard is reachable."
                     ),
-                    gate_name=agent.name,
+                    gate_name=gate_prompt.name,
                 )
             # Not bg mode: use CLI only (foreground, or non-TTY without a
             # dashboard — e.g. piped stdin, tests).
-            return await self.gate_handler.handle_gate(
-                agent, agent_context, base_dir=self._workflow_dir
-            )
+            return await self.gate_handler.prompt(gate_prompt)
 
         # Web dashboard + bg or non-TTY → web-only wait (skip the CLI arm; it
         # would EOFError-and-crash on a DEVNULL stdin, cancelling the web arm
         # before a dashboard user could respond).
         cli_usable = not self._bg_mode and sys.stdin.isatty()
         if not cli_usable:
-            return await self._wait_for_web_gate(agent)
+            return await self._wait_for_web_gate(gate_prompt)
 
         # Race CLI vs web input. We start the web task unconditionally (not only
         # when a client is currently connected), because the human often opens
@@ -2332,11 +3126,11 @@ class WorkflowEngine:
         # in the dashboard pushes a message to ``_gate_response_queue`` that
         # nobody is awaiting, and the workflow hangs forever.
         cli_task = asyncio.create_task(
-            self.gate_handler.handle_gate(agent, agent_context, base_dir=self._workflow_dir),
+            self.gate_handler.prompt(gate_prompt),
             name="gate_cli",
         )
         web_task = asyncio.create_task(
-            self._wait_for_web_gate(agent),
+            self._wait_for_web_gate(gate_prompt),
             name="gate_web",
         )
 
@@ -2355,45 +3149,79 @@ class WorkflowEngine:
         winner = done.pop()
         return winner.result()
 
-    async def _wait_for_web_gate(self, agent: AgentDef) -> GateResult:
+    @staticmethod
+    def _coerce_additional_input(raw: Any, choice: GateChoice) -> dict[str, str]:
+        """Normalize a client's ``additional_input`` into a field mapping.
+
+        ``conductor gate respond --input`` sends a bare string, which used to
+        be dropped on the floor: for a ``human_gate`` that lost an occasional
+        ``prompt_for``, but for a ``questions`` node free text *is* the primary
+        answer, so the operator's typed answer vanished and the CLI still
+        printed success. A string is mapped onto the selected choice's declared
+        field instead. Values are stringified because the payload is untrusted:
+        a JSON number would otherwise reach ``.strip()`` and raise mid-node.
+
+        Args:
+            raw: The client-supplied value.
+            choice: The choice that was selected.
+
+        Returns:
+            A field-name to text mapping, empty when there is nothing to carry.
+        """
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+        if isinstance(raw, str) and raw and choice.prompt_for:
+            return {choice.prompt_for: raw}
+        if raw is not None and not isinstance(raw, (dict, str)):
+            logger.warning(
+                "Discarding additional_input of unsupported type %s for choice %r",
+                type(raw).__name__,
+                choice.value,
+            )
+        return {}
+
+    async def _wait_for_web_gate(self, gate_prompt: GatePrompt) -> GateResponse:
         """Wait for a gate response from the web dashboard.
 
         Translates the raw JSON message from the web client into a
-        ``GateResult`` by matching ``selected_value`` against the
-        agent's options.
+        ``GateResponse`` by matching ``selected_value`` against the
+        prompt's choices.
 
         Args:
-            agent: The human_gate agent definition with options.
+            gate_prompt: The prompt awaiting a response.
 
         Returns:
-            GateResult with the selected option, route, and any
-            additional input from the web client.
+            GateResponse with the selected choice and any additional input
+            from the web client.
 
         Raises:
-            HumanGateError: If the selected value doesn't match any option.
+            HumanGateError: If the selected value doesn't match any choice.
         """
         from conductor.exceptions import HumanGateError
 
         assert self._web_dashboard is not None  # noqa: S101
 
-        msg = await self._web_dashboard.wait_for_gate_response(agent.name)
+        msg = await self._web_dashboard.wait_for_gate_response(
+            gate_prompt.name, gate_prompt.prompt_id
+        )
         selected_value = msg.get("selected_value", "")
 
-        # Find matching option
-        for option in agent.options or []:
-            if option.value == selected_value:
-                additional_input = msg.get("additional_input", {})
-                if not isinstance(additional_input, dict):
-                    additional_input = {}
-                return GateResult(
-                    selected_option=option,
-                    route=option.route,
+        # Find matching choice
+        for choice in gate_prompt.choices:
+            if choice.value == selected_value:
+                additional_input = self._coerce_additional_input(
+                    msg.get("additional_input"), choice
+                )
+                return GateResponse(
+                    value=choice.value,
+                    label=choice.label,
                     additional_input=additional_input,
+                    prompt_id=gate_prompt.prompt_id,
                 )
 
         raise HumanGateError(
             f"Web gate response value '{selected_value}' does not match any option "
-            f"for gate '{agent.name}'",
+            f"for gate '{gate_prompt.name}'",
             suggestion="Check the option values in the workflow YAML",
         )
 
@@ -2444,7 +3272,9 @@ class WorkflowEngine:
         last_output_preview: str | None = None
         if last_output is not None:
             try:
-                preview = json.dumps(last_output, indent=2, default=str)
+                # ``ensure_ascii=False`` so the preview shows real non-ASCII
+                # text instead of \uXXXX escapes (issue #356).
+                preview = json.dumps(last_output, indent=2, default=str, ensure_ascii=False)
                 last_output_preview = preview[:500]
             except (TypeError, ValueError):
                 last_output_preview = str(last_output)[:500]
@@ -2514,7 +3344,11 @@ class WorkflowEngine:
             return False
 
         try:
-            preview = json.dumps(partial_output.content, indent=2, default=str)[:500]
+            # ``ensure_ascii=False`` so the preview shows real non-ASCII
+            # text instead of \uXXXX escapes (issue #356).
+            preview = json.dumps(partial_output.content, indent=2, default=str, ensure_ascii=False)[
+                :500
+            ]
         except (TypeError, ValueError):
             preview = str(partial_output.content)[:500]
 
@@ -2639,7 +3473,11 @@ class WorkflowEngine:
 
         # Build preview from partial output
         try:
-            preview = json.dumps(partial_output.content, indent=2, default=str)[:500]
+            # ``ensure_ascii=False`` so the preview shows real non-ASCII
+            # text instead of \uXXXX escapes (issue #356).
+            preview = json.dumps(partial_output.content, indent=2, default=str, ensure_ascii=False)[
+                :500
+            ]
         except (TypeError, ValueError):
             preview = str(partial_output.content)[:500]
 
@@ -2875,12 +3713,14 @@ class WorkflowEngine:
                 outcome = await validate_coro
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Validator call for '%s' timed out or failed; treating as pass",
+                "Validator call for '%s' timed out or failed; treating as pass (%s: %s)",
                 agent.name,
-                exc_info=True,
+                type(exc).__name__,
+                exc,
             )
+            logger.debug("Validator call traceback for '%s'", agent.name, exc_info=True)
             outcome = ValidationOutcome(passed=True, errored=True)
         _v_elapsed = _time.time() - _v_start
 
@@ -2933,15 +3773,23 @@ class WorkflowEngine:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             # The re-run hit a real failure (provider error, agent timeout, or
             # the retried output failed the agent's output schema). Fail open
             # to the original output, but surface it — otherwise enabling the
             # validator would silently downgrade a hard failure into a quiet
             # one. The original is recorded once by the caller under the
             # primary name; it is NOT also attributed to the validator row.
+            # The warning stays concise because the workflow continues; the
+            # full traceback is kept at debug level for diagnosis (issue #357).
             logger.warning(
-                "Validator re-run failed for '%s'; using original output",
+                "Validator re-run failed for '%s'; using original output (%s: %s)",
+                agent.name,
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug(
+                "Validator re-run traceback for '%s'",
                 agent.name,
                 exc_info=True,
             )
@@ -3003,7 +3851,7 @@ class WorkflowEngine:
                 # resumed run's events into a phantom child workflow context).
                 self._system_metadata = self._build_system_metadata()
                 if not self._suppress_workflow_started_emit:
-                    self._emit("workflow_started", self.build_workflow_started_data())
+                    self._emit("workflow_started", await self.build_workflow_started_data())
 
                 _workflow_start = _time.time()
 
@@ -3356,6 +4204,7 @@ class WorkflowEngine:
                                     "value": o.value,
                                     "route": o.route,
                                     "prompt_for": o.prompt_for,
+                                    "multiline": o.multiline,
                                 }
                                 for o in (agent.options or [])
                             ]
@@ -3418,6 +4267,46 @@ class WorkflowEngine:
                                 self._execute_hook("on_complete", result=result)
                                 return result
                             current_agent_name = gate_result.route
+                            continue
+
+                        # Handle questions steps. N human prompts inside ONE
+                        # engine step, so the cursor can move backwards and the
+                        # node costs 1 iteration rather than 2N.
+                        if agent.type == "questions":
+                            questions_output = await self._run_questions_step(agent)
+                            self.context.store(agent.name, questions_output)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            if questions_output["outcome"] == questions_mod.OUTCOME_ABORTED:
+                                route_target = agent.abort_route or "$end"
+                                output_transform = None
+                            else:
+                                route_result = self._evaluate_routes(agent, questions_output)
+                                route_target = route_result.target
+                                output_transform = route_result.output_transform
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_target,
+                                },
+                            )
+
+                            if route_target == "$end":
+                                result = self._build_final_output(output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_target
                             continue
 
                         # Handle script steps

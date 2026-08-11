@@ -30,6 +30,10 @@ export type EventType =
   | 'set_failed'
   | 'gate_presented'
   | 'gate_resolved'
+  | 'questions_presented'
+  | 'questions_answered'
+  | 'questions_completed'
+  | 'questions_answer_rejected'
   | 'route_taken'
   | 'parallel_started'
   | 'parallel_agent_completed'
@@ -74,6 +78,30 @@ export interface ProviderMetadata {
   maintainer?: string | null;
 }
 
+/**
+ * Statically-resolved sub-workflow topology, eagerly attached to a
+ * `type: workflow` agent's entry in `WorkflowStartedData.agents` (see
+ * `WorkflowEngine._build_static_subworkflow_topology`). Lets the dashboard
+ * render — and let the user expand — a sub-workflow's internal DAG before
+ * the parent engine ever reaches that step. Recurses into nested
+ * `type: workflow` agents. `null`/absent when the reference could not be
+ * resolved eagerly (e.g. a registry fetch failure); the sub-workflow still
+ * resolves normally, synchronously, once the engine reaches it.
+ */
+export interface StaticSubworkflowTopology {
+  name: string;
+  entry_point?: string;
+  agents: Array<{
+    name: string;
+    type?: string;
+    /** Present only for nested `type: workflow` agents. */
+    subworkflow?: StaticSubworkflowTopology | null;
+  }>;
+  routes: Array<{ from: string; to: string; when?: string }>;
+  parallel_groups?: Array<{ name: string; agents: string[] }>;
+  for_each_groups?: Array<{ name: string }>;
+}
+
 export interface WorkflowStartedData {
   name: string;
   entry_point?: string;
@@ -84,6 +112,8 @@ export interface WorkflowStartedData {
     /** Provider this agent will use at runtime (honors per-agent override). */
     provider_name?: string;
     reasoning_effort?: string | null;
+    /** Present only for `type: workflow` agents; see `StaticSubworkflowTopology`. */
+    subworkflow?: StaticSubworkflowTopology | null;
   }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;
@@ -306,6 +336,7 @@ export interface GateOptionDetail {
   value: string;
   route: string;
   prompt_for?: string | null;
+  multiline?: boolean;
 }
 
 export interface GatePresentedData {
@@ -313,6 +344,39 @@ export interface GatePresentedData {
   prompt?: string;
   options?: string[];
   option_details?: GateOptionDetail[];
+  /** Staleness token; echoed back so a late click can't resolve a later prompt. */
+  prompt_id?: string | null;
+  /** 'questions' when this prompt is one question of a questions node. */
+  step_type?: string;
+}
+
+export interface QuestionsPresentedData {
+  agent_name: string;
+  total: number;
+  prompt?: string | null;
+  questions?: Array<{ id: string; text: string; hint?: string | null; choices?: string[] }>;
+}
+
+export interface QuestionsAnsweredData {
+  agent_name: string;
+  question_id: string;
+  cursor: number;
+  total: number;
+  source: string;
+  skipped: boolean;
+}
+
+export interface QuestionsCompletedData {
+  agent_name: string;
+  outcome: string;
+  answered_count: number;
+  skipped_count: number;
+}
+
+export interface QuestionsAnswerRejectedData {
+  agent_name: string;
+  question_id: string;
+  reason: string;
 }
 
 export interface GateResolvedData {

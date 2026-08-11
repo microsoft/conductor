@@ -216,8 +216,8 @@ Conductor supports multiple AI providers. Choose based on your needs:
 | **Tier** | Stable | Stable | Experimental | Experimental | Experimental |
 | **Pricing** | Subscription | Pay-per-token | Subscription | Pay-per-token (via hermes) | Subscription + ACA compute |
 | **Context Window** | Per-model | Per-model | Per-model | Per-model | Per-model (inner Copilot) |
-| **Tool Support (MCP)** | Yes | Planned | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) |
-| **Streaming** | Yes | Planned | Yes | No | Yes |
+| **Tool Support (MCP)** | Yes | Yes (stdio) | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) |
+| **Streaming** | Yes | Yes | Yes | No | Yes |
 | **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access | Untrusted/isolation-sensitive agents |
 
 ### Using Copilot

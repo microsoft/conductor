@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -208,6 +209,42 @@ class TestValidatorValidate:
         assert outcome.output is None
 
     @pytest.mark.asyncio
+    async def test_provider_error_logs_concise_warning_and_debug_traceback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement (issue #357): the handled fail-open path must not print a
+        traceback at WARNING level — a concise warning names the exception, and
+        the full traceback is only available at DEBUG level."""
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with caplog.at_level(logging.DEBUG, logger="conductor.engine.validator"):
+            outcome = await OutputValidator().validate(agent, "p", {"summary": "x"}, provider)
+
+        assert outcome.passed is True
+        assert outcome.errored is True
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.validator"
+            and r.levelno == logging.WARNING
+            and "Validator call failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is None
+        assert "RuntimeError" in warnings[0].getMessage()
+        assert "boom" in warnings[0].getMessage()
+        assert "reviewer" in warnings[0].getMessage()
+        debugs = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.validator" and r.levelno == logging.DEBUG
+        ]
+        assert any(r.exc_info is not None for r in debugs)
+
+    @pytest.mark.asyncio
     async def test_malformed_output_fails_open(self) -> None:
         agent = _agent()
         provider = MagicMock()
@@ -231,6 +268,26 @@ class TestValidatorValidate:
 
         rendered = provider.execute.call_args.kwargs["rendered_prompt"]
         assert "…[truncated]" in rendered
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_output_serialized_unescaped(self) -> None:
+        # Requirement: the fixed _OUTPUT_LIMIT budget must be measured in real
+        # characters for every language — non-ASCII output reaches the
+        # validator prompt unescaped and is not truncated when it fits the
+        # budget (issue #356).
+        agent = _agent()
+        provider = MagicMock()
+        provider.execute = AsyncMock(return_value=_agent_output({"passed": True, "issues": []}))
+
+        # 2000 CJK chars: ~2 KB unescaped (fits the 8000 budget),
+        # ~12 KB escaped (would be truncated).
+        cjk_output = {"text": "你" * 2000}
+        await OutputValidator().validate(agent, "p", cjk_output, provider)
+
+        rendered = provider.execute.call_args.kwargs["rendered_prompt"]
+        assert "你" * 2000 in rendered
+        assert "\\u4f60" not in rendered
+        assert "…[truncated]" not in rendered
 
     @pytest.mark.asyncio
     async def test_validator_runs_without_tools(self) -> None:

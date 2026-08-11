@@ -18,6 +18,7 @@ export function GateDetail({ node }: GateDetailProps) {
   const [selectedValue, setSelectedValue] = useState<string | null>(null);
   const [promptForValue, setPromptForValue] = useState('');
   const [pendingPromptFor, setPendingPromptFor] = useState<string | null>(null);
+  const [pendingMultiline, setPendingMultiline] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [viewingFile, setViewingFile] = useState<string | null>(null);
 
@@ -25,39 +26,45 @@ export function GateDetail({ node }: GateDetailProps) {
   const isCompleted = node.status === 'completed';
 
   // Reset local state when the gate transitions back to 'waiting' (re-entry in a loop)
+  // Also keyed on gate_prompt_id: a questions node presents every question
+  // under the same name and stays 'waiting' throughout, so isWaiting alone
+  // never changes and the form would stay locked after the first answer.
   useEffect(() => {
     if (isWaiting) {
       setSelectedValue(null);
       setPromptForValue('');
       setPendingPromptFor(null);
+      setPendingMultiline(false);
       setIsSending(false);
     }
-  }, [isWaiting]);
+  }, [isWaiting, node.gate_prompt_id]);
 
   const canInteract = isWaiting && wsStatus === 'connected' && selectedValue === null;
 
-  const handleOptionClick = (value: string, promptFor?: string | null) => {
+  const handleOptionClick = (value: string, promptFor?: string | null, multiline?: boolean) => {
     if (!canInteract) return;
 
     if (promptFor) {
       // Show text input before sending
       setSelectedValue(value);
       setPendingPromptFor(promptFor);
+      setPendingMultiline(Boolean(multiline));
       return;
     }
 
     // Send immediately
     setSelectedValue(value);
     setIsSending(true);
-    sendGateResponse(node.name, value);
+    sendGateResponse(node.name, value, undefined, node.gate_prompt_id);
   };
 
   const handlePromptForSubmit = () => {
     if (selectedValue === null || pendingPromptFor === null) return;
     const additionalInput: Record<string, string> = { [pendingPromptFor]: promptForValue };
     setIsSending(true);
-    sendGateResponse(node.name, selectedValue, additionalInput);
+    sendGateResponse(node.name, selectedValue, additionalInput, node.gate_prompt_id);
     setPendingPromptFor(null);
+    setPendingMultiline(false);
   };
 
   // Use option_details for interactive buttons if available
@@ -102,7 +109,7 @@ export function GateDetail({ node }: GateDetailProps) {
                     <button
                       key={opt.value}
                       disabled={!canInteract && !isSelected}
-                      onClick={() => handleOptionClick(opt.value, opt.prompt_for)}
+                      onClick={() => handleOptionClick(opt.value, opt.prompt_for, opt.multiline)}
                       className={`w-full text-left px-3 py-2.5 rounded-lg border transition-all duration-150 ${
                         isSelected
                           ? 'border-green-500/60 bg-green-500/10'
@@ -139,11 +146,11 @@ export function GateDetail({ node }: GateDetailProps) {
                           </span>
                         </div>
                         {/* Route hint */}
-                        {opt.route && (
+                        {opt.route ? (
                           <span className="text-[10px] text-[var(--text-muted)] flex-shrink-0">
                             → {opt.route}
                           </span>
-                        )}
+                        ) : null}
                       </div>
                     </button>
                   );
@@ -195,18 +202,37 @@ export function GateDetail({ node }: GateDetailProps) {
                 </h4>
               </div>
               <div className="p-3 space-y-2">
-                <input
-                  type="text"
-                  value={promptForValue}
-                  onChange={(e) => setPromptForValue(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handlePromptForSubmit()}
-                  placeholder={`Enter ${pendingPromptFor}...`}
-                  className="w-full text-xs px-3 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] outline-none focus:border-amber-400 transition-colors"
-                  autoFocus
-                />
+                {pendingMultiline ? (
+                  <textarea
+                    value={promptForValue}
+                    onChange={(e) => setPromptForValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                        e.preventDefault();
+                        handlePromptForSubmit();
+                      }
+                    }}
+                    rows={6}
+                    placeholder={`Enter ${pendingPromptFor}...`}
+                    className="w-full text-xs px-3 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] outline-none focus:border-amber-400 transition-colors resize-y font-mono leading-relaxed"
+                    autoFocus
+                  />
+                ) : (
+                  <input
+                    type="text"
+                    value={promptForValue}
+                    onChange={(e) => setPromptForValue(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handlePromptForSubmit()}
+                    placeholder={`Enter ${pendingPromptFor}...`}
+                    className="w-full text-xs px-3 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] outline-none focus:border-amber-400 transition-colors"
+                    autoFocus
+                  />
+                )}
                 <div className="flex items-center justify-between">
                   <span className="text-[10px] text-[var(--text-muted)]">
-                    Press Enter or click Submit
+                    {pendingMultiline
+                      ? 'Enter inserts a newline — press Ctrl/Cmd+Enter or click Submit'
+                      : 'Press Enter or click Submit'}
                   </span>
                   <button
                     onClick={handlePromptForSubmit}
@@ -337,7 +363,7 @@ function isRelativeFileLink(href: string | undefined): href is string {
 }
 
 /** Renders prompt text as markdown with dashboard-consistent styling. */
-function PromptMarkdown({
+export function PromptMarkdown({
   text,
   muted,
   onFileClick,

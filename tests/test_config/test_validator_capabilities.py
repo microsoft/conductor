@@ -935,7 +935,8 @@ class TestWorkflowLevelMaxSessionSeconds:
 class TestForEachProviderRecorded:
     """ForEach inline agent providers appear in workflow_started.providers block (#241 gap)."""
 
-    def test_for_each_inline_experimental_provider_appears_in_engine_metadata(
+    @pytest.mark.asyncio
+    async def test_for_each_inline_experimental_provider_appears_in_engine_metadata(
         self,
     ) -> None:
         """Engine's build_workflow_started_data must record for_each inline providers.
@@ -965,7 +966,7 @@ class TestForEachProviderRecorded:
             ],
         )
         engine = WorkflowEngine(config=config, provider=None)
-        data = engine.build_workflow_started_data()
+        data = await engine.build_workflow_started_data()
         assert "claude-agent-sdk" in data["providers"]
         assert data["providers"]["claude-agent-sdk"]["tier"] == "experimental"
 

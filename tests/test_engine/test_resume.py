@@ -815,12 +815,13 @@ class TestRunIdAndEventLogPathPersistence:
 class TestBuildAndSuppressWorkflowStarted:
     """Verify the CLI resume path can seed the dashboard with topology."""
 
-    def test_build_workflow_started_data_shape(self) -> None:
+    @pytest.mark.asyncio
+    async def test_build_workflow_started_data_shape(self) -> None:
         """The build helper returns a dict matching the engine's emit shape."""
         config = _multi_agent_config()
         engine = WorkflowEngine(config)
 
-        data = engine.build_workflow_started_data()
+        data = await engine.build_workflow_started_data()
 
         assert data["name"] == "multi-agent"
         assert data["entry_point"] == "planner"

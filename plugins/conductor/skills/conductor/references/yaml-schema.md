@@ -37,10 +37,60 @@ workflow:
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh, max (optional)
     skills: [string]                # Skills enabled for every provider-backed agent (default: [])
-                                    # Currently registered built-ins: "conductor"
+                                    # Each entry is a built-in NAME or a filesystem PATH.
+                                    #   name:  "conductor" (the only registered built-in)
+                                    #   path:  starts with . or ~, or contains / or \
+                                    #          -> a skill dir (holds SKILL.md), or a root of them
+                                    #             which expands to every immediate child holding one
+                                    # Relative paths resolve against the workflow FILE's directory.
+                                    # Every resolved SKILL.md must declare `name` and `description`
+                                    # in valid YAML frontmatter (use `description: |` if it contains
+                                    # a colon followed by a space) -- both CLIs skip
+                                    # an unparseable skill silently.
                                     # Copilot loads natively via `skill_directories`;
-                                    # Claude eagerly injects SKILL.md + references/*.md into the prompt.
-    mcp_servers:                    # MCP server configurations (ignored by claude-agent-sdk — uses CLI config)
+                                    # claude-agent-sdk loads natively via its plugin surface, so a
+                                    #   path skill OUTSIDE a Claude Code plugin is rejected there;
+                                    # Claude and hermes eagerly inject SKILL.md + references/*.md.
+    plugins:                        # Whole plugins enabled for every provider-backed agent (default: [])
+      - string                      #   String shorthand: everything the plugin ships
+      - name: string                #   Installed plugin NAME, or a PATH (same syntactic rule as skills)
+        skills: boolean             #   Load its skills/            (default: true)
+        agents: boolean             #   Register its subagents      (default: true)
+        mcp: boolean                #   Start its MCP servers       (default: true)
+                                    # A plugin ships skills, agents/*.agent.md subagents, and MCP
+                                    #   servers; enabling it brings all three because they are
+                                    #   written to work together.
+                                    # Names resolve under ~/.copilot/installed-plugins/*/ and
+                                    #   ~/.claude/plugins/*/; uninstalled or ambiguous is an error.
+                                    # copilot and claude-agent-sdk only. On claude-agent-sdk,
+                                    #   `agents: false` with `skills: true` is refused (its skill
+                                    #   surface is the plugin root, which carries subagents too).
+                                    # hooks/ and commands/ are never loaded (validate warns).
+                                    # Never discovered — a plugin loads only when a workflow names it.
+    skill_injection:                # Bounds EAGERLY injected skill content (claude, hermes only).
+      warn_bytes: integer           # Warn above this many bytes (default: 65536; null disables)
+      max_bytes: integer            # Fail above this many bytes (default: 131072; null disables)
+    skill_discovery:                # Pick up skills already installed on the machine (OFF by default)
+      sources: [string]             # personal | project (default: [] = disabled)
+                                    #   personal -> ~/.copilot/skills, ~/.claude/skills
+                                    #   project  -> .github/skills and .claude/skills, from the
+                                    #               workflow file's dir up to the repo root (or that
+                                    #               dir alone when not inside a repository)
+                                    # Conductor scans the union of both CLIs' locations itself, so
+                                    #   every agent sees the same set whatever provider it uses.
+                                    # Scanned in a fixed order (project, then personal) whatever
+                                    #   order they are written in.
+                                    # No `plugins` source: taking a plugin's skills/ and leaving
+                                    #   its agents/ and MCP behind is what runtime.plugins fixes.
+                                    # Discovered skills join runtime.skills, so an agent's own
+                                    #   `skills:` (including []) overrides them too.
+                                    # A skill named in `skills:` beats a discovered one of the same
+                                    #   name; the discovered copy is skipped, with a warning unless
+                                    #   both resolve to the same directory.
+                                    # REJECTED on claude/hermes -- they inject every body into every
+                                    #   prompt and a discovered set cannot be bounded.
+      exclude: [string]             # Skill names to drop from the discovered set (default: [])
+    mcp_servers:                    # MCP server configurations
       <server_name>:
         type: string                # "stdio" (default), "http", or "sse"
         command: string             # Command to run (required for stdio)
@@ -128,6 +178,14 @@ agents:
       <field_name>:
         type: string                # "string", "number", "boolean", "array", "object"
         description: string         # Field description
+        enum: [a, b]                # Allowed values (string/number/boolean only)
+        pattern: string             # Regex, string type only (Python re.search)
+        minimum: number             # Inclusive lower bound, number type only
+        maximum: number             # Inclusive upper bound, number type only
+        minLength: int              # Inclusive min length, string type only
+        maxLength: int              # Inclusive max length, string type only
+        nullable: bool              # Allow null (default false)
+        required: bool              # Default true; false only inside properties
         items:                      # For array types: schema of items
           type: string
         properties:                 # For object types: schema of properties
@@ -148,14 +206,8 @@ agents:
     # Agent-level limits (override workflow runtime defaults)
     max_agent_iterations: integer   # Max tool-use roundtrips for this agent (1-500, optional)
     max_session_seconds: float      # Soft wall-clock timeout per session (checked between iterations)
-    session_key: string             # Continue ONE provider session across every execution tagged
-                                    # with this key (loop-backs and cross-agent hand-off).
-                                    # Static literal label — never Jinja2-rendered; stripped, non-empty.
-                                    # Only the claude-agent-sdk provider consumes it; sessions are
-                                    # scoped per working directory. Cannot be shared by concurrent
-                                    # executions (parallel members, for_each max_concurrent > 1) —
-                                    # that is a validation error. Forbidden on script, human_gate,
-                                    # workflow, wait, set, terminate.
+    session_key: string             # Optional. Executions sharing this key continue ONE provider
+                                    # session. Static label, never rendered. claude-agent-sdk only.
     timeout_seconds: float          # Hard wall-clock timeout (>=1.0); engine wraps in asyncio.wait_for().
                                     # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
                                     # Raises AgentTimeoutError; non-retryable.
@@ -171,7 +223,14 @@ agents:
     #   - omit:           inherit runtime.skills
     #   - skills: []      explicit opt-out (no skills for this agent)
     #   - skills: [a, b]  explicit set, replaces the workflow default
-    skills: [string]                # Skill names enabled for this agent (built-ins: "conductor")
+    skills: [string]                # Built-in names and/or paths (see runtime.skills above)
+                                    # e.g. [conductor, ./team-skills/acme-widgets]
+
+    # Plugins (optional, only on provider-backed agents)
+    # Same tri-state as skills: omit inherits runtime.plugins, [] opts out,
+    # a list replaces the workflow default. See runtime.plugins above.
+    plugins:
+      - string                      # e.g. [prs] or [{name: ado, mcp: false}]
 
     # Per-agent retry policy (optional, not allowed for script, human_gate, workflow, or wait agents)
     retry:
@@ -557,6 +616,39 @@ output:
       count:
         type: number
         description: Item count
+```
+
+### Field Constraints
+
+Optional keywords that turn a declared type into an enforced contract. They are
+advertised to the model in the generated schema and validated after the response
+comes back, so a violation drives the provider's output-recovery retry.
+Constraints apply recursively inside object properties and array items.
+
+| Keyword | Applies to | Meaning |
+|---------|-----------|---------|
+| `enum` | `string`, `number`, `boolean` | Allowed values. Cannot contain null — use `nullable: true`. |
+| `pattern` | `string` | Regex, Python `re.search` semantics on every provider. Unanchored unless you write `^`/`$`. Bounded to 1 second, so a backtracking pattern fails validation instead of hanging the run. |
+| `minimum` / `maximum` | `number` | Inclusive numeric bounds. |
+| `minLength` / `maxLength` | `string` | Inclusive length bounds. |
+| `nullable` | any | Permit null. Default `false`. |
+| `required` | object properties | Default `true`. Rejected on a root-level output field — valid only inside `properties`. |
+
+Illegal combinations fail at load time: `pattern` on a number, an `enum` member
+that does not match the declared type, `minLength` above `maxLength`, a regex
+that does not compile. Unknown keys are rejected too, so a misspelled
+`minlength` fails validation rather than silently leaving the field
+unconstrained.
+
+**Referencing optional and nullable fields in templates.** Templates render with
+`StrictUndefined`, so referencing an omitted `required: false` property raises a
+template error, and a `nullable` field that came back null renders the string
+`None`. Guard both:
+
+```yaml
+output:
+  notes: "{{ agent.output.notes if agent.output.notes is not none else '' }}"
+  comments: "{{ agent.output.details.comments if agent.output.details.comments is defined else '' }}"
 ```
 
 ## Template Syntax

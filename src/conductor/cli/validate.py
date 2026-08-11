@@ -7,7 +7,7 @@ without executing them, displaying detailed error information.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -67,7 +67,220 @@ def validate_workflow(
         display_validation_error(e, workflow_path, output_console)
         return False, None
 
+    _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
+    _report_plugins(config, workflow_path, output_console)
+
     return True, config
+
+
+def _report_plugins(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+) -> None:
+    """Print what each enabled plugin actually contributes.
+
+    A plugin name in the YAML says nothing about how much it brings — the
+    installed plugins on one machine range from a single skill to seven
+    subagents plus an MCP server that authenticates with the user's own
+    credentials. Printing the component counts is what turns "I enabled
+    ``prs``" into something the author can review, and makes a change in
+    what a plugin ships visible on the next validate rather than at run
+    time.
+
+    Reports the workflow-level set only. Per-agent ``plugins:`` overrides
+    are resolved and *checked* by the validator, which knows each agent's
+    provider; repeating them here without that context would list
+    components a given agent never receives.
+
+    Never fatal, but not because the failure was already reported: the
+    validator resolves plugins per agent, so a workflow whose agents all
+    override ``plugins:`` (including with ``[]``) never resolves the
+    workflow-level list at all, and a failure surfaces here first. A
+    summary is still the wrong place to fail a workflow that is otherwise
+    valid — nothing inherits the list — so it degrades to a warning.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring relative
+            plugin paths.
+        console: Rich console for output.
+    """
+    entries = config.workflow.runtime.plugins
+    if not entries:
+        return
+
+    from conductor.plugins.errors import PluginError, PluginFetchError
+    from conductor.plugins.registry import resolve_plugins
+    from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+    from conductor.skills import SkillError
+
+    base_dir = workflow_path.resolve().parent
+    declared = config.workflow.runtime.plugin_sources
+    sources: dict[str, Any] = {}
+    if declared:
+        # Cache-only, like everything else in ``conductor validate``: this
+        # is a summary, and a summary must not clone. Resolved one at a
+        # time so a single unfetched source degrades to one line rather
+        # than discarding the summary for every healthy source beside it.
+        for name, entry in declared.items():
+            try:
+                sources.update(
+                    resolve_plugin_sources({name: entry}, base_dir=base_dir, allow_network=False)
+                )
+            except PluginFetchError:
+                # Merely unfetched. Not reported here — the plugin lines
+                # below already name ``conductor plugin fetch`` for the
+                # entries that need it, and the validator said it once.
+                continue
+            except (PluginError, SkillError, OSError) as exc:
+                console.print(f"  [yellow]⚠[/yellow] Plugin source {name!r} is unusable: {exc}")
+
+    # Printed before resolution is attempted: what a source resolved to is
+    # worth seeing even when an entry referencing a *different* source
+    # cannot be resolved, and this listing is the only place the resolved
+    # commit appears.
+    if sources:
+        console.print(f"  [dim]Plugin sources: {len(sources)} declared[/dim]")
+        for name, entry in sources.items():
+            detail = entry.source.describe()
+            if entry.sha:
+                detail = f"{detail} @ {entry.sha[:12]}"
+            if entry.stale:
+                detail = f"{detail} (cached; ref not re-checked)"
+            console.print(f"    [dim]• {name} — {detail}[/dim]")
+
+    # Resolved one entry at a time, for the same reason the sources above
+    # are: ``resolve_plugins`` is all-or-nothing, so one entry whose source
+    # is unfetched would erase the component counts for every healthy
+    # plugin beside it — the listing this function exists to print.
+    resolved = []
+    for entry in entries:
+        try:
+            resolved.extend(
+                resolve_plugins(
+                    [entry],
+                    base_dir=base_dir,
+                    marketplaces=marketplaces_from(sources),
+                    declared_sources=set(declared) - set(sources),
+                )
+            )
+        except (PluginError, SkillError, OSError) as exc:
+            # Narrow: a genuine bug in the plugin layer (AttributeError,
+            # KeyError) should surface as a crash, not as a soft yellow line
+            # the reader scrolls past. This arm is reachable through ordinary
+            # configuration — see the docstring — so it is not merely
+            # defensive.
+            console.print(f"  [yellow]⚠[/yellow] Plugin {entry.name!r}: {exc}")
+
+    console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
+    for plugin in resolved:
+        parts = [
+            f"{len(plugin.skills)} skill(s)",
+            f"{len(plugin.agents)} agent(s)",
+            f"{len(plugin.mcp_servers)} MCP server(s)",
+        ]
+        console.print(f"    [dim]• {plugin.name} — {', '.join(parts)} — {plugin.root}[/dim]")
+        if plugin.agents:
+            names = ", ".join(item.qualified_name for item in plugin.agents)
+            console.print(f"      [dim]agents: {names}[/dim]")
+        if plugin.mcp_servers:
+            console.print(f"      [dim]mcp: {', '.join(sorted(plugin.mcp_servers))}[/dim]")
+        if plugin.disabled:
+            console.print(
+                f"      [dim]disabled by this workflow: {', '.join(plugin.disabled)}[/dim]"
+            )
+
+
+def _report_skill_discovery(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+    already_reported: list[str],
+) -> None:
+    """Print what ``runtime.skill_discovery`` puts in effect on this machine.
+
+    Discovery's one real cost is that the same YAML picks up a different
+    skill set on a different machine or in CI. That is only defensible if
+    the author can see the set, so listing it is part of the feature
+    rather than a debugging aid.
+
+    Resolves rather than merely scanning, so the listing is the set an
+    inheriting agent actually gets: a skill with broken frontmatter or a
+    name already claimed in ``skills:`` is excluded here exactly as it is
+    at run time. Skills an individual provider then declines to load
+    (``claude-agent-sdk`` outside a plugin) are per-agent and reported as
+    warnings by the validator instead.
+
+    Diagnostics are forwarded unless the validator already printed them.
+    They cannot simply be discarded: the validator only resolves skills
+    for agents that *inherit* the workflow list, so a workflow whose
+    agents all declare their own ``skills:`` never runs discovery there,
+    and this becomes the only place a broken ambient location is ever
+    mentioned.
+
+    Never fatal — turning a summary into a second source of validation
+    errors would be worse than an incomplete summary.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring ``project``.
+        console: Rich console for output.
+        already_reported: Warnings the validator has printed, so the same
+            line is not shown twice.
+    """
+    discovery = config.workflow.runtime.skill_discovery
+    if not discovery.is_enabled:
+        return
+
+    from conductor.skills import (
+        BYTES_PER_TOKEN_ESTIMATE,
+        load_skill_content,
+        resolve_effective_skills,
+    )
+
+    seen = set(already_reported)
+
+    def _forward(message: str) -> None:
+        if message in seen:
+            return
+        seen.add(message)
+        console.print(f"  [yellow]⚠[/yellow] {message}")
+
+    try:
+        resolved = resolve_effective_skills(
+            list(config.workflow.runtime.skills),
+            sources=discovery.sources,
+            exclude=discovery.exclude,
+            base_dir=workflow_path.resolve().parent,
+            on_warning=_forward,
+        )
+    except Exception as exc:  # pragma: no cover - defensive; a report must not crash
+        console.print(f"  [yellow]⚠[/yellow] Skill discovery could not be summarized: {exc}")
+        return
+
+    found = [skill for skill in resolved if skill.discovered]
+    sources = ", ".join(discovery.sources)
+    if not found:
+        console.print(f"  [dim]Skill discovery ({sources}): no skills found[/dim]")
+        return
+
+    console.print(f"  [dim]Skill discovery ({sources}): {len(found)} skill(s)[/dim]")
+    for skill in found:
+        console.print(f"    [dim]• {skill.name} — {skill.source}[/dim]")
+
+    try:
+        content = load_skill_content([(skill.name, skill.directory) for skill in resolved])
+    except Exception as exc:
+        console.print(f"  [yellow]⚠[/yellow] Skill content could not be measured: {exc}")
+        return
+    size = len(content.encode("utf-8"))
+    # Covers declared skills too, since an eager-injection provider would
+    # be sent the whole set — the budget it is compared against is total.
+    console.print(
+        f"    [dim]Total if eagerly injected: {size:,} bytes "
+        f"(~{size // BYTES_PER_TOKEN_ESTIMATE:,} tokens)[/dim]"
+    )
 
 
 def display_validation_error(
@@ -120,6 +333,7 @@ def display_validation_success(
     # Build summary info
     agent_count = len(config.agents)
     human_gate_count = sum(1 for a in config.agents if a.type == "human_gate")
+    questions_count = sum(1 for a in config.agents if a.type == "questions")
     parallel_group_count = len(config.parallel)
     for_each_group_count = len(config.for_each)
 
@@ -150,6 +364,9 @@ def display_validation_success(
     if human_gate_count > 0:
         patterns.append("human gates")
 
+    if questions_count > 0:
+        patterns.append("questions")
+
     if config.tools:
         patterns.append("tools")
 
@@ -165,6 +382,8 @@ def display_validation_success(
     table.add_row("Agents", str(agent_count))
     if human_gate_count > 0:
         table.add_row("Human Gates", str(human_gate_count))
+    if questions_count > 0:
+        table.add_row("Questions", str(questions_count))
     if parallel_group_count > 0:
         table.add_row("Parallel Groups", str(parallel_group_count))
     if for_each_group_count > 0:

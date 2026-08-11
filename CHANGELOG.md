@@ -5,10 +5,321 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.26...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
 
 ### Added
 
+- **`conductor status` — see what is running without stopping it** (#384).
+  `conductor stop` with no arguments lists background workflows, but stops one
+  when exactly one is running, so the natural "what's running?" reflex was
+  destructive precisely when there was a single run to lose. `status` never
+  terminates anything and never removes a PID file, so a run stays
+  discoverable even when its liveness cannot be confirmed. It prints each
+  run's dashboard URL, which is otherwise unrecoverable once the launching
+  terminal is gone, and `--json` makes it scriptable. A malformed PID file is
+  skipped with a warning rather than taking down the listing.
+- **Git-backed plugin sources** (#380). `runtime.plugins` alone resolves
+  against machine state — an installed plugin name, or a path — so a workflow
+  shared with a teammate still needed "first install these plugins" in a
+  README, and a teammate who skipped that step got a hard error rather than a
+  working run. `runtime.plugin_sources` maps a marketplace name to where it
+  comes from (`owner/repo#v1.4.0`, any http/https/ssh or `git@host:path`
+  remote, or a local path), and `plugins:` entries reference it as
+  `prs@acme`. The split follows the Copilot CLI's own settings, which
+  separate `extraKnownMarketplaces` from `enabledPlugins` — eleven plugins
+  commonly come from one repository, so inlining a URL per entry would either
+  clone it eleven times or silently pick one of eleven refs. The load-bearing
+  property is that `prs@acme` means the same thing whether the marketplace
+  was declared, installed via a CLI, or is a local directory: a declared
+  source registers its name into the same resolution table the installed
+  roots populate, so git *feeds* resolution rather than adding a second code
+  path. It also gives the ambiguity error added in #378 a second remedy —
+  qualify `git` as `git@acme` instead of falling back to a path. Both
+  repository shapes are handled: a `marketplace.json` catalog or a
+  `plugin.json` single plugin, with a `plugin:` key for a repository that is
+  both. There is **no lockfile** — the YAML is the lock. A ref that is a full
+  40-character SHA is pinned and fetched once; a tag, branch, or absent ref
+  floats and is re-resolved every run, matching how workflow registries
+  already behave. `conductor run` acquires sources up front and in parallel;
+  `conductor plugin fetch` primes the cache as its own step, which is what
+  keeps `conductor validate` off the network entirely; `conductor plugin
+  list` reports what a run would load, including the component counts that
+  make a change in what a plugin ships visible. An unreachable remote with a
+  warm cache warns and reuses the checkout, so offline runs keep working.
+  Checkouts are cached under `$CONDUCTOR_HOME/cache/plugins/`, keyed by
+  resolved commit. Cloning shells out to `git`, so existing SSH keys and
+  credential helpers apply and self-hosted forges work.
+
+  Sources are resolved one at a time, so a source that is unfetched or
+  broken costs its own diagnostic rather than the report for every healthy
+  source beside it. The two are distinguished: an *unfetched* source is a
+  warning naming `conductor plugin fetch`, since `conductor run` heals it,
+  while a source that is itself wrong — a path that does not exist, a
+  `path:` that escapes the checkout, an unparseable catalog — is an error,
+  because no amount of fetching fixes it. A declared source that shadows a
+  same-named installed marketplace is reported, since the two can ship
+  different subagents or a different MCP server. See
+  `examples/plugin-sources.yaml` and the Plugins section of
+  `docs/workflow-syntax.md`.
+- **Output field constraints — `enum`, `pattern`, `minimum`/`maximum`,
+  `minLength`/`maxLength`, `required`, `nullable`**
+  ([#372](https://github.com/microsoft/conductor/pull/372)). An `output:` field
+  could declare a type and nothing more, so "verdict is one of three values" or
+  "score is 0-100" lived in the prompt, where it was a suggestion rather than a
+  contract. The eight new keywords are emitted into the schema each provider
+  shows its model and enforced when the response comes back, and because a
+  violation raises the same `ValidationError` a type mismatch does, it lands
+  inside the existing in-session recovery loop — the model gets a chance to
+  correct itself before the workflow fails. Constraints are checked recursively,
+  so they hold inside object properties and array items too.
+
+  Illegal combinations are rejected at load time rather than at run time:
+  `pattern` on a number, an `enum` whose members do not match the declared type,
+  `minLength` above `maxLength`, a regex that does not compile. Unknown keys are
+  rejected as well, so a misspelled `minlength` fails validation instead of
+  quietly leaving the field unconstrained. `required: false` is allowed only
+  inside object properties — a root-level output field cannot be optional.
+
+  Two things worth knowing when using them. `pattern` runs under a one-second
+  deadline on a `re`-compatible engine, because model output is untrusted input
+  and a backtracking pattern would otherwise stall the event loop and every
+  agent sharing it; an exceeded deadline is a validation failure, not a hang.
+  And templates render with `StrictUndefined`, so a `nullable` field that came
+  back null renders as `None` and an omitted optional property raises — guard
+  both with `is not none` / `is defined`, as
+  [`examples/output-constraints.yaml`](examples/output-constraints.yaml) shows.
+  See [`docs/workflow-syntax.md`](docs/workflow-syntax.md) (Field Constraints).
+
+- **Plugins as the unit of opt-in** (#378). Conductor loaded a plugin's
+  `skills/` and dropped everything else it shipped. That is a problem because
+  a plugin's parts are written to work together: its `SKILL.md` routinely
+  tells the agent to hand work to `prs:code-reviewer`, or to call an `ado` MCP
+  tool. The skill loaded, the agent read those instructions, reached for a
+  subagent that was never registered — and said nothing. `runtime.plugins`
+  (and per-agent `plugins:`) now opts into the whole unit: skills,
+  `agents/*.agent.md` subagents, and declared MCP servers. Entries take a
+  string shorthand or an object with per-component switches (`skills`,
+  `agents`, `mcp`), all defaulting on, because defaulting one off would
+  recreate the partial load the feature exists to fix. An entry is an
+  installed plugin name or a path, classified by the same syntactic rule
+  `skills:` uses; an uninstalled name errors naming where it looked, and an
+  ambiguous one errors rather than picking a winner. Conductor
+  **deconstructs** a plugin rather than handing its root to the SDK: both
+  SDKs' whole-plugin surfaces are all-or-nothing, and on Copilot hiding an
+  MCP tool from the model does **not** stop its server subprocess launching
+  with the user's credentials — so `mcp: false` built that way would be a
+  guarantee that isn't one. Deconstructed, a plugin's MCP servers also pick
+  up the same `runtime.tool_output` limits, dashboard tool events, and
+  credential/`${VAR}` resolution as a workflow-declared server. Supported on `copilot` and
+  `claude-agent-sdk`; `claude`, `hermes` and `aca` reject `plugins:` at
+  validation time, since injecting text into a prompt cannot produce a
+  subagent or an MCP server. `conductor validate` prints what each plugin
+  contributes, including every subagent by name, so a change in what a plugin
+  ships is visible before the run rather than during it. See
+  `examples/plugins.yaml` and the Plugins section of `docs/workflow-syntax.md`.
+
+- **Copilot-convention plugin manifests are recognised** (#378).
+  `.github/plugin/plugin.json` now resolves alongside
+  `.claude-plugin/plugin.json`. Both have always worked at runtime, so
+  recognising only the latter was Conductor's own gap — on an ordinary
+  machine it stranded 12 of 13 installed plugins, which on
+  `claude-agent-sdk` meant a packaged skill was rejected outright and on
+  `copilot` meant it was silently demoted to a bare directory.
+
+- **`type: questions` — ask a human a set of questions in one step** (#376).
+  `human_gate` handles a single decision; asking N questions previously meant
+  hand-rolling a gate that loops back through a `set` step accumulating a
+  string transcript. That loop cannot support going back — a workflow step
+  cannot be un-executed, and a concatenated transcript has no addressable
+  per-question answer to overwrite — and it costs two engine iterations per
+  question. A `questions` node holds the cursor and answers internally, so the
+  whole set costs one iteration and answers land in a keyed dict where
+  revisiting question 3 overwrites `answers.q3`. Questions come from an inline
+  `questions:` list or a `source:` dotted path; entries may be plain strings or
+  objects with `choices`, so an agent already emitting `array of string`
+  migrates unchanged while gaining candidate answers is a backward-compatible
+  upgrade. Supports back/skip/skip-all/abort, `required`, per-question
+  `default`s, a closing review, and partial answers that survive a checkpoint.
+  `--skip-gates` never selects a suggested answer — those come from the agent,
+  so recording one would feed invented input back as though a human gave it.
+  See `examples/questions.yaml` and the Questions section of
+  `docs/workflow-syntax.md`.
+- **Opt-in multi-line text for human gates** — `GateOption.multiline` (default
+  `false`, so existing gates are unchanged). The terminal reads until a lone
+  `.` or EOF; the dashboard renders a textarea where Enter inserts a newline
+  and Ctrl/Cmd+Enter submits. Previously a multi-paragraph answer to a
+  `prompt_for` input was silently truncated at the first newline.
+
+### Removed
+
+- **`skill_discovery.sources: [plugins]`** (#378). The source scanned every
+  installed plugin's `skills/` directory — reaching into a plugin and taking
+  exactly one of the three things it ships, which is the bug `runtime.plugins`
+  fixes rather than a feature with a gap. It was also wrong more often than it
+  looked: of 13 plugins on an ordinary machine, 3 loaded their instructions
+  without the subagents those instructions dispatch to, and the 3 most
+  plugin-like — MCP and subagent toolkits with no `skills/` at all — were never
+  discovered by it. Nothing distinguished the working set from the broken set
+  at authoring time, on a machine the workflow author may not even be using.
+  `personal` and `project` are unchanged. Replace `sources: [plugins]` with
+  `runtime.plugins`, which brings the whole plugin and, unlike a scan,
+  reproduces on another machine.
+
+### Fixed
+
+- **Agent text containing bracketed tokens no longer kills a run** (#382). A
+  step whose output contained ordinary technical prose such as
+  `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
+  markup tag, raising `MarkupError` and ending the workflow — unresumably,
+  since the crash happened while rendering rather than while running. Every
+  console sink that renders agent-supplied text now passes it as `rich.text.Text`
+  rather than interpolating it into markup, and the file-log console disables
+  markup entirely. `style=` does not turn markup parsing off, which is what hid
+  three of the five sinks; two of those were reachable on a bare `conductor run`
+  with no flags. Opening tags such as `[bold]` were the quieter half of the same
+  bug: rich consumed them without raising and the text simply disappeared.
+- **Structured `runtime.provider` for `name: claude` no longer drops a
+  YAML-declared `api_key`** — the schema accepted `api_key` (alongside
+  `base_url` and `auth_token`) but the provider factory silently discarded it,
+  so only the `ANTHROPIC_API_KEY` env var ever reached the Anthropic client.
+  The factory now forwards it. Two credential-semantics fixes ride along so
+  the documented behavior is what the code does: the Claude provider's model
+  path now resolves credentials as a unit like the Anthropic SDK does —
+  setting either credential in YAML suppresses both `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN`, where previously a YAML `auth_token` still let an
+  ambient `ANTHROPIC_API_KEY` ride along and the SDK sent both `X-Api-Key`
+  and `Authorization: Bearer` headers to whatever `base_url` pointed at
+  (a credential leak against gateway endpoints). And when both credentials
+  are set, Conductor now logs a warning naming that behavior instead of
+  shipping both headers silently — the same parity warning the Copilot
+  provider already logs for `api_key` + `bearer_token`. New example:
+  [`examples/claude-custom-endpoint.yaml`](examples/claude-custom-endpoint.yaml);
+  see [`docs/providers/claude.md`](docs/providers/claude.md) (Custom
+  Endpoints and Gateways).
+- **`conductor resume --web` no longer shows a running workflow as stopped** —
+  a workflow that was paused from the dashboard (Stop, then Kill) recorded an
+  `agent_paused` event in its event log with no `agent_resumed` counterpart.
+  On resume the CLI seeds the dashboard from that log, so the pause replayed
+  and latched the dashboard's global paused state for the entire resumed run:
+  the header showed Resume/Kill instead of Stop for a pause that never
+  happened, hiding the only graceful stop behind a Kill that would hard-stop
+  the healthy resumed run. Pause, iteration-limit-gate, and dialog events are
+  now dropped on replay at every workflow depth, alongside the root lifecycle
+  events already filtered; a gate the resumed run genuinely re-enters emits
+  its own fresh event. Prior agent output and messages are still replayed.
+  The dashboard's live-control buttons are also hidden in `conductor replay`
+  mode, where the recorded-log server serves no `/api/stop`, `/api/resume`,
+  or `/api/kill` endpoint.
+- **Dashboard Stop/Resume/Kill no longer hang on a failed request** — `fetch`
+  resolves rather than rejects on a 4xx/5xx response, so a non-2xx reply left
+  the button disabled and reading "Stopping…" indefinitely, with nothing
+  logged and no way back except reloading the page. The response status is now
+  checked explicitly and surfaced next to the controls.
+- **Dashboard: expanding a subworkflow no longer slides the graph out from
+  under you** ([#375](https://github.com/microsoft/conductor/issues/375)) —
+  the graph layout normalizes its bounding box to the origin on every rebuild,
+  so growing one container repositioned every node while the camera stayed
+  where it was. Expanding or collapsing a subworkflow now pans the viewport by
+  the same amount the toggled container moved, so that container stays pinned
+  under the cursor and the surrounding nodes visibly move out of its way
+  instead. Collapsing that same subworkflow returns you to the view you
+  started from. Expand-all, and any other change that toggles several
+  subworkflows at once, anchors on whatever sits nearest the center of the
+  pane; the view is not refit in either case. The same compensation steadies
+  the graph when a running workflow's topology grows — a `for_each` fanning
+  out or a subworkflow's DAG arriving.
+
+## [0.1.27](https://github.com/microsoft/conductor/compare/v0.1.26...v0.1.27) - 2026-08-04
+
+### Added
+
+- **Skills: `runtime.skills` and per-agent `skills:` give agents opt-in
+  knowledge bases** ([#180](https://github.com/microsoft/conductor/issues/180))
+  — `runtime.skills` enables a list of skills for every provider-backed agent
+  in the workflow, and any agent can override it with its own `skills:`
+  (omitted = inherit, `[]` = explicit opt-out, a list = explicit set).
+  Conductor ships a built-in `conductor` skill covering its own YAML schema,
+  execution model, authoring patterns, and CLI commands, so an agent that
+  writes or reviews workflows can be made Conductor-aware without pasting
+  documentation into its prompt. The observable contract is the same on every
+  provider — the agent has access to the named skill — but the mechanism
+  differs: `copilot` registers the skill directory on the SDK session, so only
+  the frontmatter is read up front and the body is loaded on demand, while
+  providers with no native skill surface receive the skill content injected
+  into the prompt. Providers declare whether they can load skills at all, and
+  `conductor validate` rejects a workflow that enables skills on one that
+  cannot, rather than letting the content be silently dropped at run time.
+  Skills are rejected on step types with no model behind them (`script`,
+  `set`, `wait`, `terminate`, `workflow`, `human_gate`). See
+  [`examples/skills-self-improving-workflow.yaml`](examples/skills-self-improving-workflow.yaml)
+  and [`docs/workflow-syntax.md`](docs/workflow-syntax.md) (Skills).
+
+- **Skill discovery: `runtime.skill_discovery` picks up skills already
+  installed on the machine** (issue #362) — `sources: [personal, project,
+  plugins]` scans `~/.copilot/skills` and `~/.claude/skills`,
+  `.github/skills` and `.claude/skills` from the workflow file's directory
+  up to the repository root, and every installed plugin's `skills/`
+  directory, so a workflow can use a personal or team skill library without
+  enumerating it. Off by default. `exclude:` drops individual skills by
+  name. Conductor scans the union of both CLIs' locations itself rather
+  than enabling each provider's own discovery: locations are
+  provider-specific, so a per-provider flag would give a `copilot` agent
+  and a `claude-agent-sdk` agent different skill sets inside a single run.
+  Scanning centrally also keeps Copilot's `enable_config_discovery` off,
+  which would otherwise auto-load MCP servers from any `.mcp.json` in the
+  working directory. Discovered skills join `runtime.skills`, so an agent
+  declaring its own `skills:` (including `skills: []`) still overrides
+  them; a skill named in `skills:` beats a discovered one of the same name.
+  Discovered content is held to a laxer standard than declared content —
+  broken frontmatter, a taken name, an unreadable directory, or a skill
+  `claude-agent-sdk` cannot load are errors for a declared skill and
+  warning-plus-skip for a discovered one (a provider with no native skill
+  surface at all is the exception, and errors either way). Rejected at validation time on `claude` and
+  `hermes`, which inject every skill body into every prompt and cannot
+  bound a machine-dependent set; on `claude-agent-sdk` only discovered
+  skills inside a Claude Code plugin are loaded and the rest are skipped
+  with a warning. `conductor validate` lists what was found, where each
+  skill came from, and the total size if eagerly injected. See
+  `examples/skills-discovery.yaml` and `docs/workflow-syntax.md`
+  (Discovering installed skills).
+
+- **`skills:` now accepts filesystem paths, not just built-in names**
+  (issue #350) — an entry is treated as a path when it starts with `.`
+  or `~`, or contains `/` or `\`; everything else must still be
+  a registered built-in, so a bare `conductor` can never be shadowed by a
+  same-named local directory. A path may point at a single skill directory
+  (one holding `SKILL.md`) or at a root of them, which expands to every
+  immediate child that holds one. Relative paths resolve against the workflow
+  file's directory — the same rule `working_dir` uses — so a team can version
+  a skill alongside the workflow that uses it with no per-developer install
+  step, and the workflow resolves identically from any working directory.
+  Conductor expands roots itself rather than handing them to a provider,
+  because eager injection needs a name per skill and `claude-agent-sdk` needs
+  a `<plugin>:<skill>` name; doing it centrally keeps every provider seeing
+  the same set. Skill paths are trusted input by design: the same workflow
+  file can already declare `type: script` steps running arbitrary shell, so
+  no additional allowlist applies.
+- **`runtime.skill_injection` bounds eagerly injected skill content**
+  (issue #350) — `warn_bytes` (default 64KB) logs a warning and reports from
+  `conductor validate`; `max_bytes` (default 128KB) fails the agent. Either
+  can be set to `null` to disable it. Providers without a native skill
+  surface (`claude`, `hermes`) have no progressive disclosure: `AgentExecutor`
+  prepends each enabled skill's `SKILL.md` **plus its entire `references/`
+  tree** on every call and every retry, and there
+  was previously no ceiling at all. The bundled `conductor` skill alone is
+  ~117KB (~29K tokens), so the defaults deliberately straddle it — enabling
+  it on `claude` now warns instead of breaking, while accumulating several
+  large skills errors. Both limits are measured against the exact string
+  being prepended and report a per-skill breakdown naming the offender.
+  Providers with progressive disclosure (`copilot`, `claude-agent-sdk`) are
+  unaffected.
+- **`hermes` declares `skills=True`** (issue #350) — the provider omitted
+  `skills` from its `CAPABILITIES`, which defaults to `False`, so
+  `conductor validate` rejected `skills:` on it while its own `execute()`
+  docstring described eager injection working. Injection happens in
+  `AgentExecutor`, upstream of every provider, so the path was always
+  reachable and the declaration was simply inaccurate. Now bounded by
+  `runtime.skill_injection` like `claude`.
 - **Session continuity for the `claude-agent-sdk` provider via a per-agent
   `session_key`** — executions tagged with the same key now continue one
   underlying Claude session instead of each starting cold, so a loop-back
@@ -52,9 +363,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field — inheritance from the CLI subprocess covers it. A missing directory
   still fails before the provider is reached, and `strict_mcp_config` remains
   enabled so a `.mcp.json` sitting in the new directory cannot inject
-  undeclared servers. Note that the `claude` CLI also reads `CLAUDE.md` and
-  `.claude/settings*.json` from its working directory, so pointing an agent at
-  an untrusted checkout means running that checkout's instructions and hooks.
+  undeclared servers. The `claude` CLI would also read `CLAUDE.md` and
+  `.claude/settings*.json` from its working directory, but the same release
+  pins `setting_sources` to an empty list (see the skills entry below), so
+  those are no longer loaded from wherever the agent happens to run.
   Launch failures caused by a bad working directory are now reported as such
   rather than as connection problems, and are no longer treated as retryable.
   See
@@ -110,7 +422,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since `validate_output` also runs on `set` and `script` step output that may
   carry secrets. ([#343](https://github.com/microsoft/conductor/issues/343))
 
+- **Sub-workflow nodes in the dashboard are expandable before they run.** A
+  `type: workflow` node previously became expandable only once the engine
+  actually reached that step, so the inner DAG of a sub-workflow that had not
+  started yet was invisible. Conductor now resolves each sub-workflow's static
+  topology up front and attaches it to the graph, so the real inner DAG can be
+  expanded — recursively, for nested sub-workflows — from the moment the run
+  starts. Resolution is best-effort: a missing file, registry error, cycle, or
+  depth limit simply leaves the node collapsed until the engine reaches it.
+  ([#360](https://github.com/microsoft/conductor/pull/360))
+
 ### Fixed
+
+- **A malformed `SKILL.md` no longer fails silently** (issue #350) — both the
+  Copilot CLI and Claude Code skip a skill whose YAML frontmatter cannot be
+  parsed, with no warning and no error, leaving an agent running without the
+  knowledge its author asked for. The trap is ordinary: a `description`
+  containing `Triggers: ...` as an unquoted plain scalar is invalid YAML.
+  Conductor now parses the frontmatter itself, requires a non-empty `name`
+  and `description`, and reports the underlying YAML error along with the
+  `description: |` block-scalar fix. Enforced during resolution rather than
+  only in `conductor validate`, because `conductor run` never invokes the
+  static validator.
+- **`conductor validate` rejects a `claude-agent-sdk` skill outside a plugin**
+  (issue #350) — that SDK exposes no bare skill-directory option, only plugin
+  roots plus skill names, so such a skill is unreachable there even though
+  `copilot` loads it fine. It previously surfaced as a runtime
+  `ProviderError` on first execution; it is now reported before the run
+  starts, naming the directory and offering both remedies (package it as a
+  plugin, or run the agent on `copilot`).
+
+- **`skills: []` is now a real opt-out on `claude-agent-sdk`, and agents no
+  longer inherit ambient skills from the machine.** The provider left the SDK's
+  `setting_sources` unset, so the `claude` CLI discovered and enabled skills
+  from `~/.claude/skills/`, every `.claude/skills/` up the directory tree, and
+  enabled plugins — none of which the workflow declared, and all of which
+  varied by developer machine and launch directory. Conductor documents
+  `skills: []` as an explicit opt-out; on this provider it silently opted out
+  of nothing. Two options now carry that fix together and neither is redundant:
+  `setting_sources` is always `[]` (the same unconditional isolation
+  `strict_mcp_config` already applies to MCP servers), and `skills` is always
+  passed explicitly, because the SDK treats an omitted list as "CLI defaults
+  apply" and re-defaults `setting_sources` to `["user", "project"]` whenever
+  `skills` is set without it.
+  **Behavior change:** agents on this provider also stop picking up ambient
+  `CLAUDE.md`, `.claude/rules/*.md`, user/project/local `settings.json`
+  (including `env` and `apiKeyHelper`), and hooks. Instruction files can be
+  supplied explicitly with `--workspace-instructions` (or `--instructions`);
+  settings and hooks have no equivalent, so move anything load-bearing there
+  into the environment. Note the SDK's skill list is a context filter, not a
+  sandbox — undeclared skills are hidden from the model's listing, but their
+  files stay readable on disk.
+  ([#352](https://github.com/microsoft/conductor/issues/352))
 
 - **`tools: []` no longer fails validation when no MCP servers are declared** —
   the capability cross-check rejected an explicit empty allowlist against any
@@ -143,7 +506,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardcoded module constant of 3 and silently ignored the YAML value that
   Copilot and Claude both respect. ([#343](https://github.com/microsoft/conductor/issues/343))
 
+- **Nested `array` item schemas in `output:` are now enforced.** `validate_output`
+  type-checked only the top level of an array, so an `array<object>` output whose
+  items were missing declared fields — or had the wrong types — passed validation
+  silently, even though the full nested schema had been sent to the model.
+  Validation now recurses through both `object.properties` and `array.items` at
+  every depth, for LLM agents, `set` steps, and `script` steps alike.
+  **Behavior change:** a workflow that was quietly emitting output violating its
+  own declared nested schema will now fail with `ValidationError` instead of
+  passing. Flat schemas and `object` nesting are unaffected, and arrays declared
+  without `items` keep their existing passthrough.
+  ([#337](https://github.com/microsoft/conductor/pull/337))
+
+- **MCP server connections are now closed by the task that opened them.** Each
+  stdio/session lifecycle is held in its own owner task and signalled at
+  shutdown, so AnyIO cancel scopes always exit in the task that entered them.
+  Previously a connection opened in a worker task and closed from the root task
+  could raise a cancel-scope error during teardown, surfacing as a spurious
+  failure at the end of an otherwise successful run. Cleanup failures are logged
+  rather than masking the caller's own cancellation, and registering a duplicate
+  server name is now rejected instead of orphaning the existing connection.
+  ([#353](https://github.com/microsoft/conductor/issues/353))
+
+- **Non-ASCII agent output is no longer truncated ~6x too aggressively before
+  semantic validation.** The `validator:` grader and the dialog-trigger evaluator
+  serialized the agent output with ASCII escaping before applying their fixed
+  character budget, so every Cyrillic or CJK code point cost 6 characters and
+  every emoji 12. Non-English output reached the grader with a fraction of the
+  source material an equivalent English output would get, and the cut could land
+  mid-escape, leaving malformed JSON in the prompt. Both now serialize without
+  escaping, so the budget is measured in real characters for every language.
+  ([#356](https://github.com/microsoft/conductor/issues/356))
+
+- **An inline-expanded sub-workflow now follows the live run after a loop-back.**
+  When a loop-back route re-invoked the same sequential sub-workflow, the inline
+  graph expansion stayed pinned to the first, already-completed invocation, even
+  though double-click navigation and the Activity tab correctly tracked the live
+  one. Inline expansion now resolves newest-first, matching the rest of the
+  dashboard. ([#361](https://github.com/microsoft/conductor/issues/361))
+
+- **Every historical sub-workflow iteration is now reachable from the
+  dashboard.** In the "Subworkflow Runs (N)" list, each row resolved by slot
+  rather than by position, and every re-invocation of a sequential sub-workflow
+  shares a slot — so clicking an older, completed run always landed on the most
+  recent one. Rows now navigate to the exact run clicked, are labelled
+  `Iteration N` once a slot repeats, and the breadcrumb trail says which
+  iteration is being viewed. Following the live run (double-click, inline
+  expansion, deep links) is deliberately unchanged.
+  ([#365](https://github.com/microsoft/conductor/issues/365))
+
+- **Handled fail-open paths no longer print a full traceback at WARNING level.**
+  When a semantic validator rejected an output and the retry itself failed,
+  Conductor correctly kept the original output and carried on — but logged the
+  warning with a complete Python traceback, making a recovered run look like a
+  crash. The warning is now a single line naming the exception type and message,
+  with the traceback kept at DEBUG. The same treatment was applied to the sibling
+  best-effort paths: validator call failures and timeouts, provider session-ID
+  collection for checkpoints, checkpoint save and rotation failures, and
+  event-callback errors in `hermes`.
+  ([#357](https://github.com/microsoft/conductor/issues/357))
+
 ### Changed
+
+- **The `claude` provider now runs its agentic loop through Pydantic AI.** The
+  hand-written inner loop was replaced with a Pydantic AI runtime while keeping
+  Conductor's provider contract at the boundary — the same `AgentOutput`, event
+  vocabulary, retry and interrupt semantics, usage accounting, MCP policy, and
+  output validation. The visible gain is streaming: `claude` now emits model,
+  reasoning, and tool events as they happen rather than only at completion, so
+  the dashboard, console, and event log follow a Claude agent live the way they
+  already followed Copilot. Structured output is produced natively by the
+  runtime and still re-validated against the declared `output:` schema.
+  **This adds `pydantic-ai>=1.44.0` as a required runtime dependency**, so a
+  `conductor` upgrade pulls in a larger dependency set than before.
+  ([#355](https://github.com/microsoft/conductor/pull/355))
+
+- **`claude-agent-sdk` now loads skills natively instead of injecting them into
+  every prompt.** The provider previously took the eager preamble path on the
+  grounds that the SDK had no skill surface — out of date, and expensive: the
+  full `SKILL.md` plus the entire `references/` tree was prepended to every
+  call and every retry (~29K tokens for the bundled `conductor` skill). The owning Claude Code plugin is now registered on the
+  session and the skill enabled by its `<plugin>:<skill>` name, so the CLI reads
+  only the frontmatter up front and loads the body on demand. An agent with an
+  explicit `tools: []` is granted back the single `Skill` tool when it has
+  skills enabled, since an empty base tool set would otherwise leave the
+  declared skill unreachable. Wheels now also ship
+  `plugins/conductor/.claude-plugin/`; without the manifest no plugin root
+  resolves at all, so a non-editable install would fail every skills-enabled
+  agent on this provider.
+  ([#352](https://github.com/microsoft/conductor/issues/352))
 
 - The `claude-agent-sdk` optional dependency floor is now
   `claude-agent-sdk>=0.2.82` — the 0.2.x line is what Conductor tests against.

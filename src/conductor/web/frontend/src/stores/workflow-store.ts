@@ -24,6 +24,10 @@ import type {
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
+  QuestionsPresentedData,
+  QuestionsAnsweredData,
+  QuestionsCompletedData,
+  QuestionsAnswerRejectedData,
   RouteTakenData,
   ParallelStartedData,
   ParallelAgentCompletedData,
@@ -45,6 +49,7 @@ import type {
   SubworkflowStartedData,
   SubworkflowCompletedData,
   SubworkflowFailedData,
+  StaticSubworkflowTopology,
   IterationLimitReachedData,
   IterationLimitResolvedData,
   IterationLimitResponseTarget,
@@ -128,6 +133,16 @@ export interface NodeData {
   // Gate-specific
   options?: string[];
   option_details?: GateOptionDetail[];
+  /** Staleness token of the currently-presented prompt (questions nodes). */
+  gate_prompt_id?: string | null;
+  /** Progress + results for a `type: questions` node. */
+  questions_total?: number;
+  questions_answered_count?: number;
+  questions_skipped_count?: number;
+  /** Per-question outcome, keyed by id, so Back cannot double-count. */
+  questions_outcomes?: Record<string, 'answered' | 'skipped'>;
+  questions_outcome?: string;
+  questions_reject_reason?: string | null;
   selected_option?: string;
   route?: string;
   additional_input?: string;
@@ -186,6 +201,8 @@ export interface WorkflowAgent {
   /** Provider this agent will use at runtime. Drives the experimental
    *  badge in the graph (#241). */
   provider_name?: string;
+  /** Present only for `type: workflow` agents; see `StaticSubworkflowTopology`. */
+  subworkflow?: StaticSubworkflowTopology | null;
 }
 
 // ProviderMetadata is defined in types/events.ts (single source of truth)
@@ -416,6 +433,7 @@ interface WorkflowState {
 
   // Replay actions
   setReplayMode: (events: WorkflowEvent[]) => void;
+  markReplayMode: () => void;
   setReplayPosition: (position: number) => void;
   setReplayPlaying: (playing: boolean) => void;
   setReplaySpeed: (speed: number) => void;
@@ -423,7 +441,7 @@ interface WorkflowState {
   // WebSocket send function (set by use-websocket hook)
   _wsSend: ((data: object) => void) | null;
   setWsSend: (fn: ((data: object) => void) | null) => void;
-  sendGateResponse: (agentName: string, selectedValue: string, additionalInput?: Record<string, string>) => void;
+  sendGateResponse: (agentName: string, selectedValue: string, additionalInput?: Record<string, string>, promptId?: string | null) => void;
   // Dialog state
   activeDialog: { agentName: string; dialogId: string } | null;
   dialogEngaged: boolean;
@@ -512,6 +530,81 @@ function createSubworkflowContext(parentAgent: string, iteration: number, workfl
     workflowOutput: null,
     workflowFailure: null,
   };
+}
+
+/**
+ * Build a `pending` placeholder `SubworkflowContext` from a statically
+ * eager-resolved `StaticSubworkflowTopology` (see `WorkflowStartedData`'s
+ * `subworkflow` field, produced by
+ * `WorkflowEngine._build_static_subworkflow_topology`). This lets the graph
+ * render — and lets the user expand — a sub-workflow's internal DAG before
+ * the engine ever reaches that step, reusing the exact same
+ * `SubworkflowContext` / expansion-key machinery as a runtime child (see
+ * `subworkflow_started`, which locates and reuses this placeholder by
+ * `slotKey` instead of pushing a duplicate once the step actually starts).
+ *
+ * Recurses into nested `type: workflow` agents so multi-level static
+ * previews are expandable all the way down.
+ */
+function buildStaticChildContext(
+  parentAgentName: string,
+  topology: StaticSubworkflowTopology,
+  workflowFile: string,
+): SubworkflowContext {
+  const ctx = createSubworkflowContext(parentAgentName, 1, workflowFile, parentAgentName);
+  ctx.workflowName = topology.name || '';
+  ctx.entryPoint = topology.entry_point || null;
+  ctx.agents = topology.agents;
+  ctx.routes = topology.routes || [];
+  ctx.parallelGroups = topology.parallel_groups || [];
+  ctx.forEachGroups = topology.for_each_groups || [];
+
+  const groupAgents = new Set<string>();
+  const agentNames = new Set<string>();
+  for (const pg of ctx.parallelGroups) {
+    for (const a of pg.agents) groupAgents.add(a);
+    agentNames.add(pg.name);
+    ensureNode(ctx.nodes, pg.name, 'parallel_group');
+    ctx.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
+    for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, 'agent');
+  }
+  for (const fg of ctx.forEachGroups) {
+    agentNames.add(fg.name);
+    ensureNode(ctx.nodes, fg.name, 'for_each_group');
+    ctx.groupProgress[fg.name] = { total: 0, completed: 0, failed: 0 };
+  }
+  for (const a of ctx.agents) {
+    if (agentNames.has(a.name) || groupAgents.has(a.name)) continue;
+    const nodeType = (a.type || 'agent') as NodeType;
+    ensureNode(ctx.nodes, a.name, nodeType);
+    agentNames.add(a.name);
+  }
+  // Seed nested static previews for every `type: workflow` agent — including
+  // ones that belong to a parallel group — not just "standalone" agents.
+  // Node creation above intentionally skips parallel-group members (they
+  // already got a node from the `pg.agents` loop), but a static preview is
+  // still owed to them regardless of group membership.
+  seedStaticSubworkflowChildren(ctx.agents, ctx.children);
+  return ctx;
+}
+
+/**
+ * Push static child-context placeholders (see `buildStaticChildContext`)
+ * for every `type: workflow` agent in `agents` that carries an eagerly
+ * resolved `subworkflow` topology and doesn't already have a runtime or
+ * placeholder child in `children` (matched by slotKey === agent name).
+ * Called from the `workflow_started` handler for both the root workflow
+ * and every child sub-workflow, so previews are built at every depth.
+ */
+function seedStaticSubworkflowChildren(
+  agents: WorkflowAgent[],
+  children: SubworkflowContext[],
+): void {
+  for (const a of agents) {
+    if (a.type !== 'workflow' || !a.subworkflow) continue;
+    if (children.some((c) => c.slotKey === a.name)) continue;
+    children.push(buildStaticChildContext(a.name, a.subworkflow, ''));
+  }
 }
 
 /**
@@ -722,7 +815,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set({ _wsSend: fn });
   },
 
-  sendGateResponse: (agentName, selectedValue, additionalInput) => {
+  sendGateResponse: (agentName, selectedValue, additionalInput, promptId) => {
     const send = useWorkflowStore.getState()._wsSend;
     if (send) {
       send({
@@ -730,6 +823,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agent_name: agentName,
         selected_value: selectedValue,
         additional_input: additionalInput || {},
+        // Echoed so the engine can drop a click that lands after the next
+        // question opened — every prompt in a questions node shares one name.
+        prompt_id: promptId ?? null,
       });
     }
   },
@@ -897,6 +993,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       }
       return changed ? { expandedContexts: next } : {};
     });
+  },
+
+  // Latch replay mode without waiting on the event payload. `setReplayMode`
+  // only runs once GET /api/state resolves, so a slow or failed fetch would
+  // otherwise leave `replayMode` false and let Header render live controls
+  // against a server that serves no /api/stop|resume|kill.
+  markReplayMode: () => {
+    set({ replayMode: true });
   },
 
   setReplayMode: (events: WorkflowEvent[]) => {
@@ -1119,7 +1223,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       if (!ctx) break;
       // Prefer the slot key (e.g. "plan_children_group[2]") so concurrent
       // for_each iterations are distinguishable; fall back to workflow name.
-      const label = ctx.slotKey || ctx.workflowName || ctx.workflowFile || ctx.parentAgent;
+      const baseLabel = ctx.slotKey || ctx.workflowName || ctx.workflowFile || ctx.parentAgent;
+      // Sequential subworkflows share slotKey === agentName, so a loop-back
+      // re-invocation collides with its earlier sibling (issue #365) —
+      // append the iteration number when siblings share a slotKey.
+      const sameSlotSiblingCount = contexts.filter((c) => c.slotKey === ctx.slotKey).length;
+      const label =
+        sameSlotSiblingCount > 1 ? `${baseLabel} (iteration ${ctx.iteration})` : baseLabel;
       crumbs.push({ label, path: state.viewContextPath.slice(0, i + 1) });
       contexts = ctx.children;
     }
@@ -1186,6 +1296,37 @@ function activeTarget(
   };
 }
 
+/**
+ * Insert `ctx` into `children`, reusing an existing static-preview
+ * placeholder (see `buildStaticChildContext`) in place of pushing a
+ * duplicate when one exists for the same `slotKey`. A placeholder is only
+ * ever `status: 'pending'`; a genuine repeat invocation of the same
+ * sequential sub-workflow step (loop-back route) has already transitioned
+ * its earlier context to `'completed'`/`'failed'` and so won't match here,
+ * preserving the existing multi-iteration-history behavior. Returns the
+ * index of the (possibly reused) entry within `children`.
+ */
+function placeChildContext(children: SubworkflowContext[], ctx: SubworkflowContext): number {
+  const placeholderIdx = children.findIndex((c) => c.slotKey === ctx.slotKey && c.status === 'pending');
+  if (placeholderIdx >= 0) {
+    // Keep the placeholder's statically-known agents/routes/nodes/children
+    // (including nested static previews) — the real `workflow_started` for
+    // this child fires momentarily and overwrites them anyway, but this
+    // keeps the graph stable in the interim if events race. Only take the
+    // lifecycle-identifying fields from the freshly-built `ctx`.
+    const placeholder = children[placeholderIdx]!;
+    children[placeholderIdx] = {
+      ...placeholder,
+      parentAgent: ctx.parentAgent,
+      iteration: ctx.iteration,
+      workflowFile: ctx.workflowFile || placeholder.workflowFile,
+    };
+    return placeholderIdx;
+  }
+  children.push(ctx);
+  return children.length - 1;
+}
+
 const eventHandlers: Record<string, (state: MutableState, data: Record<string, unknown>, timestamp?: number) => void> = {
   workflow_started: (state, _data, timestamp) => {
     const data = _data as unknown as WorkflowStartedData;
@@ -1250,6 +1391,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         }
       }
       state.agentsTotal = agentNames.size;
+
+      // Eagerly seed static sub-workflow previews (see
+      // `buildStaticChildContext`) so `type: workflow` steps are
+      // expandable in the dashboard before the engine ever reaches them.
+      resolveMutableContext(state, []);
+      seedStaticSubworkflowChildren(state.agents, state.subworkflowContexts);
     } else {
       // Child workflow — populate the owning child context. Locate it via
       // the engine-supplied subworkflow_path (slot-key path) when present,
@@ -1305,6 +1452,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           }
         }
         ctx.agentsTotal = agentNames.size;
+
+        // Eagerly seed static sub-workflow previews for this child's own
+        // `type: workflow` steps (see `buildStaticChildContext`).
+        seedStaticSubworkflowChildren(ctx.agents, ctx.children);
       }
     }
     state.wfDepth++;
@@ -1610,6 +1761,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.options = data.options;
     nd.option_details = data.option_details;
     nd.prompt = data.prompt;
+    nd.gate_prompt_id = data.prompt_id ?? null;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1622,6 +1774,58 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.selected_option = data.selected_option;
     nd.route = data.route;
     nd.additional_input = data.additional_input;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_presented: (state, _data) => {
+    const data = _data as unknown as QuestionsPresentedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.status = 'waiting';
+    nd.questions_total = data.total;
+    nd.questions_answered_count = 0;
+    nd.questions_skipped_count = 0;
+    nd.questions_outcomes = {};
+    nd.questions_outcome = undefined;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_answered: (state, _data) => {
+    const data = _data as unknown as QuestionsAnsweredData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.questions_total = data.total;
+    // Track per-question outcomes rather than incrementing counters: going
+    // back and re-answering emits a second event for the same question, so
+    // a running count would exceed `total` and drive progress past 100%.
+    const outcomes = { ...(nd.questions_outcomes || {}) };
+    outcomes[data.question_id] = data.skipped ? 'skipped' : 'answered';
+    nd.questions_outcomes = outcomes;
+    const values = Object.values(outcomes);
+    nd.questions_answered_count = values.filter((v) => v === 'answered').length;
+    nd.questions_skipped_count = values.filter((v) => v === 'skipped').length;
+    nd.questions_reject_reason = null;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_answer_rejected: (state, _data) => {
+    const data = _data as unknown as QuestionsAnswerRejectedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.questions_reject_reason = data.reason;
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  questions_completed: (state, _data) => {
+    const data = _data as unknown as QuestionsCompletedData;
+    const t = activeTarget(state, _data);
+    const nd = ensureNode(t.nodes, data.agent_name, 'questions');
+    nd.status = 'completed';
+    t.incrCompleted();
+    nd.questions_outcome = data.outcome;
+    nd.questions_answered_count = data.answered_count;
+    nd.questions_skipped_count = data.skipped_count;
+    nd.questions_reject_reason = null;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1951,13 +2155,13 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       // a fresh reference (resolveMutableContext with an empty path still
       // clones the top array; it just has no context to descend into).
       resolveMutableContext(state, []);
-      state.subworkflowContexts.push(ctx);
-      newActivePath = [state.subworkflowContexts.length - 1];
+      const idx = placeChildContext(state.subworkflowContexts, ctx);
+      newActivePath = [idx];
     } else {
       parentCtx = resolveMutableContext(state, parentIndexPath);
       if (!parentCtx) return;
-      parentCtx.children.push(ctx);
-      newActivePath = [...parentIndexPath, parentCtx.children.length - 1];
+      const idx = placeChildContext(parentCtx.children, ctx);
+      newActivePath = [...parentIndexPath, idx];
     }
     state.activeContextPath = newActivePath;
     if (wasAtLiveEdge) {
@@ -2348,6 +2552,18 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'gate_resolved':
       return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Gate resolved → ${d.selected_option || 'continue'}` };
+
+    case 'questions_presented':
+      return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: `Asking ${d.total} question(s)…` };
+
+    case 'questions_answered':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: `${d.skipped ? 'Skipped' : 'Answered'} ${d.question_id} (${(d.cursor as number) + 1}/${d.total})` };
+
+    case 'questions_answer_rejected':
+      return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: String(d.reason) };
+
+    case 'questions_completed':
+      return { timestamp: ts, level: 'success', source: String(d.agent_name), message: `Questions ${d.outcome} — ${d.answered_count} answered, ${d.skipped_count} skipped` };
 
     case 'route_taken':
       return { timestamp: ts, level: 'debug', source: 'router', message: `${d.from_agent} → ${d.to_agent}` };

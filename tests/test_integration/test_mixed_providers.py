@@ -102,6 +102,18 @@ agents:
             # is None and excluded by exclude_none.
             "checkpoint": {"every_agent": False, "keep_last": 5},
             "skills": [],
+            # Eager skill-injection budget (issue #350). Bounds only providers
+            # without progressive disclosure; copilot is unaffected.
+            "skill_injection": {"warn_bytes": 65536, "max_bytes": 131072},
+            # Skill discovery is off by default (issue #362): ambient skills
+            # would make the same YAML behave differently per machine.
+            "skill_discovery": {"sources": (), "exclude": ()},
+            # Plugins are off by default (issue #378): a plugin can launch
+            # MCP subprocesses with the user's credentials, so it loads only
+            # when a workflow names it.
+            "plugins": [],
+            # No git-backed plugin sources declared (issue #380).
+            "plugin_sources": {},
         }
 
     def test_provider_parameter_isolation(self, tmp_path):
@@ -202,6 +214,8 @@ class MockProvider(AgentProvider, abstract=True):
         interrupt_signal: asyncio.Event | None = None,
         event_callback=None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         self.executed_agents.append(agent.name)
         return AgentOutput(

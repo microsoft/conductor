@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from conductor.config.schema import AgentDef, RuntimeConfig
+from conductor.config.schema import AgentDef, OutputField, RuntimeConfig
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.factory import create_provider
@@ -252,60 +252,74 @@ class TestClaudeProviderIterationLimit:
     @patch("conductor.providers.claude.anthropic")
     @pytest.mark.asyncio
     async def test_session_timeout_fires(
-        self, mock_anthropic_module: Any, mock_anthropic_class: Any
+        self, mock_anthropic_module: Any, mock_anthropic_class: Any, monkeypatch: Any
     ) -> None:
-        """Test that _execute_agentic_loop raises ProviderError on session timeout."""
+        """Test that run_with_interrupt raises a non-retryable ProviderError on timeout.
+
+        The new Pydantic AI path enforces ``max_session_seconds`` in
+        ``run_with_interrupt``. The agent is constructed through the real
+        ``build_agent`` seam; the test simulates an elapsed session by advancing
+        ``time.monotonic`` so the first iteration's timeout check fires before
+        the model is called. The resulting ProviderError must surface through
+        ``execute()`` and be non-retryable.
+        """
+        from pydantic import BaseModel
+        from pydantic_ai import Agent
+
+        from conductor.providers._pydantic_ai import agent_builder as _ab
         from conductor.providers.claude import ClaudeProvider
 
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
         mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = MagicMock()
-        mock_anthropic_class.return_value = mock_client
+        mock_anthropic_class.return_value = MagicMock()
 
-        provider = ClaudeProvider()
+        provider = ClaudeProvider(max_session_seconds=1.0)
 
-        # Create a mock response that always returns tool_use (never terminates)
-        mock_tool_use_block = MagicMock()
-        mock_tool_use_block.type = "tool_use"
-        mock_tool_use_block.name = "some_tool"
-        mock_tool_use_block.id = "tool_1"
-        mock_tool_use_block.input = {"arg": "value"}
+        class DynamicModel(BaseModel):
+            model_config = {"extra": "allow"}
 
-        mock_response = MagicMock()
-        mock_response.content = [mock_tool_use_block]
-        mock_response.usage = MagicMock(input_tokens=10, output_tokens=20)
+        async def _slow_run(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(10.0)
+            return None
 
-        # Mock the API call and MCP manager
-        provider._execute_api_call = AsyncMock(return_value=mock_response)
-        mock_mcp = MagicMock()
-        mock_mcp.has_servers.return_value = True
-        mock_mcp.call_tool = AsyncMock(return_value="tool result")
-        provider._mcp_manager = mock_mcp
+        real_build_agent = _ab.build_agent
 
-        # Use a very short session timeout and mock time to trigger it
+        def make_slow_agent(**kwargs: Any) -> Agent[Any, Any]:
+            agent = real_build_agent(**kwargs)
+            agent.run = _slow_run  # type: ignore[method-assign]
+            return agent
+
         call_count = [0]
 
         def mock_monotonic() -> float:
             call_count[0] += 1
-            # First call returns start time, subsequent calls return past the timeout
             if call_count[0] <= 1:
                 return 1000.0
-            return 1002.0  # 2 seconds past start
+            return 1002.0  # 2 seconds past the session start
 
-        with patch("conductor.providers.claude.time") as mock_time:
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                side_effect=make_slow_agent,
+            ),
+            patch("conductor.providers._pydantic_ai.interrupt.time") as mock_time,
+            pytest.raises(ProviderError, match="maximum session duration") as exc_info,
+        ):
             mock_time.monotonic = mock_monotonic
+            agent = AgentDef(
+                name="test",
+                prompt="do something slow",
+                output={"result": OutputField(type="string")},
+            )
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="do something slow",
+                interrupt_signal=asyncio.Event(),
+            )
 
-            with pytest.raises(ProviderError, match="maximum session duration"):
-                await provider._execute_agentic_loop(
-                    messages=[{"role": "user", "content": "test"}],
-                    model="test-model",
-                    temperature=None,
-                    max_tokens=1024,
-                    tools=None,
-                    output_schema=None,
-                    has_output_schema=False,
-                    max_iterations=100,
-                    max_session_seconds=1.0,  # 1 second timeout
-                )
+        assert exc_info.value.is_retryable is False
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")

@@ -1,0 +1,5 @@
+{
+  "name": "demo",
+  "description": "A minimal plugin used by examples/plugins.yaml to demonstrate whole-plugin opt-in.",
+  "version": "1.0.0"
+}

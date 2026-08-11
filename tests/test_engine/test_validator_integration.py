@@ -10,6 +10,7 @@ can serve both by inspecting ``agent.output``. No SDK or network needed.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -453,7 +454,9 @@ class TestValidatorCostAndFailurePaths:
         assert any(r.input_tokens == 900 and r.output_tokens == 400 for r in vrows)
 
     @pytest.mark.asyncio
-    async def test_rerun_failure_keeps_original_no_double_count_and_emits_event(self) -> None:
+    async def test_rerun_failure_keeps_original_no_double_count_and_emits_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
             if agent.output and "passed" in agent.output:
                 return AgentOutput(
@@ -471,9 +474,10 @@ class TestValidatorCostAndFailurePaths:
         )
         events: list[tuple[str, dict[str, Any]]] = []
 
-        result = await engine._apply_validator(
-            agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
-        )
+        with caplog.at_level(logging.DEBUG, logger="conductor.engine.workflow"):
+            result = await engine._apply_validator(
+                agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
+            )
 
         assert result is original  # original kept on re-run failure
         # Discarded run is NOT recorded when the re-run fails (no double count):
@@ -485,6 +489,27 @@ class TestValidatorCostAndFailurePaths:
         assert len(vrows) == 1  # only the grading call
         failed = [d for (e, d) in events if e == "agent_validation_failed"]
         assert any(d.get("rerun_errored") for d in failed)
+
+        # Requirement (issue #357): the handled fail-open path must not print a
+        # traceback at WARNING level — a concise warning names the exception, and
+        # the full traceback is only available at DEBUG level.
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.workflow"
+            and r.levelno == logging.WARNING
+            and "Validator re-run failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is None
+        assert "RuntimeError" in warnings[0].getMessage()
+        assert "rerun boom" in warnings[0].getMessage()
+        debugs = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.engine.workflow" and r.levelno == logging.DEBUG
+        ]
+        assert any(r.exc_info is not None for r in debugs)
 
     @pytest.mark.asyncio
     async def test_partial_rerun_keeps_original(self) -> None:

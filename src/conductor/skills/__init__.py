@@ -18,29 +18,77 @@ Provider-parity contract:
     * **Copilot** — native ``skill_directories`` on the SDK session.
       Skill becomes discoverable; the model loads it as relevant
       (progressive disclosure, token-efficient).
-    * **Claude** — eager preamble injection of ``SKILL.md`` plus
-      ``references/*.md`` into the agent's rendered prompt. The
-      Anthropic API has no server-side skill surface without adopting
-      the container/code-execution beta.
+    * **Claude Agent SDK** — the Claude Code plugin owning the skill is
+      registered on the session (``--plugin-dir``) and the skill enabled
+      by its ``<plugin>:<skill>`` name, also progressive. Skills the
+      workflow did not declare are filtered out of the model's listing
+      rather than inherited from the machine.
+    * **Claude** and **Hermes** — eager preamble injection of
+      ``SKILL.md`` plus ``references/*.md`` into the agent's rendered
+      prompt. Neither has a native skill surface: the Anthropic API
+      offers none without adopting the container/code-execution beta,
+      and hermes runs its own internal toolsets. Injected size is
+      bounded by ``runtime.skill_injection``, since the whole body is
+      re-sent on every call and every retry.
 
-Phase 1 ships one built-in skill: ``conductor``, sourced from
-``plugins/conductor/skills/conductor/``. Future phases will add
-user-defined skill directories, executable skill resources, and
-progressive disclosure via MCP.
+A ``skills:`` entry is either a **built-in name** or a **filesystem
+path** — see :func:`conductor.skills.registry.resolve_skills`. Conductor
+ships one built-in skill, ``conductor``, sourced from
+``plugins/conductor/skills/conductor/``. Skills already installed in the
+user's environment can additionally be picked up via
+``runtime.skill_discovery`` — see :mod:`conductor.skills.discovery`,
+which scans the union of both CLIs' locations centrally rather than
+letting each provider find its own, since a single per-provider switch
+would hand different skill sets to different agents inside one run.
 """
 
-from conductor.skills.loader import load_skill_content
+from conductor.skills.discovery import (
+    DiscoveredSkill,
+    DiscoverySource,
+    discover_skills,
+    resolve_effective_skills,
+)
+from conductor.skills.errors import SkillError
+from conductor.skills.frontmatter import (
+    SkillFrontmatter,
+    SkillManifestError,
+    read_skill_frontmatter,
+)
+from conductor.skills.loader import BYTES_PER_TOKEN_ESTIMATE, load_skill_content
 from conductor.skills.registry import (
+    ResolvedSkill,
     SkillNotFoundError,
+    SkillPlugin,
+    SkillPluginError,
+    WarningSink,
+    expand_skills_root,
     get_skill_directory,
+    is_path_entry,
     list_builtin_skills,
-    resolve_skill_directories,
+    resolve_skill_plugin,
+    resolve_skills,
 )
 
 __all__ = [
+    "BYTES_PER_TOKEN_ESTIMATE",
+    "DiscoveredSkill",
+    "DiscoverySource",
+    "ResolvedSkill",
+    "SkillError",
+    "SkillFrontmatter",
+    "SkillManifestError",
     "SkillNotFoundError",
+    "SkillPlugin",
+    "SkillPluginError",
+    "WarningSink",
+    "discover_skills",
+    "expand_skills_root",
     "get_skill_directory",
+    "is_path_entry",
     "list_builtin_skills",
     "load_skill_content",
-    "resolve_skill_directories",
+    "read_skill_frontmatter",
+    "resolve_effective_skills",
+    "resolve_skill_plugin",
+    "resolve_skills",
 ]

@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 from conductor.config.schema import OutputField
-from conductor.providers.claude import ClaudeProvider
+from conductor.providers._schema import build_json_schema_field, build_prompt_schema_field
 from conductor.providers.claude_agent_sdk import _build_output_format
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.hermes import _build_prompt_schema
@@ -691,46 +691,6 @@ def _make_copilot_provider() -> CopilotProvider:
     )
 
 
-class TestClaudeOutputSchemaGolden:
-    """Golden tests for ClaudeProvider's structured-output tool wrapper."""
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_build_tools_rich_schema_matches_baseline(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
-        baseline for a schema with descriptions, nested objects, and arrays."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_client
-
-        provider = ClaudeProvider()
-        actual = _serialize(provider._build_tools_for_structured_output(rich_schema))
-        assert actual == EXPECTED_CLAUDE_RICH_SCHEMA
-
-    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude.AsyncAnthropic")
-    @patch("conductor.providers.claude.anthropic")
-    def test_build_tools_missing_descriptions_matches_baseline(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Claude tool wrapper output must be byte-for-byte identical to the pre-refactor
-        baseline for a schema without explicit descriptions."""
-        mock_anthropic_module.__version__ = "0.77.0"
-        mock_client = Mock()
-        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
-        mock_anthropic_class.return_value = mock_client
-
-        provider = ClaudeProvider()
-        actual = _serialize(
-            provider._build_tools_for_structured_output(missing_descriptions_schema)
-        )
-        assert actual == EXPECTED_CLAUDE_MISSING_SCHEMA
-
-
 class TestCopilotOutputSchemaGolden:
     """Golden tests for CopilotProvider's prompt schema wrapper."""
 
@@ -797,3 +757,259 @@ class TestGoldenMutationGuard:
         }
         actual = _serialize(provider._build_prompt_schema(schema_without_description))
         assert actual != EXPECTED_COPILOT_RICH_SCHEMA
+
+
+class TestSharedSchemaBuilder:
+    """Tests for the provider-neutral JSON and prompt schema builders."""
+
+    def test_json_schema_emits_all_constraint_keywords(self) -> None:
+        """JSON-schema builder must emit enum, pattern, minLength, and maxLength
+        for string fields, minimum and maximum for number fields, render nullable
+        fields as a type array, and exclude optional properties from the required
+        array."""
+        field = OutputField(
+            type="object",
+            description="root",
+            properties={
+                "status": OutputField(
+                    type="string",
+                    description="status",
+                    enum=["ok", "fail"],
+                    pattern="^[a-z]+$",
+                    minLength=1,
+                    maxLength=10,
+                ),
+                "score": OutputField(
+                    type="number",
+                    description="score",
+                    minimum=0.0,
+                    maximum=100.0,
+                ),
+                "count": OutputField(
+                    type="number",
+                    description="count",
+                    nullable=True,
+                ),
+                "optional_note": OutputField(
+                    type="string",
+                    description="optional note",
+                    required=False,
+                ),
+                "nested": OutputField(
+                    type="object",
+                    description="nested",
+                    required=False,
+                    properties={
+                        "flag": OutputField(
+                            type="boolean",
+                            description="flag",
+                            required=False,
+                        ),
+                    },
+                ),
+            },
+        )
+
+        actual = build_json_schema_field(field)
+
+        assert actual == {
+            "type": "object",
+            "description": "root",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "status",
+                    "enum": ["ok", "fail"],
+                    "pattern": "^[a-z]+$",
+                    "minLength": 1,
+                    "maxLength": 10,
+                },
+                "score": {
+                    "type": "number",
+                    "description": "score",
+                    "minimum": 0.0,
+                    "maximum": 100.0,
+                },
+                "count": {
+                    "type": ["number", "null"],
+                    "description": "count",
+                },
+                "optional_note": {
+                    "type": "string",
+                    "description": "optional note",
+                },
+                "nested": {
+                    "type": "object",
+                    "description": "nested",
+                    "properties": {
+                        "flag": {
+                            "type": "boolean",
+                            "description": "flag",
+                        },
+                    },
+                },
+            },
+            "required": ["status", "score", "count"],
+        }
+
+    def test_json_schema_omits_required_when_all_properties_optional(self) -> None:
+        """An object whose properties are all optional must not include a required
+        key in the JSON-schema fragment."""
+        field = OutputField(
+            type="object",
+            description="all optional",
+            properties={
+                "first": OutputField(type="string", required=False),
+                "second": OutputField(type="number", required=False),
+            },
+        )
+
+        actual = build_json_schema_field(field)
+
+        assert "required" not in actual
+        assert actual == {
+            "type": "object",
+            "description": "all optional",
+            "properties": {
+                "first": {"type": "string"},
+                "second": {"type": "number"},
+            },
+        }
+
+    def test_json_schema_never_emits_default_keys(self) -> None:
+        """Optional object fields must not leak pydantic-core default values into
+        the schema fragment at any nesting level."""
+        field = OutputField(
+            type="object",
+            required=False,
+            properties={
+                "leaf": OutputField(type="string", required=False),
+            },
+        )
+
+        actual = build_json_schema_field(field)
+
+        def _no_default_keys(value: Any) -> bool:
+            if isinstance(value, dict):
+                return "default" not in value and all(_no_default_keys(v) for v in value.values())
+            if isinstance(value, list):
+                return all(_no_default_keys(item) for item in value)
+            return True
+
+        assert _no_default_keys(actual)
+
+    def test_prompt_schema_emits_constraints_and_optional_suffix(self) -> None:
+        """Prompt-schema builder must emit the same constraint keywords as the JSON
+        builder and append ' (optional)' to descriptions of optional fields that
+        have a real description."""
+        field = OutputField(
+            type="object",
+            description="root",
+            properties={
+                "status": OutputField(
+                    type="string",
+                    description="status",
+                    enum=["ok", "fail"],
+                    pattern="^[a-z]+$",
+                    minLength=1,
+                    maxLength=10,
+                ),
+                "score": OutputField(
+                    type="number",
+                    description="score",
+                    minimum=0.0,
+                    maximum=100.0,
+                ),
+                "optional_note": OutputField(
+                    type="string",
+                    description="optional note",
+                    required=False,
+                ),
+            },
+        )
+
+        actual = build_prompt_schema_field(field)
+
+        assert actual == {
+            "type": "object",
+            "description": "root",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "status",
+                    "enum": ["ok", "fail"],
+                    "pattern": "^[a-z]+$",
+                    "minLength": 1,
+                    "maxLength": 10,
+                },
+                "score": {
+                    "type": "number",
+                    "description": "score",
+                    "minimum": 0.0,
+                    "maximum": 100.0,
+                },
+                "optional_note": {
+                    "type": "string",
+                    "description": "optional note (optional)",
+                },
+            },
+            "required": ["status", "score"],
+        }
+
+    def test_prompt_schema_omits_description_for_optional_field_without_description(self) -> None:
+        """An optional field without a description must not synthesize a description
+        key in the prompt schema fragment."""
+        field = OutputField(
+            type="object",
+            properties={
+                "opt": OutputField(type="string", required=False),
+            },
+        )
+
+        actual = build_prompt_schema_field(field)
+
+        assert "description" not in actual["properties"]["opt"]
+        assert actual == {
+            "type": "object",
+            "properties": {
+                "opt": {"type": "string"},
+            },
+        }
+
+    def test_json_schema_nullable_enum_appends_none(self) -> None:
+        """A nullable string field with enum must emit enum including None so the
+        JSON schema honestly allows null alongside the listed values."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=True)
+
+        actual = build_json_schema_field(field)
+
+        assert actual["type"] == ["string", "null"]
+        assert actual["enum"] == ["a", "b", None]
+
+    def test_json_schema_non_nullable_enum_unchanged(self) -> None:
+        """A non-nullable enum must be emitted exactly as declared."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=False)
+
+        actual = build_json_schema_field(field)
+
+        assert actual["type"] == "string"
+        assert actual["enum"] == ["a", "b"]
+
+    def test_prompt_schema_nullable_enum_appends_none(self) -> None:
+        """A nullable string field with enum must include None in the prompt schema
+        enum just as in the JSON schema."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=True)
+
+        actual = build_prompt_schema_field(field)
+
+        assert actual["type"] == ["string", "null"]
+        assert actual["enum"] == ["a", "b", None]
+
+    def test_prompt_schema_non_nullable_enum_unchanged(self) -> None:
+        """A non-nullable enum in the prompt schema must remain exactly as declared."""
+        field = OutputField(type="string", enum=["a", "b"], nullable=False)
+
+        actual = build_prompt_schema_field(field)
+
+        assert actual["type"] == "string"
+        assert actual["enum"] == ["a", "b"]

@@ -160,6 +160,91 @@ function seedNestedSubworkflows(): void {
 }
 
 /**
+ * Reproduces a loop-back re-invocation of the same sequential subworkflow
+ * (issue #361): `sub_agent` runs to completion once, then a route sends
+ * execution back through it a second time. This produces two sibling
+ * `SubworkflowContext`s sharing `slotKey: 'sub_agent'` — index 0 (completed)
+ * and index 1 (running) — so slot-key resolution must pick the newest
+ * (index 1), not the first, match.
+ */
+function seedRootWithLoopedBackSubworkflow(): void {
+  const { processEvent } = useWorkflowStore.getState();
+
+  processEvent(
+    event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'planner' }, { name: 'sub_agent', type: 'workflow' }],
+      routes: [
+        { from: 'planner', to: 'sub_agent' },
+        { from: 'sub_agent', to: '$end' },
+      ],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'planner',
+    }),
+  );
+
+  // First invocation: starts, runs, completes.
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'sub_agent',
+      workflow: 'sub.yaml',
+      iteration: 1,
+      slot_key: 'sub_agent',
+      parent_path: [],
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'childA' }],
+      routes: [{ from: 'childA', to: '$end' }],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'childA',
+      subworkflow_path: ['sub_agent'],
+    }),
+  );
+  processEvent(
+    event('workflow_completed', {
+      output: {},
+      subworkflow_path: ['sub_agent'],
+    }),
+  );
+  processEvent(
+    event('subworkflow_completed', {
+      agent_name: 'sub_agent',
+      elapsed: 1.0,
+      parent_path: [],
+    }),
+  );
+
+  // Loop-back: a route sends execution through `sub_agent` a second time,
+  // creating a new sibling context with the same slotKey.
+  processEvent(
+    event('subworkflow_started', {
+      agent_name: 'sub_agent',
+      workflow: 'sub.yaml',
+      iteration: 2,
+      slot_key: 'sub_agent',
+      parent_path: [],
+    }),
+  );
+  processEvent(
+    event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'childA' }],
+      routes: [{ from: 'childA', to: '$end' }],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'childA',
+      subworkflow_path: ['sub_agent'],
+    }),
+  );
+  processEvent(event('agent_started', { agent_name: 'childA', iteration: 1, subworkflow_path: ['sub_agent'] }));
+}
+
+/**
  * Dispatch a root workflow with a `for_each`-of-workflow group (`batch`) that
  * has fanned out into `count` started iterations, each its own child
  * subworkflow with an inner DAG (`childA → childB`). Mirrors the engine's
@@ -396,6 +481,47 @@ describe('buildGraphElements — namespacing', () => {
 });
 
 describe('buildGraphElements — inline subworkflow expansion', () => {
+  it('is expandable from a static topology preview before the sub-workflow ever starts', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(
+      event('workflow_started', {
+        name: 'root',
+        agents: [
+          { name: 'planner' },
+          {
+            name: 'sub_agent',
+            type: 'workflow',
+            subworkflow: {
+              name: 'child-workflow',
+              entry_point: 'childA',
+              agents: [{ name: 'childA' }],
+              routes: [],
+              parallel_groups: [],
+              for_each_groups: [],
+            },
+          },
+        ],
+        routes: [
+          { from: 'planner', to: 'sub_agent' },
+          { from: 'sub_agent', to: '$end' },
+        ],
+        parallel_groups: [],
+        for_each_groups: [],
+        entry_point: 'planner',
+      }),
+    );
+
+    const { nodes } = buildGraphElements(rootBase(), [], new Set());
+    const wf = nodes.find((n) => n.id === nodeKey([], 'sub_agent'));
+    expect(wf).toBeDefined();
+    expect(wf!.type).toBe('workflowNode');
+    expect(wf!.data.expanded).toBe(false);
+    // The key assertion: expandable even though `planner` hasn't run yet
+    // and the engine hasn't reached `sub_agent` at all.
+    expect(wf!.data.canExpand).toBe(true);
+    expect(wf!.data.childContextKey).toBe(contextKey([0]));
+  });
+
   it('renders a subworkflow node collapsed by default (no child nodes)', () => {
     seedRootWithStartedSubworkflow();
     const { nodes } = buildGraphElements(rootBase(), [], new Set());
@@ -467,6 +593,36 @@ describe('buildGraphElements — inline subworkflow expansion', () => {
     expect(ingress?.type).toBe('ingressNode');
     expect(ingress?.data.parentAgent).toBe('sub_agent');
   });
+
+  it('tracks the newest invocation after a loop-back re-invocation (issue #361)', () => {
+    seedRootWithLoopedBackSubworkflow();
+    const s = useWorkflowStore.getState();
+    expect(s.subworkflowContexts).toHaveLength(2);
+    expect(s.subworkflowContexts[0]!.status).toBe('completed');
+    expect(s.subworkflowContexts[1]!.status).toBe('running');
+
+    // Collapsed: childContextKey must point at the live (index 1) context,
+    // not the stale completed (index 0) one. The pill's own status (sourced
+    // from ctx.nodes['sub_agent'], separate from childContextKey resolution)
+    // should agree that the subworkflow is live.
+    const collapsed = buildGraphElements(rootBase(), [], new Set());
+    const wfCollapsed = collapsed.nodes.find((n) => n.id === nodeKey([], 'sub_agent'));
+    expect(wfCollapsed!.data.childContextKey).toBe(contextKey([1]));
+    expect(wfCollapsed!.data.status).toBe('running');
+
+    // Expanded: the inline child DAG embeds the newest (running) context's
+    // agents, not the stale first invocation.
+    const expanded = new Set([contextKey([1])]);
+    const { nodes } = buildGraphElements(rootBase(), [], expanded);
+    const container = nodes.find((n) => n.id === nodeKey([], 'sub_agent'));
+    expect(container!.data.expanded).toBe(true);
+    const childA = nodes.find((n) => n.id === nodeKey([1], 'childA'));
+    expect(childA).toBeDefined();
+    expect(childA!.data.contextPath).toEqual([1]);
+    expect(childA!.data.status).toBe('running');
+    // The stale first invocation's nodes are not rendered inline.
+    expect(nodes.some((n) => n.id === nodeKey([0], 'childA'))).toBe(false);
+  });
 });
 
 describe('collectExpandableContextKeys', () => {
@@ -535,6 +691,16 @@ describe('collectExpandableContextKeys', () => {
     // Viewed as if drilled into sub_agent (basePath [0]); only deep_sub remains.
     expect(collectExpandableContextKeys(child.agents, child.children, [0])).toEqual([
       contextKey([0, 0]),
+    ]);
+  });
+
+  it('resolves to the newest context after a loop-back re-invocation (issue #361)', () => {
+    seedRootWithLoopedBackSubworkflow();
+    const s = useWorkflowStore.getState();
+    expect(s.subworkflowContexts).toHaveLength(2);
+    // Must key off index 1 (the live re-invocation), not index 0 (stale).
+    expect(collectExpandableContextKeys(s.agents, s.subworkflowContexts, [])).toEqual([
+      contextKey([1]),
     ]);
   });
 });

@@ -6,9 +6,11 @@ workflow YAML configuration files.
 
 from __future__ import annotations
 
+import functools
 from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlparse
 
+import regex
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -25,6 +27,7 @@ from conductor.duration import parse_duration
 from conductor.file_string import FileString
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.skills.discovery import DiscoverySource
 from conductor.templating import is_jinja_template
 
 BudgetMode = Literal["audit", "enforce"]
@@ -37,6 +40,12 @@ so the literal type is defined in exactly one place.
 # Maximum allowed wait-step duration (24 hours). Anything longer almost
 # certainly wants ``limits.timeout_seconds`` reconsidered first.
 MAX_WAIT_DURATION_SECONDS = 24 * 60 * 60
+
+# Wall-clock bound for a single pattern match. Model output is untrusted input
+# and Python ``re`` has no timeout, so matching uses the third-party ``regex``
+# engine which supports deadlines (and releases the GIL, so a pathological
+# pattern cannot stall the event loop and neighboring parallel agents).
+PATTERN_MATCH_TIMEOUT_SECONDS = 1.0
 
 
 class InputDef(BaseModel):
@@ -87,6 +96,8 @@ class InputDef(BaseModel):
 class OutputField(BaseModel):
     """Schema for a single output field from an agent."""
 
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["string", "number", "boolean", "array", "object"]
     """The type of the output field."""
 
@@ -99,15 +110,113 @@ class OutputField(BaseModel):
     properties: dict[str, OutputField] | None = None
     """For object types, the schema of object properties."""
 
+    enum: list[Any] | None = None
+    """Allowed values for scalar types."""
+
+    pattern: str | None = None
+    """Regular expression pattern for string types."""
+
+    minimum: int | float | None = None
+    """Minimum value for number types."""
+
+    maximum: int | float | None = None
+    """Maximum value for number types."""
+
+    minLength: int | None = None
+    """Minimum length for string types."""
+
+    maxLength: int | None = None
+    """Maximum length for string types."""
+
+    required: bool = True
+    """Whether the field is required when used as an object property."""
+
+    nullable: bool = False
+    """Whether the field value may be null."""
+
+    @functools.cached_property
+    def compiled_pattern(self) -> Any:
+        """Return a compiled regex pattern, or ``None`` when no pattern is set.
+
+        Annotated as ``Any`` because the repo type checker (ty) does not yet
+        read the ``regex`` package stubs; the runtime object is always a
+        ``regex.Pattern`` or ``None``.
+        """
+
+        if self.pattern is None:
+            return None
+        return regex.compile(self.pattern)
+
     @model_validator(mode="after")
     def validate_type_specific_fields(self) -> OutputField:
-        """Ensure type-specific fields are properly set."""
+        """Ensure type-specific fields are properly set and consistent."""
         if self.type == "array" and self.items is None:
             # Items are optional but recommended for arrays
             pass
         if self.type == "object" and self.properties is None:
             # Properties are optional but recommended for objects
             pass
+
+        # String-only constraints.
+        if self.type != "string":
+            for field_name in ("pattern", "minLength", "maxLength"):
+                value = getattr(self, field_name)
+                if value is not None:
+                    raise ValueError(f"{field_name} can only be set when type is 'string'")
+
+        # Number-only constraints.
+        if self.type != "number":
+            for field_name in ("minimum", "maximum"):
+                value = getattr(self, field_name)
+                if value is not None:
+                    raise ValueError(f"{field_name} can only be set when type is 'number'")
+
+        # Enum validation.
+        if self.enum is not None:
+            if self.type in ("array", "object"):
+                raise ValueError("enum can only be set for scalar types")
+
+            if len(self.enum) == 0:
+                raise ValueError("enum must contain at least one value")
+
+            if any(value is None for value in self.enum):
+                raise ValueError(
+                    "enum cannot contain null; use nullable: true to allow null values"
+                )
+
+            type_checks = {
+                "string": lambda x: isinstance(x, str),
+                "number": lambda x: isinstance(x, int | float) and not isinstance(x, bool),
+                "boolean": lambda x: isinstance(x, bool),
+            }
+            check = type_checks.get(self.type)
+            if check is not None and not all(check(value) for value in self.enum):
+                raise ValueError(f"enum values must match the declared type '{self.type}'")
+
+        # String length validation.
+        if self.minLength is not None and self.minLength < 0:
+            raise ValueError("minLength must be non-negative")
+        if self.maxLength is not None and self.maxLength < 0:
+            raise ValueError("maxLength must be non-negative")
+        if (
+            self.minLength is not None
+            and self.maxLength is not None
+            and self.minLength > self.maxLength
+        ):
+            raise ValueError("minLength cannot be greater than maxLength")
+
+        # Number range validation.
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("minimum cannot be greater than maximum")
+
+        # Pattern compilation. ``regex`` is a strict superset of the stdlib
+        # ``re`` module, so every previously valid pattern still compiles.
+        if self.pattern is not None:
+            try:
+                regex.compile(self.pattern)
+            except regex.error as exc:
+                raise ValueError(f"pattern is not a valid regular expression: {exc}") from exc
+
         return self
 
 
@@ -166,6 +275,35 @@ class ParallelGroup(BaseModel):
         if len(v) < 2:
             raise ValueError("Parallel groups must contain at least 2 agents")
         return v
+
+
+def validate_dotted_source(v: str) -> str:
+    """Validate a dotted context reference (``agent_name.output.field``).
+
+    Shared by ``ForEachDef.source`` and ``AgentDef.source`` so the two stay
+    enforced identically — a reference that names the convention without
+    inheriting its checks is the worst of both.
+
+    Args:
+        v: The dotted path to check.
+
+    Returns:
+        The path unchanged.
+
+    Raises:
+        ValueError: If the path has fewer than three parts or its first
+            segment is not a valid identifier. This is a format check only;
+            actual resolution happens at runtime.
+    """
+    parts = v.split(".")
+    if len(parts) < 3:
+        raise ValueError(
+            f"Invalid source format: '{v}'. "
+            f"Expected format: 'agent_name.output.field' (minimum 3 parts)"
+        )
+    if not parts[0].isidentifier():
+        raise ValueError(f"Invalid agent name in source: '{parts[0]}' is not a valid identifier")
+    return v
 
 
 class ForEachDef(BaseModel):
@@ -256,22 +394,8 @@ class ForEachDef(BaseModel):
     @field_validator("source")
     @classmethod
     def validate_source_format(cls, v: str) -> str:
-        """Validate source reference format (agent_name.output.field).
-
-        This is a basic format check - actual resolution happens at runtime.
-        """
-        parts = v.split(".")
-        if len(parts) < 3:
-            raise ValueError(
-                f"Invalid source format: '{v}'. "
-                f"Expected format: 'agent_name.output.field' (minimum 3 parts)"
-            )
-        # First part should be a valid identifier
-        if not parts[0].isidentifier():
-            raise ValueError(
-                f"Invalid agent name in source: '{parts[0]}' is not a valid identifier"
-            )
-        return v
+        """Validate source reference format (agent_name.output.field)."""
+        return validate_dotted_source(v)
 
     @field_validator("max_concurrent")
     @classmethod
@@ -300,6 +424,86 @@ class GateOption(BaseModel):
 
     prompt_for: str | None = None
     """Optional: field name to prompt for text input."""
+
+    multiline: bool = False
+    """Whether the ``prompt_for`` input accepts multi-line text.
+
+    Defaults to False so existing gates keep single-line behavior (Enter
+    submits). When True, the terminal reads until a lone ``.`` or EOF and
+    the dashboard renders a textarea where Enter inserts a newline.
+    """
+
+
+class QuestionDef(BaseModel):
+    """One question in a ``type: questions`` node.
+
+    A ``source:`` that resolves to plain strings is coerced into these with
+    only ``text`` populated, so an agent emitting ``array of string`` needs no
+    change to gain choices later.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    """Stable key for this question's answer. Defaults to ``q1``..``qN``.
+
+    Set it explicitly when downstream templates reference a specific answer,
+    so inserting a question upstream doesn't renumber the keys under them.
+    """
+
+    text: str
+    """The question, rendered as a Jinja2 template."""
+
+    hint: str | None = None
+    """Optional clarifying text shown beneath the question."""
+
+    choices: list[str] | None = None
+    """Suggested answers to offer as selectable options.
+
+    Lets an agent propose candidate answers rather than only asking
+    open-ended questions, which is a far lower-effort interaction.
+    """
+
+    allow_free_text: bool = True
+    """Whether to offer a "write your own" option alongside ``choices``."""
+
+    default: str | None = None
+    """Answer recorded when the question is skipped."""
+
+    required: bool = False
+    """Whether an answer is mandatory.
+
+    Blocks *submission*, never navigation — otherwise a user could be trapped
+    on a question they cannot answer yet.
+    """
+
+    multiline: bool = True
+    """Whether the free-text path accepts multi-line input.
+
+    Inert when ``allow_free_text`` is false — there is no free-text path.
+    """
+
+    @model_validator(mode="after")
+    def validate_answerable(self) -> QuestionDef:
+        """Reject a question the user has no way to answer.
+
+        Without choices and without free text there is nothing to select. At
+        runtime that surfaces either as an empty-choice ``HumanGateError`` or,
+        worse, as a question whose only control is Skip — which is refused
+        when ``required`` is set, leaving the user with no way forward.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If the question offers neither choices nor free text.
+        """
+        if not self.choices and not self.allow_free_text:
+            raise ValueError(
+                f"Question {self.id or self.text!r} is unanswerable: it has no 'choices' "
+                "and 'allow_free_text' is false. Add choices or allow free text."
+            )
+        return self
 
 
 class ContextConfig(BaseModel):
@@ -651,6 +855,281 @@ class SandboxConfig(BaseModel):
     """
 
 
+class PluginSourceDef(BaseModel):
+    """One entry in a ``plugin_sources:`` mapping.
+
+    Accepts a string shorthand or an object, mirroring the
+    ``provider:`` and ``plugins:`` precedents::
+
+        plugin_sources:
+          acme: acme/agent-plugins#v1.4.0
+          beta:
+            source: git@github.com:beta/plugins.git#3f2a1c9
+            path: packages/plugins
+            plugin: reviewer
+
+    A source declares *where a marketplace comes from*; ``plugins:``
+    declares which of its plugins to enable. The split is not invented
+    here — it is the one the Copilot CLI already uses in its settings
+    (``extraKnownMarketplaces`` alongside ``enabledPlugins``), and it is
+    what stops a repository shared by eleven plugins being cloned eleven
+    times or pinned to eleven different refs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    """Where the marketplace comes from.
+
+    ``owner/repo``, ``owner/repo#ref``, an http/https/ssh URL with an
+    optional ``#ref``, a ``git@host:path`` remote, or a local path. The
+    grammar is the Copilot CLI's, so a source already written for that
+    works here unchanged.
+
+    A ref that is a full 40-character SHA is **pinned**: fetched once and
+    never re-checked. Anything else — a tag, a branch, or no ref at all —
+    floats, and is re-resolved on every run. Pinning is the only thing
+    that stops a source changing what it ships between two runs.
+    """
+
+    path: str | None = None
+    """Subdirectory within the source holding the marketplace.
+
+    For a repository that keeps its plugins somewhere other than the
+    root. Repo-relative and may not escape the checkout.
+    """
+
+    plugin: str | None = None
+    """Name of the single plugin this source provides.
+
+    Only needed when a repository is *both* a catalog and a plugin —
+    it holds a ``marketplace.json`` and a ``plugin.json`` at the same
+    level — which is otherwise refused rather than guessed at.
+    """
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, v: str) -> str:
+        """Reject a source string that matches none of the known forms.
+
+        Parsed eagerly so a typo fails at load time naming the source the
+        author wrote, rather than at fetch time naming a directory they
+        never typed.
+        """
+        from conductor.plugins.sources import parse_plugin_source
+
+        parse_plugin_source(v)
+        return v.strip()
+
+    @field_validator("path", "plugin")
+    @classmethod
+    def validate_optional_text(cls, v: str | None) -> str | None:
+        """Reject an empty or whitespace-only optional field."""
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("plugin_sources 'path' and 'plugin' must be non-empty when set")
+        return stripped
+
+
+def _coerce_plugin_sources(value: Any) -> Any:
+    """Expand string shorthands in a ``plugin_sources:`` mapping."""
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: {"source": entry} if isinstance(entry, str) else entry for key, entry in value.items()
+    }
+
+
+def _validate_plugin_source_names(value: dict[str, PluginSourceDef]) -> dict[str, PluginSourceDef]:
+    """Check each marketplace name is usable as a name and a path segment.
+
+    A marketplace name is written after ``@`` in a ``plugins:`` entry and
+    becomes a directory component in messages, so it is held to the same
+    :data:`~conductor.plugins.manifest.SAFE_NAME` pattern as a plugin.
+    """
+    from conductor.plugins.manifest import SAFE_NAME
+
+    for name in value:
+        if not SAFE_NAME.match(name):
+            raise ValueError(
+                f"plugin_sources key {name!r} must match {SAFE_NAME.pattern}. The name "
+                "is what a plugins entry references after '@'."
+            )
+    return value
+
+
+class PluginDef(BaseModel):
+    """One entry in a ``plugins:`` list.
+
+    Accepts either a string shorthand (``- prs``) or an object with
+    per-component switches, mirroring the ``provider:`` string/object
+    precedent::
+
+        plugins:
+          - prs                      # everything the plugin ships
+          - name: ado
+            mcp: false               # skills and agents only
+
+    ``name`` is an **installed plugin name**, a
+    **``plugin@marketplace``** reference, or a **filesystem path**. The
+    first two are classified by the same syntactic rule ``skills:`` uses
+    (path when it starts with ``~``/``.`` or contains a separator).
+    Resolution needs the workflow file's directory and the declared
+    ``plugin_sources``, neither of which the schema has, so only the
+    entry's shape is checked here.
+
+    Every component defaults to **on**. Defaulting one off would
+    reproduce the partial-loading bug this feature exists to fix — a
+    plugin that loads its instructions but not the subagents or MCP
+    tools those instructions call for.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Installed plugin name, ``plugin@marketplace``, or a path to a plugin root."""
+
+    skills: bool = True
+    """Load the plugin's ``skills/``."""
+
+    agents: bool = True
+    """Register the plugin's ``agents/*.agent.md`` as subagents."""
+
+    mcp: bool = True
+    """Register the MCP servers the plugin declares.
+
+    Worth a moment's thought before leaving on: an MCP server is a
+    subprocess launched with the user's credentials, not text injected
+    into a prompt. Conductor starts it only because the workflow named
+    the plugin — never because it happened to be installed.
+    """
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Reject an empty entry, or a name carrying glob metacharacters.
+
+        A bare name is interpolated into the installed-plugin glob, so
+        ``plugins: ["*"]`` would match every installed plugin and report
+        itself as *ambiguous across 13 plugins* rather than as the
+        nonsense it is. Path entries are left alone — a glob character is
+        legal in a directory name.
+
+        The ``plugin@marketplace`` form is split here too, so a malformed
+        half fails at load time rather than resolving to something odd.
+        """
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("plugins entries must be non-empty strings")
+        from conductor.plugins.manifest import SAFE_NAME
+        from conductor.skills import is_path_entry
+
+        if is_path_entry(stripped):
+            return stripped
+
+        # Path check first, so './tools/my@plugin' stays a path.
+        plugin, marketplace = _split_marketplace(stripped)
+        if marketplace is not None and (
+            not SAFE_NAME.match(plugin) or not SAFE_NAME.match(marketplace)
+        ):
+            raise ValueError(
+                f"plugins entry {stripped!r} is not a valid 'plugin@marketplace' "
+                f"reference. Both halves must match {SAFE_NAME.pattern}."
+            )
+        if any(char in stripped for char in "*?[]"):
+            raise ValueError(
+                f"plugins entry {stripped!r} contains a glob metacharacter. An entry is "
+                "either an installed plugin name, a 'plugin@marketplace' reference, or "
+                "a path (starting with '.' or '~', or containing a separator)."
+            )
+        return stripped
+
+
+def _split_marketplace(entry: str) -> tuple[str, str | None]:
+    """Split a ``plugin@marketplace`` entry into its two halves.
+
+    Splits on the **last** ``@``, so a plugin name containing one keeps
+    it. Callers must establish that ``entry`` is not a path first — a
+    directory may legitimately contain ``@``.
+
+    Returns:
+        ``(plugin, marketplace)``, with ``marketplace`` ``None`` when the
+        entry named none.
+    """
+    if "@" not in entry:
+        return entry, None
+    plugin, _, marketplace = entry.rpartition("@")
+    return plugin.strip(), marketplace.strip()
+
+
+def _coerce_plugin_entries(value: Any) -> Any:
+    """Expand string shorthands in a ``plugins:`` list.
+
+    Mirrors :meth:`RuntimeConfig._coerce_provider`: a bare string is the
+    common case and should not require the object form.
+    """
+    if not isinstance(value, list):
+        return value
+    return [{"name": entry} if isinstance(entry, str) else entry for entry in value]
+
+
+def _validate_plugin_entries(entries: list[PluginDef]) -> list[PluginDef]:
+    """Reject a ``plugins:`` list that names the same entry twice.
+
+    Duplicate entries are refused rather than deduplicated because the
+    two may disagree about components — ``[prs, {name: prs, mcp: false}]``
+    has no correct merge, and silently keeping one would be the wrong
+    kind of quiet.
+    """
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.name in seen:
+            raise ValueError(
+                f"plugins contains duplicate entry {entry.name!r}. List each plugin "
+                "once, with the components you want on that single entry."
+            )
+        seen.add(entry.name)
+    return entries
+
+
+def _validate_skill_entries(entries: list[str]) -> list[str]:
+    """Validate the shape of ``skills:`` entries at config-load time.
+
+    Bare **names** are checked eagerly against the built-in registry —
+    they need no base directory, so an unknown name still surfaces at
+    load time exactly as it did before path entries existed.
+
+    **Path** entries are only shape-checked here. Resolving them needs
+    the workflow file's directory, which the schema does not have, so
+    that happens in :func:`conductor.config.validator.validate_workflow_config`
+    (statically) and in ``AgentExecutor`` (at run time).
+
+    Args:
+        entries: The raw ``skills:`` list.
+
+    Returns:
+        The list unchanged.
+
+    Raises:
+        ValueError: If an entry is not a non-empty string, or is a bare
+            name that no built-in skill matches.
+    """
+    from conductor.skills import SkillNotFoundError, get_skill_directory, is_path_entry
+
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(f"skills entries must be non-empty strings, got {entry!r}")
+        if is_path_entry(entry):
+            continue
+        try:
+            get_skill_directory(entry)
+        except SkillNotFoundError as exc:
+            raise ValueError(str(exc)) from exc
+    return entries
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow.
 
@@ -692,7 +1171,17 @@ class AgentDef(BaseModel):
     """Human-readable description of agent's purpose."""
 
     type: (
-        Literal["agent", "human_gate", "script", "set", "terminate", "wait", "workflow"] | None
+        Literal[
+            "agent",
+            "human_gate",
+            "questions",
+            "script",
+            "set",
+            "terminate",
+            "wait",
+            "workflow",
+        ]
+        | None
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
@@ -792,6 +1281,47 @@ class AgentDef(BaseModel):
 
     options: list[GateOption] | None = None
     """Options for human_gate type agents."""
+
+    questions: list[QuestionDef] | None = None
+    """Inline questions for ``type: questions`` agents.
+
+    Mutually exclusive with ``source``; exactly one is required.
+    """
+
+    source: str | None = None
+    """Dotted path to an array of questions (``type: questions`` only).
+
+    Same convention as ``ForEachDef.source`` (e.g.
+    ``architect.output.open_questions``), including its format validation.
+    Entries may be plain strings or objects matching :class:`QuestionDef`.
+    """
+
+    allow_back: bool | None = None
+    """Whether the user can revisit the previous question (questions type).
+
+    Tri-state so an explicit value is distinguishable from the default, which
+    is what lets the schema reject these flags on other step types. Defaults
+    to True; resolve via ``executor.questions.NavFlags``.
+    """
+
+    allow_skip: bool | None = None
+    """Whether individual questions can be skipped (questions type). Defaults to True."""
+
+    allow_skip_all: bool | None = None
+    """Whether the remaining questions can be skipped at once (questions type).
+
+    Defaults to True.
+    """
+
+    allow_abort: bool | None = None
+    """Whether the user can abandon the node entirely (questions type).
+
+    Defaults to False because it routes away from the normal flow; enabling it
+    without an ``abort_route`` ends the workflow.
+    """
+
+    abort_route: str | None = None
+    """Where to route when the user aborts (questions type). Defaults to ``$end``."""
 
     command: str | None = None
     """Command to execute (required for script type). Supports Jinja2 templating."""
@@ -1126,20 +1656,47 @@ class AgentDef(BaseModel):
     """
 
     skills: list[str] | None = None
-    """Opt this agent into a list of named built-in skills.
+    r"""Opt this agent into a list of skills.
 
-    Each entry is a skill name registered in :mod:`conductor.skills`.
+    Each entry is either a **registered built-in name** (e.g.
+    ``conductor``) or a **filesystem path**. An entry is treated as a
+    path when it starts with ``.`` or ``~``, or contains ``/`` or ``\``;
+    everything else must be a built-in name, so a bare name can never be
+    shadowed by a same-named local directory.
+
+    A path may point at either granularity:
+
+    * a **skill directory** — one containing ``SKILL.md``
+    * a **skills root** — a directory of skill directories, which
+      expands to every immediate child containing a ``SKILL.md``
+
+    Relative paths resolve against the workflow file's directory
+    (consistent with ``working_dir``), so a skill can be versioned
+    alongside the workflow with no per-developer install step.
+
+    Skill paths are trusted input: a ``SKILL.md`` is injected into the
+    agent's context, but the same workflow file can already declare
+    ``type: script`` steps running arbitrary shell, so no additional
+    allowlist applies.
+
     The agent receives that skill's content via whichever mechanism the
     provider supports natively:
 
     * **Copilot** — skill directories are passed to the SDK session via
       ``skill_directories``; the model discovers and loads skill content
       as relevant (progressive disclosure, token-efficient).
-    * **Claude / Claude Agent SDK** — ``SKILL.md`` plus
-      ``references/*.md`` is eagerly injected into the agent's rendered
-      prompt, wrapped in ``<skill name="...">`` tags. There is no native
-      skill surface on the Anthropic API without adopting the
-      container/code-execution beta.
+    * **Claude Agent SDK** — the Claude Code plugin that owns the skill is
+      registered on the session and the skill is enabled by its
+      ``<plugin>:<skill>`` name, so the CLI loads only the ``SKILL.md``
+      frontmatter up front. Skills the workflow did not declare are
+      filtered out of the model's listing instead of being inherited
+      from the machine. The SDK has no bare skill-directory surface, so
+      a path skill that is not inside a Claude Code plugin is rejected.
+    * **Claude** — ``SKILL.md`` plus ``references/*.md`` is eagerly
+      injected into the agent's rendered prompt, wrapped in
+      ``<skill name="...">`` tags. There is no native skill surface on
+      the Anthropic API without adopting the container/code-execution
+      beta. Injected size is bounded by ``runtime.skill_injection``.
 
     Tri-state semantics via list presence:
 
@@ -1155,14 +1712,65 @@ class AgentDef(BaseModel):
       Enables agents to evaluate, improve, debug, or generate Conductor
       workflows.
 
+    Every resolved skill's ``SKILL.md`` must have valid YAML frontmatter
+    declaring ``name`` and ``description``; both Copilot and Claude Code
+    skip an unparseable skill in silence, so Conductor fails loudly
+    instead.
+
     Only applies to provider-backed agents (type='agent' or None).
 
     Example YAML::
 
         agents:
           - name: workflow_reviewer
-            skills: [conductor]
+            skills:
+              - conductor                     # built-in
+              - ./team-skills/acme-widgets    # versioned with the workflow
             prompt: "Review this workflow for correctness..."
+    """
+
+    plugins: list[PluginDef] | None = None
+    """Opt this agent into whole plugins.
+
+    A plugin is the unit a user actually installs, and it ships up to
+    three things Conductor can use: ``skills/``, ``agents/*.agent.md``,
+    and MCP servers. Enabling the plugin brings all three by default, so
+    a skill whose instructions dispatch to ``prs:code-reviewer`` or call
+    an ``ado`` MCP tool finds them there.
+
+    Each entry is either an **installed plugin name** or a **filesystem
+    path** — the same syntactic rule as ``skills:``. Entries take a
+    string shorthand or an object with per-component switches; see
+    :class:`PluginDef`.
+
+    Tri-state semantics via list presence, matching :attr:`skills`:
+
+    * ``None`` (omitted): inherit from ``workflow.runtime.plugins``
+    * ``[]`` (empty list): explicit none — overrides any workflow default
+    * ``[entry, ...]``: explicit set — overrides any workflow default
+
+    Requires a provider with a native skill and subagent surface
+    (``copilot``, ``claude-agent-sdk``). Providers that reach skills by
+    injecting their text into the prompt have nowhere to put a subagent
+    or an MCP server, so a plugin there would load partially — exactly
+    the failure this field exists to remove — and is rejected instead.
+
+    Plugins are never discovered. Nothing is registered because it
+    happened to be installed; a plugin is loaded only because a workflow
+    named it, and a missing one is an error rather than quietly less
+    capability.
+
+    Only applies to provider-backed agents (type='agent' or None).
+
+    Example YAML::
+
+        agents:
+          - name: reviewer
+            plugins:
+              - prs                           # everything the plugin ships
+              - name: ado
+                mcp: false                    # skills and agents only
+            prompt: "Review this pull request..."
     """
 
     status: Literal["success", "failed"] | None = None
@@ -1251,24 +1859,36 @@ class AgentDef(BaseModel):
     @field_validator("skills")
     @classmethod
     def validate_skills(cls, v: list[str] | None) -> list[str] | None:
-        """Ensure every skill name resolves to a known built-in.
+        """Validate ``skills:`` entry shape and built-in names.
 
-        Validates at load time so unknown skill names surface in
-        ``conductor validate`` and ``conductor run`` startup rather than
-        at execute time. Empty lists are allowed (explicit opt-out).
+        Unknown built-in names surface at load time as before. Path
+        entries need the workflow file's directory to resolve, so they
+        are only shape-checked here — see :func:`_validate_skill_entries`.
+        Empty lists are allowed (explicit opt-out).
         """
         if v is None:
             return v
-        from conductor.skills import SkillNotFoundError, get_skill_directory
+        return _validate_skill_entries(v)
 
-        for name in v:
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"skills entries must be non-empty strings, got {name!r}")
-            try:
-                get_skill_directory(name)
-            except SkillNotFoundError as exc:
-                raise ValueError(str(exc)) from exc
-        return v
+    @field_validator("plugins", mode="before")
+    @classmethod
+    def coerce_plugins(cls, v: Any) -> Any:
+        """Expand ``- prs`` string shorthands into ``{name: prs}``."""
+        return _coerce_plugin_entries(v)
+
+    @field_validator("plugins")
+    @classmethod
+    def validate_plugins(cls, v: list[PluginDef] | None) -> list[PluginDef] | None:
+        """Reject duplicate ``plugins:`` entries.
+
+        Nothing else can be checked here: unlike a built-in skill name,
+        a plugin name is only resolvable against installed roots or the
+        workflow file's directory, neither of which the schema has.
+        Empty lists are allowed (explicit opt-out).
+        """
+        if v is None:
+            return v
+        return _validate_plugin_entries(v)
 
     @field_validator("duration", mode="before")
     @classmethod
@@ -1335,6 +1955,28 @@ class AgentDef(BaseModel):
                 "(only 'script' agents support this field)"
             )
 
+        # Fields exclusive to ``type: questions``. A standalone guard, like the
+        # terminate/script ones above, so it also covers types with no branch
+        # of their own. The nav flags are tri-state (``bool | None``) precisely
+        # so an explicit value is distinguishable here — with a plain ``bool``
+        # default, a value equal to that default is indistinguishable from a
+        # field the user never wrote.
+        if self.type != "questions":
+            for field_name in (
+                "questions",
+                "source",
+                "allow_back",
+                "allow_skip",
+                "allow_skip_all",
+                "allow_abort",
+                "abort_route",
+            ):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"'{self.type or 'agent'}' agents cannot have '{field_name}' "
+                        "(only 'questions' agents support this field)"
+                    )
+
         if self.type == "human_gate":
             if not self.options:
                 raise ValueError("human_gate agents require 'options'")
@@ -1356,6 +1998,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("human_gate agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("human_gate agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("human_gate agents cannot have 'timeout_seconds'")
             if self.value is not None:
@@ -1372,6 +2016,69 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'working_dir'")
             if self.session_key is not None:
                 raise ValueError("human_gate agents cannot have 'session_key'")
+        elif self.type == "questions":
+            if not self.questions and not self.source:
+                raise ValueError("questions agents require either 'questions' or 'source'")
+            if self.questions and self.source:
+                raise ValueError(
+                    "questions agents cannot set both 'questions' and 'source' "
+                    "(use one or the other)"
+                )
+            if self.options is not None:
+                raise ValueError(
+                    "questions agents cannot have 'options' (only 'human_gate' agents do); "
+                    "per-question choices go in 'questions[].choices'"
+                )
+            if self.abort_route is not None and not self.allow_abort:
+                raise ValueError(
+                    "questions agents cannot set 'abort_route' without 'allow_abort: true'"
+                )
+            if self.source is not None:
+                validate_dotted_source(self.source)
+            if self.input_mapping is not None:
+                raise ValueError("questions agents cannot have 'input_mapping'")
+            if self.dialog is not None:
+                raise ValueError("questions agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("questions agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("questions agents cannot have 'sandbox'")
+            if self.max_depth is not None:
+                raise ValueError("questions agents cannot have 'max_depth'")
+            if self.reasoning is not None:
+                raise ValueError("questions agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("questions agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("questions agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("questions agents cannot have 'plugins'")
+            if self.timeout_seconds is not None:
+                raise ValueError("questions agents cannot have 'timeout_seconds'")
+            if self.model:
+                raise ValueError("questions agents cannot have 'model' (no provider is invoked)")
+            if self.provider:
+                raise ValueError("questions agents cannot have 'provider'")
+            if self.tools is not None:
+                raise ValueError("questions agents cannot have 'tools'")
+            if self.output:
+                raise ValueError(
+                    "questions agents cannot have 'output' (the answer shape is fixed)"
+                )
+            if self.value is not None:
+                raise ValueError("questions agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("questions agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError(
+                    "questions agents cannot have 'output_type' (only 'set' agents do)"
+                )
+            if self.output_mode is not None:
+                raise ValueError("questions agents cannot have 'output_mode'")
+            if self.working_dir:
+                raise ValueError("questions agents cannot have 'working_dir'")
+            if self.session_key is not None:
+                raise ValueError("questions agents cannot have 'session_key'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -1411,6 +2118,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("script agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("script agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError(
                     "script agents cannot have 'timeout_seconds' "
@@ -1518,6 +2227,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("wait agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("wait agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("wait agents cannot have 'timeout_seconds'")
             if self.output is not None:
@@ -1589,6 +2300,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("set agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("set agents cannot have 'plugins'")
             if self.timeout_seconds is not None:
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
@@ -1659,6 +2372,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'context_tier'")
             if self.skills is not None:
                 raise ValueError("terminate agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("terminate agents cannot have 'plugins'")
             if self.workflow:
                 raise ValueError("terminate agents cannot have 'workflow'")
             if self.input_mapping is not None:
@@ -1719,6 +2434,8 @@ class AgentDef(BaseModel):
             raise ValueError("workflow agents cannot have 'context_tier'")
         if self.type == "workflow" and self.skills is not None:
             raise ValueError("workflow agents cannot have 'skills'")
+        if self.type == "workflow" and self.plugins is not None:
+            raise ValueError("workflow agents cannot have 'plugins'")
 
         # Wait-only fields are forbidden on every other type. ``reason`` is
         # shared with ``type: terminate`` (which has its own required-non-
@@ -1935,11 +2652,17 @@ class ProviderSettings(BaseModel):
     auth_token: SecretStr | None = None
     """Bearer token for OAuth / gateway authentication. Claude-only.
 
-    Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK instead
-    of the usual ``x-api-key`` header. Use for Databricks AI Gateway,
-    LiteLLM proxies, or any endpoint that expects a bearer token.
+    Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK. Use for
+    Databricks AI Gateway, LiteLLM proxies, or any endpoint that expects a
+    bearer token rather than an ``x-api-key`` credential. Set exactly one of
+    ``auth_token`` / ``api_key``: the Anthropic SDK does not choose between
+    them — when both are set it sends both ``X-Api-Key`` and
+    ``Authorization: Bearer`` headers on every request, so the API key
+    reaches whatever ``base_url`` points at.
 
-    Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var when not set in YAML.
+    Credentials resolve as a unit: setting either credential in YAML
+    suppresses both ``ANTHROPIC_API_KEY`` and ``ANTHROPIC_AUTH_TOKEN`` env
+    vars. The env fallback applies only when no credential is set in YAML.
 
     Example::
 
@@ -2428,6 +3151,172 @@ class ToolOutputConfig(BaseModel):
         return v.strip() or None
 
 
+class SkillInjectionConfig(BaseModel):
+    """Size limits for eagerly injected skill content.
+
+    Providers without a native skill surface (``claude``, ``hermes``)
+    have no progressive disclosure: :class:`~conductor.executor.agent.AgentExecutor`
+    prepends every enabled skill's ``SKILL.md`` **plus its entire
+    ``references/`` tree** to the rendered prompt, on every agent call and
+    every retry. The bundled ``conductor`` skill alone is ~117KB (~29K
+    tokens), so an unbounded list is easy to turn into most of a context
+    window by accident.
+
+    Both limits are measured against the exact string that gets
+    prepended. Setting either to ``null`` disables that limit.
+
+    Example YAML::
+
+        runtime:
+            skill_injection:
+                warn_bytes: 65536     # warn above 64KB
+                max_bytes: 131072     # fail above 128KB
+    """
+
+    # Frozen for the reason ``ProviderSettings`` documents: this model carries a
+    # cross-field invariant in a ``model_validator(mode="after")``, and that does
+    # not re-fire on per-attribute assignment even under the enclosing
+    # ``RuntimeConfig``'s ``validate_assignment=True``.
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    warn_bytes: int | None = Field(default=64 * 1024, ge=0)
+    """Log a warning when injected skill content exceeds this many bytes.
+
+    ``None`` disables the warning. The 64KB default is below the bundled
+    ``conductor`` skill's ~117KB so that combination is surfaced rather
+    than passing silently.
+    """
+
+    max_bytes: int | None = Field(default=128 * 1024, ge=0)
+    """Fail the agent when injected skill content exceeds this many bytes.
+
+    ``None`` disables the limit. The 128KB default is above the bundled
+    ``conductor`` skill's ~117KB, so enabling it does not break an
+    existing single-skill workflow — it catches accumulation.
+    """
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> SkillInjectionConfig:
+        """Reject a warning threshold above the hard limit.
+
+        Such a config can never warn: the error fires first, so the
+        warning is unreachable and the author's intent is ambiguous.
+        """
+        if (
+            self.warn_bytes is not None
+            and self.max_bytes is not None
+            and self.warn_bytes > self.max_bytes
+        ):
+            raise ValueError(
+                f"skill_injection.warn_bytes ({self.warn_bytes}) must not exceed "
+                f"max_bytes ({self.max_bytes}); the error would fire before the "
+                "warning could ever be emitted."
+            )
+        return self
+
+
+class SkillDiscoveryConfig(BaseModel):
+    """Opt in to skills already installed in the user's environment.
+
+    ``skills:`` names skills one at a time. Discovery is the alternative
+    for someone who already keeps a personal or team skill library: point
+    at *categories* of well-known location and pick up whatever is there.
+
+    Conductor scans the union of both CLIs' locations itself rather than
+    asking each provider to discover its own — see
+    :mod:`conductor.skills.discovery` for why that distinction is the
+    whole point of the feature. Discovered skills join the workflow-level
+    default set, so an agent that declares its own ``skills:`` (including
+    ``skills: []``) overrides discovery exactly as it overrides
+    :attr:`RuntimeConfig.skills`.
+
+    **Off by default**, and worth leaving off unless you want it: an
+    ambient set makes the same YAML behave differently on a different
+    machine or in CI, which is the opposite of a reproducible run.
+    ``conductor validate`` prints the set it puts in effect, so it is at
+    least inspectable before you commit the workflow.
+
+    Not usable on every provider. ``claude`` and ``hermes`` have no
+    native skill surface and would eagerly inject the entire discovered
+    set into every prompt, so ``conductor validate`` rejects the
+    combination; ``claude-agent-sdk`` can only load a discovered skill
+    that lives inside a Claude Code plugin, and warns about the rest.
+
+    Example YAML::
+
+        runtime:
+            skill_discovery:
+                sources: [personal, project]
+                exclude: [scratch-notes]
+    """
+
+    # Frozen for the reason ``SkillInjectionConfig`` and ``ProviderSettings``
+    # document: the field validators below are shape checks that do not
+    # re-fire on per-attribute assignment under the enclosing
+    # ``RuntimeConfig``'s ``validate_assignment=True``. The fields are
+    # tuples rather than lists so ``frozen`` means what it says — a list
+    # would still allow ``config.sources.append(...)``, and would make the
+    # model unhashable despite Pydantic generating ``__hash__`` for it.
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sources: tuple[DiscoverySource, ...] = ()
+    """Which categories of location to scan. Empty disables discovery.
+
+    * ``personal`` — ``~/.copilot/skills``, ``~/.claude/skills``
+    * ``project`` — ``.github/skills`` and ``.claude/skills``, in the
+      workflow file's directory and each ancestor up to the repository
+      root, or that directory alone when it is not inside a repository
+
+    Scanned in a fixed order (``project``, then ``personal``) whatever
+    order they are written in, so reordering this list cannot change
+    which of two same-named skills wins.
+
+    There is no ``plugins`` source: taking a plugin's ``skills/`` and
+    leaving its subagents and MCP servers behind is the partial load
+    ``runtime.plugins`` exists to fix. Name plugins there instead — that
+    also reproduces on another machine, which a scan does not.
+    """
+
+    exclude: tuple[str, ...] = ()
+    """Skill names to drop from the discovered set.
+
+    Applies to discovered skills only. Removing an explicitly declared
+    skill is a matter of deleting its line from ``skills:``.
+    """
+
+    @field_validator("sources")
+    @classmethod
+    def validate_sources(cls, v: tuple[DiscoverySource, ...]) -> tuple[DiscoverySource, ...]:
+        """Reject a repeated source.
+
+        Listing one twice has no effect, so it always means the author
+        believed it would — most likely a merge artefact.
+        """
+        duplicates = sorted({source for source in v if v.count(source) > 1})
+        if duplicates:
+            raise ValueError(
+                f"skill_discovery.sources contains duplicate entries: {duplicates!r}. "
+                "Each source is scanned once regardless."
+            )
+        return v
+
+    @field_validator("exclude")
+    @classmethod
+    def validate_exclude(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        """Reject blank exclusions, which match no skill name."""
+        for name in v:
+            if not name.strip():
+                raise ValueError(
+                    f"skill_discovery.exclude entries must be non-empty skill names, got {name!r}"
+                )
+        return v
+
+    @property
+    def is_enabled(self) -> bool:
+        """Whether any discovery source is active."""
+        return bool(self.sources)
+
+
 class RuntimeConfig(BaseModel):
     """Provider and runtime configuration."""
 
@@ -2575,41 +3464,140 @@ class RuntimeConfig(BaseModel):
     skills: list[str] = Field(default_factory=list)
     """Workflow-wide default skills for every provider-backed agent.
 
-    Each entry is a skill name registered in :mod:`conductor.skills` (e.g.
-    ``conductor``). Every provider-backed agent inherits this list as its
-    default; individual agents override by setting their own ``skills:``
-    field (use ``skills: []`` for explicit opt-out).
+    Each entry is either a registered built-in name (e.g. ``conductor``)
+    or a filesystem path — see :attr:`AgentDef.skills` for the full
+    resolution rules. Every provider-backed agent inherits this list as
+    its default; individual agents override by setting their own
+    ``skills:`` field (use ``skills: []`` for explicit opt-out).
 
     Skill content reaches the model differently per provider:
 
     * **Copilot** — registered on the SDK session via ``skill_directories``
-    * **Claude / Claude Agent SDK** — eagerly injected into the rendered
-      prompt inside ``<skills><skill name="...">...</skill></skills>`` tags
+    * **Claude Agent SDK** — the owning plugin is registered via
+      ``--plugin-dir`` and the skill enabled by its ``<plugin>:<skill>``
+      name, so the CLI loads it on demand
+    * **Claude** — eagerly injected into the rendered prompt inside
+      ``<skills><skill name="...">...</skill></skills>`` tags, bounded by
+      :attr:`skill_injection`
 
-    Defaults to an empty list (no skills). Phase 1 ships one built-in
-    skill (``conductor``); user-defined skill directories will be added
-    in a follow-up.
+    Defaults to an empty list (no skills). Conductor ships one built-in
+    skill (``conductor``); anything else is referenced by path.
 
     Example YAML::
 
         runtime:
-            skills: [conductor]
+            skills:
+              - conductor
+              - ./team-skills/acme-widgets
     """
+
+    skill_injection: SkillInjectionConfig = Field(default_factory=SkillInjectionConfig)
+    """Size limits for *eagerly injected* skill content.
+
+    Only affects providers without a native skill surface (``claude``,
+    ``hermes``), where the full skill body is prepended to every agent
+    call. Providers with progressive disclosure (``copilot``,
+    ``claude-agent-sdk``) send only frontmatter up front and are
+    unaffected.
+    """
+
+    skill_discovery: SkillDiscoveryConfig = Field(default_factory=SkillDiscoveryConfig)
+    """Opt in to skills already installed in the user's environment.
+
+    Off by default. When enabled, the discovered skills join this
+    workflow-level default set, so an agent declaring its own ``skills:``
+    overrides them along with :attr:`skills`. See
+    :class:`SkillDiscoveryConfig`.
+    """
+
+    plugin_sources: dict[str, PluginSourceDef] = Field(default_factory=dict)
+    """Where the marketplaces named in ``plugins:`` come from.
+
+    This is what makes a workflow using plugins **standalone**. Without
+    it a ``plugins:`` entry resolves against machine state — an installed
+    plugin, or a path — so a shared workflow needs "first install these"
+    in a README, and a teammate who skips that gets an error rather than
+    a run.
+
+    Maps a marketplace name to a source. Entries take a string shorthand
+    or an object; see :class:`PluginSourceDef`. A ``plugins:`` entry then
+    references one as ``plugin@marketplace``.
+
+    A declared source registers its name into the *same* resolution table
+    the installed marketplaces populate, so ``prs@acme`` means the same
+    thing whether ``acme`` was declared here, installed via the CLI, or is
+    a local directory. A declared source wins over an installed
+    marketplace of the same name, with a warning when it shadows one.
+
+    Sources are fetched by ``conductor run`` (and by ``conductor plugin
+    fetch``); ``conductor validate`` never touches the network and reads
+    the cache only.
+
+    Example YAML::
+
+        runtime:
+            plugin_sources:
+              acme: acme/agent-plugins#v1.4.0
+              beta:
+                source: git@github.com:beta/plugins.git#3f2a1c9
+                path: packages/plugins
+              local-dev: ./vendor/plugins
+            plugins:
+              - prs@acme
+              - name: ado@acme
+                mcp: false
+    """
+
+    plugins: list[PluginDef] = Field(default_factory=list)
+    """Workflow-wide default plugins for every provider-backed agent.
+
+    Every provider-backed agent inherits this list unless it sets its own
+    ``plugins:`` field (use ``plugins: []`` for explicit opt-out). See
+    :attr:`AgentDef.plugins` for entry grammar and per-component
+    switches.
+
+    Enabling a plugin here registers its skills, its subagents, and the
+    MCP servers it declares — the whole unit the user installed, rather
+    than the one component of it Conductor used to load.
+
+    Example YAML::
+
+        runtime:
+            plugins:
+              - prs
+              - name: ado
+                mcp: false
+    """
+
+    @field_validator("plugins", mode="before")
+    @classmethod
+    def _coerce_plugins(cls, value: Any) -> Any:
+        """Expand ``- prs`` string shorthands into ``{name: prs}``."""
+        return _coerce_plugin_entries(value)
+
+    @field_validator("plugin_sources", mode="before")
+    @classmethod
+    def _coerce_plugin_sources(cls, value: Any) -> Any:
+        """Expand ``acme: owner/repo`` shorthands into ``{source: ...}``."""
+        return _coerce_plugin_sources(value)
+
+    @field_validator("plugin_sources")
+    @classmethod
+    def validate_plugin_sources(cls, v: dict[str, PluginSourceDef]) -> dict[str, PluginSourceDef]:
+        """Check each marketplace name is usable after an ``@``."""
+        return _validate_plugin_source_names(v)
+
+    @field_validator("plugins")
+    @classmethod
+    def validate_plugins(cls, v: list[PluginDef]) -> list[PluginDef]:
+        """Reject duplicate workflow-default ``plugins:`` entries."""
+        return _validate_plugin_entries(v)
 
     @field_validator("skills")
     @classmethod
     def validate_skills(cls, v: list[str]) -> list[str]:
-        """Ensure every workflow-default skill name resolves to a known built-in."""
-        from conductor.skills import SkillNotFoundError, get_skill_directory
-
-        for name in v:
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"skills entries must be non-empty strings, got {name!r}")
-            try:
-                get_skill_directory(name)
-            except SkillNotFoundError as exc:
-                raise ValueError(str(exc)) from exc
-        return v
+        """Validate workflow-default ``skills:`` entry shape and built-in names."""
+        return _validate_skill_entries(v)
 
 
 class WorkflowDef(BaseModel):
@@ -2758,4 +3746,32 @@ class WorkflowConfig(BaseModel):
                         f"routes to unknown target '{route.to}'"
                     )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_root_level_output_required(self) -> WorkflowConfig:
+        """Reject top-level optional output fields on agents and for-each agents.
+
+        Object properties may still be optional; the policy only applies to the
+        root output dict of an agent definition.
+        """
+        for agent in self.agents:
+            if agent.output:
+                for field_name, field in agent.output.items():
+                    if not field.required:
+                        raise ValueError(
+                            f"Agent '{agent.name}' output field '{field_name}': "
+                            "root-level output fields cannot be optional "
+                            "(required: false is only allowed inside object properties)"
+                        )
+        for for_each_group in self.for_each:
+            agent = for_each_group.agent
+            if agent.output:
+                for field_name, field in agent.output.items():
+                    if not field.required:
+                        raise ValueError(
+                            f"Agent '{agent.name}' output field '{field_name}': "
+                            "root-level output fields cannot be optional "
+                            "(required: false is only allowed inside object properties)"
+                        )
         return self

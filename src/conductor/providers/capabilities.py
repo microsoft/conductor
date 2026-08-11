@@ -20,6 +20,8 @@ imports of provider modules so callers don't need to instantiate providers
 
 from __future__ import annotations
 
+import inspect
+import logging
 from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -28,6 +30,8 @@ from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
     from conductor.providers.base import AgentProvider
+
+logger = logging.getLogger(__name__)
 
 
 # Stable / experimental are the only tiers for v1. Promotion criteria for
@@ -146,9 +150,12 @@ class ProviderCapabilities(BaseModel):
     :attr:`AgentProvider.supports_native_skills`:
 
     * ``supports_native_skills=True`` — resolved skill directories are
-      passed to the SDK on the ``skill_directories`` kwarg of
-      :meth:`AgentProvider.execute` and the SDK loads skill content
-      itself (progressive disclosure via ``SKILL.md`` frontmatter).
+      passed on the ``skill_directories`` kwarg of
+      :meth:`AgentProvider.execute` and the provider forwards them to
+      its SDK in whatever shape that SDK accepts (Copilot registers the
+      directories as-is; claude-agent-sdk maps them to plugin roots and
+      qualified skill names). The SDK then loads skill content itself
+      (progressive disclosure via ``SKILL.md`` frontmatter).
     * ``supports_native_skills=False`` — :class:`AgentExecutor` reads
       every enabled skill's ``SKILL.md`` plus ``references/*.md`` and
       eagerly prepends them to ``rendered_prompt`` inside
@@ -158,6 +165,29 @@ class ProviderCapabilities(BaseModel):
     against a provider with ``skills=False`` fail validation. Defaults
     to ``False`` so providers that have not been audited for skills
     surface the mismatch loudly."""
+
+    plugins: bool = False
+    """``True`` when the provider can load a whole plugin — its skills,
+    its ``agents/*.agent.md`` subagents, and the MCP servers it declares.
+
+    Conductor **deconstructs** a plugin rather than registering its root,
+    so this is not a single SDK surface: skills travel the
+    ``skill_directories`` path :attr:`skills` describes, MCP servers the
+    ``extra_mcp_servers`` kwarg, and subagents the ``custom_agents``
+    kwarg. A provider reaches ``plugins=True`` only when it honors all
+    three.
+
+    Unlike :attr:`skills`, there is no provider-agnostic fallback:
+    :class:`AgentExecutor` can inject a skill's text into a prompt, but
+    it cannot conjure a subagent the model can dispatch to or an MCP
+    server it can call. So a provider without a native subagent surface
+    declares ``False`` and workflows that name plugins against it fail
+    validation, rather than loading the one component that happens to
+    work — which is the partial-loading failure plugins exist to fix.
+
+    Workflows that declare ``runtime.plugins`` or per-agent ``plugins:``
+    against a provider with ``plugins=False`` fail validation. Defaults
+    to ``False``."""
 
     session_continuity: bool = False
     """``True`` when the provider honors an agent's ``session_key``, reusing
@@ -364,6 +394,108 @@ def known_provider_names() -> tuple[str, ...]:
     return tuple(_PROVIDER_CLASS_PATHS) + tuple(_NOT_YET_IMPLEMENTED_PROVIDERS)
 
 
+def _resolve_static_flag(provider_type: str, attribute: str) -> bool | None:
+    """Read a boolean provider property without constructing the provider.
+
+    Shared by :func:`uses_native_skills` and :func:`uses_native_plugins`.
+    Providers declare these as instance ``property`` objects, so this
+    reads the descriptor off the class and evaluates its getter with no
+    instance.
+
+    Returns:
+        The declared boolean, or ``None`` when it cannot be determined —
+        the property consults instance state, the provider is unknown or
+        not yet implemented, or the declaration cannot be read without
+        side effects. Callers should skip mechanism-specific static
+        checks on ``None`` rather than assume either branch.
+    """
+    if provider_type in _NOT_YET_IMPLEMENTED_PROVIDERS:
+        return None
+    dotted_path = _PROVIDER_CLASS_PATHS.get(provider_type)
+    if dotted_path is None:
+        return None
+
+    module_path, _, class_name = dotted_path.partition(":")
+    import importlib
+
+    try:
+        provider_cls = getattr(importlib.import_module(module_path), class_name)
+    except (ImportError, AttributeError):
+        return None
+
+    declared = inspect.getattr_static(provider_cls, attribute, None)
+    if isinstance(declared, bool):
+        return declared
+    if isinstance(declared, property) and declared.fget is not None:
+        try:
+            return bool(declared.fget(None))
+        except (AttributeError, TypeError):
+            # The property dereferences ``self``, so the only honest answer is
+            # "ask a real instance". Split from the broader handler below so
+            # this expected case stays silent while a genuine bug inside the
+            # property is still logged rather than vanishing into "undetermined".
+            return None
+        except Exception:
+            logger.warning(
+                "Provider %r raised while resolving %s statically; treating the "
+                "mechanism as undetermined.",
+                provider_type,
+                attribute,
+                exc_info=True,
+            )
+            return None
+    return None
+
+
+def uses_native_skills(provider_type: str) -> bool | None:
+    """Whether a provider loads skills natively, resolved without instantiating.
+
+    Mirrors :func:`get_capabilities`' lazy-import approach so it is safe to
+    call from ``conductor validate``.
+
+    Args:
+        provider_type: Provider name as it appears in workflow YAML.
+
+    Returns:
+        ``True`` when the provider forwards skill directories to its SDK,
+        ``False`` when :class:`~conductor.executor.agent.AgentExecutor`
+        eagerly injects skill content instead, or ``None`` when the answer
+        cannot be determined without constructing the provider.
+    """
+    return _resolve_static_flag(provider_type, "supports_native_skills")
+
+
+def uses_native_plugins(provider_type: str) -> bool | None:
+    """Whether a provider can register a plugin's subagents.
+
+    Args:
+        provider_type: Provider name as it appears in workflow YAML.
+
+    Returns:
+        ``True`` when the provider honors the ``custom_agents`` kwarg of
+        :meth:`~conductor.providers.base.AgentProvider.execute`, ``False``
+        when it has no subagent surface, or ``None`` when the answer
+        cannot be determined without constructing the provider.
+    """
+    return _resolve_static_flag(provider_type, "supports_native_plugins")
+
+
+def requires_plugin_root_for_skills(provider_type: str) -> bool | None:
+    """Whether reaching a skill means registering its whole plugin root.
+
+    Args:
+        provider_type: Provider name as it appears in workflow YAML.
+
+    Returns:
+        ``True`` when the provider has no bare skill-directory surface —
+        so enabling a plugin's skills also contributes its subagents and
+        exposes its hooks — ``False`` when each component is registered
+        independently, or ``None`` when the answer cannot be determined
+        without constructing the provider.
+    """
+    return _resolve_static_flag(provider_type, "skills_require_plugin_root")
+
+
 __all__ = [
     "ProviderCapabilities",
     "ProviderTier",
@@ -371,4 +503,7 @@ __all__ = [
     "StructuredOutputMode",
     "get_capabilities",
     "known_provider_names",
+    "requires_plugin_root_for_skills",
+    "uses_native_plugins",
+    "uses_native_skills",
 ]

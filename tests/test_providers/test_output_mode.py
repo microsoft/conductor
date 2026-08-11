@@ -8,12 +8,16 @@ Tests cover:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
 from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError
+from conductor.providers._pydantic_ai.agent_builder import build_agent
+from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider, RetryConfig
 
 # ── Copilot provider tests ──────────────────────────────────────────────
@@ -214,6 +218,8 @@ class TestCopilotParseExhaustionNotRetryable:
             event_callback: Any = None,
             retry_config: Any = None,
             skill_directories: Any = None,
+            custom_agents: Any = None,
+            extra_mcp_servers: Any = None,
         ) -> Any:
             nonlocal call_count
             call_count += 1
@@ -238,167 +244,68 @@ class TestCopilotParseExhaustionNotRetryable:
 # ── Claude provider tests ───────────────────────────────────────────────
 
 
-def _create_text_block(text: str) -> Mock:
-    block = Mock()
-    block.type = "text"
-    block.text = text
-    return block
+def _build_text_agent(text: str) -> Agent[Any, str]:
+    """Build a Pydantic AI text agent backed by TestModel."""
+    return Agent(model=TestModel(custom_output_text=text), output_type=str)
 
 
-def _create_tool_use_block(input_dict: dict) -> Mock:
-    block = Mock()
-    block.type = "tool_use"
-    block.id = "tool_123"
-    block.name = "emit_output"
-    block.input = input_dict
-    return block
+@pytest.fixture(autouse=True)
+def _ensure_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide a dummy API key so ClaudeProvider construction succeeds."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
 
-def _create_response(content_blocks: list, msg_id: str = "msg_1") -> Mock:
-    response = Mock()
-    response.id = msg_id
-    response.content = content_blocks
-    response.model = "claude-3-5-sonnet-latest"
-    response.stop_reason = "end_turn"
-    response.usage = Mock(
-        input_tokens=10,
-        output_tokens=20,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-    )
-    response.type = "message"
-    response.role = "assistant"
-    return response
+@pytest.fixture
+def claude_provider() -> ClaudeProvider:
+    """Return a fresh ClaudeProvider instance using a dummy API key."""
+    return ClaudeProvider(api_key="test-key")
 
 
-@patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-@patch("conductor.providers.claude.AsyncAnthropic")
-@patch("conductor.providers.claude.anthropic")
 class TestClaudeOutputModeRaw:
     """output_mode=raw with the Claude provider."""
 
     @pytest.mark.asyncio
     async def test_raw_agent_wraps_response_as_result(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+        self, claude_provider: ClaudeProvider
     ) -> None:
         """output_mode=raw agent returns text wrapped in {"result": ...}."""
-        mock_anthropic_module.__version__ = "0.77.0"
-
-        text_response = _create_response([_create_text_block("raw output")])
-        mock_client = Mock()
-        mock_client.messages = Mock()
-        mock_client.messages.create = AsyncMock(return_value=text_response)
-        mock_anthropic_class.return_value = mock_client
-
-        from conductor.providers.claude import ClaudeProvider
-
-        provider = ClaudeProvider(api_key="test-key")
-        agent = AgentDef(name="a", prompt="p", model="claude-3-5-sonnet-latest", output_mode="raw")
-        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+        agent = AgentDef(
+            name="a",
+            prompt="p",
+            model="claude-3-5-sonnet-latest",
+            output_mode="raw",
+        )
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_text_agent("raw output"),
+        ):
+            result = await claude_provider.execute(agent=agent, context={}, rendered_prompt="p")
 
         # Raw mode wraps text response as {"result": "..."} — matches Copilot parity
         assert result.content == {"result": "raw output"}
 
-    @pytest.mark.asyncio
-    async def test_raw_agent_no_emit_output_tool_injected(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """output_mode=raw must not inject the emit_output tool."""
-        mock_anthropic_module.__version__ = "0.77.0"
 
-        text_response = _create_response([_create_text_block("raw output")])
-        mock_client = Mock()
-        mock_client.messages = Mock()
-        mock_client.messages.create = AsyncMock(return_value=text_response)
-        mock_anthropic_class.return_value = mock_client
-
-        from conductor.providers.claude import ClaudeProvider
-
-        provider = ClaudeProvider(api_key="test-key")
-        agent = AgentDef(name="a", prompt="p", model="claude-3-5-sonnet-latest", output_mode="raw")
-        await provider.execute(agent=agent, context={}, rendered_prompt="p")
-
-        # Verify no emit_output tool in the API call
-        call_kwargs = mock_client.messages.create.call_args
-        tools_arg = call_kwargs.kwargs.get("tools") if call_kwargs.kwargs else None
-        # When output_mode=raw, no tools should be injected (unless MCP tools exist)
-        assert tools_arg is None or not any(
-            t.get("name") == "emit_output" for t in (tools_arg or [])
-        )
+def test_no_final_result_tool_in_raw_agent() -> None:
+    """output_mode=raw must not register the structured-output 'final_result' tool."""
+    agent = AgentDef(
+        name="a",
+        prompt="p",
+        model="claude-3-5-sonnet-latest",
+        output_mode="raw",
+    )
+    built = build_agent(
+        agent=agent,
+        system_prompt="",
+        rendered_prompt="p",
+        api_key="test-key",
+    )
+    toolset = built._output_schema.toolset
+    tool_names = {t.name for t in toolset._tool_defs} if toolset is not None else set()
+    assert "final_result" not in tool_names
 
 
-@patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
-@patch("conductor.providers.claude.AsyncAnthropic")
-@patch("conductor.providers.claude.anthropic")
-class TestClaudeParseExhaustionNotRetryable:
-    """Parse-exhaustion errors in Claude must be is_retryable=False."""
-
-    @pytest.mark.asyncio
-    async def test_parse_exhaustion_is_not_retryable(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """After Claude parse recovery exhausts, ProviderError has is_retryable=False."""
-        mock_anthropic_module.__version__ = "0.77.0"
-
-        # Every response is text-only (no emit_output tool use) → triggers recovery
-        bad_response = _create_response([_create_text_block("I cannot format this as JSON")])
-        mock_client = Mock()
-        mock_client.messages = Mock()
-        mock_client.messages.create = AsyncMock(return_value=bad_response)
-        mock_anthropic_class.return_value = mock_client
-
-        from conductor.providers.claude import ClaudeProvider
-        from conductor.providers.claude import RetryConfig as ClaudeRetryConfig
-
-        provider = ClaudeProvider(
-            api_key="test-key",
-            retry_config=ClaudeRetryConfig(max_attempts=1, max_parse_recovery_attempts=1),
-        )
-        agent = AgentDef(
-            name="a",
-            prompt="p",
-            model="claude-3-5-sonnet-latest",
-            output={"field": OutputField(type="string")},
-        )
-
-        with pytest.raises(ProviderError) as exc_info:
-            await provider.execute(agent=agent, context={}, rendered_prompt="p")
-
-        assert exc_info.value.is_retryable is False
-        # The parse-exhaustion error is wrapped by the outer retry handler;
-        # the output_mode hint appears in the wrapped message string.
-        assert "output_mode: raw" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_no_outer_retry_on_parse_exhaustion(
-        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
-    ) -> None:
-        """Verify parse-exhaustion does not trigger outer retry in Claude."""
-        mock_anthropic_module.__version__ = "0.77.0"
-
-        bad_response = _create_response([_create_text_block("I cannot format this as JSON")])
-        mock_client = Mock()
-        mock_client.messages = Mock()
-        mock_client.messages.create = AsyncMock(return_value=bad_response)
-        mock_anthropic_class.return_value = mock_client
-
-        from conductor.providers.claude import ClaudeProvider
-        from conductor.providers.claude import RetryConfig as ClaudeRetryConfig
-
-        provider = ClaudeProvider(
-            api_key="test-key",
-            retry_config=ClaudeRetryConfig(max_attempts=3, max_parse_recovery_attempts=0),
-        )
-        agent = AgentDef(
-            name="a",
-            prompt="p",
-            model="claude-3-5-sonnet-latest",
-            output={"field": OutputField(type="string")},
-        )
-
-        with pytest.raises(ProviderError) as exc_info:
-            await provider.execute(agent=agent, context={}, rendered_prompt="p")
-
-        assert exc_info.value.is_retryable is False
-        # With is_retryable=False, the outer retry loop should only call once
-        assert mock_client.messages.create.call_count == 1
+# Removed: TestClaudeParseExhaustionNotRetryable class.
+# The obsolete multi-turn JSON parse recovery loop was deleted by design; Pydantic
+# AI structured outputs natively steer the model using the output schema. Any
+# remaining parse-exhaustion behavior is covered by the new structured output path
+# in tests/test_providers/test_pydantic_ai_structured_output.py.

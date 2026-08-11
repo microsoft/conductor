@@ -1538,7 +1538,7 @@ class TestWorkflowEngineHumanGates:
 
         from unittest.mock import patch
 
-        with patch.object(engine.gate_handler, "handle_gate", side_effect=_never_returns):
+        with patch.object(engine.gate_handler, "prompt", side_effect=_never_returns):
             await engine.run({})
 
         gate_output = captured_context.get("approval_gate", {})  # type: ignore[assignment]
@@ -1658,11 +1658,11 @@ class TestWorkflowEngineHumanGates:
             run_context=RunContext(bg_mode=True),
         )
 
-        with patch.object(engine.gate_handler, "handle_gate") as mock_cli_handle:
+        with patch.object(engine.gate_handler, "prompt") as mock_cli_handle:
             result = await engine.run({})
 
         assert result["received"] == "ok"
-        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate", None)
         mock_cli_handle.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1727,13 +1727,13 @@ class TestWorkflowEngineHumanGates:
         with (
             patch("sys.stdin.isatty", return_value=True),
             patch.object(
-                engine.gate_handler, "handle_gate", side_effect=_never_returns
+                engine.gate_handler, "prompt", side_effect=_never_returns
             ) as mock_cli_handle,
         ):
             result = await engine.run({})
 
         assert result["received"] == "ok"
-        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate")
+        mock_dashboard.wait_for_gate_response.assert_awaited_once_with("approval_gate", None)
         # Prove the CLI arm was actually started (not just that the web
         # dashboard eventually won) — this is what distinguishes "raced" from
         # "took the web-only shortcut," which would also produce this result.
@@ -1784,7 +1784,7 @@ class TestWorkflowEngineHumanGates:
         )
 
         with (
-            patch.object(engine.gate_handler, "handle_gate") as mock_cli_handle,
+            patch.object(engine.gate_handler, "prompt") as mock_cli_handle,
             pytest.raises(HumanGateError, match="approval_gate"),
         ):
             await engine.run({})
@@ -2818,6 +2818,8 @@ class _RecordingReasoningProvider:
         interrupt_signal=None,
         event_callback=None,
         skill_directories=None,
+        custom_agents=None,
+        extra_mcp_servers=None,
     ):
         from conductor.providers.base import AgentOutput
         from conductor.providers.reasoning import resolve_reasoning_effort
@@ -3826,6 +3828,8 @@ class _RecordingWorkingDirProvider:
         interrupt_signal=None,
         event_callback=None,
         skill_directories=None,
+        custom_agents=None,
+        extra_mcp_servers=None,
     ):
         self.calls += 1
         self.seen.append((agent.name, agent.working_dir))

@@ -92,6 +92,7 @@ def _gate_respond_impl(
     resolved_token = token or os.environ.get("CONDUCTOR_GATE_TOKEN")
 
     # Auto-discover agent name if not provided
+    prompt_id: str | None = None
     if agent is None:
         try:
             resp = httpx.get(f"{base_url}/api/gate-status", timeout=5)
@@ -101,6 +102,11 @@ def _gate_respond_impl(
                 console.print(f"[yellow]No gate is currently waiting on port {port}.[/yellow]")
                 raise typer.Exit(code=1)
             agent = status["agent_name"]
+            # Echo the staleness token back. A questions node presents every
+            # question under one name, so between this GET and the POST below
+            # the node can advance — without the token the answer would land
+            # on whichever question is open by then.
+            prompt_id = status.get("prompt_id")
         except httpx.ConnectError:
             console.print(
                 f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
@@ -116,7 +122,11 @@ def _gate_respond_impl(
         "agent_name": agent,
         "selected_value": choice,
     }
+    if prompt_id is not None:
+        body["prompt_id"] = prompt_id
     if input_text is not None:
+        # Must be a mapping: the engine discards a bare string. The server
+        # resolves the field name from the selected choice's `prompt_for`.
         body["additional_input"] = input_text
 
     # Send the token in the Authorization header (not the body) so it is not

@@ -477,3 +477,518 @@ describe('workflow-store processEvent — system log metadata capture (#330)', (
     expect(state.bgStdoutLog).toBe('/tmp/conductor/conductor-root-123.bg.stdout.log');
   });
 });
+
+describe('workflow-store — eager static sub-workflow preview (dashboard expandability)', () => {
+  it('seeds a pending child context from static `subworkflow` topology on workflow_started', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        { name: 'planner' },
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'planner',
+    }));
+
+    const state = useWorkflowStore.getState();
+    expect(state.subworkflowContexts).toHaveLength(1);
+    const child = state.subworkflowContexts[0]!;
+    expect(child.slotKey).toBe('sub_wf');
+    expect(child.status).toBe('pending');
+    expect(child.workflowName).toBe('child-workflow');
+    expect(child.agents.map((a) => a.name)).toEqual(['step_one']);
+  });
+
+  it('recurses into nested `type: workflow` agents when seeding static previews', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'mid',
+            agents: [
+              {
+                name: 'mid',
+                type: 'workflow',
+                subworkflow: {
+                  name: 'grandchild-workflow',
+                  entry_point: 'leaf',
+                  agents: [{ name: 'leaf' }],
+                  routes: [],
+                  parallel_groups: [],
+                  for_each_groups: [],
+                },
+              },
+            ],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    const child = useWorkflowStore.getState().subworkflowContexts[0]!;
+    expect(child.children).toHaveLength(1);
+    const grandchild = child.children[0]!;
+    expect(grandchild.slotKey).toBe('mid');
+    expect(grandchild.workflowName).toBe('grandchild-workflow');
+    expect(grandchild.agents.map((a) => a.name)).toEqual(['leaf']);
+  });
+
+  it('does not seed a preview when the sub-workflow could not be resolved statically', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'sub_wf', type: 'workflow', subworkflow: null }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    expect(useWorkflowStore.getState().subworkflowContexts).toHaveLength(0);
+  });
+
+  it('reuses the static placeholder (instead of pushing a duplicate) once subworkflow_started fires', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    expect(useWorkflowStore.getState().subworkflowContexts).toHaveLength(1);
+
+    processEvent(event('subworkflow_started', {
+      agent_name: 'sub_wf',
+      workflow: 'child.yaml',
+      iteration: 1,
+    }));
+
+    const state = useWorkflowStore.getState();
+    // Still exactly one child — the placeholder was reused, not duplicated.
+    expect(state.subworkflowContexts).toHaveLength(1);
+    expect(state.activeContextPath).toEqual([0]);
+
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+
+    const afterChildStart = useWorkflowStore.getState();
+    expect(afterChildStart.subworkflowContexts).toHaveLength(1);
+    expect(afterChildStart.subworkflowContexts[0]!.status).toBe('running');
+  });
+
+  it('pushes a new context (not the completed one) on a genuine loop-back re-invocation', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [{ from: 'sub_wf', to: 'sub_wf' }],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    // First invocation: reuses the static placeholder (as verified above).
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+    processEvent(event('workflow_completed', { output: {}, subworkflow_path: ['sub_wf'] }));
+    processEvent(event('subworkflow_completed', { agent_name: 'sub_wf', elapsed: 1.0, parent_path: [] }));
+
+    const afterFirstRun = useWorkflowStore.getState();
+    expect(afterFirstRun.subworkflowContexts).toHaveLength(1);
+    expect(afterFirstRun.subworkflowContexts[0]!.status).toBe('completed');
+
+    // A loop-back routes back into `sub_wf` a second time — this must push
+    // a brand-new context (preserving iteration history), not reuse/clobber
+    // the now-completed one from the first pass.
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 2, parent_path: [] }));
+
+    const afterSecondStart = useWorkflowStore.getState();
+    expect(afterSecondStart.subworkflowContexts).toHaveLength(2);
+    expect(afterSecondStart.subworkflowContexts[0]!.status).toBe('completed');
+    expect(afterSecondStart.subworkflowContexts[1]!.slotKey).toBe('sub_wf');
+    expect(afterSecondStart.subworkflowContexts[1]!.status).toBe('pending');
+  });
+
+  it('seeds a nested static preview for a `type: workflow` agent that belongs to a parallel group', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'fan_out',
+            agents: [
+              { name: 'a' },
+              {
+                name: 'b',
+                type: 'workflow',
+                subworkflow: {
+                  name: 'grandchild-workflow',
+                  entry_point: 'leaf',
+                  agents: [{ name: 'leaf' }],
+                  routes: [],
+                  parallel_groups: [],
+                  for_each_groups: [],
+                },
+              },
+            ],
+            routes: [],
+            parallel_groups: [{ name: 'fan_out', agents: ['a', 'b'] }],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    const child = useWorkflowStore.getState().subworkflowContexts[0]!;
+    // `b` is a parallel-group member AND a `type: workflow` agent with its
+    // own eagerly-resolved topology — it must still get a nested preview.
+    expect(child.children).toHaveLength(1);
+    expect(child.children[0]!.slotKey).toBe('b');
+    expect(child.children[0]!.workflowName).toBe('grandchild-workflow');
+  });
+});
+
+describe('workflow-store — navigating to a specific historical subworkflow iteration (#365)', () => {
+  function startRootWithLoopBackSubworkflow() {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'step_one',
+            agents: [{ name: 'step_one' }],
+            routes: [],
+            parallel_groups: [],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [{ from: 'sub_wf', to: 'sub_wf' }],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+    return processEvent;
+  }
+
+  it('resolves distinct iteration data when navigating by index instead of by slotKey', () => {
+    const processEvent = startRootWithLoopBackSubworkflow();
+
+    // Iteration 1: one agent (`step_one`), then completes.
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+    processEvent(event('workflow_completed', { output: {}, subworkflow_path: ['sub_wf'] }));
+    processEvent(event('subworkflow_completed', { agent_name: 'sub_wf', elapsed: 1.0, parent_path: [] }));
+
+    // Iteration 2 (loop-back re-invocation): a *different* inner agent
+    // (`step_two`), so the two iterations are distinguishable by content.
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 2, parent_path: [] }));
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_two' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_two',
+    }));
+
+    const { subworkflowContexts, navigateToContext, getViewedContext } = useWorkflowStore.getState();
+    expect(subworkflowContexts).toHaveLength(2);
+    expect(subworkflowContexts[0]!.status).toBe('completed');
+    expect(subworkflowContexts[1]!.status).toBe('running');
+    // Both siblings share the same slotKey — this is exactly the ambiguity
+    // that `navigateIntoSubworkflow(slotKey)` cannot resolve.
+    expect(subworkflowContexts[0]!.slotKey).toBe('sub_wf');
+    expect(subworkflowContexts[1]!.slotKey).toBe('sub_wf');
+
+    // Navigating by explicit index reaches iteration 1 (the older, completed
+    // run), not whichever sibling is newest.
+    navigateToContext([0]);
+    const iter1View = useWorkflowStore.getState().getViewedContext();
+    expect(iter1View.agents.map((a) => a.name)).toEqual(['step_one']);
+    expect(iter1View.subworkflowContexts).toBe(subworkflowContexts[0]!.children);
+
+    // Navigating to index 1 reaches iteration 2's distinct content.
+    navigateToContext([1]);
+    const iter2View = useWorkflowStore.getState().getViewedContext();
+    expect(iter2View.agents.map((a) => a.name)).toEqual(['step_two']);
+
+    // Re-confirm index 0 is still reachable and unaffected by having viewed
+    // index 1 in between (no accidental "always latest" collapsing).
+    navigateToContext([0]);
+    expect(getViewedContext().agents.map((a) => a.name)).toEqual(['step_one']);
+  });
+
+  it('falls back to the root view for an out-of-range context index (stale click target)', () => {
+    const processEvent = startRootWithLoopBackSubworkflow();
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+
+    const { navigateToContext, getViewedContext } = useWorkflowStore.getState();
+    // Only one sibling exists (index 0) — index 5 doesn't resolve to
+    // anything, e.g. if the clicked row's context was pruned/replaced
+    // between render and click.
+    navigateToContext([5]);
+    const view = getViewedContext();
+    expect(view.workflowName).toBe(useWorkflowStore.getState().workflowName);
+    expect(view.agents).toEqual(useWorkflowStore.getState().agents);
+  });
+
+  it('labels breadcrumbs with the iteration number only once a slotKey repeats across siblings', () => {
+    const processEvent = startRootWithLoopBackSubworkflow();
+
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+
+    // A single invocation so far — no disambiguation needed yet.
+    useWorkflowStore.getState().navigateToContext([0]);
+    const singleRunCrumbs = useWorkflowStore.getState().getBreadcrumbs();
+    expect(singleRunCrumbs[singleRunCrumbs.length - 1]!.label).toBe('sub_wf');
+
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [{ name: 'step_one' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'step_one',
+    }));
+    processEvent(event('workflow_completed', { output: {}, subworkflow_path: ['sub_wf'] }));
+    processEvent(event('subworkflow_completed', { agent_name: 'sub_wf', elapsed: 1.0, parent_path: [] }));
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 2, parent_path: [] }));
+
+    // Two siblings now share the slotKey `sub_wf` — breadcrumbs for each
+    // must disambiguate by iteration number.
+    useWorkflowStore.getState().navigateToContext([0]);
+    const iter1Crumbs = useWorkflowStore.getState().getBreadcrumbs();
+    expect(iter1Crumbs[iter1Crumbs.length - 1]!.label).toBe('sub_wf (iteration 1)');
+
+    useWorkflowStore.getState().navigateToContext([1]);
+    const iter2Crumbs = useWorkflowStore.getState().getBreadcrumbs();
+    expect(iter2Crumbs[iter2Crumbs.length - 1]!.label).toBe('sub_wf (iteration 2)');
+  });
+});
+
+/**
+ * The store-side half of the resumed-workflow-looks-stopped bug: `isPaused`,
+ * `iterationLimitGate` and `activeDialog` are *global* "the engine is blocked
+ * waiting on you" flags cleared only by their counterpart event — plus, for
+ * `isPaused` / `iterationLimitGate` only, a root `workflow_completed` /
+ * `workflow_failed`. (Nothing clears `activeDialog` on a root terminal.)
+ *
+ * That makes them unrecoverable from a replayed history — on resume the CLI
+ * seeds the dashboard from the original run's JSONL, and the root terminal
+ * events are deliberately filtered out (they would make the run look finished
+ * before it starts). So a run killed while paused would latch `isPaused` on
+ * for the whole resumed run, hiding the Stop button behind a Resume/Kill pair
+ * that drives the live resumed engine.
+ *
+ * The fix lives server-side in `WebDashboard._REPLAY_INTERACTIVE_SKIP_TYPES`.
+ * These tests pin the store behaviour that filter depends on: if a latch ever
+ * becomes self-healing, the corresponding entry can be dropped — and if a new
+ * global latch is added, it needs a new entry.
+ *
+ * They drive `replayState` rather than `processEvent` because `replayState` is
+ * what consumes GET /api/state (`hooks/use-websocket.ts`), and GET /api/state
+ * is exactly what the resume path seeds. Driving the real entry point is what
+ * makes these fail if a client-side clamp ever makes the server filter moot.
+ */
+function rootStartedEvent() {
+  return event('workflow_started', {
+    name: 'root',
+    agents: [{ name: 'architect_questions' }],
+    routes: [],
+    parallel_groups: [],
+    for_each_groups: [],
+    entry_point: 'architect_questions',
+  });
+}
+describe('workflow-store — a replayed history latches the global interaction flags', () => {
+  it('leaves isPaused latched when a seeded history ends on an unresolved agent_paused', () => {
+    useWorkflowStore.getState().replayState([
+      rootStartedEvent(),
+      event('agent_started', { agent_name: 'architect_questions', iteration: 1 }),
+      event('agent_paused', { agent_name: 'architect_questions', partial_content: '{}' }),
+      // The resumed run re-executes the agent — which must not be mistaken
+      // for a mechanism that unsticks the header.
+      event('agent_started', { agent_name: 'architect_questions', iteration: 2 }),
+      event('agent_completed', { agent_name: 'architect_questions', iteration: 2 }),
+    ]);
+    expect(useWorkflowStore.getState().isPaused).toBe(true);
+  });
+
+  it('leaves iterationLimitGate latched when a seeded history ends on an unresolved gate', () => {
+    useWorkflowStore.getState().replayState([
+      rootStartedEvent(),
+      event('iteration_limit_reached', {
+        agent_name: 'architect_questions',
+        gate_id: 'g1',
+        current_iteration: 10,
+        max_iterations: 10,
+        skip_gates: false,
+      }),
+      event('agent_started', { agent_name: 'architect_questions', iteration: 11 }),
+    ]);
+    expect(useWorkflowStore.getState().iterationLimitGate).not.toBeNull();
+  });
+
+  it('leaves activeDialog latched when a seeded history ends on an unclosed dialog', () => {
+    useWorkflowStore.getState().replayState([
+      rootStartedEvent(),
+      event('dialog_started', { agent_name: 'architect_questions', dialog_id: 'd1' }),
+      event('agent_started', { agent_name: 'architect_questions', iteration: 2 }),
+    ]);
+    expect(useWorkflowStore.getState().activeDialog).not.toBeNull();
+  });
+});
+
+describe('workflow-store — a counterpart event clears its latch', () => {
+  function startWorkflow() {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(rootStartedEvent());
+    return processEvent;
+  }
+
+  it('leaves isPaused set after agent_paused, and a later agent_started does not clear it', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 1 }));
+    processEvent(event('agent_paused', { agent_name: 'architect_questions', partial_content: '{}' }));
+    expect(useWorkflowStore.getState().isPaused).toBe(true);
+
+    // The resumed run re-executes the agent — which must not be mistaken for
+    // a mechanism that unsticks the header.
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 2 }));
+    processEvent(event('agent_completed', { agent_name: 'architect_questions', iteration: 2 }));
+    expect(useWorkflowStore.getState().isPaused).toBe(true);
+
+    processEvent(event('agent_resumed', { agent_name: 'architect_questions' }));
+    expect(useWorkflowStore.getState().isPaused).toBe(false);
+  });
+
+  it('leaves iterationLimitGate set after iteration_limit_reached until it is explicitly resolved', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('iteration_limit_reached', {
+      agent_name: 'architect_questions',
+      gate_id: 'g1',
+      current_iteration: 10,
+      max_iterations: 10,
+      skip_gates: false,
+    }));
+    expect(useWorkflowStore.getState().iterationLimitGate).not.toBeNull();
+
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 11 }));
+    expect(useWorkflowStore.getState().iterationLimitGate).not.toBeNull();
+
+    processEvent(event('iteration_limit_resolved', {
+      agent_name: 'architect_questions',
+      continue_execution: true,
+      additional_iterations: 5,
+    }));
+    expect(useWorkflowStore.getState().iterationLimitGate).toBeNull();
+  });
+
+  it('leaves activeDialog set after dialog_started until the dialog completes', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('dialog_started', { agent_name: 'architect_questions', dialog_id: 'd1' }));
+    expect(useWorkflowStore.getState().activeDialog).not.toBeNull();
+
+    processEvent(event('agent_started', { agent_name: 'architect_questions', iteration: 2 }));
+    expect(useWorkflowStore.getState().activeDialog).not.toBeNull();
+
+    processEvent(event('dialog_completed', { agent_name: 'architect_questions', dialog_id: 'd1' }));
+    expect(useWorkflowStore.getState().activeDialog).toBeNull();
+  });
+});

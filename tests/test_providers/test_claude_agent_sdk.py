@@ -11,6 +11,7 @@ import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -35,6 +36,7 @@ from conductor.exceptions import ProviderError  # noqa: E402
 from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
     _remove_mcp_config,
+    _resolve_skill_plugins,
     _translate_mcp_servers,
     _write_mcp_config,
 )
@@ -2301,3 +2303,213 @@ class TestWorkingDirectory:
         exc = CLIConnectionError("subprocess died unexpectedly")
         assert "firewall" in _classify_error_suggestion(exc)
         assert _is_retryable_exception(exc) is True
+
+
+class TestSkillsWiring:
+    """Skills reach the SDK natively, and ambient skills never do.
+
+    The provider's contract is ultimately the ``claude`` CLI command line,
+    so these assert the argv the SDK builds from our options rather than
+    stopping at the options object.
+    """
+
+    @staticmethod
+    async def _capture_options(
+        agent: AgentDef,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        tools: list[str] | None = None,
+    ):
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["options"] = kwargs["options"]
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=tools,
+                skill_directories=skill_directories,
+            )
+        return captured["options"]
+
+    @staticmethod
+    def _argv(options) -> list[str]:
+        """Build the real CLI command the SDK would spawn for these options."""
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        transport = SubprocessCLITransport(prompt="hi", options=options)
+        transport._cli_path = "/usr/bin/claude"
+        return transport._build_command()
+
+    @staticmethod
+    def _skill_dirs() -> list[str]:
+        from conductor.skills import resolve_skills
+
+        return [str(item.directory) for item in resolve_skills(["conductor"])]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_skill_is_enabled_via_plugin(self) -> None:
+        skill_dir = Path(self._skill_dirs()[0])
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), skill_directories=[str(skill_dir)]
+        )
+
+        assert options.skills == ["conductor:conductor"]
+        assert options.plugins == [{"type": "local", "path": str(skill_dir.parents[1])}]
+
+        argv = self._argv(options)
+        assert "--plugin-dir" in argv
+        assert argv[argv.index("--plugin-dir") + 1] == str(skill_dir.parents[1])
+        assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_skills_suppresses_ambient_discovery(self) -> None:
+        """``skills=[]`` is not ``skills=None``: None would let CLI defaults win."""
+        options = await self._capture_options(AgentDef(name="t", prompt="hi"))
+
+        assert options.skills == []
+        assert options.plugins == []
+
+        argv = self._argv(options)
+        assert "--plugin-dir" not in argv
+        assert "--allowedTools" not in argv
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("skills", [None, "declared"])
+    async def test_setting_sources_isolated_unconditionally(self, skills: str | None) -> None:
+        """No ambient skills, CLAUDE.md, settings.json, or hooks — ever."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"),
+            skill_directories=self._skill_dirs() if skills else None,
+        )
+
+        assert options.setting_sources == []
+        # The SDK only defaults setting_sources to ["user", "project"] when
+        # it is None, so an explicit [] has to survive into the argv.
+        assert "--setting-sources=" in self._argv(options)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_explicit_no_tools_still_grants_skill_tool(self) -> None:
+        """``tools: []`` + skills must not leave the skill unreachable."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", tools=[]),
+            skill_directories=self._skill_dirs(),
+            tools=[],
+        )
+
+        assert options.tools == ["Skill"]
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == "Skill"
+        # With no permission bypass, the SDK's allowed_tools injection is the
+        # only thing permitting the tool -- assert it here, not just on the
+        # preset path where bypassPermissions would mask its absence.
+        assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
+        assert options.permission_mode is None
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_explicit_no_tools_without_skills_stays_empty(self) -> None:
+        options = await self._capture_options(AgentDef(name="t", prompt="hi", tools=[]), tools=[])
+
+        assert options.tools == []
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == ""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_tools_keeps_preset_with_skills(self) -> None:
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), skill_directories=self._skill_dirs()
+        )
+
+        assert options.tools == {"type": "preset", "preset": "claude_code"}
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == "default"
+
+    @staticmethod
+    def _make_plugin(root: Path, plugin_name: str, *skills: str) -> Path:
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text(f'{{"name": "{plugin_name}"}}')
+        for skill in skills:
+            (root / "skills" / skill).mkdir(parents=True)
+            (root / "skills" / skill / "SKILL.md").write_text(
+                # ``description`` is required frontmatter; without it the
+                # manifest parser rejects the skill before plugin resolution.
+                f"---\nname: {skill}\ndescription: A test skill.\n---\n"
+            )
+        return root
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_skill_outside_a_plugin_is_refused(self, tmp_path: Path) -> None:
+        orphan = tmp_path / "skills" / "lonely"
+        orphan.mkdir(parents=True)
+        (orphan / "SKILL.md").write_text("---\nname: lonely\ndescription: A test skill.\n---\n")
+
+        with pytest.raises(ProviderError, match="not part of a Claude Code plugin"):
+            await self._capture_options(
+                AgentDef(name="t", prompt="hi"), skill_directories=[str(orphan)]
+            )
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_broken_plugin_manifest_is_refused_with_its_reason(self, tmp_path: Path) -> None:
+        """A present-but-broken manifest must not be reported as an absent one."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text("{not json")
+        skill = root / "skills" / "s"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: s\n---\n")
+
+        with pytest.raises(ProviderError, match="cannot be loaded") as exc:
+            await self._capture_options(
+                AgentDef(name="t", prompt="hi"), skill_directories=[str(skill)]
+            )
+        assert "could not be read" in str(exc.value)
+        assert exc.value.is_retryable is False
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_missing_plugin_error_is_not_retryable(self, tmp_path: Path) -> None:
+        """A path containing 'connection' must not trip the retryability
+        heuristic, which sniffs the message text."""
+        orphan = tmp_path / "connection-hub" / "skills" / "lonely"
+        orphan.mkdir(parents=True)
+        (orphan / "SKILL.md").write_text("---\nname: lonely\ndescription: A test skill.\n---\n")
+
+        with pytest.raises(ProviderError) as exc:
+            await self._capture_options(
+                AgentDef(name="t", prompt="hi"), skill_directories=[str(orphan)]
+            )
+        assert exc.value.is_retryable is False
+
+    def test_two_skills_from_one_plugin_register_it_once(self, tmp_path: Path) -> None:
+        """Roots dedupe, names do not -- dropping a name would under-serve the
+        workflow."""
+        root = self._make_plugin(tmp_path / "plug", "p", "alpha", "beta")
+        names, plugins = _resolve_skill_plugins(
+            [str(root / "skills" / "alpha"), str(root / "skills" / "beta")]
+        )
+
+        assert names == ["p:alpha", "p:beta"]
+        assert plugins == [{"type": "local", "path": str(root)}]
+
+    def test_duplicate_skill_directory_is_collapsed(self) -> None:
+        skill_dir = self._skill_dirs()[0]
+        names, plugins = _resolve_skill_plugins([skill_dir, skill_dir])
+
+        assert names == ["conductor:conductor"]
+        assert len(plugins) == 1
+
+    def test_two_plugins_claiming_one_name_are_refused(self, tmp_path: Path) -> None:
+        """Deduping the clash away would silently drop one declared skill."""
+        a = self._make_plugin(tmp_path / "vendorA", "dup", "s")
+        b = self._make_plugin(tmp_path / "vendorB", "dup", "s")
+
+        with pytest.raises(ProviderError, match="Two different plugins") as exc:
+            _resolve_skill_plugins([str(a / "skills" / "s"), str(b / "skills" / "s")])
+        assert exc.value.is_retryable is False

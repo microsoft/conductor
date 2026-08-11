@@ -480,6 +480,59 @@ class TestVerboseLogging:
             full_mode.reset(token_full)
             verbose_mode.reset(token_verbose)
 
+    async def test_workflow_inputs_section_serializes_non_ascii_unescaped(
+        self, tmp_path: Path
+    ) -> None:
+        """Test that the Workflow Inputs section renders non-ASCII values literally."""
+        from typing import Any
+
+        from conductor.cli.run import run_workflow_async
+        from conductor.config.schema import AgentDef
+        from conductor.providers.copilot import CopilotProvider
+
+        workflow_file = tmp_path / "wf.yaml"
+        workflow_file.write_text(
+            "workflow:\n"
+            "  name: inputs-encoding\n"
+            "  entry_point: answer\n"
+            "  input:\n"
+            "    question:\n"
+            "      type: string\n"
+            "      required: true\n"
+            "agents:\n"
+            "  - name: answer\n"
+            "    prompt: 'Echo {{ workflow.input.question }}'\n"
+            "    output:\n"
+            "      answer:\n"
+            "        type: string\n"
+            "    routes:\n"
+            "      - to: $end\n"
+            "output:\n"
+            "  answer: '{{ answer.output.answer }}'\n"
+        )
+
+        def mock_handler(agent: AgentDef, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+            return {"answer": "ok"}
+
+        sections: list[tuple[str, str]] = []
+
+        with (
+            patch("conductor.providers.registry.create_provider") as mock_factory,
+            patch(
+                "conductor.cli.run.verbose_log_section",
+                side_effect=lambda title, content: sections.append((title, content)),
+            ),
+        ):
+            mock_factory.return_value = CopilotProvider(mock_handler=mock_handler)
+            await run_workflow_async(workflow_file, {"question": "план 你好"})
+
+        # Requirement: the inputs panel must show non-ASCII input values as real
+        # text, not \uXXXX escapes (issue #356).
+        payload = next(content for title, content in sections if title == "Workflow Inputs")
+        assert "план 你好" in payload
+        assert "\\u4f60" not in payload
+        assert "\\u043f" not in payload
+
     def test_verbose_log_section_skipped_in_minimal_mode(self) -> None:
         """Test that verbose_log_section skips console output in MINIMAL mode."""
         from io import StringIO

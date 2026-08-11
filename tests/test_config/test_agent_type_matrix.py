@@ -36,6 +36,10 @@ class TestSessionKeyTypeMatrix:
                 "script agents cannot have 'session_key'",
             ),
             (
+                {"name": "q", "type": "questions", "questions": [{"id": "q1", "text": "Why?"}]},
+                "questions agents cannot have 'session_key'",
+            ),
+            (
                 {"name": "w", "type": "wait", "duration": "1s"},
                 "wait agents cannot have 'session_key'",
             ),
@@ -61,7 +65,7 @@ class TestSessionKeyTypeMatrix:
                 "workflow agents cannot have 'session_key'",
             ),
         ],
-        ids=["script", "wait", "set", "terminate", "human_gate", "workflow"],
+        ids=["script", "questions", "wait", "set", "terminate", "human_gate", "workflow"],
     )
     def test_session_key_rejected(self, kwargs: dict, match: str) -> None:
         with pytest.raises(PydanticValidationError, match=match):

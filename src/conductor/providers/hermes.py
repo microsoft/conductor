@@ -99,6 +99,20 @@ class HermesProvider(AgentProvider):
         checkpoint_resume=True,
         usage_tracking=True,
         concurrent_safe=True,
+        # Hermes has no native skill surface, but skills are not an allowed
+        # experimental carve-out: ``AgentExecutor`` eagerly injects SKILL.md
+        # plus references/*.md into the rendered prompt for any provider whose
+        # ``supports_native_skills`` is False, entirely upstream of this class.
+        # That path is provider-agnostic and already works here, so declaring
+        # False would be inaccurate — and would make the ``skill_directories``
+        # docstring on ``execute()`` describe an unreachable branch, since
+        # config/validator.py rejects ``skills:`` on a skills=False provider.
+        # Injected size is bounded by ``runtime.skill_injection``.
+        skills=True,
+        # No plugin support: hermes has no MCP surface (mcp_tools=False)
+        # and no subagent surface, so a plugin could only ever load its
+        # skills — the partial load ``plugins:`` exists to prevent.
+        plugins=False,
         # Hermes runs its own internal toolsets (mcp_tools=False); a
         # per-agent working directory has no meaning for the session.
         working_dir=False,
@@ -190,6 +204,8 @@ class HermesProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent via the hermes-agent library.
 
@@ -211,6 +227,10 @@ class HermesProvider(AgentProvider):
                 so :class:`AgentExecutor` has already eager-injected the
                 skill content into ``rendered_prompt`` for this provider
                 (see :attr:`AgentProvider.supports_native_skills`).
+            custom_agents: Ignored. Declares ``plugins=False``, so
+                :class:`AgentExecutor` refuses ``plugins:`` on this
+                provider before reaching here and this is always ``None``.
+            extra_mcp_servers: Ignored, for the same reason.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -661,7 +681,11 @@ class HermesProvider(AgentProvider):
 
         try:
             normalized = normalize_agent_output(parsed, agent.output)  # type: ignore[arg-type]
-            validate_output(normalized, agent.output)  # type: ignore[arg-type]
+            validate_output(
+                normalized,
+                agent.output,  # type: ignore[arg-type]
+                warn_undeclared_keys=True,
+            )
         except ValidationError as exc:
             return (None, exc, exc)
 
@@ -724,7 +748,7 @@ def _fire(callback: EventCallback | None, event: str, data: dict[str, Any]) -> N
     try:
         callback(event, data)
     except Exception:
-        logger.warning("Error in event_callback for %s", event, exc_info=True)
+        logger.debug("Error in event_callback for %s", event, exc_info=True)
 
 
 async def _wait_for_event(event: asyncio.Event) -> None:

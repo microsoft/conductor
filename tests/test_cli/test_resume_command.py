@@ -970,6 +970,7 @@ def _make_resume_mocks() -> tuple[MagicMock, MagicMock]:
     mock_engine.set_context = MagicMock()
     mock_engine.set_limits = MagicMock()
     mock_engine.get_execution_summary = MagicMock(return_value={})
+    mock_engine.build_workflow_started_data = AsyncMock(return_value={})
     return mock_registry, mock_engine
 
 
@@ -1190,6 +1191,7 @@ class TestResumeReplaysIntoDashboard:
             mock_engine.resume = AsyncMock(return_value={"result": "ok"})
             mock_engine.config = MagicMock()
             mock_engine.config.workflow.cost.show_summary = False
+            mock_engine.build_workflow_started_data = AsyncMock(return_value={})
             mock_engine_cls.return_value = mock_engine
 
             await resume_workflow_async(
@@ -1248,6 +1250,7 @@ class TestResumeReplaysIntoDashboard:
             mock_engine.resume = AsyncMock(return_value={"result": "ok"})
             mock_engine.config = MagicMock()
             mock_engine.config.workflow.cost.show_summary = False
+            mock_engine.build_workflow_started_data = AsyncMock(return_value={})
             mock_engine_cls.return_value = mock_engine
 
             await resume_workflow_async(

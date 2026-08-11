@@ -7,6 +7,7 @@ import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
 import { SetDetail } from './SetDetail';
 import { GateDetail } from './GateDetail';
+import { QuestionsDetail } from './QuestionsDetail';
 import { GroupDetail } from './GroupDetail';
 import { DialogEngagementPrompt } from './DialogEngagementPrompt';
 import { SubworkflowDetail } from './SubworkflowDetail';
@@ -56,6 +57,8 @@ export function DetailPanel() {
         return SetDetail;
       case 'human_gate':
         return GateDetail;
+      case 'questions':
+        return QuestionsDetail;
       case 'parallel_group':
       case 'for_each_group':
         return GroupDetail;

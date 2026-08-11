@@ -11,7 +11,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
 | **Setup** | GitHub auth | API key | `claude` CLI auth | API key (model-provider's key) |
 | **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
-| **Streaming** | Yes | No (Phase 1) | Yes | Yes |
+| **Streaming** | Yes | Yes | Yes | Yes |
 | **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (MCP + built-in preset) | Yes (hermes toolsets) |
 | **MCP Servers** | Yes | Yes (stdio) | Yes (all types) | No |
 | **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
@@ -19,7 +19,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Output Quality** | Excellent | Excellent | Excellent | Depends on model |
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable (usage-based) |
 | **Multi-provider** | No | Yes (via Conductor) | No | Yes (native) |
-| **Agentic Loop** | SDK-managed | Manual (provider code) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
+| **Agentic Loop** | SDK-managed | SDK-managed (Pydantic AI) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
 | **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
 | **Session Resume** | Yes | No | No | Yes |
 | **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | native CLI env var | N/A |
@@ -126,11 +126,49 @@ agents:
 The `claude-agent-sdk` provider bridges MCP servers into the CLI, but not per-agent tool allowlists. Concretely:
 
 - `runtime.mcp_servers` — **supported**. Servers are translated into the SDK's MCP config and attach alongside the built-in preset. Only declared servers attach: Conductor sets `strict_mcp_config`, so ambient Claude Code MCP settings are ignored. A narrowing per-server `tools:` filter is refused, since the SDK has no equivalent field.
-- Per-agent `tools: []` — disables the built-in tools for that agent. Declared MCP servers still attach, so this combination is rejected at `conductor validate` when the workflow declares `mcp_servers`.
+- Per-agent `tools: []` — disables the built-in tools for that agent, except the `Skill` loader when the agent has skills enabled (an empty tool set would otherwise leave a declared skill unreachable). Declared MCP servers still attach, so this combination is rejected at `conductor validate` when the workflow declares `mcp_servers`.
 - Per-agent `tools: [list]` — **refused loudly**. Workflow tool names do not translate to Claude CLI tool IDs; silently passing them through would risk granting the wrong native tool.
 - Workflow-level `tools:` combined with an agent that omits `tools:` — **rejected at `conductor validate`**. The agent would otherwise inherit that non-empty list at runtime and hit the same refusal with a confusing message. Remove the workflow-level `tools:` (so omitting `tools:` grants the preset) or set the agent's `tools: []`.
 - Omitting `tools:` entirely (with no workflow-level `tools:`) — grants the full `claude_code` preset (filesystem, bash, web), matching the bare `claude` CLI experience.
-- `temperature` and `max_tokens` are **rejected at the factory** — sampling behavior is controlled by the CLI.
+
+### Important: Skills and ambient settings
+
+Skills are loaded natively: the Claude Code plugin that ships a declared skill is
+registered on the session and the skill enabled by its `<plugin>:<skill>` name, so
+the CLI reads only the `SKILL.md` frontmatter up front and the body on demand.
+
+Conductor also pins the SDK's `setting_sources` to an empty list on every run — the
+skills counterpart to `strict_mcp_config`. Without it the `claude` CLI enables skills
+the workflow never declared, varying by machine and launch directory, which made
+`skills: []` a no-op on this provider.
+
+That isolation is broader than skills. Agents on this provider do **not** pick up:
+
+- ambient skills from `~/.claude/skills/` or any `.claude/skills/` directory
+- `CLAUDE.md` and `.claude/rules/*.md`
+- user, project, and local `settings.json` (including `env` and `apiKeyHelper`)
+- hooks
+
+Instruction files have a replacement: run with `--workspace-instructions` (or
+`--instructions <file>`) to inject `AGENTS.md` / `CLAUDE.md` explicitly. Settings and
+hooks have none — if you rely on `apiKeyHelper` for credentials, supply them through
+the environment instead.
+
+Note the SDK treats the enabled-skill list as a context filter rather than a sandbox:
+undeclared skills are hidden from the model's listing and rejected by the `Skill`
+tool, but their files remain readable on disk through `Read`/`Bash`.
+
+Because the SDK exposes **no bare skill-directory option** — a skill is enabled by
+name through the plugin that ships it — a skill directory that is not inside a
+Claude Code plugin cannot be loaded here at all. `conductor validate` reports such
+a `skills:` entry before the run starts, naming the directory and both remedies:
+package it as a plugin (a `.claude-plugin/plugin.json` with the skill under
+`<plugin>/skills/`), or run that agent on `copilot`, which registers skill
+directories directly and accepts the identical skill untouched. See the
+[Skills section of the workflow syntax guide](../workflow-syntax.md#skills).
+
+Separately, `temperature` and `max_tokens` are **rejected at the factory** —
+sampling behavior is controlled by the CLI.
 
 ### Example Claude Agent SDK Workflow
 

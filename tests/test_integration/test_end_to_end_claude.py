@@ -1,36 +1,46 @@
 """End-to-end integration tests for Claude provider.
 
-Tests the complete flow from schema → provider → execution → output.
+Tests the complete flow from schema -> provider -> execution -> output using
+the Pydantic AI TestModel seam so no real network calls are made.
 """
 
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import patch
 
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
 
 from conductor.config.loader import load_workflow
 from conductor.engine.workflow import WorkflowEngine
 from conductor.providers.factory import create_provider
 
 
-@pytest.fixture
-def mock_anthropic_response():
-    """Mock Anthropic API response matching actual SDK structure."""
-    mock_response = Mock()
-    mock_response.content = [Mock(text='{"result": "Test response from Claude"}', type="text")]
-    mock_response.model = "claude-3-5-sonnet-20241022"
-    mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
-    mock_response.stop_reason = "end_turn"
-    mock_response.id = "msg_123"
-    mock_response.type = "message"
-    mock_response.role = "assistant"
-    return mock_response
+def _build_text_agent(text: str) -> Agent[Any, str]:
+    """Build a Pydantic AI text agent backed by TestModel."""
+    return Agent(model=TestModel(custom_output_text=text), output_type=str)
+
+
+def _build_structured_agent(data: dict[str, Any]) -> Agent[Any, Any]:
+    """Build a Pydantic AI structured-output agent backed by TestModel."""
+
+    class DynamicModel(BaseModel):
+        model_config = {"extra": "allow"}
+
+    return Agent(
+        model=TestModel(custom_output_args=data),
+        output_type=DynamicModel,
+    )
 
 
 class TestEndToEndClaudeIntegration:
     """Verify Claude integration works end-to-end."""
 
     @pytest.mark.asyncio
-    async def test_basic_claude_workflow_execution(self, tmp_path, mock_anthropic_response):
+    async def test_basic_claude_workflow_execution(self, tmp_path) -> None:
         """Test basic Claude workflow execution with schema validation."""
         # Create workflow YAML with proper schema format
         workflow_yaml = tmp_path / "test_workflow.yaml"
@@ -67,36 +77,35 @@ output:
         assert config.workflow.runtime.temperature == 0.7
         assert config.workflow.runtime.max_tokens == 1000
 
-        # Execute workflow with mocked Anthropic SDK
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_anthropic_response)
-            mock_client.close = AsyncMock()
+        # Execute workflow with the Pydantic AI mock seam
+        provider = await create_provider(
+            provider_type="claude",
+            validate=False,
+            temperature=config.workflow.runtime.temperature,
+            max_tokens=config.workflow.runtime.max_tokens,
+        )
+        engine = WorkflowEngine(config, provider)
 
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-                temperature=config.workflow.runtime.temperature,
-                max_tokens=config.workflow.runtime.max_tokens,
-            )
-            engine = WorkflowEngine(config, provider)
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_structured_agent({"result": "Test response from Claude"}),
+        ) as mock_build_agent:
             result = await engine.run({"question": "What is 2+2?"})
 
             # Verify execution completed
             assert result is not None
             assert "answer" in result
 
-            await provider.close()
+            # Verify the provider built a Pydantic AI agent with the right settings
+            assert mock_build_agent.called
+            assert mock_build_agent.call_args.kwargs["default_temperature"] == 0.7
+            assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 1000
+
+        await provider.close()
 
     @pytest.mark.asyncio
-    async def test_agent_level_parameter_overrides(self, tmp_path, mock_anthropic_response):
-        """Test that agent-level parameters override runtime defaults."""
+    async def test_agent_level_parameter_overrides(self, tmp_path) -> None:
+        """Test that agent-level model overrides runtime defaults."""
         workflow_yaml = tmp_path / "test_overrides.yaml"
         workflow_yaml.write_text("""
 workflow:
@@ -113,6 +122,7 @@ workflow:
 
 agents:
   - name: creative
+    model: claude-3-opus-20240229
     prompt: "Be creative: {{ workflow.input.topic }}"
     output:
       result:
@@ -123,32 +133,27 @@ agents:
 
         config = load_workflow(str(workflow_yaml))
 
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_anthropic_response)
-            mock_client.close = AsyncMock()
+        provider = await create_provider(
+            provider_type="claude",
+            validate=False,
+            temperature=config.workflow.runtime.temperature,
+        )
+        engine = WorkflowEngine(config, provider)
 
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-                temperature=config.workflow.runtime.temperature,
-            )
-            engine = WorkflowEngine(config, provider)
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_structured_agent({"result": "Creative response"}),
+        ) as mock_build_agent:
             await engine.run({"topic": "AI"})
 
-            # Verify API was called
-            assert mock_client.messages.create.call_count >= 1
+            # Verify API was called (provider built a Pydantic AI agent)
+            assert mock_build_agent.call_count >= 1
+            assert mock_build_agent.call_args.kwargs["agent"].model == "claude-3-opus-20240229"
 
-            await provider.close()
+        await provider.close()
 
     @pytest.mark.asyncio
-    async def test_exclude_none_in_actual_workflow(self, tmp_path, mock_anthropic_response):
+    async def test_exclude_none_in_actual_workflow(self, tmp_path) -> None:
         """Verify exclude_none=True prevents Claude fields in Copilot workflows."""
         # Create workflow without Claude-specific fields
         workflow_yaml = tmp_path / "copilot_workflow.yaml"
@@ -181,7 +186,7 @@ agents:
         assert "max_tokens" not in runtime_dict
 
     @pytest.mark.asyncio
-    async def test_schema_validation_error_injection(self, tmp_path):
+    async def test_schema_validation_error_injection(self, tmp_path) -> None:
         """Test schema validation with invalid values."""
 
         # Test invalid temperature
@@ -235,7 +240,7 @@ agents:
         assert "max_tokens" in error_str or "greater than" in error_str
 
     @pytest.mark.asyncio
-    async def test_backward_compatibility_in_workflow(self, tmp_path, mock_anthropic_response):
+    async def test_backward_compatibility_in_workflow(self, tmp_path) -> None:
         """Test that Copilot workflows still work after Claude addition."""
         from conductor.providers.copilot import CopilotProvider
 
@@ -291,21 +296,8 @@ output:
 class TestClaudePerformanceIntegration:
     """Performance tests for Claude integration."""
 
-    @pytest.fixture
-    def mock_anthropic_response(self):
-        """Mock Anthropic API response for performance tests."""
-        mock_response = Mock()
-        mock_response.content = [Mock(text='{"result": "Test response"}', type="text")]
-        mock_response.model = "claude-3-5-sonnet-20241022"
-        mock_response.usage = Mock(input_tokens=10, output_tokens=20, cache_creation_input_tokens=0)
-        mock_response.stop_reason = "end_turn"
-        mock_response.id = "msg_123"
-        mock_response.type = "message"
-        mock_response.role = "assistant"
-        return mock_response
-
     @pytest.mark.asyncio
-    async def test_parameter_overhead(self, tmp_path, mock_anthropic_response):
+    async def test_parameter_overhead(self, tmp_path) -> None:
         """Verify Claude parameter passing doesn't add significant overhead."""
         import time
 
@@ -332,25 +324,18 @@ agents:
 
         config = load_workflow(str(workflow_yaml))
 
-        with (
-            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude.AsyncAnthropic") as mock_anthropic,
-            patch("conductor.providers.claude.anthropic") as mock_module,
-        ):
-            mock_module.__version__ = "0.77.0"
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_anthropic_response)
-            mock_client.close = AsyncMock()
+        provider = await create_provider(
+            provider_type="claude",
+            validate=False,
+            temperature=config.workflow.runtime.temperature,
+            max_tokens=config.workflow.runtime.max_tokens,
+        )
+        engine = WorkflowEngine(config, provider)
 
-            provider = await create_provider(
-                provider_type="claude",
-                validate=False,
-                temperature=config.workflow.runtime.temperature,
-                max_tokens=config.workflow.runtime.max_tokens,
-            )
-            engine = WorkflowEngine(config, provider)
-
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_structured_agent({"result": "Test response"}),
+        ) as mock_build_agent:
             # Measure execution time
             start = time.time()
             await engine.run({})
@@ -359,4 +344,8 @@ agents:
             # Should complete in < 1 second (mocked, so overhead only)
             assert duration < 1.0, f"Unexpected overhead: {duration}s"
 
-            await provider.close()
+            # Verify sampling parameters reached the Pydantic AI seam
+            assert mock_build_agent.call_args.kwargs["default_temperature"] == 0.7
+            assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 1000
+
+        await provider.close()
