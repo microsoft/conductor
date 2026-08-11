@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { MessageSquarePlus, Send, X } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
@@ -47,10 +47,21 @@ export function GuidanceModal({ onClose }: GuidanceModalProps) {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void handleSend();
-    } else if (e.key === 'Escape') {
-      onClose();
     }
   };
+
+  // Close on Escape regardless of which element has focus — mirrors
+  // FileViewer.tsx's window-level listener. Wiring Escape only to the
+  // textarea's onKeyDown (the prior approach) stops working the moment
+  // focus leaves it (e.g. after tabbing to Close/Send), silently
+  // contradicting this component's own "dismissable via Escape" claim.
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [onClose]);
 
   return (
     <div

@@ -1,8 +1,10 @@
 """``conductor guide`` — submit mid-run guidance to a running workflow.
 
-Modeled on ``cli/gate.py``: resolves the dashboard port via
-``scan_pid_files()`` when ``--port`` is omitted, posts to ``POST
-/api/guidance``, and maps error responses to clear console messages.
+Port auto-discovery via ``scan_pid_files()`` mirrors ``app.py::status``'s
+reasoning; error-response mapping (403/409/422/connect-error) mirrors
+``cli/gate.py::_gate_respond_impl`` — ``cli/gate.py``'s own ``--port`` is a
+required option with no auto-discovery, so only the latter half of this
+command is actually modeled on it.
 """
 
 from __future__ import annotations

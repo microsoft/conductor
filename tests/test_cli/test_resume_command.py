@@ -295,6 +295,39 @@ class TestResumeCommand:
         result = runner.invoke(app, ["resume", str(wf_path), "--metadata", "no_equals"])
         assert result.exit_code != 0
 
+    def test_resume_guidance_stripped(self, tmp_path: Path) -> None:
+        """--guidance entries are stripped before being forwarded (issue #400)."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(app, ["resume", str(wf_path), "--guidance", "  padded text  "])
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["guidance"] == ["padded text"]
+
+    def test_resume_rejects_empty_guidance(self, tmp_path: Path) -> None:
+        """--guidance rejects a blank/whitespace-only entry, matching POST /api/guidance."""
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(app, ["resume", str(wf_path), "--guidance", "   "])
+        assert result.exit_code != 0
+        assert "empty" in result.output.lower()
+
+    def test_resume_rejects_oversized_guidance(self, tmp_path: Path) -> None:
+        """--guidance rejects text over MAX_GUIDANCE_CHARS, matching POST /api/guidance."""
+        from conductor.engine.guidance import MAX_GUIDANCE_CHARS
+
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(
+            app, ["resume", str(wf_path), "--guidance", "x" * (MAX_GUIDANCE_CHARS + 1)]
+        )
+        assert result.exit_code != 0
+        assert "maximum length" in result.output.lower()
+
     def test_resume_with_web(self, tmp_path: Path) -> None:
         """Test resume passes --web and --web-port through."""
         wf_path = _write_workflow(tmp_path)

@@ -197,7 +197,8 @@ conductor run workflow.yaml --web --input question="What is Python?"
 - **Three-pane layout** — Resizable panels for the graph, agent detail, and a tabbed output pane (Log, Activity, Output)
 - **In-browser human gates** — Respond to human-in-the-loop decision points directly in the dashboard, no terminal needed
 - **Per-node detail** — Click any node to see its prompt, metadata (model, tokens, cost), activity stream, and output
-- **Background mode** — Run with `--web-bg` to start the dashboard in the background, print the URL, and exit. Use `conductor stop` to shut it down later, `conductor status` to list what's running, and `conductor guide --text "..."` to send mid-run guidance without stopping it.
+- **Mid-run guidance** — Send a correction to a running workflow — via the dashboard's **Guide** button or `conductor guide --text "..."` — without stopping it first. Works with both `--web` and `--web-bg`.
+- **Background mode** — Run with `--web-bg` to start the dashboard in the background, print the URL, and exit. Use `conductor stop` to shut it down later and `conductor status` to list what's running.
 
 ```bash
 # Run in background — prints dashboard URL and exits

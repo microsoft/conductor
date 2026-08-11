@@ -314,19 +314,22 @@ With no options, `conductor stop` lists running background workflows. If exactly
 
 When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The PID file also records the launch's `run_id` and the child's captured stderr/stdout log paths (see `conductor status --json` above), so a run stays correlatable to its forensic artefacts even after the launching terminal is gone. The `stop` command reads these PID files, sends `SIGTERM` to the process, and cleans up the file. PID files are also automatically cleaned up when a background workflow completes normally.
 
-The web dashboard also exposes terminate controls that always preserve progress:
+The web dashboard also exposes these run-time controls:
 
 - **Stop** (`POST /api/stop`) interrupts the current agent and pauses it, then
   offers **Resume** (re-run the agent) or **Kill**. If clicked during the brief
   startup window before the engine is ready, the Stop is queued and honored as
   soon as the engine binds its interrupt event (rather than hard-cancelling).
+  This and **Kill** always preserve progress.
 - **Kill** (`POST /api/kill`) stops the workflow entirely. A best-effort
   checkpoint is written so you can `conductor resume` later, and the dashboard
   shows a **"Workflow Stopped"** banner with the checkpoint path (or a clear
   explanation if no checkpoint could be saved).
 - **Guide** sends mid-run guidance text (`POST /api/guidance`) to the running
   workflow — applied at the next step boundary, or immediately if an agent is
-  currently paused (in which case it resumes with the guidance applied). See
+  currently paused (in which case it resumes with the guidance applied).
+  Unlike Stop/Kill, this does not pause or terminate anything — it corrects
+  the run's course without interrupting it. See
   [`conductor guide`](#conductor-guide) below for the CLI equivalent.
 
 ### Examples

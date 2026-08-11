@@ -33,6 +33,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from conductor.engine.guidance import validate_guidance_text
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.executor.linkify import LINKABLE_EXTENSIONS
 
@@ -45,11 +46,6 @@ _BG_GRACE_SECONDS = 30
 
 # File API: max file size (extension allowlist is LINKABLE_EXTENSIONS from linkify)
 _FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
-
-# Guidance API: max text length (issue #400). Guidance is injected verbatim
-# into every subsequent prompt, so an unbounded body could balloon context
-# usage indefinitely.
-_GUIDANCE_MAX_CHARS = 10_000
 
 
 class WebDashboard:
@@ -391,14 +387,10 @@ class WebDashboard:
                 return JSONResponse(
                     {"error": "Missing or non-string required field: text"}, status_code=422
                 )
-            text = text.strip()
-            if not text:
-                return JSONResponse({"error": "text must not be empty"}, status_code=422)
-            if len(text) > _GUIDANCE_MAX_CHARS:
-                return JSONResponse(
-                    {"error": f"text exceeds maximum length of {_GUIDANCE_MAX_CHARS} characters"},
-                    status_code=422,
-                )
+            try:
+                text = validate_guidance_text(text)
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=422)
 
             if self._guidance_sink is not None:
                 pending = self._guidance_sink(text)

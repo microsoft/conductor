@@ -428,6 +428,77 @@ class TestHandleWebPauseGuidanceArm:
         assert result.handled is True
         assert result.guidance == []
 
+    @pytest.mark.asyncio
+    async def test_concurrent_pauses_sharing_channel_do_not_double_claim_guidance(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        """Two engines sharing one GuidanceChannel both wake on one submission,
+        but only the one that actually drains text reports guidance applied —
+        the "loser" must not emit a misleading with_guidance=True (issue #400
+        review: concurrent for-each branches share a single broadcast Event,
+        and drain() is destructive).
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        shared_channel = GuidanceChannel()
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        dashboard_a = self._make_dashboard()
+        dashboard_b = self._make_dashboard()
+        engine_a = WorkflowEngine(
+            two_agent_config,
+            provider,
+            web_dashboard=dashboard_a,  # type: ignore[arg-type]
+            event_emitter=emitter,
+            _guidance_channel=shared_channel,
+        )
+        engine_b = WorkflowEngine(
+            two_agent_config,
+            provider,
+            web_dashboard=dashboard_b,  # type: ignore[arg-type]
+            event_emitter=emitter,
+            _guidance_channel=shared_channel,
+        )
+        assert engine_a._guidance is engine_b._guidance is shared_channel
+
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        async def submit_once() -> None:
+            await asyncio.sleep(0.05)
+            shared_channel.submit("single correction")
+
+        result_a, result_b, _ = await asyncio.gather(
+            engine_a._handle_web_pause("planner", partial),
+            engine_b._handle_web_pause("planner", partial),
+            submit_once(),
+        )
+
+        # Exactly one of the two engines actually drained the text; the other
+        # must resolve as a plain resume rather than falsely reporting the
+        # guidance as applied to it too.
+        results = [result_a, result_b]
+        with_guidance = [r for r in results if r.guidance]
+        without_guidance = [r for r in results if not r.guidance]
+        assert len(with_guidance) == 1
+        assert with_guidance[0].guidance == ["single correction"]
+        assert len(without_guidance) == 1
+        assert without_guidance[0].handled is True
+
+        # Only one guidance_applied and one "with_guidance: True" agent_resumed
+        # event should have fired — the loser must not emit either.
+        applied = [e for e in events if e.type == "guidance_applied"]
+        assert len(applied) == 1
+
+        resumed = [e for e in events if e.type == "agent_resumed"]
+        assert len(resumed) == 2
+        with_guidance_events = [e for e in resumed if e.data["with_guidance"] is True]
+        without_guidance_events = [e for e in resumed if e.data["with_guidance"] is False]
+        assert len(with_guidance_events) == 1
+        assert len(without_guidance_events) == 1
+
 
 class TestSendGuidanceFollowup:
     """_send_guidance_followup: Copilot in-place resume vs. fallback re-execute."""

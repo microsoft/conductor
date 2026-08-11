@@ -1320,6 +1320,38 @@ def parse_metadata_flags(raw_metadata: list[str]) -> dict[str, str]:
     return result
 
 
+def parse_guidance_flags(raw_guidance: list[str]) -> list[str]:
+    """Validate ``--guidance`` flags, mirroring ``POST /api/guidance``.
+
+    ``resume --guidance`` calls :meth:`WorkflowEngine.add_user_guidance`
+    directly rather than going through the HTTP endpoint, so without this it
+    would skip the non-empty/length checks that endpoint enforces (issue
+    #400 review). Validating here — at the CLI boundary, before any
+    checkpoint restore or background-process fork — gives the same
+    ``typer.BadParameter`` treatment ``--metadata`` gets rather than letting
+    an empty or oversized entry reach the engine.
+
+    Args:
+        raw_guidance: List of raw ``--guidance`` values from the CLI.
+
+    Returns:
+        The stripped, validated guidance texts, in the order given.
+
+    Raises:
+        typer.BadParameter: If any entry is empty after stripping, or
+            exceeds :data:`conductor.engine.guidance.MAX_GUIDANCE_CHARS`.
+    """
+    from conductor.engine.guidance import validate_guidance_text
+
+    result: list[str] = []
+    for raw in raw_guidance:
+        try:
+            result.append(validate_guidance_text(raw))
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    return result
+
+
 def coerce_value(value: str) -> Any:
     """Coerce a string value to an appropriate Python type.
 

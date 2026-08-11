@@ -931,6 +931,7 @@ def resume(
 
     from conductor.cli.run import (
         generate_log_path,
+        parse_guidance_flags,
         parse_metadata_flags,
         resume_workflow_async,
     )
@@ -992,6 +993,12 @@ def resume(
     cli_metadata: dict[str, str] = {}
     if raw_metadata:
         cli_metadata.update(parse_metadata_flags(raw_metadata))
+
+    # Validate --guidance flags up front (empty/oversized entries rejected
+    # the same way POST /api/guidance rejects them), before any checkpoint
+    # restore or --web-bg fork.
+    if guidance:
+        guidance = parse_guidance_flags(guidance)
 
     # Resolve log file path
     resolved_log_file: Path | None = None

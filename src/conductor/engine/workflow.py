@@ -112,9 +112,13 @@ class WebPauseOutcome:
 
     handled: bool
     """True if the pause was resolved here (Resume clicked, guidance
-    submitted, or all clients disconnected). False means no dashboard is
-    connected and the caller should fall through to the CLI interactive
-    handler (``_handle_partial_output``)."""
+    submitted, or all clients disconnected). False means this method did not
+    resolve the pause, for one of two reasons the caller must distinguish:
+    a dashboard is attached but has no connected clients (the caller should
+    auto-resume rather than block), or no dashboard is attached at all (the
+    caller should fall through to the CLI interactive handler,
+    ``_handle_partial_output``). See ``_handle_web_pause``'s own docstring
+    for how the caller tells these two ``False`` cases apart."""
 
     guidance: list[str] = field(default_factory=list)
     """Guidance text(s) submitted while paused, in submission order. Empty
@@ -1156,8 +1160,10 @@ class WorkflowEngine:
         """Queue mid-run guidance text (issue #400).
 
         The sink handed to :meth:`WebDashboard.set_guidance_sink` — called
-        from ``POST /api/guidance`` and, on resume, directly by the CLI for
-        each ``--guidance`` flag. Does not itself apply the guidance to
+        from ``POST /api/guidance``. ``resume --guidance`` does not go
+        through this method: it calls :meth:`add_user_guidance` directly for
+        each flag, applying immediately rather than queuing (see that
+        method's docstring). Does not itself apply the guidance to
         ``self.context``: it only wakes whichever consumer is waiting
         (``_drain_pending_guidance`` at the next loop-top boundary, or the
         guidance wait-arm inside a live :meth:`_handle_web_pause`).
@@ -1174,7 +1180,7 @@ class WorkflowEngine:
         """Apply guidance to the run's context and emit ``guidance_applied``.
 
         The single entry point for every guidance source — the TTY Esc/
-        Ctrl+G interrupt flow, a dashboard/`` conductor guide`` submission
+        Ctrl+G interrupt flow, a dashboard/``conductor guide`` submission
         drained at the next step boundary or while an agent is paused, and
         ``resume --guidance`` — so the dashboard and JSONL log see guidance
         applied through the interrupt path too, not just the new channel.
@@ -3425,9 +3431,11 @@ class WorkflowEngine:
             A :class:`WebPauseOutcome`. ``handled=True`` means the pause was
             resolved here (Resume clicked, guidance submitted, or all clients
             disconnected) — ``guidance`` carries any submitted text(s), empty
-            for a plain Resume/disconnect. ``handled=False`` means no web
-            dashboard is connected and the caller should invoke
-            ``_handle_partial_output`` instead.
+            for a plain Resume/disconnect. ``handled=False`` covers two
+            distinct cases the caller branches on separately: a dashboard is
+            attached but has no connected clients (auto-resume — there is no
+            one to wait on), or no dashboard is attached at all (fall
+            through to the CLI interactive handler, ``_handle_partial_output``).
 
         Raises:
             InterruptError: If the user chose Kill (``POST /api/kill``).
@@ -3510,7 +3518,13 @@ class WorkflowEngine:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
-        except Exception:
+        except BaseException:
+            # BaseException (not Exception): asyncio.CancelledError derives
+            # from BaseException specifically so broad except blocks don't
+            # accidentally absorb cancellation — if this coroutine itself
+            # gets cancelled while awaiting asyncio.wait (e.g. a Kill on a
+            # nested sub-workflow branch), we still need to clean up the
+            # sibling wait-arm tasks rather than leaving them for the GC.
             for t in tasks:
                 if not t.done():
                     t.cancel()
@@ -3529,17 +3543,28 @@ class WorkflowEngine:
 
         if guidance_task in done:
             texts = self._guidance.drain()
-            for text in texts:
-                # guidance_applied fires before agent_resumed so an observer
-                # sees the correction land before the agent starts running.
-                self.add_user_guidance(text, source="dashboard")
-            # Clear resume_event too: if a Resume click raced in alongside the
-            # guidance submission, leaving it set would falsely skip the next
-            # legitimate pause cycle.
-            resume_event.clear()
-            self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": True})
-            logger.info("Agent '%s' resumed with guidance — re-executing", agent_name)
-            return WebPauseOutcome(True, texts)
+            # Concurrent for-each branches share one GuidanceChannel and all
+            # wake on the same broadcast asyncio.Event, but drain() is
+            # destructive — only the first caller to reach this line gets
+            # the queued text; a sibling branch woken by the same submission
+            # can find texts == [] here. Only report guidance as applied
+            # (and re-execute with it) when this call actually drained
+            # something; otherwise fall through to the plain-resume path
+            # below so we don't emit a misleading with_guidance=True for a
+            # branch that received no new information (issue #400 review).
+            if texts:
+                for text in texts:
+                    # guidance_applied fires before agent_resumed so an
+                    # observer sees the correction land before the agent
+                    # starts running.
+                    self.add_user_guidance(text, source="dashboard")
+                # Clear resume_event too: if a Resume click raced in alongside
+                # the guidance submission, leaving it set would falsely skip
+                # the next legitimate pause cycle.
+                resume_event.clear()
+                self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": True})
+                logger.info("Agent '%s' resumed with guidance — re-executing", agent_name)
+                return WebPauseOutcome(True, texts)
 
         if disconnect_task in done:
             logger.info(

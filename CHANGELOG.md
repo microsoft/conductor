@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Mid-run guidance for `--web-bg` runs** (#400). The dashboard previously
-  offered only Stop, Resume, and Kill — there was no way to correct a
-  background run's course without stopping it first. `conductor guide --text
+- **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
+  previously offered only Stop, Resume, and Kill — there was no way to
+  correct a run's course without stopping it first. `conductor guide --text
   "..."` (auto-discovering the dashboard port) and a dashboard **Guide**
   button both POST to a new `POST /api/guidance` endpoint, which feeds a
   `GuidanceChannel` the engine drains at the next step boundary (agents,
