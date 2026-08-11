@@ -72,9 +72,37 @@ class TestProviderSettingsValidation:
         with pytest.raises(ValidationError, match="only supported when name='copilot'"):
             ProviderSettings(name="claude", type="anthropic")
 
+    def test_openai_wire_api_rejected_with_targeted_message(self) -> None:
+        with pytest.raises(
+            ValidationError, match=r"Provider fields \['wire_api'\] are Copilot-only"
+        ):
+            ProviderSettings(name="openai", wire_api="completions")
+
+    def test_openai_type_rejected_with_targeted_message(self) -> None:
+        with pytest.raises(ValidationError, match=r"Provider fields \['type'\] are Copilot-only"):
+            ProviderSettings(name="openai", type="openai")
+
+    def test_openai_bearer_token_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="only supported when name='copilot'"):
+            ProviderSettings(name="openai", bearer_token="tok")
+
+    def test_openai_headers_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="only supported when name='copilot'"):
+            ProviderSettings(name="openai", headers={"X-Foo": "1"})
+
     def test_non_copilot_with_base_url_rejected(self) -> None:
         with pytest.raises(ValidationError, match="not yet implemented"):
             ProviderSettings(name="openai-agents", base_url="http://some-proxy/v1")
+
+    def test_openai_with_base_url_and_api_key_accepted(self) -> None:
+        s = ProviderSettings(name="openai", base_url="https://api.openai.com/v1", api_key="sk-xxx")
+        assert s.base_url == "https://api.openai.com/v1"
+        assert s.api_key is not None
+        assert s.api_key.get_secret_value() == "sk-xxx"
+
+    def test_openai_with_base_url_only_accepted(self) -> None:
+        s = ProviderSettings(name="openai", base_url="http://localhost:11434/v1")
+        assert s.base_url == "http://localhost:11434/v1"
 
     def test_claude_with_base_url_accepted(self) -> None:
         s = ProviderSettings(name="claude", base_url="https://my-gateway.example.com/api/v1")

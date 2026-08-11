@@ -49,6 +49,26 @@ class TestCreateProvider:
         assert "copilot" in exc_info.value.suggestion
 
     @pytest.mark.asyncio
+    async def test_openai_provider_receives_default_reasoning_effort(self) -> None:
+        """default_reasoning_effort reaches the OpenAI provider."""
+        from conductor.providers.openai import OpenAIProvider
+
+        provider_settings = ProviderSettings(name="openai", api_key=SecretStr("sk-test"))
+        with (
+            patch("conductor.providers.factory.OPENAI_SDK_AVAILABLE", True),
+            patch("openai.AsyncOpenAI"),
+            patch.object(OpenAIProvider, "_initialize_client"),
+        ):
+            provider = await create_provider(
+                "openai",
+                validate=False,
+                default_reasoning_effort="high",
+                provider_settings=provider_settings,
+            )
+        assert isinstance(provider, OpenAIProvider)
+        assert provider._default_reasoning_effort == "high"
+
+    @pytest.mark.asyncio
     async def test_copilot_provider_receives_default_context_tier(self) -> None:
         """default_context_tier is threaded into the Copilot provider."""
         provider = await create_provider(

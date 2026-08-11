@@ -1825,6 +1825,7 @@ def _validate_provider_capabilities(
     runtime_skills = config.workflow.runtime.skills
     skill_limits = config.workflow.runtime.skill_injection
     discovery = config.workflow.runtime.skill_discovery
+    runtime_temperature = config.workflow.runtime.temperature
     skill_base_dir = workflow_path.resolve().parent if workflow_path is not None else None
     # Keyed by (entries, discovery sources, discovery excludes), so agents
     # sharing a skill list resolve once but an agent that overrides the list
@@ -2523,6 +2524,23 @@ def _validate_provider_capabilities(
                     f"skill-aware provider, opt out per-agent with 'skills: []', "
                     f"or remove the workflow-level skills."
                 )
+
+    if runtime_temperature is not None and runtime_temperature > 1.0:
+        providers_over_one: dict[str, list[str]] = {}
+        for agent in all_llm_agents:
+            pname = _resolved_provider_name(agent, default_provider)
+            if pname == "openai":
+                continue
+            providers_over_one.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_over_one.items():
+            errors.append(
+                f"Workflow declares 'runtime.temperature'={runtime_temperature!r} "
+                f"but provider '{pname}' only supports temperatures up to 1.0 "
+                f"and is used by agent(s): {sorted(agent_names)!r}. "
+                f"Override these agents to provider 'openai', lower the "
+                f"temperature to 1.0 or below, or remove the workflow-level "
+                f"temperature."
+            )
 
     # ----- Per-agent checks -----
     for agent in config.agents:

@@ -107,7 +107,7 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
             "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
         ),
     ),
-    "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
+    "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY", "OPENAI_BASE_URL")),
     "hermes": _CredentialSpec(),
     "openai-agents": _CredentialSpec(),
 }

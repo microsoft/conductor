@@ -132,6 +132,7 @@ class ProviderRegistry:
             timeout=runtime.timeout,
             max_session_seconds=runtime.max_session_seconds,
             max_agent_iterations=runtime.max_agent_iterations,
+            default_reasoning_effort=runtime.default_reasoning_effort,
             provider_settings=provider_settings,
             tool_output=runtime.tool_output,
         )

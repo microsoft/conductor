@@ -648,3 +648,9 @@ The shared Pydantic AI execution loop from `ClaudeProvider.execute()` was extrac
 4. Delegates to `run_agent_pipeline(...)`.
 
 The runner owns the toolset wiring, retry/interrupt/extract pipeline, partial-output construction, and model-name resolution. To keep existing tests green, the runner imports its Pydantic-AI seam helpers (`run_with_interrupt`, `execute_with_retry`, `extract_content`, etc.) **inside** `run_agent_pipeline()` rather than at module scope. This preserves the historical patching surface (`conductor.providers._pydantic_ai.interrupt.run_with_interrupt`, etc.) that tests rely on.
+
+## Provider registration and validation notes
+
+- **Provider-aware temperature bounds**: `RuntimeConfig.temperature` widens the schema upper bound to `2.0` because OpenAI supports it, but most providers (copilot, claude, hermes, aca, claude-agent-sdk) cap at `1.0`. `config/validator.py` enforces the per-provider bound at `conductor validate` time so high temperatures do not fail mysteriously at the SDK boundary. Only the `openai` provider is exempt; override agents to `openai` or keep `temperature <= 1.0` for the others.
+- **Provider registration completeness**: adding a new provider requires updating `providers/factory.py::ProviderType` and `providers/diagnostics.py::_CREDENTIAL_SPECS` (and `providers/capabilities.py::_PROVIDER_CLASS_PATHS` for validate-time capability checks). Latent forwarding bugs happen when `ProviderRegistry.get_or_create_provider` does not pass new runtime fields to `create_provider`.
+- **OpenAI provider routing restrictions**: `ProviderSettings` for `name="openai"` rejects `type`, `wire_api`, `bearer_token`, `headers`, `azure`, and Copilot runtime fields with targeted messages because the native OpenAI provider always speaks Chat Completions and does not support Copilot custom routing.

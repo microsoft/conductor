@@ -2810,6 +2810,19 @@ class ProviderSettings(BaseModel):
         }
         if self.name != "copilot":
             extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
+            if self.name == "openai" and extras:
+                if "wire_api" in extras:
+                    raise ValueError(
+                        "Provider fields ['wire_api'] are Copilot-only. "
+                        "The 'openai' provider always speaks the Chat Completions "
+                        "wire API; remove the field."
+                    )
+                if "type" in extras:
+                    raise ValueError(
+                        "Provider fields ['type'] are Copilot-only. "
+                        "The 'openai' provider always speaks the Chat Completions "
+                        "wire API; remove the field."
+                    )
             if extras:
                 raise ValueError(
                     f"Provider fields {extras} are only supported when name='copilot'. "
@@ -3338,8 +3351,8 @@ class RuntimeConfig(BaseModel):
     temperature: float | None = Field(
         None,
         ge=0.0,
-        le=1.0,
-        description="Controls randomness. Range: 0.0-1.0",
+        le=2.0,
+        description="Controls randomness. Range: 0.0-2.0",
     )
     """Temperature parameter for models. Controls randomness in responses."""
 

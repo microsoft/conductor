@@ -23,10 +23,10 @@ def test_temperature_out_of_range_low():
 
 
 def test_temperature_out_of_range_high():
-    """Verify temperature > 1 raises validation error."""
+    """Verify temperature above the widened bound raises validation error."""
     with pytest.raises(ValidationError) as exc_info:
         RuntimeConfig(
-            provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=1.1
+            provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=2.1
         )
 
     errors = exc_info.value.errors()
@@ -34,18 +34,16 @@ def test_temperature_out_of_range_high():
 
 
 def test_temperature_at_boundaries():
-    """Verify temperature at 0.0 and 1.0 boundaries is valid."""
-    # Temperature = 0.0 should be valid
+    """Verify temperature at 0.0 and 2.0 boundaries is valid."""
     config = RuntimeConfig(
         provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=0.0
     )
     assert config.temperature == 0.0
 
-    # Temperature = 1.0 should be valid
     config = RuntimeConfig(
-        provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=1.0
+        provider="claude", default_model="claude-3-5-sonnet-20241022", temperature=2.0
     )
-    assert config.temperature == 1.0
+    assert config.temperature == 2.0
 
 
 def test_max_tokens_negative():

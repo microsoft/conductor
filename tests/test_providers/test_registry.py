@@ -318,6 +318,7 @@ class TestConfigPassing:
                     temperature=0.7,
                     max_tokens=4096,
                     timeout=60.0,
+                    default_reasoning_effort="high",
                 ),
             ),
             agents=[AgentDef(name="agent1", prompt="test")],
@@ -339,6 +340,7 @@ class TestConfigPassing:
             timeout=60.0,
             max_session_seconds=None,
             max_agent_iterations=None,
+            default_reasoning_effort="high",
             provider_settings=config.workflow.runtime.provider,
             tool_output=config.workflow.runtime.tool_output,
         )

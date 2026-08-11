@@ -51,12 +51,15 @@ def _build_workflow(
     mcp_servers: dict[str, MCPServerDef] | None = None,
     tools: list[str] | None = None,
     skills: list[str] | None = None,
+    temperature: float | None = None,
 ) -> WorkflowConfig:
     runtime_kwargs: dict[str, Any] = {"provider": "copilot"}
     if mcp_servers is not None:
         runtime_kwargs["mcp_servers"] = mcp_servers
     if skills is not None:
         runtime_kwargs["skills"] = skills
+    if temperature is not None:
+        runtime_kwargs["temperature"] = temperature
     workflow_kwargs: dict[str, Any] = {}
     if tools is not None:
         workflow_kwargs["tools"] = tools
@@ -160,6 +163,74 @@ class TestMcpToolsCrossCheck:
         )
         with pytest.raises(ConfigurationError, match="claude.*MCP servers"):
             validate_workflow_config(config)
+
+
+class TestTemperatureCrossCheck:
+    def test_temperature_above_one_with_openai_default_passes(self, patch_caps: Any) -> None:
+        patch_caps({"openai": _caps()})
+        config = _build_workflow(
+            temperature=1.5,
+            agents=[AgentDef(name="a", prompt="hi", provider="openai")],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_temperature_above_one_with_copilot_default_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps()})
+        config = _build_workflow(
+            temperature=1.5,
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        with pytest.raises(ConfigurationError, match="temperature.*1.5.*copilot"):
+            validate_workflow_config(config)
+
+    def test_temperature_above_one_agent_override_to_openai_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(), "openai": _caps()})
+        config = _build_workflow(
+            temperature=1.5,
+            agents=[
+                AgentDef(name="a", prompt="hi", provider="openai"),
+                AgentDef(name="b", prompt="hi", provider="openai"),
+            ],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_temperature_above_one_mixed_providers_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(), "openai": _caps()})
+        config = _build_workflow(
+            temperature=1.5,
+            agents=[
+                AgentDef(name="a", prompt="hi", provider="openai"),
+                AgentDef(name="b", prompt="hi", provider="copilot"),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="temperature.*1.5.*copilot"):
+            validate_workflow_config(config)
+
+    def test_temperature_above_one_for_each_inline_copilot_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps()})
+        config = _build_workflow(
+            temperature=1.5,
+            agents=[AgentDef(name="entry", prompt="hi", output={"items": {"type": "array"}})],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(name="inline", prompt="{{ item }}"),
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="temperature.*1.5.*copilot"):
+            validate_workflow_config(config)
+
+    def test_temperature_at_one_allowed_for_all_providers(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps()})
+        config = _build_workflow(
+            temperature=1.0,
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        validate_workflow_config(config)  # no raise
 
 
 class TestToolsAllowlistCrossCheck:
