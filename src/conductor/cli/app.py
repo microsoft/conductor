@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+from conductor.console import make_console, styled
 from conductor.exceptions import WorkflowTerminated
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,8 @@ app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 
 # Rich console for formatted output
-console = Console(stderr=True)
-output_console = Console()
+console = make_console(stderr=True)
+output_console = make_console()
 
 # Context variable for verbose mode (default True - show progress output)
 verbose_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("verbose_mode", default=True)
@@ -133,7 +134,7 @@ def format_error(error: Exception) -> Panel:
 
     return Panel(
         content,
-        title=f"[bold red]❌ {error_type}[/bold red]",
+        title=styled("[bold red]❌ {}[/bold red]", error_type),
         border_style="red",
         padding=(1, 2),
     )
@@ -155,7 +156,7 @@ def print_error(error: Exception) -> None:
         content.append(str(error), style="red")
         panel = Panel(
             content,
-            title=f"[bold red]❌ {type(error).__name__}[/bold red]",
+            title=styled("[bold red]❌ {}[/bold red]", type(error).__name__),
             border_style="red",
             padding=(1, 2),
         )
@@ -211,10 +212,13 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     port = urlparse(url).port
     port_hint = str(port) if port is not None else "<port>"
     console.print(
-        "[yellow]This workflow contains steps that wait for you[/yellow] "
-        "(human_gate / questions). Resolve them from "
-        "the dashboard above, or run "
-        f"[bold]conductor gate respond --port {port_hint} --choice <value>[/bold]."
+        styled(
+            "[yellow]This workflow contains steps that wait for "
+            "you[/yellow] (human_gate / questions). Resolve them from "
+            "the dashboard above, or run [bold]conductor gate respond "
+            "--port {} --choice <value>[/bold].",
+            port_hint,
+        )
     )
 
 
@@ -287,6 +291,8 @@ def run(
     workflow: Annotated[
         str,
         typer.Argument(
+            # Not wrapped for markup safety: Typer renders its own help text
+            # through its own console, not conductor's.
             help="Workflow file path or registry reference (name[@registry][@version]).",
         ),
     ],
@@ -518,11 +524,13 @@ def run(
                 print_loaded_instructions=print_loaded_instructions,
             )
             if is_verbose():
-                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
-                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
+                console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
                 console.print(
-                    "[dim]Workflow running in background. Dashboard auto-shuts down after "
-                    "workflow completes and all clients disconnect.[/dim]"
+                    Text.from_markup(
+                        "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                        "workflow completes and all clients disconnect.[/dim]"
+                    )
                 )
                 if notify_gate:
                     _print_web_bg_human_gate_notice(launch.url)
@@ -569,11 +577,15 @@ def run(
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
-                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+                styled(
+                    "[yellow]Warning:[/yellow] could not serialise terminate output: {}", json_exc
+                )
             )
-        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        console.print(
+            styled("[red]Workflow terminated[/red] at '{}': {}", e.terminated_by, e.reason)
+        )
         if e.suggestion:
-            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+            console.print(styled("[dim]Suggestion: {}[/dim]", e.suggestion))
         raise typer.Exit(code=1) from None
     except Exception as e:
         print_error(e)
@@ -585,6 +597,8 @@ def validate(
     workflow: Annotated[
         str,
         typer.Argument(
+            # Not wrapped for markup safety: Typer renders its own help text
+            # through its own console, not conductor's.
             help="Workflow file path or registry reference (name[@registry][@version]).",
         ),
     ],
@@ -631,6 +645,8 @@ def show(
     workflow: Annotated[
         str,
         typer.Argument(
+            # Not wrapped for markup safety: Typer renders its own help text
+            # through its own console, not conductor's.
             help="Workflow file path or registry reference (name[@registry][@version]).",
         ),
     ],
@@ -656,7 +672,9 @@ def show(
             assert ref.path is not None
             workflow_path = ref.path
             if not workflow_path.exists():
-                console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
+                console.print(
+                    styled("[bold red]Error:[/bold red] Workflow file not found: {}", workflow)
+                )
                 raise typer.Exit(code=1)
         else:
             workflow_path = resolve_and_fetch(ref)
@@ -669,20 +687,20 @@ def show(
 
         config = load_workflow_config(workflow_path)
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] Failed to parse workflow: {e}")
+        console.print(styled("[bold red]Error:[/bold red] Failed to parse workflow: {}", e))
         raise typer.Exit(code=1) from None
 
     wf = config.workflow
-    output_console.print(f"[bold]Name:[/bold]        {wf.name}")
+    output_console.print(styled("[bold]Name:[/bold]        {}", wf.name))
     if wf.description:
-        output_console.print(f"[bold]Description:[/bold] {wf.description}")
-    output_console.print(f"[bold]Entry point:[/bold] {wf.entry_point}")
-    output_console.print(f"[bold]Source:[/bold]      {workflow_path}")
+        output_console.print(styled("[bold]Description:[/bold] {}", wf.description))
+    output_console.print(styled("[bold]Entry point:[/bold] {}", wf.entry_point))
+    output_console.print(styled("[bold]Source:[/bold]      {}", workflow_path))
 
     if ref.kind == "registry":
-        output_console.print(f"[bold]Registry:[/bold]    {ref.registry_name}")
+        output_console.print(styled("[bold]Registry:[/bold]    {}", ref.registry_name))
         if ref.ref:
-            output_console.print(f"[bold]Version:[/bold]     {ref.ref}")
+            output_console.print(styled("[bold]Version:[/bold]     {}", ref.ref))
 
     from rich.table import Table
 
@@ -746,9 +764,9 @@ def show(
     ref_str = workflow if ref.kind == "registry" else str(workflow_path)
     if inputs:
         input_args = " ".join(f'--input {name}="..."' for name in inputs)
-        output_console.print(f"\n[dim]conductor run {ref_str} {input_args}[/dim]")
+        output_console.print(styled("\n[dim]conductor run {} {}[/dim]", ref_str, input_args))
     else:
-        output_console.print(f"\n[dim]conductor run {ref_str}[/dim]")
+        output_console.print(styled("\n[dim]conductor run {}[/dim]", ref_str))
 
 
 @app.command(rich_help_panel="Run & Recover")
@@ -756,6 +774,8 @@ def resume(
     workflow: Annotated[
         str | None,
         typer.Argument(
+            # Not wrapped for markup safety: Typer renders its own help text
+            # through its own console, not conductor's.
             help=(
                 "Workflow file path or registry reference (name[@registry][@version]). "
                 "Finds the latest checkpoint for this workflow."
@@ -878,12 +898,16 @@ def resume(
     # Validate arguments
     if workflow is None and from_checkpoint is None:
         console.print(
-            "[bold red]Error:[/bold red] "
-            "Provide a workflow file or use --from to specify a checkpoint."
+            Text.from_markup(
+                "[bold red]Error:[/bold red] "
+                "Provide a workflow file or use --from to specify a checkpoint."
+            )
         )
         console.print(
-            "[dim]Usage: conductor resume workflow.yaml "
-            "or conductor resume --from <checkpoint.json>[/dim]"
+            Text.from_markup(
+                "[dim]Usage: conductor resume workflow.yaml "
+                "or conductor resume --from <checkpoint.json>[/dim]"
+            )
         )
         raise typer.Exit(code=1)
 
@@ -905,7 +929,7 @@ def resume(
                 resolved_workflow = ref.path.resolve()
                 if not resolved_workflow.exists():
                     console.print(
-                        f"[bold red]Error:[/bold red] Workflow file not found: {workflow}"
+                        styled("[bold red]Error:[/bold red] Workflow file not found: {}", workflow)
                     )
                     raise typer.Exit(code=1)
             else:
@@ -920,7 +944,7 @@ def resume(
         resolved_checkpoint = from_checkpoint.resolve()
         if not resolved_checkpoint.exists():
             console.print(
-                f"[bold red]Error:[/bold red] Checkpoint file not found: {from_checkpoint}"
+                styled("[bold red]Error:[/bold red] Checkpoint file not found: {}", from_checkpoint)
             )
             raise typer.Exit(code=1)
 
@@ -977,11 +1001,13 @@ def resume(
                 metadata=cli_metadata,
             )
             if is_verbose():
-                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
-                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
+                console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
                 console.print(
-                    "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
-                    "after workflow completes and all clients disconnect.[/dim]"
+                    Text.from_markup(
+                        "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
+                        "after workflow completes and all clients disconnect.[/dim]"
+                    )
                 )
                 if notify_gate:
                     _print_web_bg_human_gate_notice(launch.url)
@@ -1017,11 +1043,15 @@ def resume(
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
-                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+                styled(
+                    "[yellow]Warning:[/yellow] could not serialise terminate output: {}", json_exc
+                )
             )
-        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        console.print(
+            styled("[red]Workflow terminated[/red] at '{}': {}", e.terminated_by, e.reason)
+        )
         if e.suggestion:
-            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+            console.print(styled("[dim]Suggestion: {}[/dim]", e.suggestion))
         raise typer.Exit(code=1) from None
     except Exception as e:
         print_error(e)
@@ -1039,8 +1069,10 @@ def checkpoints(
 ) -> None:
     """Deprecated alias for 'conductor checkpoint list'."""
     console.print(
-        "[yellow]Warning:[/yellow] 'conductor checkpoints' is deprecated and will "
-        "be removed in a future release. Use 'conductor checkpoint list' instead."
+        Text.from_markup(
+            "[yellow]Warning:[/yellow] 'conductor checkpoints' is deprecated and will "
+            "be removed in a future release. Use 'conductor checkpoint list' instead."
+        )
     )
     from conductor.cli.checkpoint import _list_checkpoints_impl
 
@@ -1095,8 +1127,8 @@ def replay(
 
         await dashboard.start()
         if is_verbose():
-            console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
-            console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+            console.print(styled("\n[bold green]▶ Replay dashboard:[/] {}\n", dashboard.url))
+            console.print(Text.from_markup("[dim]Press Ctrl+C to exit[/dim]\n"))
 
         try:
             await asyncio.Event().wait()
@@ -1109,7 +1141,7 @@ def replay(
         asyncio.run(_run_replay())
     except KeyboardInterrupt:
         if is_verbose():
-            console.print("\n[dim]Replay stopped.[/dim]")
+            console.print(Text.from_markup("\n[dim]Replay stopped.[/dim]"))
 
 
 @app.command(rich_help_panel="Run & Recover")
@@ -1168,12 +1200,14 @@ def status(
         return
 
     if not running:
-        console.print("[dim]No background workflows are currently running.[/dim]")
+        console.print(Text.from_markup("[dim]No background workflows are currently running.[/dim]"))
         return
 
     _print_running_list(running, console, show_url=True)
     console.print(
-        f"\n[dim]{len(running)} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]"
+        styled(
+            "\n[dim]{} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]", len(running)
+        )
     )
 
 
@@ -1211,7 +1245,7 @@ def stop(
     running = read_pid_files()
 
     if not running:
-        console.print("[dim]No background workflows are currently running.[/dim]")
+        console.print(Text.from_markup("[dim]No background workflows are currently running.[/dim]"))
         return
 
     if all_workflows:
@@ -1225,9 +1259,9 @@ def stop(
         match = [e for e in running if e["port"] == port]
         if not match:
             console.print(
-                f"[bold red]Error:[/bold red] No background workflow found on port {port}."
+                styled("[bold red]Error:[/bold red] No background workflow found on port {}.", port)
             )
-            console.print("[dim]Running workflows:[/dim]")
+            console.print(Text.from_markup("[dim]Running workflows:[/dim]"))
             _print_running_list(running, console)
             raise typer.Exit(code=1)
         _stop_process(match[0], console)
@@ -1241,9 +1275,16 @@ def stop(
         remove_pid_file(entry["port"])
     else:
         console.print(
-            f"[bold yellow]Multiple background workflows running ({len(running)}).[/bold yellow]"
+            styled(
+                "[bold yellow]Multiple background workflows running ({}).[/bold yellow]",
+                len(running),
+            )
         )
-        console.print("[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n")
+        console.print(
+            Text.from_markup(
+                "[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n"
+            )
+        )
         _print_running_list(running, console)
 
 
@@ -1267,16 +1308,29 @@ def _stop_process(entry: dict, con: Console) -> None:
         else:
             os.kill(pid, signal.SIGTERM)
         con.print(
-            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
+            styled(
+                "[green]Stopped[/green] workflow [cyan]'{}'[/cyan] (PID {}, port {})",
+                workflow,
+                pid,
+                port,
+            )
         )
     except ProcessLookupError:
         con.print(
-            f"[dim]Process already exited:[/dim] workflow '{workflow}' (PID {pid}, port {port})"
+            styled(
+                "[dim]Process already exited:[/dim] workflow '{}' (PID {}, port {})",
+                workflow,
+                pid,
+                port,
+            )
         )
     except PermissionError:
         con.print(
-            f"[bold red]Permission denied:[/bold red] could not stop PID {pid}. "
-            f"Try running with elevated privileges."
+            styled(
+                "[bold red]Permission denied:[/bold red] could not stop PID "
+                "{}. Try running with elevated privileges.",
+                pid,
+            )
         )
     except OSError as exc:
         # Defensive catch (companion to the fix for issue #166): on Windows,
@@ -1289,8 +1343,13 @@ def _stop_process(entry: dict, con: Console) -> None:
             "Unexpected OSError stopping PID %s; treating as already exited", pid, exc_info=True
         )
         con.print(
-            f"[yellow]Could not signal PID {pid} ({exc}); "
-            f"removing PID file for workflow '{workflow}' anyway.[/yellow]"
+            styled(
+                "[yellow]Could not signal PID {} ({}); removing PID file for "
+                "workflow '{}' anyway.[/yellow]",
+                pid,
+                exc,
+                workflow,
+            )
         )
 
 
@@ -1372,8 +1431,10 @@ def gate_respond(
 ) -> None:
     """Deprecated alias for 'conductor gate respond'."""
     console.print(
-        "[yellow]Warning:[/yellow] 'conductor gate-respond' is deprecated and will "
-        "be removed in a future release. Use 'conductor gate respond' instead."
+        Text.from_markup(
+            "[yellow]Warning:[/yellow] 'conductor gate-respond' is deprecated and will "
+            "be removed in a future release. Use 'conductor gate respond' instead."
+        )
     )
     from conductor.cli.gate import _gate_respond_impl
 

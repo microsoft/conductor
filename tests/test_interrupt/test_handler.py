@@ -426,8 +426,14 @@ class TestInterruptHandlerPanel:
         assert "Last Output Preview" not in panel_call.renderable
 
     @pytest.mark.asyncio
-    async def test_panel_escapes_rich_markup_in_output_preview(self) -> None:
-        """Verify Rich markup in output preview is escaped, not rendered."""
+    async def test_panel_shows_rich_markup_in_output_preview_literally(self) -> None:
+        """Verify Rich markup in output preview is shown, not rendered.
+
+        The panel content is a ``Text``, so the preview is carried as literal
+        characters rather than escaped with backslashes (#406). That is
+        byte-exact, where ``escape`` was not: it cannot round-trip a value
+        that already contains a backslash before a bracket.
+        """
         console = MagicMock()
         handler = InterruptHandler(console=console)
 
@@ -447,15 +453,13 @@ class TestInterruptHandlerPanel:
                 break
 
         assert panel_call is not None
-        content = panel_call.renderable
-        # The raw markup tags should be escaped (rendered as literal text)
-        from rich.markup import escape
-
-        assert escape("[red]error[/red]") in content
+        content = panel_call.renderable.plain
+        assert "[red]error[/red] and [bold]text[/bold]" in content
+        assert "\\[red]" not in content, "value should be literal, not backslash-escaped"
 
     @pytest.mark.asyncio
-    async def test_panel_escapes_rich_markup_in_guidance(self) -> None:
-        """Verify Rich markup in accumulated guidance is escaped."""
+    async def test_panel_shows_rich_markup_in_guidance_literally(self) -> None:
+        """Verify Rich markup in accumulated guidance is shown, not rendered."""
         console = MagicMock()
         handler = InterruptHandler(console=console)
 
@@ -475,10 +479,9 @@ class TestInterruptHandlerPanel:
                 break
 
         assert panel_call is not None
-        content = panel_call.renderable
-        from rich.markup import escape
-
-        assert escape("[bold]inject markup[/bold]") in content
+        content = panel_call.renderable.plain
+        assert "[bold]inject markup[/bold]" in content
+        assert "\\[bold]" not in content, "value should be literal, not backslash-escaped"
 
 
 class TestInterruptHandlerActions:

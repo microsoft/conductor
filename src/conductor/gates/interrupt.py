@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 from rich.console import Console
-from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
+from rich.text import Text
+
+from conductor.console import join, make_console, styled
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ class InterruptHandler:
             console: Rich console for output. Creates one if not provided.
             skip_gates: If True, auto-selects cancel without prompting.
         """
-        self.console = console or Console()
+        self.console = console or make_console()
         self.skip_gates = skip_gates
 
     async def handle_interrupt(
@@ -115,7 +117,9 @@ class InterruptHandler:
             InterruptResult with the user's selected action and any data.
         """
         if self.skip_gates:
-            self.console.print("\n[dim]Interrupt received. Auto-cancelling (--skip-gates)[/dim]")
+            self.console.print(
+                Text.from_markup("\n[dim]Interrupt received. Auto-cancelling (--skip-gates)[/dim]")
+            )
             logger.debug("Interrupt auto-cancelled due to skip_gates mode")
             return InterruptResult(action=InterruptAction.CANCEL)
 
@@ -143,8 +147,8 @@ class InterruptHandler:
             accumulated_guidance: List of previously provided guidance entries.
         """
         content_lines = [
-            f"[bold]Current Agent:[/bold] {current_agent}",
-            f"[bold]Iteration:[/bold] {iteration}",
+            styled("[bold]Current Agent:[/bold] {}", current_agent),
+            styled("[bold]Iteration:[/bold] {}", iteration),
         ]
 
         # Add output preview if available
@@ -153,29 +157,29 @@ class InterruptHandler:
             if len(last_output_preview) > _OUTPUT_PREVIEW_MAX_LENGTH:
                 truncated += "..."
             content_lines.append("")
-            content_lines.append("[bold]Last Output Preview:[/bold]")
-            content_lines.append(f"  {escape(truncated)}")
+            content_lines.append(Text.from_markup("[bold]Last Output Preview:[/bold]"))
+            content_lines.append(f"  {truncated}")
 
         # Add accumulated guidance if any
         if accumulated_guidance:
             content_lines.append("")
-            content_lines.append("[bold]Previous Guidance:[/bold]")
+            content_lines.append(Text.from_markup("[bold]Previous Guidance:[/bold]"))
             for i, guidance in enumerate(accumulated_guidance, 1):
-                content_lines.append(f"  {i}. {escape(guidance)}")
+                content_lines.append(f"  {i}. {guidance}")
 
         # Add action options
         content_lines.append("")
-        content_lines.append("[bold]Actions:[/bold]")
-        content_lines.append("  [cyan][1][/cyan] Continue with guidance")
-        content_lines.append("  [cyan][2][/cyan] Skip to agent...")
-        content_lines.append("  [cyan][3][/cyan] Stop workflow")
-        content_lines.append("  [cyan][4][/cyan] Cancel (resume as-is)")
+        content_lines.append(Text.from_markup("[bold]Actions:[/bold]"))
+        content_lines.append(Text.from_markup("  [cyan][1][/cyan] Continue with guidance"))
+        content_lines.append(Text.from_markup("  [cyan][2][/cyan] Skip to agent..."))
+        content_lines.append(Text.from_markup("  [cyan][3][/cyan] Stop workflow"))
+        content_lines.append(Text.from_markup("  [cyan][4][/cyan] Cancel (resume as-is)"))
 
         self.console.print()
         self.console.print(
             Panel(
-                "\n".join(content_lines),
-                title="[bold yellow]Workflow Interrupted[/bold yellow]",
+                join("\n", content_lines),
+                title=Text.from_markup("[bold yellow]Workflow Interrupted[/bold yellow]"),
                 border_style="yellow",
             )
         )
@@ -192,7 +196,7 @@ class InterruptHandler:
         while True:
             try:
                 choice = IntPrompt.ask(
-                    "\n[bold]Select action[/bold]",
+                    Text.from_markup("\n[bold]Select action[/bold]"),
                     choices=["1", "2", "3", "4"],
                     show_choices=True,
                 )
@@ -207,10 +211,12 @@ class InterruptHandler:
                     return result
                 # If None, re-prompt (user cancelled skip selection)
             elif choice == 3:
-                self.console.print("\n[yellow]Stopping workflow execution[/yellow]")
+                self.console.print(
+                    Text.from_markup("\n[yellow]Stopping workflow execution[/yellow]")
+                )
                 return InterruptResult(action=InterruptAction.STOP)
             elif choice == 4:
-                self.console.print("\n[green]Resuming workflow[/green]")
+                self.console.print(Text.from_markup("\n[green]Resuming workflow[/green]"))
                 return InterruptResult(action=InterruptAction.CANCEL)
 
     async def _collect_guidance(self) -> InterruptResult:
@@ -221,16 +227,20 @@ class InterruptHandler:
         """
         self.console.print()
         try:
-            guidance = Prompt.ask("[bold]Enter guidance for subsequent agents[/bold]")
+            guidance = Prompt.ask(
+                Text.from_markup("[bold]Enter guidance for subsequent agents[/bold]")
+            )
         except (KeyboardInterrupt, EOFError):
             return InterruptResult(action=InterruptAction.CANCEL)
 
         if not guidance.strip():
-            self.console.print("[yellow]No guidance provided. Resuming as-is.[/yellow]")
+            self.console.print(
+                Text.from_markup("[yellow]No guidance provided. Resuming as-is.[/yellow]")
+            )
             return InterruptResult(action=InterruptAction.CANCEL)
 
         guidance = guidance.strip()
-        self.console.print(f"\n[green]Guidance added:[/green] {guidance}")
+        self.console.print(styled("\n[green]Guidance added:[/green] {}", guidance))
         return InterruptResult(action=InterruptAction.CONTINUE, guidance=guidance)
 
     async def _collect_skip_target(self, available_agents: list[str]) -> InterruptResult | None:
@@ -246,19 +256,21 @@ class InterruptHandler:
             InterruptResult with SKIP action and target, or None if user cancels.
         """
         if not available_agents:
-            self.console.print("[red]No agents available to skip to.[/red]")
+            self.console.print(Text.from_markup("[red]No agents available to skip to.[/red]"))
             return None
 
         # Display available agents
         self.console.print()
-        self.console.print("[bold]Available agents:[/bold]")
+        self.console.print(Text.from_markup("[bold]Available agents:[/bold]"))
         for i, agent_name in enumerate(available_agents, 1):
-            self.console.print(f"  [cyan][{i}][/cyan] {agent_name}")
+            self.console.print(styled("  [cyan][{}][/cyan] {}", i, agent_name))
 
         while True:
             try:
                 target = Prompt.ask(
-                    "\n[bold]Enter agent name or number (or 'back' to go back)[/bold]"
+                    Text.from_markup(
+                        "\n[bold]Enter agent name or number (or 'back' to go back)[/bold]"
+                    )
                 )
             except (KeyboardInterrupt, EOFError):
                 return None
@@ -273,17 +285,20 @@ class InterruptHandler:
                 index = int(target) - 1
                 if 0 <= index < len(available_agents):
                     selected = available_agents[index]
-                    self.console.print(f"\n[green]Skipping to agent:[/green] {selected}")
+                    self.console.print(styled("\n[green]Skipping to agent:[/green] {}", selected))
                     return InterruptResult(action=InterruptAction.SKIP, skip_target=selected)
             except ValueError:
                 pass
 
             # Allow selection by name
             if target in available_agents:
-                self.console.print(f"\n[green]Skipping to agent:[/green] {target}")
+                self.console.print(styled("\n[green]Skipping to agent:[/green] {}", target))
                 return InterruptResult(action=InterruptAction.SKIP, skip_target=target)
 
             self.console.print(
-                f"[red]Agent '{target}' not found. "
-                f"Available agents: {', '.join(available_agents)}[/red]"
+                styled(
+                    "[red]Agent '{}' not found. Available agents: {}[/red]",
+                    target,
+                    ", ".join(available_agents),
+                )
             )

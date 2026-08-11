@@ -167,6 +167,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bracketed text no longer crashes or corrupts CLI output** (#406). The same
+  defect as #382, which #387 fixed only in `cli/run.py`. `conductor validate`
+  died with an unhandled `MarkupError` traceback on a workflow whose `name:`
+  contained `[/bold]`, and silently deleted the token when it contained
+  `[dim]`. The quiet half is the more damaging one: a listing that drops part
+  of a name looks like it worked. Rich treats a bracketed token as a style tag
+  when its first character is lowercase, `#`, `/` or `@`, so `[0]` is fine,
+  `[task1]` disappears, and `[/etc/x]` raises — and `style=` does not turn
+  parsing off, which is what made the earlier fix look complete.
+
+  Two consequences shipped unnoticed. Every for-each iteration's verbose panel
+  read the same, because the engine qualifies a member's name as
+  `<agent>[<key>]` so interleaved output can be attributed to one iteration,
+  and a `key_by:` key of `task1` erased exactly that identity — while a key
+  starting with `/`, which `key_by:` over paths or URLs produces, killed the
+  run from a logging call. This needed no flags: verbose and full mode both
+  default on. Separately, `conductor status` (#389) and `conductor plugin
+  list` (#398) were written against the unfixed pattern in files #387 never
+  touched, and #398 made these strings third-party rather than the author's
+  own YAML, since plugin, marketplace, skill and subagent names are now read
+  out of git-cloned repositories.
+
+  Rather than escape ~450 call sites, the default is inverted: every console
+  is built by the new `conductor.console.make_console()` with `markup=False`,
+  so a plain string is literal unless it asks to be styled, and conductor's
+  own styling goes through `styled("<template>", value)`, which parses the
+  template but inserts values verbatim and byte-exact. `Panel` titles and
+  `Prompt` prompts are handled separately because rich parses those
+  regardless of the console setting — that is the trap that left #387
+  incomplete one line from the code it changed. `rich.markup.escape` is no
+  longer used anywhere: it cannot round-trip a value containing a backslash
+  before a bracket, so an ordinary regex came out mangled. Four static guards
+  now read the source and fail with file:line if a new call site
+  reintroduces any of these shapes.
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing

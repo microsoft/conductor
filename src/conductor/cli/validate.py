@@ -12,8 +12,10 @@ from typing import TYPE_CHECKING, Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from conductor.config.loader import load_config
+from conductor.console import make_console, styled
 from conductor.exceptions import ConductorError
 
 if TYPE_CHECKING:
@@ -36,7 +38,7 @@ def validate_workflow(
     Returns:
         A tuple of (is_valid, config_or_none).
     """
-    output_console = console if console is not None else Console()
+    output_console = console if console is not None else make_console()
 
     try:
         config = load_config(workflow_path)
@@ -48,8 +50,8 @@ def validate_workflow(
         # Unexpected error
         output_console.print(
             Panel(
-                f"[bold red]Unexpected Error[/bold red]\n\n{e}",
-                title="[red]Validation Failed[/red]",
+                styled("[bold red]Unexpected Error[/bold red]\n\n{}", e),
+                title=Text.from_markup("[red]Validation Failed[/red]"),
                 border_style="red",
             )
         )
@@ -62,7 +64,7 @@ def validate_workflow(
         warnings = validate_workflow_config(config, workflow_path=workflow_path)
         if warnings:
             for warning in warnings:
-                output_console.print(f"  [yellow]⚠[/yellow] {warning}")
+                output_console.print(styled("  [yellow]⚠[/yellow] {}", warning))
     except ConductorError as e:
         display_validation_error(e, workflow_path, output_console)
         return False, None
@@ -134,21 +136,23 @@ def _report_plugins(
                 # entries that need it, and the validator said it once.
                 continue
             except (PluginError, SkillError, OSError) as exc:
-                console.print(f"  [yellow]⚠[/yellow] Plugin source {name!r} is unusable: {exc}")
+                console.print(
+                    styled("  [yellow]⚠[/yellow] Plugin source {!r} is unusable: {}", name, exc)
+                )
 
     # Printed before resolution is attempted: what a source resolved to is
     # worth seeing even when an entry referencing a *different* source
     # cannot be resolved, and this listing is the only place the resolved
     # commit appears.
     if sources:
-        console.print(f"  [dim]Plugin sources: {len(sources)} declared[/dim]")
+        console.print(styled("  [dim]Plugin sources: {} declared[/dim]", len(sources)))
         for name, entry in sources.items():
             detail = entry.source.describe()
             if entry.sha:
                 detail = f"{detail} @ {entry.sha[:12]}"
             if entry.stale:
                 detail = f"{detail} (cached; ref not re-checked)"
-            console.print(f"    [dim]• {name} — {detail}[/dim]")
+            console.print(styled("    [dim]• {} — {}[/dim]", name, detail))
 
     # Resolved one entry at a time, for the same reason the sources above
     # are: ``resolve_plugins`` is all-or-nothing, so one entry whose source
@@ -171,24 +175,26 @@ def _report_plugins(
             # the reader scrolls past. This arm is reachable through ordinary
             # configuration — see the docstring — so it is not merely
             # defensive.
-            console.print(f"  [yellow]⚠[/yellow] Plugin {entry.name!r}: {exc}")
+            console.print(styled("  [yellow]⚠[/yellow] Plugin {!r}: {}", entry.name, exc))
 
-    console.print(f"  [dim]Plugins: {len(resolved)} enabled[/dim]")
+    console.print(styled("  [dim]Plugins: {} enabled[/dim]", len(resolved)))
     for plugin in resolved:
         parts = [
             f"{len(plugin.skills)} skill(s)",
             f"{len(plugin.agents)} agent(s)",
             f"{len(plugin.mcp_servers)} MCP server(s)",
         ]
-        console.print(f"    [dim]• {plugin.name} — {', '.join(parts)} — {plugin.root}[/dim]")
+        console.print(
+            styled("    [dim]• {} — {} — {}[/dim]", plugin.name, ", ".join(parts), plugin.root)
+        )
         if plugin.agents:
             names = ", ".join(item.qualified_name for item in plugin.agents)
-            console.print(f"      [dim]agents: {names}[/dim]")
+            console.print(styled("      [dim]agents: {}[/dim]", names))
         if plugin.mcp_servers:
-            console.print(f"      [dim]mcp: {', '.join(sorted(plugin.mcp_servers))}[/dim]")
+            console.print(styled("      [dim]mcp: {}[/dim]", ", ".join(sorted(plugin.mcp_servers))))
         if plugin.disabled:
             console.print(
-                f"      [dim]disabled by this workflow: {', '.join(plugin.disabled)}[/dim]"
+                styled("      [dim]disabled by this workflow: {}[/dim]", ", ".join(plugin.disabled))
             )
 
 
@@ -245,7 +251,7 @@ def _report_skill_discovery(
         if message in seen:
             return
         seen.add(message)
-        console.print(f"  [yellow]⚠[/yellow] {message}")
+        console.print(styled("  [yellow]⚠[/yellow] {}", message))
 
     try:
         resolved = resolve_effective_skills(
@@ -256,30 +262,35 @@ def _report_skill_discovery(
             on_warning=_forward,
         )
     except Exception as exc:  # pragma: no cover - defensive; a report must not crash
-        console.print(f"  [yellow]⚠[/yellow] Skill discovery could not be summarized: {exc}")
+        console.print(
+            styled("  [yellow]⚠[/yellow] Skill discovery could not be summarized: {}", exc)
+        )
         return
 
     found = [skill for skill in resolved if skill.discovered]
     sources = ", ".join(discovery.sources)
     if not found:
-        console.print(f"  [dim]Skill discovery ({sources}): no skills found[/dim]")
+        console.print(styled("  [dim]Skill discovery ({}): no skills found[/dim]", sources))
         return
 
-    console.print(f"  [dim]Skill discovery ({sources}): {len(found)} skill(s)[/dim]")
+    console.print(styled("  [dim]Skill discovery ({}): {} skill(s)[/dim]", sources, len(found)))
     for skill in found:
-        console.print(f"    [dim]• {skill.name} — {skill.source}[/dim]")
+        console.print(styled("    [dim]• {} — {}[/dim]", skill.name, skill.source))
 
     try:
         content = load_skill_content([(skill.name, skill.directory) for skill in resolved])
     except Exception as exc:
-        console.print(f"  [yellow]⚠[/yellow] Skill content could not be measured: {exc}")
+        console.print(styled("  [yellow]⚠[/yellow] Skill content could not be measured: {}", exc))
         return
     size = len(content.encode("utf-8"))
     # Covers declared skills too, since an eager-injection provider would
     # be sent the whole set — the budget it is compared against is total.
     console.print(
-        f"    [dim]Total if eagerly injected: {size:,} bytes "
-        f"(~{size // BYTES_PER_TOKEN_ESTIMATE:,} tokens)[/dim]"
+        styled(
+            "    [dim]Total if eagerly injected: {:,} bytes (~{:,} tokens)[/dim]",
+            size,
+            size // BYTES_PER_TOKEN_ESTIMATE,
+        )
     )
 
 
@@ -302,17 +313,17 @@ def display_validation_error(
     if error.suggestion:
         error_msg = error_msg.replace(f"\n\n💡 Suggestion: {error.suggestion}", "")
 
-    content = f"[bold red]{error_type}[/bold red]\n\n"
-    content += f"[dim]File:[/dim] {workflow_path}\n\n"
+    content = styled("[bold red]{}[/bold red]\n\n", error_type)
+    content += styled("[dim]File:[/dim] {}\n\n", workflow_path)
     content += f"{error_msg}"
 
     if error.suggestion:
-        content += f"\n\n[yellow]💡 Suggestion:[/yellow] {error.suggestion}"
+        content += styled("\n\n[yellow]💡 Suggestion:[/yellow] {}", error.suggestion)
 
     console.print(
         Panel(
             content,
-            title="[red]Validation Failed[/red]",
+            title=Text.from_markup("[red]Validation Failed[/red]"),
             border_style="red",
         )
     )
@@ -397,7 +408,7 @@ def display_validation_success(
     console.print(
         Panel(
             table,
-            title="[green]Validation Successful[/green]",
+            title=Text.from_markup("[green]Validation Successful[/green]"),
             border_style="green",
         )
     )
@@ -412,7 +423,11 @@ def display_validation_success(
 
         for agent in config.agents:
             agent_type = agent.type or "agent"
-            model = agent.model or config.workflow.runtime.default_model or "[dim]default[/dim]"
+            model = (
+                agent.model
+                or config.workflow.runtime.default_model
+                or Text.from_markup("[dim]default[/dim]")
+            )
 
             if agent.routes:
                 route_targets = [r.to for r in agent.routes]
@@ -420,7 +435,7 @@ def display_validation_success(
                 if len(route_targets) > 3:
                     routes_str += f" (+{len(route_targets) - 3} more)"
             else:
-                routes_str = "[dim]none[/dim]"
+                routes_str = Text.from_markup("[dim]none[/dim]")
 
             agent_table.add_row(agent.name, agent_type, model, routes_str)
 

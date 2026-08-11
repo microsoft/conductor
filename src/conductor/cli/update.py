@@ -26,8 +26,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.text import Text
 
 from conductor import __version__
+from conductor.console import styled
 
 logger = logging.getLogger(__name__)
 
@@ -304,10 +306,14 @@ def _print_hint(console: Console, remote_version: str) -> None:
         remote_version: The newer version available.
     """
     console.print(
-        f"💡 Conductor v{remote_version} available "
-        f"(you have v{__version__}). "
-        f"Run [bold]'conductor update'[/bold] to see how, "
-        f"or [bold]'conductor update --apply'[/bold] to upgrade in one step.",
+        styled(
+            "💡 Conductor v{} available (you have v{}). Run "
+            "[bold]'conductor update'[/bold] to see how, or "
+            "[bold]'conductor update --apply'[/bold] to upgrade in one "
+            "step.",
+            remote_version,
+            __version__,
+        ),
         style="yellow",
     )
 
@@ -397,16 +403,21 @@ def _spawn_installer_and_exit(console: Console) -> None:
 
         if not spawned:
             assert last_error is not None
-            console.print(f"[bold red]Could not spawn installer:[/bold red] {last_error}")
+            console.print(styled("[bold red]Could not spawn installer:[/bold red] {}", last_error))
             console.print(
-                f"Run this manually in a new shell:  [bold cyan]{_install_command()}[/bold cyan]"
+                styled(
+                    "Run this manually in a new shell:  [bold cyan]{}[/bold cyan]",
+                    _install_command(),
+                )
             )
             raise SystemExit(1) from None
 
         console.print(
-            "[green]Installer launched in a new console window.[/green] "
-            "This conductor process will now exit so file locks release. "
-            "Watch the new window for progress."
+            Text.from_markup(
+                "[green]Installer launched in a new console window.[/green] "
+                "This conductor process will now exit so file locks release. "
+                "Watch the new window for progress."
+            )
         )
         # Exit immediately so the venv we live in becomes deletable.
         raise SystemExit(0)
@@ -415,7 +426,9 @@ def _spawn_installer_and_exit(console: Console) -> None:
     # so its output streams directly to this terminal.
     sh_command = f"curl -sSfL {_INSTALL_SH_URL} | sh"
     console.print(
-        "[green]Replacing conductor with installer…[/green] (install script output follows)"
+        Text.from_markup(
+            "[green]Replacing conductor with installer…[/green] (install script output follows)"
+        )
     )
     # os.execvpe replaces the current process image, so we need to flush
     # any buffered Rich output first.
@@ -423,8 +436,8 @@ def _spawn_installer_and_exit(console: Console) -> None:
     try:
         os.execvpe("sh", ["sh", "-c", sh_command], env)
     except OSError as e:
-        console.print(f"[bold red]Could not exec installer:[/bold red] {e}")
-        console.print(f"Run this manually:  [bold cyan]{_install_command()}[/bold cyan]")
+        console.print(styled("[bold red]Could not exec installer:[/bold red] {}", e))
+        console.print(styled("Run this manually:  [bold cyan]{}[/bold cyan]", _install_command()))
         raise SystemExit(1) from None
 
 
@@ -447,23 +460,29 @@ def run_update(console: Console, force: bool = False, apply: bool = False) -> No
     """
     del force  # accepted for backward compatibility; ignored
 
-    console.print("[bold]Checking for updates…[/bold]")
+    console.print(Text.from_markup("[bold]Checking for updates…[/bold]"))
 
     result = fetch_latest_version()
     if result is None:
-        console.print("[bold red]Error:[/bold red] Could not reach GitHub to check for updates.")
+        console.print(
+            Text.from_markup(
+                "[bold red]Error:[/bold red] Could not reach GitHub to check for updates."
+            )
+        )
         return
 
     version, _tag_name, _url = result
     current = __version__
 
     if not is_newer(version, current):
-        console.print(f"[green]Already up to date[/green] (v{current}).")
+        console.print(styled("[green]Already up to date[/green] (v{}).", current))
         # Refresh the cache so the hint stops nagging.
         write_cache(version, _tag_name, _url)
         return
 
-    console.print(f"[bold]Conductor v{version}[/bold] is available (you have v{current}).")
+    console.print(
+        styled("[bold]Conductor v{}[/bold] is available (you have v{}).", version, current)
+    )
     console.print()
 
     if apply:
@@ -472,16 +491,22 @@ def run_update(console: Console, force: bool = False, apply: bool = False) -> No
         return  # pragma: no cover - _spawn_installer_and_exit never returns
 
     cmd = _install_command()
-    console.print("To upgrade, run this in a [bold]new shell[/bold] (not inside conductor):")
+    console.print(
+        Text.from_markup("To upgrade, run this in a [bold]new shell[/bold] (not inside conductor):")
+    )
     console.print()
-    console.print(f"  [bold cyan]{cmd}[/bold cyan]")
+    console.print(styled("  [bold cyan]{}[/bold cyan]", cmd))
     console.print()
     console.print(
-        "[dim]Or re-run with [bold]--apply[/bold] to launch the installer "
-        "automatically (conductor will exit so file locks release).[/dim]"
+        Text.from_markup(
+            "[dim]Or re-run with [bold]--apply[/bold] to launch the installer "
+            "automatically (conductor will exit so file locks release).[/dim]"
+        )
     )
     console.print(
-        "[dim]The install script handles file-lock safety, retries, and "
-        "post-install verification. It is the single supported upgrade path "
-        "on all platforms.[/dim]"
+        Text.from_markup(
+            "[dim]The install script handles file-lock safety, retries, and "
+            "post-install verification. It is the single supported upgrade path "
+            "on all platforms.[/dim]"
+        )
     )

@@ -22,8 +22,10 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from conductor.config.loader import load_config
+from conductor.console import _MarkupFreeConsole, join, make_console, styled
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
@@ -52,17 +54,21 @@ logger = logging.getLogger(__name__)
 # silently bypass ``--silent`` if used on this instance. All current call
 # sites in this module use only ``.print``; if you introduce a new one,
 # either route it through ``.print`` or extend this subclass.
-class _SilentAwareConsole(Console):
+class _SilentAwareConsole(_MarkupFreeConsole):
     """``Console`` that honors ``--silent`` at the print level.
 
     The instance is locked to ``stderr=True`` to preserve the contract that
     ``--silent`` runs emit JSON on stdout with nothing else; routing gated
     output to stdout would corrupt that channel.
+
+    It is also locked to ``markup=False``, matching ``make_console``: this
+    console renders workflow, agent and for-each iteration names, so a plain
+    string must not be parsed as styling (#406). Style with ``styled``.
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        # Lock stderr=True; everything else (highlight, width, etc.) is
-        # caller-tunable.
+        # Lock stderr=True and markup=False; everything else (highlight,
+        # width, etc.) is caller-tunable.
         kwargs.pop("stderr", None)
         super().__init__(stderr=True, **kwargs)
 
@@ -141,25 +147,28 @@ def close_file_logging() -> None:
         _file_handle = None
 
 
-def verbose_log(message: str, style: str = "dim") -> None:
+def verbose_log(message: str | Text, style: str = "dim") -> None:
     """Log a message if verbose mode is enabled.
 
     Args:
-        message: The message to log.
+        message: The message to log. A ``str`` is treated as literal text; a
+            ``Text`` (e.g. from ``styled``) keeps its styling. Accepting both
+            matters because an f-string renders a ``Text`` as its plain form,
+            silently discarding the styling a caller went out of its way to
+            build (#406).
         style: Rich style for the message.
     """
     from conductor.cli.app import is_verbose
 
+    # ``Text`` not an f-string for a plain ``str``: ``message`` is
+    # agent-supplied, and interpolating it into markup makes a bracketed token
+    # like ``[/nestedType]`` a closing tag and raises MarkupError (#382).
+    # ``style=`` does not disable markup parsing, so it is not a substitute.
+    renderable = message if isinstance(message, Text) else Text(message)
     if is_verbose():
-        # ``Text`` not an f-string: ``message`` is agent-supplied, and
-        # interpolating it into markup makes a bracketed token like
-        # ``[/nestedType]`` a closing tag and raises MarkupError (#382).
-        # ``style=`` does not disable markup parsing, so it is not a substitute.
-        from rich.text import Text
-
-        _verbose_console.print(Text(message), style=style)
+        _verbose_console.print(renderable, style=style)
     if _file_console is not None:
-        _file_console.print(message)
+        _file_console.print(renderable)
 
 
 def _describe_provider(provider: ProviderSettings) -> str:
@@ -351,17 +360,31 @@ def verbose_log_section(title: str, content: str) -> None:
         # ``[/nestedType]`` in ordinary technical prose would raise MarkupError
         # and kill the run (#382). ``Text`` rather than ``escape``: escaping is
         # not byte-exact for input that already contains a backslash before a
-        # bracket (``\[0-9\]+`` renders as ``[0-9\]+``). ``title`` is
-        # conductor-controlled, so it keeps its styling.
+        # bracket (``\[0-9\]+`` renders as ``[0-9\]+``).
+        #
+        # ``title`` is *not* conductor-controlled, as this comment used to
+        # claim. Its only non-constant caller passes ``Prompt for '<agent>'``,
+        # and inside a for-each group the engine rewrites that name to
+        # ``<agent>[<key>]`` where the key comes from the source item -- so a
+        # key of ``task1`` erased the iteration identity the qualified name
+        # exists to carry, and one of ``/etc/x`` killed the run from a logging
+        # call (#406). ``Panel`` parses its title with ``Text.from_markup``
+        # regardless of the console's ``markup=False``, so this has to be a
+        # ``Text``, not an f-string.
         _verbose_console.print(
-            Panel(Text(content), title=f"[cyan]{title}[/cyan]", border_style="dim")
+            Panel(
+                Text(content),
+                title=styled("[cyan]{}[/cyan]", title),
+                border_style="dim",
+            )
         )
 
     # File always gets full untruncated content
     if _file_console is not None:
         # Deliberately not escaped: ``_file_console`` has ``markup=False``, so
-        # escaping here would write literal backslashes into the log.
-        _file_console.print(Panel(content, title=title, border_style="dim"))
+        # escaping here would write literal backslashes into the log. The title
+        # still needs wrapping -- ``markup=False`` does not reach it.
+        _file_console.print(Panel(content, title=Text(title), border_style="dim"))
 
 
 def verbose_log_timing(operation: str, elapsed: float) -> None:
@@ -374,7 +397,7 @@ def verbose_log_timing(operation: str, elapsed: float) -> None:
     from conductor.cli.app import is_verbose
 
     if is_verbose():
-        _verbose_console.print(f"[dim]⏱ {operation}: {elapsed:.2f}s[/dim]")
+        _verbose_console.print(styled("[dim]⏱ {}: {:.2f}s[/dim]", operation, elapsed))
     if _file_console is not None:
         _file_console.print(f"⏱ {operation}: {elapsed:.2f}s")
 
@@ -862,25 +885,29 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
                 exc,
             )
 
-        header_bits = [f"[bold]{provider_name}[/bold]"]
+        header_bits = [styled("[bold]{}[/bold]", provider_name)]
         if pin:
-            header_bits.append(f"([dim]{pin}[/dim])")
+            header_bits.append(styled("([dim]{}[/dim])", pin))
         if maintainer:
-            header_bits.append(f"maintained by [dim]{maintainer}[/dim]")
-        header = " ".join(header_bits)
+            header_bits.append(styled("maintained by [dim]{}[/dim]", maintainer))
+        header = join(" ", header_bits)
 
-        body_lines = [f"⚠ Experimental provider in use: {header}"]
+        body_lines = [styled("⚠ Experimental provider in use: {}", header)]
         if limitations:
-            body_lines.append("Limitations: " + ", ".join(limitations) + ".")
-        body_lines.append("See [link]docs/providers/experimental.md[/link] for stability policy.")
+            body_lines.append(Text("Limitations: " + ", ".join(limitations) + "."))
+        body_lines.append(
+            Text.from_markup(
+                "See [link]docs/providers/experimental.md[/link] for stability policy."
+            )
+        )
 
-        # ``Text.from_markup`` rather than a markup-bearing string: this panel
-        # goes to both consoles, and ``_file_console`` has ``markup=False``, so
-        # a raw string would write ``[bold]``/``[dim]`` tags literally into the
-        # log instead of styling them. Resolving the markup once here renders
-        # identically on both sinks.
+        # Built as ``Text`` rather than a markup-bearing string: this panel
+        # goes to both consoles, and both have ``markup=False``, so a raw
+        # string would write ``[bold]``/``[dim]`` tags literally instead of
+        # styling them. Resolving the markup once here renders identically on
+        # both sinks.
         panel = Panel(
-            Text.from_markup("\n".join(body_lines)),
+            join("\n", body_lines),
             border_style="yellow",
             expand=False,
         )
@@ -1164,7 +1191,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
 
     _print()
     _print("=" * 60, style="dim")
-    _print("[bold cyan]Token Usage Summary[/bold cyan]")
+    _print(Text.from_markup("[bold cyan]Token Usage Summary[/bold cyan]"))
 
     # Token totals
     total_input = usage_data.get("total_input_tokens", 0)
@@ -1176,7 +1203,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
         _print(f"  Output: {total_output:,} tokens", style="dim")
         _print(f"  Total:  {total_tokens:,} tokens", style="dim")
     else:
-        _print("  [dim]No token data available[/dim]")
+        _print(Text.from_markup("  [dim]No token data available[/dim]"))
 
     # Cost breakdown
     total_cost = usage_data.get("total_cost_usd")
@@ -1195,7 +1222,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
 
     if total_cost is not None and total_cost > 0:
         _print()
-        _print("[bold cyan]Cost Breakdown:[/bold cyan]")
+        _print(Text.from_markup("[bold cyan]Cost Breakdown:[/bold cyan]"))
 
         for agent in agents:
             agent_cost = agent.get("cost_usd")
@@ -1209,16 +1236,26 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
         if unpriced_count:
             # Partial total: flag it so a silently-undercounted number is not
             # presented as complete (see #265).
-            _print(f"  [bold]Total: ~${total_cost:.4f}[/bold][yellow]{_unpriced_suffix()}[/yellow]")
-            _print("  [dim]Partial total — some agents' models had no available pricing.[/dim]")
+            _print(
+                styled(
+                    "  [bold]Total: ~${:.4f}[/bold][yellow]{}[/yellow]",
+                    total_cost,
+                    _unpriced_suffix(),
+                )
+            )
+            _print(
+                Text.from_markup(
+                    "  [dim]Partial total — some agents' models had no available pricing.[/dim]"
+                )
+            )
         else:
-            _print(f"  [bold]Total: ${total_cost:.4f}[/bold]")
+            _print(styled("  [bold]Total: ${:.4f}[/bold]", total_cost))
     elif total_tokens > 0:
         _print()
         if unpriced_count:
-            _print(f"  [dim]Cost data unavailable{_unpriced_suffix()}[/dim]")
+            _print(styled("  [dim]Cost data unavailable{}[/dim]", _unpriced_suffix()))
         else:
-            _print("  [dim]Cost data unavailable (unknown model pricing)[/dim]")
+            _print(Text.from_markup("  [dim]Cost data unavailable (unknown model pricing)[/dim]"))
 
     _print("=" * 60, style="dim")
 
@@ -1570,6 +1607,11 @@ def _print_loaded_instructions(detailed: list[DiscoveredInstruction]) -> None:
     from conductor.config.instructions import ALWAYS_ON_SCOPE
 
     if not detailed:
+        # Plain strings on the builtin ``print``: this goes to stderr as a
+        # grep label, not through a Rich console. Wrapping it in
+        # ``Text.from_markup`` would delete the ``[workspace-instructions]``
+        # prefix outright — it starts with a lowercase letter, so Rich reads
+        # it as a style tag, and ``print`` then renders the Text's plain form.
         print("[workspace-instructions] 0 files discovered from CWD.", file=sys.stderr)
         return
     print(
@@ -1636,7 +1678,9 @@ async def run_workflow_async(
             init_file_logging(log_file)
         except OSError as e:
             _verbose_console.print(
-                f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_file, e
+                )
             )
 
     # Always create event emitter and JSONL log subscriber
@@ -1661,11 +1705,16 @@ async def run_workflow_async(
             from conductor.cli.app import is_verbose
 
             if is_verbose():
-                _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+                _verbose_console.print(
+                    styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
+                )
         except Exception as e:
             _verbose_console.print(
-                f"[bold yellow]Warning:[/bold yellow] "
-                f"Dashboard failed to start: {e}. Continuing without dashboard."
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
+                    "start: {}. Continuing without dashboard.",
+                    e,
+                )
             )
             dashboard = None
 
@@ -1804,7 +1853,9 @@ async def run_workflow_async(
             try:
                 if listener is not None:
                     await listener.start()
-                    _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    _verbose_console.print(
+                        Text.from_markup("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    )
 
                 result = await _run_with_stop_signal(engine, inputs, dashboard)
             except WorkflowTerminated as exc:
@@ -1855,14 +1906,17 @@ async def run_workflow_async(
 
                     if is_verbose():
                         banner = (
-                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            Text.from_markup("[bold yellow]Workflow terminated.[/bold yellow]")
                             if terminate_exc is not None
-                            else "[bold green]Workflow complete.[/bold green]"
+                            else Text.from_markup("[bold green]Workflow complete.[/bold green]")
                         )
                         _verbose_console.print(
-                            f"\n{banner} "
-                            f"Dashboard still running at {dashboard.url} — "
-                            f"press [bold]Ctrl+C[/bold] to exit."
+                            styled(
+                                "\n{} Dashboard still running at {} — press "
+                                "[bold]Ctrl+C[/bold] to exit.",
+                                banner,
+                                dashboard.url,
+                            )
                         )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
@@ -1887,25 +1941,27 @@ async def run_workflow_async(
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
             event_log_subscriber.close()
-            _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+            _verbose_console.print(
+                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+            )
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
-            _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
+            _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
         close_file_logging()
 
 
-def format_routes(routes: list[dict[str, Any]]) -> str:
+def format_routes(routes: list[dict[str, Any]]) -> Text:
     """Format routes for display in the dry-run table.
 
     Args:
         routes: List of route dictionaries with 'to', 'when', and 'is_conditional' keys.
 
     Returns:
-        Formatted string representation of routes.
+        Formatted representation of routes.
     """
     if not routes:
-        return "[dim]$end[/dim]"
+        return Text.from_markup("[dim]$end[/dim]")
 
     parts = []
     for route in routes:
@@ -1914,10 +1970,10 @@ def format_routes(routes: list[dict[str, Any]]) -> str:
             # Truncate long conditions
             if len(condition) > 40:
                 condition = condition[:37] + "..."
-            parts.append(f"→ {route['to']} [dim](if {condition})[/dim]")
+            parts.append(styled("→ {} [dim](if {})[/dim]", route["to"], condition))
         else:
             parts.append(f"→ {route['to']}")
-    return "\n".join(parts) if parts else "[dim]$end[/dim]"
+    return join("\n", parts) if parts else Text.from_markup("[dim]$end[/dim]")
 
 
 def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) -> None:
@@ -1930,17 +1986,21 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
         plan: The execution plan to display.
         console: Optional Rich console. Creates one if not provided.
     """
-    output_console = console if console is not None else Console()
+    output_console = console if console is not None else make_console()
 
     # Header panel with workflow metadata
     timeout_display = f"{plan.timeout_seconds}s" if plan.timeout_seconds else "unlimited"
-    header_content = (
-        f"[bold]Workflow:[/bold] {plan.workflow_name}\n"
-        f"[bold]Entry Point:[/bold] {plan.entry_point}\n"
-        f"[bold]Max Iterations:[/bold] {plan.max_iterations}\n"
-        f"[bold]Timeout:[/bold] {timeout_display}"
+    header_content = styled(
+        "[bold]Workflow:[/bold] {}\n[bold]Entry Point:[/bold] "
+        "{}\n[bold]Max Iterations:[/bold] {}\n[bold]Timeout:[/bold] {}",
+        plan.workflow_name,
+        plan.entry_point,
+        plan.max_iterations,
+        timeout_display,
     )
-    output_console.print(Panel(header_content, title="[cyan]Execution Plan (Dry Run)[/cyan]"))
+    output_console.print(
+        Panel(header_content, title=Text.from_markup("[cyan]Execution Plan (Dry Run)[/cyan]"))
+    )
 
     # Steps table
     table = Table(title="Agent Sequence", show_lines=True)
@@ -1952,13 +2012,15 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
 
     for i, step in enumerate(plan.steps, 1):
         routes_str = format_routes(step.routes)
-        loop_marker = " [yellow](loop target)[/yellow]" if step.is_loop_target else ""
+        loop_marker = (
+            Text.from_markup(" [yellow](loop target)[/yellow]") if step.is_loop_target else ""
+        )
 
         # Handle parallel groups differently
         if step.agent_type == "parallel_group":
             # Show parallel group with failure mode
             failure_mode_display = step.failure_mode or "fail_fast"
-            model_info = f"[dim]{failure_mode_display}[/dim]"
+            model_info = styled("[dim]{}[/dim]", failure_mode_display)
 
             table.add_row(
                 str(i),
@@ -1970,12 +2032,12 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
 
             # Add a detail row showing which agents execute in parallel
             if step.parallel_agents:
-                agents_display = ", ".join(
-                    f"[cyan]{agent}[/cyan]" for agent in step.parallel_agents
+                agents_display = join(
+                    ", ", (styled("[cyan]{}[/cyan]", agent) for agent in step.parallel_agents)
                 )
                 table.add_row(
                     "",
-                    f"[dim]  ⚡ {agents_display}[/dim]",
+                    styled("[dim]  ⚡ {}[/dim]", agents_display),
                     "",
                     "",
                     "",
@@ -1985,7 +2047,7 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
                 str(i),
                 f"{step.agent_name}{loop_marker}",
                 step.agent_type,
-                step.model or "[dim]default[/dim]",
+                step.model or Text.from_markup("[dim]default[/dim]"),
                 routes_str,
             )
 
@@ -1999,15 +2061,15 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
     )
 
     summary_parts = [
-        f"[dim]Total steps:[/dim] {len(plan.steps)}",
-        f"[dim]Loop targets:[/dim] {sum(1 for s in plan.steps if s.is_loop_target)}",
+        styled("[dim]Total steps:[/dim] {}", len(plan.steps)),
+        styled("[dim]Loop targets:[/dim] {}", sum(1 for s in plan.steps if s.is_loop_target)),
     ]
 
     if parallel_group_count > 0:
-        summary_parts.append(f"[dim]Parallel groups:[/dim] {parallel_group_count}")
-        summary_parts.append(f"[dim]Parallel agents:[/dim] {total_parallel_agents}")
+        summary_parts.append(styled("[dim]Parallel groups:[/dim] {}", parallel_group_count))
+        summary_parts.append(styled("[dim]Parallel agents:[/dim] {}", total_parallel_agents))
 
-    output_console.print(" | ".join(summary_parts))
+    output_console.print(join(" | ", summary_parts))
 
 
 def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
@@ -2094,13 +2156,19 @@ def _print_resume_instructions(engine: WorkflowEngine) -> None:
         return
 
     _verbose_console.print()
-    _verbose_console.print(f"[bold yellow]Workflow state saved to:[/bold yellow] {checkpoint_path}")
     _verbose_console.print(
-        f"[bold yellow]Resume with:[/bold yellow] conductor resume --from {checkpoint_path}"
+        styled("[bold yellow]Workflow state saved to:[/bold yellow] {}", checkpoint_path)
+    )
+    _verbose_console.print(
+        styled(
+            "[bold yellow]Resume with:[/bold yellow] conductor resume --from {}", checkpoint_path
+        )
     )
     if engine.workflow_path is not None:
         _verbose_console.print(
-            f"[dim]Or resume latest checkpoint:[/dim] conductor resume {engine.workflow_path}"
+            styled(
+                "[dim]Or resume latest checkpoint:[/dim] conductor resume {}", engine.workflow_path
+            )
         )
     _verbose_console.print()
 
@@ -2167,7 +2235,9 @@ async def resume_workflow_async(
             init_file_logging(log_file)
         except OSError as e:
             _verbose_console.print(
-                f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_file, e
+                )
             )
 
     # Always create event emitter and JSONL log subscriber (parity with run)
@@ -2210,9 +2280,11 @@ async def resume_workflow_async(
         current_hash = CheckpointManager.compute_workflow_hash(resolved_workflow_path)
         if current_hash != cp.workflow_hash:
             _verbose_console.print(
-                "[bold yellow]⚠ Warning:[/bold yellow] "
-                "Workflow file has changed since checkpoint was created. "
-                "Resume may produce unexpected results."
+                Text.from_markup(
+                    "[bold yellow]⚠ Warning:[/bold yellow] "
+                    "Workflow file has changed since checkpoint was created. "
+                    "Resume may produce unexpected results."
+                )
             )
 
         # Log checkpoint details
@@ -2395,11 +2467,16 @@ async def resume_workflow_async(
                     from conductor.cli.app import is_verbose
 
                     if is_verbose():
-                        _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+                        _verbose_console.print(
+                            styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
+                        )
                 except Exception as e:
                     _verbose_console.print(
-                        f"[bold yellow]Warning:[/bold yellow] "
-                        f"Dashboard failed to start: {e}. Continuing without dashboard."
+                        styled(
+                            "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
+                            "start: {}. Continuing without dashboard.",
+                            e,
+                        )
                     )
                     # Drop the dashboard everywhere it's been wired up.
                     # The engine + DialogHandler captured it at construction
@@ -2416,7 +2493,9 @@ async def resume_workflow_async(
             try:
                 if listener is not None:
                     await listener.start()
-                    _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    _verbose_console.print(
+                        Text.from_markup("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    )
 
                 result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
             except WorkflowTerminated as exc:
@@ -2467,14 +2546,17 @@ async def resume_workflow_async(
 
                     if is_verbose():
                         banner = (
-                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            Text.from_markup("[bold yellow]Workflow terminated.[/bold yellow]")
                             if terminate_exc is not None
-                            else "[bold green]Workflow complete.[/bold green]"
+                            else Text.from_markup("[bold green]Workflow complete.[/bold green]")
                         )
                         _verbose_console.print(
-                            f"\n{banner} "
-                            f"Dashboard still running at {dashboard.url} — "
-                            f"press [bold]Ctrl+C[/bold] to exit."
+                            styled(
+                                "\n{} Dashboard still running at {} — press "
+                                "[bold]Ctrl+C[/bold] to exit.",
+                                banner,
+                                dashboard.url,
+                            )
                         )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
@@ -2497,11 +2579,13 @@ async def resume_workflow_async(
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
             event_log_subscriber.close()
-            _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+            _verbose_console.print(
+                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+            )
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
-            _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
+            _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
         close_file_logging()
 
 
@@ -2564,9 +2648,19 @@ async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str
         if entry.stale:
             # This line says the run used a plugin version nobody could
             # verify, so it gets the marker rather than reading as one more
-            # startup progress line.
-            detail = f"{detail} [yellow]⚠ cached; ref not re-checked[/yellow]"
-        verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
+            # startup progress line. Assembled in one ``styled`` call: an
+            # f-string would render the Text as its plain form and drop the
+            # yellow that makes it stand out.
+            verbose_log(
+                styled(
+                    "  {}: {} [yellow]⚠ cached; ref not re-checked[/yellow] — {} plugin(s)",
+                    name,
+                    detail,
+                    len(entry.marketplace.plugins),
+                )
+            )
+        else:
+            verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
     return marketplaces_from(resolved)
 
 
