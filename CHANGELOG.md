@@ -184,6 +184,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signalled. Process-ancestry detection is POSIX-only — Windows relies on
   the env-var signals alone.
 
+- **A pricing hook that silently prices nothing is now reported** (#386). #265
+  warns when the provider pricing hook *raises*; the companion case — a hook
+  that never raises and returns `None` for everything — looked identical to
+  "these models are simply unpriced", so live pricing could be dead for a whole
+  run with no symptom beyond newer models showing up as unpriced. The verdict is
+  drawn once when the run ends — however it ends, so a run that dies part way
+  still reports it, which is when a partial cost total most needs the caveat —
+  and is emitted as a `pricing_hook_silent` event as well as a log line, so it
+  reaches the event log and the console rather than only unattributed stderr.
+  The run summary gains `usage.live_pricing_degraded` and the cost breakdown
+  prints a matching caveat, because a model priced from the static table still
+  reports a confident cost and would otherwise carry no qualification.
+  Providers that do not implement the hook are excluded: returning
+  `None` is the documented default, so counting them accused four of the five
+  providers of a broken SDK for behaving correctly.
+- **`conductor stop` now confirms the process actually stopped, and never
+  stops the wrong one** (#344). `stop` sent one signal and reported success
+  without checking, so a workflow that ignored it was reported as stopped and
+  its PID file deleted — leaving a live run untracked, invisible to `stop`,
+  and holding its port. Termination is now a ladder (ask the dashboard to
+  cancel, then signal, then force-terminate), each rung confirmed before the
+  next, and the PID file is removed only once the process is confirmed gone.
+  Every PID-directed rung is gated on the dashboard confirming its own PID,
+  because between a PID file being written and `stop` reading it the OS may
+  have recycled that PID onto an unrelated process. `--force` overrides
+  *uncertainty* only: a positive identity mismatch blocks every rung, force
+  included. PID files are written atomically, so a concurrent `stop` can no
+  longer read a half-written file and deregister a live run, and the reader
+  logs before deleting anything it cannot parse. `--force` can clear an entry
+  whose liveness cannot be probed, which would otherwise wedge `stop --all`
+  at exit 2 permanently (#166).
 - **Bracketed text no longer crashes or corrupts CLI output** (#406). The same
   defect as #382, which #387 fixed only in `cli/run.py`. `conductor validate`
   died with an unhandled `MarkupError` traceback on a workflow whose `name:`

@@ -213,19 +213,31 @@ class WebDashboard:
 
         @app.get("/api/info")
         async def get_info() -> JSONResponse:
-            """Return run identity for dashboard linking."""
-            # Extract from first workflow_started event
-            info: dict[str, Any] = {}
+            """Return run identity for dashboard linking and for ``conductor stop``.
+
+            ``pid`` is the identity ``conductor stop`` relies on: the dashboard
+            runs in the same process as the workflow, so it proves that the PID
+            recorded in a PID file really is the process listening on this port
+            and has not been recycled onto something unrelated. It is reported
+            unconditionally, unlike the ``workflow_started``-derived fields
+            below, which are empty until the workflow actually starts.
+            """
+            info: dict[str, Any] = {"pid": os.getpid()}
+            # Remaining fields come from the first workflow_started event.
             for event in self._event_history:
                 if event.get("type") == "workflow_started":
                     data = event.get("data", {})
-                    info = {
-                        "run_id": data.get("run_id", ""),
-                        "workflow_name": data.get("name", ""),
-                        "started_at": event.get("timestamp", 0),
-                        "metadata": data.get("metadata", {}),
-                        "conductor_version": data.get("system", {}).get("conductor_version", ""),
-                    }
+                    info.update(
+                        {
+                            "run_id": data.get("run_id", ""),
+                            "workflow_name": data.get("name", ""),
+                            "started_at": event.get("timestamp", 0),
+                            "metadata": data.get("metadata", {}),
+                            "conductor_version": data.get("system", {}).get(
+                                "conductor_version", ""
+                            ),
+                        }
+                    )
                     break
             return JSONResponse(content=info)
 

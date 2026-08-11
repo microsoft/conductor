@@ -679,7 +679,9 @@ class TestLaunchBackgroundResumeFailures:
         mock_write.assert_called_once()
         args, kwargs = mock_write.call_args
         assert args == (5555, 9201, wf_path)
-        assert kwargs["run_id"]  # non-empty fresh id
+        # The run id must reach the PID file, or ``conductor stop`` has no way
+        # to confirm identity before force-terminating (issue #344).
+        assert kwargs["run_id"], "run_id must be recorded in the PID file"
         assert kwargs["stderr_log"]
         assert kwargs["stdout_log"]
 
@@ -706,7 +708,9 @@ class TestLaunchBackgroundResumeFailures:
         mock_write.assert_called_once()
         args, kwargs = mock_write.call_args
         assert args == (5556, 9202, cp_path)
-        assert kwargs["run_id"]  # non-empty fresh id (checkpoint has no run_id)
+        # The run id must reach the PID file, or ``conductor stop`` has no way
+        # to confirm identity before force-terminating (issue #344).
+        assert kwargs["run_id"], "run_id must be recorded in the PID file"
         assert kwargs["stderr_log"]
         assert kwargs["stdout_log"]
 
