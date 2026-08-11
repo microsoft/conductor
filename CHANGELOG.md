@@ -167,6 +167,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`conductor stop` no longer kills the run it is executing inside** (#399).
+  An agent smoke-testing `conductor stop` from its own workflow's `bash` tool
+  inherited that workflow's background environment and terminated itself —
+  the process printed "Stopped" and was killed by what it printed. `stop` now
+  identifies the run it is executing inside via `CONDUCTOR_RUN_ID` (set on
+  every `--web-bg` child and inherited by descendants), the legacy
+  `CONDUCTOR_WEB_BG`/`CONDUCTOR_WEB_PORT` pair (for PID files predating
+  #411's `run_id` field), and POSIX process ancestry, and excludes it from
+  targeting by default: `--all` now means "stop all *other* runs", the
+  no-flag auto-stop skips it, and `--port <your own port>` is refused (exit
+  `1`, naming the fix). If only your own run is alive, `stop`/`stop --all`
+  print a refusal and exit `0` rather than erroring, since nothing named was
+  declined. Pass `--allow-self` to restore the previous behavior exactly; a
+  yellow warning is printed whenever it actually causes your own run to be
+  signalled. Process-ancestry detection is POSIX-only — Windows relies on
+  the env-var signals alone.
+
 - **Bracketed text no longer crashes or corrupts CLI output** (#406). The same
   defect as #382, which #387 fixed only in `cli/run.py`. `conductor validate`
   died with an unhandled `MarkupError` traceback on a workflow whose `name:`

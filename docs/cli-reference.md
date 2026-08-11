@@ -305,7 +305,8 @@ conductor stop [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--port PORT` | Stop the workflow running on this specific port |
-| `--all` | Stop all background conductor workflows |
+| `--all` | Stop all background conductor workflows (all *other* runs; see Self-Exclusion) |
+| `--allow-self` | Include the run this command is executing inside (refused by default) |
 
 With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
 
@@ -324,6 +325,54 @@ The web dashboard also exposes terminate controls that always preserve progress:
   shows a **"Workflow Stopped"** banner with the checkpoint path (or a clear
   explanation if no checkpoint could be saved).
 
+### Self-Exclusion
+
+`conductor stop` never targets the run it is executing inside by default — an
+agent smoke-testing this command must not terminate its own workflow (issue
+#399). This matters because a background workflow's `bash` tool inherits the
+parent process's environment, so an agent-invoked `conductor stop` can easily
+end up pointed at the very run driving it.
+
+The caller's own run is identified by three signals, tried in order (first
+match wins):
+
+1. **`CONDUCTOR_RUN_ID`** env var matching the PID file's `run_id`. Set on
+   every `--web-bg` child (and inherited by its descendants, including a
+   spawned `conductor stop`).
+2. **`CONDUCTOR_WEB_BG=1` + `CONDUCTOR_WEB_PORT`** matching the entry's port —
+   a compatibility signal used only for PID files written before `run_id`
+   existed (empty `run_id`).
+3. **Process ancestry** — a `/proc/<pid>/status` `PPid:` walk plus a session-id
+   check, so any descendant of the background process (however it was
+   re-parented) still resolves to it.
+
+Effects:
+
+- `conductor stop` (no flags) and `conductor stop --all` never stop your own
+  run; `--all` means "stop all *other* runs." If only your own run is alive,
+  both print a refusal and exit `0` (nothing was requested by name and
+  nothing failed).
+- `conductor stop --port <your own port>` is refused and exits `1`, naming
+  `--allow-self` as the remedy — here a specific target was named and
+  declined.
+- `conductor stop --allow-self [...]` restores the pre-#399 behavior exactly,
+  printing a yellow warning when the run actually being stopped is your own.
+
+**Windows caveat**: process ancestry (signal 3) is POSIX-only. On Windows,
+self-identification relies solely on the `CONDUCTOR_RUN_ID` /
+`CONDUCTOR_WEB_BG`+`CONDUCTOR_WEB_PORT` env vars — an agent whose tool runner
+strips `CONDUCTOR_*` env vars before spawning its shell is still exposed.
+
+See [`conductor status`](#conductor-status) for a non-destructive way to see
+the full list of running workflows, including your own.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Stopped/listed successfully, including a self-only refusal |
+| `1` | `--port` matched nothing, or matched only your own run |
+
 ### Examples
 
 ```bash
@@ -333,8 +382,11 @@ conductor stop
 # Stop a specific workflow by port
 conductor stop --port 8080
 
-# Stop all running background workflows
+# Stop all other running background workflows
 conductor stop --all
+
+# Include the run this command is executing inside
+conductor stop --allow-self --port 8080
 ```
 
 ## `conductor gate respond`
