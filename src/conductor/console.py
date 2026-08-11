@@ -79,42 +79,88 @@ def _highlighted(highlighter: HighlighterType, text: Text) -> Text:
     out.overflow = text.overflow
     out.no_wrap = text.no_wrap
     out.end = text.end
+    out.tab_size = text.tab_size
     out.style = text.style
     return out
 
 
-class _MarkupFreeConsole(Console):
+_MARKUP_KWARG_ERROR = (
+    "markup is not overridable: consoles are markup-free by design so an "
+    "interpolated runtime value cannot be parsed as styling. Use styled() to "
+    "style conductor's own text."
+)
+
+
+class MarkupFreeConsole(Console):
     """A ``Console`` that never parses markup but still highlights.
 
-    ``markup=False`` is the point of the class. The highlighting is what keeps
-    it a pure safety change: rich applies its ``ReprHighlighter`` to a plain
-    ``str`` but not to a ``Text``, so replacing a markup string with a
-    ``styled`` call would otherwise silently drop the colour rich gives
-    numbers, paths and quoted values across the whole CLI.
+    ``markup=False`` is the point of the class, and it is not overridable —
+    passing ``markup`` to the constructor, to ``print`` or to ``log`` raises
+    ``TypeError`` rather than being honoured or silently dropped. Rich accepts
+    a per-call ``markup=`` that overrides the instance setting, so without
+    that refusal a single call site could reopen both original failure modes
+    (a silently deleted ``[task1]``, a ``MarkupError`` from ``[/etc/x]``) —
+    and it is the obvious-looking fix for the visible ``[green]`` that
+    forgetting :func:`styled` now produces.
+
+    The highlighting is what keeps this a pure safety change: rich applies its
+    ``ReprHighlighter`` to a plain ``str`` but not to a ``Text``, so replacing
+    a markup string with a :func:`styled` call would otherwise silently drop
+    the colour rich gives numbers, paths and quoted values across the CLI.
 
     Only top-level ``Text`` arguments are highlighted, matching rich's own
     behaviour of highlighting only the strings passed directly to ``print``.
+
+    Subclass this rather than ``Console`` so the refusal is inherited (see
+    ``cli/run.py::_SilentAwareConsole``); prefer :func:`make_console` when a
+    subclass is not needed.
     """
 
     def __init__(self, **kwargs: Any) -> None:
+        if kwargs.pop("markup", False):
+            raise TypeError(_MARKUP_KWARG_ERROR)
         # Captured rather than read back off the instance: the attribute rich
         # stores it in is private, and ``rich`` is pinned only ``>=13.0.0``.
-        self._conductor_highlight: bool = bool(kwargs.get("highlight", True))
-        kwargs.pop("markup", None)
+        self._conductor_highlight: bool = kwargs.get("highlight") is not False
         super().__init__(markup=False, **kwargs)
 
     def print(self, *objects: Any, **kwargs: Any) -> None:
+        # Rejects a *truthy* markup only. ``Console.input`` forwards
+        # ``markup=`` to ``print`` unconditionally, so rejecting the kwarg's
+        # mere presence would make ``Prompt.ask(..., console=self)`` raise --
+        # and a redundant ``markup=False`` restates the guarantee rather than
+        # defeating it.
+        if kwargs.pop("markup", False):
+            raise TypeError(_MARKUP_KWARG_ERROR)
         highlight = kwargs.get("highlight")
         if highlight is None:
             highlight = self._conductor_highlight
         if highlight and self.highlighter is not None:
             objects = tuple(
-                _highlighted(self.highlighter, obj) if type(obj) is Text else obj for obj in objects
+                # ``type(...) is Text`` rather than ``isinstance``: a Text
+                # subclass would come back from ``_highlighted`` as a plain
+                # Text, silently losing its type.
+                _highlighted(self.highlighter, obj) if type(obj) is Text else obj
+                for obj in objects
             )
         super().print(*objects, **kwargs)
 
+    def log(self, *objects: Any, **kwargs: Any) -> None:
+        if kwargs.pop("markup", False):
+            raise TypeError(_MARKUP_KWARG_ERROR)
+        super().log(*objects, **kwargs)
 
-def make_console(**kwargs: Any) -> Console:
+    def input(self, prompt: Any = "", **kwargs: Any) -> str:
+        # ``Console.input`` defaults ``markup=True`` independent of the
+        # instance and forwards it to ``print``, so the prompt would be parsed
+        # even here. Forced off rather than refused: this is the method
+        # ``Prompt.ask`` calls, and rejecting it would make every prompt that
+        # passes ``console=`` unusable.
+        kwargs["markup"] = False
+        return super().input(prompt, **kwargs)
+
+
+def make_console(**kwargs: Any) -> MarkupFreeConsole:
     """Build a ``Console`` that does not parse markup.
 
     ``markup`` is locked to ``False``: this is the inverted default that keeps
@@ -122,24 +168,22 @@ def make_console(**kwargs: Any) -> Console:
     with :func:`styled` (or any ``Text``/renderable), not with markup in a
     plain string.
 
+    The concrete return type is deliberate — it is the one place the guarantee
+    can enter the type system, so a parameter annotated
+    ``MarkupFreeConsole`` cannot be handed a markup-parsing console.
+
     Args:
         **kwargs: Forwarded to ``rich.console.Console``. Passing ``markup``
             is an error rather than an override — a console that parses
             markup is the defect this module exists to prevent.
 
     Returns:
-        A configured ``Console``.
+        A configured :class:`MarkupFreeConsole`.
 
     Raises:
         TypeError: If ``markup`` is passed.
     """
-    if "markup" in kwargs:
-        raise TypeError(
-            "make_console() does not accept 'markup': consoles are markup-free by "
-            "design so interpolated runtime values cannot be parsed as styling. "
-            "Use styled() to style conductor's own text."
-        )
-    return _MarkupFreeConsole(**kwargs)
+    return MarkupFreeConsole(**kwargs)
 
 
 def join(separator: str | Text, parts: Iterable[str | Text]) -> Text:
@@ -169,18 +213,20 @@ def styled(template: str, /, *args: object, **kwargs: object) -> Text:
     verbatim, so a value containing ``[/etc/x]`` can neither raise
     ``MarkupError`` nor be silently deleted.
 
-    Field syntax is ``str.format``'s, so positional, auto-numbered and named
-    fields, conversions (``!r``, ``!s``, ``!a``) and format specs all work,
-    and ``{{``/``}}`` are literal braces.
+    Field syntax is ``str.format``'s — positional, auto-numbered, named,
+    dotted and indexed fields, conversions (``!r``, ``!s``, ``!a``) and format
+    specs, with ``{{``/``}}`` as literal braces. Mixing automatic and manual
+    numbering is not diagnosed the way ``str.format`` diagnoses it.
 
     A value that is already a ``Text`` is spliced in with its own styling
     intact, so pre-styled fragments compose::
 
-        CHECK = styled("[green]✓[/green]")
+        CHECK = Text.from_markup("[green]✓[/green]")
         styled("{} {}", CHECK, provider_name)
 
-    A format spec is not applied to a ``Text`` value — there is nothing
-    meaningful to round or align.
+    A format spec or conversion on a ``Text`` value is an error rather than a
+    silent no-op: both would flatten it back to plain characters, discarding
+    the styling the caller passed a ``Text`` to keep.
 
     Examples::
 
@@ -199,8 +245,10 @@ def styled(template: str, /, *args: object, **kwargs: object) -> Text:
         console and to pass as a ``Panel`` title or a prompt.
 
     Raises:
-        ValueError: If the template contains a NUL character, which the
-            placeholder machinery reserves.
+        ValueError: If the template contains a NUL character (reserved by the
+            placeholder machinery), if a field sits inside a markup tag so the
+            parser consumes it, or if a format spec or conversion is applied
+            to a ``Text`` value (which would discard its styling).
         rich.errors.MarkupError: If the *template* is malformed. That is a
             conductor bug rather than bad input — values never reach the
             parser.
@@ -223,18 +271,31 @@ def styled(template: str, /, *args: object, **kwargs: object) -> Text:
         if field is None:
             continue
 
+        # ``get_field`` rather than hand-rolled resolution so dotted and
+        # indexed fields (``{p.name}``, ``{d[0]}``) work and a missing field
+        # raises the standard IndexError/KeyError with the standard message.
         if field == "":
-            value = args[auto_index]
+            field = str(auto_index)
             auto_index += 1
-        elif field.isdigit():
-            value = args[int(field)]
+        value, _ = _FORMATTER.get_field(field, args, kwargs)
+
+        if isinstance(value, Text):
+            # A spec would have nothing meaningful to align and a conversion
+            # would call ``str()`` on it, flattening away exactly the styling
+            # the caller passed a ``Text`` to preserve. Refuse rather than
+            # silently drop it — that flattening is this module's own bug.
+            if spec or conversion:
+                raise ValueError(
+                    f"styled() cannot apply a format spec or conversion to a Text value "
+                    f"(field {field!r} in {template!r}): it would discard the value's "
+                    f"styling. Pass the Text without a spec, or pass a str."
+                )
+            rendered: str | Text = value
         else:
-            value = kwargs[field]
+            if conversion:
+                value = _FORMATTER.convert_field(value, conversion)
+            rendered = format(value, spec or "")
 
-        if conversion:
-            value = _FORMATTER.convert_field(value, conversion)
-
-        rendered: str | Text = value if isinstance(value, Text) else format(value, spec or "")
         values.append(rendered)
         marked.append(_FILLER * len(rendered.plain if isinstance(rendered, Text) else rendered))
 
@@ -254,7 +315,18 @@ def styled(template: str, /, *args: object, **kwargs: object) -> Text:
         body = value.plain if isinstance(value, Text) else value
         if not body:
             continue
-        start = plain.index(_FILLER, cursor)
+        try:
+            start = plain.index(_FILLER, cursor)
+        except ValueError:
+            # The parser consumed the placeholder, which happens when a field
+            # sits inside a tag (``styled("[link={}]x[/link]", url)``). The
+            # bare "'\x00' is not in list" names an internal detail and tells
+            # the reader nothing about the template that caused it.
+            raise ValueError(
+                f"styled() template put a field inside a markup tag, so the markup "
+                f"parser consumed the value: {template!r}. Build the tag from a "
+                f"conductor literal instead of interpolating into it."
+            ) from None
         plain[start : start + len(body)] = list(body)
         if isinstance(value, Text):
             # Re-anchor the fragment's own styling at its position in the

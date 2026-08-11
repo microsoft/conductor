@@ -139,7 +139,7 @@ step-by-step checklist.
 
 - **duration.py**: `parse_duration(value)` shared helper. Accepts plain `int`/`float` seconds, or strings with `ms`/`s`/`m`/`h` suffix. Raises `ValueError` (nests cleanly inside Pydantic `ValidationError`). Rejects booleans. Bounds enforcement (e.g. > 0, 24h cap) lives in callers so the parser can be reused.
 
-- **console.py**: `make_console()` / `styled()` / `join()` — the markup-safety primitives (issue #406). A leaf module (like `duration.py`) with no conductor imports, deliberately **top-level rather than under `cli/`** because `gates/` and `providers/` need it and must not import from `cli/`. `make_console` locks `markup=False`, inverting Rich's default so an interpolated runtime value is literal unless it asks to be styled; it *rejects* a `markup=` kwarg rather than allowing an override. `styled("<template>", ...)` parses the template's markup — conductor's own literal — while inserting values verbatim. It works by replacing each field with a **length-matched filler run**, parsing once, then substituting by offset: matching the width keeps the parsed template's spans valid, which is what makes nested styling around a placeholder (`[bold][red]{}[/red][/bold]`) come out right. Reading `spans[0].style` and re-applying it — the obvious alternative — collapses the nesting. A value that is already a `Text` is spliced in with its own spans re-anchored, so pre-styled fragments compose (`styled("{} {}", CHECK, name)`); without that, `format()` would flatten it and silently drop the colour from every doctor table cell. `join(sep, parts)` exists because `Text.join` requires every part to already be a `Text`, while the common shape here is a `content_lines` list mixing conductor-styled fragments with plain runtime values. `rich.markup.escape` is deliberately unused throughout: the parser treats `\[` as an escaped bracket, so `\[0-9\]+` renders as `[0-9\]+` whether escaped or not, whereas a `Text` is byte-exact. See the Console Output section under Code Style.
+- **console.py**: `make_console()` / `styled()` / `join()` — the markup-safety primitives (issue #406). A leaf module (like `duration.py`) with no conductor imports, deliberately **top-level rather than under `cli/`** because `gates/` and `providers/` need it and must not import from `cli/`. `make_console` locks `markup=False`, inverting Rich's default so an interpolated runtime value is literal unless it asks to be styled; it *rejects* a `markup=` kwarg rather than allowing an override — on the constructor and on `print`/`log`, since rich's per-call `markup=True` would otherwise reopen the defect from a single line. `styled("<template>", ...)` parses the template's markup — conductor's own literal — while inserting values verbatim. It works by replacing each field with a **length-matched filler run**, parsing once, then locating each run to substitute the value back: matching the width keeps the parsed template's spans valid, which is what makes nested styling around a placeholder (`[bold][red]{}[/red][/bold]`) come out right. Reading `spans[0].style` and re-applying it — the obvious alternative — collapses the nesting. A value that is already a `Text` is spliced in with its own spans re-anchored, so pre-styled fragments compose (`styled("{} {}", CHECK, name)`); without that, `format()` would flatten it and silently drop the colour from every doctor table cell. `join(sep, parts)` exists because `Text.join` requires every part to already be a `Text`, while the common shape here is a `content_lines` list mixing conductor-styled fragments with plain runtime values. `rich.markup.escape` is deliberately unused throughout: the parser treats `\[` as an escaped bracket, so `\[0-9\]+` renders as `[0-9\]+` whether escaped or not, whereas a `Text` is byte-exact. See the Console Output section under Code Style.
 
 - **providers/**: SDK provider abstraction
   - `base.py` - `AgentProvider` ABC defining `execute()`, `validate_connection()`, `close()`
@@ -223,7 +223,7 @@ log. See issue #116.
 ## Tests Structure
 
 Tests mirror source structure in `tests/`:
-- `test_cli/` - CLI command tests, e2e tests. `test_markup_guards.py` is the one that keeps issue #406 closed: it reads `src/conductor` with `ast` and fails with file:line when a new call site builds a bare `Console`, hands an interpolated string to a `Panel` title or a `Prompt`, passes an f-string to `Text.from_markup`, or leaves a markup literal at a print/cell sink. Each rule has a negative control, because a source-scanning check that quietly matches nothing reports "all clear" forever. `test_markup_injection.py` covers the same ground behaviourally, driving the real commands — the two layers are not redundant: the guard alone cannot prove `styled` renders correctly, and the behavioural tests alone cannot stop the *next* call site, which is the actual failure mode here
+- `test_cli/` - CLI command tests, e2e tests. `test_markup_guards.py` is the one that keeps issue #406 closed: it reads `src/conductor` with `ast` and fails with file:line across eight rules — a bare `Console` or a `Console` subclass (A), an interpolated `Panel` title or `Prompt` (B), an f-string into `Text.from_markup` (C), a markup literal at a print/cell sink (D), a `Text` through the builtin `print` (E) or into an f-string (F), unescaped brackets in `typer` help text (G), and any use of `rich.markup.escape` (H). Each rule is a shared predicate called by both the source scan and its negative control, so a control cannot pass against a drifted rule — that had already happened once. Each rule has a negative control, because a source-scanning check that quietly matches nothing reports "all clear" forever. `test_markup_injection.py` covers the same ground behaviourally, driving the real commands — the two layers are not redundant: the guard alone cannot prove `styled` renders correctly, and the behavioural tests alone cannot stop the *next* call site, which is the actual failure mode here
 - `test_config/` - Schema validation, loader tests
 - `test_engine/` - Workflow, router, context, limits tests
 - `test_executor/` - Agent, template, output tests
@@ -273,14 +273,18 @@ quiet half is the dangerous one — a listing that drops half a name looks
 like it worked. Note `style=` does **not** disable parsing (issues #382,
 #387, #406).
 
-The rules, all enforced by `tests/test_cli/test_markup_guards.py`, which
-reads the source and reports file:line:
+Each rule below is enforced by a matching rule in
+`tests/test_cli/test_markup_guards.py`, which reads the source and reports
+file:line:
 
-- **Build every console with `conductor.console.make_console()`.** It locks
-  `markup=False`, so a plain string is literal unless it asks to be styled.
-  This covers plain prints, `Panel` bodies, `Table` cells, headers, titles
-  and captions, and `Rule` titles. A `Console` subclass must lock it too
-  (see `cli/run.py::_SilentAwareConsole`).
+- **Build every console with `conductor.console.make_console()`** (rule A).
+  It locks `markup=False`, so a plain string is literal unless it asks to be
+  styled. This covers plain prints, `Panel` bodies, `Table` cells, headers,
+  titles and captions, and `Rule` titles. `markup` is not overridable —
+  passing it to the constructor, to `print` or to `log` raises `TypeError`,
+  because rich's per-call `markup=True` would otherwise reopen the whole
+  defect from one line. Subclass `MarkupFreeConsole` rather than rich's
+  `Console` so the refusal is inherited (see `cli/run.py::_SilentAwareConsole`).
 - **Style with `conductor.console.styled("<template>", value, ...)`.** The
   template is conductor's own literal and is parsed; values are inserted
   verbatim and never reach the parser. A value that is already a `Text` is
@@ -289,20 +293,33 @@ reads the source and reports file:line:
   `conductor.console.join(sep, parts)` to join a list mixing `str` and
   `Text` (`Text.join` requires every part to be a `Text` already).
 - **`Panel(title=)`, `Panel(subtitle=)` and `Prompt`/`Confirm`/`IntPrompt`
-  prompts must be handed a `Text`.** Rich calls `Text.from_markup` on those
-  unconditionally (`rich/panel.py`, `rich/prompt.py`), so `markup=False`
-  never reaches them. This is the trap that made #387 incomplete: it fixed
-  the panel *body* and left the `title=` f-string one line away.
-- **Do not use `rich.markup.escape`.** It is not byte-exact — the parser
-  treats `\[` as an escaped bracket, so an ordinary regex like `\[0-9\]+`
-  renders as `[0-9\]+` whether or not it was escaped first. Building a
-  `Text` avoids the parser entirely.
-- Typer's own `help=` / `epilog=` are **outside** this convention: Typer
-  renders them through its own console.
+  prompts must be handed a `Text`** (rule B). Rich calls `Text.from_markup`
+  on those unconditionally (`rich/panel.py`, `rich/prompt.py`), so
+  `markup=False` never reaches them. This is the trap that made #387
+  incomplete: it fixed the panel *body* and left the `title=` f-string one
+  line away.
+- **Never let a `Text` reach a plain-string context** — an f-string (rule F),
+  `str()`, or the builtin `print` (rule E). `str(Text)` is its *plain* form,
+  so styling is dropped and any text rich already parsed as a tag is gone
+  outright. This one has the worst record in the codebase: it shipped four
+  separate times during #406 alone, twice destroying data rather than
+  colour. Use `styled("{}{}", ...)` or `join(...)` instead.
+- **Do not use `rich.markup.escape`** (rule H). It is not
+  byte-exact — the parser treats `\[` as an escaped bracket, so an ordinary
+  regex like `\[0-9\]+` renders as `[0-9\]+` whether or not it was escaped
+  first. Building a `Text` avoids the parser entirely.
+- **Typer's `help=` / `epilog=` must escape their brackets** as `\[ ... ]`
+  (rule G). These are outside the *console* convention — Typer renders them
+  through its own rich console — but they are still markup-parsed. Escaping
+  is the remedy here rather than a `Text`, because Typer takes a `str`.
+  Forgetting cost `conductor run --help` the entire `[@registry][@version]`
+  syntax, which appears nowhere else in the help output.
 
 The worst outcome of forgetting is now a visible literal `[green]` in the
 output rather than a crash or a silent deletion, and rule D of the guard
-catches that statically.
+catches that statically. Each rule is a shared predicate called by both the
+source scan and its negative control, so a control cannot pass while the rule
+it guards has drifted.
 
 ### Provider Parity
 

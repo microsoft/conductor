@@ -24,7 +24,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from conductor.console import make_console, styled
+from conductor.console import join, make_console, styled
 
 # Values that a workflow, an agent name, a plugin manifest or an exception
 # string can genuinely contain. Split by failure mode, because they fail
@@ -195,6 +195,38 @@ class TestFormatSyntax:
             styled("a\x00b{}c", "X")
 
 
+class TestStyledRefusesRatherThanLosingData:
+    """The paths where silently doing something reasonable would lose styling."""
+
+    def test_format_spec_on_a_text_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="format spec or conversion"):
+            styled("[dim]{:>10}[/dim]", styled("[green]x[/green]"))
+
+    def test_conversion_on_a_text_is_refused(self) -> None:
+        """``!s`` would call ``str()`` on it, flattening the styling away."""
+        with pytest.raises(ValueError, match="format spec or conversion"):
+            styled("{!s}", styled("[green]x[/green]"))
+
+    def test_a_field_inside_a_tag_is_a_clear_error(self) -> None:
+        """The parser eats the placeholder, so the value has nowhere to land.
+
+        The bare ``'\x00' is not in list`` named an internal detail and told
+        the reader nothing about which template caused it.
+        """
+        with pytest.raises(ValueError, match="field inside a markup tag"):
+            styled("[link={}]docs[/link]", "https://example.com")
+
+    def test_dotted_and_indexed_fields_resolve(self) -> None:
+        """``get_field`` rather than hand-rolled resolution."""
+
+        class Agent:
+            name = "review[/x]"
+
+        assert render(styled("{a.name} {d[0]}", a=Agent(), d=["first[/y]"])) == (
+            "review[/x] first[/y]"
+        )
+
+
 class TestTextIsNotFlattenedByCallers:
     """``str(Text)`` is its plain form, so an f-string discards the styling.
 
@@ -287,9 +319,57 @@ class TestTextValuesAreSpliced:
         b = styled("[red]B[/red]")
         assert render_ansi(styled("{} {}", a, b)) == "\x1b[32mA\x1b[0m \x1b[31mB\x1b[0m"
 
+    def test_a_text_with_a_base_style_keeps_it(self) -> None:
+        """The ``value.style`` branch — a ``Text`` styled at construction.
+
+        Every ``Text`` conductor passes today carries its styling in spans
+        rather than a base style, so without this the branch that re-anchors
+        the base style is never exercised.
+        """
+        assert render_ansi(styled("<{}>", Text("x", style="green"))) == "<\x1b[32mx\x1b[0m>"
+
+    def test_a_base_style_does_not_override_an_inner_span(self) -> None:
+        fragment = Text("ab", style="green")
+        fragment.stylize("bold", 0, 1)
+        assert render_ansi(styled("{}", fragment)) == "\x1b[1;32ma\x1b[0m\x1b[32mb\x1b[0m"
+
     def test_mixed_text_and_plain_values(self) -> None:
         check = styled("[green]✓[/green]")
         assert render(styled("{} {} {}", check, "x[/y]", 3)) == "✓ x[/y] 3"
+
+
+class TestJoin:
+    """``join`` is what carries the mixed ``content_lines`` lists.
+
+    ``Text.join`` requires every part to already be a ``Text``, but the shape
+    in ``gates/`` is a list holding some conductor-styled fragments and some
+    plain runtime values. Untested, a regression to ``"\n".join(str(x))``
+    passes the whole suite while flattening every styled fragment.
+    """
+
+    def test_plain_parts_stay_literal(self) -> None:
+        assert render(join("\n", ["[dim]", "[/etc/x]"])) == "[dim]\n[/etc/x]"
+
+    def test_text_parts_keep_their_styling(self) -> None:
+        out = render_ansi(join(" ", [styled("[green]a[/green]"), "b[/c]"]))
+        assert out == "\x1b[32ma\x1b[0m b[/c]"
+
+    def test_a_plain_separator_stays_literal(self) -> None:
+        assert render(join("[dim]", ["a", "b"])) == "a[dim]b"
+
+    def test_a_text_separator_keeps_its_styling(self) -> None:
+        out = render_ansi(join(styled("[red]|[/red]"), ["a", "b"]))
+        assert out == "a\x1b[31m|\x1b[0mb"
+
+    def test_empty_iterable_is_empty(self) -> None:
+        assert render(join("\n", [])) == ""
+
+    def test_single_part_has_no_separator(self) -> None:
+        assert render(join(", ", ["only[/x]"])) == "only[/x]"
+
+    @pytest.mark.parametrize("value", CRASHING_VALUES + DELETED_VALUES)
+    def test_dangerous_values_survive(self, value: str) -> None:
+        assert value in render(join(" ", ["before", value, "after"]))
 
 
 class TestMakeConsole:
@@ -344,8 +424,65 @@ class TestMakeConsole:
         assert "[/etc/p]" in buf.getvalue()
 
     def test_markup_cannot_be_re_enabled(self) -> None:
-        with pytest.raises(TypeError, match="does not accept 'markup'"):
+        with pytest.raises(TypeError, match="markup is not overridable"):
             make_console(markup=True)
+
+    def test_markup_cannot_be_re_enabled_per_call(self) -> None:
+        """The per-call kwarg reopens both original failure modes.
+
+        Rich lets ``print(..., markup=True)`` override the instance setting, so
+        without this refusal one call site restores the silent deletion and the
+        MarkupError. It is also the obvious-looking fix for the visible
+        ``[green]`` that forgetting ``styled`` now produces, which is exactly
+        why it has to be refused rather than documented against.
+        """
+        console = make_console(file=io.StringIO())
+        with pytest.raises(TypeError, match="markup is not overridable"):
+            console.print("plugin [task1] name", markup=True)
+        with pytest.raises(TypeError, match="markup is not overridable"):
+            console.log("plugin [task1] name", markup=True)
+
+    def test_a_redundant_markup_false_is_tolerated(self) -> None:
+        """Only a *truthy* markup is refused.
+
+        ``Console.input`` forwards ``markup=`` to ``print`` unconditionally,
+        so refusing the kwarg's mere presence breaks every prompt that passes
+        ``console=``. A redundant ``markup=False`` restates the guarantee.
+        """
+        buf = io.StringIO()
+        make_console(file=buf, width=200, no_color=True).print("x [/etc/p] y", markup=False)
+        assert "[/etc/p]" in buf.getvalue()
+
+    def test_prompt_works_when_given_this_console(self) -> None:
+        """``Prompt.ask(console=...)`` goes through ``Console.input``."""
+        from rich.prompt import Prompt
+
+        console = make_console(file=io.StringIO(), width=200, no_color=True)
+        answer = Prompt.ask(
+            styled("[bold]Enter {}[/bold]", "a[/etc/x]"),
+            console=console,
+            stream=io.StringIO("value\n"),
+        )
+        assert answer == "value"
+
+    def test_prompt_text_is_not_parsed_when_given_this_console(self) -> None:
+        buf = io.StringIO()
+        console = make_console(file=buf, width=200, no_color=True)
+        Prompt.ask(Text("name [/etc/x]"), console=console, stream=io.StringIO("v\n"))
+        assert "[/etc/x]" in buf.getvalue()
+
+    def test_log_still_forwards_when_markup_is_not_passed(self) -> None:
+        """The override must guard the kwarg without breaking the method."""
+        buf = io.StringIO()
+        make_console(file=buf, width=200, no_color=True).log("keep [dim] this")
+        assert "keep [dim] this" in buf.getvalue()
+
+    def test_subclasses_inherit_the_refusal(self) -> None:
+        """The rule lives on the class, so a subclass cannot bypass it."""
+        from conductor.cli.run import _SilentAwareConsole
+
+        with pytest.raises(TypeError, match="markup is not overridable"):
+            _SilentAwareConsole(markup=True)
 
     def test_other_console_options_are_forwarded(self) -> None:
         console = make_console(stderr=True, width=123, no_color=True)

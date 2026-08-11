@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from rich.table import Table
 from rich.text import Text
 
-from conductor.console import join, styled
+from conductor.console import MarkupFreeConsole, join, styled
 from conductor.providers.capabilities import known_provider_names
 from conductor.providers.diagnostics import (
     ALL_SECTIONS,
@@ -50,8 +50,8 @@ def run_doctor(
     check: bool,
     models: bool,
     as_json: bool,
-    console: Console,
-    err_console: Console,
+    console: MarkupFreeConsole,
+    err_console: MarkupFreeConsole,
 ) -> int:
     """Gather and render diagnostics, returning a process exit code.
 
@@ -195,7 +195,7 @@ def _render_env(env: EnvDiagnostic, console: Console) -> None:
 
 def _render_providers(
     providers: list[ProviderDiagnostic],
-    console: Console,
+    console: MarkupFreeConsole,
     *,
     check: bool,
     models: bool,

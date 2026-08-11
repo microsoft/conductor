@@ -17,16 +17,43 @@ the one that ships unnoticed.
 
 from __future__ import annotations
 
+import importlib
+import io
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
+from conductor.console import make_console
+
+# ``conductor.cli.app`` binds a Typer named ``app`` at module scope, so a
+# plain ``import conductor.cli.app as _app_module`` resolves to the Typer
+# rather than the module. Same trap documented in test_doctor.py.
+_app_module = importlib.import_module("conductor.cli.app")
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _fixed_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Render at a fixed width regardless of the developer's terminal.
+
+    These tests assert that a bracketed value survives *rendering*, so a
+    narrow terminal wrapping a table cell reports a markup regression that did
+    not happen. ``tests/test_cli/test_doctor.py`` pins the app consoles for
+    the same reason; pinning ``COLUMNS`` covers the commands that build their
+    own console too.
+    """
+    monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", "1")
+    # The CLI's consoles are module-level, so they take their width at import
+    # time and ``COLUMNS`` alone does not reach them.
+    monkeypatch.setattr(_app_module, "output_console", make_console(width=200))
+    monkeypatch.setattr(_app_module, "console", make_console(stderr=True, width=200))
+
 
 # ``/``-leading tokens raise MarkupError; the rest are silently deleted.
 CRASHING = "[/etc/x]"
@@ -217,25 +244,32 @@ class TestForEachIterationIdentitySurvives:
 class TestDialogRendersAgentNames:
     """``gates/dialog.py`` builds a Panel title from the same qualified name."""
 
-    @pytest.mark.parametrize("key", ["task1", "/etc/x"])
-    def test_dialog_opening_title_keeps_the_agent_name(self, key: str) -> None:
-        from rich.panel import Panel
+    @pytest.mark.parametrize("key", ["task1", "kpi-7", "#42", "user@host", "/etc/x", "0"])
+    def test_dialog_opening_renders_the_agent_name_in_body_and_title(self, key: str) -> None:
+        """Render for real rather than inspecting a mocked ``Panel``.
 
+        Reading ``str(panel.title)`` off a ``MagicMock`` cannot see this bug: a
+        regressed f-string title is a ``str`` that still *contains* the name,
+        so the assertion holds while the rendered output has the name deleted.
+        Rendering also covers the ``Panel`` body, which carries the same name.
+
+        The name appears twice — once in the "Dialog Mode" body and once as the
+        question panel's title — so ``count >= 2`` is what isolates the title.
+        A plain ``in`` would be satisfied by the body alone.
+        """
         from conductor.config.schema import AgentDef
+        from conductor.console import make_console
         from conductor.gates.dialog import DialogHandler
 
-        console = MagicMock()
-        handler = DialogHandler(console=console)
+        buf = io.StringIO()
+        handler = DialogHandler(console=make_console(file=buf, width=300, no_color=True))
         agent = AgentDef(name=f"review[{key}]", prompt="p")
 
         handler._display_dialog_start(agent, {"out": 1}, "question?")
 
-        titles = [
-            call.args[0].title
-            for call in console.print.call_args_list
-            if call.args and isinstance(call.args[0], Panel) and call.args[0].title is not None
-        ]
-        assert any(f"review[{key}]" in str(title) for title in titles), titles
+        rendered = "".join(buf.getvalue().split())
+        needle = "".join(f"review[{key}]".split())
+        assert rendered.count(needle) >= 2, rendered
 
 
 class TestErrorPanelsRenderExceptionText:
@@ -324,6 +358,22 @@ class TestFetchedPluginMetadataRenders:
         with console.capture() as captured:
             print_error(PluginManifestError(message))
         assert "".join(message.split()) in "".join(captured.get().split())
+
+
+class TestTyperHelpDocumentsRegistrySyntax:
+    """Typer renders help through its own rich console, which parses markup.
+
+    ``[@registry]`` starts with ``@``, so rich read it as a tag and deleted
+    it: every command that accepts a registry reference documented the syntax
+    as plain ``name``, and it appears nowhere else in ``--help``.
+    """
+
+    @pytest.mark.parametrize("command", ["run", "resume", "validate", "show"])
+    def test_registry_reference_syntax_is_visible(self, command: str) -> None:
+        result = runner.invoke(app, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        rendered = "".join(result.output.split())
+        assert "name[@registry][@version]" in rendered
 
 
 class TestGateResponseRendersServerPayloads:

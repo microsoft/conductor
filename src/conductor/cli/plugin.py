@@ -138,14 +138,20 @@ def fetch_plugins(
             state = "cached (ref not re-checked)"
         else:
             state = "fetched" if entry.fetched else "cached"
-        mark = "[yellow]⚠[/yellow]" if entry.stale else "[green]✓[/green]"
-        # Assembled in one ``styled`` call rather than an f-string: an
-        # f-string renders a ``Text`` as its plain form, which would drop the
-        # ✓/⚠ colour that is the whole point of the marker column on a
-        # command CI gates on.
+        # Passed as a value rather than concatenated into the template: the
+        # template is meant to be a conductor literal, and building it from a
+        # variable is the shape that becomes an injection site the day the
+        # variable holds runtime data. ``styled`` splices a pre-styled
+        # ``Text`` with its spans intact, which is what it is for.
+        mark = (
+            Text.from_markup("[yellow]⚠[/yellow]")
+            if entry.stale
+            else Text.from_markup("[green]✓[/green]")
+        )
         output_console.print(
             styled(
-                "  " + mark + " {} — {} — {}, {} plugin(s)",
+                "  {} {} — {} — {}, {} plugin(s)",
+                mark,
                 name,
                 detail,
                 state,

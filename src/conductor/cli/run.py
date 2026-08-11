@@ -25,7 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from conductor.config.loader import load_config
-from conductor.console import _MarkupFreeConsole, join, make_console, styled
+from conductor.console import MarkupFreeConsole, join, make_console, styled
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # silently bypass ``--silent`` if used on this instance. All current call
 # sites in this module use only ``.print``; if you introduce a new one,
 # either route it through ``.print`` or extend this subclass.
-class _SilentAwareConsole(_MarkupFreeConsole):
+class _SilentAwareConsole(MarkupFreeConsole):
     """``Console`` that honors ``--silent`` at the print level.
 
     The instance is locked to ``stderr=True`` to preserve the contract that
@@ -224,8 +224,6 @@ def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
         agent_name: Name of the agent being executed.
         iteration: Current iteration number (1-indexed).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -270,8 +268,6 @@ def verbose_log_agent_complete(
         input_tokens: Input tokens used (if available).
         output_tokens: Output tokens generated (if available).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -310,8 +306,6 @@ def verbose_log_route(target: str) -> None:
     Args:
         target: The routing target.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -344,8 +338,6 @@ def verbose_log_section(title: str, content: str) -> None:
         title: Section title.
         content: Section content.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_full, is_verbose
 
     # Sections are detail-level: show on console only in FULL mode
@@ -409,8 +401,6 @@ def verbose_log_parallel_start(group_name: str, agent_count: int) -> None:
         group_name: Name of the parallel group.
         agent_count: Number of agents in the group.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -449,8 +439,6 @@ def verbose_log_parallel_agent_complete(
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -491,8 +479,6 @@ def verbose_log_parallel_agent_failed(
         exception_type: Type of exception.
         message: Error message.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -529,8 +515,6 @@ def verbose_log_agent_timeout(
         elapsed: Elapsed time in seconds.
         timeout_seconds: Configured timeout limit.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -567,8 +551,6 @@ def verbose_log_budget_exceeded(
         budget_mode: Active mode (``audit`` or ``enforce``).
         current_agent: Agent executing when the budget was exceeded.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -603,8 +585,6 @@ def verbose_log_parallel_summary(
         failure_count: Number of agents that failed.
         total_elapsed: Total elapsed time in seconds.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -653,8 +633,6 @@ def verbose_log_for_each_start(
         max_concurrent: Maximum concurrent executions.
         failure_mode: Failure mode (fail_fast, continue_on_error, all_or_nothing).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -693,8 +671,6 @@ def verbose_log_for_each_item_complete(
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -733,8 +709,6 @@ def verbose_log_for_each_item_failed(
         exception_type: Type of exception.
         message: Error message.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -773,8 +747,6 @@ def verbose_log_for_each_summary(
         failure_count: Number of items that failed.
         total_elapsed: Total elapsed time in seconds.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -848,7 +820,6 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
     )
 
     from rich.panel import Panel
-    from rich.text import Text
 
     for provider_name, meta in providers.items():
         if not isinstance(meta, dict):
@@ -1973,7 +1944,9 @@ def format_routes(routes: list[dict[str, Any]]) -> Text:
             parts.append(styled("→ {} [dim](if {})[/dim]", route["to"], condition))
         else:
             parts.append(f"→ {route['to']}")
-    return join("\n", parts) if parts else Text.from_markup("[dim]$end[/dim]")
+    # ``parts`` cannot be empty: ``routes`` is non-empty past the guard above
+    # and every iteration appends.
+    return join("\n", parts)
 
 
 def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) -> None:
@@ -2012,6 +1985,10 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
 
     for i, step in enumerate(plan.steps, 1):
         routes_str = format_routes(step.routes)
+        # Interpolated via ``styled`` rather than an f-string at the two call
+        # sites below: an f-string renders a ``Text`` as its plain form, which
+        # would silently drop the yellow that makes a loop target stand out
+        # from the agent names around it (#406).
         loop_marker = (
             Text.from_markup(" [yellow](loop target)[/yellow]") if step.is_loop_target else ""
         )
@@ -2024,7 +2001,7 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
 
             table.add_row(
                 str(i),
-                f"{step.agent_name}{loop_marker}",
+                styled("{}{}", step.agent_name, loop_marker),
                 step.agent_type,
                 model_info,
                 routes_str,
@@ -2045,7 +2022,7 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
         else:
             table.add_row(
                 str(i),
-                f"{step.agent_name}{loop_marker}",
+                styled("{}{}", step.agent_name, loop_marker),
                 step.agent_type,
                 step.model or Text.from_markup("[dim]default[/dim]"),
                 routes_str,

@@ -291,9 +291,13 @@ def run(
     workflow: Annotated[
         str,
         typer.Argument(
-            # Not wrapped for markup safety: Typer renders its own help text
-            # through its own console, not conductor's.
-            help="Workflow file path or registry reference (name[@registry][@version]).",
+            # Typer renders help through rich (``rich_markup_mode="rich"``),
+            # so this string *is* markup-parsed and the console convention
+            # does not reach it. ``[@registry]`` starts with ``@``, which rich
+            # reads as a tag and deletes -- the syntax this line documents was
+            # missing from ``--help`` entirely. Escaped rather than wrapped in
+            # ``Text``: typer takes a ``str`` here (#406).
+            help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
     provider: Annotated[
@@ -597,9 +601,13 @@ def validate(
     workflow: Annotated[
         str,
         typer.Argument(
-            # Not wrapped for markup safety: Typer renders its own help text
-            # through its own console, not conductor's.
-            help="Workflow file path or registry reference (name[@registry][@version]).",
+            # Typer renders help through rich (``rich_markup_mode="rich"``),
+            # so this string *is* markup-parsed and the console convention
+            # does not reach it. ``[@registry]`` starts with ``@``, which rich
+            # reads as a tag and deletes -- the syntax this line documents was
+            # missing from ``--help`` entirely. Escaped rather than wrapped in
+            # ``Text``: typer takes a ``str`` here (#406).
+            help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
 ) -> None:
@@ -645,9 +653,13 @@ def show(
     workflow: Annotated[
         str,
         typer.Argument(
-            # Not wrapped for markup safety: Typer renders its own help text
-            # through its own console, not conductor's.
-            help="Workflow file path or registry reference (name[@registry][@version]).",
+            # Typer renders help through rich (``rich_markup_mode="rich"``),
+            # so this string *is* markup-parsed and the console convention
+            # does not reach it. ``[@registry]`` starts with ``@``, which rich
+            # reads as a tag and deletes -- the syntax this line documents was
+            # missing from ``--help`` entirely. Escaped rather than wrapped in
+            # ``Text``: typer takes a ``str`` here (#406).
+            help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
 ) -> None:
@@ -774,10 +786,10 @@ def resume(
     workflow: Annotated[
         str | None,
         typer.Argument(
-            # Not wrapped for markup safety: Typer renders its own help text
-            # through its own console, not conductor's.
+            # Escaped, not wrapped: typer renders help through rich, so an
+            # unescaped ``[@registry]`` is parsed as a tag and deleted (#406).
             help=(
-                "Workflow file path or registry reference (name[@registry][@version]). "
+                r"Workflow file path or registry reference (name\[@registry]\[@version]). "
                 "Finds the latest checkpoint for this workflow."
             ),
         ),

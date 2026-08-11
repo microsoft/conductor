@@ -11,12 +11,11 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
-from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 from rich.text import Text
 
-from conductor.console import join, make_console, styled
+from conductor.console import MarkupFreeConsole, join, make_console, styled
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +80,7 @@ class InterruptHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_gates: bool = False,
     ) -> None:
         """Initialize the InterruptHandler.

@@ -15,13 +15,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
 
-from conductor.console import make_console, styled
+from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.executor.linkify import linkify_markdown
 
 if TYPE_CHECKING:
@@ -149,7 +148,7 @@ class DialogHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_dialogs: bool = False,
         emitter: WorkflowEventEmitter | None = None,
         web_dashboard: WebDashboard | None = None,

@@ -9,13 +9,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from conductor.config.loader import load_config
-from conductor.console import make_console, styled
+from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.exceptions import ConductorError
 
 if TYPE_CHECKING:
@@ -24,7 +23,7 @@ if TYPE_CHECKING:
 
 def validate_workflow(
     workflow_path: Path,
-    console: Console | None = None,
+    console: MarkupFreeConsole | None = None,
 ) -> tuple[bool, WorkflowConfig | None]:
     """Validate a workflow YAML file.
 
@@ -78,7 +77,7 @@ def validate_workflow(
 def _report_plugins(
     config: WorkflowConfig,
     workflow_path: Path,
-    console: Console,
+    console: MarkupFreeConsole,
 ) -> None:
     """Print what each enabled plugin actually contributes.
 
@@ -201,7 +200,7 @@ def _report_plugins(
 def _report_skill_discovery(
     config: WorkflowConfig,
     workflow_path: Path,
-    console: Console,
+    console: MarkupFreeConsole,
     already_reported: list[str],
 ) -> None:
     """Print what ``runtime.skill_discovery`` puts in effect on this machine.
@@ -297,7 +296,7 @@ def _report_skill_discovery(
 def display_validation_error(
     error: ConductorError,
     workflow_path: Path,
-    console: Console,
+    console: MarkupFreeConsole,
 ) -> None:
     """Display a validation error with Rich formatting.
 
@@ -332,7 +331,7 @@ def display_validation_error(
 def display_validation_success(
     config: WorkflowConfig,
     workflow_path: Path,
-    console: Console,
+    console: MarkupFreeConsole,
 ) -> None:
     """Display validation success with workflow summary.
 

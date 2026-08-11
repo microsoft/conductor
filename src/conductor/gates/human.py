@@ -12,13 +12,12 @@ import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 from rich.text import Text
 
-from conductor.console import join, make_console, styled
+from conductor.console import MarkupFreeConsole, join, make_console, styled
 from conductor.exceptions import HumanGateError
 from conductor.executor.linkify import linkify_markdown
 from conductor.executor.template import TemplateRenderer
@@ -223,7 +222,7 @@ class HumanGateHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_gates: bool = False,
     ) -> None:
         """Initialize the HumanGateHandler.
@@ -537,7 +536,7 @@ class MaxIterationsHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_gates: bool = False,
     ) -> None:
         """Initialize the MaxIterationsHandler.

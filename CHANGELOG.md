@@ -198,9 +198,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regardless of the console setting — that is the trap that left #387
   incomplete one line from the code it changed. `rich.markup.escape` is no
   longer used anywhere: it cannot round-trip a value containing a backslash
-  before a bracket, so an ordinary regex came out mangled. Four static guards
-  now read the source and fail with file:line if a new call site
-  reintroduces any of these shapes.
+  before a bracket, so an ordinary regex came out mangled. Eight static guards
+  now read the source and fail with file:line if a new call site reintroduces
+  any of these shapes — including a `Text` flattened back into an f-string,
+  which is how the defect kept coming back, and unescaped brackets in `typer`
+  help text, which had silently cost `conductor run --help` the whole
+  `[@registry][@version]` syntax.
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
