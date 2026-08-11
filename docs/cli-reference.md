@@ -6,6 +6,7 @@ Complete command-line reference for Conductor.
 
 - [Root-Level Options](#root-level-options)
 - [`conductor run`](#conductor-run)
+- [`conductor status`](#conductor-status)
 - [`conductor stop`](#conductor-stop)
 - [`conductor gate respond`](#conductor-gate-respond)
 - [`conductor checkpoint list`](#conductor-checkpoint-list)
@@ -224,6 +225,44 @@ conductor run workflow.yaml --input config='{"key": "value", "count": 5}'
 conductor run workflow.yaml --input text="Line 1
 Line 2
 Line 3"
+```
+
+## `conductor status`
+
+List background workflows launched with `--web-bg`, without stopping any of them.
+
+```bash
+conductor status [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Emit machine-readable output instead of a table |
+
+### Why This Exists
+
+`conductor stop` with no arguments also lists running workflows — but it *stops* one when exactly one is running, so the natural "what's running?" reflex is destructive precisely when there is a single run to lose. `conductor status` never terminates anything.
+
+It is also read-only on disk: unlike `stop`, it never removes a PID file, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
+
+The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Listed successfully, including when nothing is running |
+
+### Examples
+
+```bash
+# What is running right now?
+conductor status
+
+# Machine-readable, for scripts
+conductor status --json
 ```
 
 ## `conductor stop`

@@ -167,6 +167,33 @@ to whatever `base_url` points at, which is a real credential-leak risk.
 Users who want OpenAI-environment-style behavior must opt in
 explicitly via `api_key: ${OPENAI_API_KEY}` interpolation in YAML.
 
+For `name: claude`, missing fields fall back to Anthropic environment variables:
+
+| Field | Env-var fallback |
+|---|---|
+| `base_url` | `ANTHROPIC_BASE_URL` |
+| `api_key` | `ANTHROPIC_API_KEY` |
+| `auth_token` | `ANTHROPIC_AUTH_TOKEN` |
+
+Unlike the Copilot chains above, the two credential rows are not independent.
+The Anthropic SDK resolves them as a unit: set either one in YAML and it reads
+neither env var. Only `base_url` falls back on its own.
+
+#### Field compatibility by provider
+
+| Field | `copilot` | `claude` |
+|---|---|---|
+| `base_url` | Supported | Supported |
+| `api_key` | Supported | Supported |
+| `auth_token` | Rejected | Supported |
+| `bearer_token` | Supported | Rejected |
+| `type` | Supported | Rejected |
+| `wire_api` | Supported | Rejected |
+| `headers` | Supported | Rejected |
+| `azure` | Supported | Rejected |
+| `runtime_url` | Supported | Rejected |
+| `runtime_token` | Supported | Rejected |
+
 #### Secrets
 
 `api_key` and `bearer_token` are stored as Pydantic `SecretStr` — they
@@ -190,9 +217,10 @@ visible.
 the following misconfigurations at config load time so they cannot
 silently produce a no-op SDK call:
 
-- `name != "copilot"` combined with **any** non-`name` field
-  (structured config for `claude` / `openai-agents` is not yet
-  implemented).
+- Structured provider config for other provider names is not yet implemented.
+- Unsupported structured provider fields for the selected provider name.
+  For `name: claude`, only `base_url`, `api_key`, and `auth_token` are supported
+  (fields `type`, `wire_api`, `headers`, `azure`, `bearer_token`, `runtime_url`, and `runtime_token` remain Copilot-only and are rejected for `claude`).
 - `type: azure` without an `azure: { api_version: ... }` block
   (and the reverse: `azure` block without `type: azure`).
 - Anchorless routing fields: `wire_api`, `type`, `headers`, or

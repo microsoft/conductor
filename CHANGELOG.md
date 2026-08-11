@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`conductor status` — see what is running without stopping it** (#384).
+  `conductor stop` with no arguments lists background workflows, but stops one
+  when exactly one is running, so the natural "what's running?" reflex was
+  destructive precisely when there was a single run to lose. `status` never
+  terminates anything and never removes a PID file, so a run stays
+  discoverable even when its liveness cannot be confirmed. It prints each
+  run's dashboard URL, which is otherwise unrecoverable once the launching
+  terminal is gone, and `--json` makes it scriptable. A malformed PID file is
+  skipped with a warning rather than taking down the listing.
 - **Git-backed plugin sources** (#380). `runtime.plugins` alone resolves
   against machine state — an installed plugin name, or a path — so a workflow
   shared with a teammate still needed "first install these plugins" in a
@@ -168,6 +177,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `\uXXXX` escapes on all platforms as a result, which is valid JSON and decodes
   identically. `conductor doctor`'s default *table* output is unaffected by this
   change and still fails on such a console (#401).
+- **Agent text containing bracketed tokens no longer kills a run** (#382). A
+  step whose output contained ordinary technical prose such as
+  `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
+  markup tag, raising `MarkupError` and ending the workflow — unresumably,
+  since the crash happened while rendering rather than while running. Every
+  console sink that renders agent-supplied text now passes it as `rich.text.Text`
+  rather than interpolating it into markup, and the file-log console disables
+  markup entirely. `style=` does not turn markup parsing off, which is what hid
+  three of the five sinks; two of those were reachable on a bare `conductor run`
+  with no flags. Opening tags such as `[bold]` were the quieter half of the same
+  bug: rich consumed them without raising and the text simply disappeared.
+- **Structured `runtime.provider` for `name: claude` no longer drops a
+  YAML-declared `api_key`** — the schema accepted `api_key` (alongside
+  `base_url` and `auth_token`) but the provider factory silently discarded it,
+  so only the `ANTHROPIC_API_KEY` env var ever reached the Anthropic client.
+  The factory now forwards it. Two credential-semantics fixes ride along so
+  the documented behavior is what the code does: the Claude provider's model
+  path now resolves credentials as a unit like the Anthropic SDK does —
+  setting either credential in YAML suppresses both `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN`, where previously a YAML `auth_token` still let an
+  ambient `ANTHROPIC_API_KEY` ride along and the SDK sent both `X-Api-Key`
+  and `Authorization: Bearer` headers to whatever `base_url` pointed at
+  (a credential leak against gateway endpoints). And when both credentials
+  are set, Conductor now logs a warning naming that behavior instead of
+  shipping both headers silently — the same parity warning the Copilot
+  provider already logs for `api_key` + `bearer_token`. New example:
+  [`examples/claude-custom-endpoint.yaml`](examples/claude-custom-endpoint.yaml);
+  see [`docs/providers/claude.md`](docs/providers/claude.md) (Custom
+  Endpoints and Gateways).
 - **`conductor resume --web` no longer shows a running workflow as stopped** —
   a workflow that was paused from the dashboard (Stop, then Kill) recorded an
   `agent_paused` event in its event log with no `agent_resumed` counterpart.

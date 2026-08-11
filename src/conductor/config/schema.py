@@ -2578,11 +2578,17 @@ class ProviderSettings(BaseModel):
     auth_token: SecretStr | None = None
     """Bearer token for OAuth / gateway authentication. Claude-only.
 
-    Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK instead
-    of the usual ``x-api-key`` header. Use for Databricks AI Gateway,
-    LiteLLM proxies, or any endpoint that expects a bearer token.
+    Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK. Use for
+    Databricks AI Gateway, LiteLLM proxies, or any endpoint that expects a
+    bearer token rather than an ``x-api-key`` credential. Set exactly one of
+    ``auth_token`` / ``api_key``: the Anthropic SDK does not choose between
+    them — when both are set it sends both ``X-Api-Key`` and
+    ``Authorization: Bearer`` headers on every request, so the API key
+    reaches whatever ``base_url`` points at.
 
-    Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var when not set in YAML.
+    Credentials resolve as a unit: setting either credential in YAML
+    suppresses both ``ANTHROPIC_API_KEY`` and ``ANTHROPIC_AUTH_TOKEN`` env
+    vars. The env fallback applies only when no credential is set in YAML.
 
     Example::
 
