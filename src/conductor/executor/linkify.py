@@ -52,13 +52,10 @@ _LINKABLE_SUFFIXES = tuple(LINKABLE_EXTENSIONS)
 # ---------------------------------------------------------------------------
 
 # Fenced code block (``` or ~~~, with optional language tag)
-_FENCED_CODE_RE = re.compile(r"^(`{3,}|~{3,}).*?^\1", re.MULTILINE | re.DOTALL)
+_FENCED_CODE_RE = re.compile(r"^(`{3,}+|~{3,}+)[^\n]*\n.*?^\1", re.MULTILINE | re.DOTALL)
 
 # Inline code span (`...`)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
-
-# Existing markdown links: [text](url) or [text][ref]
-_EXISTING_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)|\[[^\]]*\]\[[^\]]*\]")
 
 # Bare URL: http(s)://... terminated at whitespace or common punctuation
 _URL_RE = re.compile(
@@ -121,9 +118,10 @@ def _linkify_with_protection(text: str, base_dir: Path | None) -> str:
     """
     protected: list[tuple[int, int]] = []
 
-    for pattern in (_FENCED_CODE_RE, _INLINE_CODE_RE, _EXISTING_LINK_RE):
+    for pattern in (_FENCED_CODE_RE, _INLINE_CODE_RE):
         for m in pattern.finditer(text):
             protected.append((m.start(), m.end()))
+    protected.extend(_existing_link_spans(text))
 
     # Sort and merge overlapping spans
     protected.sort()
@@ -149,6 +147,39 @@ def _linkify_with_protection(text: str, base_dir: Path | None) -> str:
         result.append(_linkify_segment(text[prev_end:], base_dir))
 
     return "".join(result)
+
+
+def _existing_link_spans(text: str) -> list[tuple[int, int]]:
+    """Find existing ``[text](url)`` and ``[text][ref]`` links."""
+    spans: list[tuple[int, int]] = []
+    search_start = 0
+    unavailable_closers: set[str] = set()
+
+    while (start := text.find("[", search_start)) != -1:
+        label_end = text.find("]", start + 1)
+        if label_end == -1:
+            break
+
+        target_start = label_end + 1
+        if target_start == len(text) or text[target_start] not in "([":
+            search_start = target_start
+            continue
+
+        closer = ")" if text[target_start] == "(" else "]"
+        if closer in unavailable_closers:
+            search_start = target_start + 1
+            continue
+
+        target_end = text.find(closer, target_start + 1)
+        if target_end == -1:
+            unavailable_closers.add(closer)
+            search_start = target_start + 1
+            continue
+
+        spans.append((start, target_end + 1))
+        search_start = target_end + 1
+
+    return spans
 
 
 def _linkify_segment(segment: str, base_dir: Path | None) -> str:
@@ -200,19 +231,11 @@ def _try_linkify_path(token: str, base_dir: Path | None) -> str | None:
     Returns the markdown link string, or None if the token is not a file path.
     """
     # Strip leading/trailing punctuation that isn't part of the path
-    prefix = ""
-    suffix = ""
-    stripped = token
-
-    # Strip common leading chars
-    while stripped and stripped[0] in "([\"'":
-        prefix += stripped[0]
-        stripped = stripped[1:]
-
-    # Strip common trailing chars
-    while stripped and stripped[-1] in ")]\"'.,;:!?":
-        suffix = stripped[-1] + suffix
-        stripped = stripped[:-1]
+    stripped = token.lstrip("([\"'")
+    prefix = token[: len(token) - len(stripped)]
+    path = stripped.rstrip(")]\"'.,;:!?")
+    suffix = stripped[len(path) :]
+    stripped = path
 
     if not stripped:
         return None

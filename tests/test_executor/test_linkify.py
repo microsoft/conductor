@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from pathlib import Path
+
+import pytest
 
 from conductor.executor.linkify import linkify_markdown
 
@@ -61,6 +65,10 @@ class TestUrlLinking:
 
     def test_preserves_existing_markdown_link(self) -> None:
         text = "See [docs](https://example.com/docs) for more"
+        assert linkify_markdown(text) == text
+
+    def test_preserves_existing_reference_link(self) -> None:
+        text = "See [docs][reference] for more"
         assert linkify_markdown(text) == text
 
     def test_url_in_inline_code_untouched(self) -> None:
@@ -211,3 +219,24 @@ class TestCombined:
         """Paths that escape base_dir should not be linked."""
         result = linkify_markdown("See ../../../etc/passwd.txt", base_dir=tmp_path)
         assert "[../../../etc/passwd.txt]" not in result
+
+
+@pytest.mark.performance
+@pytest.mark.parametrize(
+    "make_text",
+    [
+        pytest.param(lambda size: "`" * size, id="backticks"),
+        pytest.param(lambda size: "[" * (size // 2) + "]" * (size // 2), id="brackets"),
+        pytest.param(lambda size: '"' * size, id="punctuation"),
+    ],
+)
+def test_pathological_inputs_scale_near_linearly(make_text: Callable[[int], str]) -> None:
+    """Doubling pathological input must not quadruple processing time."""
+    elapsed: list[float] = []
+    for size in (20_000, 40_000):
+        text = make_text(size)
+        start = time.perf_counter()
+        assert linkify_markdown(text) == text
+        elapsed.append(time.perf_counter() - start)
+
+    assert elapsed[1] < elapsed[0] * 3 + 0.01
