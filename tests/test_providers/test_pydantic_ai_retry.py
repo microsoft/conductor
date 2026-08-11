@@ -311,6 +311,71 @@ class TestOpenAIErrorClassification:
         assert events[0][1]["delay"] == 3.0
         mock_sleep.assert_called_once_with(3.0)
 
+    @pytest.mark.asyncio
+    async def test_real_openai_rate_limit_error_retries_once_then_succeeds(self) -> None:
+        """Requirement: openai.RateLimitError with Retry-After header flows through
+        execute_with_retry, emits an agent_retry event, and succeeds on the next call."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        config = RetryConfig(max_attempts=2, base_delay=1.0, jitter=0.0)
+        factory = _make_factory([_make_openai_rate_limit_error("2"), "success"])
+
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=callback,
+                agent_name="openai-retryer",
+            )
+
+        assert result == "success"
+        assert len(events) == 1
+        assert events[0][0] == "agent_retry"
+        assert events[0][1] == {
+            "agent_name": "openai-retryer",
+            "attempt": 1,
+            "max_attempts": 2,
+            "error": "rate limited",
+            "error_type": "RateLimitError",
+            "delay": 2.0,
+        }
+        mock_sleep.assert_called_once_with(2.0)
+
+    @pytest.mark.asyncio
+    async def test_real_openai_bad_request_error_is_not_retried(self) -> None:
+        """Requirement: openai.BadRequestError is fatal and must not be retried;
+        it propagates as a non-retryable ProviderError."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        request = _make_http_request()
+        response = httpx.Response(400, text="bad request", request=request)
+        bad_request = openai.BadRequestError("bad request", response=response, body=None)
+        config = RetryConfig(max_attempts=3, base_delay=0.0, jitter=0.0)
+        factory = _make_factory([bad_request])
+
+        with (
+            patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep,
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=callback,
+                agent_name="openai-bad-request",
+            )
+
+        assert exc_info.value.is_retryable is False
+        assert exc_info.value.status_code == 400
+        assert "bad request" in str(exc_info.value)
+        assert events == []
+        mock_sleep.assert_not_called()
+
 
 class TestRetryConfig:
     """Tests for retry configuration resolution."""
