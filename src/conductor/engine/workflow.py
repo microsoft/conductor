@@ -2176,6 +2176,43 @@ class WorkflowEngine:
                 return value
         return None
 
+    async def _context_window_fields(
+        self, agent: AgentDef, output: AgentOutput
+    ) -> dict[str, int | None]:
+        """Return the ``context_window_used`` / ``context_window_max`` event pair.
+
+        ``context_window_used`` is sourced from
+        ``output.last_call_input_tokens`` — the prompt size of the most
+        recent single API call — rather than ``output.input_tokens``, which
+        is a billing total summed across every call in the execution.
+        Reusing the billing figure as a context measurement is what caused
+        issue #412: a multi-turn agent's cumulative token count can exceed
+        the model's context window, producing a false "over 100%" red bar.
+
+        When both values are known and ``used > maximum``, a single API call
+        physically cannot exceed the cap it was made against, so either the
+        usage figure or the looked-up cap (e.g. a mismatched ``long_context``
+        session tier) is untrustworthy — both are dropped to ``None`` rather
+        than shown misleadingly. A debug record is logged in this case.
+
+        Returns:
+            A dict with ``context_window_used`` and ``context_window_max``,
+            ready to splice into an event payload.
+        """
+        used = output.last_call_input_tokens
+        maximum = await self._get_context_window_for_agent(agent, output)
+        if used is not None and maximum is not None and used > maximum:
+            logger.debug(
+                "Dropping impossible context-window pair for agent %s: "
+                "used=%d exceeds max=%d for model %s",
+                agent.name,
+                used,
+                maximum,
+                output.model,
+            )
+            return {"context_window_used": None, "context_window_max": None}
+        return {"context_window_used": used, "context_window_max": maximum}
+
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
 
@@ -4809,10 +4846,7 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
-                                "context_window_used": output.input_tokens,
-                                "context_window_max": await self._get_context_window_for_agent(
-                                    resolved_agent, output
-                                ),
+                                **await self._context_window_fields(resolved_agent, output),
                             },
                         )
 
@@ -5882,10 +5916,7 @@ class WorkflowEngine:
                         "model": output.model,
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
-                        "context_window_used": output.input_tokens,
-                        "context_window_max": await self._get_context_window_for_agent(
-                            resolved_agent, output
-                        ),
+                        **await self._context_window_fields(resolved_agent, output),
                     },
                 )
 

@@ -257,7 +257,257 @@ class TestParallelAgentContextWindow:
             assert event.data["context_window_max"] is None
 
 
-class TestContextWindowResolutionOrder:
+class TestAgentCompletedUsesLastCallInputTokens:
+    """context_window_used is sourced from last_call_input_tokens (issue #412),
+    not the cumulative billing input_tokens."""
+
+    @pytest.mark.asyncio
+    async def test_context_window_used_is_last_call_not_cumulative_input(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-last-call",
+                entry_point="a1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a1",
+                    model="gpt-4o",
+                    prompt="Hello",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ a1.output.answer }}"},
+        )
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_distinct_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            # Cumulative billing total is much larger than the last call's
+            # prompt size — the exact shape that produced #412's false red.
+            output.input_tokens = 1_121_132
+            output.last_call_input_tokens = 561_285
+            return output
+
+        provider.execute = execute_with_distinct_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("agent_completed")
+        assert event.data["input_tokens"] == 1_121_132
+        assert event.data["context_window_used"] == 561_285
+
+    @pytest.mark.asyncio
+    async def test_impossible_pair_drops_both_to_none_and_logs_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A used > max pair can never describe one real API call, so both
+        fields are dropped rather than shown misleadingly (Q2, issue #412)."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-impossible-pair",
+                entry_point="a1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a1",
+                    model="gpt-4o",
+                    prompt="Hello",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ a1.output.answer }}"},
+        )
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_impossible_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.last_call_input_tokens = 1_121_132  # exceeds the 936_000 cap
+            return output
+
+        provider.execute = execute_with_impossible_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="conductor.engine.workflow"):
+            await engine.run({})
+
+        event = collector.first("agent_completed")
+        assert event.data["context_window_used"] is None
+        assert event.data["context_window_max"] is None
+        assert any(
+            "a1" in record.getMessage() and "1121132" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_last_call_input_tokens_none_hides_used_but_keeps_max(self) -> None:
+        """No reading to distrust when used is None — the cap (already
+        published via agent_started) survives."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-unmeasurable",
+                entry_point="a1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a1",
+                    model="gpt-4o",
+                    prompt="Hello",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ a1.output.answer }}"},
+        )
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_unmeasurable_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.last_call_input_tokens = None
+            return output
+
+        provider.execute = execute_with_unmeasurable_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("agent_completed")
+        assert event.data["context_window_used"] is None
+        assert event.data["context_window_max"] == 936_000
+
+
+class TestParallelAgentCompletedUsesLastCallInputTokens:
+    """The same last_call_input_tokens sourcing and impossible-pair drop
+    applies to parallel_agent_completed events."""
+
+    @staticmethod
+    def _parallel_config() -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-parallel-last-call",
+                entry_point="team",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="r1",
+                    model="gpt-4o",
+                    prompt="research 1",
+                    output={"result": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="r2",
+                    model="gpt-4o",
+                    prompt="research 2",
+                    output={"result": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="team",
+                    agents=["r1", "r2"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "done"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_context_window_used_is_last_call_not_cumulative_input(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_distinct_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.input_tokens = 1_121_132
+            output.last_call_input_tokens = 561_285
+            return output
+
+        provider.execute = execute_with_distinct_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(self._parallel_config(), provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("parallel_agent_completed")
+        assert event.data["context_window_used"] == 561_285
+
+    @pytest.mark.asyncio
+    async def test_impossible_pair_drops_both_to_none_and_logs_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_impossible_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.last_call_input_tokens = 1_121_132
+            return output
+
+        provider.execute = execute_with_impossible_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(self._parallel_config(), provider, event_emitter=emitter)
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="conductor.engine.workflow"):
+            await engine.run({})
+
+        event = collector.first("parallel_agent_completed")
+        assert event.data["context_window_used"] is None
+        assert event.data["context_window_max"] is None
+        assert any(
+            "r1" in record.getMessage() and "1121132" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_last_call_input_tokens_none_hides_used_but_keeps_max(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_unmeasurable_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.last_call_input_tokens = None
+            return output
+
+        provider.execute = execute_with_unmeasurable_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(self._parallel_config(), provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("parallel_agent_completed")
+        assert event.data["context_window_used"] is None
+        assert event.data["context_window_max"] == 936_000
+
     """The model is resolved from output.model first, then agent.model, then default."""
 
     @pytest.mark.asyncio

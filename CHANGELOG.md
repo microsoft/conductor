@@ -167,6 +167,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dashboard context-window bar no longer reports cumulative input tokens as
+  a false red at >100% of the cap** (#412). The bar reused
+  `AgentOutput.input_tokens` — a *billing* total summed across every API call
+  in an agent's execution — as a *context* measurement, so a multi-turn
+  tool-calling agent (or a Copilot parse-recovery retry) could report more
+  tokens than the model's context window physically allows. A new
+  `AgentOutput.last_call_input_tokens` field carries only the prompt size of
+  the most recent single API call, populated by every provider, and the
+  engine now sources `context_window_used` from it instead. When a provider
+  cannot isolate one call's prompt size, the field is `None` and the
+  dashboard hides the bar rather than showing a misleading number; a
+  `used > max` pair (impossible for one real API call) is dropped to `None`
+  entirely, logged at debug, since either the usage figure or the looked-up
+  cap is untrustworthy. Riding along: `copilot.py`'s `assistant.usage` handler
+  previously *overwrote* its running token counts on every event instead of
+  summing them, so a 20-turn tool-calling agent's cost was billed only for
+  its final API call — this under-report is fixed at the same time, since
+  fixing it alone (without the new field) would have made the context bar
+  report the sum of every turn rather than just the last, making the original
+  defect worse. Cost figures for multi-turn Copilot agents will rise as a
+  result; a `cost.budget_usd` tuned against the old under-reported total may
+  now trip its limit sooner.
+
 - **`conductor stop` now confirms the process actually stopped, and never
   stops the wrong one** (#344). `stop` sent one signal and reported success
   without checking, so a workflow that ignored it was reported as stopped and

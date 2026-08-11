@@ -10,11 +10,42 @@ execution.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.usage import RunUsage
 
 from conductor.providers.base import AgentOutput
+
+
+def last_request_input_tokens(messages: Sequence[ModelMessage] | None) -> int | None:
+    """Return the prompt-token count of the most recent model response.
+
+    Pydantic AI's ``RunUsage`` aggregates every request in the run, so it
+    cannot answer "how big was the last call" — the question the
+    context-window bar needs (issue #412). This walks ``messages`` in
+    reverse and returns the first ``ModelResponse``'s per-request
+    ``input_tokens``.
+
+    Pydantic AI normalizes ``RequestUsage.input_tokens`` to *include* cache
+    reads/writes (see ``UsageBase`` in ``pydantic_ai.usage``), so the value
+    is directly comparable to a provider's prompt-token cap.
+
+    Args:
+        messages: The full message history for the run, or ``None``.
+
+    Returns:
+        The last response's input-token count, or ``None`` when there is no
+        message history, no ``ModelResponse`` in it, or its usage reports no
+        input tokens.
+    """
+    if not messages:
+        return None
+    for message in reversed(messages):
+        if isinstance(message, ModelResponse):
+            return message.usage.input_tokens or None
+    return None
 
 
 def run_usage_to_agent_output_fields(
@@ -71,6 +102,7 @@ def build_agent_output(
     *,
     usage: RunUsage | None = None,
     model: str | None = None,
+    last_call_input_tokens: int | None = None,
 ) -> AgentOutput:
     """Build a normalized ``AgentOutput`` from Pydantic AI result pieces.
 
@@ -83,6 +115,9 @@ def build_agent_output(
         raw_response: Provider-specific raw response for debugging/logging.
         usage: Pydantic AI usage for the run, or ``None`` if unavailable.
         model: Actual model name used (may differ from the requested alias).
+        last_call_input_tokens: Prompt tokens of the most recent single API
+            call, for the context-window bar (issue #412). See
+            :func:`last_request_input_tokens`.
 
     Returns:
         A fully populated ``AgentOutput`` ready for the Conductor engine.
@@ -97,6 +132,7 @@ def build_agent_output(
         output_tokens=fields["output_tokens"],
         cache_read_tokens=fields["cache_read_tokens"],
         cache_write_tokens=fields["cache_write_tokens"],
+        last_call_input_tokens=last_call_input_tokens,
     )
 
 

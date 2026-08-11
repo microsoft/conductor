@@ -137,6 +137,9 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) 
                   contextPct >= CONTEXT_DANGER_PCT ? 'animate-[context-pulse_2s_ease-in-out_infinite]' : ''
                 )}
                 style={{
+                  // The engine now drops an impossible used > max pair to
+                  // null before emitting (issue #412), so this clamp is a
+                  // belt-and-braces guard rather than the primary defence.
                   width: `${Math.min(contextPct, 100)}%`,
                   backgroundColor: contextPct >= CONTEXT_DANGER_PCT ? '#ef4444' : contextPct >= CONTEXT_WARN_PCT ? '#f59e0b' : '#22c55e',
                 }}

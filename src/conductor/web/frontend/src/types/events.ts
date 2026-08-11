@@ -179,6 +179,8 @@ export interface AgentCompletedData {
   input_tokens?: number;
   output_tokens?: number;
   cost_usd?: number;
+  /** Prompt size of the most recent single API call, not a cumulative
+   * total; absent/null when the provider couldn't measure it (issue #412). */
   context_window_used?: number;
   context_window_max?: number;
   output?: unknown;
@@ -407,6 +409,8 @@ export interface ParallelAgentCompletedData {
   model?: string;
   tokens?: number;
   cost_usd?: number;
+  /** Prompt size of the most recent single API call, not a cumulative
+   * total; absent/null when the provider couldn't measure it (issue #412). */
   context_window_used?: number;
   context_window_max?: number;
 }

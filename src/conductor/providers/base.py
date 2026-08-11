@@ -115,6 +115,11 @@ class AgentOutput:
         output_tokens: Number of output/completion tokens generated.
         cache_read_tokens: Tokens read from cache (Claude prompt caching).
         cache_write_tokens: Tokens written to cache (Claude prompt caching).
+        last_call_input_tokens: Prompt tokens of the most recent single API
+            call in this execution. A point-in-time context measurement,
+            unlike ``input_tokens`` which sums every call for billing.
+            ``None`` when the provider cannot isolate one call, in which case
+            the dashboard hides the context-window bar (issue #412).
         model: Actual model used (may differ from requested if aliased).
         session_seconds: Sandbox wall-clock time reported by a remote-runtime
             provider (e.g. ``aca``), separate from token cost (FR7). ``None``
@@ -142,6 +147,15 @@ class AgentOutput:
 
     cache_write_tokens: int | None = None
     """Tokens written to cache (Claude prompt caching)."""
+
+    last_call_input_tokens: int | None = None
+    """Prompt tokens of the most recent single API call in this execution.
+
+    A point-in-time context measurement, unlike ``input_tokens`` which sums
+    every call for billing. ``None`` when the provider cannot isolate one
+    call, in which case the dashboard hides the context-window bar (issue
+    #412).
+    """
 
     model: str | None = None
     """Actual model used (may differ from requested if aliased)."""

@@ -244,6 +244,14 @@ class AcaResultData(BaseModel):
     """Tokens written to cache (Claude-style prompt caching), when the inner
     provider reports it."""
 
+    last_call_input_tokens: int | None = None
+    """Prompt tokens of the most recent single API call (issue #412), when
+    the inner provider reports it. Together with ``ConfigDict(extra="ignore")``
+    and the ``None`` default, this keeps host/runner version skew
+    bidirectionally compatible: a new host against an old runner gets
+    ``None`` (bar hidden); an old host against a new runner ignores the
+    extra key."""
+
     session_seconds: float | None = None
     """Sandbox wall-clock time for this execution, as measured by the runner
     (issue #284, FR7). Parsed into ``AgentOutput.session_seconds`` so the host
