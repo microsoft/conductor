@@ -11,17 +11,21 @@ immediately before the write, putting the literal character back. The fix is to
 pass ``ensure_ascii=True`` at every JSON sink.
 
 These tests drive the **production call sites** -- the module-level
-``output_console`` in :mod:`conductor.cli.app`, and the ``data=`` kwarg shape
-used by ``conductor doctor`` -- through a stream bound to strict ``cp1252``.
-Patching only the console, never the code under test, means reverting an
-``ensure_ascii=True`` argument fails a test that exercised that sink.
+``output_console`` in :mod:`conductor.cli.app`, and ``run_doctor``'s ``data=``
+kwarg shape in :mod:`conductor.cli.doctor` -- through a stream bound to strict
+``cp1252``. Patching only the console, never the code under test, means
+reverting an ``ensure_ascii=True`` argument fails a test that exercised that
+sink. That now holds for all five sinks: with the source-level guard disabled,
+reverting any one of them fails exactly one behavioural test.
 
 That was not true when this file was first written: every behavioural test
 built its own Console, so reverting any of the five call sites failed only the
 source-level AST guard at the bottom. ``TestRealSinksThroughTheCli`` closes
 that, using the same ``run_workflow_async`` patch ``test_run.py`` already
 relies on -- what the earlier attempt was missing was that mock, not a process
-boundary.
+boundary. The ``doctor`` case took a second pass for the same reason in
+miniature: its first test built a Console and passed the keyword itself, so it
+asserted that rich honours ``ensure_ascii`` rather than that we pass it.
 
 They deliberately *simulate* the platform rather than detect it: CI runs on
 ``ubuntu-latest``, so anything gated on ``sys.platform`` would never execute.
@@ -118,16 +122,18 @@ def test_negative_control_unfixed_sink_still_raises(char: str) -> None:
 
 # --- Production-code guard -------------------------------------------------
 #
-# The behavioural tests above pin the *contract* (what a legacy codec can and
-# cannot encode) but they construct their own Console, so on their own they
-# would still pass if someone deleted ``ensure_ascii=True`` from the call
-# sites. This guard closes that gap by asserting the production source itself,
-# which is cheap, runs on any platform, and fails loudly on a revert.
+# The contract tests above construct their own Console, so on their own they
+# would still pass if someone deleted ``ensure_ascii=True`` from a call site.
+# It asserts the source rather than the behaviour, which is cheap and runs
+# anywhere. ``TestRealSinksThroughTheCli`` covers the behaviour, so this
+# guard's remaining job is the narrower one: catching a *new* sink added
+# without the keyword, which is what a source assertion is actually good at.
 #
-# It is deliberately a source assertion rather than a mock: driving the real
-# ``conductor run`` command to its JSON sink requires standing up a full
-# workflow execution, which belongs in an end-to-end subprocess test (tracked
-# as follow-up on #342) rather than a unit test.
+# Its blind spot is the module list below: a sink added to a module that is
+# not listed is invisible here. ``cli/checkpoint.py`` already owns a stdout
+# ``output_console`` and a ``--json`` flag on ``checkpoint list`` is a
+# plausible next sink. Discovering the modules rather than listing them is
+# tracked as a follow-up on #342.
 
 _JSON_SINK_MODULES = ["conductor.cli.app", "conductor.cli.doctor"]
 
@@ -175,7 +181,7 @@ def test_every_print_json_sink_forces_ascii(module_name: str) -> None:
 class TestRealSinksThroughTheCli:
     """Behavioural coverage for the sinks, driven through the CLI.
 
-    The AST guard below asserts the *source*. These assert the *behaviour*, so
+    The AST guard above asserts the *source*. These assert the *behaviour*, so
     reverting a single ``ensure_ascii=True`` fails a test that exercises that
     sink rather than one that reads the file it lives in.
 
@@ -184,6 +190,9 @@ class TestRealSinksThroughTheCli:
     patching ``conductor.cli.run.run_workflow_async``. No subprocess and no
     workflow execution -- the missing piece was that mock, not the process
     boundary.
+
+    All five sinks are covered here: ``run``'s success and terminate handlers,
+    ``resume``'s matching pair, and ``doctor --json``.
     """
 
     def _workflow(self, tmp_path: Path) -> Path:
@@ -209,13 +218,110 @@ class TestRealSinksThroughTheCli:
         payload = json.loads(holder.text())
         assert payload["summary"] == "done \u2192 \u2705"
 
-    def test_doctor_data_kwarg_survives_a_cp1252_stdout(self) -> None:
-        """``doctor`` uses the ``data=`` shape, which takes a different path.
+    def test_terminate_sink_survives_a_cp1252_stdout(self, tmp_path: Path) -> None:
+        """``run``'s ``WorkflowTerminated`` handler is a second, separate sink."""
+        from conductor.exceptions import WorkflowTerminated
+
+        holder = _Cp1252Console()
+        wf = self._workflow(tmp_path)
+
+        with (
+            patch("conductor.cli.run.run_workflow_async") as mock_run,
+            patch("conductor.cli.app.output_console", holder.console),
+        ):
+            mock_run.side_effect = WorkflowTerminated(
+                "stopped",
+                terminated_by="a",
+                reason="stopped",
+                output={"summary": "done \u2192 \u2705"},
+            )
+            CliRunner().invoke(app, ["run", str(wf)])
+
+        payload = json.loads(holder.text())
+        assert payload["summary"] == "done \u2192 \u2705"
+
+    def test_resume_success_sink_survives_a_cp1252_stdout(self, tmp_path: Path) -> None:
+        """``resume`` has its own pair of sinks, mirroring ``run``'s."""
+        holder = _Cp1252Console()
+        wf = self._workflow(tmp_path)
+
+        with (
+            patch("conductor.cli.run.resume_workflow_async") as mock_resume,
+            patch("conductor.cli.app.output_console", holder.console),
+        ):
+            mock_resume.return_value = {"summary": "done \u2192 \u2705"}
+            result = CliRunner().invoke(app, ["resume", str(wf)])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(holder.text())
+        assert payload["summary"] == "done \u2192 \u2705"
+
+    def test_resume_terminate_sink_survives_a_cp1252_stdout(self, tmp_path: Path) -> None:
+        from conductor.exceptions import WorkflowTerminated
+
+        holder = _Cp1252Console()
+        wf = self._workflow(tmp_path)
+
+        with (
+            patch("conductor.cli.run.resume_workflow_async") as mock_resume,
+            patch("conductor.cli.app.output_console", holder.console),
+        ):
+            mock_resume.side_effect = WorkflowTerminated(
+                "stopped",
+                terminated_by="a",
+                reason="stopped",
+                output={"summary": "done \u2192 \u2705"},
+            )
+            CliRunner().invoke(app, ["resume", str(wf)])
+
+        payload = json.loads(holder.text())
+        assert payload["summary"] == "done \u2192 \u2705"
+
+    def test_doctor_json_sink_survives_a_cp1252_stdout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``doctor --json`` uses the ``data=`` shape, a different rich path.
 
         ``JSON.from_data`` rather than the string path the negative control
         exercises, so it is independently vulnerable and worth its own case.
+
+        The earlier version of this test built a Console and passed
+        ``ensure_ascii=True`` itself, which asserted that rich honours the
+        keyword -- something the negative control already covers from the
+        other side. It never reached ``doctor.py``, so reverting the sink
+        there left it green. This one patches only the console and drives
+        ``run_doctor``, so the revert fails it.
         """
+        from conductor.cli.doctor import run_doctor
+        from conductor.providers.diagnostics import DoctorReport, EnvDiagnostic
+
         holder = _Cp1252Console()
-        holder.console.print_json(data={"note": "arrow \u2192 check \u2705"}, ensure_ascii=True)
+        report = DoctorReport(
+            env=EnvDiagnostic(
+                conductor_version="arrow \u2192 check \u2705",
+                python_version="3.12.0",
+                platform="test",
+                update_checked=False,
+                update_available=None,
+                latest_version=None,
+            ),
+            providers=None,
+        )
+
+        async def _fake_gather(**kwargs: object) -> DoctorReport:
+            return report
+
+        monkeypatch.setattr("conductor.cli.doctor.gather", _fake_gather)
+
+        run_doctor(
+            section="env",
+            provider=None,
+            check=False,
+            models=False,
+            as_json=True,
+            console=holder.console,
+            err_console=holder.console,
+        )
+
         payload = json.loads(holder.text())
-        assert payload["note"] == "arrow \u2192 check \u2705"
+        assert payload["env"]["conductor_version"] == "arrow \u2192 check \u2705"
