@@ -1300,9 +1300,10 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
     Args:
         entries: List of PID-file dicts.
         con: Rich Console for output.
-        show_url: Include the dashboard URL column. On by default for
-            ``conductor status``, whose whole purpose is discovery — the URL is
-            otherwise unrecoverable once the launching terminal is gone.
+        show_url: Append a Dashboard URL column. Defaults to False;
+            ``conductor status`` passes True, since discovery is its whole
+            purpose and the URL is otherwise unrecoverable once the launching
+            terminal is gone.
     """
     from rich.table import Table
 

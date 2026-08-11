@@ -69,6 +69,7 @@ class TestHelpPanels:
         expected = {
             "run": "Run & Recover",
             "resume": "Run & Recover",
+            "status": "Run & Recover",
             "stop": "Run & Recover",
             "replay": "Run & Recover",
             "validate": "Author & Inspect",

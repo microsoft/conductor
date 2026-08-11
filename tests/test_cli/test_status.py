@@ -77,6 +77,34 @@ class TestStatusNeverStops:
         stop_one.assert_not_called()
         kill.assert_not_called()
 
+    def test_the_liveness_probe_only_ever_sends_the_null_signal(self, pid_tmpdir: Path) -> None:
+        """The test above cannot fail, so this one carries the property.
+
+        ``status`` never reaches ``_stop_process`` or ``app.os.kill``, and the
+        one call that *can* signal a process — ``os.kill(pid, 0)`` in
+        ``_is_process_alive_posix`` — is stubbed out there by the
+        ``_is_process_alive`` patch. So every mutant that makes the probe send
+        a real signal survives the whole suite.
+
+        Asserting on the signal value instead pins "never terminates" at the
+        only place it can actually be violated. ``sys.platform`` is forced (as
+        in ``test_pid.py``) so the POSIX probe runs on any host rather than
+        passing vacuously on Windows, where ``os.kill`` is never called.
+        """
+        _write_pid(pid_tmpdir, 4242, 8080)
+
+        with (
+            patch("conductor.cli.pid.sys.platform", "linux"),
+            patch("conductor.cli.pid.os.kill") as kill,
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert kill.call_args_list, "the liveness probe never ran, so nothing was asserted"
+        assert all(call.args == (4242, 0) for call in kill.call_args_list), (
+            f"status signalled a process instead of probing it: {kill.call_args_list}"
+        )
+
     def test_pid_files_are_left_in_place(self, pid_tmpdir: Path) -> None:
         _write_pid(pid_tmpdir, 4242, 8080)
 
