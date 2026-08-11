@@ -12,6 +12,8 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 from unittest.mock import Mock, patch
 
+import httpx
+import openai
 import pytest
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
 
@@ -28,6 +30,37 @@ from conductor.providers._pydantic_ai.retry import (
     _resolve_retry_config,
     execute_with_retry,
 )
+
+
+def _make_http_request() -> httpx.Request:
+    """Return a minimal httpx request for constructing openai exceptions."""
+    return httpx.Request("GET", "http://example.com")
+
+
+def _make_openai_rate_limit_error(retry_after: str | None = None) -> openai.RateLimitError:
+    """Return a real openai RateLimitError with an optional Retry-After header."""
+    request = _make_http_request()
+    headers: dict[str, str] = {}
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    response = httpx.Response(429, text="rate limited", headers=headers, request=request)
+    return openai.RateLimitError("rate limited", response=response, body=None)
+
+
+def _make_openai_status_error(status_code: int) -> openai.APIStatusError:
+    """Return a real openai APIStatusError subclass for the given status code."""
+    request = _make_http_request()
+    response = httpx.Response(status_code, text="boom", request=request)
+    mapping: dict[int, type[openai.APIStatusError]] = {
+        400: openai.BadRequestError,
+        401: openai.AuthenticationError,
+        403: openai.PermissionDeniedError,
+        404: openai.NotFoundError,
+        429: openai.RateLimitError,
+        500: openai.InternalServerError,
+    }
+    cls = mapping.get(status_code, openai.APIStatusError)
+    return cls("boom", response=response, body=None)
 
 
 class MockRateLimitError(Exception):
@@ -161,6 +194,122 @@ class TestRetryClassification:
         pydantic-ai adds e.g. an auth or quota error as a new subclass, this
         must fail loudly rather than let it silently become retryable."""
         assert ModelAPIError.__subclasses__() == [ModelHTTPError]
+
+
+class TestOpenAIErrorClassification:
+    """Tests for pydantic-ai wrapped and raw openai error classification."""
+
+    def test_model_http_error_429_408_and_5xx_are_retryable(self) -> None:
+        """Wrapped ModelHTTPError 429/408/5xx must be retryable."""
+        assert _is_retryable_error(ModelHTTPError(429, model_name="gpt-4o")) is True
+        assert _is_retryable_error(ModelHTTPError(408, model_name="gpt-4o")) is True
+        assert _is_retryable_error(ModelHTTPError(500, model_name="gpt-4o")) is True
+        assert _is_retryable_error(ModelHTTPError(503, model_name="gpt-4o")) is True
+
+    def test_model_http_error_400_401_403_404_are_fatal(self) -> None:
+        """Wrapped ModelHTTPError 400/401/403/404 must be fatal."""
+        assert _is_retryable_error(ModelHTTPError(400, model_name="gpt-4o")) is False
+        assert _is_retryable_error(ModelHTTPError(401, model_name="gpt-4o")) is False
+        assert _is_retryable_error(ModelHTTPError(403, model_name="gpt-4o")) is False
+        assert _is_retryable_error(ModelHTTPError(404, model_name="gpt-4o")) is False
+
+    def test_model_api_error_is_retryable(self) -> None:
+        """Wrapped ModelAPIError must be retryable."""
+        err = ModelAPIError(model_name="gpt-4o", message="stream interrupted")
+        assert _is_retryable_error(err) is True
+
+    def test_raw_openai_rate_limit_is_retryable(self) -> None:
+        """Raw openai RateLimitError must be retryable."""
+        assert _is_retryable_error(_make_openai_rate_limit_error()) is True
+
+    def test_raw_openai_api_status_5xx_and_429_are_retryable(self) -> None:
+        """Raw openai APIStatusError 5xx and 429 must be retryable."""
+        assert _is_retryable_error(_make_openai_status_error(500)) is True
+        assert _is_retryable_error(_make_openai_status_error(503)) is True
+        assert _is_retryable_error(_make_openai_status_error(429)) is True
+
+    def test_raw_openai_api_status_4xx_are_fatal(self) -> None:
+        """Raw openai APIStatusError 400/401/403/404 must be fatal."""
+        assert _is_retryable_error(_make_openai_status_error(400)) is False
+        assert _is_retryable_error(_make_openai_status_error(401)) is False
+        assert _is_retryable_error(_make_openai_status_error(403)) is False
+        assert _is_retryable_error(_make_openai_status_error(404)) is False
+
+    def test_raw_openai_connection_and_timeout_are_retryable(self) -> None:
+        """Raw openai APIConnectionError and APITimeoutError must be retryable."""
+        request = _make_http_request()
+        assert (
+            _is_retryable_error(
+                openai.APIConnectionError(message="connection reset", request=request)
+            )
+            is True
+        )
+        assert _is_retryable_error(openai.APITimeoutError(request=request)) is True
+
+    def test_raw_openai_authentication_and_bad_request_are_fatal(self) -> None:
+        """Raw openai AuthenticationError and BadRequestError must be fatal."""
+        request = _make_http_request()
+        assert (
+            _is_retryable_error(
+                openai.AuthenticationError(
+                    "unauthorized", response=httpx.Response(401, request=request), body=None
+                )
+            )
+            is False
+        )
+        assert (
+            _is_retryable_error(
+                openai.BadRequestError(
+                    "bad request", response=httpx.Response(400, request=request), body=None
+                )
+            )
+            is False
+        )
+
+    def test_extract_status_code_from_model_http_error(self) -> None:
+        """_extract_status_code must read ModelHTTPError.status_code."""
+        assert _extract_status_code(ModelHTTPError(503, model_name="gpt-4o")) == 503
+
+    def test_extract_status_code_from_raw_openai(self) -> None:
+        """_extract_status_code must read raw openai APIStatusError status_code."""
+        assert _extract_status_code(_make_openai_status_error(429)) == 429
+        assert _extract_status_code(_make_openai_status_error(500)) == 500
+
+    def test_get_retry_after_from_model_http_error_returns_none(self) -> None:
+        """Wrapped ModelHTTPError loses Retry-After headers; fallback to backoff."""
+        assert _get_retry_after(ModelHTTPError(429, model_name="gpt-4o")) is None
+
+    def test_get_retry_after_from_raw_openai_rate_limit(self) -> None:
+        """Raw openai RateLimitError with Retry-After header must be honored."""
+        assert _get_retry_after(_make_openai_rate_limit_error("42")) == 42.0
+
+    def test_get_retry_after_from_raw_openai_rate_limit_without_header(self) -> None:
+        """Raw openai RateLimitError without header must fall back to backoff."""
+        assert _get_retry_after(_make_openai_rate_limit_error()) is None
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_retries_raw_openai_rate_limit(self) -> None:
+        """execute_with_retry must retry a raw openai RateLimitError and respect Retry-After."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        config = RetryConfig(max_attempts=2, base_delay=1.0, jitter=0.0)
+        factory = _make_factory([_make_openai_rate_limit_error("3"), "ok"])
+
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=callback,
+                agent_name="retryer",
+            )
+
+        assert result == "ok"
+        assert len(events) == 1
+        assert events[0][1]["delay"] == 3.0
+        mock_sleep.assert_called_once_with(3.0)
 
 
 class TestRetryConfig:

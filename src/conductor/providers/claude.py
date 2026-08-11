@@ -28,7 +28,7 @@ from typing import Any, get_args
 
 from pydantic import BaseModel
 
-from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
+from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.mcp.manager import (
     MCPManager,
@@ -898,67 +898,42 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories  # Claude relies on eager preamble injection (see docstring).
-        from pydantic_ai import UsageLimits
-
         from conductor.providers._pydantic_ai.agent_builder import build_agent
-        from conductor.providers._pydantic_ai.interrupt import run_with_interrupt
-        from conductor.providers._pydantic_ai.mcp_toolset import MCPManagerToolset
-        from conductor.providers._pydantic_ai.retry import (
-            RetryConfig as PydanticRetryConfig,
-        )
-        from conductor.providers._pydantic_ai.retry import (
-            _resolve_retry_config,
-            execute_with_retry,
-        )
-        from conductor.providers._pydantic_ai.structured_output import extract_content
-        from conductor.providers._pydantic_ai.usage import build_agent_output
+        from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
+        from conductor.providers._pydantic_ai.runner import run_agent_pipeline
 
         resolved_cwd = agent.working_dir or os.getcwd()
         manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
-        toolsets: list[Any] = []
-        if manager is not None:
-            tool_names = None if agent.tools is None and not tools else tools
-            toolsets.append(
-                MCPManagerToolset(
-                    manager,
-                    tool_names,
-                    self._tool_output_config,
-                    event_callback=event_callback,
-                )
+        def build_agent_fn(toolsets: list[Any], *, max_parse_recovery_attempts: int) -> Any:
+            return build_agent(
+                agent=agent,
+                system_prompt=agent.system_prompt or "",
+                rendered_prompt=rendered_prompt,
+                default_model=self._default_model,
+                default_temperature=self._default_temperature,
+                default_max_tokens=self._default_max_tokens,
+                default_reasoning_effort=self._default_reasoning_effort,
+                max_parse_recovery_attempts=max_parse_recovery_attempts,
+                api_key=self._api_key,
+                auth_token=self._auth_token,
+                base_url=self._base_url,
+                timeout=self._timeout,
+                toolsets=toolsets,
             )
 
-        retry_cfg = _resolve_retry_config(
-            agent,
-            PydanticRetryConfig(
-                max_attempts=self._retry_config.max_attempts,
-                base_delay=self._retry_config.base_delay,
-                max_delay=self._retry_config.max_delay,
-                jitter=self._retry_config.jitter,
-                backoff=self._retry_config.backoff,
-                retry_on=(
-                    list(self._retry_config.retry_on)
-                    if self._retry_config.retry_on is not None
-                    else None
-                ),
-                max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
+        retry_config = PydanticRetryConfig(
+            max_attempts=self._retry_config.max_attempts,
+            base_delay=self._retry_config.base_delay,
+            max_delay=self._retry_config.max_delay,
+            jitter=self._retry_config.jitter,
+            backoff=self._retry_config.backoff,
+            retry_on=(
+                list(self._retry_config.retry_on)
+                if self._retry_config.retry_on is not None
+                else None
             ),
-        )
-
-        pydantic_agent = build_agent(
-            agent=agent,
-            system_prompt=agent.system_prompt or "",
-            rendered_prompt=rendered_prompt,
-            default_model=self._default_model,
-            default_temperature=self._default_temperature,
-            default_max_tokens=self._default_max_tokens,
-            default_reasoning_effort=self._default_reasoning_effort,
-            max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
-            api_key=self._api_key,
-            auth_token=self._auth_token,
-            base_url=self._base_url,
-            timeout=self._timeout,
-            toolsets=toolsets,
+            max_parse_recovery_attempts=self._retry_config.max_parse_recovery_attempts,
         )
 
         max_iterations = (
@@ -974,92 +949,18 @@ class ClaudeProvider(AgentProvider):
 
         self._retry_history.clear()
 
-        def intercepting_callback(event_type: str, data: dict[str, Any]) -> None:
-            if event_type == "agent_retry":
-                self._retry_history.append(data)
-            if event_callback is not None:
-                event_callback(event_type, data)
-
-        outcome = await execute_with_retry(
-            coro_factory=lambda: run_with_interrupt(
-                agent=pydantic_agent,
-                user_prompt=rendered_prompt,
-                interrupt_signal=interrupt_signal,
-                event_callback=intercepting_callback,
-                has_output_schema=bool(agent.output),
-                usage_limits=UsageLimits(request_limit=max_iterations),
-                max_session_seconds=max_session,
-                max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
-            ),
-            retry_config=retry_cfg,
-            event_callback=intercepting_callback,
-            agent_name=agent.name,
+        return await run_agent_pipeline(
+            agent=agent,
+            rendered_prompt=rendered_prompt,
+            mcp_manager=manager,
+            tools=tools,
+            tool_output_config=self._tool_output_config,
+            retry_config=retry_config,
+            interrupt_signal=interrupt_signal,
+            event_callback=event_callback,
+            max_agent_iterations=max_iterations,
+            max_session_seconds=max_session,
+            default_model=self._default_model,
+            retry_history=self._retry_history,
+            build_agent_fn=build_agent_fn,
         )
-
-        if outcome.is_cancelled:
-            raise asyncio.CancelledError()
-
-        model_name = self._model_name_from_pydantic_agent(pydantic_agent)
-
-        if outcome.is_partial:
-            content = self._build_partial_content(outcome.partial_output, agent.output, agent.name)
-            total_usage = outcome.total_usage or {}
-            return AgentOutput(
-                content=content,
-                raw_response=outcome.partial_output,
-                tokens_used=total_usage.get("total_tokens"),
-                input_tokens=total_usage.get("request_tokens"),
-                output_tokens=total_usage.get("response_tokens"),
-                last_call_input_tokens=outcome.last_call_input_tokens,
-                partial=True,
-                model=model_name,
-            )
-
-        if outcome.result is None:
-            raise ProviderError(
-                f"Agent '{agent.name}' produced no result",
-                suggestion="Check the model and prompt configuration.",
-                is_retryable=False,
-            )
-
-        content = extract_content(outcome.result.output, agent.output, agent.name)
-        return build_agent_output(
-            content=content,
-            raw_response=outcome.result,
-            usage=outcome.result.usage,
-            model=model_name,
-            last_call_input_tokens=outcome.last_call_input_tokens,
-        )
-
-    def _model_name_from_pydantic_agent(self, pydantic_agent: Any) -> str:
-        """Return a resolved model name from a Pydantic AI agent instance."""
-        model = pydantic_agent.model
-        if model is None:
-            return self._default_model
-        if hasattr(model, "model_name"):
-            return model.model_name
-        if hasattr(model, "name"):
-            return model.name
-        return str(model)
-
-    def _build_partial_content(
-        self,
-        partial_output: Any,
-        output_schema: dict[str, OutputField] | None,
-        agent_name: str,
-    ) -> dict[str, Any]:
-        """Build a content dict from a partial/interrupted output."""
-        from conductor.executor.output import parse_json_output
-
-        if isinstance(partial_output, BaseModel):
-            return partial_output.model_dump()
-
-        if isinstance(partial_output, str):
-            if output_schema is not None:
-                try:
-                    return parse_json_output(partial_output)
-                except ValidationError:
-                    pass
-            return {"result": partial_output}
-
-        return {"result": partial_output}
