@@ -403,7 +403,8 @@ Because paths are normalized lexically instead of resolving to their real paths:
 By default each agent execution starts a fresh provider session, so an agent
 that runs twice re-reads everything it read the first time. The optional
 per-agent `session_key` opts into continuity: every execution tagged with the
-same key continues **one** underlying session.
+same key continues **one** underlying session. Only the `claude-agent-sdk`
+provider supports it today.
 
 ```yaml
 agents:
@@ -426,61 +427,44 @@ agents:
     prompt: Summarise what you found.
 ```
 
-- **The key is a static label, not a value produced by a step.** The provider
-  maps it to the real session id internally, so no session id passes through
-  the workflow context and nothing has to be extracted from an earlier
-  agent's output. Two agents share a session simply by writing the same
-  string.
-- **The key is never rendered.** Unlike `working_dir` or `model`, `session_key`
-  is *not* a Jinja2 template, so a `{{ ... }}` value is **rejected at
-  validation** rather than becoming one literal key shared by every
-  execution. Surrounding whitespace is stripped and the result must be
-  non-empty.
-- **The prompt is still rendered and sent every time.** The session means the
-  model *additionally* has the prior conversation, so it sees
+- **A static label, never rendered.** Unlike `working_dir` or `model`,
+  `session_key` is not a Jinja2 template. A `{{ ... }}` value is rejected at
+  validation, rather than becoming one literal key shared by every execution.
+  Whitespace is stripped and the result must be non-empty. The provider maps
+  the label to the real session id internally, so no session id passes through
+  the workflow context. Two agents share a session by writing the same string.
+- **The prompt is still rendered and sent every time.** The session only means
+  the model *additionally* has the prior conversation, so it sees
   `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where an
   agent is meant to re-evaluate from scratch.
-- **A session is scoped to one working directory.** The `claude` CLI stores
-  transcripts per directory, so the provider tracks sessions by
-  `(session_key, working directory)`. Two agents that share a key but run
-  under different `working_dir` values get two independent sessions — they
-  cannot share one. Keep the `working_dir` stable across executions that are
-  meant to continue each other.
-- **Continuity survives `conductor resume`** — the session map is written to
-  the checkpoint and restored on resume. Each provider namespaces its own
-  entries in that shared map (this provider writes
-  `claude-agent-sdk:["<key>", "<cwd>"]`) and the engine merges every active
-  provider's map, so a workflow that mixes providers persists all of them and
-  each provider ignores entries that are not its own.
-- **A session that cannot be resumed degrades, it never fails the run.**
-  Passing `--resume` for a session the CLI cannot find makes it abort *before
-  running the agent*, so the provider only resumes once it has confirmed the
-  transcript is on disk — it checks the exact path the CLI would use,
-  `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project key for the working
-  directory>/<session id>.jsonl`, and consults the SDK's own session lookup
-  only as a fallback (and only when that lookup agrees the session belongs to
-  this directory). If a recorded session has since disappeared — the CLI
-  prunes transcripts on its own schedule — the provider logs a warning and
-  starts fresh. Having nothing recorded for a key is not an error and is not
-  logged: that is simply the first execution under it, or an execution under
-  a different `working_dir`.
-- **Rejected step types:** `script`, `human_gate`, `workflow`, `wait`, `set`,
-  and `terminate` — none of them have a provider session to continue.
-- **Providers that cannot honor it fail validation.** `session_key` is gated
-  on the `session_continuity` capability, so declaring it against a provider
-  without support is a `conductor validate` error rather than a setting that
-  is quietly dropped at runtime. Currently only `claude-agent-sdk` declares
-  it.
-- **Concurrent executions cannot share a key.** Two members of the same
-  parallel group declaring one key, or a for-each agent with a `session_key`
-  and `max_concurrent > 1`, are rejected at `conductor validate` time: the
-  second execution would resume a session the first still has open, leaving
-  two `claude` processes appending to one transcript. Give them distinct
-  keys, drop the key, or set `max_concurrent: 1`.
+- **Scoped to one working directory.** The `claude` CLI stores transcripts per
+  directory, so sessions are tracked by `(session_key, working directory)`. Two
+  agents sharing a key under different `working_dir` values get two independent
+  sessions. Keep `working_dir` stable across executions meant to continue each
+  other.
+- **Survives `conductor resume`.** The session map is written to the checkpoint
+  and restored on resume. The engine merges every active provider's map, and
+  `claude-agent-sdk` namespaces its own entries (`claude-agent-sdk:["<key>",
+  "<cwd>"]`) and ignores entries that are not its own.
+- **Degrades, never fails the run.** `--resume` for a session the CLI cannot
+  find makes it abort *before running the agent*. The provider therefore
+  resumes only after it confirms the transcript is on disk. If a recorded
+  session has since disappeared — the CLI prunes transcripts on its own
+  schedule — the provider logs a warning and starts fresh. Having nothing
+  recorded for a key is normal and is not logged: that is the first execution
+  under it, or one under a different `working_dir`.
+- **Rejected step types:** `script`, `human_gate`, `questions`, `workflow`,
+  `wait`, `set`, and `terminate` — none have a provider session to continue.
+  `session_key` is also rejected against a provider that does not declare the
+  `session_continuity` capability, rather than being dropped at runtime.
+- **Concurrent executions cannot share a key.** `conductor validate` rejects two
+  members of one parallel group with the same key, and a for-each agent with a
+  `session_key` and `max_concurrent > 1`. The second execution would resume a
+  session the first still has open, leaving two `claude` processes appending to
+  one transcript. Give them distinct keys, drop the key, or set
+  `max_concurrent: 1`.
 
-See
-[`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml)
-and [`docs/providers/experimental.md`](providers/experimental.md).
+See [`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml).
 
 ### Sandbox Configuration (ACA)
 

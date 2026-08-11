@@ -48,10 +48,8 @@ except ImportError:
     AgentDefinition: Any = None
 
 try:
-    # Session lookup is imported separately from the required symbols above:
-    # folding it into that try would turn an SDK missing only this helper into
-    # "Claude Agent SDK not installed" and disable the whole provider. Here a
-    # sub-floor SDK degrades just the session_key guard.
+    # Separate try from the required symbols above: an SDK missing only these
+    # must degrade the session_key guard, not disable the whole provider.
     from claude_agent_sdk import (  # ty: ignore[unresolved-import]
         get_session_info,
         project_key_for_directory,
@@ -217,10 +215,8 @@ _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
 # way to express — see :func:`_translate_mcp_servers`.
 _ALL_TOOLS: Final[str] = "*"
 
-# Prefix applied to ``session_key`` values in the checkpoint session map. The
-# map is a single flat dict shared by every provider, and our keys are
-# author-chosen strings while Copilot's are agent names — see
-# :meth:`ClaudeAgentSdkProvider.get_session_ids`.
+# Prefix for our entries in the checkpoint session map, a flat dict shared by
+# every provider — see :meth:`ClaudeAgentSdkProvider.get_session_ids`.
 _SESSION_KEY_NAMESPACE: Final[str] = "claude-agent-sdk:"
 
 # Message types whose ``session_id`` is the conversation's own. Hook and other
@@ -552,23 +548,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``max_session_seconds`` is enforced between messages via
         # ``time.monotonic()``.
         max_session_seconds=True,
-        # Deliberately False even though a ``session_key`` agent's session
-        # *is* persisted and re-applied on resume (see
-        # ``get_session_ids`` / ``set_resume_session_ids``). The flag is a
-        # blanket promise read by the startup banner, and it would be false
-        # for every agent that does not opt in — which is all of them by
-        # default. ``session_continuity`` below is the honest, granular
-        # claim; under-claiming here keeps the banner truthful for the
-        # majority who declare no key and genuinely get nothing back.
+        # False even though a ``session_key`` agent's session *is* restored on
+        # resume: this flag is a blanket promise the startup banner reads out,
+        # and agents without a key — the default — carry nothing across.
+        # ``session_continuity`` below is the granular, honest claim.
         checkpoint_resume=False,
         # Token counts come from ``ResultMessage.usage`` (cumulative
         # session total — see A4 fix).
         usage_tracking=True,
-        # Each call spawns an independent subprocess. The session map added
-        # for ``session_key`` is shared mutable state, but it is keyed per
-        # (session_key, cwd) and only read by agents that opted in, so
-        # unkeyed agents remain fully isolated. Concurrent executions
-        # deliberately sharing one key is an authoring error, not a race.
+        # Each call spawns an independent subprocess. The ``session_key`` map
+        # is shared mutable state but is only read by agents that opted in;
+        # concurrent executions sharing one key are rejected by the validator.
         concurrent_safe=True,
         # The engine-resolved working directory is forwarded to
         # ``ClaudeAgentOptions.cwd``, which the SDK applies as the ``claude``
@@ -615,13 +605,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # constructed lazily, so an untranslatable server config surfaces when
         # the first agent on this provider runs — not at `conductor validate`.
         self._mcp_servers = _translate_mcp_servers(mcp_servers) if mcp_servers else {}
-        # Claude session ids keyed by ``(session_key, cwd)``. NOT by agent
-        # name — the whole point of the key is that several agents, or
-        # several executions of one agent, can share a session. The cwd is
-        # part of the key because the CLI stores transcripts per working
-        # directory: two agents sharing a key under different directories
-        # cannot share a session, and keying on the label alone would make
-        # them overwrite each other's id so neither ever resumed.
+        # Claude session ids keyed by ``(session_key, cwd)`` — by the authored
+        # key rather than agent name, since sharing a session between agents is
+        # the point, and by cwd because the CLI stores transcripts per working
+        # directory, so one key under two directories is two sessions.
         self._session_ids: dict[tuple[str, str], str] = {}
         self._resume_session_ids: dict[tuple[str, str], str] = {}
 
@@ -843,15 +830,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
             agen = query(prompt=rendered_prompt, options=options)
             async for message in agen:
-                # Record before the interrupt and timeout checks below, both
-                # of which return: an agent cut short mid-run is exactly the
-                # one whose accumulated context is worth resuming.
-                #
-                # Only conversation messages are trusted. Hook frames carry a
-                # session_id of their own — a SessionStart hook fires one
-                # before the first assistant turn — and recording that id
-                # would shadow the real session with one that has no
-                # transcript, permanently breaking continuity for the run.
+                # Record before the interrupt and timeout checks below, which
+                # return: an agent cut short is worth resuming. Only
+                # conversation messages are trusted — hook and other auxiliary
+                # frames carry session ids of their own, and recording one
+                # would shadow the real session with a transcript-less id.
                 if session_key and type(message).__name__ in _SESSION_ID_MESSAGES:
                     message_session_id = getattr(message, "session_id", None)
                     if message_session_id:
@@ -1056,21 +1039,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
     def get_session_ids(self) -> dict[str, str]:
         """Return the Claude session id recorded for each session.
 
-        Mirrors the Copilot provider hook of the same name; the engine calls
-        it (duck-typed) when writing a checkpoint so session continuity
-        survives ``conductor resume``.
+        Mirrors the Copilot hook of the same name; the engine calls it
+        (duck-typed) when writing a checkpoint. Keys are namespaced and carry
+        their cwd because the engine merges every provider's map into one flat
+        field, and our authored keys collide with Copilot's agent names —
+        ``session_key: investigate`` on an agent named ``investigate``.
 
-        Keys are namespaced and carry their working directory because the
-        engine merges every active provider's map into one flat
-        ``dict[str, str]`` checkpoint field. Ours are workflow-authored
-        ``session_key`` values while Copilot's are agent names, and the two
-        spaces genuinely collide — ``session_key: investigate`` on an agent
-        named ``investigate`` is the obvious thing to write.
-
-        Restored entries are re-exported alongside ones recorded this run,
-        so a session survives more than one resume: a second checkpoint taken
-        before the keyed agent runs again would otherwise drop it and a later
-        loop-back would silently start cold.
+        Restored entries are re-exported alongside ones recorded this run, so a
+        checkpoint taken before the keyed agent runs again does not drop them.
 
         Returns:
             Mapping of namespaced ``[session_key, cwd]`` to Claude session id.
@@ -1085,13 +1061,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         """Seed session ids restored from a checkpoint.
 
         Entries that are not ours — another provider's, or malformed — are
-        ignored rather than raising: a checkpoint must never fail to restore
-        because one provider's slice of a shared field is unreadable.
+        skipped rather than raising: one unreadable slice of a shared field
+        must not fail the whole restore.
 
         Args:
             ids: Merged provider session map from the checkpoint, as written
-                by :meth:`get_session_ids`. Ids whose transcript is gone are
-                dropped at execute time by :meth:`_resolve_resume_session`.
+                by :meth:`get_session_ids`.
         """
         restored: dict[tuple[str, str], str] = {}
         for raw_key, sid in ids.items():
@@ -1108,12 +1083,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
     async def _resolve_resume_session(self, session_key: str, cwd: str) -> str | None:
         """Return the session id to resume for ``session_key``, if usable.
 
-        A session recorded earlier in this run takes precedence over one
-        restored from a checkpoint. The chosen id is returned only once the
-        transcript is confirmed present: ``--resume`` for a session the CLI
-        cannot find makes it abort *before running the agent*, so an ordinary
-        first iteration or a transcript the CLI has since pruned would become
-        a hard failure.
+        A session recorded this run takes precedence over one restored from a
+        checkpoint. The id is returned only once its transcript is confirmed
+        present: ``--resume`` for a session the CLI cannot find aborts it
+        *before running the agent*, so an ordinary first iteration or a pruned
+        transcript would otherwise become a hard failure.
 
         Args:
             session_key: The agent's workflow-authored session key.
@@ -1128,10 +1102,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if session_id is None:
             return None
         if get_session_info is None and project_key_for_directory is None:
-            # Neither lookup is available (an SDK below the session floor).
-            # Do NOT hand the id over unverified: `--resume` on a transcript
-            # the CLI cannot find aborts it before the agent runs, so a silent
-            # fresh session is strictly the safer degradation.
+            # SDK below the session-lookup floor. Never hand the id over
+            # unverified — a fresh session is the safer degradation.
             logger.debug(
                 "Session lookup unavailable in this claude-agent-sdk build; "
                 "starting a fresh session for session_key '%s'.",
@@ -1166,20 +1138,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         Checks the exact on-disk path the CLI uses,
         ``<config>/projects/<project key for cwd>/<id>.jsonl``, rather than
-        asking ``get_session_info``. That helper answers a different question
-        in both directions: it derives a *summary* from a bounded head+tail
-        read and returns ``None`` whenever it cannot — a sidechain session, or
-        a transcript whose first prompt overruns the head buffer with no title
-        or last-prompt record in the tail — so a resumable session can look
-        absent; and it falls back to scanning sibling *git worktrees* (via a
-        ``git`` subprocess), so
-        it reports a session as present from a subdirectory or worktree the
-        CLI will then refuse to resume it from — turning the graceful
-        degradation this guard exists to provide into a hard abort.
-
-        The SDK lookup is still consulted as a fallback, because it tolerates
-        a hash mismatch for very long paths that the exact check cannot model,
-        but only when it agrees the session belongs to this directory.
+        trusting ``get_session_info``, which is wrong in both directions: it
+        derives a *summary* and returns ``None`` when it cannot, so a resumable
+        session can look absent; and it falls back to scanning sibling git
+        worktrees, so it reports sessions the CLI would then refuse to resume.
+        It is still consulted as a fallback — it tolerates a hash mismatch for
+        very long paths the exact check cannot model — but only when it agrees
+        the session belongs to this directory.
         """
         try:
             if project_key_for_directory is not None:

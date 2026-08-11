@@ -189,15 +189,12 @@ class ProviderRegistry:
 
         The IDs are forwarded to providers that support
         ``set_resume_session_ids`` — both already-active providers
-        and providers created lazily in the future. The map is shared by
-        every provider, so each one picks out the entries it recognises
-        and ignores the rest.
+        and providers created lazily in the future.
 
         Args:
-            ids: Merged provider session map from the checkpoint —
-                provider-defined session keys to provider session IDs.
-                Copilot keys are agent names; ``claude-agent-sdk`` keys are
-                namespaced ``session_key`` + working-directory strings.
+            ids: Merged provider session map from the checkpoint. It is shared
+                by every provider, so each picks out the entries it recognises
+                and ignores the rest.
         """
         self._resume_session_ids = dict(ids)
         for provider in self._providers.values():

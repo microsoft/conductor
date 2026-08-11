@@ -191,15 +191,11 @@ class ProviderCapabilities(BaseModel):
 
     session_continuity: bool = False
     """``True`` when the provider honors an agent's ``session_key``, reusing
-    one underlying provider session across every execution tagged with that
-    key (loop-backs, and hand-offs to a later agent declaring the same key).
+    one provider session across every execution tagged with that key.
 
     Agents that set ``session_key:`` against a provider with
-    ``session_continuity=False`` fail validation — silently starting a fresh
-    session would drop the accumulated context the author asked to keep, the
-    same class of quietly-discarded operational intent as ``working_dir``.
-    Defaults to ``False`` so providers that have not implemented the key
-    surface the mismatch loudly."""
+    ``session_continuity=False`` fail validation, rather than silently losing
+    the context the author asked to keep. Defaults to ``False``."""
 
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.

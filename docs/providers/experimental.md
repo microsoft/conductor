@@ -100,24 +100,9 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output. Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is pinned empty as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited. Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and that map survives `conductor resume`. `checkpoint_resume` stays `False` because agents *without* a key — the default — carry no session state across a resume. |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` (agents without a `session_key` carry no session state across a resume). Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is pinned empty as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited. Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and the session map survives `conductor resume` — see [Session Continuity](../workflow-syntax.md#session-continuity-session_key). |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 | `aca` | `azure-identity>=1.19.0` | `(unassigned)` | no `workflow_tools_passthrough` (the wrapped in-container `CopilotProvider` never applies the `tools:` allowlist to the SDK session), no `working_dir` (only the separate, container-relative `sandbox.working_dir` is honored — not the generic host-resolved field), `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
-
-## Session Continuity (claude-agent-sdk)
-
-By default every agent execution spawns a fresh `claude` session. The
-per-agent `session_key` opts into continuity: executions tagged with the same
-key (loop-backs, or a later agent declaring the same key) continue one
-underlying session, and the session map is persisted in checkpoints so
-continuity survives `conductor resume`. A session that cannot be resumed
-starts fresh with a logged warning rather than failing the run.
-
-Full documentation — semantics, working-directory scoping, checkpoint
-behavior, and restrictions — lives in
-[`docs/workflow-syntax.md` → Session Continuity (`session_key`)](../workflow-syntax.md#session-continuity-session_key).
-Runnable example:
-[`examples/claude-agent-sdk-session-key.yaml`](../../examples/claude-agent-sdk-session-key.yaml).
 
 ## See also
 

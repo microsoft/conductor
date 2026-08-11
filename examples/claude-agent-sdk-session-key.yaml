@@ -1,13 +1,12 @@
 # Session continuity with the claude-agent-sdk provider (`session_key`)
 #
-# Every execution tagged with the same `session_key` continues ONE underlying
-# Claude session. This workflow shows both halves of that: a LOOP-BACK
-# (`investigate` resumes its own session on each pass) and a CROSS-AGENT
-# hand-off (`summarize` declares the same key and inherits the whole
-# investigation instead of a lossy summary of it).
+# Every execution tagged with the same `session_key` continues ONE Claude
+# session. This workflow shows both uses:
+#   - a LOOP-BACK: `investigate` resumes its own session on each pass.
+#   - a CROSS-AGENT hand-off: `summarize` declares the same key, so it
+#     inherits the whole investigation instead of a summary of it.
 #
-# Full documentation: docs/workflow-syntax.md, "Session Continuity
-# (`session_key`)".
+# Full documentation: docs/workflow-syntax.md, "Session Continuity".
 #
 # Pre-requisites:
 #   pip install conductor[claude-agent-sdk]      # or: uv add 'claude-agent-sdk>=0.2.82'
@@ -48,9 +47,8 @@ workflow:
 agents:
   - name: investigate
     description: Investigate the goal, keeping context across every pass.
-    # Executions of this agent share one Claude session. On a loop-back the
-    # agent still has the files it read and the hypotheses it already ruled
-    # out, so each pass builds on the last instead of repeating it.
+    # On a loop-back this agent still has the files it read and the hypotheses
+    # it ruled out, so each pass builds on the last instead of repeating it.
     session_key: investigation
     prompt: |
       Goal: {{ workflow.input.goal }}
@@ -74,9 +72,8 @@ agents:
     description: Cheap non-LLM gate deciding whether another pass is needed.
     type: script
     # Script steps have no provider session, so `session_key` is rejected on
-    # them. Exit 0 = investigation is good enough; exit 1 = go around again.
-    # The boolean is resolved in Jinja2 rather than compared as a shell string,
-    # so the gate does not depend on how the value renders ("True" vs "true").
+    # them. Exit 0 = good enough; exit 1 = go around again. Jinja2 resolves the
+    # boolean, so the gate does not depend on how it renders ("True"/"true").
     command: sh
     args:
       - "-c"
@@ -89,8 +86,8 @@ agents:
 
   - name: summarize
     description: Write the summary from inside the same investigation session.
-    # Same key as `investigate`, so this agent inherits the entire
-    # investigation transcript rather than a lossy hand-off through context.
+    # Same key as `investigate`, so this agent inherits the whole
+    # investigation transcript rather than a hand-off through context.
     session_key: investigation
     prompt: |
       Summarise the investigation you just carried out for a teammate who has

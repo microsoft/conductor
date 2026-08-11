@@ -493,7 +493,7 @@ agents:
                                     # the parent and traverse in Jinja2.
 ```
 
-**Human gate restrictions:** Requires `options` and `prompt`. Cannot have `input_mapping`, `dialog`, `validator`, `sandbox`, `max_depth`, `reasoning`, `context_tier`, `skills`, `timeout_seconds`, `session_key`, `working_dir`, `output_mode`, `value`, `values`, or `output_type`.
+**Human gate restrictions:** Requires `options` and `prompt`. Cannot have `input_mapping`, `dialog`, `validator`, `sandbox`, `max_depth`, `reasoning`, `context_tier`, `skills`, `plugins`, `timeout_seconds`, `session_key`, `working_dir`, `output_mode`, `value`, `values`, or `output_type`.
 
 ## Parallel Group Schema
 

@@ -127,8 +127,7 @@ agents:
     max_agent_iterations: 100    # Override workflow default for this agent (optional)
     max_session_seconds: 60      # Wall-clock timeout for this agent (optional, soft, between iterations)
     session_key: investigation   # Optional. Executions sharing this key continue ONE provider
-                                 # session (loop-backs, cross-agent hand-off). Static label, never
-                                 # rendered. claude-agent-sdk only. See workflow-syntax.md.
+                                 # session. Static label, never rendered. claude-agent-sdk only.
     timeout_seconds: 120         # Hard wall-clock cancellation for this agent (provider-backed only).
                                  # Engine wraps execution in asyncio.wait_for(); raises AgentTimeoutError.
                                  # Effective limit = min(timeout_seconds, remaining_workflow_timeout).

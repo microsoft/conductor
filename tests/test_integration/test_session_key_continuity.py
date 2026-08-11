@@ -1,19 +1,13 @@
 """End-to-end coverage for ``session_key`` continuity.
 
-The provider unit tests in
-``tests/test_providers/test_claude_agent_sdk_session_key.py`` exercise the
-map and the resume guard directly. These tests pin the two properties the
-feature silently depends on, neither of which is visible from the provider:
-
-- ``ProviderRegistry`` hands back the **same provider instance** on a
-  loop-back. If provider creation ever became per-agent or per-execution,
-  every provider-level test would still pass while the feature became a
-  no-op.
-- The **duck-typed** checkpoint hop (``WorkflowEngine._write_checkpoint``
-  → ``copilot_session_ids`` → ``ProviderRegistry.set_resume_session_ids``)
-  connects. It is held together by ``hasattr`` calls that no type checker
-  can verify, and it is what the ``session_continuity`` capability
-  promises.
+``tests/test_providers/test_claude_agent_sdk_session_key.py`` exercises the map
+and the resume guard directly. These tests pin the two properties the feature
+depends on that are invisible from the provider: ``ProviderRegistry`` hands back
+the *same provider instance* on a loop-back (per-execution creation would leave
+every provider-level test passing while the feature no-ops), and the duck-typed
+checkpoint hop (``_write_checkpoint`` → ``copilot_session_ids`` →
+``set_resume_session_ids``) connects — it is held together by ``hasattr`` calls
+no type checker can verify.
 """
 
 from __future__ import annotations
@@ -126,9 +120,7 @@ def workflow_file(tmp_path: Path) -> Path:
 
 class TestLoopBackContinuity:
     async def test_loop_back_and_hand_off_share_one_session(self, workflow_file: Path) -> None:
-        """The scenario the feature exists for.
-
-        ``investigate`` runs three times via a script-gated loop-back and
+        """``investigate`` runs three times via a script-gated loop-back and
         ``summarize`` inherits the same session — four SDK calls, one session.
         """
         fake = _FakeQuery()

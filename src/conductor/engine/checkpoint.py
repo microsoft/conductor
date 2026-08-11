@@ -88,14 +88,11 @@ class CheckpointData:
             to run (periodic) when the checkpoint was taken.
         context: Serialized ``WorkflowContext`` state.
         limits: Serialized ``LimitEnforcer`` state.
-        copilot_session_ids: Merged provider session map — provider-defined
-            session keys to provider session IDs. The field name is
-            historical: entries come from every active provider that exposes
-            ``get_session_ids``. Copilot keys are agent names;
-            ``claude-agent-sdk`` keys are namespaced
-            ``claude-agent-sdk:["<session_key>", "<cwd>"]`` strings. Nothing
-            outside a provider interprets these keys, and each provider
-            ignores entries it does not recognise.
+        copilot_session_ids: Merged session map from every active provider —
+            provider-defined keys to provider session IDs (the field name is
+            historical). Copilot keys are agent names; ``claude-agent-sdk``
+            keys are namespaced ``claude-agent-sdk:["<key>", "<cwd>"]``. Only
+            providers interpret these keys, and each ignores the rest.
         copilot_session_cwds: Mapping of agent names to the working directory
             their Copilot session was created with. Persisted so resume can
             detect a changed cwd and start a fresh session instead of
@@ -214,10 +211,8 @@ class CheckpointManager:
             error: The exception that triggered the checkpoint, or ``None``
                 for a periodic / non-failure checkpoint.
             inputs: Workflow inputs.
-            copilot_session_ids: Optional merged provider session map —
-                provider-defined session keys to provider session IDs
-                (Copilot uses agent names; ``claude-agent-sdk`` uses
-                namespaced ``session_key`` + cwd strings).
+            copilot_session_ids: Optional merged provider session map; see
+                :class:`CheckpointData`.
             copilot_session_cwds: Optional mapping of agent names to the
                 working directory their session was created with. Persisted
                 alongside the session IDs so resume can skip stale sessions

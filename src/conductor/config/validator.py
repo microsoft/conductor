@@ -2345,9 +2345,8 @@ def _validate_provider_capabilities(
                 f"directories (capabilities.working_dir=False)."
             )
 
-        # session_key: a provider that ignores it would start a fresh session
-        # every execution, silently discarding the accumulated context the
-        # author asked to carry across loop-backs — same class as working_dir.
+        # session_key: a provider that ignores it starts a fresh session every
+        # execution, silently discarding the context the author asked to keep.
         if agent.session_key is not None and not caps.session_continuity:
             errors.append(
                 f"Agent '{agent.name}' sets session_key={agent.session_key!r} but "
@@ -2543,12 +2542,10 @@ def _validate_provider_capabilities(
             )
 
     # ----- Concurrent executions must not share a session -----
-    # Two executions resuming one session means two CLI processes appending to
-    # a single transcript: the first session is orphaned and the file is
-    # written concurrently. Sessions are scoped to (session_key, working
-    # directory), so executions under different directories are already
-    # distinct sessions and must NOT be flagged — that separation is what
-    # makes multi-worktree fan-out legal.
+    # Two executions resuming one session leaves two CLI processes appending to
+    # one transcript. Sessions are scoped to (session_key, working directory),
+    # so different directories are already distinct sessions and are not
+    # flagged — that is what makes multi-worktree fan-out legal.
     runtime_working_dir = config.workflow.runtime.working_dir
 
     def _effective_working_dir(agent: AgentDef) -> str | None:
@@ -2578,8 +2575,8 @@ def _validate_provider_capabilities(
     for fe in config.for_each:
         if fe.max_concurrent <= 1 or fe.agent.session_key is None:
             continue
-        # A per-item working_dir gives each iteration its own session, so
-        # the group is only unsafe when every iteration lands in one directory.
+        # A per-item working_dir gives each iteration its own session, so only
+        # a directory shared by every iteration is unsafe.
         working_dir = _effective_working_dir(fe.agent) or ""
         loop_vars = (f"{{{{ {fe.as_}", f"{{{{{fe.as_}", "_index", "_key")
         if any(var in working_dir for var in loop_vars):

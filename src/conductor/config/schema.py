@@ -1526,43 +1526,22 @@ class AgentDef(BaseModel):
     session_key: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
         None
     )
-    """Continue one provider session across every execution tagged with this key.
+    """Continue one provider session across every execution sharing this key.
 
-    Executions sharing a key resume the same underlying session instead of
-    starting cold, so a loop-back keeps the files the agent already read and
-    a later agent inherits the earlier one's conversation. ``None`` (the
-    default) starts a fresh session per execution — the historical behavior.
+    Keyed executions resume the same session instead of starting cold, so a
+    loop-back keeps what the agent already read and a later agent inherits an
+    earlier one's conversation. Default (``None``) starts a fresh session each
+    time; the map is checkpointed, so continuity survives ``conductor resume``.
 
-    The key is a static label, not a value produced by a workflow step: the
-    provider maps it to the real session id internally, so no session id ever
-    passes through the workflow context.
-
-    Gated on the provider's ``session_continuity`` capability: declaring it
-    against a provider that cannot honor it is a ``conductor validate``
-    error, not a silently dropped setting. Only ``claude-agent-sdk``
-    declares it today. The session id is persisted in checkpoints, so
-    continuity survives ``conductor resume``. A recorded session whose
-    transcript is no longer on disk (the CLI prunes on its own schedule)
-    falls back to a fresh session with a logged warning rather than failing
-    the run; a key with nothing recorded against it — the first execution,
-    or one under a different ``working_dir`` — simply starts fresh.
-
-    Concurrency: executions that genuinely overlap — two members of one
-    parallel group, or a for-each agent with ``max_concurrent > 1`` — are
-    rejected by the validator, since the second would resume a session the
-    first still has open. A *sequential* for-each with a key shares one
-    session across every item, which is only sensible when the items are
-    meant to build on each other.
-
-    Not a Jinja2 template. Unlike ``working_dir`` or ``model`` this value is
-    never rendered, so ``{{ ... }}`` is rejected rather than silently
-    becoming one literal key (see :meth:`validate_session_key_is_literal`).
+    A static label, never Jinja2-rendered — ``{{ ... }}`` is rejected (see
+    :meth:`validate_session_key_is_literal`). Requires a provider declaring
+    ``session_continuity`` (only ``claude-agent-sdk`` today); the validator
+    also rejects a key shared by concurrent executions.
 
     Example YAML::
 
         - name: analyze
           session_key: investigation
-          prompt: Investigate the failing build...
     """
 
     retry: RetryPolicy | None = None
@@ -1842,11 +1821,9 @@ class AgentDef(BaseModel):
     @field_validator("session_key")
     @classmethod
     def validate_session_key_is_literal(cls, v: str | None) -> str | None:
-        """Reject a Jinja2 template.
-
-        ``session_key`` is never rendered, so ``"item-{{ _key }}"`` would
-        become one literal key shared by every iteration rather than the
-        per-item key the author clearly intended. Fail loudly instead.
+        """Reject a Jinja2 template: ``session_key`` is never rendered, so
+        ``"item-{{ _key }}"`` would be one literal key shared by every
+        iteration rather than the per-item key the author intended.
         """
         if v is not None and ("{{" in v or "{%" in v):
             raise ValueError(

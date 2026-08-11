@@ -1,9 +1,8 @@
 """Session-continuity tests for the Claude Agent SDK provider.
 
-Covers the per-agent ``session_key`` contract: executions sharing a key
-resume one underlying Claude session, a key that resolves to a transcript
-the CLI can no longer find degrades to a fresh session rather than
-aborting the run, and the recorded map round-trips through a checkpoint.
+Covers the per-agent ``session_key`` contract: executions sharing a key resume
+one Claude session, an unfindable transcript degrades to a fresh session rather
+than aborting the run, and the map round-trips through a checkpoint.
 """
 
 from __future__ import annotations
@@ -114,11 +113,9 @@ class _Recorder:
 def _sdk(recorder: _Recorder, session_exists: bool = True):
     """Patch the SDK surface the provider touches.
 
-    The transcript probe is stubbed here rather than the SDK lookups it wraps:
-    these tests use synthetic session ids with no files on disk, so the real
-    probe would (correctly) refuse every one of them. The probe's own
-    behaviour against real transcripts is covered by
-    :class:`TestTranscriptProbe`.
+    The transcript probe is stubbed rather than the SDK lookups it wraps: these
+    tests use synthetic session ids with no files on disk, so the real probe
+    would (correctly) refuse every one. :class:`TestTranscriptProbe` covers it.
     """
     probe = Mock(return_value=session_exists)
     with (
@@ -224,11 +221,8 @@ class TestSessionReuse:
 
 class TestUnresolvableSession:
     async def test_missing_transcript_falls_back_to_a_fresh_session(self) -> None:
-        """Regression guard.
-
-        ``--resume`` on a transcript the CLI cannot find aborts it *before*
-        the agent runs, so an id that no longer resolves must be dropped
-        rather than passed through.
+        """``--resume`` on a transcript the CLI cannot find aborts it *before*
+        the agent runs, so an unresolvable id must be dropped, not passed on.
         """
         rec = _Recorder(["sess-1", "sess-2"])
         with _sdk(rec, session_exists=False):
@@ -252,10 +246,8 @@ class TestUnresolvableSession:
         assert "could not be found" in caplog.text
 
     async def test_sdk_without_session_lookup_does_not_resume_unverified(self) -> None:
-        """A sub-floor SDK must degrade to a fresh session, not an unguarded resume.
-
-        Handing an unverifiable id to ``--resume`` aborts the CLI *before the
-        agent runs*, so silently starting fresh is the safer degradation.
+        """A sub-floor SDK degrades to a fresh session: handing an unverifiable
+        id to ``--resume`` would abort the CLI before the agent runs.
         """
         rec = _Recorder(["sess-1", "sess-2"])
         with (
@@ -329,10 +321,8 @@ class TestCapability:
         )
 
     def test_under_claims_blanket_checkpoint_resume(self) -> None:
-        """Sessions do survive resume, but only for agents that opted in.
-
-        The flag is a blanket promise the startup banner reads out, so it
-        stays False; ``session_continuity`` carries the granular claim.
+        """Sessions survive resume, but only for agents that opted in, so this
+        blanket flag stays False; ``session_continuity`` is the granular claim.
         """
         assert ClaudeAgentSdkProvider.CAPABILITIES.checkpoint_resume is False
 
@@ -347,12 +337,9 @@ class _Hook:
 
 class TestSessionIdProvenance:
     async def test_hook_frames_do_not_shadow_the_real_session(self) -> None:
-        """Regression guard.
-
-        A ``SessionStart`` hook emits frames carrying a session id of their
-        own before the first assistant turn. Recording one would point the
-        map at an id with no transcript, silently breaking continuity for
-        every later pass.
+        """A ``SessionStart`` hook emits frames carrying a session id of their
+        own before the first assistant turn. Recording one would point the map
+        at an id with no transcript, breaking continuity for every later pass.
         """
         rec = _Recorder(["sess-real"])
         rec.prefix_messages = [_Hook("hook-stray")]
@@ -393,10 +380,8 @@ class TestSessionIdProvenance:
 
 class TestWorkingDirScoping:
     async def test_same_key_under_different_cwds_does_not_stomp(self, tmp_path: Any) -> None:
-        """Transcripts are stored per directory, so these cannot share a session.
-
-        Keying on the label alone made each execution overwrite the other's
-        id, so neither ever resumed.
+        """Transcripts are stored per directory, so these cannot share a
+        session. Keying on the label alone made each overwrite the other's id.
         """
         dir_a = tmp_path / "a"
         dir_b = tmp_path / "b"
@@ -457,8 +442,8 @@ class TestMapHygiene:
 class TestTranscriptProbe:
     """``_session_transcript_exists`` against real transcripts on disk.
 
-    Every other test in this file stubs the probe, so without these the
-    guard AGENTS.md calls "load-bearing" would have no coverage at all.
+    Every other test in this file stubs the probe, so without these the guard
+    would have no coverage at all.
     """
 
     @staticmethod
@@ -501,10 +486,8 @@ class TestTranscriptProbe:
         )
 
     def test_large_first_prompt_is_still_found(self, claude_home: Any) -> None:
-        """``get_session_info`` cannot summarise this one and returns None.
-
-        Treating that as "transcript gone" disabled continuity permanently
-        for any agent whose prompt cleared the SDK's read buffer.
+        """``get_session_info`` cannot summarise this one and returns None;
+        treating that as "transcript gone" would disable continuity for good.
         """
         repo, project_dir = claude_home
         sid = str(uuid.uuid4())
@@ -516,11 +499,9 @@ class TestTranscriptProbe:
         assert ClaudeAgentSdkProvider._session_transcript_exists(sid, str(repo)) is True
 
     def test_transcript_from_another_directory_is_not_claimed(self, claude_home: Any) -> None:
-        """The CLI refuses ``--resume`` across project dirs, so the probe must too.
-
-        ``get_session_info`` searches sibling git worktrees, which would
-        report the session present and turn the graceful fallback into the
-        hard abort this guard exists to prevent.
+        """The CLI refuses ``--resume`` across project dirs, so the probe must
+        too. ``get_session_info`` searches sibling git worktrees, which would
+        report the session present and turn the fallback into a hard abort.
         """
         repo, project_dir = claude_home
         sid = str(uuid.uuid4())
@@ -536,11 +517,8 @@ class TestTranscriptProbe:
 
 class TestMultiResume:
     async def test_restored_ids_are_re_exported(self) -> None:
-        """Continuity must survive more than one resume.
-
-        A second checkpoint taken before the keyed agent runs again would
-        otherwise drop the restored id, and a later loop-back would silently
-        start cold.
+        """Continuity must survive more than one resume: a checkpoint taken
+        before the keyed agent runs again must not drop the restored id.
         """
         provider = ClaudeAgentSdkProvider()
         stored = {_ck("investigation", "/proj"): "sess-1"}
@@ -549,10 +527,8 @@ class TestMultiResume:
         assert provider.get_session_ids() == stored
 
     async def test_ids_recorded_this_run_override_restored_ones_on_export(self) -> None:
-        """A superseded entry must not linger in the exported map.
-
-        The restored transcript is gone, so a fresh session is started; the
-        next checkpoint must carry the live id, not the dead one.
+        """A superseded entry must not linger: the restored transcript is gone,
+        so the next checkpoint must carry the live id, not the dead one.
         """
         rec = _Recorder(["sess-live"])
         with _sdk(rec, session_exists=False):
