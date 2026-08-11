@@ -8,6 +8,7 @@ The Claude provider enables Conductor workflows to use Anthropic's Claude models
 - [Architecture & Internal Design](#architecture--internal-design)
 - [Behavioral & Migration Notes](#behavioral--migration-notes)
 - [API Key Setup](#api-key-setup)
+- [Custom Endpoints and Gateways](#custom-endpoints-and-gateways)
 - [Model Selection](#model-selection)
 - [Runtime Configuration](#runtime-configuration)
 - [System Prompt](#system-prompt)
@@ -122,6 +123,84 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 ```bash
 echo '.env' >> .gitignore
+```
+
+## Custom Endpoints and Gateways
+
+You can route Claude requests through custom API gateways, LiteLLM proxies, or enterprise endpoints such as Databricks AI Gateway. Configure these targets by passing a structured `provider` object under `runtime`.
+
+### Provider Options
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude
+      base_url: "https://gateway.example.com"
+      auth_token: "${GATEWAY_TOKEN}"
+      # For an endpoint that expects an Anthropic key instead, use api_key
+      # and omit auth_token. Do not set both.
+      # api_key: "${ANTHROPIC_API_KEY}"
+```
+
+| Field | Description | Env Fallback |
+|-------|-------------|--------------|
+| `base_url` | Custom Anthropic-compatible endpoint URL. The SDK appends `/v1/messages` itself — whether the `/v1` prefix belongs in `base_url` depends on the gateway (see the note below) | `ANTHROPIC_BASE_URL` |
+| `api_key` | Key sent in `x-api-key` header | `ANTHROPIC_API_KEY` |
+| `auth_token` | Token sent in `Authorization: Bearer` header | `ANTHROPIC_AUTH_TOKEN` |
+
+### Configuration Rules and Precedence
+
+- **`base_url` precedence**: YAML `base_url` overrides `ANTHROPIC_BASE_URL`; when omitted, the env var is used.
+- **`base_url` and the `/v1` prefix**: the Anthropic SDK appends `/v1/messages` (and `/v1/...` for other endpoints) to `base_url` itself. LiteLLM-style gateways therefore expect `base_url` **without** `/v1` — a `base_url` of `https://gateway.example.com/v1` would send requests to `/v1/v1/messages`. Some gateways (e.g. Databricks AI Gateway) do require the `/v1` prefix in `base_url`. Check your gateway's documentation.
+- **Credential precedence**: `api_key` and `auth_token` are resolved together, not independently. Setting **either** in YAML makes the Anthropic SDK skip environment-variable credential resolution entirely, so a YAML `auth_token` also suppresses `ANTHROPIC_API_KEY`, and vice versa. If you set one credential in YAML and expect the other from the environment, it resolves to `None` with no warning.
+- **Authentication header selection**: Use `api_key` for standard Anthropic keys (`x-api-key` header). Use `auth_token` for gateways expecting bearer authentication (`Authorization: Bearer` header). **Set exactly one.** If both are configured, the Anthropic SDK does not choose between them: it sends `X-Api-Key` and `Authorization: Bearer` on every request, so your Anthropic key reaches whatever `base_url` points at. Conductor forwards both without arbitrating and logs a warning.
+
+### Security Warning
+
+Secrets must always use environment variable interpolation (such as `${ANTHROPIC_API_KEY}` or `${GATEWAY_TOKEN}`), never literal string values. Conductor embeds raw workflow source code inside the `yaml_source` attribute of `workflow_started` events. Hardcoding a literal secret key in YAML exposes it in JSONL event logs and the web dashboard.
+
+### Example Configurations
+
+#### Example 1: LiteLLM or Enterprise Gateway (Bearer Auth)
+
+To route requests through a LiteLLM proxy or Databricks AI Gateway using `base_url` and `auth_token`:
+
+```yaml
+workflow:
+  name: gateway-workflow
+  runtime:
+    provider:
+      name: claude
+      base_url: "https://litellm.internal.company.com"
+      auth_token: "${GATEWAY_BEARER_TOKEN}"
+    default_model: claude-sonnet-4.5
+
+agents:
+  - name: processor
+    prompt: "Process this input: {{ workflow.input.text }}"
+    routes:
+      - to: $end
+```
+
+#### Example 2: Direct Anthropic Endpoint with YAML Key
+
+To target the standard Anthropic endpoint while managing `api_key` in YAML:
+
+```yaml
+workflow:
+  name: direct-anthropic-workflow
+  runtime:
+    provider:
+      name: claude
+      api_key: "${ANTHROPIC_API_KEY}"
+    default_model: claude-sonnet-4.5
+
+agents:
+  - name: processor
+    prompt: "Summarize: {{ workflow.input.text }}"
+    routes:
+      - to: $end
 ```
 
 ## Model Selection

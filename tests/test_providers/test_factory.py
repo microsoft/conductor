@@ -8,6 +8,7 @@ from pydantic import SecretStr
 
 from conductor.config.schema import ProviderSettings, ToolOutputConfig
 from conductor.exceptions import ProviderError
+from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.factory import create_provider
 
@@ -154,6 +155,91 @@ class TestCreateProvider:
         assert provider._timeout == 300.0
         assert provider._tool_output_config.max_chars == 2500
         assert provider._tool_output_config.spill_dir == "/tmp/claude-out"
+
+    @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_create_claude_provider_extracts_api_key_from_settings(
+        self,
+        mock_anthropic_module: Any,
+        mock_anthropic_class: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """YAML api_key for name='claude' is forwarded to ClaudeProvider._api_key."""
+        from unittest.mock import AsyncMock
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
+        mock_client.close = AsyncMock(return_value=None)
+        mock_anthropic_class.return_value = mock_client
+
+        settings = ProviderSettings(name="claude", api_key=SecretStr("sk-yaml"))
+        provider = await create_provider(
+            "claude",
+            validate=False,
+            provider_settings=settings,
+        )
+        assert isinstance(provider, ClaudeProvider)
+        assert provider._api_key == "sk-yaml"
+        await provider.close()
+
+    @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_create_claude_provider_forwards_api_key_to_sdk_client(
+        self,
+        mock_anthropic_module: Any,
+        mock_anthropic_class: Any,
+    ) -> None:
+        """The YAML api_key reaches the Anthropic client as api_key, not as a bearer token."""
+        from unittest.mock import AsyncMock
+
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
+        mock_client.close = AsyncMock(return_value=None)
+        mock_anthropic_class.return_value = mock_client
+
+        settings = ProviderSettings(name="claude", api_key=SecretStr("sk-yaml"))
+        provider = await create_provider(
+            "claude",
+            validate=False,
+            provider_settings=settings,
+        )
+        assert isinstance(provider, ClaudeProvider)
+        assert mock_anthropic_class.call_count == 1
+        assert mock_anthropic_class.call_args.kwargs["api_key"] == "sk-yaml"
+        assert "auth_token" not in mock_anthropic_class.call_args.kwargs
+        await provider.close()
+
+    @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_create_claude_provider_api_key_defaults_to_none(
+        self,
+        mock_anthropic_module: Any,
+        mock_anthropic_class: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without YAML api_key and with no env key, ClaudeProvider._api_key remains None."""
+        from unittest.mock import AsyncMock
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
+        mock_client.close = AsyncMock(return_value=None)
+        mock_anthropic_class.return_value = mock_client
+
+        provider = await create_provider("claude", validate=False)
+        assert isinstance(provider, ClaudeProvider)
+        assert provider._api_key is None
+        await provider.close()
 
     @patch("conductor.providers.factory.ANTHROPIC_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude.AsyncAnthropic")
