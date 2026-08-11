@@ -148,6 +148,10 @@ class TestStatusAndStopRenderWorkflowNames:
         runs = tmp_path / "runs"
         runs.mkdir()
         monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs)
+        # Issue #399: the hardcoded ``pid: 610745`` below must never be
+        # misidentified as this test process's own run by a coincidental
+        # ancestor PID, which would make this markup test flaky.
+        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
         return runs
 
     def _write_pid(self, pid_dir: Path, stem: str) -> None:

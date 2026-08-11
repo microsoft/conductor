@@ -2586,6 +2586,152 @@ class TestCopilotProviderResolvedModel:
         )
         assert result.resolved_model == self._RESOLVED_MODEL_FROM_SDK
 
+    @pytest.mark.asyncio
+    async def test_send_and_wait_sums_usage_across_multiple_calls(self) -> None:
+        """Three assistant.usage events accumulate for billing (#412);
+        last_call_input_tokens reflects only the final event."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        def _usage_event(input_tokens: int, output_tokens: int, call_id: str) -> Any:
+            ev = _Mock()
+            ev.type.value = "assistant.usage"
+            ev.data.input_tokens = input_tokens
+            ev.data.output_tokens = output_tokens
+            ev.data.cache_read_tokens = None
+            ev.data.cache_write_tokens = None
+            ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+            ev.data.api_call_id = call_id
+            return ev
+
+        usage_ev_1 = _usage_event(100, 50, "call-1")
+        usage_ev_2 = _usage_event(200, 75, "call-2")
+        usage_ev_3 = _usage_event(300, 25, "call-3")
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (usage_ev_1, usage_ev_2, usage_ev_3, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.input_tokens == 600
+        assert result.output_tokens == 150
+        assert result.last_call_input_tokens == 300
+
+    @pytest.mark.asyncio
+    async def test_send_and_wait_dedupes_repeated_api_call_id(self) -> None:
+        """Two events sharing one string api_call_id are counted once."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        def _usage_event(input_tokens: int, output_tokens: int, call_id: str) -> Any:
+            ev = _Mock()
+            ev.type.value = "assistant.usage"
+            ev.data.input_tokens = input_tokens
+            ev.data.output_tokens = output_tokens
+            ev.data.cache_read_tokens = None
+            ev.data.cache_write_tokens = None
+            ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+            ev.data.api_call_id = call_id
+            return ev
+
+        usage_ev_1 = _usage_event(100, 50, "same-call")
+        usage_ev_2 = _usage_event(100, 50, "same-call")  # repeat of the same call
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (usage_ev_1, usage_ev_2, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.input_tokens == 100
+        assert result.output_tokens == 50
+        assert result.last_call_input_tokens == 100
+
+    @pytest.mark.asyncio
+    async def test_send_and_wait_accumulates_events_without_api_call_id(self) -> None:
+        """Events with no api_call_id still accumulate normally."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        def _usage_event(input_tokens: int, output_tokens: int) -> Any:
+            ev = _Mock()
+            ev.type.value = "assistant.usage"
+            ev.data.input_tokens = input_tokens
+            ev.data.output_tokens = output_tokens
+            ev.data.cache_read_tokens = None
+            ev.data.cache_write_tokens = None
+            ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+            ev.data.api_call_id = None
+            return ev
+
+        usage_ev_1 = _usage_event(100, 50)
+        usage_ev_2 = _usage_event(200, 75)
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (usage_ev_1, usage_ev_2, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.input_tokens == 300
+        assert result.output_tokens == 125
+        assert result.last_call_input_tokens == 200
+
 
 # ---------------------------------------------------------------------------
 # Epic E9 (#284): forward a ``github_token`` to the Copilot SDK in memory

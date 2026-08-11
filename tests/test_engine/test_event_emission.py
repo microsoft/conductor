@@ -645,6 +645,13 @@ class TestEventSequence:
             "agent_completed",
             "route_taken",
             "workflow_completed",
+            # Drawn when the run ends, so it trails workflow_completed. The
+            # mock handler bypasses the SDK, so the pricing hook is asked and
+            # returns None for every model -- which is exactly the condition
+            # the verdict reports. It cannot be suppressed for mock runs
+            # without making test and production behaviour diverge, since a
+            # real SDK that prices nothing (issue #386) looks identical here.
+            "pricing_hook_silent",
         ]
 
 

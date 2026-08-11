@@ -183,6 +183,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dashboard context-window bar no longer reports cumulative input tokens as
+  a false red at >100% of the cap** (#412). The bar reused
+  `AgentOutput.input_tokens` — a *billing* total summed across every API call
+  in an agent's execution — as a *context* measurement, so a multi-turn
+  tool-calling agent (or a Copilot parse-recovery retry) could report more
+  tokens than the model's context window physically allows. A new
+  `AgentOutput.last_call_input_tokens` field carries only the prompt size of
+  the most recent single API call, populated by every provider, and the
+  engine now sources `context_window_used` from it instead. When a provider
+  cannot isolate one call's prompt size, the field is `None` and the
+  dashboard hides the bar rather than showing a misleading number; a
+  `used > max` pair (impossible for one real API call) is dropped to `None`
+  entirely, logged at debug on every occurrence and at warning once per run
+  (nothing reads debug logs in production), since either the usage figure or
+  the looked-up cap is untrustworthy. Riding along: `copilot.py`'s
+  `assistant.usage` handler previously *overwrote* its running token counts
+  on every event instead of summing them, so a 20-turn tool-calling agent's
+  cost was billed only for its final API call — this under-report is fixed
+  at the same time, since fixing it alone (without the new field) would have
+  made the context bar report the sum of every turn rather than just the
+  last, making the original defect worse. The event's dedup guard (which
+  prevents a repeated `assistant.usage` event from double-billing the same
+  API call) keys on `api_call_id`, falling back to `provider_call_id` then
+  `service_request_id` when the SDK omits it, since all three are
+  independently optional. Cost figures for multi-turn Copilot agents will
+  rise as a result; a `cost.budget_usd` tuned against the old
+  under-reported total may now trip its limit sooner.
+
+- **`conductor stop` no longer kills the run it is executing inside** (#399).
+  An agent smoke-testing `conductor stop` from its own workflow's `bash` tool
+  inherited that workflow's background environment and terminated itself —
+  the process printed "Stopped" and was killed by what it printed. `stop` now
+  identifies the run it is executing inside via `CONDUCTOR_RUN_ID` (set on
+  every `--web-bg` child and inherited by descendants), the legacy
+  `CONDUCTOR_WEB_BG`/`CONDUCTOR_WEB_PORT` pair (for PID files predating
+  #411's `run_id` field), and POSIX process ancestry, and excludes it from
+  targeting by default: `--all` now means "stop all *other* runs", the
+  no-flag auto-stop skips it, and `--port <your own port>` is refused (exit
+  `1`, naming `--allow-self` as the remedy). If only your own run is alive, `stop`/`stop --all`
+  print a refusal and exit `0` rather than erroring, since nothing named was
+  declined. Pass `--allow-self` to restore the previous targeting exactly; a
+  yellow warning is printed whenever it actually causes your own run to be
+  signalled. Process-ancestry detection is POSIX-only — Windows relies on
+  the env-var signals alone.
+
+- **A pricing hook that silently prices nothing is now reported** (#386). #265
+  warns when the provider pricing hook *raises*; the companion case — a hook
+  that never raises and returns `None` for everything — looked identical to
+  "these models are simply unpriced", so live pricing could be dead for a whole
+  run with no symptom beyond newer models showing up as unpriced. The verdict is
+  drawn once when the run ends — however it ends, so a run that dies part way
+  still reports it, which is when a partial cost total most needs the caveat —
+  and is emitted as a `pricing_hook_silent` event as well as a log line, so it
+  reaches the event log and the console rather than only unattributed stderr.
+  The run summary gains `usage.live_pricing_degraded` and the cost breakdown
+  prints a matching caveat, because a model priced from the static table still
+  reports a confident cost and would otherwise carry no qualification.
+  Providers that do not implement the hook are excluded: returning
+  `None` is the documented default, so counting them accused four of the five
+  providers of a broken SDK for behaving correctly.
+- **`conductor stop` now confirms the process actually stopped, and never
+  stops the wrong one** (#344). `stop` sent one signal and reported success
+  without checking, so a workflow that ignored it was reported as stopped and
+  its PID file deleted — leaving a live run untracked, invisible to `stop`,
+  and holding its port. Termination is now a ladder (ask the dashboard to
+  cancel, then signal, then force-terminate), each rung confirmed before the
+  next, and the PID file is removed only once the process is confirmed gone.
+  Every PID-directed rung is gated on the dashboard confirming its own PID,
+  because between a PID file being written and `stop` reading it the OS may
+  have recycled that PID onto an unrelated process. `--force` overrides
+  *uncertainty* only: a positive identity mismatch blocks every rung, force
+  included. PID files are written atomically, so a concurrent `stop` can no
+  longer read a half-written file and deregister a live run, and the reader
+  logs before deleting anything it cannot parse. `--force` can clear an entry
+  whose liveness cannot be probed, which would otherwise wedge `stop --all`
+  at exit 2 permanently (#166).
 - **Bracketed text no longer crashes or corrupts CLI output** (#406). The same
   defect as #382, which #387 fixed only in `cli/run.py`. `conductor validate`
   died with an unhandled `MarkupError` traceback on a workflow whose `name:`
@@ -242,6 +318,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file predating this fix is distinguishable from one that legitimately has
   no run id. `conductor status` is unreleased, so the `log_file` →
   `stderr_log`/`stdout_log` rename costs no released contract.
+- **`conductor status`'s dashboard URL no longer gets cropped at a default
+  80-column terminal** (#405). At that width, the `Dashboard` column — the
+  one field the command exists to surface — was the one rich elided,
+  leaving `http://127.0.0.1:…` reconstructable only by hand from the `Port`
+  column. Both the `Started` and `Dashboard` columns now fold onto a second
+  line instead of cropping — a folded value is complete and readable, a
+  cropped one is unrecoverable from the output. `Started` also renders to
+  minute precision in UTC (`2026-08-11 12:48Z`, down from a 32-character
+  microsecond-precision timestamp), leaving more room for `Workflow` before
+  folding is ever needed. The table is a glance-at listing, not an audit
+  log, so `--json` keeps reporting the exact recorded timestamp untouched —
+  only the human-readable rendering changed. `_print_running_list` is
+  shared with `conductor stop`, so its listing gets the shorter timestamp
+  too. The test fixture that let this through built its own PID-file JSON by
+  hand with a 19-character naive `started_at`, well short of production's
+  32-character value — it now goes through the real `write_pid_file`, so the
+  widths under test match the widths production writes.
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing

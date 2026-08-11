@@ -1097,6 +1097,15 @@ class ConsoleEventSubscriber:
                     style="yellow",
                 )
 
+        elif t == "pricing_hook_silent":
+            models = d.get("models") or []
+            names = ", ".join(models) if models else "any model"
+            verbose_log(
+                f"  WARNING: the provider returned no live pricing for {names} — "
+                f"costs are estimates from the static pricing table",
+                style="yellow",
+            )
+
         elif t == "agent_tool_output_truncated":
             tool_name = d.get("tool_name", "?")
             original = d.get("original_chars", "?")
@@ -1243,6 +1252,19 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
             _print(styled("  [dim]Cost data unavailable{}[/dim]", _unpriced_suffix()))
         else:
             _print(Text.from_markup("  [dim]Cost data unavailable (unknown model pricing)[/dim]"))
+
+    # The provider priced nothing this run, so every figure above that has a
+    # cost came from the static table. Without this the summary prints a
+    # confident number and the explanation goes only to stderr, where
+    # ``--web-bg`` writes it to a temp file nobody was told to read.
+    if usage_data.get("live_pricing_degraded"):
+        _print(
+            Text.from_markup(
+                "  [yellow]Live pricing unavailable for every model this run.[/yellow]"
+                "[dim] Costs shown are estimates from the static pricing table; "
+                "set `cost.pricing` in the workflow to supply rates.[/dim]"
+            )
+        )
 
     _print("=" * 60, style="dim")
 

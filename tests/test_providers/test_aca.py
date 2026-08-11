@@ -721,6 +721,56 @@ class TestAcaExecuteStreaming:
         assert output.cache_write_tokens == 3
 
     @pytest.mark.asyncio
+    async def test_execute_parses_last_call_input_tokens_from_result(self) -> None:
+        """Issue #412: a result frame carrying last_call_input_tokens parses
+        into AgentOutput."""
+        frames = [
+            {
+                "type": "result",
+                "data": {
+                    "content": {},
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "last_call_input_tokens": 8,
+                },
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_ndjson_body(frames))
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            output = await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert output.last_call_input_tokens == 8
+
+    @pytest.mark.asyncio
+    async def test_execute_last_call_input_tokens_none_when_absent(self) -> None:
+        """An older runner that doesn't send the key yields None (bar hidden)."""
+        frames = [
+            {
+                "type": "result",
+                "data": {
+                    "content": {},
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                },
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_ndjson_body(frames))
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            output = await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert output.last_call_input_tokens is None
+
+    @pytest.mark.asyncio
     async def test_execute_parses_session_seconds_from_result(self) -> None:
         """E6-T1: `AcaResultData.session_seconds` reaches `AgentOutput`, distinct
         from token cost (FR7)."""

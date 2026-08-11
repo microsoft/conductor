@@ -45,6 +45,7 @@ def _make_result(
     input_tokens: int | None = 10,
     output_tokens: int | None = 20,
     total_tokens: int | None = 30,
+    api_calls: int | None = 1,
 ) -> dict[str, Any]:
     return {
         "final_response": final_response,
@@ -53,7 +54,7 @@ def _make_result(
         "partial": partial,
         "error": error,
         "messages": [],
-        "api_calls": 1,
+        "api_calls": api_calls,
         "model": model,
         "provider": "anthropic",
         "input_tokens": input_tokens,
@@ -340,6 +341,64 @@ class TestHermesExecute:
         assert output.input_tokens == 100
         assert output.output_tokens == 50
         assert output.tokens_used == 150
+
+    def test_last_call_input_tokens_populated_for_single_call_run(
+        self, provider: HermesProvider
+    ) -> None:
+        """A single-call run's aggregate *is* one call's prompt (issue #412)."""
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result(
+                input_tokens=100, api_calls=1
+            )
+            mock_cls.return_value = mock_instance
+
+            output = self._run(provider.execute(agent, {}, "hello"))
+
+        assert output.last_call_input_tokens == 100
+
+    def test_last_call_input_tokens_none_for_multi_call_run(self, provider: HermesProvider) -> None:
+        """A multi-call run's aggregate does not describe any single call."""
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result(
+                input_tokens=100, api_calls=3
+            )
+            mock_cls.return_value = mock_instance
+
+            output = self._run(provider.execute(agent, {}, "hello"))
+
+        assert output.last_call_input_tokens is None
+
+    def test_last_call_input_tokens_none_after_parse_recovery(
+        self, provider: HermesProvider
+    ) -> None:
+        """A recovery call spins up a fresh AIAgent whose usage never reaches
+        `result`, so the prompt size of the actual last call is unknown."""
+        schema = {"answer": OutputField(type="string")}
+        agent = _make_agent(output=schema)
+
+        call_count = {"n": 0}
+
+        def fake_run_conv(prompt: str, **kwargs: Any) -> dict[str, Any]:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _make_result(final_response='{"wrong": "field"}', api_calls=1)
+            return _make_result(final_response='{"answer": "pong"}', api_calls=1)
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.side_effect = fake_run_conv
+            mock_cls.return_value = mock_instance
+
+            output = self._run(provider.execute(agent, {}, "answer this"))
+
+        assert output.content == {"answer": "pong"}
+        assert output.last_call_input_tokens is None
 
     def test_session_metadata_in_raw_response(self, provider: HermesProvider) -> None:
         agent = _make_agent()

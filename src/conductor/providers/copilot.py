@@ -172,6 +172,8 @@ class SDKResponse:
         output_tokens: Number of output tokens generated (from assistant.usage event).
         cache_read_tokens: Tokens read from cache (if available).
         cache_write_tokens: Tokens written to cache (if available).
+        last_call_input_tokens: Prompt tokens of the most recent assistant.usage
+            event, distinct from input_tokens which sums every call for billing.
         partial: Whether this response is partial (from a mid-agent interrupt).
         resolved_model: Model name the SDK reported in the assistant.usage event's
             model field. None when that event is absent (error or interrupt paths)
@@ -183,6 +185,7 @@ class SDKResponse:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    last_call_input_tokens: int | None = None
     partial: bool = False
     resolved_model: str | None = None
 
@@ -837,6 +840,9 @@ class CopilotProvider(AgentProvider):
                 output_tokens = sdk_response.output_tokens if sdk_response else None
                 cache_read = sdk_response.cache_read_tokens if sdk_response else None
                 cache_write = sdk_response.cache_write_tokens if sdk_response else None
+                last_call_input_tokens = (
+                    sdk_response.last_call_input_tokens if sdk_response else None
+                )
                 tokens_used = None
                 if input_tokens is not None and output_tokens is not None:
                     tokens_used = input_tokens + output_tokens
@@ -852,6 +858,7 @@ class CopilotProvider(AgentProvider):
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
+                    last_call_input_tokens=last_call_input_tokens,
                     model=(
                         sdk_response.resolved_model
                         if sdk_response and agent.model in (None, "auto")
@@ -1273,6 +1280,7 @@ class CopilotProvider(AgentProvider):
                         output_tokens=sdk_response.output_tokens,
                         cache_read_tokens=sdk_response.cache_read_tokens,
                         cache_write_tokens=sdk_response.cache_write_tokens,
+                        last_call_input_tokens=sdk_response.last_call_input_tokens,
                         partial=True,
                         resolved_model=sdk_response.resolved_model,
                     )
@@ -1283,6 +1291,10 @@ class CopilotProvider(AgentProvider):
                 total_output_tokens = sdk_response.output_tokens
                 cache_read_tokens = sdk_response.cache_read_tokens
                 cache_write_tokens = sdk_response.cache_write_tokens
+                # The most recent single call's prompt size (context-window
+                # measurement, issue #412), replaced (not accumulated) by
+                # each recovery call below.
+                last_call = sdk_response.last_call_input_tokens
                 current_resolved_model = sdk_response.resolved_model
 
                 # If no output schema (or output_mode is raw), we're done
@@ -1293,6 +1305,7 @@ class CopilotProvider(AgentProvider):
                         output_tokens=total_output_tokens,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
+                        last_call_input_tokens=last_call,
                         resolved_model=current_resolved_model,
                     )
                     return {"result": response_content}, final_usage
@@ -1312,6 +1325,7 @@ class CopilotProvider(AgentProvider):
                             output_tokens=total_output_tokens,
                             cache_read_tokens=cache_read_tokens,
                             cache_write_tokens=cache_write_tokens,
+                            last_call_input_tokens=last_call,
                             resolved_model=current_resolved_model,
                         )
                         return parsed_content, final_usage
@@ -1351,7 +1365,8 @@ class CopilotProvider(AgentProvider):
                         )
                         response_content = recovery_response.content
 
-                        # Accumulate usage from recovery calls
+                        # Accumulate usage from recovery calls (all four
+                        # billing counters follow one rule).
                         if recovery_response.input_tokens is not None:
                             total_input_tokens = (
                                 total_input_tokens or 0
@@ -1360,6 +1375,19 @@ class CopilotProvider(AgentProvider):
                             total_output_tokens = (
                                 total_output_tokens or 0
                             ) + recovery_response.output_tokens
+                        if recovery_response.cache_read_tokens is not None:
+                            cache_read_tokens = (
+                                cache_read_tokens or 0
+                            ) + recovery_response.cache_read_tokens
+                        if recovery_response.cache_write_tokens is not None:
+                            cache_write_tokens = (
+                                cache_write_tokens or 0
+                            ) + recovery_response.cache_write_tokens
+                        # The recovery call is now the most recent call, so
+                        # its prompt size replaces (not accumulates) the
+                        # context-window figure.
+                        if recovery_response.last_call_input_tokens is not None:
+                            last_call = recovery_response.last_call_input_tokens
                         # Keep the latest resolved model (recovery uses the same session/model)
                         if recovery_response.resolved_model:
                             current_resolved_model = recovery_response.resolved_model
@@ -1446,7 +1474,10 @@ class CopilotProvider(AgentProvider):
                 tagged with their plain name.
 
         Returns:
-            SDKResponse with content and usage data. If interrupted,
+            SDKResponse with content and usage data. Usage is summed across
+            every ``assistant.usage`` event seen for the turn's API calls
+            (issue #412); ``last_call_input_tokens`` is the final call's
+            prompt size, a point-in-time context measurement. If interrupted,
             ``SDKResponse.partial`` will be True.
 
         Raises:
@@ -1460,8 +1491,18 @@ class CopilotProvider(AgentProvider):
         # Using a list so the nested callback can mutate it
         last_activity_ref: list[Any] = [None, None, time.monotonic()]
 
-        # Mutable container for usage data: [input_tokens, output_tokens, cache_read, cache_write]
+        # Mutable container for accumulated usage data (billing totals):
+        # [input_tokens, output_tokens, cache_read, cache_write]
         usage_ref: list[int | None] = [None, None, None, None]
+
+        # Mutable container for the most recent single call's prompt size
+        # (context-window measurement, issue #412), distinct from the
+        # accumulated usage_ref[0].
+        last_call_ref: list[int | None] = [None]
+
+        # api_call_id values already folded into usage_ref, so a repeated
+        # event for the same call isn't double-counted.
+        seen_call_ids: set[str] = set()
 
         # Mutable container for the resolved model name (from assistant.usage event)
         resolved_model_ref: list[str | None] = [None]
@@ -1496,20 +1537,43 @@ class CopilotProvider(AgentProvider):
             if event_type == "assistant.message":
                 response_content = event.data.content
             elif event_type == "assistant.usage":
-                # Capture token usage from the assistant.usage event
+                # Capture token usage from the assistant.usage event. One
+                # event is emitted per API call, so accumulate across calls
+                # for billing (issue #412) rather than overwriting — a
+                # multi-turn tool-calling agent otherwise bills only its
+                # final call. A repeated event for the same call (matched by
+                # api_call_id, falling back to provider_call_id then
+                # service_request_id when the SDK omits it) is skipped so
+                # it isn't double-counted. All three id fields are optional
+                # per the SDK schema; if none are present, dedup cannot be
+                # applied and the event is treated as a new call.
+                call_id = (
+                    getattr(event.data, "api_call_id", None)
+                    or getattr(event.data, "provider_call_id", None)
+                    or getattr(event.data, "service_request_id", None)
+                )
+                already_seen = isinstance(call_id, str) and call_id and call_id in seen_call_ids
+                if isinstance(call_id, str) and call_id:
+                    seen_call_ids.add(call_id)
                 input_tokens = getattr(event.data, "input_tokens", None)
                 output_tokens = getattr(event.data, "output_tokens", None)
                 cache_read = getattr(event.data, "cache_read_tokens", None)
                 cache_write = getattr(event.data, "cache_write_tokens", None)
                 # Convert floats to ints if needed (SDK sometimes returns floats)
-                if input_tokens is not None:
-                    usage_ref[0] = int(input_tokens)
-                if output_tokens is not None:
-                    usage_ref[1] = int(output_tokens)
-                if cache_read is not None:
-                    usage_ref[2] = int(cache_read)
-                if cache_write is not None:
-                    usage_ref[3] = int(cache_write)
+                if not already_seen:
+                    if input_tokens is not None:
+                        usage_ref[0] = (usage_ref[0] or 0) + int(input_tokens)
+                    if output_tokens is not None:
+                        usage_ref[1] = (usage_ref[1] or 0) + int(output_tokens)
+                    if cache_read is not None:
+                        usage_ref[2] = (usage_ref[2] or 0) + int(cache_read)
+                    if cache_write is not None:
+                        usage_ref[3] = (usage_ref[3] or 0) + int(cache_write)
+                    if input_tokens is not None:
+                        # The most recent single call's prompt size — a
+                        # point-in-time context measurement, unlike the
+                        # accumulated usage_ref[0] used for billing.
+                        last_call_ref[0] = int(input_tokens)
                 # Capture the actual model resolved by the SDK (e.g., when model="auto")
                 sdk_model = getattr(event.data, "model", None)
                 if sdk_model:
@@ -1568,6 +1632,7 @@ class CopilotProvider(AgentProvider):
                 output_tokens=usage_ref[1],
                 cache_read_tokens=usage_ref[2],
                 cache_write_tokens=usage_ref[3],
+                last_call_input_tokens=last_call_ref[0],
                 partial=True,
                 resolved_model=resolved_model_ref[0],
             )
@@ -1584,6 +1649,7 @@ class CopilotProvider(AgentProvider):
             output_tokens=usage_ref[1],
             cache_read_tokens=usage_ref[2],
             cache_write_tokens=usage_ref[3],
+            last_call_input_tokens=last_call_ref[0],
             resolved_model=resolved_model_ref[0],
         )
 
@@ -1697,6 +1763,7 @@ class CopilotProvider(AgentProvider):
                 output_tokens=sdk_response.output_tokens,
                 cache_read_tokens=sdk_response.cache_read_tokens,
                 cache_write_tokens=sdk_response.cache_write_tokens,
+                last_call_input_tokens=sdk_response.last_call_input_tokens,
                 model=(sdk_response.resolved_model if agent_model in (None, "auto") else None)
                 or agent_model
                 or self._default_model,

@@ -81,6 +81,40 @@ class TestWritePidFile:
         data = json.loads((pid_tmpdir / "wf-8080.pid").read_text())
         assert data["pid"] == 200
 
+    def test_write_is_atomic_so_a_reader_never_sees_a_partial_file(self, pid_tmpdir: Path) -> None:
+        """A truncating write races every reader, and readers here delete.
+
+        ``read_pid_files`` treats unparseable JSON as a dead run and unlinks it,
+        so a ``stop`` or ``status`` landing inside a non-atomic rewrite window
+        silently deregisters a live workflow. Asserting the rename directly is
+        what pins the property: mocking the filesystem would only re-test the
+        mock.
+        """
+        write_pid_file(100, 8080, "/tmp/wf.yaml")
+        target = pid_tmpdir / "wf-8080.pid"
+
+        seen: list[str] = []
+        real_replace = os.replace
+
+        def _spy(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+            # Before the rename the destination must still hold the OLD content
+            # in full — never a truncated or empty file.
+            seen.append(Path(str(dst)).read_text())
+            real_replace(src, dst)
+
+        with patch("conductor.cli.pid.os.replace", side_effect=_spy):
+            write_pid_file(200, 8080, "/tmp/wf.yaml")
+
+        assert len(seen) == 1, "write_pid_file must publish via a single atomic rename"
+        assert json.loads(seen[0])["pid"] == 100
+        assert json.loads(target.read_text())["pid"] == 200
+
+    def test_temp_file_is_not_left_behind(self, pid_tmpdir: Path) -> None:
+        """A stray temp file would be picked up by nothing and cleaned by nobody."""
+        write_pid_file(100, 8080, "/tmp/wf.yaml")
+        assert list(pid_tmpdir.glob("*.tmp")) == []
+        assert len(list(pid_tmpdir.glob("*.pid"))) == 1
+
 
 class TestReadPidFiles:
     """Tests for ``read_pid_files``."""
@@ -361,3 +395,34 @@ class TestReadPidFilesDoesNotCrashOnOsError:
         assert len(results) == 1
         assert results[0]["port"] == 8080
         assert (pid_tmpdir / "wf-8080.pid").exists()
+
+
+class TestDestructiveReadsAreAnnounced:
+    """Deleting someone's background-run record should never be silent."""
+
+    def test_unreadable_pid_file_logs_before_unlinking(
+        self, pid_tmpdir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bad = pid_tmpdir / "corrupt-8080.pid"
+        bad.write_text("{not json")
+
+        with caplog.at_level("WARNING", logger="conductor.cli.pid"):
+            assert read_pid_files() == []
+
+        assert not bad.exists()
+        assert any(
+            "Removing unreadable PID file" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        ), "a silent unlink leaves the user with no way to explain a vanished run"
+
+    def test_pid_file_without_a_pid_logs_before_unlinking(
+        self, pid_tmpdir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bad = pid_tmpdir / "nopid-8080.pid"
+        bad.write_text(json.dumps({"port": 8080}))
+
+        with caplog.at_level("WARNING", logger="conductor.cli.pid"):
+            assert read_pid_files() == []
+
+        assert not bad.exists()
+        assert any("no 'pid' field" in r.message for r in caplog.records)

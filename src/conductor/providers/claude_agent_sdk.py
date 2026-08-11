@@ -748,6 +748,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         structured_output: Any = None
         total_input_tokens = 0
         total_output_tokens = 0
+        # Prompt size of the most recent AssistantMessage carrying usage — a
+        # point-in-time context measurement for the dashboard bar (issue
+        # #412), distinct from the cumulative total_input_tokens above.
+        last_call_input_tokens: int | None = None
         result_model: str | None = model
         turn_count = 0
         # Track pending tool_use IDs so we can pair them with ToolResultBlocks
@@ -797,6 +801,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         result_model,
                         total_input_tokens,
                         total_output_tokens,
+                        last_call_input_tokens=last_call_input_tokens,
                         partial=True,
                     )
 
@@ -852,6 +857,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     if hasattr(msg, "usage") and msg.usage:
                         total_input_tokens += msg.usage.get("input_tokens", 0)
                         total_output_tokens += msg.usage.get("output_tokens", 0)
+                        # Unlike Copilot and pydantic-ai, the Anthropic-shaped
+                        # usage dict here reports cached prompt tokens
+                        # separately from ``input_tokens``, so the context
+                        # figure must add them in — the bare ``input_tokens``
+                        # understates the prompt badly on a cached
+                        # conversation.
+                        last_call_input_tokens = (
+                            msg.usage.get("input_tokens", 0)
+                            + msg.usage.get("cache_read_input_tokens", 0)
+                            + msg.usage.get("cache_creation_input_tokens", 0)
+                        )
 
                     # If this turn requested tool calls, the SDK will run
                     # them and then make another model call. Signal
@@ -928,6 +944,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             result_model,
             total_input_tokens,
             total_output_tokens,
+            last_call_input_tokens=last_call_input_tokens,
         )
 
     async def validate_connection(self) -> bool:
@@ -1221,6 +1238,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         model: str | None,
         input_tokens: int,
         output_tokens: int,
+        last_call_input_tokens: int | None = None,
         partial: bool = False,
     ) -> AgentOutput:
         """Assemble the final ``AgentOutput`` from accumulated execution state.
@@ -1242,6 +1260,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
             model: SDK-reported model identifier.
             input_tokens: Cumulative input tokens.
             output_tokens: Cumulative output tokens.
+            last_call_input_tokens: Prompt tokens of the most recent single
+                API call (issue #412), or ``None`` when unavailable.
             partial: True when the output is from a mid-stream interrupt.
                 Disables strict schema enforcement so partial best-effort
                 output is preferred over hard failure.
@@ -1326,6 +1346,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             tokens_used=total if total else None,
             input_tokens=input_tokens or None,
             output_tokens=output_tokens or None,
+            last_call_input_tokens=last_call_input_tokens,
             model=model,
             partial=partial,
         )

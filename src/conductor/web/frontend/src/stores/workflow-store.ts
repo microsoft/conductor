@@ -1546,6 +1546,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.output = undefined;
     nd.error_type = undefined;
     nd.error_message = undefined;
+    nd.context_pct = undefined;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1567,6 +1568,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.context_window_max = data.context_window_max;
     if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
       nd.context_pct = Math.round((data.context_window_used / data.context_window_max) * 100);
+    } else {
+      nd.context_pct = undefined;
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
@@ -1913,6 +1916,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.context_window_max = data.context_window_max;
     if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
       nd.context_pct = Math.round((data.context_window_used / data.context_window_max) * 100);
+    } else {
+      nd.context_pct = undefined;
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
