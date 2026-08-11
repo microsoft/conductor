@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -40,6 +41,8 @@ from dataclasses import dataclass
 from io import IOBase
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Windows process creation flags. Exposed via ``getattr`` with documented
 # fallbacks so this module can be imported on POSIX (where these attributes do
@@ -648,7 +651,16 @@ def _checkpoint_run_id(workflow_path: Path | None, checkpoint_path: Path | None)
 
     A launcher must never fail a launch over checkpoint parsing — the child
     will surface the real error — so any failure here is swallowed and
-    ``None`` is returned, which falls back to a fresh id.
+    ``None`` is returned, which falls back to a fresh id. The except clause
+    is deliberately broad (rather than naming only ``CheckpointManager``'s
+    documented exceptions) because a hand-edited or corrupted checkpoint can
+    fail in shapes ``CheckpointManager`` doesn't itself guard against — e.g.
+    a top-level JSON value that isn't an object (``AttributeError`` from
+    ``.get()``) or a ``run_id`` field that parsed as a non-string JSON value
+    (``AttributeError`` from ``.lower()`` below). Every such failure is
+    logged at warning level so the fallback leaves a forensic trail instead
+    of silently reusing a fresh id with no explanation (this module's own
+    stated philosophy — see the module docstring).
 
     Args:
         workflow_path: Optional workflow YAML path, used to find the latest
@@ -661,7 +673,6 @@ def _checkpoint_run_id(workflow_path: Path | None, checkpoint_path: Path | None)
         when no checkpoint could be resolved/loaded.
     """
     from conductor.engine.checkpoint import CheckpointManager
-    from conductor.exceptions import CheckpointError
 
     try:
         resolved_path = checkpoint_path
@@ -670,10 +681,23 @@ def _checkpoint_run_id(workflow_path: Path | None, checkpoint_path: Path | None)
         if resolved_path is None:
             return None
         cp = CheckpointManager.load_checkpoint(resolved_path)
-    except (CheckpointError, OSError, ValueError):
+        # ``CheckpointData.run_id`` is a ``str`` type hint, not an enforced
+        # constraint — a hand-edited or malformed checkpoint could carry a
+        # non-string value here, which would otherwise raise a bare
+        # ``AttributeError`` from ``.lower()``.
+        candidate = str(cp.run_id or "").lower()
+    except Exception as exc:  # must never fail a launch over checkpoint parsing; see docstring
+        logger.warning(
+            "Could not adopt run_id from checkpoint %s (%s: %s); minting a "
+            "fresh id instead. If the resumed child adopts the checkpoint's "
+            "real run_id from its own events JSONL, the PID file may not "
+            "correlate with it.",
+            resolved_path,
+            type(exc).__name__,
+            exc,
+        )
         return None
 
-    candidate = (cp.run_id or "").lower()
     if _RUN_ID_PATTERN_LOCAL.fullmatch(candidate):
         return candidate
     return None

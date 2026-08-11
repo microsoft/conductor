@@ -271,9 +271,10 @@ The dashboard URL is included because there is otherwise no supported way to rec
 `run_id` is the join key to the run's events JSONL
 (`conductor-<name>-<ts>-<run_id>.events.jsonl` under `$TMPDIR/conductor/`);
 `stderr_log`/`stdout_log` are the paths to the child's captured console
-output (see [Debugging `--web-bg` failures](../AGENTS.md)). All three are
-`null` — never `""` — for a PID file written before this field existed, or
-when a checkpoint carried no usable run id on resume.
+output (see [Debugging `--web-bg` failures](../AGENTS.md#debugging---web-bg-failures)).
+All three are `null` — never `""` — for a PID file written before this field
+existed. A resumed run whose checkpoint carried no usable run id still gets
+a freshly-minted `run_id` (and matching log paths), not `null`.
 
 ### Exit Codes
 

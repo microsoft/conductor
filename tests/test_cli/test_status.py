@@ -255,6 +255,40 @@ class TestStatusJson:
         assert entry["stderr_log"] is None
         assert entry["stdout_log"] is None
 
+    def test_json_empty_string_run_id_and_logs_report_null(self, pid_tmpdir: Path) -> None:
+        """The actual pre-fix issue #404 shape (keys present, empty strings).
+
+        Unlike the "field didn't exist yet" case above, every PID file
+        actually affected by issue #404 has ``run_id``/``log_file`` *present*
+        with empty-string values — ``write_pid_file``'s ``run_id``/
+        ``stderr_log``/``stdout_log`` parameters already defaulted to ``""``
+        before this fix; the bug was that the caller never passed real
+        values, not that the keys were absent. This must report ``null`` too.
+        """
+        filepath = pid_tmpdir / "wf-8080.pid"
+        filepath.write_text(
+            json.dumps(
+                {
+                    "pid": 4242,
+                    "port": 8080,
+                    "workflow": "/tmp/wf.yaml",
+                    "started_at": "2026-03-03T00:00:00",
+                    "run_id": "",
+                    "stderr_log": "",
+                    "stdout_log": "",
+                }
+            )
+        )
+
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["status", "--json"])
+
+        assert result.exit_code == 0
+        entry = json.loads(result.stdout)["running"][0]
+        assert entry["run_id"] is None
+        assert entry["stderr_log"] is None
+        assert entry["stdout_log"] is None
+
     def test_json_is_ascii_safe(self, pid_tmpdir: Path) -> None:
         """Workflow paths are user data and can contain non-ASCII.
 

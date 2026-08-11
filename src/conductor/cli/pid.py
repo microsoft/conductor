@@ -17,8 +17,10 @@ PID files are JSON with the schema::
     }
 
 ``run_id``, ``stderr_log``, and ``stdout_log`` are populated by
-``cli/bg_runner.py`` from the same launch that produced the PID file; a PID
-file written before this field existed has them as empty strings.
+``cli/bg_runner.py`` from the same launch that produced the PID file. A PID
+file written before this field existed has ``run_id`` present as an empty
+string (its prior default) and lacks the ``stderr_log``/``stdout_log`` keys
+entirely (they did not exist yet) — both shapes are read back as ``None``.
 """
 
 from __future__ import annotations
@@ -198,7 +200,8 @@ def read_pid_files() -> list[dict]:
 
     Returns:
         List of dicts with keys ``pid``, ``port``, ``workflow``,
-        ``started_at``, and ``file`` (the PID file path).
+        ``started_at``, ``run_id``, ``stderr_log``, ``stdout_log``, and
+        ``file`` (the PID file path).
     """
     d = pid_dir()
     results: list[dict] = []

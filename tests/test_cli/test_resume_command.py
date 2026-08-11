@@ -935,6 +935,98 @@ class TestLaunchBackgroundResumeRunIdAdoption:
 
         assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
 
+    def test_uppercase_checkpoint_run_id_is_lowercased_and_adopted(self, tmp_path: Path) -> None:
+        """A checkpoint's ``run_id`` is normalized to lowercase before adoption.
+
+        Every current writer of a checkpoint's ``run_id`` (``EventLogSubscriber``,
+        ``secrets.token_hex``) already produces lowercase hex, but a
+        hand-edited or future-format checkpoint could carry uppercase hex —
+        this must still be recognized and adopted, not treated as malformed.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="DEADBEEF")
+
+        proc = MagicMock()
+        proc.pid = 6007
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9216
+            )
+
+        assert launch.run_id == "deadbeef"
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == "deadbeef"
+
+    def test_non_string_checkpoint_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint whose ``run_id`` field is a non-string JSON value doesn't crash.
+
+        ``CheckpointData.run_id: str`` is a type hint, not an enforced
+        constraint — a hand-edited or corrupted checkpoint can carry e.g. a
+        JSON number for ``run_id``, which would otherwise raise a bare
+        ``AttributeError`` from ``.lower()`` and crash the whole launch.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+        checkpoint = json.loads(cp_path.read_text())
+        checkpoint["run_id"] = 12345678  # a JSON number, not a string
+        cp_path.write_text(json.dumps(checkpoint))
+
+        proc = MagicMock()
+        proc.pid = 6008
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9217
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_non_dict_checkpoint_content_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint file whose top-level JSON isn't an object doesn't crash.
+
+        ``CheckpointManager.load_checkpoint`` calls ``.get()`` on the parsed
+        JSON without an ``isinstance(data, dict)`` guard, so a checkpoint
+        file that is syntactically valid JSON but not an object (e.g. a bare
+        list) raises ``AttributeError`` rather than ``CheckpointError`` —
+        this must still degrade to a fresh id rather than crash the launch.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        cp_path = tmp_path / "wf-20260224-153000.json"
+        cp_path.write_text(json.dumps([1, 2, 3]))
+
+        proc = MagicMock()
+        proc.pid = 6009
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9218
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
 
 # ---------------------------------------------------------------------------
 # _execute_with_stop_signal tests (used by both run and resume)
