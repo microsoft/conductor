@@ -107,6 +107,7 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
             "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
         ),
     ),
+    "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
     "hermes": _CredentialSpec(),
     "openai-agents": _CredentialSpec(),
 }
@@ -326,6 +327,10 @@ def _sdk_available(name: str) -> bool:
             from conductor.providers.claude_agent_sdk import CLAUDE_AGENT_SDK_AVAILABLE
 
             return CLAUDE_AGENT_SDK_AVAILABLE
+        if name == "openai":
+            from conductor.providers.openai import OPENAI_SDK_AVAILABLE
+
+            return OPENAI_SDK_AVAILABLE
         if name == "hermes":
             from conductor.providers.hermes import HERMES_SDK_AVAILABLE
 

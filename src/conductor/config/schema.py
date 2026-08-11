@@ -1191,7 +1191,7 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude", "claude-agent-sdk", "hermes"] | None = None
+    provider: Literal["copilot", "openai", "claude", "claude-agent-sdk", "hermes"] | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -2602,9 +2602,9 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"] = (
-        "copilot"
-    )
+    name: Literal[
+        "copilot", "openai", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"
+    ] = "copilot"
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None
@@ -2815,7 +2815,7 @@ class ProviderSettings(BaseModel):
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
-        if self.name not in ("copilot", "claude", "hermes") and (
+        if self.name not in ("copilot", "openai", "claude", "hermes") and (
             self.base_url is not None or self.api_key is not None
         ):
             raise ValueError(

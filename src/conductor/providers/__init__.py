@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
     from conductor.providers.copilot import CopilotProvider
     from conductor.providers.factory import create_provider
+    from conductor.providers.openai import OpenAIProvider
 
 __all__ = [
     "AgentOutput",
@@ -23,6 +24,7 @@ __all__ = [
     "ClaudeProvider",
     "CopilotProvider",
     "create_provider",
+    "OpenAIProvider",
 ]
 
 
@@ -39,6 +41,10 @@ def __getattr__(name: str) -> Any:
         from conductor.providers.copilot import CopilotProvider
 
         return CopilotProvider
+    if name == "OpenAIProvider":
+        from conductor.providers.openai import OpenAIProvider
+
+        return OpenAIProvider
     if name == "create_provider":
         from conductor.providers.factory import create_provider
 

@@ -1,0 +1,282 @@
+"""Tests for the OpenAI provider.
+
+These tests verify construction, configuration forwarding, and the
+execute()/execute_dialog_turn() surfaces without making network calls.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import SecretStr
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+
+from conductor.config.schema import AgentDef, OutputField, ProviderSettings
+from conductor.exceptions import ValidationError
+from conductor.providers.factory import create_provider
+from conductor.providers.openai import OpenAIProvider
+
+
+@pytest.fixture
+def provider() -> OpenAIProvider:
+    """Return a fresh OpenAIProvider instance using a dummy API key."""
+    return OpenAIProvider(api_key="test-key")
+
+
+@pytest.fixture
+def no_mcp_manager(provider: OpenAIProvider) -> Any:
+    """Disable MCP manager resolution so execute() does not spawn tools."""
+    with patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None) as mock:
+        yield mock
+
+
+def _build_text_agent(text: str) -> Agent[Any, str]:
+    """Build a Pydantic AI text agent backed by TestModel."""
+    return Agent(model=TestModel(custom_output_text=text), output_type=str)
+
+
+class TestProviderConstruction:
+    """Tests for OpenAIProvider construction and validation."""
+
+    def test_default_model_is_gpt_5_mini(self) -> None:
+        """The provider defaults to gpt-5-mini when no model is passed."""
+        p = OpenAIProvider(api_key="test-key")
+        assert p._default_model == "gpt-5-mini"
+
+    def test_explicit_model_is_used(self) -> None:
+        """An explicitly passed model overrides the default."""
+        p = OpenAIProvider(api_key="test-key", model="gpt-5")
+        assert p._default_model == "gpt-5"
+
+    def test_missing_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Construction without an API key or env var raises ValidationError."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+            OpenAIProvider()
+
+    def test_temperature_validation_accepts_range(self) -> None:
+        """OpenAI accepts temperatures up to 2.0."""
+        p = OpenAIProvider(api_key="test-key", temperature=2.0)
+        assert p._default_temperature == 2.0
+
+    def test_temperature_validation_rejects_out_of_range(self) -> None:
+        """Temperatures outside 0..2 are rejected at construction time."""
+        with pytest.raises(ValidationError, match="between 0.0 and 2.0"):
+            OpenAIProvider(api_key="test-key", temperature=2.5)
+
+    def test_capabilities_are_stable(self) -> None:
+        """CAPABILITIES declares the expected stable-provider contract."""
+        caps = OpenAIProvider.CAPABILITIES
+        assert caps.tier == "stable"
+        assert caps.mcp_tools is True
+        assert caps.workflow_tools_passthrough is True
+        assert caps.streaming_events is True
+        assert caps.agent_reasoning_events is True
+        assert caps.reasoning_effort == ("low", "medium", "high", "xhigh")
+        assert caps.structured_output == "native"
+        assert caps.interrupt is True
+        assert caps.max_session_seconds is True
+        assert caps.checkpoint_resume is False
+        assert caps.usage_tracking is True
+        assert caps.concurrent_safe is True
+        assert caps.working_dir is True
+        assert caps.skills is True
+        assert caps.plugins is False
+
+    def test_supports_native_skills_is_false(self) -> None:
+        """OpenAI relies on eager skill injection by AgentExecutor."""
+        p = OpenAIProvider(api_key="test-key")
+        assert p.supports_native_skills is False
+
+
+class TestFactoryIntegration:
+    """Tests that the factory wires the openai provider correctly."""
+
+    @pytest.mark.asyncio
+    async def test_factory_creates_openai_provider(self) -> None:
+        """create_provider('openai') returns an OpenAIProvider."""
+        settings = ProviderSettings(name="openai", api_key=SecretStr("sk-test"))
+        p = await create_provider("openai", validate=False, provider_settings=settings)
+        assert isinstance(p, OpenAIProvider)
+        assert p._api_key == "sk-test"
+        await p.close()
+
+    @pytest.mark.asyncio
+    async def test_factory_forwards_base_url(self) -> None:
+        """YAML base_url for name='openai' reaches the provider."""
+        settings = ProviderSettings(
+            name="openai",
+            api_key=SecretStr("sk-test"),
+            base_url="http://localhost:1234/v1",
+        )
+        p = await create_provider("openai", validate=False, provider_settings=settings)
+        assert isinstance(p, OpenAIProvider)
+        assert p._base_url == "http://localhost:1234/v1"
+        await p.close()
+
+
+class TestExecute:
+    """Tests for the execute() path."""
+
+    async def test_execute_forwards_backend_openai(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """execute() calls build_agent with backend='openai' and http_client=None."""
+        agent = AgentDef(name="greeter", model="test", prompt="say hi")
+        captured_kwargs: dict[str, Any] = {}
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Agent[Any, Any]:
+            captured_kwargs.update(kwargs)
+            return _build_text_agent("hello")
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            side_effect=spy_build_agent,
+        ):
+            output = await provider.execute(agent, {}, "say hi")
+
+        assert output.content == {"result": "hello"}
+        assert captured_kwargs.get("backend") == "openai"
+        assert captured_kwargs.get("http_client") is None
+        assert captured_kwargs.get("api_key") == "test-key"
+
+    async def test_execute_forwards_temperature_and_max_tokens(self, no_mcp_manager: Any) -> None:
+        """Runtime temperature/max_tokens are passed to the agent builder."""
+        provider = OpenAIProvider(api_key="test-key", temperature=0.5, max_tokens=1024)
+        agent = AgentDef(name="greeter", model="test", prompt="say hi")
+        captured_kwargs: dict[str, Any] = {}
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Agent[Any, Any]:
+            captured_kwargs.update(kwargs)
+            return _build_text_agent("hello")
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            side_effect=spy_build_agent,
+        ):
+            await provider.execute(agent, {}, "say hi")
+
+        assert captured_kwargs.get("default_temperature") == 0.5
+        assert captured_kwargs.get("default_max_tokens") == 1024
+
+    async def test_execute_returns_structured_output(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """execute() returns validated structured output from a Pydantic model."""
+        from pydantic import BaseModel
+
+        class AnswerModel(BaseModel):
+            answer: str
+
+        agent = AgentDef(
+            name="greeter",
+            model="test",
+            prompt="say hi",
+            output={"answer": OutputField(type="string")},
+        )
+
+        structured_agent = Agent(
+            model=TestModel(custom_output_args={"answer": "hello"}),
+            output_type=AnswerModel,
+        )
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=structured_agent,
+        ):
+            output = await provider.execute(agent, {}, "say hi")
+
+        assert output.content == {"answer": "hello"}
+
+
+class TestExecuteDialogTurn:
+    """Tests for execute_dialog_turn()."""
+
+    async def test_dialog_turn_returns_text(self, provider: OpenAIProvider) -> None:
+        """execute_dialog_turn() returns the Pydantic AI text response."""
+
+        async def fake_run(*args: Any, **kwargs: Any) -> Any:
+            class FakeResult:
+                output = "dialog reply"
+
+            return FakeResult()
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._resolve_openai_model"
+            ) as mock_resolve_model,
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run = fake_run
+            result = await provider.execute_dialog_turn(
+                "system prompt",
+                "user message",
+                history=[{"role": "user", "content": "previous"}],
+                model="gpt-test",
+            )
+
+        assert result == "dialog reply"
+        kwargs = mock_resolve_model.call_args.kwargs
+        assert kwargs.get("api_key") == "test-key"
+        assert kwargs.get("timeout") == 600.0
+
+
+class TestConnectionHelpers:
+    """Tests for validate_connection/list_models/get_model_capabilities."""
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_returns_true_when_list_succeeds(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """validate_connection() returns True when models.list() succeeds."""
+        from unittest.mock import AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
+        provider._client = mock_client  # type: ignore[assignment]
+        assert await provider.validate_connection() is True
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_returns_false_on_error(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """validate_connection() returns False when models.list() fails."""
+        from unittest.mock import AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(side_effect=RuntimeError("boom"))
+        provider._client = mock_client  # type: ignore[assignment]
+        assert await provider.validate_connection() is False
+
+    @pytest.mark.asyncio
+    async def test_list_models_returns_ids(self, provider: OpenAIProvider) -> None:
+        """list_models() returns model ids from the OpenAI API."""
+        from unittest.mock import AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(
+            return_value=MagicMock(data=[MagicMock(id="gpt-5-mini"), MagicMock(id="gpt-5")])
+        )
+        provider._client = mock_client  # type: ignore[assignment]
+        ids = await provider.list_models()
+        assert ids == ["gpt-5-mini", "gpt-5"]
+
+    @pytest.mark.asyncio
+    async def test_get_model_capabilities_reasoning_models(self, provider: OpenAIProvider) -> None:
+        """Reasoning models advertise the full supported effort tuple."""
+        caps = await provider.get_model_capabilities("o3-mini")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == ["low", "medium", "high", "xhigh"]
+
+    @pytest.mark.asyncio
+    async def test_get_model_capabilities_non_reasoning_models(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Non-reasoning models advertise no supported reasoning efforts."""
+        caps = await provider.get_model_capabilities("gpt-5-mini")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == []

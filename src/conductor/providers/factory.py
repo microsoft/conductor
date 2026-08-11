@@ -21,13 +21,22 @@ from conductor.providers.claude_agent_sdk import (
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
+from conductor.providers.openai import OPENAI_SDK_AVAILABLE, OpenAIProvider
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
 
 
-ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"]
+ProviderType = Literal[
+    "copilot",
+    "openai",
+    "openai-agents",
+    "claude",
+    "claude-agent-sdk",
+    "hermes",
+    "aca",
+]
 
 
 async def create_provider(
@@ -105,6 +114,31 @@ async def create_provider(
                 default_reasoning_effort=default_reasoning_effort,
                 default_context_tier=default_context_tier,
                 provider_settings=provider_settings,
+                tool_output=tool_output,
+            )
+        case "openai":
+            if not OPENAI_SDK_AVAILABLE:
+                raise ProviderError(
+                    "OpenAI provider requires the openai package",
+                    suggestion="Install with: uv add 'openai>=1.0.0'",
+                )
+            openai_api_key: str | None = None
+            openai_base_url: str | None = None
+            if provider_settings is not None and provider_settings.name == "openai":
+                if provider_settings.api_key is not None:
+                    openai_api_key = provider_settings.api_key.get_secret_value()
+                openai_base_url = provider_settings.base_url
+            provider = OpenAIProvider(
+                api_key=openai_api_key,
+                base_url=openai_base_url,
+                model=default_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout if timeout is not None else 600.0,
+                mcp_servers=mcp_servers,
+                max_agent_iterations=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
+                default_reasoning_effort=default_reasoning_effort,
                 tool_output=tool_output,
             )
         case "openai-agents":
@@ -232,7 +266,7 @@ async def create_provider(
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
                 suggestion=(
-                    "Valid providers are: copilot, openai-agents, claude, "
+                    "Valid providers are: copilot, openai, openai-agents, claude, "
                     "claude-agent-sdk, hermes, aca"
                 ),
             )
