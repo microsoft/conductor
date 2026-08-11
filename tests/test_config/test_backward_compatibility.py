@@ -50,6 +50,8 @@ def get_copilot_example_files() -> list[Path]:
             continue
         if "aca" in example.name.lower():
             continue
+        if "openai" in example.name.lower():
+            continue
 
         copilot_examples.append(example)
 

@@ -52,8 +52,9 @@ def _build_workflow(
     tools: list[str] | None = None,
     skills: list[str] | None = None,
     temperature: float | None = None,
+    provider: str = "copilot",
 ) -> WorkflowConfig:
-    runtime_kwargs: dict[str, Any] = {"provider": "copilot"}
+    runtime_kwargs: dict[str, Any] = {"provider": provider}
     if mcp_servers is not None:
         runtime_kwargs["mcp_servers"] = mcp_servers
     if skills is not None:
@@ -165,6 +166,104 @@ class TestMcpToolsCrossCheck:
             validate_workflow_config(config)
 
 
+class TestOpenAIProviderCrossCheck:
+    """Requirement: ``runtime.provider: openai`` and per-agent ``provider: openai``
+    workflows pass ``conductor validate`` for features the provider supports.
+    """
+
+    def test_runtime_provider_openai_validates(self, patch_caps: Any) -> None:
+        """Requirement: a workflow with ``runtime.provider: openai`` validates cleanly."""
+        from conductor.providers.openai import OpenAIProvider
+
+        patch_caps({"openai": OpenAIProvider.CAPABILITIES})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="openai"),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_per_agent_provider_openai_validates(self, patch_caps: Any) -> None:
+        """Requirement: a per-agent ``provider: openai`` override validates cleanly."""
+        from conductor.providers.openai import OpenAIProvider
+
+        patch_caps({"copilot": _caps(), "openai": OpenAIProvider.CAPABILITIES})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", provider="openai")],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_max_effort_rejected_against_real_openai_capabilities(self, patch_caps: Any) -> None:
+        """Requirement: ``reasoning.effort: max`` on ``openai`` is rejected statically
+        via the real capability descriptor (which excludes ``max``).
+        """
+        from conductor.providers.openai import OpenAIProvider
+
+        patch_caps({"openai": OpenAIProvider.CAPABILITIES})
+        config = _build_workflow(
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    provider="openai",
+                    reasoning=ReasoningConfig(effort="max"),
+                ),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="supports only.*low.*medium.*high.*xhigh"):
+            validate_workflow_config(config)
+
+    def test_non_empty_tools_allowlist_passes(self, patch_caps: Any) -> None:
+        """Requirement: openai honors per-agent tool allowlists, so
+        ``tools: [...]`` validates."""
+        from conductor.providers.openai import OpenAIProvider
+
+        patch_caps({"openai": OpenAIProvider.CAPABILITIES})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", provider="openai", tools=["search"])],
+            tools=["search"],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_mcp_servers_with_openai_passes(self, patch_caps: Any) -> None:
+        """Requirement: ``runtime.mcp_servers`` with default provider ``openai``
+        validates."""
+        from conductor.providers.openai import OpenAIProvider
+
+        patch_caps({"openai": OpenAIProvider.CAPABILITIES})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(
+                    provider="openai",
+                    mcp_servers={"docs": MCPServerDef(command="docs-server")},
+                ),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_skills_with_openai_passes(self, patch_caps: Any) -> None:
+        """Requirement: declared skills with provider ``openai`` validate
+        (openai supports skills)."""
+        from conductor.providers.openai import OpenAIProvider
+
+        patch_caps({"openai": OpenAIProvider.CAPABILITIES})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="openai"),
+            ),
+            agents=[AgentDef(name="a", prompt="hi", skills=["conductor"])],
+        )
+        validate_workflow_config(config)  # no raise
+
+
 class TestTemperatureCrossCheck:
     def test_temperature_above_one_with_openai_default_passes(self, patch_caps: Any) -> None:
         patch_caps({"openai": _caps()})
@@ -222,6 +321,46 @@ class TestTemperatureCrossCheck:
             ],
         )
         with pytest.raises(ConfigurationError, match="temperature.*1.5.*copilot"):
+            validate_workflow_config(config)
+
+    def test_temperature_above_one_with_claude_per_agent_override_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """Requirement: workflow default=openai + temperature=1.5 with a per-agent
+        provider='claude' override fails validation, naming temperature and claude."""
+        patch_caps({"openai": _caps(), "claude": _caps()})
+        config = _build_workflow(
+            provider="openai",
+            temperature=1.5,
+            agents=[
+                AgentDef(name="a", prompt="hi", provider="claude"),
+                AgentDef(name="b", prompt="hi", provider="openai"),
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="temperature.*1.5.*claude"):
+            validate_workflow_config(config)
+
+    def test_temperature_above_one_with_for_each_inline_claude_override_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """Requirement: workflow default=openai + temperature=1.5 with a for_each
+        inline provider='claude' override fails validation, naming temperature and claude."""
+        patch_caps({"openai": _caps(), "claude": _caps()})
+        config = _build_workflow(
+            provider="openai",
+            temperature=1.5,
+            agents=[AgentDef(name="entry", prompt="hi", output={"items": {"type": "array"}})],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=AgentDef(name="inline", prompt="{{ item }}", provider="claude"),
+                )
+            ],
+        )
+        with pytest.raises(ConfigurationError, match="temperature.*1.5.*claude"):
             validate_workflow_config(config)
 
     def test_temperature_at_one_allowed_for_all_providers(self, patch_caps: Any) -> None:

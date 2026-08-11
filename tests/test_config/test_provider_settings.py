@@ -104,6 +104,27 @@ class TestProviderSettingsValidation:
         s = ProviderSettings(name="openai", base_url="http://localhost:11434/v1")
         assert s.base_url == "http://localhost:11434/v1"
 
+    def test_openai_temperature_within_range_accepted(self) -> None:
+        """Requirement: ``RuntimeConfig(provider={name: openai}, temperature=1.5)`` validates."""
+        rc = RuntimeConfig(provider={"name": "openai"}, temperature=1.5)
+        assert rc.provider.name == "openai"
+        assert rc.temperature == 1.5
+
+    def test_openai_temperature_out_of_range_rejected(self) -> None:
+        """Requirement: ``RuntimeConfig(provider={name: openai}, temperature=2.5)`` raises."""
+        with pytest.raises(ValidationError) as exc_info:
+            RuntimeConfig(provider={"name": "openai"}, temperature=2.5)
+        errors = exc_info.value.errors()
+        assert any("temperature" in str(e.get("loc", [])) for e in errors)
+
+    def test_openai_api_key_redacted_in_json_dump(self) -> None:
+        """Requirement: openai ProviderSettings api_key redacts to '**********' in
+        ``model_dump(mode='json')``."""
+        s = ProviderSettings(name="openai", api_key="sk-x")
+        dumped = s.model_dump(mode="json")
+        assert dumped["api_key"] == "**********"
+        assert "sk-x" not in str(dumped)
+
     def test_claude_with_base_url_accepted(self) -> None:
         s = ProviderSettings(name="claude", base_url="https://my-gateway.example.com/api/v1")
         assert s.base_url == "https://my-gateway.example.com/api/v1"
