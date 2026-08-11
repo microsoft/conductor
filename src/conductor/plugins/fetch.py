@@ -236,9 +236,20 @@ def _run_git(arguments: Sequence[str], *, timeout: int, context: str) -> str:
         "SSH_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
     }
+    # ``core.longpaths`` is git-for-Windows' opt-in to the Win32 extended-length
+    # API; without it git refuses any path over 260 characters. The plugin cache
+    # is inherently deep -- cache root, then host, owner, repo-digest, a staging
+    # directory, and then whatever the repository itself nests -- so a user whose
+    # cache lives under a long home directory could not clone at all, failing on
+    # git's own `.git/hooks/*.sample` before any project file was written.
+    #
+    # Set per-invocation rather than asking users to configure it globally: this
+    # is a property of the paths Conductor generates, not a preference of theirs.
+    # A no-op on POSIX, where the limit does not exist.
+    git_config = ["-c", "protocol.ext.allow=never", "-c", "core.longpaths=true"]
     try:
         completed = subprocess.run(  # noqa: S603
-            ["git", "-c", "protocol.ext.allow=never", *arguments],  # noqa: S607
+            ["git", *git_config, *arguments],  # noqa: S607
             capture_output=True,
             text=True,
             timeout=timeout,

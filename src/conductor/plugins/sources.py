@@ -92,9 +92,12 @@ _LOCAL_HOST = "_local"
 _PATH_UNSAFE = str.maketrans(dict.fromkeys(':<>"|?*', "_"))
 
 # Bound on one cache-key segment. Windows caps a path at 260 characters
-# unless long-path support is enabled, and the segment is only one part of
-# a path that also carries the cache root, the host, and the leaf.
-_MAX_SEGMENT = 48
+# unless long-path support is enabled, and the segment is only one part of a
+# path that also carries the cache root, the host, the leaf, a staging
+# directory, and whatever the repository itself nests. Sized against the
+# worst case seen in CI -- a pytest temporary root, which at 48 came to 264
+# characters and at 24 comes to 240.
+_MAX_SEGMENT = 24
 
 
 def redact_credentials(text: str) -> str:
@@ -333,11 +336,15 @@ def _safe_segment(segment: str) -> str:
     an over-long segment with a digest of itself costs nothing: the cache
     key's leaf already carries a digest of the full location, so the owner
     disambiguates nothing on its own.
+
+    The *tail* is kept rather than the head. What survives is then the
+    directory nearest the repository, which is the part someone browsing the
+    cache can recognise; the head is a drive letter and ``Users``.
     """
     segment = segment.translate(_PATH_UNSAFE)
     if len(segment) > _MAX_SEGMENT:
         digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()[:12]
-        return f"{segment[: _MAX_SEGMENT - len(digest) - 1]}-{digest}"
+        return f"{segment[-(_MAX_SEGMENT - len(digest) - 1) :]}-{digest}"
     return segment
 
 

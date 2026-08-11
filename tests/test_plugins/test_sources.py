@@ -154,7 +154,7 @@ class TestLocalPaths:
         for part in key.parts:
             assert part not in ("", ".", "..")
             assert not set(part) & set(':<>"|?*\\/'), f"unsafe character in {part!r}"
-            assert len(part) <= 48, f"segment too long for a 260-char path: {part!r}"
+            assert len(part) <= 24, f"segment too long for a 260-char path: {part!r}"
 
     def test_file_url_keys_stay_distinct_when_shortened(self):
         """Shortening must not collapse two different sources onto one key."""
