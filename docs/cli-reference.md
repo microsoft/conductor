@@ -247,7 +247,7 @@ conductor status [OPTIONS]
 
 It is also read-only on disk: unlike `stop`, it never removes a PID file, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
 
-The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone.
+The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone. The table renders `Started` to minute precision in UTC, and the dashboard URL wraps onto a second line rather than being cropped on a narrow terminal. `--json` reports the exact recorded `started_at` value regardless.
 
 ### `--json` Payload
 
