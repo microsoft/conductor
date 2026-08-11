@@ -8,9 +8,10 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 from rich.console import Console
@@ -20,6 +21,11 @@ from rich.text import Text
 from conductor import __version__
 from conductor.console import make_console, styled
 from conductor.exceptions import WorkflowTerminated
+
+if TYPE_CHECKING:
+    # Typing-only: ``stop()`` imports ``conductor.cli.self_run`` lazily at
+    # runtime, matching the existing lazy import of ``conductor.cli.pid``.
+    from conductor.cli.self_run import OwnRunPartition
 
 logger = logging.getLogger(__name__)
 
@@ -1271,6 +1277,13 @@ def stop(
             help="Stop all background conductor workflows.",
         ),
     ] = False,
+    allow_self: Annotated[
+        bool,
+        typer.Option(
+            "--allow-self",
+            help="Include the run this command is executing inside (refused by default).",
+        ),
+    ] = False,
     force: Annotated[
         bool,
         typer.Option(
@@ -1310,9 +1323,20 @@ def stop(
     unrelated process. Use --force to override that check.
 
     \b
+    By default, `stop` never targets the run it is executing inside --
+    an agent smoke-testing this command must not terminate its own
+    workflow (issue #399). That run is identified by `CONDUCTOR_RUN_ID`,
+    the legacy `CONDUCTOR_WEB_BG`/`CONDUCTOR_WEB_PORT` pair, or process
+    ancestry, and is excluded from `--all` and the no-flag auto-stop; a
+    `--port` naming it is refused outright. Pass `--allow-self` to
+    include it anyway.
+
+    \b
     Exit codes:
-        0  every targeted workflow is confirmed stopped (or was already gone)
-        1  --port matched no running workflow, or the target was ambiguous
+        0  every targeted workflow is confirmed stopped (or was already
+           gone), including a self-only refusal
+        1  --port matched no running workflow, the target was ambiguous,
+           or --port matched only your own run
         2  at least one workflow survived or could not be confirmed stopped
 
     \b
@@ -1321,10 +1345,12 @@ def stop(
         conductor stop --port 8080
         conductor stop --all
         conductor stop --all --json
+        conductor stop --allow-self --port 8080
     """
     import json
 
     from conductor.cli.pid import read_pid_files, remove_pid_file_at
+    from conductor.cli.self_run import partition_own_run
 
     running = read_pid_files()
 
@@ -1337,11 +1363,44 @@ def stop(
             )
         return
 
+    partition = partition_own_run(running)
+    targetable = running if allow_self else partition.others
+    auto_detected_single = False
+
     if all_workflows:
-        targets = running
+        if not allow_self and not targetable:
+            if json_output:
+                output_console.print_json(
+                    json.dumps({"stopped": [], "failed": []}), ensure_ascii=True
+                )
+            else:
+                _print_self_exclusion(partition, console, blocking=True)
+            return
+        targets = targetable
+        if not allow_self and partition.own and not json_output:
+            _print_self_exclusion(partition, console, blocking=False)
     elif port is not None:
-        targets = [e for e in running if e["port"] == port]
+        targets = [e for e in targetable if e["port"] == port]
         if not targets:
+            if not allow_self:
+                own_match = [e for e in partition.own if e["port"] == port]
+                if own_match:
+                    if json_output:
+                        output_console.print_json(
+                            json.dumps(
+                                {
+                                    "error": (
+                                        f"port {port} is the run this command is executing "
+                                        "inside; pass --allow-self to include it"
+                                    )
+                                }
+                            ),
+                            ensure_ascii=True,
+                        )
+                    else:
+                        _print_self_refusal_line(own_match[0], console)
+                        _print_allow_self_hint(console)
+                    raise typer.Exit(code=1)
             if json_output:
                 output_console.print_json(
                     json.dumps({"error": f"no background workflow on port {port}"}),
@@ -1354,11 +1413,21 @@ def stop(
                         port,
                     )
                 )
-                console.print(Text.from_markup("[dim]Running workflows:[/dim]"))
-                _print_running_list(running, console)
+                if not allow_self and not targetable and partition.own:
+                    _print_self_exclusion(partition, console, blocking=False)
+                else:
+                    console.print(Text.from_markup("[dim]Running workflows:[/dim]"))
+                    _print_running_list(targetable, console)
             raise typer.Exit(code=1)
-    elif len(running) == 1:
-        targets = running
+    elif len(targetable) == 0:
+        if json_output:
+            output_console.print_json(json.dumps({"stopped": [], "failed": []}), ensure_ascii=True)
+        else:
+            _print_self_exclusion(partition, console, blocking=True)
+        return
+    elif len(targetable) == 1:
+        targets = targetable
+        auto_detected_single = True
     else:
         # Ambiguous: list rather than guess which run the user meant. This is
         # a failure to act, so it must not report success to automation.
@@ -1371,7 +1440,7 @@ def stop(
             console.print(
                 styled(
                     "[bold yellow]Multiple background workflows running ({}).[/bold yellow]",
-                    len(running),
+                    len(targetable),
                 )
             )
             console.print(
@@ -1379,13 +1448,19 @@ def stop(
                     "[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n"
                 )
             )
-            _print_running_list(running, console)
+            _print_running_list(targetable, console)
+            if not allow_self and partition.own:
+                _print_self_exclusion(partition, console, blocking=False)
         raise typer.Exit(code=1)
 
     # Prose goes to ``console`` (stderr); JSON goes to ``output_console``
     # (stdout). They cannot corrupt each other, so diagnostics stay visible
     # even in --json mode.
-    results = [_stop_process(entry, console, force=force) for entry in targets]
+    results = []
+    for entry in targets:
+        if allow_self:
+            _maybe_warn_stopping_self(entry, partition, console)
+        results.append(_stop_process(entry, console, force=force))
 
     for entry, result in zip(targets, results, strict=True):
         if result["outcome"] in ("stopped", "already-exited"):
@@ -1424,9 +1499,89 @@ def stop(
             "failed": [r for r in results if r["outcome"] not in ("stopped", "already-exited")],
         }
         output_console.print_json(json.dumps(payload), ensure_ascii=True)
+    elif auto_detected_single and not allow_self and partition.own:
+        # Single-target auto-stop: the exclusion note comes after the stop
+        # so the user sees "Stopped <other>" before being told their own run
+        # was left out of consideration, matching the --all branch's note.
+        _print_self_exclusion(partition, console, blocking=False)
 
     if any(r["outcome"] not in ("stopped", "already-exited") for r in results):
         raise typer.Exit(code=2)
+
+
+def _print_self_refusal_line(entry: dict, con: Console) -> None:
+    """Print the red refusal line naming the run this command is executing inside.
+
+    Args:
+        entry: The PID-file dict identified as this process's own run.
+        con: Rich Console for output.
+    """
+    from conductor.cli.self_run import describe_own_run
+
+    con.print(
+        styled(
+            "[bold red]Refusing[/bold red] to stop run {} — it is the run this "
+            "command is executing inside.",
+            describe_own_run(entry),
+        )
+    )
+
+
+def _print_allow_self_hint(con: Console) -> None:
+    """Print the dim hint pointing at the ``--allow-self`` escape hatch."""
+    con.print(Text.from_markup("[dim]Use --allow-self to include it.[/dim]"))
+
+
+def _print_self_exclusion(partition: OwnRunPartition, con: Console, *, blocking: bool) -> None:
+    """Print the message explaining that this run was excluded from targeting.
+
+    Args:
+        partition: The result of ``partition_own_run``. ``partition.own``
+            must be non-empty.
+        con: Rich Console for output.
+        blocking: True when there is nothing left to stop (prints the red
+            refusal line plus "No other workflows are running."); False when
+            other runs were still targeted (prints a yellow exclusion note).
+    """
+    entry = partition.own[0]
+    if blocking:
+        _print_self_refusal_line(entry, con)
+        con.print(Text.from_markup("[dim]No other workflows are running.[/dim]"))
+    else:
+        from conductor.cli.self_run import describe_own_run
+
+        con.print(
+            styled(
+                "[yellow]Excluded[/yellow] run {} — it is the run this command is "
+                "executing inside.",
+                describe_own_run(entry),
+            )
+        )
+    _print_allow_self_hint(con)
+
+
+def _maybe_warn_stopping_self(entry: dict, partition: OwnRunPartition, con: Console) -> None:
+    """Print a yellow warning when about to signal the caller's own run.
+
+    Only reachable via ``--allow-self`` -- without that flag, an entry
+    identified as this process's own run is never present in the
+    targetable list in the first place.
+
+    Args:
+        entry: The PID-file dict about to be stopped.
+        partition: The result of ``partition_own_run``.
+        con: Rich Console for output.
+    """
+    from conductor.cli.self_run import describe_own_run
+
+    if any(o["port"] == entry["port"] for o in partition.own):
+        con.print(
+            styled(
+                "[yellow]Warning:[/yellow] stopping run {} — this is the run "
+                "executing this command.",
+                describe_own_run(entry),
+            )
+        )
 
 
 class Identity(str, Enum):
@@ -1734,8 +1889,48 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     return _result("unconfirmed", "terminate")
 
 
+def _format_started_at(value: object) -> str:
+    """Render a PID file's ``started_at`` for the running-list table.
+
+    ``write_pid_file`` records a full microsecond-precision ISO timestamp
+    (32 characters), which crowds out the ``Dashboard`` column at a default
+    80-column terminal width. This trims it to minute precision in UTC —
+    the table is a glance-at listing, not an audit log; ``--json`` continues
+    to report the exact recorded value untouched.
+
+    Args:
+        value: The raw ``started_at`` value read from the PID file JSON.
+
+    Returns:
+        ``"%Y-%m-%d %H:%MZ"`` in UTC, the raw string unchanged if it cannot
+        be parsed as an ISO timestamp or normalized to UTC, or ``"?"`` if
+        missing/empty/non-string.
+    """
+    if not isinstance(value, str) or not value:
+        return "?"
+    try:
+        parsed = datetime.fromisoformat(value)
+        # write_pid_file always writes a tz-aware UTC value; a naive one
+        # implies an externally-written or hand-edited file. Treat it as
+        # UTC rather than guessing the local timezone.
+        parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        return parsed.strftime("%Y-%m-%d %H:%MZ")
+    except (ValueError, OverflowError):
+        # ValueError: not a parseable ISO timestamp. OverflowError: parsed
+        # fine but astimezone() pushed a near-datetime.min/max value out of
+        # range. Either way, one malformed entry must not crash the whole
+        # listing (see pid.py's scan_pid_files for the same principle) —
+        # fall back to the raw value rather than raise.
+        logger.warning("Could not render started_at value %r as UTC; showing it as-is", value)
+        return value
+
+
 def _print_running_list(entries: list[dict], con: Console, show_url: bool = False) -> None:
     """Print a table of running background workflows.
+
+    ``Started`` is rendered to minute precision (``_format_started_at``)
+    regardless of ``show_url`` — ``conductor stop`` shares this function and
+    gets the shorter timestamp too.
 
     Args:
         entries: List of PID-file dicts.
@@ -1743,7 +1938,9 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
         show_url: Append a Dashboard URL column. Defaults to False;
             ``conductor status`` passes True, since discovery is its whole
             purpose and the URL is otherwise unrecoverable once the launching
-            terminal is gone.
+            terminal is gone. That column folds rather than crops (see
+            below), so a long workflow stem plus this column can wrap the
+            row onto two lines rather than lose part of the URL.
     """
     from rich.table import Table
 
@@ -1751,16 +1948,23 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
     table.add_column("Port", style="cyan")
     table.add_column("PID", style="yellow")
     table.add_column("Workflow", style="white")
-    table.add_column("Started", style="dim")
+    # Folds rather than crops: _format_started_at's happy path is a fixed
+    # 17 characters, but its fallback for an unparseable/out-of-range value
+    # returns the raw string unbounded, which could otherwise reproduce the
+    # exact cropping bug this PR fixes for Dashboard, one column over.
+    table.add_column("Started", style="dim", overflow="fold")
     if show_url:
-        table.add_column("Dashboard", style="blue")
+        # Folds onto a second line instead of cropping. A cropped URL is
+        # unrecoverable from the output — the one thing this column exists
+        # to surface — whereas a folded one is complete, just wrapped.
+        table.add_column("Dashboard", style="blue", overflow="fold")
 
     for e in entries:
         row = [
             str(e["port"]),
             str(e["pid"]),
             Path(e.get("workflow", "unknown")).stem,
-            e.get("started_at", "?"),
+            _format_started_at(e.get("started_at")),
         ]
         if show_url:
             row.append(f"http://127.0.0.1:{e['port']}")

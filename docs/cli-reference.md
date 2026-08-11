@@ -247,7 +247,7 @@ conductor status [OPTIONS]
 
 It is also read-only on disk: unlike `stop`, it never removes a PID file, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
 
-The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone.
+The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone. The table renders `Started` to minute precision in UTC, and the dashboard URL wraps onto a second line rather than being cropped on a narrow terminal. `--json` reports the exact recorded `started_at` value regardless.
 
 ### `--json` Payload
 
@@ -305,18 +305,19 @@ conductor stop [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--port PORT` | Stop the workflow running on this specific port |
-| `--all` | Stop all background conductor workflows |
+| `--all` | Stop all *other* background conductor workflows (see Self-Exclusion) |
+| `--allow-self` | Include the run this command is executing inside (refused by default) |
 | `--force` | Proceed when the run's identity cannot be confirmed (see [Identity and `--force`](#identity-and---force)) |
 | `--json` | Emit a machine-readable result per workflow on stdout instead of prose |
 
-With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
+With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`. That listing shares its rendering with `conductor status`, so `Started` is shown at the same minute precision in UTC.
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| `0` | Every targeted workflow is confirmed stopped, or was already gone |
-| `1` | `--port` matched no running workflow, or the target was ambiguous |
+| `0` | Every targeted workflow is confirmed stopped, or was already gone — including a self-only refusal (see Self-Exclusion) |
+| `1` | `--port` matched no running workflow, the target was ambiguous, or `--port` matched only your own run |
 | `2` | At least one workflow survived, or could not be confirmed stopped |
 
 Exit `2` is deliberately not a synonym for failure to signal — it means Conductor could not *prove* the process is gone. A run that ignored every rung and a run whose liveness could not be probed both land here, because both leave you with something you should look at by hand.
@@ -358,6 +359,50 @@ The web dashboard also exposes terminate controls that always preserve progress:
   shows a **"Workflow Stopped"** banner with the checkpoint path (or a clear
   explanation if no checkpoint could be saved).
 
+### Self-Exclusion
+
+`conductor stop` never targets the run it is executing inside by default — an
+agent smoke-testing this command must not terminate its own workflow (issue
+#399). This matters because nothing about a PID-file entry says "this is the
+workflow driving you" — an agent's `bash` tool, and any `conductor stop` it
+spawns, sits inside that very run's process tree, so a naive `stop` treats it
+as fair game just like any other run.
+
+The caller's own run is identified by three signals, tried in order (first
+match wins):
+
+1. **`CONDUCTOR_RUN_ID`** env var matching the PID file's `run_id`
+   (case-insensitively, since a manually-exported env var could differ in
+   case from the minted lowercase id). Set on every `--web-bg` child (and
+   inherited by its descendants, including a spawned `conductor stop`).
+2. **`CONDUCTOR_WEB_BG=1` + `CONDUCTOR_WEB_PORT`** matching the entry's port —
+   a compatibility signal used only for PID files written before `run_id`
+   existed (empty `run_id`).
+3. **Process ancestry** — a `/proc/<pid>/status` `PPid:` walk plus a session-id
+   check, so any descendant of the background process (however it was
+   re-parented) still resolves to it.
+
+Effects:
+
+- `conductor stop` (no flags) and `conductor stop --all` never stop your own
+  run; `--all` means "stop all *other* runs." If only your own run is alive,
+  both print a refusal and exit `0` (nothing was requested by name and
+  nothing failed).
+- `conductor stop --port <your own port>` is refused and exits `1`, naming
+  `--allow-self` as the remedy — here a specific target was named and
+  declined.
+- `conductor stop --allow-self [...]` restores the pre-#399 targeting exactly
+  (same processes, same counts), but now prints a yellow warning when the run
+  being stopped is your own.
+
+**Windows caveat**: process ancestry (signal 3) is POSIX-only. On Windows,
+self-identification relies solely on the `CONDUCTOR_RUN_ID` /
+`CONDUCTOR_WEB_BG`+`CONDUCTOR_WEB_PORT` env vars — an agent whose tool runner
+strips `CONDUCTOR_*` env vars before spawning its shell is still exposed.
+
+See [`conductor status`](#conductor-status) for a non-destructive way to see
+the full list of running workflows, including your own.
+
 ### Examples
 
 ```bash
@@ -367,8 +412,11 @@ conductor stop
 # Stop a specific workflow by port
 conductor stop --port 8080
 
-# Stop all running background workflows
+# Stop all other running background workflows
 conductor stop --all
+
+# Include the run this command is executing inside
+conductor stop --allow-self --port 8080
 ```
 
 ## `conductor gate respond`

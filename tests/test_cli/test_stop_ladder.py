@@ -67,6 +67,27 @@ def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return runs_dir
 
 
+@pytest.fixture(autouse=True)
+def no_self_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep self-exclusion (issue #399) from perturbing these ladder tests.
+
+    These tests use small, arbitrary PIDs (e.g. ``1``, ``2``, ``4242``) as
+    stand-ins for "some other process" -- they predate issue #399 and are not
+    about self-exclusion at all. But ``conductor.cli.self_run.own_run_pids()``
+    walks real process ancestry, and in a shallow-PID-namespace environment
+    (e.g. a container) that walk can genuinely include low PIDs like ``1`` or
+    ``2``, which would misclassify these entries as the caller's own run and
+    silently exclude them from ``stop --all`` targeting. Clearing the env
+    vars and stubbing ``own_run_pids`` keeps these pre-existing tests exactly
+    as deterministic as they were before #399; self-exclusion itself is
+    covered by ``test_stop.py::TestStopSelfExclusion``.
+    """
+    monkeypatch.delenv("CONDUCTOR_RUN_ID", raising=False)
+    monkeypatch.delenv("CONDUCTOR_WEB_BG", raising=False)
+    monkeypatch.delenv("CONDUCTOR_WEB_PORT", raising=False)
+    monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
+
+
 def _entry(pid: int = 4242, port: int = 8080, run_id: str = _RUN_ID) -> dict:
     """Build a PID-file dict shaped like ``read_pid_files`` output."""
     return {

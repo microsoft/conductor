@@ -418,7 +418,9 @@ class TestAgentCompletedUsesLastCallInputTokens:
         warning_records = [
             r
             for r in caplog.records
-            if r.levelno == logging.WARNING and r.name == "conductor.engine.workflow"
+            if r.levelno == logging.WARNING
+            and r.name == "conductor.engine.workflow"
+            and "context-window" in r.getMessage().lower()
         ]
         debug_records = [
             r
