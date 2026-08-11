@@ -60,7 +60,9 @@ export type EventType =
   | 'agent_validation_failed'
   | 'iteration_limit_reached'
   | 'iteration_limit_resolved'
-  | 'budget_exceeded';
+  | 'budget_exceeded'
+  | 'guidance_received'
+  | 'guidance_applied';
 
 // --- Workflow lifecycle ---
 
@@ -473,6 +475,26 @@ export interface AgentPausedData {
 
 export interface AgentResumedData {
   agent_name: string;
+  /** True when the resume was triggered by a mid-run guidance submission
+   *  (issue #400) rather than a plain dashboard Resume click. */
+  with_guidance?: boolean;
+}
+
+// --- Mid-run guidance (issue #400) ---
+
+export interface GuidanceReceivedData {
+  text: string;
+  /** Number of guidance entries pending in the engine's channel, including this one. */
+  pending: number;
+}
+
+export interface GuidanceAppliedData {
+  text: string;
+  /** Where the guidance came from: an Esc/Ctrl+G interrupt, a dashboard/
+   *  `conductor guide` submission, or `resume --guidance`. */
+  source: 'interrupt' | 'dashboard' | 'cli';
+  /** The step the guidance was applied ahead of, when known. */
+  agent_name?: string | null;
 }
 
 // --- Dialog events ---

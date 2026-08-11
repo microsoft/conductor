@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
+from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
@@ -96,6 +97,28 @@ class RunContext:
     log_file: str = ""
     dashboard_port: int | None = None
     bg_mode: bool = False
+
+
+@dataclass(frozen=True)
+class WebPauseOutcome:
+    """Result of :meth:`WorkflowEngine._handle_web_pause`.
+
+    Replaces a bare ``bool`` so a guidance submission consumed while paused
+    (a fourth wait arm alongside resume/kill/disconnect) can be reported back
+    to the caller alongside "was this handled" — the caller then either
+    applies a Copilot follow-up in place or falls through to a full re-run,
+    rather than always re-executing from scratch.
+    """
+
+    handled: bool
+    """True if the pause was resolved here (Resume clicked, guidance
+    submitted, or all clients disconnected). False means no dashboard is
+    connected and the caller should fall through to the CLI interactive
+    handler (``_handle_partial_output``)."""
+
+    guidance: list[str] = field(default_factory=list)
+    """Guidance text(s) submitted while paused, in submission order. Empty
+    when the pause was resolved by a plain Resume click or disconnect."""
 
 
 @dataclass
@@ -333,6 +356,7 @@ class WorkflowEngine:
         _dashboard_context_path: list[str] | None = None,
         instructions_preamble: str | None = None,
         plugin_marketplaces: Mapping[str, Marketplace] | None = None,
+        _guidance_channel: GuidanceChannel | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -380,6 +404,11 @@ class WorkflowEngine:
                 mid-run would stall an agent on a network round trip, and
                 a failure there would surface as an agent error rather
                 than a configuration one. Inherited by sub-workflows.
+            _guidance_channel: Shared mid-run guidance channel (issue #400).
+                When None, a fresh :class:`GuidanceChannel` is created. Child
+                engines inherit the parent's channel so a paused sub-workflow
+                agent can be corrected too. Callers should not set this
+                directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -549,6 +578,11 @@ class WorkflowEngine:
         # outgoing events so the frontend can resolve the owning context
         # without inferring parentage from activeContextPath.
         self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
+        # Mid-run guidance channel (issue #400). Shared with child engines so
+        # a sub-workflow agent paused mid-call can receive guidance submitted
+        # via the dashboard or ``conductor guide`` too.
+        self._guidance: GuidanceChannel = _guidance_channel or GuidanceChannel()
 
     @property
     def _workflow_dir(self) -> Path | None:
@@ -1117,6 +1151,68 @@ class WorkflowEngine:
         """
         self._web_dashboard = None
         self._dialog_handler.web_dashboard = None
+
+    def submit_guidance(self, text: str) -> int:
+        """Queue mid-run guidance text (issue #400).
+
+        The sink handed to :meth:`WebDashboard.set_guidance_sink` — called
+        from ``POST /api/guidance`` and, on resume, directly by the CLI for
+        each ``--guidance`` flag. Does not itself apply the guidance to
+        ``self.context``: it only wakes whichever consumer is waiting
+        (``_drain_pending_guidance`` at the next loop-top boundary, or the
+        guidance wait-arm inside a live :meth:`_handle_web_pause`).
+
+        Args:
+            text: The guidance text to queue.
+
+        Returns:
+            The number of guidance entries now pending (including this one).
+        """
+        return self._guidance.submit(text)
+
+    def add_user_guidance(self, text: str, *, source: str) -> None:
+        """Apply guidance to the run's context and emit ``guidance_applied``.
+
+        The single entry point for every guidance source — the TTY Esc/
+        Ctrl+G interrupt flow, a dashboard/`` conductor guide`` submission
+        drained at the next step boundary or while an agent is paused, and
+        ``resume --guidance`` — so the dashboard and JSONL log see guidance
+        applied through the interrupt path too, not just the new channel.
+
+        Args:
+            text: The guidance text to add to ``self.context.user_guidance``.
+            source: Where the guidance came from (``"interrupt"``,
+                ``"dashboard"``, or ``"cli"``), carried on the emitted event
+                for observability.
+        """
+        self.context.add_guidance(text)
+        self._emit(
+            "guidance_applied",
+            {
+                "text": text,
+                "source": source,
+                "agent_name": self._current_agent_name,
+            },
+        )
+
+    def _drain_pending_guidance(self) -> None:
+        """Apply any guidance queued via :meth:`submit_guidance` (root only).
+
+        Called at the top of ``_execute_loop``'s ``while True``, right after
+        ``_maybe_save_periodic_checkpoint`` — the one choke point every step
+        type passes through, so guidance reaches the next agent, parallel
+        group, for-each group, script, set, or wait step alike.
+
+        Root-only (mirrors ``_periodic_checkpoints_active``): draining at
+        every sub-workflow depth would let concurrent for-each sub-workflows
+        race for the same queued sentence. A sub-workflow paused mid-agent
+        still receives guidance via the shared channel's wait-arm in
+        ``_handle_web_pause``, which is active at every depth.
+        """
+        if self._subworkflow_depth != 0:
+            return
+        for text in self._guidance.drain():
+            self.add_user_guidance(text, source="dashboard")
 
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
@@ -1744,6 +1840,7 @@ class WorkflowEngine:
             ],
             instructions_preamble=child_preamble,
             plugin_marketplaces=child_marketplaces,
+            _guidance_channel=self._guidance,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -1830,6 +1927,7 @@ class WorkflowEngine:
             "keyboard_listener": self._keyboard_listener,
             "web_dashboard": self._web_dashboard,
             "_subworkflow_depth": self._subworkflow_depth + 1,
+            "_guidance_channel": self._guidance,
         }
         # Thread the dashboard context path into the child engine when the
         # field exists on this engine (added by the breadcrumb-navigation PR).
@@ -3300,7 +3398,7 @@ class WorkflowEngine:
         match result.action:
             case InterruptAction.CONTINUE:
                 if result.guidance:
-                    self.context.add_guidance(result.guidance)
+                    self.add_user_guidance(result.guidance, source="interrupt")
                 return current_agent_name
             case InterruptAction.SKIP:
                 return result.skip_target or current_agent_name
@@ -3309,27 +3407,33 @@ class WorkflowEngine:
             case InterruptAction.CANCEL:
                 return current_agent_name
 
-    async def _handle_web_pause(self, agent_name: str, partial_output: AgentOutput) -> bool:
+    async def _handle_web_pause(
+        self, agent_name: str, partial_output: AgentOutput
+    ) -> WebPauseOutcome:
         """Handle a mid-agent interrupt when the web dashboard is connected.
 
         Emits an ``agent_paused`` event and waits for the user to click
-        Resume or Kill in the dashboard.  If all browser clients disconnect
-        while waiting, auto-resumes to avoid hanging the workflow.
+        Resume or Kill in the dashboard, or to submit guidance (issue #400).
+        If all browser clients disconnect while waiting, auto-resumes to
+        avoid hanging the workflow.
 
         Args:
             agent_name: The name of the interrupted agent.
             partial_output: The partial output from the interrupted agent.
 
         Returns:
-            True if the agent should be re-executed (Resume chosen or
-            all clients disconnected), False if no web dashboard is
-            connected (caller should invoke ``_handle_partial_output``).
+            A :class:`WebPauseOutcome`. ``handled=True`` means the pause was
+            resolved here (Resume clicked, guidance submitted, or all clients
+            disconnected) — ``guidance`` carries any submitted text(s), empty
+            for a plain Resume/disconnect. ``handled=False`` means no web
+            dashboard is connected and the caller should invoke
+            ``_handle_partial_output`` instead.
 
         Raises:
             InterruptError: If the user chose Kill (``POST /api/kill``).
         """
         if self._web_dashboard is None or not self._web_dashboard.has_connections():
-            return False
+            return WebPauseOutcome(False, [])
 
         try:
             # ``ensure_ascii=False`` so the preview shows real non-ASCII
@@ -3360,7 +3464,13 @@ class WorkflowEngine:
         resume_task = asyncio.create_task(resume_event.wait())
         kill_task = asyncio.create_task(kill_event.wait())
         disconnect_task = asyncio.create_task(disconnect_event.wait())
-        tasks = {resume_task, kill_task, disconnect_task}
+        # Guidance is a fourth wait arm (issue #400). Deliberately NOT cleared
+        # first: if guidance was already queued (submitted while the agent
+        # was still executing, before this pause began) the event is already
+        # set, so this task resolves immediately — the queued text is applied
+        # without requiring a second submission.
+        guidance_task = asyncio.create_task(self._guidance.event.wait())
+        tasks = {resume_task, kill_task, disconnect_task, guidance_task}
 
         # In subworkflows, also watch the interrupt_event so that a second
         # Stop click while paused will stop the workflow without requiring
@@ -3417,6 +3527,20 @@ class WorkflowEngine:
                 self._interrupt_event.clear()
             raise InterruptError(agent_name=agent_name)
 
+        if guidance_task in done:
+            texts = self._guidance.drain()
+            for text in texts:
+                # guidance_applied fires before agent_resumed so an observer
+                # sees the correction land before the agent starts running.
+                self.add_user_guidance(text, source="dashboard")
+            # Clear resume_event too: if a Resume click raced in alongside the
+            # guidance submission, leaving it set would falsely skip the next
+            # legitimate pause cycle.
+            resume_event.clear()
+            self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": True})
+            logger.info("Agent '%s' resumed with guidance — re-executing", agent_name)
+            return WebPauseOutcome(True, texts)
+
         if disconnect_task in done:
             logger.info(
                 "All dashboard clients disconnected while '%s' was paused — auto-resuming",
@@ -3427,9 +3551,47 @@ class WorkflowEngine:
         # double-click or prior API call doesn't skip the next legitimate pause.
         resume_event.clear()
 
-        self._emit("agent_resumed", {"agent_name": agent_name})
+        self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": False})
         logger.info("Agent '%s' resumed — re-executing", agent_name)
-        return True
+        return WebPauseOutcome(True, [])
+
+    async def _send_guidance_followup(
+        self,
+        agent: AgentDef,
+        executor: AgentExecutor,
+        guidance_text: str,
+    ) -> AgentOutput | None:
+        """Send guidance as a follow-up to an interrupted Copilot session.
+
+        Lifted out of ``_handle_partial_output`` so both the CLI interactive
+        interrupt path and the dashboard/``conductor guide`` pause path share
+        one copy. Only Copilot supports resuming a paused session with a
+        follow-up message; other providers return ``None`` so the caller
+        falls back to a full re-execution with guidance appended to the
+        prompt.
+
+        Args:
+            agent: The agent whose session may be resumable.
+            executor: The executor (and provider) the agent ran under.
+            guidance_text: The guidance text to send as a follow-up.
+
+        Returns:
+            The follow-up ``AgentOutput`` if the provider had an interrupted
+            session to resume, else ``None``.
+        """
+        from conductor.providers.copilot import CopilotProvider
+
+        provider = executor.provider
+        if isinstance(provider, CopilotProvider):
+            session = provider.get_interrupted_session()
+            if session is not None:
+                return await provider.send_followup(
+                    session,
+                    guidance_text,
+                    agent_name=agent.name,
+                    agent_model=agent.model,
+                )
+        return None
 
     async def _handle_partial_output(
         self,
@@ -3457,8 +3619,6 @@ class WorkflowEngine:
         Returns:
             The final (non-partial) AgentOutput after handling the interrupt.
         """
-        from conductor.providers.copilot import CopilotProvider
-
         # Build preview from partial output
         try:
             # ``ensure_ascii=False`` so the preview shows real non-ASCII
@@ -3488,19 +3648,12 @@ class WorkflowEngine:
             return partial_output
 
         # Add guidance to context
-        self.context.add_guidance(interrupt_result.guidance)
+        self.add_user_guidance(interrupt_result.guidance, source="interrupt")
 
         # Try Copilot follow-up if provider supports it
-        provider = executor.provider
-        if isinstance(provider, CopilotProvider):
-            session = provider.get_interrupted_session()
-            if session is not None:
-                return await provider.send_followup(
-                    session,
-                    interrupt_result.guidance,
-                    agent_name=agent.name,
-                    agent_model=agent.model,
-                )
+        followup = await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
+        if followup is not None:
+            return followup
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
@@ -3851,6 +4004,11 @@ class WorkflowEngine:
                     # to context and current_agent_name is the step about to
                     # run, so a resume re-runs exactly this step. See issue #244.
                     self._maybe_save_periodic_checkpoint()
+
+                    # Apply any guidance queued via the dashboard/`conductor
+                    # guide` since the last boundary (issue #400). Root-only —
+                    # see `_drain_pending_guidance`.
+                    self._drain_pending_guidance()
 
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)
@@ -4734,17 +4892,35 @@ class WorkflowEngine:
 
                         # Handle mid-agent interrupt (partial output)
                         if output.partial:
-                            if await self._handle_web_pause(agent.name, output):
-                                # Web mode: agent paused then resumed → re-execute.
-                                # Clear interrupt_event to prevent the re-executed agent
-                                # from seeing the stale signal and returning partial again.
+                            pause_outcome = await self._handle_web_pause(agent.name, output)
+                            if pause_outcome.handled:
+                                # Web mode: agent paused then resumed. Clear
+                                # interrupt_event to prevent a re-executed agent
+                                # from seeing the stale signal and returning
+                                # partial again.
                                 if self._interrupt_event is not None:
                                     self._interrupt_event.clear()
-                                continue
-                            # In web mode with no connections, auto-resume rather than
-                            # falling through to the CLI interactive handler (which would
-                            # block on stdin with no tty in --web-bg mode).
-                            if self._web_dashboard is not None:
+                                followup = None
+                                if pause_outcome.guidance:
+                                    combined_guidance = "\n".join(pause_outcome.guidance)
+                                    followup = await self._send_guidance_followup(
+                                        resolved_agent, executor, combined_guidance
+                                    )
+                                if followup is None:
+                                    # Plain Resume, or guidance with no
+                                    # resumable session — fall through to the
+                                    # loop-top re-execution, which picks up any
+                                    # applied guidance via guidance_section.
+                                    continue
+                                # Copilot follow-up resumed the same session in
+                                # place — fall through to dialog/validator/
+                                # usage/routing below with no re-run.
+                                output = followup
+                                _agent_elapsed = _time.time() - _agent_start
+                            elif self._web_dashboard is not None:
+                                # In web mode with no connections, auto-resume rather than
+                                # falling through to the CLI interactive handler (which would
+                                # block on stdin with no tty in --web-bg mode).
                                 logger.info(
                                     "No dashboard connections for '%s' — auto-resuming",
                                     agent.name,
@@ -4752,15 +4928,16 @@ class WorkflowEngine:
                                 if self._interrupt_event is not None:
                                     self._interrupt_event.clear()
                                 continue
-                            output = await self._handle_partial_output(
-                                resolved_agent,
-                                output,
-                                agent_context,
-                                guidance_section,
-                                executor,
-                                _agent_start,
-                            )
-                            _agent_elapsed = _time.time() - _agent_start
+                            else:
+                                output = await self._handle_partial_output(
+                                    resolved_agent,
+                                    output,
+                                    agent_context,
+                                    guidance_section,
+                                    executor,
+                                    _agent_start,
+                                )
+                                _agent_elapsed = _time.time() - _agent_start
 
                         # Dialog mode: evaluate whether agent should enter dialog
                         if agent.dialog and not output.partial:
@@ -5842,11 +6019,13 @@ class WorkflowEngine:
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(resolved_agent)
                 event_callback = self._make_event_callback(agent.name)
+                guidance_section = self.context.get_guidance_prompt_section()
                 output = await self._execute_with_agent_timeout(
                     resolved_agent,
                     executor.execute(
                         resolved_agent,
                         agent_context,
+                        guidance_section=guidance_section,
                         event_callback=event_callback,
                     ),
                 )
@@ -5860,7 +6039,7 @@ class WorkflowEngine:
                         _agent_elapsed,
                         agent_context,
                         executor,
-                        None,
+                        guidance_section,
                         event_callback,
                     )
                     _agent_elapsed = _time.time() - _agent_start
@@ -6342,11 +6521,13 @@ class WorkflowEngine:
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
+                guidance_section = self.context.get_guidance_prompt_section()
                 output = await self._execute_with_agent_timeout(
                     qualified_agent,
                     executor.execute(
                         qualified_agent,
                         agent_context,
+                        guidance_section=guidance_section,
                         event_callback=event_callback,
                     ),
                 )
@@ -6360,7 +6541,7 @@ class WorkflowEngine:
                         _item_elapsed,
                         agent_context,
                         executor,
-                        None,
+                        guidance_section,
                         event_callback,
                         usage_label=f"{for_each_group.name}[{key}]",
                     )

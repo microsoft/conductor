@@ -142,6 +142,24 @@ conductor stop --port 8080
 conductor stop --all
 ```
 
+### conductor guide
+
+Send mid-run guidance to a `--web`/`--web-bg` workflow without stopping it:
+
+```bash
+conductor guide [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--text`, `-t TEXT` | Guidance text (**required**) |
+| `--port`, `-p PORT` | Dashboard port (auto-discovered if omitted) |
+| `--token SECRET` | Auth token (also reads `CONDUCTOR_GATE_TOKEN`) |
+
+Applied at the next step boundary, or immediately if paused.
+
+**Example:** `conductor guide --text "Prefer Python 3.12 examples"`
+
 ### conductor update
 
 Check for the latest version of Conductor and (optionally) launch the installer:
@@ -185,6 +203,7 @@ conductor resume --from <checkpoint.json> [OPTIONS]
 | `--web` | Start real-time web dashboard for the resumed run |
 | `--web-port PORT` | Port for the dashboard (0 = auto) |
 | `--web-bg` | Fork a detached resume + dashboard process and exit |
+| `--guidance TEXT` | Mid-run guidance applied before the resumed agent runs (repeatable) |
 
 `--web` and `--web-bg` are mutually exclusive. The dashboard only shows events from the resumed agent forward — events emitted in the original process before the checkpoint are not replayed.
 
@@ -568,6 +587,10 @@ During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interact
 Guidance text accumulates across multiple interrupts and is injected into agent context.
 
 Disable with `--no-interactive`. In `--skip-gates` mode, interrupts auto-cancel.
+
+A `--web-bg` run has no TTY for this menu. Use `conductor guide --text
+"..."` or the dashboard's **Guide** button instead — see
+[`conductor guide`](#conductor-guide) above.
 
 ## Checkpoint & Resume
 

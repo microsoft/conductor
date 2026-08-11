@@ -262,6 +262,32 @@ class TestResumeCommand:
             "work_item_id": "1814",
         }
 
+    def test_resume_with_guidance(self, tmp_path: Path) -> None:
+        """--guidance flags are forwarded to resume_workflow_async as a list."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(
+                app,
+                [
+                    "resume",
+                    str(wf_path),
+                    "--guidance",
+                    "Skip the benchmark step",
+                    "--guidance",
+                    "Prefer Python 3.12",
+                ],
+            )
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["guidance"] == [
+            "Skip the benchmark step",
+            "Prefer Python 3.12",
+        ]
+
     def test_resume_invalid_metadata_format(self, tmp_path: Path) -> None:
         """Test resume rejects malformed --metadata values."""
         wf_path = _write_workflow(tmp_path)

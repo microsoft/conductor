@@ -295,6 +295,32 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
         assert env["CONDUCTOR_WEB_BG"] == "1"
         assert env["CONDUCTOR_WEB_PORT"] == "9302"
 
+    def test_launch_background_resume_forwards_guidance(self, tmp_path: Path) -> None:
+        """--guidance texts are forwarded as repeated --guidance argv entries."""
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        fake_proc = MagicMock(pid=3)
+        fake_proc.poll.return_value = None
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=wf_path,
+                checkpoint_path=None,
+                web_port=9303,
+                guidance=["Skip the benchmark step", "Prefer Python 3.12"],
+            )
+
+        cmd = mock_spawn.call_args.args[0]
+        guidance_indices = [i for i, arg in enumerate(cmd) if arg == "--guidance"]
+        assert len(guidance_indices) == 2
+        assert cmd[guidance_indices[0] + 1] == "Skip the benchmark step"
+        assert cmd[guidance_indices[1] + 1] == "Prefer Python 3.12"
+
     def test_launch_background_wraps_spawn_failure_in_runtimeerror(self, tmp_path: Path) -> None:
         """Spawn failures are wrapped so the CLI surfaces a clean error."""
         wf_path = tmp_path / "wf.yaml"

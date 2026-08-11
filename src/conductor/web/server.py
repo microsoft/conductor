@@ -24,7 +24,7 @@ import hmac
 import json
 import logging
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -45,6 +45,11 @@ _BG_GRACE_SECONDS = 30
 
 # File API: max file size (extension allowlist is LINKABLE_EXTENSIONS from linkify)
 _FILE_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+
+# Guidance API: max text length (issue #400). Guidance is injected verbatim
+# into every subsequent prompt, so an unbounded body could balloon context
+# usage indefinitely.
+_GUIDANCE_MAX_CHARS = 10_000
 
 
 class WebDashboard:
@@ -136,6 +141,21 @@ class WebDashboard:
         # set_interrupt_event). Draining it there honors the Stop gracefully
         # instead of falling back to a hard cancel that loses progress (#245).
         self._pending_stop = False
+
+        # Guidance sink (dashboard → engine, issue #400). Bound via
+        # set_guidance_sink once the engine exists; POST /api/guidance calls
+        # it directly rather than being polled, mirroring set_interrupt_event.
+        self._guidance_sink: Callable[[str], int] | None = None
+
+        # Pre-sink latch — guidance submitted during the startup window
+        # before set_guidance_sink is called (mirrors _pending_stop). Drained
+        # into the sink the moment it binds.
+        self._pending_guidance: list[str] = []
+
+        # Tracks whether an agent is currently paused (from agent_paused /
+        # agent_resumed events), so POST /api/guidance can report whether a
+        # submission resumed a paused agent or is merely queued.
+        self._agent_paused = False
 
         # Server internals
         self._server: Any = None
@@ -336,6 +356,75 @@ class WebDashboard:
             )
             return JSONResponse({"status": "accepted"})
 
+        @app.post("/api/guidance")
+        async def guidance_api(request: Request) -> JSONResponse:
+            """Submit mid-run guidance text to the running workflow (issue #400).
+
+            Body: ``{"text": str}``. Applied at the next step boundary
+            (``_drain_pending_guidance``), or immediately if an agent is
+            currently paused (the fourth wait-arm in ``_handle_web_pause``).
+
+            When the ``CONDUCTOR_GATE_TOKEN`` environment variable is set,
+            the request must carry a matching token in the
+            ``Authorization: Bearer <token>`` header — the same check as
+            ``POST /api/gate-respond``.
+            """
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=422)
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"error": "Request body must be a JSON object"}, status_code=422
+                )
+
+            if not self._gate_token_ok(request.headers.get("authorization")):
+                return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
+
+            # A completed run has nobody left to read the guidance — accepting
+            # it here would silently discard text the user believes was heard.
+            if self._workflow_completed:
+                return JSONResponse({"error": "Workflow has already completed"}, status_code=409)
+
+            text = body.get("text")
+            if not isinstance(text, str):
+                return JSONResponse(
+                    {"error": "Missing or non-string required field: text"}, status_code=422
+                )
+            text = text.strip()
+            if not text:
+                return JSONResponse({"error": "text must not be empty"}, status_code=422)
+            if len(text) > _GUIDANCE_MAX_CHARS:
+                return JSONResponse(
+                    {"error": f"text exceeds maximum length of {_GUIDANCE_MAX_CHARS} characters"},
+                    status_code=422,
+                )
+
+            if self._guidance_sink is not None:
+                pending = self._guidance_sink(text)
+            else:
+                # Startup race: the engine hasn't bound the sink yet. Queue
+                # it — set_guidance_sink drains this the moment it binds.
+                self._pending_guidance.append(text)
+                pending = len(self._pending_guidance)
+
+            # This is the first place the dashboard *produces* an event
+            # rather than merely reacting to one — it lands in
+            # _event_history via _on_event's normal subscription, and in the
+            # JSONL log.
+            import time as _time
+
+            self._emitter.emit(
+                WorkflowEvent(
+                    type="guidance_received",
+                    timestamp=_time.time(),
+                    data={"text": text, "pending": pending},
+                )
+            )
+            return JSONResponse(
+                {"status": "accepted", "pending": pending, "paused": self._agent_paused}
+            )
+
         @app.get("/api/files/{file_path:path}")
         async def get_file(file_path: str) -> JSONResponse:
             """Serve a local file relative to the workflow root directory.
@@ -490,6 +579,13 @@ class WebDashboard:
         self._event_history.append(event_dict)
         self._queue.put_nowait(event_dict)
 
+        # Track paused-ness so POST /api/guidance can report whether a
+        # submission resumed a paused agent or is merely queued (issue #400).
+        if event.type == "agent_paused":
+            self._agent_paused = True
+        elif event.type == "agent_resumed":
+            self._agent_paused = False
+
         # Also arm the grace timer here (not only from the WebSocket-disconnect
         # paths) so an unwatched run — zero clients ever connected — still
         # shuts down instead of blocking forever in
@@ -562,6 +658,14 @@ class WebDashboard:
             "iteration_limit_resolved",
             "dialog_started",
             "dialog_completed",
+            # ``guidance_received`` is the opening half of a pair whose closer
+            # is ``guidance_applied`` (issue #400) — a submission still
+            # pending when the original run died would otherwise replay as a
+            # phantom "pending" entry forever. ``guidance_applied`` is
+            # deliberately NOT filtered: ``WorkflowContext.from_dict``
+            # restores ``user_guidance``, so that guidance really is still in
+            # effect on the resumed run and must stay listed.
+            "guidance_received",
         }
     )
 
@@ -1379,3 +1483,27 @@ class WebDashboard:
         if self._pending_stop:
             self._pending_stop = False
             event.set()
+
+    def set_guidance_sink(self, sink: Callable[[str], int]) -> None:
+        """Bind the callable ``POST /api/guidance`` pushes submitted text into.
+
+        Called during engine setup — the exact mirror of
+        ``set_interrupt_event()`` above, but pushing into the engine rather
+        than sharing an ``asyncio.Event``: the engine's ``_web_dashboard`` is
+        duck-typed and stubbed across many tests, so a new attribute read in
+        the engine's hot loop would be fragile. ``sink`` is
+        ``WorkflowEngine.submit_guidance``.
+
+        Any guidance submitted during the startup window before this was
+        called (``_pending_guidance``) is drained into the sink immediately,
+        mirroring the ``_pending_stop`` latch above.
+
+        Args:
+            sink: Callable taking guidance text and returning the number of
+                entries now pending in the engine's channel.
+        """
+        self._guidance_sink = sink
+        if self._pending_guidance:
+            pending_texts, self._pending_guidance = self._pending_guidance, []
+            for text in pending_texts:
+                sink(text)

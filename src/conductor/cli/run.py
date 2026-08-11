@@ -1126,6 +1126,22 @@ class ConsoleEventSubscriber:
                 style="yellow",
             )
 
+        elif t == "guidance_received":
+            pending = d.get("pending", 1)
+            verbose_log(
+                f"  Guidance received (pending: {pending}): {d.get('text', '')}",
+                style="cyan",
+            )
+
+        elif t == "guidance_applied":
+            source = d.get("source", "?")
+            agent_name = d.get("agent_name")
+            target = f" before '{agent_name}'" if agent_name else ""
+            verbose_log(
+                f"  Guidance applied ({source}){target}: {d.get('text', '')}",
+                style="cyan",
+            )
+
 
 def _validator_label(data: dict[str, Any]) -> str:
     """Build an agent label including a for-each ``item_key`` when present."""
@@ -1820,6 +1836,13 @@ async def run_workflow_async(
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            # Share the guidance sink with the dashboard so POST /api/guidance
+            # can push mid-run text into the engine (issue #400). Unlike
+            # set_interrupt_event this doesn't need interrupt_event -- a plain
+            # --web run with no keyboard listener still accepts guidance.
+            if dashboard is not None:
+                dashboard.set_guidance_sink(engine.submit_guidance)
+
             terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
@@ -2147,6 +2170,11 @@ def _print_resume_instructions(engine: WorkflowEngine) -> None:
                 "[dim]Or resume latest checkpoint:[/dim] conductor resume {}", engine.workflow_path
             )
         )
+    _verbose_console.print(
+        Text.from_markup(
+            '[dim]Add guidance for the resumed run with:[/dim] --guidance "correction text"'
+        )
+    )
     _verbose_console.print()
 
 
@@ -2162,6 +2190,7 @@ async def resume_workflow_async(
     web_port: int = 0,
     web_bg: bool = False,
     metadata: dict[str, str] | None = None,
+    guidance: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resume a workflow from a checkpoint.
 
@@ -2190,6 +2219,11 @@ async def resume_workflow_async(
             disconnect.
         metadata: Optional CLI metadata to merge on top of YAML-declared
             metadata for the resumed run.
+        guidance: Optional mid-run guidance text(s) applied to the restored
+            context before the resumed agent runs (issue #400). Applied via
+            ``engine.add_user_guidance(text, source="cli")`` for each entry,
+            in order, before the dashboard's ``workflow_started`` is
+            prepended so the seeded history reflects the applied guidance.
 
     Returns:
         The workflow output as a dictionary.
@@ -2411,6 +2445,13 @@ async def resume_workflow_async(
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)
 
+            # Apply any --guidance flags to the restored context before the
+            # dashboard is seeded, so the prepended workflow_started (which
+            # inserts at index 0) ends up before these guidance_applied
+            # events in history order (issue #400).
+            for guidance_text in guidance or []:
+                engine.add_user_guidance(guidance_text, source="cli")
+
             # Seed the dashboard with the original timeline so previously
             # completed agents remain visible. Order matters:
             #   1. Prepend a fresh ``workflow_started`` built from the
@@ -2465,6 +2506,13 @@ async def resume_workflow_async(
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
+
+            # Share the guidance sink with the dashboard so POST /api/guidance
+            # can push mid-run text into the engine (issue #400). Unlike
+            # set_interrupt_event this doesn't need interrupt_event -- a plain
+            # --web run with no keyboard listener still accepts guidance.
+            if dashboard is not None:
+                dashboard.set_guidance_sink(engine.submit_guidance)
 
             terminate_exc: WorkflowTerminated | None = None
             try:

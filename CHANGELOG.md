@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mid-run guidance for `--web-bg` runs** (#400). The dashboard previously
+  offered only Stop, Resume, and Kill — there was no way to correct a
+  background run's course without stopping it first. `conductor guide --text
+  "..."` (auto-discovering the dashboard port) and a dashboard **Guide**
+  button both POST to a new `POST /api/guidance` endpoint, which feeds a
+  `GuidanceChannel` the engine drains at the next step boundary (agents,
+  parallel groups, for-each groups, scripts, sets, and waits alike) or
+  immediately if an agent is currently paused, in which case it resumes with
+  the guidance applied — reusing a Copilot follow-up on the same session when
+  one is available. The TTY Esc/Ctrl+G interrupt path now goes through the
+  same `add_user_guidance` entry point, so that guidance is visible in the
+  dashboard and JSONL log too, and parallel/for-each group members now
+  receive the current guidance section (previously always omitted). `resume
+  --guidance "..."` (repeatable) applies guidance to the restored context
+  before the resumed agent runs. Protected by the same `CONDUCTOR_GATE_TOKEN`
+  as `conductor gate respond` when configured.
 - **`conductor status` — see what is running without stopping it** (#384).
   `conductor stop` with no arguments lists background workflows, but stops one
   when exactly one is running, so the natural "what's running?" reflex was

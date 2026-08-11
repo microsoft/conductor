@@ -53,7 +53,10 @@ import type {
   IterationLimitReachedData,
   IterationLimitResolvedData,
   IterationLimitResponseTarget,
+  GuidanceReceivedData,
+  GuidanceAppliedData,
 } from '@/types/events';
+import { mergeGuidance, type GuidanceEntry } from '@/lib/guidance';
 
 export interface ActivityEntry {
   type: string;
@@ -366,6 +369,8 @@ interface WorkflowState {
   isPaused: boolean;
   /** Set when the engine is blocked on a max-iterations gate (issue #134). */
   iterationLimitGate: IterationLimitReachedData | null;
+  /** Accumulated mid-run guidance entries, in submission/application order (issue #400). */
+  userGuidance: GuidanceEntry[];
 
   // --- Subworkflow depth tracking ---
   /** Current nesting depth: 0 = root workflow events are active */
@@ -465,6 +470,23 @@ interface WorkflowState {
     gateId: string,
     additionalIterations: number,
   ) => void;
+
+  /**
+   * Submit mid-run guidance text to the running workflow (issue #400).
+   *
+   * POSTs to ``/api/guidance`` (not the WebSocket — a 403/409/422 needs a
+   * status code the caller can render, and an HTTP response is the one
+   * server-side code path shared with ``conductor guide``). Returns a
+   * discriminated result so the modal can show the exact rejection reason
+   * (403/409/422) rather than a generic failure, and separately handle an
+   * unreachable dashboard.
+   */
+  sendGuidance: (
+    text: string,
+  ) => Promise<
+    | { ok: true; pending: number; paused: boolean }
+    | { ok: false; status: number | null; error: string }
+  >;
 }
 
 function ensureNode(nodes: Record<string, NodeData>, name: string, type: NodeType = 'agent'): NodeData {
@@ -798,6 +820,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   lastEventTime: null,
   isPaused: false,
   iterationLimitGate: null,
+  userGuidance: [],
   wfDepth: 0,
   subworkflowContexts: [],
   activeContextPath: [],
@@ -883,6 +906,27 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       ...targetFields,
       additional_iterations: additional,
     });
+  },
+
+  sendGuidance: async (text) => {
+    try {
+      const res = await fetch('/api/guidance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        pending?: number;
+        paused?: boolean;
+        error?: string;
+      };
+      if (res.ok) {
+        return { ok: true, pending: body.pending ?? 0, paused: body.paused ?? false };
+      }
+      return { ok: false, status: res.status, error: body.error || `HTTP ${res.status}` };
+    } catch {
+      return { ok: false, status: null, error: 'The dashboard is unreachable.' };
+    }
   },
 
   processEvent: (event: WorkflowEvent) => {
@@ -1074,6 +1118,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         forEachGroups: [],
         isPaused: false,
         iterationLimitGate: null,
+        userGuidance: [],
         lastEventTime: null,
         activeDialog: null,
         dialogEngaged: false,
@@ -1352,6 +1397,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.routes = data.routes || [];
       state.parallelGroups = data.parallel_groups || [];
       state.forEachGroups = data.for_each_groups || [];
+      // Reset accumulated guidance for a fresh root run (issue #400). A
+      // resumed run's restored context re-populates this via replayed
+      // guidance_applied events, not this reset.
+      state.userGuidance = [];
 
       ensureNode(state.nodes, '$start', 'start');
       state.nodes['$start']!.status = 'running';
@@ -2291,10 +2340,38 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       type: 'agent_resumed',
       icon: '▶',
       label: 'Resumed',
-      text: 'Agent resumed — re-executing',
+      text: data.with_guidance
+        ? 'Agent resumed with guidance — re-executing'
+        : 'Agent resumed — re-executing',
     });
     replaceNode(state.nodes, data.agent_name);
     state.isPaused = false;
+  },
+
+  guidance_received: (state, _data) => {
+    const data = _data as unknown as GuidanceReceivedData;
+    state.userGuidance = mergeGuidance(state.userGuidance, {
+      type: 'guidance_received',
+      data,
+    });
+  },
+
+  guidance_applied: (state, _data) => {
+    const data = _data as unknown as GuidanceAppliedData;
+    state.userGuidance = mergeGuidance(state.userGuidance, {
+      type: 'guidance_applied',
+      data,
+    });
+    if (data.agent_name) {
+      const nd = ensureNode(state.nodes, data.agent_name);
+      nd.activity.push({
+        type: 'guidance_applied',
+        icon: '💬',
+        label: 'Guidance',
+        text: `Guidance applied (${data.source}): ${data.text}`,
+      });
+      replaceNode(state.nodes, data.agent_name);
+    }
   },
 
   iteration_limit_reached: (state, _data) => {
@@ -2616,7 +2693,20 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
       return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Agent paused — waiting for resume' };
 
     case 'agent_resumed':
-      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: 'Agent resumed — re-executing' };
+      return {
+        timestamp: ts,
+        level: 'info',
+        source: String(d.agent_name),
+        message: d.with_guidance ? 'Agent resumed with guidance — re-executing' : 'Agent resumed — re-executing',
+      };
+
+    case 'guidance_received':
+      return { timestamp: ts, level: 'info', source: 'guidance', message: `Guidance received (pending: ${d.pending}): ${d.text}` };
+
+    case 'guidance_applied': {
+      const target = (d.agent_name as string) || 'workflow';
+      return { timestamp: ts, level: 'info', source: target, message: `Guidance applied (${d.source}): ${d.text}` };
+    }
 
     case 'iteration_limit_reached': {
       const target = (d.agent_name ?? d.group_name ?? 'workflow') as string;
