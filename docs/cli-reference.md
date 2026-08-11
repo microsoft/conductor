@@ -279,12 +279,46 @@ conductor stop [OPTIONS]
 |--------|-------------|
 | `--port PORT` | Stop the workflow running on this specific port |
 | `--all` | Stop all background conductor workflows |
+| `--force` | Proceed when the run's identity cannot be confirmed (see [Identity and `--force`](#identity-and---force)) |
+| `--json` | Emit a machine-readable result per workflow on stdout instead of prose |
 
 With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
 
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every targeted workflow is confirmed stopped, or was already gone |
+| `1` | `--port` matched no running workflow, or the target was ambiguous |
+| `2` | At least one workflow survived, or could not be confirmed stopped |
+
+Exit `2` is deliberately not a synonym for failure to signal — it means Conductor could not *prove* the process is gone. A run that ignored every rung and a run whose liveness could not be probed both land here, because both leave you with something you should look at by hand.
+
 ### How It Works
 
-When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The `stop` command reads these PID files, sends `SIGTERM` to the process, and cleans up the file. PID files are also automatically cleaned up when a background workflow completes normally.
+When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. PID files are written atomically, so a concurrent `stop` can never read a half-written file. They are also cleaned up automatically when a background workflow completes normally.
+
+`stop` reads those files and escalates through a ladder, confirming each rung before moving to the next:
+
+1. **Ask the dashboard to cancel** (`POST /api/kill`) — the graceful rung, which lets the run write a checkpoint so you can `conductor resume` later.
+2. **Send a platform signal** — `SIGTERM` on POSIX, `CTRL_BREAK_EVENT` on Windows.
+3. **Force-terminate** — `SIGKILL` / `TerminateProcess`.
+
+A PID file is removed **only once its process is confirmed gone**. A workflow that survives every rung keeps its file and stays discoverable, rather than becoming an untracked orphan still holding its port.
+
+### Identity and `--force`
+
+Between a PID file being written and `stop` reading it, the OS may have recycled that PID onto an unrelated process. Every PID-directed rung is therefore gated on the dashboard confirming its own PID first. Three outcomes:
+
+| Identity | Meaning | Behavior |
+|----------|---------|----------|
+| **confirmed** | The dashboard reports the PID we recorded | Proceed |
+| **unconfirmed** | The dashboard could not be reached, or is too old to report a PID | Refuse, unless `--force` |
+| **mismatched** | The dashboard reports a *different* PID | Refuse — `--force` does **not** override this |
+
+`--force` overrides *uncertainty* only. A positive mismatch means the PID demonstrably belongs to something else, so signalling it would be signalling a stranger; no flag lifts that.
+
+`--force` has one further effect. If a run's liveness cannot be probed at all, its entry would otherwise be permanent — bare `stop` stays ambiguous and `stop --all` exits `2` forever, which wedges CI teardown ([#166](https://github.com/microsoft/conductor/issues/166)). `--force` clears such an entry, printing a warning: if that process is still alive it is now untracked and must be stopped by hand. This is deliberately narrow, and does not fire for a mismatch or for a process demonstrably still alive.
 
 The web dashboard also exposes terminate controls that always preserve progress:
 

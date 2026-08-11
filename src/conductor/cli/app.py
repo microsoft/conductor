@@ -1210,7 +1210,11 @@ def stop(
             "--force",
             help=(
                 "Force-terminate even when the run's identity cannot be confirmed. "
-                "Dangerous: the recorded PID may have been recycled onto another process."
+                "Dangerous: the recorded PID may have been recycled onto another process. "
+                "Does not override a confirmed mismatch, which blocks every rung. "
+                "Also clears the PID file of a run whose liveness cannot be probed at "
+                "all -- if that process is still alive it becomes untracked and must be "
+                "stopped by hand."
             ),
         ),
     ] = False,
