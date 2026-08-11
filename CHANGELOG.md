@@ -179,16 +179,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot isolate one call's prompt size, the field is `None` and the
   dashboard hides the bar rather than showing a misleading number; a
   `used > max` pair (impossible for one real API call) is dropped to `None`
-  entirely, logged at debug, since either the usage figure or the looked-up
-  cap is untrustworthy. Riding along: `copilot.py`'s `assistant.usage` handler
-  previously *overwrote* its running token counts on every event instead of
-  summing them, so a 20-turn tool-calling agent's cost was billed only for
-  its final API call — this under-report is fixed at the same time, since
-  fixing it alone (without the new field) would have made the context bar
-  report the sum of every turn rather than just the last, making the original
-  defect worse. Cost figures for multi-turn Copilot agents will rise as a
-  result; a `cost.budget_usd` tuned against the old under-reported total may
-  now trip its limit sooner.
+  entirely, logged at debug on every occurrence and at warning once per run
+  (nothing reads debug logs in production), since either the usage figure or
+  the looked-up cap is untrustworthy. Riding along: `copilot.py`'s
+  `assistant.usage` handler previously *overwrote* its running token counts
+  on every event instead of summing them, so a 20-turn tool-calling agent's
+  cost was billed only for its final API call — this under-report is fixed
+  at the same time, since fixing it alone (without the new field) would have
+  made the context bar report the sum of every turn rather than just the
+  last, making the original defect worse. The event's dedup guard (which
+  prevents a repeated `assistant.usage` event from double-billing the same
+  API call) keys on `api_call_id`, falling back to `provider_call_id` then
+  `service_request_id` when the SDK omits it, since all three are
+  independently optional. Cost figures for multi-turn Copilot agents will
+  rise as a result; a `cost.budget_usd` tuned against the old
+  under-reported total may now trip its limit sooner.
 
 - **`conductor stop` now confirms the process actually stopped, and never
   stops the wrong one** (#344). `stop` sent one signal and reported success

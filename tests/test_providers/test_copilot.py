@@ -2588,7 +2588,7 @@ class TestCopilotProviderResolvedModel:
 
     @pytest.mark.asyncio
     async def test_send_and_wait_sums_usage_across_multiple_calls(self) -> None:
-        """Three assistant.usage events accumulate for billing (Q3, #412);
+        """Three assistant.usage events accumulate for billing (#412);
         last_call_input_tokens reflects only the final event."""
         from unittest.mock import Mock as _Mock
 

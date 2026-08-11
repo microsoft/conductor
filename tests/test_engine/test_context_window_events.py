@@ -8,6 +8,8 @@ monkeypatch the provider method to inject the values being asserted.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from conductor.config.schema import (
@@ -309,7 +311,7 @@ class TestAgentCompletedUsesLastCallInputTokens:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A used > max pair can never describe one real API call, so both
-        fields are dropped rather than shown misleadingly (Q2, issue #412)."""
+        fields are dropped rather than shown misleadingly (issue #412)."""
         emitter, collector = _make_emitter_and_collector()
         config = WorkflowConfig(
             workflow=WorkflowDef(
@@ -342,7 +344,6 @@ class TestAgentCompletedUsesLastCallInputTokens:
         provider.execute = execute_with_impossible_usage  # type: ignore[method-assign]
 
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
-        import logging
 
         with caplog.at_level(logging.DEBUG, logger="conductor.engine.workflow"):
             await engine.run({})
@@ -354,6 +355,80 @@ class TestAgentCompletedUsesLastCallInputTokens:
             "a1" in record.getMessage() and "1121132" in record.getMessage()
             for record in caplog.records
         )
+        # The first occurrence in a run is also surfaced at warning level so
+        # it doesn't go unnoticed (nothing reads debug logs in production;
+        # see AGENTS.md's "not logged at debug where nothing would reach the
+        # user" rule).
+        assert any(
+            record.levelno == logging.WARNING
+            and "a1" in record.getMessage()
+            and "1121132" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_impossible_pair_warns_only_once_per_run(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A second impossible pair in the same run is still dropped and
+        logged at debug, but doesn't repeat the warning (issue #412)."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-impossible-pair-once",
+                entry_point="a1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a1",
+                    model="gpt-4o",
+                    prompt="Hello",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="a2")],
+                ),
+                AgentDef(
+                    name="a2",
+                    model="gpt-4o",
+                    prompt="Hello again",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ a2.output.answer }}"},
+        )
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_impossible_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.last_call_input_tokens = 1_121_132  # exceeds the 936_000 cap
+            return output
+
+        provider.execute = execute_with_impossible_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+
+        with caplog.at_level(logging.DEBUG, logger="conductor.engine.workflow"):
+            await engine.run({})
+
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == "conductor.engine.workflow"
+        ]
+        debug_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and r.name == "conductor.engine.workflow"
+            and "impossible" in r.getMessage().lower()
+        ]
+        assert len(warning_records) == 1
+        assert len(debug_records) == 2
 
     @pytest.mark.asyncio
     async def test_last_call_input_tokens_none_hides_used_but_keeps_max(self) -> None:
@@ -395,6 +470,49 @@ class TestAgentCompletedUsesLastCallInputTokens:
 
         event = collector.first("agent_completed")
         assert event.data["context_window_used"] is None
+        assert event.data["context_window_max"] == 936_000
+
+    @pytest.mark.asyncio
+    async def test_used_equal_to_max_is_kept_not_dropped(self) -> None:
+        """used == max is the boundary case, not the impossible one — a
+        single call using exactly the full context window is a real 100%
+        state the bar should show, not an anomaly to hide (issue #412)."""
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-boundary",
+                entry_point="a1",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a1",
+                    model="gpt-4o",
+                    prompt="Hello",
+                    output={"answer": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"answer": "{{ a1.output.answer }}"},
+        )
+        provider = _provider_with_max_prompt({"gpt-4o": 936_000})
+
+        original_execute = provider.execute
+
+        async def execute_with_boundary_usage(*args, **kwargs):  # type: ignore[no-untyped-def]
+            output = await original_execute(*args, **kwargs)
+            output.last_call_input_tokens = 936_000  # exactly equal to the cap
+            return output
+
+        provider.execute = execute_with_boundary_usage  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("agent_completed")
+        assert event.data["context_window_used"] == 936_000
         assert event.data["context_window_max"] == 936_000
 
 
@@ -508,6 +626,8 @@ class TestParallelAgentCompletedUsesLastCallInputTokens:
         assert event.data["context_window_used"] is None
         assert event.data["context_window_max"] == 936_000
 
+
+class TestContextWindowResolutionOrder:
     """The model is resolved from output.model first, then agent.model, then default."""
 
     @pytest.mark.asyncio

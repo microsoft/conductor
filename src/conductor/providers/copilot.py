@@ -1476,7 +1476,7 @@ class CopilotProvider(AgentProvider):
         Returns:
             SDKResponse with content and usage data. Usage is summed across
             every ``assistant.usage`` event seen for the turn's API calls
-            (Q3, issue #412); ``last_call_input_tokens`` is the final call's
+            (issue #412); ``last_call_input_tokens`` is the final call's
             prompt size, a point-in-time context measurement. If interrupted,
             ``SDKResponse.partial`` will be True.
 
@@ -1539,11 +1539,19 @@ class CopilotProvider(AgentProvider):
             elif event_type == "assistant.usage":
                 # Capture token usage from the assistant.usage event. One
                 # event is emitted per API call, so accumulate across calls
-                # for billing (Q3, issue #412) rather than overwriting —
-                # a multi-turn tool-calling agent otherwise bills only its
-                # final call. A repeated event for the same call (matched
-                # by api_call_id) is skipped so it isn't double-counted.
-                call_id = getattr(event.data, "api_call_id", None)
+                # for billing (issue #412) rather than overwriting — a
+                # multi-turn tool-calling agent otherwise bills only its
+                # final call. A repeated event for the same call (matched by
+                # api_call_id, falling back to provider_call_id then
+                # service_request_id when the SDK omits it) is skipped so
+                # it isn't double-counted. All three id fields are optional
+                # per the SDK schema; if none are present, dedup cannot be
+                # applied and the event is treated as a new call.
+                call_id = (
+                    getattr(event.data, "api_call_id", None)
+                    or getattr(event.data, "provider_call_id", None)
+                    or getattr(event.data, "service_request_id", None)
+                )
                 already_seen = isinstance(call_id, str) and call_id and call_id in seen_call_ids
                 if isinstance(call_id, str) and call_id:
                     seen_call_ids.add(call_id)
