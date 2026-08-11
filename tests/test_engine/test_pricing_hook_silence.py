@@ -42,6 +42,8 @@ from conductor.config.schema import (
     WorkflowConfig,
     WorkflowDef,
 )
+from conductor.engine.context import WorkflowContext
+from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.workflow import WorkflowEngine
 from conductor.providers.base import AgentProvider as AgentProviderBase
@@ -364,6 +366,37 @@ class TestTheVerdictIsReachedByRealRuns:
             await engine.run({})
 
         assert [r for r in caplog.records if "no pricing for any" in r.getMessage()] == []
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_run_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """``resume`` draws the verdict too, and nothing else covered it.
+
+        ``run`` and ``resume`` carry separate calls, so a test through ``run``
+        leaves the ``resume`` one free to be dropped -- reverting it kept the
+        suite green. A resumed run is still a run that priced nothing, and the
+        repository treats the two entry points as a parity pair.
+        """
+        provider = _silent_pricing_provider(mock_handler=lambda a, p, c: {"answer": "ok"})
+        engine = WorkflowEngine(_two_agent_workflow(), provider)
+
+        # Resume as if agent1 had already run before the checkpoint.
+        restored = WorkflowContext()
+        restored.set_workflow_inputs({})
+        restored.store("agent1", {"answer": "ok"})
+        engine.set_context(restored)
+        engine.set_limits(
+            LimitEnforcer.from_dict(
+                {"current_iteration": 1, "max_iterations": 5, "execution_history": ["agent1"]},
+                timeout_seconds=300,
+                budget_usd=None,
+                budget_mode="audit",
+            )
+        )
+
+        with caplog.at_level(logging.WARNING, logger="conductor.engine.workflow"):
+            await engine.resume("agent2")
+
+        assert [r for r in caplog.records if "no pricing for any" in r.getMessage()]
 
 
 class TestTheVerdictReachesTheUser:

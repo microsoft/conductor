@@ -1243,9 +1243,11 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
     # ``--web-bg`` writes it to a temp file nobody was told to read.
     if usage_data.get("live_pricing_degraded"):
         _print(
-            "  [yellow]Live pricing unavailable for every model this run.[/yellow]"
-            "[dim] Costs shown are estimates from the static pricing table; "
-            "set `cost.pricing` in the workflow to supply rates.[/dim]"
+            Text.from_markup(
+                "  [yellow]Live pricing unavailable for every model this run.[/yellow]"
+                "[dim] Costs shown are estimates from the static pricing table; "
+                "set `cost.pricing` in the workflow to supply rates.[/dim]"
+            )
         )
 
     _print("=" * 60, style="dim")
