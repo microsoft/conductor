@@ -346,14 +346,14 @@ See [docs/fleet.md](docs/fleet.md) for every screen, key binding, the status voc
 
 Conductor supports multiple AI providers. Choose based on your needs:
 
-| Feature | Copilot | Claude | Claude Agent SDK | Hermes | ACA |
-|---------|---------|--------|------------------|--------|-----|
-| **Tier** | Stable | Stable | Experimental | Experimental | Experimental |
-| **Pricing** | Subscription | Pay-per-token | Subscription | Pay-per-token (via hermes) | Subscription + ACA compute |
-| **Context Window** | Per-model | Per-model | Per-model | Per-model | Per-model (inner Copilot) |
-| **Tool Support (MCP)** | Yes | Yes (stdio) | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) |
-| **Streaming** | Yes | Yes | Yes | No | Yes |
-| **Best For** | Heavy usage, tools | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access | Untrusted/isolation-sensitive agents |
+| Feature | Copilot | OpenAI | Claude | Claude Agent SDK | Hermes | ACA |
+|---------|---------|--------|--------|------------------|--------|-----|
+| **Tier** | Stable | Stable | Stable | Experimental | Experimental | Experimental |
+| **Pricing** | Subscription | Pay-per-token | Pay-per-token | Subscription | Pay-per-token (via hermes) | Subscription + ACA compute |
+| **Context Window** | Per-model | Per-model | Per-model | Per-model | Per-model | Per-model (inner Copilot) |
+| **Tool Support (MCP)** | Yes | Yes (stdio) | Yes (stdio) | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) |
+| **Streaming** | Yes | Yes | Yes | Yes | No | Yes |
+| **Best For** | Heavy usage, tools | OpenAI ecosystem, pay-per-use | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access | Untrusted/isolation-sensitive agents |
 
 ### Using Copilot
 
@@ -365,6 +365,17 @@ workflow:
 ```
 
 Copilot is the default provider — `runtime.provider` can be omitted entirely. Requires an active GitHub Copilot subscription and the GitHub CLI authenticated (`gh auth login`).
+
+### Using OpenAI
+
+```yaml
+workflow:
+  runtime:
+    provider: openai
+    default_model: gpt-5-mini
+```
+
+Set your API key: `export OPENAI_API_KEY=sk-...`
 
 ### Using Claude
 
@@ -415,7 +426,7 @@ workflow:
 
 The `aca` provider delegates an agent's entire agentic loop, tools, and MCP calls to a remote **Azure Container Apps dynamic-sessions sandbox** instead of running it on the host — useful for untrusted or isolation-sensitive agents (e.g. running arbitrary generated code). Unlike the other providers, `aca` requires the structured `provider:` form with a `pool_endpoint` pointing at an operator-provisioned ACA session pool (`scripts/aca/provision-pool.sh`) and `azure-identity` for authentication. Resolves its inner Copilot credential automatically via `COPILOT_PROVIDER_BASE_URL` → `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token`, so a `gh`-authenticated operator needs no ACA-specific setup. See [`examples/aca-coding-agent.yaml`](examples/aca-coding-agent.yaml) for a full end-to-end example.
 
-**See also:** [Claude Documentation](docs/providers/claude.md) | [Hermes Documentation](docs/providers/hermes.md) | [ACA Documentation](docs/providers/aca.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
+**See also:** [OpenAI Documentation](docs/providers/openai.md) | [Claude Documentation](docs/providers/claude.md) | [Hermes Documentation](docs/providers/hermes.md) | [ACA Documentation](docs/providers/aca.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 
 ### Using a Local / Custom LLM Endpoint (Ollama, vLLM, Azure OpenAI, ...)
 
@@ -550,6 +561,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [Fleet Manager](./docs/fleet.md) | `conductor fleet` TUI: screens, key bindings, gate resolvability, retention |
 | [Parallel Execution](./docs/parallel-execution.md) | Static parallel groups |
 | [Dynamic Parallel](./docs/dynamic-parallel.md) | For-each groups and array processing |
+| [OpenAI Provider](./docs/providers/openai.md) | OpenAI setup and configuration |
 | [Claude Provider](./docs/providers/claude.md) | Claude setup and configuration |
 | [Hermes Provider](./docs/providers/hermes.md) | Hermes setup and configuration |
 | [ACA Provider](./docs/providers/aca.md) | Azure Container Apps sandboxed execution setup and configuration |

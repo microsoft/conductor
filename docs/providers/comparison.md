@@ -1,28 +1,28 @@
-# Provider Comparison: Copilot vs Claude vs Claude Agent SDK vs Hermes
+# Provider Comparison: Copilot vs OpenAI vs Claude vs Claude Agent SDK vs Hermes
 
-This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Agent SDK, and NousResearch Hermes providers for your workflows.
+This guide helps you choose between GitHub Copilot, OpenAI, Anthropic Claude, Claude Agent SDK, and NousResearch Hermes providers for your workflows.
 
 ## Quick Comparison
 
-| Feature | Copilot | Claude | Claude Agent SDK | Hermes |
-|---------|---------|--------|------------------|--------|
-| **Tier** | Stable | Stable | Experimental | Experimental |
-| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | 200K | per-model |
-| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
-| **Setup** | GitHub auth | API key | `claude` CLI auth | API key (model-provider's key) |
-| **Model Selection** | GPT-5.2, o1 | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
-| **Streaming** | Yes | Yes | Yes | Yes |
-| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (MCP + built-in preset) | Yes (hermes toolsets) |
-| **MCP Servers** | Yes | Yes (stdio) | Yes (all types) | No |
-| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
-| **Speed** | Fast | Fast | Fast | Depends on model |
-| **Output Quality** | Excellent | Excellent | Excellent | Depends on model |
-| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable | Variable (usage-based) |
-| **Multi-provider** | No | Yes (via Conductor) | No | Yes (native) |
-| **Agentic Loop** | SDK-managed | SDK-managed (Pydantic AI) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
-| **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
-| **Session Resume** | Yes | No | No | Yes |
-| **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | native CLI env var | N/A |
+| Feature | Copilot | OpenAI | Claude | Claude Agent SDK | Hermes |
+|---------|---------|--------|--------|------------------|--------|
+| **Tier** | Stable | Stable | Stable | Experimental | Experimental |
+| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | per-model (SDK-reported) | 200K | per-model |
+| **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
+| **Setup** | GitHub auth | API key | API key | `claude` CLI auth | API key (model-provider's key) |
+| **Model Selection** | GPT-5.2, o1 | GPT-4o, GPT-5-mini, o1, o3-mini | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |
+| **Streaming** | Yes | Yes | Yes | Yes | Yes |
+| **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (MCP, stdio only) | Yes (MCP + built-in preset) | Yes (hermes toolsets) |
+| **MCP Servers** | Yes | Yes (stdio) | Yes (stdio) | Yes (all types) | No |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (`reasoning_effort` on o1/o3) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
+| **Speed** | Fast | Fast | Fast | Fast | Depends on model |
+| **Output Quality** | Excellent | Excellent | Excellent | Excellent | Depends on model |
+| **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable (usage-based) | Variable | Variable (usage-based) |
+| **Multi-provider** | No | Yes (via custom base_url) | Yes (via Conductor) | No | Yes (native) |
+| **Agentic Loop** | SDK-managed | SDK-managed (Pydantic AI) | SDK-managed (Pydantic AI) | SDK-managed (delegated to CLI) | SDK-managed (delegated to hermes) |
+| **Structured Output** | Prompt injection | Native | Native | Prompt injection | Prompt injection |
+| **Session Resume** | Yes | No | No | No | Yes |
+| **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | conductor-side truncation+spill | native CLI env var | N/A |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
 > specific capability carve-outs (e.g. no per-agent tools allowlist). `conductor validate`
@@ -69,6 +69,30 @@ agents:
   - name: researcher
     tools: [web_search]
     prompt: "Research {{ topic }} using web search"
+```
+
+## When to Use OpenAI
+
+### ✅ Choose OpenAI if:
+
+1. **You work primarily with OpenAI models or custom endpoints** — GPT-4o, GPT-5-mini, o1, o3-mini, or compatible proxies (OpenRouter, Ollama, vLLM)
+2. **You need full temperature control** — OpenAI supports temperatures from 0.0 up to 2.0
+3. **You want pay-per-token usage with native schema enforcement** — Built on Pydantic AI's forced tool call structured output
+4. **You use custom gateways** — Point `base_url` to local or corporate OpenAI-compatible endpoints
+
+### Example OpenAI Workflow
+
+```yaml
+workflow:
+  name: openai-workflow
+  runtime:
+    provider: openai
+    default_model: gpt-5-mini
+    temperature: 0.7
+
+agents:
+  - name: analyzer
+    prompt: "Analyze the following text: {{ workflow.input.text }}"
 ```
 
 ## When to Use Claude

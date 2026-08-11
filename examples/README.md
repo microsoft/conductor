@@ -228,6 +228,21 @@ conductor run examples/copilot-local-llm.yaml --input question="What is Python?"
 See [Configuration → Custom Provider Routing](../docs/configuration.md#custom-provider-routing-ollama--vllm--azure-openai)
 for env-var fallbacks, validator rules, and the security rationale.
 
+### openai-compatible.yaml
+
+Route the native `openai` provider at any OpenAI-compatible Chat Completions endpoint (Ollama, vLLM, OpenRouter, LM Studio, etc.). Demonstrates:
+- Object form of `runtime.provider` for the `openai` provider
+- `base_url` / `api_key` forwarded to the OpenAI client
+- Secret hygiene via `${OPENAI_BASE_URL:-...}` and `${OPENAI_API_KEY:-...}` interpolation with placeholder defaults
+- Commented alternates for OpenRouter, Ollama, and omniroute gateways
+
+```bash
+# Requires an OpenAI-compatible endpoint; defaults point at Ollama on localhost
+conductor run examples/openai-compatible.yaml --input question="What is Python?"
+```
+
+See [Configuration → OpenAI-compatible Provider Routing](../docs/configuration.md#openai-compatible-provider-routing) for env-var fallbacks, validator rules, and the security rationale.
+
 ### claude-custom-endpoint.yaml
 
 Route the Claude provider through a custom Anthropic-compatible endpoint or proxy. Demonstrates:

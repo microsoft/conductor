@@ -1,0 +1,90 @@
+# OpenAI-compatible provider workflow
+#
+# Demonstrates the native ``openai`` provider pointed at any
+# OpenAI-compatible Chat Completions endpoint.
+#
+# NEVER commit real API keys.  Use environment-variable interpolation
+# (``${VAR:-default}``) so secrets are resolved at load time and never
+# appear in checkpoints, dashboard events, or the workflow file.
+#
+# IMPORTANT: the ``openai`` provider uses the Chat Completions API only.
+# The ``Responses`` API is not supported. The endpoint you supply must
+# expose ``/v1/chat/completions`` and the model name must match a model
+# that endpoint actually serves.
+#
+# The placeholder defaults (``:-...``) exist only so this example passes
+# static validation without any environment variables set.  They are not
+# valid credentials and will not run against a real endpoint.
+#
+# Usage (Ollama running on http://localhost:11434):
+#
+#   conductor run examples/openai-compatible.yaml --input question="What is Python?"
+#
+# Uncomment one of the alternate blocks below for OpenRouter, a local
+# Ollama default, or the omniroute gateway.
+
+workflow:
+  name: openai-compatible
+  description: Single-agent Q&A using the native OpenAI-compatible provider
+  version: "1.0.0"
+  entry_point: answerer
+
+  runtime:
+    provider:
+      name: openai
+      base_url: ${OPENAI_BASE_URL:-http://localhost:11434/v1}
+      api_key: ${OPENAI_API_KEY:-ollama}
+    default_model: llama3.1
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question via the configured endpoint
+    prompt: |
+      You are a helpful assistant. Please answer the following question
+      clearly and concisely:
+
+      Question: {{ workflow.input.question }}
+
+      Provide a direct answer without unnecessary preamble.
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+
+# Alternate: OpenRouter (commented out):
+#
+#   runtime:
+#     provider:
+#       name: openai
+#       base_url: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
+#       api_key: ${OPENAI_API_KEY:-sk-or-placeholder-replace-me}
+#     default_model: openai/gpt-4o-mini
+
+# Alternate: Ollama default without env vars (commented out):
+#
+#   runtime:
+#     provider:
+#       name: openai
+#       base_url: ${OPENAI_BASE_URL:-http://localhost:11434/v1}
+#       api_key: ${OPENAI_API_KEY:-ollama}
+#     default_model: llama3.1
+
+# Alternate: omniroute gateway (commented out):
+#
+#   runtime:
+#     provider:
+#       name: openai
+#       base_url: ${OPENAI_BASE_URL:-https://api.omniroute.example.com/v1}
+#       api_key: ${OPENAI_API_KEY:-sk-omniroute-placeholder-replace-me}
+#     default_model: gpt-4o-mini

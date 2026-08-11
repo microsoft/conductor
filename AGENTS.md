@@ -388,6 +388,19 @@ All providers must maintain feature parity where applicable. Any change to one p
 
 When modifying any provider, check all other providers for the same change. The dashboard, JSONL logger, console subscriber, and workflow engine all depend on consistent behavior across providers.
 
+#### `openai.py` parity notes
+
+The OpenAI provider (`openai.py`) implements `AgentProvider` on the shared
+Pydantic AI execution loop (`src/conductor/providers/_pydantic_ai/runner.py::run_agent_pipeline`).
+It shares toolset bridges, event callbacks, interrupts, and retry contracts with `ClaudeProvider`,
+with the following backend specifics:
+
+- **Shared runner**: Delegates `execute()` to `run_agent_pipeline()` with an `OpenAIChatModel` backend.
+- **Env-resolution rule**: YAML `api_key` and `base_url` take precedence over `OPENAI_API_KEY` and `OPENAI_BASE_URL`. Ambient env vars never reroute an unconfigured provider (e.g. `provider: copilot` is never diverted by `OPENAI_*` variables). If an explicit `base_url` is provided without `api_key`, the key must be in `OPENAI_API_KEY` or passed explicitly.
+- **Chat-Completions-only**: Exclusively uses the OpenAI Chat Completions API; the OpenAI Responses API is not supported.
+- **Reasoning max rejection**: Supports `low`, `medium`, `high`, `xhigh` effort on reasoning models (`o1`, `o3-mini`), but rejects `max` with a `ValidationError`.
+- **Temperature 0..2**: Validates temperature in the `0.0..2.0` range and is exempt from the `1.0` cap enforced on Claude and Copilot providers.
+
 #### `claude_agent_sdk.py` parity notes
 
 The Claude Agent SDK provider (`claude_agent_sdk.py`) is the canonical
