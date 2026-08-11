@@ -504,6 +504,91 @@ class TestVerboseLogging:
             full_mode.reset(token_full)
             verbose_mode.reset(token_verbose)
 
+    def test_verbose_log_section_rejects_markup_interpretation(self) -> None:
+        """Content that looks like Rich markup must not be parsed as markup.
+
+        Rendered prompts carry agent output verbatim, so a bare ``[/bold]`` in
+        an agent's own words reaches this function. Passing the raw string to
+        ``Panel`` made Rich parse it and raise ``MarkupError``, killing the
+        workflow mid-run.
+        """
+        import re
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        # A closing tag with no opening tag — the exact shape that crashed.
+        content = "Valid metadata such as `[/bold]` raises Rich MarkupError."
+        output = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, width=200),
+            ):
+                verbose_log_section("Prompt", content)
+            clean_text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert "[/bold]" in clean_text
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_verbose_log_section_file_output_rejects_markup(self) -> None:
+        """The file console must not parse markup either.
+
+        File logging is enabled for every ``--web-bg`` run regardless of
+        console verbosity, so this path is reached even when nothing is
+        printed to the terminal.
+        """
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log_section
+
+        content = "unbalanced [/bold] tag"
+
+        file_output = StringIO()
+        token_verbose = verbose_mode.set(False)
+        token_full = full_mode.set(False)
+        try:
+            with patch(
+                "conductor.cli.run._file_console",
+                Console(file=file_output, width=200),
+            ):
+                verbose_log_section("Prompt", content)
+            assert "[/bold]" in file_output.getvalue()
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+    def test_verbose_log_rejects_markup_interpretation(self) -> None:
+        """``verbose_log`` shares the flaw: it interpolated into a markup string."""
+        import re
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import verbose_log
+
+        content = "plugin warning: [/dim] unbalanced"
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, width=200),
+            ):
+                verbose_log(content)
+            clean_text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert "[/dim]" in clean_text
+        finally:
+            verbose_mode.reset(token)
+
     def test_verbose_log_section_skipped_in_silent_mode(self) -> None:
         """Test that verbose_log_section skips console output in SILENT mode."""
         from io import StringIO

@@ -136,16 +136,23 @@ def close_file_logging() -> None:
 def verbose_log(message: str, style: str = "dim") -> None:
     """Log a message if verbose mode is enabled.
 
+    ``message`` is rendered literally rather than as console markup, for the
+    same reason as :func:`verbose_log_section`: callers interpolate names,
+    paths and warning text that conductor does not control, and a stray
+    ``[/bold]`` in any of them would otherwise raise ``MarkupError``.
+
     Args:
-        message: The message to log.
-        style: Rich style for the message.
+        message: The message to log. Rendered literally, never as markup.
+        style: Rich style applied to the message on the console.
     """
+    from rich.text import Text
+
     from conductor.cli.app import is_verbose
 
     if is_verbose():
-        _verbose_console.print(f"[{style}]{message}[/{style}]")
+        _verbose_console.print(Text(message, style=style))
     if _file_console is not None:
-        _file_console.print(message)
+        _file_console.print(Text(message))
 
 
 def _describe_provider(provider: ProviderSettings) -> str:
@@ -317,10 +324,18 @@ def verbose_log_section(title: str, content: str) -> None:
     They are shown in FULL mode (default) but skipped in MINIMAL mode (--quiet).
     File logging always receives full content regardless of console verbosity.
 
+    ``content`` is untrusted — rendered prompts carry agent output, tool
+    arguments and plan text — so it is wrapped in :class:`~rich.text.Text` and
+    rendered literally. Passing the raw ``str`` would make Rich parse it as
+    console markup, and a bare ``[/bold]`` in an agent's own words is enough to
+    raise ``MarkupError`` and take the workflow down with it.
+
     Args:
         title: Section title.
-        content: Section content.
+        content: Section content. Rendered literally, never as markup.
     """
+    from rich.text import Text
+
     from conductor.cli.app import is_full, is_verbose
 
     # Sections are detail-level: show on console only in FULL mode
@@ -329,12 +344,14 @@ def verbose_log_section(title: str, content: str) -> None:
     if not should_console and not should_file:
         return
 
+    body = Text(content)
+
     if should_console:
-        _verbose_console.print(Panel(content, title=f"[cyan]{title}[/cyan]", border_style="dim"))
+        _verbose_console.print(Panel(body, title=f"[cyan]{title}[/cyan]", border_style="dim"))
 
     # File always gets full untruncated content
     if _file_console is not None:
-        _file_console.print(Panel(content, title=title, border_style="dim"))
+        _file_console.print(Panel(body, title=title, border_style="dim"))
 
 
 def verbose_log_timing(operation: str, elapsed: float) -> None:
