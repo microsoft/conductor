@@ -37,7 +37,15 @@ def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return runs_dir
 
 
-def _write_pid(pid_dir: Path, pid: int, port: int, workflow: str = "/tmp/wf.yaml") -> Path:
+def _write_pid(
+    pid_dir: Path,
+    pid: int,
+    port: int,
+    workflow: str = "/tmp/wf.yaml",
+    *,
+    stderr_log: str = "/tmp/conductor/conductor-wf-20260303-000000-a1b2c3d4.bg.stderr.log",
+    stdout_log: str = "/tmp/conductor/conductor-wf-20260303-000000-a1b2c3d4.bg.stdout.log",
+) -> Path:
     name = Path(workflow).stem
     filepath = pid_dir / f"{name}-{port}.pid"
     filepath.write_text(
@@ -48,6 +56,8 @@ def _write_pid(pid_dir: Path, pid: int, port: int, workflow: str = "/tmp/wf.yaml
                 "workflow": workflow,
                 "started_at": "2026-03-03T00:00:00",
                 "run_id": _RUN_ID,
+                "stderr_log": stderr_log,
+                "stdout_log": stdout_log,
             }
         )
     )
@@ -208,12 +218,42 @@ class TestStatusJson:
         assert entry["pid"] == 4242
         assert entry["port"] == 8080
         assert entry["run_id"] == _RUN_ID
+        assert entry["stderr_log"].endswith("bg.stderr.log")
+        assert entry["stdout_log"].endswith("bg.stdout.log")
         assert entry["url"] == "http://127.0.0.1:8080"
 
     def test_json_empty_when_nothing_runs(self, pid_tmpdir: Path) -> None:
         result = runner.invoke(app, ["status", "--json"])
         assert result.exit_code == 0
         assert json.loads(result.stdout) == {"running": []}
+
+    def test_json_missing_run_id_and_logs_report_null(self, pid_tmpdir: Path) -> None:
+        """A PID file written before this field existed reports null, not "".
+
+        Absent key, empty string, and "no run id" are three different facts
+        (issue #404); collapsing them to ``""`` made all three indistinguishable
+        in scripted output.
+        """
+        filepath = pid_tmpdir / "wf-8080.pid"
+        filepath.write_text(
+            json.dumps(
+                {
+                    "pid": 4242,
+                    "port": 8080,
+                    "workflow": "/tmp/wf.yaml",
+                    "started_at": "2026-03-03T00:00:00",
+                }
+            )
+        )
+
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["status", "--json"])
+
+        assert result.exit_code == 0
+        entry = json.loads(result.stdout)["running"][0]
+        assert entry["run_id"] is None
+        assert entry["stderr_log"] is None
+        assert entry["stdout_log"] is None
 
     def test_json_is_ascii_safe(self, pid_tmpdir: Path) -> None:
         """Workflow paths are user data and can contain non-ASCII.

@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -675,7 +676,12 @@ class TestLaunchBackgroundResumeFailures:
                 workflow_path=wf_path, checkpoint_path=None, web_port=9201
             )
 
-        mock_write.assert_called_once_with(5555, 9201, wf_path)
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (5555, 9201, wf_path)
+        assert kwargs["run_id"]  # non-empty fresh id
+        assert kwargs["stderr_log"]
+        assert kwargs["stdout_log"]
 
     def test_pid_file_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
         """When only checkpoint_path is given, it is used for the PID file ref."""
@@ -697,7 +703,12 @@ class TestLaunchBackgroundResumeFailures:
                 workflow_path=None, checkpoint_path=cp_path, web_port=9202
             )
 
-        mock_write.assert_called_once_with(5556, 9202, cp_path)
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (5556, 9202, cp_path)
+        assert kwargs["run_id"]  # non-empty fresh id (checkpoint has no run_id)
+        assert kwargs["stderr_log"]
+        assert kwargs["stdout_log"]
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
         """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
@@ -763,6 +774,166 @@ class TestLaunchBackgroundResumeFailures:
         assert len(env["CONDUCTOR_RUN_ID"]) == 8
         assert env["CONDUCTOR_BG_STDERR_LOG"].endswith(".bg.stderr.log")
         assert env["CONDUCTOR_BG_STDOUT_LOG"].endswith(".bg.stdout.log")
+
+
+class TestLaunchBackgroundResumeRunIdAdoption:
+    """``launch_background_resume`` adopts the checkpoint's ``run_id`` (issue #404).
+
+    Without this, the launcher always minted a fresh id — one that matches
+    neither the resumed child's ``EventLogSubscriber`` (which reuses the
+    checkpoint's ``run_id`` whenever the original JSONL still exists) nor the
+    events JSONL filename, leaving the PID file's ``run_id`` correlating with
+    nothing.
+    """
+
+    def test_explicit_from_checkpoint_run_id_is_adopted(self, tmp_path: Path) -> None:
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="deadbeef")
+
+        proc = MagicMock()
+        proc.pid = 6001
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9210
+            )
+
+        assert launch.run_id == "deadbeef"
+        assert "deadbeef" in launch.stderr_log.name
+        assert "deadbeef" in launch.stdout_log.name
+
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == "deadbeef"
+
+    def test_explicit_from_checkpoint_run_id_wires_env(self, tmp_path: Path) -> None:
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="deadbeef")
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 6002
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9211
+            )
+
+        assert captured["env"]["CONDUCTOR_RUN_ID"] == "deadbeef"
+
+    def test_workflow_only_resume_mirrors_child_latest_checkpoint_resolution(
+        self, tmp_path: Path
+    ) -> None:
+        """A bare ``workflow_path`` resume finds the latest checkpoint, same as the child."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="cafef00d")
+
+        proc = MagicMock()
+        proc.pid = 6003
+        proc.poll.return_value = None
+
+        with (
+            patch(
+                "conductor.engine.checkpoint.CheckpointManager.find_latest_checkpoint",
+                return_value=cp_path,
+            ),
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=wf_path, checkpoint_path=None, web_port=9212
+            )
+
+        assert launch.run_id == "cafef00d"
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == "cafef00d"
+
+    def test_missing_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint with no ``run_id`` doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="")
+
+        proc = MagicMock()
+        proc.pid = 6004
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9213
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_malformed_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint whose ``run_id`` isn't 8 hex chars doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="not-a-valid-run-id")
+
+        proc = MagicMock()
+        proc.pid = 6005
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9214
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_unreadable_checkpoint_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """An unreadable/absent checkpoint doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        missing_cp = tmp_path / "does-not-exist.json"
+
+        proc = MagicMock()
+        proc.pid = 6006
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=missing_cp, web_port=9215
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
 
 
 # ---------------------------------------------------------------------------

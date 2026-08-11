@@ -204,6 +204,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is how the defect kept coming back, and unescaped brackets in `typer`
   help text, which had silently cost `conductor run --help` the whole
   `[@registry][@version]` syntax.
+- **`conductor status --json` no longer ships two permanently dead fields**
+  (#404). `--web-bg`'s launcher wrote every PID file's `run_id` empty and its
+  `log_file` was a promise it could never keep — the JSONL path is derived
+  inside the child by `EventLogSubscriber`, after the PID file is already
+  written. `write_pid_file` now records the launch's actual `run_id` and
+  `stderr_log`/`stdout_log` (replacing `log_file`, which the parent
+  legitimately knows) — the same three artefacts `_finalize_background_launch`
+  already had in scope but never threaded through. `run_id` is the join key to
+  the run's `conductor-<name>-<ts>-<run_id>.events.jsonl`, so a populated value
+  makes that file findable by glob without storing a path the parent would
+  otherwise have to guess. `conductor resume --web-bg` goes further: it now
+  resolves the checkpoint exactly as the resumed child does (`--from` first,
+  else the latest checkpoint for the workflow) and adopts *its* `run_id` for
+  the whole launch, rather than minting a fresh one that matches neither the
+  child's `EventLogSubscriber` (which reuses the checkpoint's id whenever the
+  original JSONL still exists) nor the events log filename. A checkpoint with
+  a missing or malformed `run_id` falls back to a fresh id rather than
+  failing the launch. `conductor status --json` also now emits `null` for an
+  absent/empty `run_id`/`stderr_log`/`stdout_log` instead of `""`, so a PID
+  file predating this fix is distinguishable from one that legitimately has
+  no run id. `conductor status` is unreleased, so the `log_file` →
+  `stderr_log`/`stdout_log` rename costs no released contract.
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing

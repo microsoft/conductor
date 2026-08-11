@@ -10,8 +10,15 @@ PID files are JSON with the schema::
         "pid": 12345,
         "port": 8080,
         "workflow": "my-workflow.yaml",
-        "started_at": "2026-03-03T12:00:00"
+        "started_at": "2026-03-03T12:00:00",
+        "run_id": "a1b2c3d4",
+        "stderr_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stderr.log",
+        "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log"
     }
+
+``run_id``, ``stderr_log``, and ``stdout_log`` are populated by
+``cli/bg_runner.py`` from the same launch that produced the PID file; a PID
+file written before this field existed has them as empty strings.
 """
 
 from __future__ import annotations
@@ -97,7 +104,8 @@ def write_pid_file(
     port: int,
     workflow_path: str | Path,
     run_id: str = "",
-    log_file: str = "",
+    stderr_log: str = "",
+    stdout_log: str = "",
 ) -> Path:
     """Write a PID file for a background workflow process.
 
@@ -105,8 +113,12 @@ def write_pid_file(
         pid: Process ID of the background child.
         port: TCP port the web dashboard is listening on.
         workflow_path: Path to the workflow YAML file.
-        run_id: Unique run identifier (from event log subscriber).
-        log_file: Path to the JSONL event log file.
+        run_id: The run id shared with the child via ``CONDUCTOR_RUN_ID`` —
+            the key that finds the child's
+            ``conductor-<name>-<ts>-<run_id>.events.jsonl`` log.
+        stderr_log: Path to the file capturing the child's stderr — the
+            first place to look when a bg run misbehaves silently.
+        stdout_log: Path to the file capturing the child's stdout.
 
     Returns:
         Path to the created PID file.
@@ -121,7 +133,8 @@ def write_pid_file(
         "workflow": str(workflow_path),
         "started_at": datetime.now(UTC).isoformat(),
         "run_id": run_id,
-        "log_file": log_file,
+        "stderr_log": stderr_log,
+        "stdout_log": stdout_log,
     }
 
     filepath.write_text(json.dumps(data, indent=2))

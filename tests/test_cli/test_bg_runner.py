@@ -525,7 +525,12 @@ class TestLaunchBackgroundDiagnostics:
         assert captured["stderr"].closed
 
     def test_env_wires_correlation_vars(self, tmp_path: Path) -> None:
-        """``CONDUCTOR_RUN_ID`` / log paths are passed to the child via env."""
+        """``CONDUCTOR_RUN_ID`` / log paths are passed to the child via env.
+
+        Also asserts the PID-file ``run_id`` equals ``env["CONDUCTOR_RUN_ID"]``
+        — the property that makes the events JSONL findable by glob from the
+        PID file alone (issue #404).
+        """
         from conductor.cli import bg_runner
 
         wf_path = _write_workflow(tmp_path)
@@ -542,7 +547,7 @@ class TestLaunchBackgroundDiagnostics:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             launch = bg_runner.launch_background(
                 workflow_path=wf_path,
@@ -556,6 +561,46 @@ class TestLaunchBackgroundDiagnostics:
         assert env["CONDUCTOR_RUN_ID"] == launch.run_id
         assert env["CONDUCTOR_BG_STDERR_LOG"] == str(launch.stderr_log)
         assert env["CONDUCTOR_BG_STDOUT_LOG"] == str(launch.stdout_log)
+
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == env["CONDUCTOR_RUN_ID"]
+
+    def test_pid_file_records_run_id_and_capture_logs(self, tmp_path: Path) -> None:
+        """Regression guard for issue #404: PID file must not ship dead fields.
+
+        Before this fix, ``_finalize_background_launch`` called
+        ``write_pid_file(proc.pid, web_port, pid_workflow_ref)`` with no
+        ``run_id``/log kwargs, so every bg-launched PID file recorded an
+        empty ``run_id`` and a nonexistent ``log_file``.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9305,
+            )
+
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (4321, 9305, wf_path)
+        assert kwargs["run_id"] == launch.run_id
+        assert kwargs["run_id"]  # non-empty
+        assert kwargs["stderr_log"] == str(launch.stderr_log)
+        assert kwargs["stdout_log"] == str(launch.stdout_log)
 
     def test_early_exit_error_mentions_stderr_log_path(self, tmp_path: Path) -> None:
         """RuntimeError raised on early child exit includes the stderr log path."""

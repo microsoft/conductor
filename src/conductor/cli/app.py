@@ -167,6 +167,26 @@ _INTERACTIVE_STEP_TYPES = ("human_gate", "questions")
 """Step types that park the workflow waiting on a human."""
 
 
+def _optional_str(value: object) -> str | None:
+    """Coerce a PID-file field to ``str | None`` for JSON output.
+
+    A PID file written before ``run_id``/``stderr_log``/``stdout_log``
+    existed has the key absent; ``write_pid_file`` with no explicit value
+    writes an empty string. Both should surface as JSON ``null`` rather than
+    ``""``, so a scripted reader can distinguish "no id recorded" from an
+    id that happens to be the empty string — which never legitimately
+    occurs, but collapsing it to ``""`` would make it indistinguishable
+    from "field absent" if it ever did.
+
+    Args:
+        value: The raw value read from the PID file JSON.
+
+    Returns:
+        ``value`` if it is a non-empty string, otherwise ``None``.
+    """
+    return value if isinstance(value, str) and value else None
+
+
 def _workflow_has_human_gate(workflow_path: Path) -> bool:
     """Return True if the workflow defines any step that waits on a human.
 
@@ -1201,9 +1221,10 @@ def status(
                 "pid": e["pid"],
                 "port": e["port"],
                 "workflow": str(e.get("workflow", "")),
-                "run_id": e.get("run_id", ""),
+                "run_id": _optional_str(e.get("run_id")),
                 "started_at": e.get("started_at", ""),
-                "log_file": e.get("log_file", ""),
+                "stderr_log": _optional_str(e.get("stderr_log")),
+                "stdout_log": _optional_str(e.get("stdout_log")),
                 "url": f"http://127.0.0.1:{e['port']}",
             }
             for e in running
