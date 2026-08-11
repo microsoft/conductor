@@ -1795,12 +1795,12 @@ class CopilotProvider(AgentProvider):
                 event icon so concurrent parallel/for-each iterations can be
                 distinguished in interleaved logs.
         """
-        from rich.console import Console
         from rich.text import Text
 
         from conductor.cli.run import _file_console
+        from conductor.console import make_console
 
-        console = Console(stderr=True, highlight=False)
+        console = make_console(stderr=True, highlight=False)
 
         def _print(renderable: Any) -> None:
             console.print(renderable)
@@ -2037,10 +2037,11 @@ class CopilotProvider(AgentProvider):
             agent_name: Optional agent identifier used to attribute the
                 recovery message to a specific concurrent agent.
         """
-        from rich.console import Console
         from rich.text import Text
 
-        console = Console(stderr=True, highlight=False)
+        from conductor.console import make_console
+
+        console = make_console(stderr=True, highlight=False)
 
         text = Text()
         text.append("    ├─ ", style="dim")

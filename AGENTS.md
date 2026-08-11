@@ -93,8 +93,8 @@ step-by-step checklist.
   - `plugin.py` - `plugin` group (`list` / `fetch`). Deliberately no `update`: a floating ref self-updates and a pinned one is meant not to. `fetch` existing as a separate verb is what keeps `conductor validate` off the network
   - `doctor.py` - `doctor` diagnostics rendering (thin presentation layer over `providers/diagnostics.py`)
   - `run.py` - Workflow execution command with verbose logging helpers
-  - `bg_runner.py` - Background process forking for `--web-bg` mode. Captures the detached child's stdout/stderr to `$TMPDIR/conductor/conductor-<name>-<ts>-<runid>.bg.{stderr,stdout}.log` so silent crashes (uncaught Python exceptions, `faulthandler` dumps) leave a forensic trail — DEVNULL is **not** used for stdout/stderr. Passes `CONDUCTOR_RUN_ID`, `CONDUCTOR_BG_STDERR_LOG`, and `CONDUCTOR_BG_STDOUT_LOG` to the child via env so the child's `EventLogSubscriber` shares a run id with the bg log files and surfaces both paths in `workflow_started` system metadata. Returns a `BackgroundLaunch` dataclass (`url`, `stderr_log`, `stdout_log`, `run_id`).
-  - `pid.py` - PID file utilities for tracking/stopping background processes
+  - `bg_runner.py` - Background process forking for `--web-bg` mode. Captures the detached child's stdout/stderr to `$TMPDIR/conductor/conductor-<name>-<ts>-<runid>.bg.{stderr,stdout}.log` so silent crashes (uncaught Python exceptions, `faulthandler` dumps) leave a forensic trail — DEVNULL is **not** used for stdout/stderr. Passes `CONDUCTOR_RUN_ID`, `CONDUCTOR_BG_STDERR_LOG`, and `CONDUCTOR_BG_STDOUT_LOG` to the child via env so the child's `EventLogSubscriber` shares a run id with the bg log files and surfaces both paths in `workflow_started` system metadata. Returns a `BackgroundLaunch` dataclass (`url`, `stderr_log`, `stdout_log`, `run_id`). The launcher records that same `run_id` and both capture-log paths into the PID file (issue #404), rather than the launcher-invisible `run_id=""`/`log_file=""` defaults `write_pid_file` used to fall back to. `launch_background_resume` adopts the run id from the resolved checkpoint (`_checkpoint_run_id`, mirroring `cli/run.py`'s own checkpoint-resolution precedence) instead of minting a fresh one, so the PID file, `/api/info`, the events JSONL, and the capture-log filenames all agree on one id across a resume; a checkpoint with no usable id falls back to a fresh one.
+  - `pid.py` - PID file utilities for tracking/stopping background processes. The PID file records `run_id`, `stderr_log`, and `stdout_log` from the launch (see `bg_runner.py`); a PID file written before this field existed has `run_id` as an empty string and lacks the `stderr_log`/`stdout_log` keys entirely (they didn't exist yet) — both cases surface as JSON `null` via `conductor status --json`.
   - `update.py` - Update check and version comparison. Upgrades are delegated to the install script (`install.ps1`/`install.sh`); in-process self-upgrade was removed because on Windows the running Python interpreter sits inside the venv `uv tool install --force` is trying to recreate, which fails with "Access is denied". `conductor update` prints the OS-appropriate install-script one-liner; `conductor update --apply` spawns the installer detached (Windows: new console window; POSIX: `os.execvpe` replace) and exits the current process so file locks release. The startup hint is suppressed by `CONDUCTOR_NO_UPDATE_CHECK=1`, `--silent`, `--help`/`--version`, and the `update` subcommand itself.
 
 - **config/**: YAML loading and Pydantic schema validation
@@ -138,6 +138,8 @@ step-by-step checklist.
   - `output.py` - JSON output parsing and schema validation. `validate_output` is deliberately **strict with no coercion** — it also validates `set` and `script` step output, where silently reshaping an authored value would be surprising. Response normalization belongs in `providers/_output_shape.py` instead. Note `parse_json_output` raises `ValidationError` for JSON *syntax* errors, so callers cannot distinguish syntax from schema failures by exception type alone.
 
 - **duration.py**: `parse_duration(value)` shared helper. Accepts plain `int`/`float` seconds, or strings with `ms`/`s`/`m`/`h` suffix. Raises `ValueError` (nests cleanly inside Pydantic `ValidationError`). Rejects booleans. Bounds enforcement (e.g. > 0, 24h cap) lives in callers so the parser can be reused.
+
+- **console.py**: `make_console()` / `styled()` / `join()` — the markup-safety primitives (issue #406). A leaf module (like `duration.py`) with no conductor imports, deliberately **top-level rather than under `cli/`** because `gates/` and `providers/` need it and must not import from `cli/`. `make_console` locks `markup=False`, inverting Rich's default so an interpolated runtime value is literal unless it asks to be styled; it *rejects* a `markup=` kwarg rather than allowing an override — on the constructor and on `print`/`log`, since rich's per-call `markup=True` would otherwise reopen the defect from a single line. `styled("<template>", ...)` parses the template's markup — conductor's own literal — while inserting values verbatim. It works by replacing each field with a **length-matched filler run**, parsing once, then locating each run to substitute the value back: matching the width keeps the parsed template's spans valid, which is what makes nested styling around a placeholder (`[bold][red]{}[/red][/bold]`) come out right. Reading `spans[0].style` and re-applying it — the obvious alternative — collapses the nesting. A value that is already a `Text` is spliced in with its own spans re-anchored, so pre-styled fragments compose (`styled("{} {}", CHECK, name)`); without that, `format()` would flatten it and silently drop the colour from every doctor table cell. `join(sep, parts)` exists because `Text.join` requires every part to already be a `Text`, while the common shape here is a `content_lines` list mixing conductor-styled fragments with plain runtime values. `rich.markup.escape` is deliberately unused throughout: the parser treats `\[` as an escaped bracket, so `\[0-9\]+` renders as `[0-9\]+` whether escaped or not, whereas a `Text` is byte-exact. See the Console Output section under Code Style.
 
 - **providers/**: SDK provider abstraction
   - `base.py` - `AgentProvider` ABC defining `execute()`, `validate_connection()`, `close()`
@@ -221,7 +223,7 @@ log. See issue #116.
 ## Tests Structure
 
 Tests mirror source structure in `tests/`:
-- `test_cli/` - CLI command tests, e2e tests
+- `test_cli/` - CLI command tests, e2e tests. `test_markup_guards.py` is the one that keeps issue #406 closed: it reads `src/conductor` with `ast` and fails with file:line across eight rules — a bare `Console` or a `Console` subclass (A), an interpolated `Panel` title or `Prompt` (B), an f-string into `Text.from_markup` (C), a markup literal at a print/cell sink (D), a `Text` through the builtin `print` (E) or into an f-string (F), unescaped brackets in `typer` help text (G), and any use of `rich.markup.escape` (H). Each rule is a shared predicate called by both the source scan and its negative control, so a control cannot pass against a drifted rule — that had already happened once. Each rule has a negative control, because a source-scanning check that quietly matches nothing reports "all clear" forever. `test_markup_injection.py` covers the same ground behaviourally, driving the real commands — the two layers are not redundant: the guard alone cannot prove `styled` renders correctly, and the behavioural tests alone cannot stop the *next* call site, which is the actual failure mode here
 - `test_config/` - Schema validation, loader tests
 - `test_engine/` - Workflow, router, context, limits tests
 - `test_executor/` - Agent, template, output tests
@@ -257,6 +259,67 @@ When adding new fields to `LimitEnforcer`:
 - Type hints required, checked with ty (Red Knot)
 - Pydantic v2 for data validation
 - async/await for all provider operations
+
+### Console Output
+
+**Never put a runtime value into a string that Rich will parse as markup.**
+Rich reads `[...]` in a plain `str` as a style tag, so a workflow name, an
+agent name, a plugin name from a cloned repo, a path, or an `str(e)` that
+happens to contain a bracketed token is interpreted as styling. In rich a
+token is a tag when its **first character** is lowercase, `#`, `/` or `@`,
+which splits three ways: `[0]` renders literally, `[task1]` is **silently
+deleted**, and `[/etc/x]` raises `MarkupError` out of the print call. The
+quiet half is the dangerous one — a listing that drops half a name looks
+like it worked. Note `style=` does **not** disable parsing (issues #382,
+#387, #406).
+
+Each rule below is enforced by a matching rule in
+`tests/test_cli/test_markup_guards.py`, which reads the source and reports
+file:line:
+
+- **Build every console with `conductor.console.make_console()`** (rule A).
+  It locks `markup=False`, so a plain string is literal unless it asks to be
+  styled. This covers plain prints, `Panel` bodies, `Table` cells, headers,
+  titles and captions, and `Rule` titles. `markup` is not overridable —
+  passing it to the constructor, to `print` or to `log` raises `TypeError`,
+  because rich's per-call `markup=True` would otherwise reopen the whole
+  defect from one line. Subclass `MarkupFreeConsole` rather than rich's
+  `Console` so the refusal is inherited (see `cli/run.py::_SilentAwareConsole`).
+- **Style with `conductor.console.styled("<template>", value, ...)`.** The
+  template is conductor's own literal and is parsed; values are inserted
+  verbatim and never reach the parser. A value that is already a `Text` is
+  spliced in with its styling intact, so pre-styled fragments compose. Use
+  `Text.from_markup("...")` when there is nothing to interpolate, and
+  `conductor.console.join(sep, parts)` to join a list mixing `str` and
+  `Text` (`Text.join` requires every part to be a `Text` already).
+- **`Panel(title=)`, `Panel(subtitle=)` and `Prompt`/`Confirm`/`IntPrompt`
+  prompts must be handed a `Text`** (rule B). Rich calls `Text.from_markup`
+  on those unconditionally (`rich/panel.py`, `rich/prompt.py`), so
+  `markup=False` never reaches them. This is the trap that made #387
+  incomplete: it fixed the panel *body* and left the `title=` f-string one
+  line away.
+- **Never let a `Text` reach a plain-string context** — an f-string (rule F),
+  `str()`, or the builtin `print` (rule E). `str(Text)` is its *plain* form,
+  so styling is dropped and any text rich already parsed as a tag is gone
+  outright. This one has the worst record in the codebase: it shipped four
+  separate times during #406 alone, twice destroying data rather than
+  colour. Use `styled("{}{}", ...)` or `join(...)` instead.
+- **Do not use `rich.markup.escape`** (rule H). It is not
+  byte-exact — the parser treats `\[` as an escaped bracket, so an ordinary
+  regex like `\[0-9\]+` renders as `[0-9\]+` whether or not it was escaped
+  first. Building a `Text` avoids the parser entirely.
+- **Typer's `help=` / `epilog=` must escape their brackets** as `\[ ... ]`
+  (rule G). These are outside the *console* convention — Typer renders them
+  through its own rich console — but they are still markup-parsed. Escaping
+  is the remedy here rather than a `Text`, because Typer takes a `str`.
+  Forgetting cost `conductor run --help` the entire `[@registry][@version]`
+  syntax, which appears nowhere else in the help output.
+
+The worst outcome of forgetting is now a visible literal `[green]` in the
+output rather than a crash or a silent deletion, and rule D of the guard
+catches that statically. Each rule is a shared predicate called by both the
+source scan and its negative control, so a control cannot pass while the rule
+it guards has drifted.
 
 ### Provider Parity
 

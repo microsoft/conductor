@@ -6,9 +6,10 @@ from typing import Annotated
 
 import httpx
 import typer
-from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
+from conductor.console import make_console, styled
 from conductor.registry.cache import clear_cache, prune_temp_dirs
 from conductor.registry.config import (
     RegistryEntry,
@@ -32,8 +33,8 @@ registry_app = typer.Typer(
     no_args_is_help=True,
 )
 
-console = Console(stderr=True)
-output_console = Console()
+console = make_console(stderr=True)
+output_console = make_console()
 
 
 @registry_app.command("list")
@@ -50,7 +51,7 @@ def list_registries(
         else:
             _list_registry_workflows(name)
     except RegistryError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(styled("[bold red]Error:[/bold red] {}", e))
         raise typer.Exit(code=1) from None
 
 
@@ -60,7 +61,9 @@ def _list_all_registries() -> None:
 
     if not config.registries:
         output_console.print("No registries configured.")
-        output_console.print("Run [bold]conductor registry add <name> <source>[/bold] to add one.")
+        output_console.print(
+            Text.from_markup("Run [bold]conductor registry add <name> <source>[/bold] to add one.")
+        )
         return
 
     table = Table(title="Configured Registries")
@@ -98,7 +101,9 @@ def _list_registry_workflows(name: str) -> None:
     if tags_line is not None:
         output_console.print(f"\nLatest tags: {tags_line}")
 
-    output_console.print("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
+    output_console.print(
+        Text.from_markup("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
+    )
 
 
 def _format_latest_tags(entry: RegistryEntry) -> str | None:
@@ -154,7 +159,7 @@ def add(
         if default:
             output_console.print(f"Set '{name}' as the default registry.")
     except RegistryError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(styled("[bold red]Error:[/bold red] {}", e))
         raise typer.Exit(code=1) from None
 
 
@@ -167,7 +172,7 @@ def remove(
         remove_registry(name)
         output_console.print(f"Registry '{name}' removed.")
     except RegistryError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(styled("[bold red]Error:[/bold red] {}", e))
         raise typer.Exit(code=1) from None
 
 
@@ -187,7 +192,7 @@ def set_default(
         save_config(config)
         output_console.print(f"Default registry set to '{name}'.")
     except RegistryError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(styled("[bold red]Error:[/bold red] {}", e))
         raise typer.Exit(code=1) from None
 
 
@@ -242,7 +247,7 @@ def update(
                 load_index(entry)
                 output_console.print(f"Registry '{reg_name}' updated.")
     except RegistryError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(styled("[bold red]Error:[/bold red] {}", e))
         raise typer.Exit(code=1) from None
 
 
@@ -258,15 +263,15 @@ def show(
         entry = get_registry(name)
         _show_registry(name, entry)
     except RegistryError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(styled("[bold red]Error:[/bold red] {}", e))
         raise typer.Exit(code=1) from None
 
 
 def _show_registry(name: str, entry: RegistryEntry) -> None:
     """Show a registry's details and its workflows."""
-    output_console.print(f"[bold]Registry:[/bold]  {name}")
-    output_console.print(f"[bold]Type:[/bold]      {entry.type.value}")
-    output_console.print(f"[bold]Source:[/bold]    {entry.source}")
+    output_console.print(styled("[bold]Registry:[/bold]  {}", name))
+    output_console.print(styled("[bold]Type:[/bold]      {}", entry.type.value))
+    output_console.print(styled("[bold]Source:[/bold]    {}", entry.source))
     output_console.print()
 
     index = load_index(entry)
@@ -287,4 +292,6 @@ def _show_registry(name: str, entry: RegistryEntry) -> None:
     if tags_line is not None:
         output_console.print(f"\nLatest tags: {tags_line}")
 
-    output_console.print("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
+    output_console.print(
+        Text.from_markup("\n[dim]Use 'conductor show <workflow>' to see inputs and details.[/dim]")
+    )

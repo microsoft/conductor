@@ -466,7 +466,7 @@ class TestMaxIterationsHandlerInteractive:
             # Verify Panel was called with iteration info
             mock_panel.assert_called()
             panel_args = mock_panel.call_args
-            panel_content = panel_args[0][0]
+            panel_content = str(panel_args[0][0])
             assert "10/10" in panel_content or "10" in panel_content
 
     @pytest.mark.asyncio
@@ -489,7 +489,7 @@ class TestMaxIterationsHandlerInteractive:
             # Verify Panel was called with agent history
             mock_panel.assert_called()
             panel_args = mock_panel.call_args
-            panel_content = panel_args[0][0]
+            panel_content = str(panel_args[0][0])
             assert "agent" in panel_content.lower()
 
     @pytest.mark.asyncio
@@ -513,7 +513,7 @@ class TestMaxIterationsHandlerInteractive:
             # Verify Panel was called with loop warning
             mock_panel.assert_called()
             panel_args = mock_panel.call_args
-            panel_content = panel_args[0][0]
+            panel_content = str(panel_args[0][0])
             assert "loop" in panel_content.lower()
 
 

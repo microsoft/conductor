@@ -1339,15 +1339,16 @@ def _log_event_verbose(event_type: str, data: dict[str, Any], full_mode: bool) -
     braces — kept in case a caller invokes the helper directly without
     going through ``execute()``.
     """
-    from rich.console import Console
     from rich.text import Text
+
+    from conductor.console import make_console
 
     try:
         from conductor.cli.run import _file_console
     except ImportError:
         _file_console = None
 
-    console = Console(stderr=True, highlight=False)
+    console = make_console(stderr=True, highlight=False)
 
     def _print(renderable: Any) -> None:
         console.print(renderable)

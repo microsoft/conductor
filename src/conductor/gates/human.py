@@ -12,11 +12,12 @@ import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
+from rich.text import Text
 
+from conductor.console import MarkupFreeConsole, join, make_console, styled
 from conductor.exceptions import HumanGateError
 from conductor.executor.linkify import linkify_markdown
 from conductor.executor.template import TemplateRenderer
@@ -221,7 +222,7 @@ class HumanGateHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_gates: bool = False,
     ) -> None:
         """Initialize the HumanGateHandler.
@@ -233,7 +234,7 @@ class HumanGateHandler:
                 (auto-selecting would invent an answer) are still presented,
                 so such callers must short-circuit before reaching here.
         """
-        self.console = console or Console()
+        self.console = console or make_console()
         self.skip_gates = skip_gates
         self.renderer = TemplateRenderer()
 
@@ -368,7 +369,9 @@ class HumanGateHandler:
         """
         for choice in gate_prompt.choices:
             if choice.value == gate_prompt.auto_select:
-                self.console.print(f"\n[dim]Auto-selecting: {choice.label} (--skip-gates)[/dim]")
+                self.console.print(
+                    styled("\n[dim]Auto-selecting: {} (--skip-gates)[/dim]", choice.label)
+                )
                 return GateResponse(
                     value=choice.value,
                     label=choice.label,
@@ -402,16 +405,16 @@ class HumanGateHandler:
         self.console.print(
             Panel(
                 RichMarkdown(prompt_text),
-                title="[bold cyan]Decision Required[/bold cyan]",
+                title=Text.from_markup("[bold cyan]Decision Required[/bold cyan]"),
                 border_style="cyan",
             )
         )
 
         # Display options as numbered list
         self.console.print()
-        self.console.print("[bold]Options:[/bold]")
+        self.console.print(Text.from_markup("[bold]Options:[/bold]"))
         for i, choice in enumerate(choices, 1):
-            self.console.print(f"  [cyan][{i}][/cyan] {choice.label}")
+            self.console.print(styled("  [cyan][{}][/cyan] {}", i, choice.label))
 
         # Get user selection — run in thread to avoid blocking the event loop
         # (blocking here prevents the web dashboard from updating)
@@ -420,7 +423,7 @@ class HumanGateHandler:
 
             def _ask_choice() -> str:
                 return Prompt.ask(
-                    "\n[bold]Select option[/bold]",
+                    Text.from_markup("\n[bold]Select option[/bold]"),
                     choices=valid_choices,
                     show_choices=True,
                 )
@@ -430,11 +433,11 @@ class HumanGateHandler:
                 index = int(choice_input) - 1
                 if 0 <= index < len(choices):
                     selected = choices[index]
-                    self.console.print(f"\n[green]Selected:[/green] {selected.label}")
+                    self.console.print(styled("\n[green]Selected:[/green] {}", selected.label))
                     return selected
             except ValueError:
                 pass
-            self.console.print("[red]Invalid selection. Please try again.[/red]")
+            self.console.print(Text.from_markup("[red]Invalid selection. Please try again.[/red]"))
 
     async def _collect_additional_input(
         self, field_name: str, multiline: bool = False
@@ -453,7 +456,7 @@ class HumanGateHandler:
             Dictionary with the field name and collected value.
         """
         self.console.print()
-        self.console.print(f"[bold]Please provide {field_name}:[/bold]")
+        self.console.print(styled("[bold]Please provide {}:[/bold]", field_name))
 
         # Without a TTY, fall back: _read_multiline treats EOF as "submit" and
         # would return "" instantly on a DEVNULL stdin, letting the CLI arm win
@@ -463,7 +466,10 @@ class HumanGateHandler:
             return {field_name: value}
 
         def _ask_value() -> str:
-            return Prompt.ask(f"  {field_name}")
+            # ``field_name`` comes from the workflow YAML, and ``Prompt``
+            # parses its prompt with ``Text.from_markup`` regardless of the
+            # console's ``markup=False`` -- so this has to be a ``Text``.
+            return Prompt.ask(styled("  {}", field_name))
 
         value = await read_on_daemon_thread(_ask_value)
         return {field_name: value}
@@ -479,8 +485,11 @@ class HumanGateHandler:
             newlines are preserved.
         """
         self.console.print(
-            f"  [dim]Enter your answer. Finish with '{MULTILINE_SENTINEL}' on its own line"
-            f" (or {_eof_key_hint()}).[/dim]"
+            styled(
+                "  [dim]Enter your answer. Finish with '{}' on its own line (or {}).[/dim]",
+                MULTILINE_SENTINEL,
+                _eof_key_hint(),
+            )
         )
         lines: list[str] = []
         while True:
@@ -527,7 +536,7 @@ class MaxIterationsHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_gates: bool = False,
     ) -> None:
         """Initialize the MaxIterationsHandler.
@@ -536,7 +545,7 @@ class MaxIterationsHandler:
             console: Rich console for output. Creates one if not provided.
             skip_gates: If True, auto-stops without prompting (for automation).
         """
-        self.console = console or Console()
+        self.console = console or make_console()
         self.skip_gates = skip_gates
 
     async def handle_limit_reached(
@@ -561,7 +570,11 @@ class MaxIterationsHandler:
         """
         # In skip_gates mode, auto-stop without prompting
         if self.skip_gates:
-            self.console.print("\n[dim]Max iterations reached. Auto-stopping (--skip-gates)[/dim]")
+            self.console.print(
+                Text.from_markup(
+                    "\n[dim]Max iterations reached. Auto-stopping (--skip-gates)[/dim]"
+                )
+            )
             return MaxIterationsPromptResult(
                 continue_execution=False,
                 additional_iterations=0,
@@ -575,14 +588,14 @@ class MaxIterationsHandler:
 
         if additional > 0:
             self.console.print(
-                f"\n[green]Continuing with {additional} additional iteration(s)[/green]"
+                styled("\n[green]Continuing with {} additional iteration(s)[/green]", additional)
             )
             return MaxIterationsPromptResult(
                 continue_execution=True,
                 additional_iterations=additional,
             )
         else:
-            self.console.print("\n[yellow]Stopping workflow execution[/yellow]")
+            self.console.print(Text.from_markup("\n[yellow]Stopping workflow execution[/yellow]"))
             return MaxIterationsPromptResult(
                 continue_execution=False,
                 additional_iterations=0,
@@ -623,14 +636,16 @@ class MaxIterationsHandler:
         if len(agent_history) >= 3:
             last_agents = agent_history[-3:]
             if len(set(last_agents)) <= 2:
-                content_lines.append("[yellow]This may indicate a loop between agents.[/yellow]")
+                content_lines.append(
+                    Text.from_markup("[yellow]This may indicate a loop between agents.[/yellow]")
+                )
 
         # Create and display the panel
         self.console.print()
         self.console.print(
             Panel(
-                "\n".join(content_lines),
-                title="[bold yellow]Max Iterations Reached[/bold yellow]",
+                join("\n", content_lines),
+                title=Text.from_markup("[bold yellow]Max Iterations Reached[/bold yellow]"),
                 border_style="yellow",
             )
         )
@@ -646,7 +661,9 @@ class MaxIterationsHandler:
 
             def _ask_int() -> int:
                 return IntPrompt.ask(
-                    "[bold]How many more iterations would you like to allow?[/bold]",
+                    Text.from_markup(
+                        "[bold]How many more iterations would you like to allow?[/bold]"
+                    ),
                     default=0,
                 )
 

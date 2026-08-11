@@ -10,15 +10,18 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
-from conductor.cli.app import app
+from conductor.cli.app import Identity, app
+from conductor.cli.pid import Liveness
 
 runner = CliRunner()
 
@@ -32,16 +35,47 @@ def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return runs_dir
 
 
-def _write_pid(pid_dir: Path, pid: int, port: int, workflow: str = "/tmp/wf.yaml") -> Path:
+def _write_pid(
+    pid_dir: Path,
+    pid: int,
+    port: int,
+    workflow: str = "/tmp/wf.yaml",
+    run_id: str = "a1b2c3d4",
+) -> Path:
     """Helper to write a PID file directly."""
     name = Path(workflow).stem
     filepath = pid_dir / f"{name}-{port}.pid"
     filepath.write_text(
         json.dumps(
-            {"pid": pid, "port": port, "workflow": workflow, "started_at": "2026-03-03T00:00:00"}
+            {
+                "pid": pid,
+                "port": port,
+                "workflow": workflow,
+                "started_at": "2026-03-03T00:00:00",
+                "run_id": run_id,
+            }
         )
     )
     return filepath
+
+
+@contextlib.contextmanager
+def _stops_cleanly() -> Iterator[None]:
+    """Patch the ladder so the target is confirmed dead on the first rung.
+
+    These tests cover *routing* — which PID files get targeted by ``--port`` /
+    ``--all`` / auto-detect — not the escalation ladder itself, which has its
+    own module (``test_stop_ladder.py``). Patching the outcome also keeps them
+    free of the ladder's real bounded waits.
+    """
+    with (
+        patch("conductor.cli.pid._is_process_alive", return_value=True),
+        patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+        patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
+        patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+        patch("conductor.cli.app._request_graceful_kill", return_value=True),
+    ):
+        yield
 
 
 class TestStopNoRunning:
@@ -60,10 +94,7 @@ class TestStopByPort:
         pid = os.getpid()
         _write_pid(pid_tmpdir, pid, 8080)
 
-        with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
-            patch("conductor.cli.app.os.kill"),
-        ):
+        with _stops_cleanly():
             result = runner.invoke(app, ["stop", "--port", "8080"])
 
         assert result.exit_code == 0
@@ -89,16 +120,21 @@ class TestStopAll:
         _write_pid(pid_tmpdir, pid, 8080, "/tmp/wf1.yaml")
         _write_pid(pid_tmpdir, pid, 9090, "/tmp/wf2.yaml")
 
-        with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
-            patch("conductor.cli.app.os.kill") as mock_kill,
-        ):
+        with _stops_cleanly(), patch("conductor.cli.app._stop_process") as stop_one:
+            stop_one.return_value = {
+                "pid": pid,
+                "port": 0,
+                "workflow": "wf",
+                "run_id": "",
+                "outcome": "stopped",
+                "rung": "api-kill",
+            }
             result = runner.invoke(app, ["stop", "--all"])
 
         assert result.exit_code == 0
-        assert "Stopped" in result.output
-        # Both should be stopped
-        assert mock_kill.call_count == 2
+        # Both registered workflows must be targeted.
+        assert stop_one.call_count == 2
+        assert sorted(c.args[0]["port"] for c in stop_one.call_args_list) == [8080, 9090]
 
 
 class TestStopAutoDetect:
@@ -108,10 +144,7 @@ class TestStopAutoDetect:
         pid = os.getpid()
         _write_pid(pid_tmpdir, pid, 8080)
 
-        with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
-            patch("conductor.cli.app.os.kill"),
-        ):
+        with _stops_cleanly():
             result = runner.invoke(app, ["stop"])
 
         assert result.exit_code == 0
@@ -125,7 +158,9 @@ class TestStopAutoDetect:
         with patch("conductor.cli.pid._is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop"])
 
-        assert result.exit_code == 0
+        # Ambiguous target: nothing was stopped, so this must not report
+        # success to a script that only checks the exit code.
+        assert result.exit_code == 1
         assert "Multiple background workflows" in result.output
         assert "8080" in result.output
         assert "9090" in result.output
@@ -152,17 +187,26 @@ class TestStopProcessUnexpectedOSError:
 
     The original bug crashed ``conductor stop`` when ``_is_process_alive``
     propagated an unexpected ``OSError`` (e.g. ``WinError 11``). That probe
-    is now defensive — but ``_stop_process`` itself also calls ``os.kill``
-    one frame deeper and must tolerate the same class of failure, especially
-    because the "assume alive" fallback in ``_is_process_alive_windows`` lets
+    is now defensive — but the stop ladder also calls ``os.kill`` one frame
+    deeper and must tolerate the same class of failure, especially because
+    the "unknown — assume alive" fallback in the Windows probe lets
     probe-failing PIDs reach this code path.
     """
 
     def test_unexpected_oserror_does_not_crash(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, 99999999, 8080)
+        _write_pid(pid_tmpdir, 4242, 8080)
 
         with (
             patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+            patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+            patch("conductor.cli.app._request_graceful_kill", return_value=False),
+            # Pin the platform so the signal rung is deterministic; otherwise
+            # this exercises CTRL_BREAK_EVENT on Windows and SIGTERM on Linux,
+            # and only one of them is what CI actually runs.
+            patch("sys.platform", "linux"),
             patch(
                 "conductor.cli.app.os.kill",
                 side_effect=OSError(
@@ -172,19 +216,29 @@ class TestStopProcessUnexpectedOSError:
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
 
+        # The signal rung swallowed the OSError and the ladder escalated
+        # rather than crashing.
+        assert result.exception is None or isinstance(result.exception, SystemExit)
         assert result.exit_code == 0
-        assert "Could not signal" in result.output
+        assert "Stopped" in result.output
 
-    def test_pid_file_is_removed_after_oserror(self, pid_tmpdir: Path) -> None:
-        # Even when os.kill raises an unexpected OSError, the PID file should
-        # be cleaned up so the user's ``conductor stop`` listings don't
-        # accumulate phantom entries.
+    def test_pid_file_is_removed_when_process_confirmed_gone(self, pid_tmpdir: Path) -> None:
+        # A PID file for a process that no longer exists must be cleaned up so
+        # ``conductor stop`` listings don't accumulate phantom entries.
+        #
+        # ``process_liveness`` is patched explicitly rather than relying on a
+        # bogus PID: ``patch("conductor.cli.app.os.kill")`` mutates the shared
+        # ``os`` module object, so on POSIX it would also break ``pid.py``'s
+        # own probe (turning DEAD into UNKNOWN) and this test would fail on
+        # Linux CI while passing on Windows.
         _write_pid(pid_tmpdir, 99999999, 8080)
 
         with (
             patch("conductor.cli.pid._is_process_alive", return_value=True),
-            patch("conductor.cli.app.os.kill", side_effect=OSError(11, "boom")),
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.DEAD),
         ):
-            runner.invoke(app, ["stop", "--port", "8080"])
+            result = runner.invoke(app, ["stop", "--port", "8080"])
 
+        assert result.exit_code == 0
+        assert "already exited" in result.output
         assert list(pid_tmpdir.glob("*.pid")) == []
