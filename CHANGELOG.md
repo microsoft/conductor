@@ -163,12 +163,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that never raises and returns `None` for everything — looked identical to
   "these models are simply unpriced", so live pricing could be dead for a whole
   run with no symptom beyond newer models showing up as unpriced. The verdict is
-  drawn once at end of run, when "it priced nothing" is finally answerable, and
-  is emitted as a `pricing_hook_silent` event as well as a log line, so it
-  reaches the event log and dashboard rather than only unattributed stderr. The
-  run summary gains `usage.live_pricing_degraded`, because a model priced from
-  the static table still reports a confident cost and would otherwise carry no
-  caveat. Providers that do not implement the hook are excluded: returning
+  drawn once when the run ends — however it ends, so a run that dies part way
+  still reports it, which is when a partial cost total most needs the caveat —
+  and is emitted as a `pricing_hook_silent` event as well as a log line, so it
+  reaches the event log and the console rather than only unattributed stderr.
+  The run summary gains `usage.live_pricing_degraded` and the cost breakdown
+  prints a matching caveat, because a model priced from the static table still
+  reports a confident cost and would otherwise carry no qualification.
+  Providers that do not implement the hook are excluded: returning
   `None` is the documented default, so counting them accused four of the five
   providers of a broken SDK for behaving correctly.
 - **`conductor resume --web` no longer shows a running workflow as stopped** —

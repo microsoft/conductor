@@ -34,7 +34,18 @@ import logging
 
 import pytest
 
+from conductor.config.schema import (
+    AgentDef,
+    LimitsConfig,
+    OutputField,
+    RouteDef,
+    WorkflowConfig,
+    WorkflowDef,
+)
 from conductor.engine.pricing import ModelPricing
+from conductor.engine.workflow import WorkflowEngine
+from conductor.providers.base import AgentProvider as AgentProviderBase
+from conductor.providers.copilot import CopilotProvider
 
 
 class _Recorder:
@@ -183,3 +194,245 @@ class TestBaseHookProvidersAreNotAccused:
 
         assert _Inherits.get_model_pricing is AgentProvider.get_model_pricing
         assert _Overrides.get_model_pricing is not AgentProvider.get_model_pricing
+
+
+def _one_agent_workflow() -> WorkflowConfig:
+    """Smallest config that resolves exactly one model and finishes."""
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="pricing-silence",
+            entry_point="agent1",
+            limits=LimitsConfig(max_iterations=5),
+        ),
+        agents=[
+            AgentDef(
+                name="agent1",
+                model="gpt-4",
+                prompt="hi",
+                output={"answer": OutputField(type="string")},
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"answer": "{{ agent1.output.answer }}"},
+    )
+
+
+def _two_agent_workflow() -> WorkflowConfig:
+    """Two agents in sequence, so the second can fail after the first priced."""
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="pricing-silence-2",
+            entry_point="agent1",
+            limits=LimitsConfig(max_iterations=5),
+        ),
+        agents=[
+            AgentDef(
+                name="agent1",
+                model="gpt-4",
+                prompt="hi",
+                output={"answer": OutputField(type="string")},
+                routes=[RouteDef(to="agent2")],
+            ),
+            AgentDef(
+                name="agent2",
+                model="gpt-4",
+                prompt="hi",
+                output={"answer": OutputField(type="string")},
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"answer": "{{ agent2.output.answer }}"},
+    )
+
+
+def _silent_pricing_provider(**kwargs: object) -> CopilotProvider:
+    """A provider that overrides the hook and prices nothing.
+
+    Overriding matters: the engine deliberately ignores providers using the
+    base implementation, so a stand-in that inherits it would never be tracked.
+    """
+    return _SilentPricing(**kwargs)  # type: ignore[arg-type]
+
+
+class _SilentPricing(CopilotProvider):
+    """Overrides the hook and returns ``None`` for every model."""
+
+    CAPABILITIES = CopilotProvider.CAPABILITIES
+
+    async def get_model_pricing(self, model: str) -> ModelPricing | None:
+        return None
+
+
+class _WorkingPricing(CopilotProvider):
+    """Overrides the hook and prices every model."""
+
+    CAPABILITIES = CopilotProvider.CAPABILITIES
+
+    async def get_model_pricing(self, model: str) -> ModelPricing | None:
+        return _priced()
+
+
+class _InheritsBaseHook(CopilotProvider):
+    """Uses the base implementation, which returns ``None`` by design."""
+
+    CAPABILITIES = CopilotProvider.CAPABILITIES
+    get_model_pricing = AgentProviderBase.get_model_pricing  # type: ignore[assignment]
+
+
+class TestTheVerdictIsReachedByRealRuns:
+    """The helpers above are exercised in isolation by a stand-in.
+
+    That leaves the wiring untested: whether a real run asks the hook, whether
+    the provider gate lets a real provider through, and whether anything calls
+    the verdict at all. Reverting any one of those left the isolated tests
+    green, so they are covered here through ``WorkflowEngine.run``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_completed_run_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        provider = _silent_pricing_provider(mock_handler=lambda a, p, c: {"answer": "ok"})
+        engine = WorkflowEngine(_one_agent_workflow(), provider)
+
+        with caplog.at_level(logging.WARNING, logger="conductor.engine.workflow"):
+            await engine.run({})
+
+        assert len(caplog.records) == 1
+        assert "no pricing for any" in caplog.records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_dies_half_way_still_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The case a summary-time verdict can never reach.
+
+        ``cli/run.py`` calls ``get_execution_summary()`` after its
+        ``except BaseException: raise`` block, so a run that dies part way
+        never reaches it. That is also the run where "these numbers came from
+        the static table" matters most, because someone is looking at a
+        partial cost total trying to work out what it cost before it broke.
+
+        The first agent has to succeed: a run that dies before anything asked
+        the hook has nothing to conclude, and staying quiet there is correct.
+        """
+
+        def _explode_on_second(agent: object, prompt: object, ctx: object) -> dict[str, str]:
+            if getattr(agent, "name", None) == "agent2":
+                raise RuntimeError("boom")
+            return {"answer": "ok"}
+
+        provider = _silent_pricing_provider(mock_handler=_explode_on_second)
+        engine = WorkflowEngine(_two_agent_workflow(), provider)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="conductor.engine.workflow"),
+            pytest.raises(BaseException),  # noqa: B017,PT011 - any failure will do
+        ):
+            await engine.run({})
+
+        assert [r for r in caplog.records if "no pricing for any" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_working_hook_stays_quiet(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Negative control: the run itself does not manufacture the warning."""
+        engine = WorkflowEngine(
+            _one_agent_workflow(),
+            _WorkingPricing(mock_handler=lambda a, p, c: {"answer": "ok"}),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="conductor.engine.workflow"):
+            await engine.run({})
+
+        assert [r for r in caplog.records if "no pricing for any" in r.getMessage()] == []
+
+    @pytest.mark.asyncio
+    async def test_a_base_hook_provider_is_not_accused(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The provider gate, through a real run rather than attribute identity.
+
+        Asserting ``is`` on two throwaway subclasses only tests Python's
+        attribute lookup, which holds whether or not the gate exists. This
+        provider reaches the engine and returns ``None`` from the *base*
+        implementation, which is the condition the gate must not report.
+        """
+        engine = WorkflowEngine(
+            _one_agent_workflow(),
+            _InheritsBaseHook(mock_handler=lambda a, p, c: {"answer": "ok"}),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="conductor.engine.workflow"):
+            await engine.run({})
+
+        assert [r for r in caplog.records if "no pricing for any" in r.getMessage()] == []
+
+
+class TestTheVerdictReachesTheUser:
+    """A warning nothing renders is a warning nobody reads."""
+
+    @pytest.mark.asyncio
+    async def test_the_summary_reports_degraded_pricing(self) -> None:
+        provider = _silent_pricing_provider(mock_handler=lambda a, p, c: {"answer": "ok"})
+        engine = WorkflowEngine(_one_agent_workflow(), provider)
+        await engine.run({})
+
+        summary = engine.get_execution_summary()
+        assert summary["usage"]["live_pricing_degraded"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_working_hook_leaves_the_flag_clear(self) -> None:
+        engine = WorkflowEngine(
+            _one_agent_workflow(),
+            _WorkingPricing(mock_handler=lambda a, p, c: {"answer": "ok"}),
+        )
+        await engine.run({})
+
+        assert engine.get_execution_summary()["usage"]["live_pricing_degraded"] is False
+
+    def test_the_displayed_summary_carries_the_caveat(self) -> None:
+        """Without this the total prints as confidently as a live-priced one."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import display_usage_summary
+
+        buf = StringIO()
+        display_usage_summary(
+            {
+                "total_input_tokens": 10,
+                "total_output_tokens": 5,
+                "total_tokens": 15,
+                "total_cost_usd": 0.25,
+                "live_pricing_degraded": True,
+                "unpriced_agent_count": 0,
+                "unpriced_models": [],
+                "agents": [],
+            },
+            console=Console(file=buf, width=200, force_terminal=False),
+        )
+
+        assert "Live pricing unavailable" in buf.getvalue()
+
+    def test_no_caveat_when_pricing_was_live(self) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import display_usage_summary
+
+        buf = StringIO()
+        display_usage_summary(
+            {
+                "total_input_tokens": 10,
+                "total_output_tokens": 5,
+                "total_tokens": 15,
+                "total_cost_usd": 0.25,
+                "live_pricing_degraded": False,
+                "unpriced_agent_count": 0,
+                "unpriced_models": [],
+                "agents": [],
+            },
+            console=Console(file=buf, width=200, force_terminal=False),
+        )
+
+        assert "Live pricing unavailable" not in buf.getvalue()

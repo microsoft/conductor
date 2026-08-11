@@ -2307,7 +2307,15 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
-        result = await self._execute_loop(current_agent_name)
+        try:
+            result = await self._execute_loop(current_agent_name)
+        finally:
+            # The pricing verdict belongs to the run ending, not to anyone
+            # asking for a summary. Drawing it here covers the run that dies
+            # part way -- the case where "these numbers came from the static
+            # table" matters most, and the one a summary-time call can never
+            # reach, because the CLI re-raises before it asks.
+            self._warn_if_pricing_hook_silent()
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -2344,7 +2352,12 @@ class WorkflowEngine:
         # Execute on_start hook (signals resume)
         self._execute_hook("on_start")
 
-        result = await self._execute_loop(current_agent_name)
+        try:
+            result = await self._execute_loop(current_agent_name)
+        finally:
+            # Same reasoning as :meth:`run` -- a resumed run that dies part way
+            # is still a run that priced nothing.
+            self._warn_if_pricing_hook_silent()
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -6894,10 +6907,10 @@ class WorkflowEngine:
             summary["parallel_agents_count"] = parallel_agents_count
 
         # Add usage/cost information
-        # Draw the pricing-hook verdict here rather than mid-run: this is the
-        # point at which the run has finished asking the hook, so "it priced
-        # nothing" is finally answerable. It also puts the caveat next to the
-        # cost total it qualifies.
+        # Normally already drawn by :meth:`run` / :meth:`resume` when the run
+        # ended; the call is idempotent. It stays here for callers that drive
+        # the engine without those entry points, so the flag below is never
+        # reported as ``False`` merely because nothing concluded the run.
         self._warn_if_pricing_hook_silent()
         usage = self.usage_tracker.get_summary()
         summary["usage"] = {
