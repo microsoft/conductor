@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
 from anthropic import AsyncAnthropic
 from anthropic.types.beta.beta_thinking_config_enabled_param import (
     BetaThinkingConfigEnabledParam,
 )
+from openai import AsyncOpenAI
 from pydantic_ai import Agent, AgentRetries
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.output import ToolOutput
 from pydantic_ai.providers.anthropic import AnthropicProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from conductor.exceptions import ValidationError
 from conductor.providers._pydantic_ai.converters import (
@@ -34,6 +37,7 @@ from conductor.providers.reasoning import (
 )
 
 if TYPE_CHECKING:
+    import httpx
     from pydantic_ai import AgentToolset
 
     from conductor.config.schema import AgentDef
@@ -45,6 +49,9 @@ logger = logging.getLogger(__name__)
 # model deprecation risk. The "-latest" suffix lets Anthropic aliases keep the
 # identifier current without YAML changes.
 DEFAULT_ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
+
+# Default OpenAI model used when the agent and runtime fail to declare one.
+DEFAULT_OPENAI_MODEL: str = "gpt-5-mini"
 
 # Default cap for total output tokens when Anthropic extended thinking is
 # enabled. This matches CLAUDE_EXTENDED_THINKING_OUTPUT_CAP in reasoning.py
@@ -63,6 +70,66 @@ _ANTHROPIC_THINKING_HEADROOM: int = 4_096
 # This value matches the legacy ``RetryConfig.max_parse_recovery_attempts=2``
 # default used by ClaudeProvider.
 _OUTPUT_RECOVERY_RETRIES: int = 2
+
+
+def _resolve_openai_model(
+    agent: AgentDef,
+    default_model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    timeout: float | None = None,
+) -> OpenAIChatModel:
+    """Build a Pydantic AI ``OpenAIChatModel`` from the agent definition.
+
+    Resolves the model identifier, API key, optional base URL, custom HTTP
+    client, and timeout. Unlike the Anthropic branch, an explicit custom
+    ``base_url`` without an explicit ``api_key`` is rejected because Conductor
+    does not want to rely on ambient ``OPENAI_API_KEY`` for authenticated custom
+    endpoints — custom routing must be explicitly provided in full.
+
+    Args:
+        agent: The Conductor agent definition.
+        default_model: Fallback model identifier when ``agent.model`` is unset.
+        api_key: OpenAI API key. When passed explicitly it is used directly.
+            Otherwise ``OPENAI_API_KEY`` is read from the environment.
+        base_url: Optional custom API endpoint.
+        http_client: Optional ``httpx.AsyncClient`` to share across requests.
+        timeout: Request timeout in seconds. ``None`` lets the OpenAI SDK apply
+            its own default.
+
+    Returns:
+        A configured Pydantic AI ``OpenAIChatModel`` instance.
+
+    Raises:
+        ValidationError: If no API key is available, or if a custom base_url is
+            provided without an explicit api_key.
+    """
+    effective_api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
+
+    if base_url is not None and api_key is None:
+        raise ValidationError(
+            "Custom base_url requires an explicit api_key for the openai backend.",
+            suggestion="Pass api_key in the provider config or set OPENAI_API_KEY.",
+        )
+
+    if not effective_api_key:
+        raise ValidationError(
+            "OPENAI_API_KEY environment variable is not set and no api_key was provided",
+            suggestion="Set OPENAI_API_KEY or pass api_key to the provider.",
+        )
+
+    model_name = (agent.model or default_model) or DEFAULT_OPENAI_MODEL
+
+    openai_client = AsyncOpenAI(
+        api_key=effective_api_key,
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=0,
+        http_client=http_client,
+    )
+    provider = OpenAIProvider(openai_client=openai_client)
+    return OpenAIChatModel(model_name=model_name, provider=provider)
 
 
 def _resolve_anthropic_model(
@@ -268,7 +335,39 @@ def _coerce_for_thinking(
     return 1.0, effective_max_tokens
 
 
-def _build_model_settings(
+def _build_openai_model_settings(
+    agent: AgentDef,
+    default_temperature: float | None,
+    default_max_tokens: int | None,
+    default_reasoning_effort: ReasoningEffort | None,
+    timeout: float | None = None,
+) -> OpenAIChatModelSettings:
+    """Build ``OpenAIChatModelSettings`` from the agent and runtime defaults.
+
+    OpenAI reasoning effort is forwarded directly as the
+    ``openai_reasoning_effort`` field; unlike Anthropic extended thinking it
+    does not require coercion of temperature or max_tokens.
+    """
+    effort = resolve_reasoning_effort(agent, default_reasoning_effort)
+
+    agent_temperature = getattr(agent, "temperature", None)
+    temperature = agent_temperature if agent_temperature is not None else default_temperature
+    agent_max_tokens = getattr(agent, "max_tokens", None)
+    max_tokens = agent_max_tokens if agent_max_tokens is not None else default_max_tokens
+
+    settings: OpenAIChatModelSettings = OpenAIChatModelSettings()
+    if temperature is not None:
+        settings["temperature"] = temperature
+    if max_tokens is not None:
+        settings["max_tokens"] = max_tokens
+    if timeout is not None:
+        settings["timeout"] = timeout
+    if effort is not None:
+        settings["openai_reasoning_effort"] = effort
+    return settings
+
+
+def _build_anthropic_model_settings(
     agent: AgentDef,
     default_temperature: float | None,
     default_max_tokens: int | None,
@@ -344,6 +443,8 @@ def build_agent(
     timeout: float | None = None,
     toolsets: list[AgentToolset[Any]] | None = None,
     tools: list[Any] | None = None,
+    backend: Literal["anthropic", "openai"] = "anthropic",
+    http_client: httpx.AsyncClient | None = None,
 ) -> Agent[Any, Any]:
     """Build a Pydantic AI Agent from a Conductor agent definition.
 
@@ -357,34 +458,54 @@ def build_agent(
         default_reasoning_effort: Workflow-level default reasoning effort.
         max_parse_recovery_attempts: Output correction retries handled inside
             the Pydantic AI agent.
-        api_key: Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
-        auth_token: Optional bearer-auth token for gateway / LiteLLM endpoints.
+        api_key: API key. Falls back to the backend-specific env var.
+        auth_token: Anthropic bearer-auth token for gateway / LiteLLM endpoints
+            (anthropic backend only).
         base_url: Optional custom API endpoint.
-        timeout: Request timeout in seconds. ``None`` lets the Anthropic SDK use
-            its own default.
+        timeout: Request timeout in seconds. ``None`` lets the SDK use its own
+            default.
         toolsets: Optional Pydantic AI toolsets to register (e.g. the MCP tool
             bridge).
         tools: Optional plain Pydantic AI tools to register.
+        backend: Which LLM backend to build the agent for.
+        http_client: Optional ``httpx.AsyncClient`` shared across model requests
+            (openai backend only).
 
     Returns:
         A configured Pydantic AI ``Agent`` ready to run.
     """
-    model = _resolve_anthropic_model(
-        agent, default_model, api_key, base_url, auth_token=auth_token, timeout=timeout
-    )
+    if backend == "openai":
+        model = _resolve_openai_model(
+            agent,
+            default_model,
+            api_key,
+            base_url,
+            http_client=http_client,
+            timeout=timeout,
+        )
+        model_settings = _build_openai_model_settings(
+            agent,
+            default_temperature,
+            default_max_tokens,
+            default_reasoning_effort,
+            timeout=timeout,
+        )
+    else:
+        model = _resolve_anthropic_model(
+            agent, default_model, api_key, base_url, auth_token=auth_token, timeout=timeout
+        )
+        model_settings = _build_anthropic_model_settings(
+            agent,
+            default_temperature,
+            default_max_tokens,
+            default_reasoning_effort,
+            default_model=default_model,
+            timeout=timeout,
+        )
 
     output_type = _build_output_type(agent)
     if output_type is None:
         output_type = str
-
-    model_settings = _build_model_settings(
-        agent,
-        default_temperature,
-        default_max_tokens,
-        default_reasoning_effort,
-        default_model=default_model,
-        timeout=timeout,
-    )
 
     pydantic_agent: Agent[Any, Any] = Agent(
         model=model,

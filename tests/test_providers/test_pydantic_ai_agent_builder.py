@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent
@@ -17,26 +18,23 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.output import ToolOutput
 
 from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
 from conductor.exceptions import ValidationError
 from conductor.providers._pydantic_ai.agent_builder import (
     DEFAULT_ANTHROPIC_MODEL,
+    DEFAULT_OPENAI_MODEL,
     build_agent,
 )
 
 
 @pytest.fixture(autouse=True)
 def _ensure_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Provide a dummy API key so AnthropicModel construction succeeds."""
+    """Provide dummy API keys so model construction succeeds for both backends."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-
-
-def _extract_model_name(agent: Agent[Any, Any]) -> str:
-    """Return the underlying Anthropic model name from a built agent."""
-    assert isinstance(agent.model, AnthropicModel)
-    return agent.model.model_name
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
 
 def _extract_output_model(agent: Agent[Any, Any]) -> type[BaseModel] | None:
@@ -66,6 +64,12 @@ def _assert_no_keys(node: Any, *keys: str) -> None:
     elif isinstance(node, list):
         for item in node:
             _assert_no_keys(item, *keys)
+
+
+def _extract_model_name(agent: Agent[Any, Any]) -> str:
+    """Return the underlying model name from a built agent."""
+    assert isinstance(agent.model, AnthropicModel | OpenAIChatModel)
+    return agent.model.model_name
 
 
 class TestModelMapping:
@@ -99,6 +103,161 @@ class TestModelMapping:
         pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="")
 
         assert _extract_model_name(pydantic_agent) == DEFAULT_ANTHROPIC_MODEL
+
+
+class TestOpenAIModelMapping:
+    """Tests for resolving the OpenAI model identifier."""
+
+    def test_openai_agent_model_is_used_when_present(self) -> None:
+        """agent.model must be forwarded to OpenAIChatModel.model_name."""
+        agent_def = AgentDef(name="mapper", model="gpt-5")
+
+        pydantic_agent = build_agent(
+            agent_def, system_prompt="", rendered_prompt="", backend="openai"
+        )
+
+        assert _extract_model_name(pydantic_agent) == "gpt-5"
+        assert isinstance(pydantic_agent.model, OpenAIChatModel)
+
+    def test_openai_default_model_falls_back_when_agent_model_missing(self) -> None:
+        """The default_model parameter must be used when agent.model is None."""
+        agent_def = AgentDef(name="mapper")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            backend="openai",
+            default_model="gpt-5",
+        )
+
+        assert _extract_model_name(pydantic_agent) == "gpt-5"
+
+    def test_openai_default_constant_used_when_no_model_anywhere(self) -> None:
+        """The module-level default must be used when no model is supplied."""
+        agent_def = AgentDef(name="mapper")
+
+        pydantic_agent = build_agent(
+            agent_def, system_prompt="", rendered_prompt="", backend="openai"
+        )
+
+        assert _extract_model_name(pydantic_agent) == DEFAULT_OPENAI_MODEL
+        assert isinstance(pydantic_agent.model, OpenAIChatModel)
+
+
+class TestOpenAIBackend:
+    """Tests specific to the openai backend branch."""
+
+    def test_openai_output_schema_becomes_tool_output(self) -> None:
+        """OpenAI backend must wrap a non-empty output schema in ToolOutput."""
+        agent_def = AgentDef(
+            name="formatter",
+            output={"answer": OutputField(type="string")},
+        )
+
+        pydantic_agent = build_agent(
+            agent_def, system_prompt="", rendered_prompt="", backend="openai"
+        )
+
+        assert isinstance(pydantic_agent.model, OpenAIChatModel)
+        assert isinstance(pydantic_agent.output_type, ToolOutput)
+
+    def test_openai_sampling_settings(self) -> None:
+        """OpenAI model settings must carry temperature, max_tokens and timeout."""
+        agent_def = AgentDef(name="sampler")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            backend="openai",
+            default_temperature=0.7,
+            default_max_tokens=4096,
+            timeout=120.0,
+        )
+
+        assert isinstance(pydantic_agent.model, OpenAIChatModel)
+        assert pydantic_agent.model_settings.get("temperature") == 0.7
+        assert pydantic_agent.model_settings.get("max_tokens") == 4096
+        assert pydantic_agent.model_settings.get("timeout") == 120.0
+
+    @pytest.mark.parametrize(
+        ("effort",),
+        [("low",), ("medium",), ("high",), ("xhigh",), ("max",)],
+    )
+    def test_openai_reasoning_effort_maps_to_openai_reasoning_effort(self, effort: str) -> None:
+        """Each reasoning effort level must be forwarded as openai_reasoning_effort."""
+        agent_def = AgentDef(
+            name="reasoner",
+            model="gpt-5",
+            reasoning=ReasoningConfig(effort=effort),  # type: ignore[arg-type]
+        )
+
+        pydantic_agent = build_agent(
+            agent_def, system_prompt="", rendered_prompt="", backend="openai"
+        )
+
+        assert pydantic_agent.model_settings.get("openai_reasoning_effort") == effort
+
+    def test_openai_custom_base_url_without_key_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Custom base_url without an explicit api_key must raise ValidationError."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        agent_def = AgentDef(name="custom_endpoint")
+
+        with pytest.raises(ValidationError):
+            build_agent(
+                agent_def,
+                system_prompt="",
+                rendered_prompt="",
+                backend="openai",
+                base_url="http://localhost:11434/v1",
+            )
+
+    def test_openai_explicit_api_key_allows_custom_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Custom base_url is allowed when api_key is passed explicitly."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        agent_def = AgentDef(name="custom_endpoint")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            backend="openai",
+            api_key="explicit-key",
+            base_url="http://localhost:11434/v1",
+        )
+
+        assert isinstance(pydantic_agent.model, OpenAIChatModel)
+        assert str(pydantic_agent.model.client.base_url).rstrip("/") == "http://localhost:11434/v1"
+
+    def test_openai_missing_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Building an openai agent without OPENAI_API_KEY or api_key must raise."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        agent_def = AgentDef(name="unauthenticated")
+
+        with pytest.raises(ValidationError):
+            build_agent(agent_def, system_prompt="", rendered_prompt="", backend="openai")
+
+    def test_openai_http_client_is_forwarded(self) -> None:
+        """A provided httpx.AsyncClient must be forwarded to the OpenAI client."""
+        agent_def = AgentDef(name="shared_client")
+        shared = httpx.AsyncClient()
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            backend="openai",
+            api_key="explicit-key",
+            http_client=shared,
+        )
+
+        assert isinstance(pydantic_agent.model, OpenAIChatModel)
+        assert pydantic_agent.model.client._client._transport is shared._transport
 
 
 class TestSystemPromptMapping:
