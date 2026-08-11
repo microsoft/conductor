@@ -22,7 +22,7 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
-from conductor.cli.app import _format_started_at, app
+from conductor.cli.app import _format_started_at, _print_running_list, app
 
 runner = CliRunner()
 
@@ -369,8 +369,8 @@ class TestStatusFitsAnEightyColumnTerminal:
 
         ``Dashboard`` is the last column, so a folded continuation line has
         only empty cells before it and squashing rejoins the URL
-        contiguously. An ellipsis breaks contiguity, so this assertion fails
-        against today's cropping behaviour.
+        contiguously. An ellipsis breaks contiguity, so this assertion would
+        have failed against the pre-fix cropping behaviour.
         """
         _write_pid(pid_tmpdir, 4242, 53941, "/home/u/workflows/code-review-pipeline.yaml")
 
@@ -405,6 +405,74 @@ class TestStatusFitsAnEightyColumnTerminal:
         assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}Z", result.output)
         assert on_disk not in result.output
 
+    def test_one_malformed_started_at_does_not_hide_a_healthy_run(self, pid_tmpdir: Path) -> None:
+        """A near-``datetime.max`` value raises ``OverflowError`` in
+        ``.astimezone(UTC)``, not ``ValueError`` — a distinct failure mode
+        from an unparseable string. One poisoned entry must not crash the
+        whole listing and hide every other running workflow, matching the
+        "one bad PID file can't cost you the rest" guarantee ``pid.py``'s
+        own malformed-file handling already provides.
+        """
+        _write_pid(pid_tmpdir, 4242, 53941, "/home/u/workflows/code-review-pipeline.yaml")
+        poisoned = pid_tmpdir / "poisoned-9999.pid"
+        poisoned.write_text(
+            json.dumps(
+                {
+                    "pid": 4243,
+                    "port": 9999,
+                    "workflow": "/tmp/poisoned.yaml",
+                    "started_at": "9999-12-31T23:59:59-14:00",
+                    "run_id": "deadbeef",
+                    "stderr_log": "",
+                    "stdout_log": "",
+                }
+            )
+        )
+
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["status"], env=_NARROW)
+
+        assert result.exit_code == 0
+        assert "http://127.0.0.1:53941" in _squash(result.output)
+
+    def test_an_unfoldable_started_fallback_still_wraps_instead_of_cropping(self) -> None:
+        """``_format_started_at``'s failure fallback returns the raw value
+        unbounded (unlike its fixed-width happy path), which could
+        reintroduce issue #405's cropping in the ``Started`` column instead
+        of ``Dashboard``. ``Started`` must fold too, so a long fallback
+        value wraps rather than gets cropped to an ellipsis.
+
+        Checked directly against the constructed ``Table``, not via
+        end-to-end squashing: with two folding columns on the same row,
+        their wrapped continuation text interleaves and is no longer
+        contiguous once whitespace is stripped, so squashing (which relies
+        on ``Dashboard`` being the only folding, trailing column) cannot
+        distinguish "folded" from "cropped" here. ``_print_running_list``
+        only calls ``con.print(table)``, so a bare recorder standing in for
+        ``con`` is enough to capture it without touching real ``Console``
+        internals.
+        """
+        from rich.table import Table as RichTable
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.printed: list[object] = []
+
+            def print(self, *args: object, **kwargs: object) -> None:
+                self.printed.extend(args)
+
+        recorder = _Recorder()
+        _print_running_list(
+            [{"port": 53941, "pid": 4242, "workflow": "wf.yaml", "started_at": "bad"}],
+            recorder,  # type: ignore[arg-type]
+            show_url=True,
+        )
+
+        tables = [p for p in recorder.printed if isinstance(p, RichTable)]
+        assert tables, "expected _print_running_list to print a Table"
+        started_column = next(c for c in tables[0].columns if c.header == "Started")
+        assert started_column.overflow == "fold"
+
 
 class TestStartedColumnFormatting:
     """Direct unit tests for ``_format_started_at``'s five input shapes.
@@ -427,6 +495,15 @@ class TestStartedColumnFormatting:
 
     def test_unparseable_value_is_returned_verbatim(self) -> None:
         assert _format_started_at("not-a-timestamp") == "not-a-timestamp"
+
+    def test_out_of_range_after_utc_conversion_is_returned_verbatim(self) -> None:
+        """``fromisoformat`` parses this fine, but converting to UTC pushes
+        it past ``datetime.max`` and ``.astimezone`` raises ``OverflowError``
+        — a distinct failure mode from an unparseable string, and one the
+        ``except ValueError`` alone would not catch.
+        """
+        value = "9999-12-31T23:59:59-14:00"
+        assert _format_started_at(value) == value
 
     def test_none_becomes_a_question_mark(self) -> None:
         assert _format_started_at(None) == "?"

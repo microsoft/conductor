@@ -245,15 +245,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`conductor status`'s dashboard URL no longer gets cropped at a default
   80-column terminal** (#405). At that width, the `Dashboard` column — the
   one field the command exists to surface — was the one rich elided,
-  leaving a bare `…` reconstructable only by hand from the `Port` column.
-  `Started` now renders to minute precision in UTC (`2026-08-11 12:48Z`,
-  down from a 32-character microsecond-precision timestamp) rather than
-  being dropped outright, and the `Dashboard` column folds onto a second
-  line instead of cropping — a folded URL is complete and readable, a
-  cropped one is unrecoverable from the output. `conductor status` is
-  unreleased, so the `--json` payload keeps the exact recorded timestamp
-  untouched; only the table's human-readable rendering changed. `_print_running_list`
-  is shared with `conductor stop`, so its listing gets the shorter timestamp
+  leaving `http://127.0.0.1:…` reconstructable only by hand from the `Port`
+  column. Both the `Started` and `Dashboard` columns now fold onto a second
+  line instead of cropping — a folded value is complete and readable, a
+  cropped one is unrecoverable from the output. `Started` also renders to
+  minute precision in UTC (`2026-08-11 12:48Z`, down from a 32-character
+  microsecond-precision timestamp), leaving more room for `Workflow` before
+  folding is ever needed. The table is a glance-at listing, not an audit
+  log, so `--json` keeps reporting the exact recorded timestamp untouched —
+  only the human-readable rendering changed. `_print_running_list` is
+  shared with `conductor stop`, so its listing gets the shorter timestamp
   too. The test fixture that let this through built its own PID-file JSON by
   hand with a 19-character naive `started_at`, well short of production's
   32-character value — it now goes through the real `write_pid_file`, so the

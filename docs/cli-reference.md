@@ -309,7 +309,7 @@ conductor stop [OPTIONS]
 | `--force` | Proceed when the run's identity cannot be confirmed (see [Identity and `--force`](#identity-and---force)) |
 | `--json` | Emit a machine-readable result per workflow on stdout instead of prose |
 
-With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
+With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`. That listing shares its rendering with `conductor status`, so `Started` is shown at the same minute precision in UTC.
 
 ### Exit Codes
 

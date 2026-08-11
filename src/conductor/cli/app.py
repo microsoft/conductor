@@ -1749,21 +1749,34 @@ def _format_started_at(value: object) -> str:
 
     Returns:
         ``"%Y-%m-%d %H:%MZ"`` in UTC, the raw string unchanged if it cannot
-        be parsed as an ISO timestamp, or ``"?"`` if missing/empty/non-string.
+        be parsed as an ISO timestamp or normalized to UTC, or ``"?"`` if
+        missing/empty/non-string.
     """
     if not isinstance(value, str) or not value:
         return "?"
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError:
+        # write_pid_file always writes a tz-aware UTC value; a naive one
+        # implies an externally-written or hand-edited file. Treat it as
+        # UTC rather than guessing the local timezone.
+        parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        return parsed.strftime("%Y-%m-%d %H:%MZ")
+    except (ValueError, OverflowError):
+        # ValueError: not a parseable ISO timestamp. OverflowError: parsed
+        # fine but astimezone() pushed a near-datetime.min/max value out of
+        # range. Either way, one malformed entry must not crash the whole
+        # listing (see pid.py's scan_pid_files for the same principle) —
+        # fall back to the raw value rather than raise.
+        logger.warning("Could not render started_at value %r as UTC; showing it as-is", value)
         return value
-    # Legacy/naive values were always written via ``datetime.now(UTC)``.
-    parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
-    return parsed.strftime("%Y-%m-%d %H:%MZ")
 
 
 def _print_running_list(entries: list[dict], con: Console, show_url: bool = False) -> None:
     """Print a table of running background workflows.
+
+    ``Started`` is rendered to minute precision (``_format_started_at``)
+    regardless of ``show_url`` — ``conductor stop`` shares this function and
+    gets the shorter timestamp too.
 
     Args:
         entries: List of PID-file dicts.
@@ -1774,9 +1787,6 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
             terminal is gone. That column folds rather than crops (see
             below), so a long workflow stem plus this column can wrap the
             row onto two lines rather than lose part of the URL.
-            ``Started`` is rendered to minute precision (``_format_started_at``)
-            regardless of ``show_url`` — ``conductor stop`` shares this
-            function and gets the shorter timestamp too.
     """
     from rich.table import Table
 
@@ -1784,7 +1794,11 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
     table.add_column("Port", style="cyan")
     table.add_column("PID", style="yellow")
     table.add_column("Workflow", style="white")
-    table.add_column("Started", style="dim")
+    # Folds rather than crops: _format_started_at's happy path is a fixed
+    # 17 characters, but its fallback for an unparseable/out-of-range value
+    # returns the raw string unbounded, which could otherwise reproduce the
+    # exact cropping bug this PR fixes for Dashboard, one column over.
+    table.add_column("Started", style="dim", overflow="fold")
     if show_url:
         # Folds onto a second line instead of cropping. A cropped URL is
         # unrecoverable from the output — the one thing this column exists
