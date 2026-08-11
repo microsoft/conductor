@@ -167,6 +167,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Plugin checkouts from a `file://` source no longer land outside the plugin
+  cache on Windows.** The cache key is derived from the URL's path segments, but
+  the splitter only knew `/`, so a native Windows path arrived as a single
+  segment with its backslashes intact — and the key kept them, putting the
+  checkout at a drive-absolute location rather than under the cache root, which
+  is the same escape the `..` check exists to prevent. Two further problems sat
+  behind it: a drive colon made an owner of `C:_src` read as a drive (or, in the
+  middle of a name, as an NTFS alternate data stream), and flattening a deep
+  path into one segment produced a directory name long enough that `git` refused
+  to create `.git` inside it. Separators are now folded, the characters that
+  change a path's meaning on Windows are substituted, and an over-long segment
+  is replaced by a digest of itself — on every platform, so one workflow file
+  resolves to the same cache layout wherever it runs.
+- **Two sources resolving to the same commit no longer fail the whole fetch on
+  Windows.** Publishing a completed checkout tolerates losing the race to a
+  concurrent fetch, but recognised only the POSIX errnos for "destination
+  already exists"; Windows reports that as `ERROR_ACCESS_DENIED`, so the
+  tolerance never applied and the second source raised. Safe to accept because
+  the readiness sentinel is written after publishing: a winner that died
+  mid-clone leaves no sentinel, so the tree is re-fetched rather than read
+  half-written.
+- **A local path is recognised the same way on every platform** — `_is_local_path`
+  asked `pathlib.Path`, which is the *running* platform's flavour, so a POSIX
+  absolute path such as `/srv/plugins` was refused as an unrecognised source on
+  Windows. Both conventions are now consulted.
 - **Registry names are validated before they can corrupt the config** — a name
   containing a quote, a space, `=` or `#` was accepted, written into
   `registries.toml` as an unescaped table key, and then failed to parse. Since

@@ -60,6 +60,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -483,7 +484,19 @@ def _publish(temporary: Path, destination: Path) -> None:
         # Only the lost-race errnos. Treating EACCES or ENOSPC as "someone
         # else got there first" would report a broken checkout as a
         # successful one, on the strength of the directory merely existing.
-        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST) and destination.is_dir():
+        #
+        # Windows is the exception, and needs naming rather than adding
+        # EACCES globally: replacing a directory that already exists raises
+        # ERROR_ACCESS_DENIED (WinError 5, surfaced as EACCES) instead of
+        # ENOTEMPTY, so the POSIX-only list never fired and a second source
+        # resolving to the same SHA failed the whole fetch. Safe because the
+        # readiness sentinel is written *after* this returns: a winner that
+        # died mid-clone leaves no sentinel, `is_cached` reports a miss, and
+        # the tree is re-fetched rather than read half-written.
+        lost_race = exc.errno in (errno.ENOTEMPTY, errno.EEXIST) or (
+            sys.platform == "win32" and getattr(exc, "winerror", None) == 5
+        )
+        if lost_race and destination.is_dir():
             shutil.rmtree(temporary, ignore_errors=True)
             return
         raise
