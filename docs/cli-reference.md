@@ -305,7 +305,7 @@ conductor stop [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--port PORT` | Stop the workflow running on this specific port |
-| `--all` | Stop all background conductor workflows (all *other* runs; see Self-Exclusion) |
+| `--all` | Stop all *other* background conductor workflows (see Self-Exclusion) |
 | `--allow-self` | Include the run this command is executing inside (refused by default) |
 
 With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
@@ -329,16 +329,18 @@ The web dashboard also exposes terminate controls that always preserve progress:
 
 `conductor stop` never targets the run it is executing inside by default — an
 agent smoke-testing this command must not terminate its own workflow (issue
-#399). This matters because a background workflow's `bash` tool inherits the
-parent process's environment, so an agent-invoked `conductor stop` can easily
-end up pointed at the very run driving it.
+#399). This matters because nothing about a PID-file entry says "this is the
+workflow driving you" — an agent's `bash` tool, and any `conductor stop` it
+spawns, sits inside that very run's process tree, so a naive `stop` treats it
+as fair game just like any other run.
 
 The caller's own run is identified by three signals, tried in order (first
 match wins):
 
-1. **`CONDUCTOR_RUN_ID`** env var matching the PID file's `run_id`. Set on
-   every `--web-bg` child (and inherited by its descendants, including a
-   spawned `conductor stop`).
+1. **`CONDUCTOR_RUN_ID`** env var matching the PID file's `run_id`
+   (case-insensitively, since a manually-exported env var could differ in
+   case from the minted lowercase id). Set on every `--web-bg` child (and
+   inherited by its descendants, including a spawned `conductor stop`).
 2. **`CONDUCTOR_WEB_BG=1` + `CONDUCTOR_WEB_PORT`** matching the entry's port —
    a compatibility signal used only for PID files written before `run_id`
    existed (empty `run_id`).
@@ -355,8 +357,9 @@ Effects:
 - `conductor stop --port <your own port>` is refused and exits `1`, naming
   `--allow-self` as the remedy — here a specific target was named and
   declined.
-- `conductor stop --allow-self [...]` restores the pre-#399 behavior exactly,
-  printing a yellow warning when the run actually being stopped is your own.
+- `conductor stop --allow-self [...]` restores the pre-#399 targeting exactly
+  (same processes, same counts), but now prints a yellow warning when the run
+  being stopped is your own.
 
 **Windows caveat**: process ancestry (signal 3) is POSIX-only. On Windows,
 self-identification relies solely on the `CONDUCTOR_RUN_ID` /

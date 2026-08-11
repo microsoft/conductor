@@ -101,6 +101,71 @@ class TestAncestryWalk:
         assert os.getpid() in pids
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="ancestry walk is /proc-based (Linux only)"
+)
+class TestReadPpid:
+    """Direct tests of ``_read_ppid``'s real error handling (not monkeypatched away)."""
+
+    def test_returns_none_for_nonexistent_pid(self) -> None:
+        from conductor.cli.self_run import _read_ppid
+
+        assert _read_ppid(999_999_999) is None
+
+    def test_returns_none_for_malformed_ppid_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli import self_run
+
+        fake_status = tmp_path / "status"
+        fake_status.write_text("Name:\ttest\nPPid:\tnotanumber\n")
+        monkeypatch.setattr(
+            self_run,
+            "Path",
+            lambda p: fake_status if str(p).startswith("/proc/") else _Path(p),
+        )
+
+        assert self_run._read_ppid(12345) is None
+
+    def test_returns_none_when_no_ppid_line_present(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli import self_run
+
+        fake_status = tmp_path / "status"
+        fake_status.write_text("Name:\ttest\nState:\tS (sleeping)\n")
+        monkeypatch.setattr(
+            self_run,
+            "Path",
+            lambda p: fake_status if str(p).startswith("/proc/") else _Path(p),
+        )
+
+        assert self_run._read_ppid(12345) is None
+
+    def test_non_utf8_status_file_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A process with a non-UTF-8 ``Name:`` (e.g. via ``prctl(PR_SET_NAME)``) must
+        not crash the ancestry walk -- only the ``PPid:`` line is ever parsed."""
+        from pathlib import Path as _Path
+
+        from conductor.cli import self_run
+
+        fake_status = tmp_path / "status"
+        fake_status.write_bytes(b"Name:\tx\xff\xfey\nPPid:\t42\n")
+        monkeypatch.setattr(
+            self_run,
+            "Path",
+            lambda p: fake_status if str(p).startswith("/proc/") else _Path(p),
+        )
+
+        assert self_run._read_ppid(12345) == 42
+
+
 def _entry(pid: int, port: int, run_id: str = "", workflow: str = "/tmp/wf.yaml") -> dict:
     return {"pid": pid, "port": port, "run_id": run_id, "workflow": workflow}
 
@@ -170,6 +235,67 @@ class TestPartitionOwnRun:
         assert partition.own == []
         assert partition.others == entries
 
+    def test_mixed_entries_partition_correctly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A genuinely mixed self+other input classifies each entry independently.
+
+        This is the precise, cheap unit-level check for the exact scenario
+        issue #399 exists to fix: proven (during review) to catch an
+        own/others swap bug that CLI-level substring assertions missed.
+        """
+        monkeypatch.setenv(RUN_ID_ENV, "mine")
+        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
+
+        entries = [_entry(111, 8080, run_id="mine"), _entry(222, 9090, run_id="other")]
+        partition = partition_own_run(entries)
+
+        assert partition.own == [entries[0]]
+        assert partition.others == [entries[1]]
+
+    def test_non_string_run_id_is_ignored_rather_than_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A malformed PID file with a non-string ``run_id`` must not crash classification.
+
+        One corrupted/hand-edited PID file must not take down `stop` for
+        every other run (matching `pid.py::scan_pid_files`'s own "skip,
+        don't raise" discipline for malformed entries).
+        """
+        monkeypatch.setenv(RUN_ID_ENV, "mine")
+        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
+
+        entry = _entry(111, 8080)
+        entry["run_id"] = 12345  # malformed: an int instead of a string
+        partition = partition_own_run([entry])
+
+        assert partition.own == []
+        assert partition.others == [entry]
+
+
+class TestOwnRunPartitionInvariant:
+    """Tests for ``OwnRunPartition``'s constructor-enforced own/others disjointness."""
+
+    def test_disjoint_own_and_others_construct_cleanly(self) -> None:
+        from conductor.cli.self_run import OwnRunPartition
+
+        OwnRunPartition(own=[_entry(111, 8080)], others=[_entry(222, 9090)], reasons={})
+
+    def test_overlapping_own_and_others_raises(self) -> None:
+        from conductor.cli.self_run import OwnRunPartition
+
+        entry = _entry(111, 8080)
+        with pytest.raises(ValueError, match="both own and other"):
+            OwnRunPartition(own=[entry], others=[entry], reasons={})
+
+    def test_entries_missing_port_do_not_falsely_collide(self) -> None:
+        """Multiple entries with no ``port`` key must not be treated as an overlap."""
+        from conductor.cli.self_run import OwnRunPartition
+
+        OwnRunPartition(
+            own=[{"pid": 1}],
+            others=[{"pid": 2}],
+            reasons={},
+        )
+
 
 class TestDescribeOwnRun:
     """Tests for ``describe_own_run``'s identity formatting."""
@@ -185,3 +311,13 @@ class TestDescribeOwnRun:
     def test_returns_plain_str_not_text(self) -> None:
         entry = _entry(111, 8080, run_id="abc123")
         assert type(describe_own_run(entry)) is str
+
+    def test_null_workflow_falls_back_to_unknown_rather_than_crashing(self) -> None:
+        """A PID file with ``"workflow": null`` must not crash ``Path(None)``.
+
+        ``dict.get(key, default)`` only substitutes the default when the key
+        is *absent*, not when it's present with value ``None`` -- so this
+        exercises that exact gotcha.
+        """
+        entry = {"pid": 111, "port": 8080, "run_id": "", "workflow": None}
+        assert describe_own_run(entry) == "unknown (port 8080)"

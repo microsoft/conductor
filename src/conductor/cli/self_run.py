@@ -9,12 +9,13 @@ targeting by default.
 
 Three independent signals are tried, in order (first match wins per entry):
 
-1. **``CONDUCTOR_RUN_ID`` env var** matches the PID file's ``run_id``.
-   ``cli/bg_runner.py::_build_bg_env`` sets this on the detached background
-   child, so every descendant of it — including an agent's ``bash`` tool and
-   the ``conductor stop`` it spawns — inherits it, and
-   ``_finalize_background_launch`` writes the same id into the PID file's
-   ``run_id`` key (added in issue #411).
+1. **``CONDUCTOR_RUN_ID`` env var** matches the PID file's ``run_id``
+   (case-insensitively, since a manually-exported env var could differ in
+   case from the minted lowercase id). ``cli/bg_runner.py::_build_bg_env``
+   sets this on the detached background child, so every descendant of it —
+   including an agent's ``bash`` tool and the ``conductor stop`` it spawns —
+   inherits it, and ``_finalize_background_launch`` writes the same id into
+   the PID file's ``run_id`` key (added in issue #411).
 2. **``CONDUCTOR_WEB_BG=1`` + ``CONDUCTOR_WEB_PORT``** matching the entry's
    ``port``, used *only* when the entry records no ``run_id`` (i.e. ``""``).
    This is the compatibility path for PID files written before #411. Limiting
@@ -43,7 +44,6 @@ its shell is still exposed to this issue.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 from dataclasses import dataclass
@@ -76,8 +76,16 @@ def _read_ppid(pid: int) -> int | None:
         does not exist, is unreadable, or has no parseable ``PPid:`` line).
     """
     try:
-        status = Path(f"/proc/{pid}/status").read_text()
-    except OSError:
+        # errors="replace": the kernel-sourced ``Name:`` line can be
+        # arbitrary, non-UTF-8 bytes (any unprivileged process can set its
+        # own via ``prctl(PR_SET_NAME, ...)``), but only ``PPid:`` and the
+        # digits after it are ever parsed below, so corruption elsewhere in
+        # the file is harmless — raising here would needlessly crash the
+        # whole ancestry walk (and the ``os.getsid(0)`` fallback after it)
+        # over a process with an unrelated garbled name.
+        status = Path(f"/proc/{pid}/status").read_text(errors="replace")
+    except OSError as exc:
+        logger.debug("Could not read /proc/%s/status: %s", pid, exc)
         return None
 
     for line in status.splitlines():
@@ -93,8 +101,9 @@ def own_run_pids() -> frozenset[int]:
     """Return the set of PIDs that identify "this process" for self-exclusion.
 
     Includes ``os.getpid()`` unconditionally, then walks ``/proc/<pid>/status``
-    ``PPid:`` links upward (bounded by :data:`_MAX_ANCESTRY_HOPS`, with a
-    ``seen`` set so a malformed cyclic chain also terminates), then adds
+    ``PPid:`` links upward (bounded by :data:`_MAX_ANCESTRY_HOPS`; a cyclic
+    chain terminates immediately, before the hop cap, because each new
+    parent is checked against every pid collected so far), then adds
     ``os.getsid(0)`` when available.
 
     Deliberately not memoized: a ``stop`` invocation calls this once, and
@@ -107,12 +116,8 @@ def own_run_pids() -> frozenset[int]:
     pids: set[int] = {os.getpid()}
 
     if Path("/proc/self/status").exists():
-        seen: set[int] = set()
         current = os.getpid()
         for _ in range(_MAX_ANCESTRY_HOPS):
-            if current in seen:
-                break
-            seen.add(current)
             parent = _read_ppid(current)
             if parent is None or parent in pids:
                 break
@@ -120,13 +125,15 @@ def own_run_pids() -> frozenset[int]:
             current = parent
 
     if hasattr(os, "getsid"):
-        with contextlib.suppress(OSError):
+        try:
             pids.add(os.getsid(0))
+        except OSError as exc:
+            logger.debug("os.getsid(0) failed: %s", exc)
 
     return frozenset(pids)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OwnRunPartition:
     """The result of classifying PID-file entries against this process's identity."""
 
@@ -140,6 +147,25 @@ class OwnRunPartition:
     """Why an entry (keyed by port) was classified as own: ``"run id"``,
     ``"dashboard port"``, or ``"process ancestry"``. Logged at debug so a
     false positive is diagnosable without being printed to the user."""
+
+    def __post_init__(self) -> None:
+        """Guard the one invariant that matters for safety: no entry is in both lists.
+
+        ``others``/``own`` are both plain ``list[dict]`` — nothing in the type
+        system stops a future edit to :func:`partition_own_run` from swapping
+        them, which would silently invert exactly the safety property this
+        module exists to provide. Catching it here, at construction, turns
+        that mistake into an immediate ``ValueError`` instead of a quiet
+        misclassification.
+        """
+        own_ports = {e.get("port") for e in self.own if isinstance(e.get("port"), int)}
+        other_ports = {e.get("port") for e in self.others if isinstance(e.get("port"), int)}
+        overlap = own_ports & other_ports
+        if overlap:
+            raise ValueError(
+                f"OwnRunPartition: entr{'y' if len(overlap) == 1 else 'ies'} on "
+                f"port(s) {sorted(overlap)} classified as both own and other"
+            )
 
 
 def partition_own_run(entries: list[dict]) -> OwnRunPartition:
@@ -170,6 +196,18 @@ def partition_own_run(entries: list[dict]) -> OwnRunPartition:
     for entry in entries:
         port = entry.get("port")
         entry_run_id = entry.get("run_id") or ""
+        if not isinstance(entry_run_id, str):
+            # A malformed PID file (hand-edited, partially written, or from a
+            # future schema) could carry a non-string run_id. Don't let one
+            # bad file crash `stop` for every other run: log it and treat it
+            # as absent, matching pid.py::scan_pid_files' own "skip, don't
+            # raise" discipline for malformed entries.
+            logger.warning(
+                "PID-file entry on port %r has non-string run_id (%r); ignoring for self-exclusion",
+                port,
+                entry_run_id,
+            )
+            entry_run_id = ""
         reason: str | None = None
 
         if my_run_id and entry_run_id and entry_run_id.lower() == my_run_id.lower():
@@ -199,11 +237,14 @@ def describe_own_run(entry: dict) -> str:
     Returns:
         The ``run_id`` when the PID file records one, otherwise
         ``"<workflow-stem> (port N)"``. Always a plain ``str`` — never a
-        ``Text`` — since callers interpolate it through ``styled()`` (markup
-        guard rule F).
+        ``Text`` — since there's no styling to preserve here, and keeping it
+        a plain string forecloses a future f-string interpolation mistake
+        (markup guard rule F) regardless of which mechanism a caller uses to
+        print it.
     """
     run_id = entry.get("run_id")
     if run_id:
         return str(run_id)
-    workflow = Path(entry.get("workflow", "unknown")).stem
+    workflow_raw = entry.get("workflow") or "unknown"
+    workflow = Path(str(workflow_raw)).stem
     return f"{workflow} (port {entry.get('port')})"

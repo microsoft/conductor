@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import signal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,12 @@ runner = CliRunner()
 # of these tests to the refusal path. A synthetic PID that will never match
 # the real test process keeps them deterministic.
 _LIVE_PID = 999001
+
+# A second synthetic "definitely alive but distinct from _LIVE_PID" PID, used
+# in self+other mixed-population tests so assertions can pin down *which*
+# entry was actually signalled rather than merely counting calls (a swapped
+# own/other classification would otherwise pass the same assertions).
+_OTHER_PID = 999002
 
 
 @pytest.fixture()
@@ -217,19 +224,6 @@ class TestStopProcessUnexpectedOSError:
 class TestStopSelfExclusion:
     """Issue #399: ``conductor stop`` must never target the run it executes inside."""
 
-    @pytest.fixture(autouse=True)
-    def _clear_default_stub(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Override the module's ``no_self_run`` autouse fixture for this class.
-
-        These tests exercise the real self-exclusion behaviour, so each test
-        configures its own identity signal (env var or ancestry) rather than
-        having ``own_run_pids`` stubbed to an empty set.
-        """
-        monkeypatch.delenv("CONDUCTOR_RUN_ID", raising=False)
-        monkeypatch.delenv("CONDUCTOR_WEB_BG", raising=False)
-        monkeypatch.delenv("CONDUCTOR_WEB_PORT", raising=False)
-        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
-
     def test_run_id_match_refuses_no_flag(
         self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -268,7 +262,7 @@ class TestStopSelfExclusion:
     ) -> None:
         monkeypatch.setenv("CONDUCTOR_RUN_ID", "self-run")
         _write_pid(pid_tmpdir, _LIVE_PID, 8080, "/tmp/self.yaml", run_id="self-run")
-        _write_pid(pid_tmpdir, _LIVE_PID, 9090, "/tmp/other.yaml", run_id="other-run")
+        _write_pid(pid_tmpdir, _OTHER_PID, 9090, "/tmp/other.yaml", run_id="other-run")
 
         with (
             patch("conductor.cli.pid._is_process_alive", return_value=True),
@@ -279,7 +273,11 @@ class TestStopSelfExclusion:
         assert result.exit_code == 0
         assert "Excluded" in result.output
         assert "Stopped" in result.output
-        assert mock_kill.call_count == 1
+        assert "9090" in result.output
+        # Pins down *which* run was signalled: a classification that swapped
+        # own/other would still print "Excluded"/"Stopped" and call os.kill
+        # exactly once, just against the wrong PID.
+        mock_kill.assert_called_once_with(_OTHER_PID, signal.SIGTERM)
 
     def test_all_with_only_self_sends_no_signal(
         self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
@@ -367,7 +365,7 @@ class TestStopSelfExclusion:
     ) -> None:
         monkeypatch.setenv("CONDUCTOR_RUN_ID", "self-run")
         _write_pid(pid_tmpdir, _LIVE_PID, 8080, "/tmp/self.yaml", run_id="self-run")
-        _write_pid(pid_tmpdir, _LIVE_PID, 9090, "/tmp/other.yaml", run_id="other-run")
+        _write_pid(pid_tmpdir, _OTHER_PID, 9090, "/tmp/other.yaml", run_id="other-run")
 
         with (
             patch("conductor.cli.pid._is_process_alive", return_value=True),
@@ -377,4 +375,61 @@ class TestStopSelfExclusion:
 
         assert result.exit_code == 0
         assert "Warning" in result.output
+        # Only the self entry should trigger the warning; a swapped
+        # classification would warn about the *other* entry instead, silently.
+        assert result.output.count("Warning") == 1
         assert mock_kill.call_count == 2
+        mock_kill.assert_any_call(_LIVE_PID, signal.SIGTERM)
+        mock_kill.assert_any_call(_OTHER_PID, signal.SIGTERM)
+
+    def test_no_flag_mixed_auto_stops_sole_other_and_notes_exclusion(
+        self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No flags, self-run + exactly one other run: auto-stops the other, excludes self.
+
+        Covers `app.py`'s single-target auto-stop branch when the caller's
+        own run is present alongside exactly one other -- the most common
+        real trigger for issue #399 (an agent's own background workflow
+        plus one unrelated run, invoking bare `conductor stop`).
+        """
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "self-run")
+        _write_pid(pid_tmpdir, _LIVE_PID, 8080, "/tmp/self.yaml", run_id="self-run")
+        _write_pid(pid_tmpdir, _OTHER_PID, 9090, "/tmp/other.yaml", run_id="other-run")
+
+        with (
+            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill") as mock_kill,
+        ):
+            result = runner.invoke(app, ["stop"])
+
+        assert result.exit_code == 0
+        assert "Stopped" in result.output
+        assert "9090" in result.output
+        assert "Excluded" in result.output
+        mock_kill.assert_called_once_with(_OTHER_PID, signal.SIGTERM)
+
+    def test_no_flag_mixed_lists_others_only_and_notes_exclusion(
+        self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No flags, self-run + two other runs: lists the *other* runs only.
+
+        Covers `app.py`'s multi-target listing branch, asserting the printed
+        count reflects the post-exclusion `targetable` list (2), not the raw
+        PID-file count (3), and that the self entry's port never appears
+        under the running-workflows listing.
+        """
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "self-run")
+        _write_pid(pid_tmpdir, _LIVE_PID, 8080, "/tmp/self.yaml", run_id="self-run")
+        _write_pid(pid_tmpdir, 999003, 9090, "/tmp/other1.yaml", run_id="other-run-1")
+        _write_pid(pid_tmpdir, 999004, 9091, "/tmp/other2.yaml", run_id="other-run-2")
+
+        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop"])
+
+        assert result.exit_code == 0
+        assert "Multiple background workflows running (2)" in result.output
+        assert "9090" in result.output
+        assert "9091" in result.output
+        assert "Excluded" in result.output
+        # The self entry's port must not leak into the "running" listing.
+        assert "8080" not in result.output.split("Excluded")[0]

@@ -177,9 +177,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #411's `run_id` field), and POSIX process ancestry, and excludes it from
   targeting by default: `--all` now means "stop all *other* runs", the
   no-flag auto-stop skips it, and `--port <your own port>` is refused (exit
-  `1`, naming the fix). If only your own run is alive, `stop`/`stop --all`
+  `1`, naming `--allow-self` as the remedy). If only your own run is alive, `stop`/`stop --all`
   print a refusal and exit `0` rather than erroring, since nothing named was
-  declined. Pass `--allow-self` to restore the previous behavior exactly; a
+  declined. Pass `--allow-self` to restore the previous targeting exactly; a
   yellow warning is printed whenever it actually causes your own run to be
   signalled. Process-ancestry detection is POSIX-only — Windows relies on
   the env-var signals alone.

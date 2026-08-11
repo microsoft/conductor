@@ -1280,12 +1280,12 @@ def stop(
     list and asks you to specify --port.
 
     \b
-    By default, ``stop`` never targets the run it is executing inside --
+    By default, `stop` never targets the run it is executing inside --
     an agent smoke-testing this command must not terminate its own
-    workflow (issue #399). That run is identified by ``CONDUCTOR_RUN_ID``,
-    the legacy ``CONDUCTOR_WEB_BG``/``CONDUCTOR_WEB_PORT`` pair, or process
-    ancestry, and is excluded from ``--all`` and the no-flag auto-stop; a
-    ``--port`` naming it is refused outright. Pass ``--allow-self`` to
+    workflow (issue #399). That run is identified by `CONDUCTOR_RUN_ID`,
+    the legacy `CONDUCTOR_WEB_BG`/`CONDUCTOR_WEB_PORT` pair, or process
+    ancestry, and is excluded from `--all` and the no-flag auto-stop; a
+    `--port` naming it is refused outright. Pass `--allow-self` to
     include it anyway.
 
     \b
