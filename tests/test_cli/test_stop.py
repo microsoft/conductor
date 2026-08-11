@@ -1,13 +1,25 @@
 """Tests for ``conductor stop`` CLI command.
 
-Covers:
-- Stopping a workflow by port
-- Stopping all workflows with ``--all``
-- Auto-stop when exactly one workflow is running
-- Listing when multiple workflows are running
-- Error cases (no running workflows, invalid port)
-- Self-exclusion (issue #399): ``stop`` must never target the run it
-  executes inside
+Covers (Fleet Manager E3 — ``conductor stop`` over run records):
+
+- Discovering every mode (``fg``, ``fg-web``, ``bg``) via
+  ``conductor.fleet.records.read_run_records()``, not just background runs.
+- ``--run-id`` and ``--port`` selectors; ``--all``; auto-stop-single; the
+  multi-workflow listing branch.
+- A missing ``port`` (portless foreground record) never crashes discovery,
+  the listing, or ``--port`` filtering, and renders as ``—``.
+- D1: the foreground-stop confirmation prompt, ``--yes``/``-y`` bypass, and
+  the non-TTY refusal.
+- E3-T5: the confirmation prompt's checkpoint-awareness text.
+- E3-T6: run-id-keyed record removal, falling back to port-keyed removal
+  for a legacy ``.pid`` record.
+- E3-T10: ``_stop_process`` verifies termination (polling
+  ``is_process_alive``) before reporting success or letting the caller
+  remove the run record, escalating to ``SIGKILL`` if the grace period
+  elapses.
+- E3-T12: the Windows ``CTRL_BREAK_EVENT`` cross-console limitation.
+- Legacy ``.pid`` file compatibility: still listable and stoppable, and
+  never triggers the D1 prompt (mode is always ``"bg"``).
 """
 
 from __future__ import annotations
@@ -16,8 +28,6 @@ import contextlib
 import importlib
 import json
 import os
-import re
-from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,47 +37,101 @@ from typer.testing import CliRunner
 from conductor.cli.app import Identity, app
 from conductor.cli.pid import Liveness
 
-# ``conductor.cli.__init__`` does ``from conductor.cli.app import app``, which
-# rebinds the *package's* ``app`` attribute to the Typer instance -- shadowing
-# the submodule of the same name. ``import conductor.cli.app as x`` resolves
-# through that shadowed attribute (via IMPORT_FROM) and would silently hand
-# back the Typer app instead of the module, so ``importlib.import_module`` is
-# used here instead to get the real module object to patch/wrap attributes on.
+# ``conductor.cli`` re-exports the ``app`` Typer instance under the
+# ``conductor.cli.app`` name, shadowing the submodule for attribute-based
+# patching -- importlib resolves the module itself.
 app_module = importlib.import_module("conductor.cli.app")
 
 runner = CliRunner()
 
-# ``os.getpid()`` used to be a convenient "definitely alive" PID for these
-# fixtures, but the self-exclusion rule (issue #399) treats a PID-file entry
-# naming *this* test process as the caller's own run -- which would flip all
-# of these tests to the refusal path. A synthetic PID that will never match
-# the real test process keeps them deterministic.
-_LIVE_PID = 999001
 
-# A second synthetic "definitely alive but distinct from _LIVE_PID" PID, used
-# in self+other mixed-population tests so assertions can pin down *which*
-# entry was actually signalled rather than merely counting calls (a swapped
-# own/other classification would otherwise pass the same assertions).
-_OTHER_PID = 999002
+def _alive_then_dead():
+    """``is_process_alive`` side_effect: alive on first probe per PID, dead after.
+
+    Simulates a process that is running during discovery (the first probe
+    ``read_run_records()`` performs for that PID) and has actually
+    terminated by the time ``_stop_process`` polls again after signalling
+    it (E3-T10) — without waiting out the real grace period in every test.
+    """
+    seen: dict[int, int] = {}
+
+    def _is_alive(pid: int) -> bool:
+        seen[pid] = seen.get(pid, 0) + 1
+        return seen[pid] == 1
+
+    return _is_alive
 
 
-@pytest.fixture()
-def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Override ``pid_dir()`` to use a temporary directory."""
-    runs_dir = tmp_path / "runs"
-    runs_dir.mkdir()
-    monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs_dir)
-    return runs_dir
+@contextlib.contextmanager
+def _fast_grace_period():
+    """Shrink the E3-T10 grace period/poll interval so escalation tests stay fast.
+
+    A context manager (rather than ``monkeypatch.setattr``) because
+    ``conductor.cli`` re-exports the ``app`` Typer instance under the
+    ``conductor.cli.app`` name (see ``cli/__init__.py``), which shadows the
+    submodule for pytest's own dotted-path attribute resolver; plain
+    ``unittest.mock.patch`` (used everywhere else in this file) resolves it
+    correctly via ``pkgutil.resolve_name``.
+    """
+    with (
+        patch("conductor.cli.app._STOP_GRACE_PERIOD_SECONDS", 0.05),
+        patch("conductor.cli.app._STOP_POLL_INTERVAL_SECONDS", 0.01),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _stops_cleanly():
+    """Patch the ladder so the target is confirmed dead on the first rung.
+
+    These tests cover *routing* -- which records get targeted by ``--port`` /
+    ``--run-id`` / ``--all`` / auto-detect -- not the escalation ladder
+    itself, which has its own module (``test_stop_ladder.py``).
+
+    Patching ``pid.process_liveness``/``pid.wait_for_exit`` rather than
+    ``os.kill`` is load-bearing: ``_stop_process`` escalates through
+    ``pid.terminate_process`` and asks ``process_liveness`` (not
+    ``is_process_alive``) whether the target died, so a test that stubs only
+    ``os.kill`` leaves the run looking like it survived and ``stop`` exits 2.
+    """
+    with (
+        patch("conductor.cli.pid.is_process_alive", return_value=True),
+        patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+        patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
+        patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+        patch("conductor.cli.app._request_graceful_kill", return_value=True),
+        # Stubbed even though the graceful rung above "succeeds": these tests
+        # write records whose pid is the *test process's own*, and a portless
+        # (foreground) record skips the dashboard rung entirely -- so an
+        # unstubbed signal rung SIGTERMs the test runner mid-suite, which
+        # presents as the whole session dying rather than as a failure.
+        patch("conductor.cli.app._signal_process"),
+        patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _spy_stop_process():
+    """Wrap the real ``_stop_process`` so calls are recorded without changing behaviour.
+
+    Stop counts are asserted here rather than on ``app.os.kill``: the ladder
+    escalates through ``pid.terminate_process``, so ``os.kill`` is no longer
+    the seam ``stop`` acts on and counting it would silently measure nothing.
+    """
+    with patch.object(app_module, "_stop_process", wraps=app_module._stop_process) as spy:
+        yield spy
 
 
 @pytest.fixture(autouse=True)
 def no_self_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep self-exclusion (issue #399) from perturbing the pre-existing targeting tests.
+    """Keep self-exclusion (issue #399) from perturbing the targeting tests.
 
     Clears the bg-launch identity env vars and stubs ``own_run_pids`` so no
-    entry is ever misidentified as "this run" by a coincidental ancestor PID.
-    ``TestStopSelfExclusion`` overrides this per-test to exercise the actual
-    self-exclusion behaviour.
+    record is ever misidentified as "this run" by a coincidental ancestor
+    PID. That is not hypothetical here: these tests write records whose
+    ``pid`` is the *test process's own* PID so the liveness probe passes,
+    which is exactly what ``partition_own_run``'s ancestry check flags.
     """
     monkeypatch.delenv("CONDUCTOR_RUN_ID", raising=False)
     monkeypatch.delenv("CONDUCTOR_WEB_BG", raising=False)
@@ -75,10 +139,45 @@ def no_self_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
 
 
+@pytest.fixture()
+def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolate both legacy PID files and Fleet Manager run records.
+
+    ``conductor stop`` discovers workflows via
+    ``conductor.fleet.records.read_run_records()`` (Fleet Manager E3),
+    which reads *both* the ``CONDUCTOR_HOME``-aware run-record directory
+    and the legacy, unredirected ``cli.pid.pid_dir()`` location. Without
+    isolating both, these tests would pick up (and be polluted by) any
+    real run records or PID files under the developer's actual
+    ``~/.conductor/``, matching the ``fleet_env`` fixture already used by
+    ``tests/test_fleet/test_records.py``.
+    """
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs_dir)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+
+    return runs_dir
+
+
+_LIVE_PID = 999001
+"""A PID no live process owns, for tests that stub the liveness probe."""
+
+_OTHER_PID = 999002
+"""A second such PID, for tests that need two distinguishable runs."""
+
+
 def _write_pid(
-    pid_dir: Path, pid: int, port: int, workflow: str = "/tmp/wf.yaml", run_id: str = ""
+    pid_dir: Path,
+    pid: int,
+    port: int,
+    workflow: str = "/tmp/wf.yaml",
+    run_id: str = "",
 ) -> Path:
-    """Helper to write a PID file directly."""
+    """Helper to write a legacy PID file directly."""
     name = Path(workflow).stem
     filepath = pid_dir / f"{name}-{port}.pid"
     filepath.write_text(
@@ -95,55 +194,87 @@ def _write_pid(
     return filepath
 
 
-@contextlib.contextmanager
-def _stops_cleanly() -> Iterator[None]:
-    """Patch the ladder so the target is confirmed dead on the first rung.
+def _write_run_record(
+    run_id: str,
+    pid: int,
+    port: int | None,
+    workflow: str = "/tmp/wf.yaml",
+    mode: str = "bg",
+    checkpoint_dir: str | None = "/tmp/conductor/checkpoints",
+) -> Path:
+    """Helper to write a Fleet Manager run record (the new, ``run_id``-keyed format)."""
+    from conductor.fleet.records import RunRecord, write_run_record
 
-    These tests cover *routing* — which PID files get targeted by ``--port`` /
-    ``--all`` / auto-detect / self-exclusion — not the escalation ladder
-    itself, which has its own module (``test_stop_ladder.py``). Patching the
-    outcome also keeps them free of the ladder's real bounded waits.
+    return write_run_record(
+        RunRecord(
+            run_id=run_id,
+            pid=pid,
+            workflow_path=workflow,
+            workflow_name=Path(workflow).stem,
+            started_at="2026-03-03T00:00:00",
+            event_log_path=f"/tmp/conductor/{run_id}.events.jsonl",
+            port=port,
+            mode=mode,
+            checkpoint_dir=checkpoint_dir,
+        )
+    )
+
+
+def _write_checkpoint_file(
+    checkpoint_dir: Path,
+    workflow_name: str,
+    run_id: str,
+    *,
+    trigger: str = "periodic",
+    suffix: str = "20260303-000000",
+) -> Path:
+    """Write a minimal, valid checkpoint JSON file directly (for E3-T5 tests).
+
+    Bypasses ``CheckpointManager.save_checkpoint`` (which requires a real
+    ``WorkflowContext``/``LimitEnforcer``) and writes just the fields
+    ``CheckpointManager.load_checkpoint`` requires, matching the on-disk
+    shape documented in ``engine/checkpoint.py``.
     """
-    with (
-        patch("conductor.cli.pid._is_process_alive", return_value=True),
-        patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
-        patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
-        patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
-        patch("conductor.cli.app._request_graceful_kill", return_value=True),
-    ):
-        yield
-
-
-@contextlib.contextmanager
-def _spy_stop_process() -> Iterator[object]:
-    """Wrap the real ``_stop_process`` so calls are recorded without changing behaviour.
-
-    Used by the self-exclusion tests to pin down *which* PID-file entries
-    were actually targeted, the same way ``TestStopAll`` above pins down
-    call args by patching ``_stop_process`` directly -- except here the real
-    ladder still runs (under ``_stops_cleanly()``), so the printed "Stopped"
-    / "Excluded" / "Warning" text is genuine rather than asserted on faith.
-    """
-    with patch.object(app_module, "_stop_process", wraps=app_module._stop_process) as spy:
-        yield spy
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_dir / f"{workflow_name}-{suffix}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workflow_path": f"/tmp/{workflow_name}.yaml",
+                "workflow_hash": "sha256:deadbeef",
+                "created_at": "2026-03-03T00:00:00",
+                "failure": {"error_type": None, "message": None},
+                "current_agent": "some_agent",
+                "context": {},
+                "limits": {},
+                "run_id": run_id,
+                "trigger": trigger,
+            }
+        )
+    )
+    return path
 
 
 class TestStopNoRunning:
-    """Test behavior when no background workflows are running."""
+    """Test behavior when no workflows are running."""
 
     def test_no_workflows_message(self, pid_tmpdir: Path) -> None:
         result = runner.invoke(app, ["stop"])
         assert result.exit_code == 0
-        assert "No background workflows" in result.output
+        assert "No workflows are currently running" in result.output
 
 
 class TestStopByPort:
     """Test ``conductor stop --port <PORT>``."""
 
     def test_stops_specific_port(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, _LIVE_PID, 8080)
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8080)
 
-        with _stops_cleanly():
+        with (
+            _stops_cleanly(),
+        ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
 
         assert result.exit_code == 0
@@ -151,83 +282,140 @@ class TestStopByPort:
         assert "8080" in result.output
 
     def test_error_on_unknown_port(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, _LIVE_PID, 8080)
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8080)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop", "--port", "9999"])
 
         assert result.exit_code == 1
-        assert "No background workflow found on port 9999" in result.output
+        assert "No running workflow found on port 9999" in result.output
+
+    def test_port_never_matches_a_portless_foreground_record(self, pid_tmpdir: Path) -> None:
+        """A foreground record has ``port=None`` -- ``--port <N>`` must never
+        raise (E3-T2) and must simply report no match."""
+        pid = os.getpid()
+        _write_run_record("f0000001", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop", "--port", "8080"])
+
+        assert result.exit_code == 1
+        assert "No running workflow found on port 8080" in result.output
+
+
+class TestStopByRunId:
+    """Test ``conductor stop --run-id <ID>`` (E3-T1)."""
+
+    def test_stops_by_run_id(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("abcd1234", pid, 8080, "/tmp/wf.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
+        ):
+            result = runner.invoke(app, ["stop", "--run-id", "abcd1234"])
+
+        assert result.exit_code == 0
+        assert "Stopped" in result.output
+
+    def test_error_on_unknown_run_id(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("abcd1234", pid, 8080, "/tmp/wf.yaml", mode="bg")
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop", "--run-id", "nonexistent"])
+
+        assert result.exit_code == 1
+        assert "No running workflow found with run ID" in result.output
+
+    def test_run_id_finds_a_portless_foreground_record(self, pid_tmpdir: Path) -> None:
+        """``--run-id`` is the one selector that can target a foreground run
+        with no dashboard/port at all."""
+        pid = os.getpid()
+        _write_run_record("f0000002", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            _stops_cleanly(),
+        ):
+            result = runner.invoke(app, ["stop", "--run-id", "f0000002", "--yes"])
+
+        assert result.exit_code == 0
+        assert "Stopped" in result.output
 
 
 class TestStopAll:
     """Test ``conductor stop --all``."""
 
     def test_stops_all_workflows(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, _LIVE_PID, 8080, "/tmp/wf1.yaml")
-        _write_pid(pid_tmpdir, _LIVE_PID, 9090, "/tmp/wf2.yaml")
+        # Distinct fake PIDs -- each real workflow run is a distinct OS
+        # process, and the ``_alive_then_dead`` helper tracks liveness
+        # per-PID, so two entries sharing one PID would collide.
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8080, "/tmp/wf1.yaml")
+        _write_pid(pid_tmpdir, pid + 1, 9090, "/tmp/wf2.yaml")
 
-        with _stops_cleanly(), patch("conductor.cli.app._stop_process") as stop_one:
-            stop_one.return_value = {
-                "pid": _LIVE_PID,
-                "port": 0,
-                "workflow": "wf",
-                "run_id": "",
-                "outcome": "stopped",
-                "rung": "api-kill",
-            }
+        with (
+            _stops_cleanly(),
+            _spy_stop_process() as mock_kill,
+        ):
             result = runner.invoke(app, ["stop", "--all"])
 
         assert result.exit_code == 0
-        # Both registered workflows must be targeted.
-        assert stop_one.call_count == 2
-        assert sorted(c.args[0]["port"] for c in stop_one.call_args_list) == [8080, 9090]
+        assert "Stopped" in result.output
+        # Both should be stopped
+        assert mock_kill.call_count == 2
 
 
 class TestStopAutoDetect:
     """Test ``conductor stop`` with no flags (auto-detect)."""
 
     def test_auto_stops_single_workflow(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, _LIVE_PID, 8080)
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8080)
 
-        with _stops_cleanly():
+        with (
+            _stops_cleanly(),
+        ):
             result = runner.invoke(app, ["stop"])
 
         assert result.exit_code == 0
         assert "Stopped" in result.output
 
     def test_lists_multiple_workflows(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, _LIVE_PID, 8080, "/tmp/wf1.yaml")
-        _write_pid(pid_tmpdir, _LIVE_PID, 9090, "/tmp/wf2.yaml")
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8080, "/tmp/wf1.yaml")
+        _write_pid(pid_tmpdir, pid, 9090, "/tmp/wf2.yaml")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop"])
 
-        # Ambiguous target: nothing was stopped, so this must not report
-        # success to a script that only checks the exit code.
+        # Listing without stopping anything is a failure to act, so it exits
+        # non-zero rather than reporting success to automation.
         assert result.exit_code == 1
-        assert "Multiple background workflows" in result.output
+        assert "Multiple workflows" in result.output
         assert "8080" in result.output
         assert "9090" in result.output
 
-    def test_lists_started_at_minute_precision(self, pid_tmpdir: Path) -> None:
-        """``stop``'s ambiguous listing shares ``_print_running_list`` with
-        ``status``, so it should render ``Started`` at the same minute
-        precision rather than a raw microsecond timestamp.
-        """
-        from conductor.cli.pid import write_pid_file
-
+    def test_lists_mode_and_run_id_columns(self, pid_tmpdir: Path) -> None:
+        """E3-T2: the listing table must show ``Mode`` and ``Run ID``."""
         pid = os.getpid()
-        first = write_pid_file(pid, 8080, "/tmp/wf1.yaml")
-        write_pid_file(pid, 9090, "/tmp/wf2.yaml")
-        on_disk = json.loads(first.read_text())["started_at"]
+        _write_run_record("aaaa0001", pid, 8080, "/tmp/wf1.yaml", mode="bg")
+        _write_run_record("bbbb0002", pid, None, "/tmp/wf2.yaml", mode="fg")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop"])
 
+        # Listing without stopping anything is a failure to act, so it exits
+        # non-zero rather than reporting success to automation.
         assert result.exit_code == 1
-        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}Z", result.output)
-        assert on_disk not in result.output
+        assert "Mode" in result.output
+        assert "Run ID" in result.output
+        assert "aaaa0001" in result.output
+        assert "bbbb0002" in result.output
+        # The portless foreground record's Port column renders as "—", not
+        # a crash.
+        assert "—" in result.output
 
 
 class TestStopProcessGone:
@@ -237,7 +425,7 @@ class TestStopProcessGone:
         _write_pid(pid_tmpdir, 99999999, 8080)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.app.os.kill", side_effect=ProcessLookupError),
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
@@ -249,30 +437,34 @@ class TestStopProcessGone:
 class TestStopProcessUnexpectedOSError:
     """Companion regression for issue #166.
 
-    The original bug crashed ``conductor stop`` when ``_is_process_alive``
+    The original bug crashed ``conductor stop`` when ``is_process_alive``
     propagated an unexpected ``OSError`` (e.g. ``WinError 11``). That probe
-    is now defensive — but the stop ladder also calls ``os.kill`` one frame
-    deeper and must tolerate the same class of failure, especially because
-    the "unknown — assume alive" fallback in the Windows probe lets
+    is now defensive — but ``_stop_process`` itself also calls ``os.kill``
+    one frame deeper and must tolerate the same class of failure, especially
+    because the "assume alive" fallback in ``_is_process_alive_windows`` lets
     probe-failing PIDs reach this code path.
     """
 
     def test_unexpected_oserror_does_not_crash(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, 4242, 8080)
+        _write_pid(pid_tmpdir, 99999999, 8080)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            # process_liveness must be stubbed too: the ladder asks it (not
+            # is_process_alive) whether the target is worth signalling, and
+            # this record's PID is deliberately fake, so an unstubbed probe
+            # reports DEAD and the run short-circuits as "already exited"
+            # without ever reaching the failing call below.
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
-            patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
-            patch("conductor.cli.pid.terminate_process", return_value=Liveness.DEAD),
             patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
             patch("conductor.cli.app._request_graceful_kill", return_value=False),
-            # Pin the platform so the signal rung is deterministic; otherwise
-            # this exercises CTRL_BREAK_EVENT on Windows and SIGTERM on Linux,
-            # and only one of them is what CI actually runs.
-            patch("sys.platform", "linux"),
+            # Patched inside pid.py rather than on `terminate_process`
+            # itself: that function already classifies OSError internally,
+            # so stubbing it to raise would assert against a path the real
+            # implementation cannot take. os.kill is where the surprising
+            # errno actually surfaces (issue: WinError 11 / ERROR_BAD_FORMAT).
             patch(
-                "conductor.cli.app.os.kill",
+                "conductor.cli.pid.os.kill",
                 side_effect=OSError(
                     11, "An attempt was made to load a program with an incorrect format"
                 ),
@@ -280,32 +472,387 @@ class TestStopProcessUnexpectedOSError:
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
 
-        # The signal rung swallowed the OSError and the ladder escalated
-        # rather than crashing.
-        assert result.exception is None or isinstance(result.exception, SystemExit)
-        assert result.exit_code == 0
-        assert "Stopped" in result.output
+        # Must not crash -- but must also not claim success for a process it
+        # could not signal, so this is exit 2 (not stopped), never 0.
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
 
-    def test_pid_file_is_removed_when_process_confirmed_gone(self, pid_tmpdir: Path) -> None:
-        # A PID file for a process that no longer exists must be cleaned up so
-        # ``conductor stop`` listings don't accumulate phantom entries.
-        #
-        # ``process_liveness`` is patched explicitly rather than relying on a
-        # bogus PID: ``patch("conductor.cli.app.os.kill")`` mutates the shared
-        # ``os`` module object, so on POSIX it would also break ``pid.py``'s
-        # own probe (turning DEAD into UNKNOWN) and this test would fail on
-        # Linux CI while passing on Windows.
+    def test_pid_file_is_retained_when_process_still_alive_after_oserror(
+        self, pid_tmpdir: Path
+    ) -> None:
+        # An unexpected OSError from os.kill does not confirm the signal was
+        # delivered. If the process is still alive, the PID file must be
+        # retained -- removing it would let a live run silently disappear
+        # from ``conductor stop``/``fleet list`` while still executing.
         _write_pid(pid_tmpdir, 99999999, 8080)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
-            patch("conductor.cli.pid.process_liveness", return_value=Liveness.DEAD),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill", side_effect=OSError(11, "boom")),
+        ):
+            runner.invoke(app, ["stop", "--port", "8080"])
+
+        assert len(list(pid_tmpdir.glob("*.pid"))) == 1
+
+    def test_pid_file_is_removed_when_process_confirmed_dead_after_oserror(
+        self, pid_tmpdir: Path
+    ) -> None:
+        # If os.kill raises an unexpected OSError but the process is already
+        # confirmed dead, the record should still be cleaned up.
+        _write_pid(pid_tmpdir, 99999999, 8080)
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=False),
+            patch("conductor.cli.app.os.kill", side_effect=OSError(11, "boom")),
+        ):
+            runner.invoke(app, ["stop", "--port", "8080"])
+
+        assert list(pid_tmpdir.glob("*.pid")) == []
+
+
+class TestStopDiscoversForegroundRecords:
+    """Fleet Manager E3: ``conductor stop`` now discovers *every* mode, not
+    just ``bg`` -- closing the design's stated blindness to foreground
+    runs."""
+
+    def test_foreground_run_is_discovered_and_listed(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f0000010", pid, None, "/tmp/wf.yaml", mode="fg")
+        # A second record forces the "multiple workflows" listing branch, so
+        # this test observes discovery/listing only -- not stop behavior
+        # (a lone foreground record would instead hit the D1 confirmation
+        # gate, covered separately by TestStopForegroundConfirmation).
+        _write_run_record("b0000099", pid + 1, 9099, "/tmp/wf2.yaml", mode="bg")
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop"])
+
+        # Listing without stopping anything is a failure to act, so it exits
+        # non-zero rather than reporting success to automation.
+        assert result.exit_code == 1
+        assert "fg" in result.output
+
+    def test_foreground_web_run_is_discovered(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f0000011", pid, 9000, "/tmp/wf.yaml", mode="fg-web")
+        _write_run_record("b0000098", pid + 1, 9098, "/tmp/wf2.yaml", mode="bg")
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
+            result = runner.invoke(app, ["stop"])
+
+        # Listing without stopping anything is a failure to act, so it exits
+        # non-zero rather than reporting success to automation.
+        assert result.exit_code == 1
+        assert "fg-web" in result.output
+        assert "9000" in result.output
+
+    def test_mixed_fg_and_bg_fleet_all_stops_with_confirmation(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f0000012", pid, None, "/tmp/wf-fg.yaml", mode="fg")
+        _write_run_record("b0000013", pid + 1, 8080, "/tmp/wf-bg.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
+            _spy_stop_process() as mock_kill,
+        ):
+            result = runner.invoke(app, ["stop", "--all", "--yes"])
+
+        assert result.exit_code == 0
+        assert mock_kill.call_count == 2
+
+
+class TestStopDiscoversFleetRunRecords:
+    """Fleet Manager E2/E3 compatibility: ``conductor stop`` discovers (and
+    cleans up) the new ``run_id``-keyed run records written by every run,
+    not just legacy port-keyed ``.pid`` files."""
+
+    def test_stops_workflow_backed_by_a_run_record(self, pid_tmpdir: Path, tmp_path: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("deadbeef", pid, 8080, "/tmp/wf.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
 
         assert result.exit_code == 0
-        assert "already exited" in result.output
-        assert list(pid_tmpdir.glob("*.pid")) == []
+        assert "Stopped" in result.output
+        assert "8080" in result.output
+
+    def test_removes_the_run_record_not_a_pid_file(self, pid_tmpdir: Path, tmp_path: Path) -> None:
+        """Stopping a run-record-backed entry must remove its ``.json``
+        record via ``remove_run_record`` -- not attempt (and silently no-op)
+        a legacy ``.pid`` removal."""
+        from conductor.fleet.records import read_run_record
+
+        pid = os.getpid()
+        _write_run_record("cafef00d", pid, 8081, "/tmp/wf.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
+        ):
+            result = runner.invoke(app, ["stop", "--port", "8081"])
+
+        assert result.exit_code == 0
+        assert read_run_record("cafef00d") is None
+
+    def test_stops_all_mixes_legacy_pid_and_run_record_entries(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """``--all`` stops both a legacy ``.pid``-backed run and a fleet
+        run-record-backed run in the same invocation."""
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8080, "/tmp/wf1.yaml")
+        _write_run_record("abc12345", pid + 1, 9090, "/tmp/wf2.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
+            _spy_stop_process() as mock_kill,
+        ):
+            result = runner.invoke(app, ["stop", "--all"])
+
+        assert result.exit_code == 0
+        assert mock_kill.call_count == 2
+
+    def test_run_record_wins_liveness_check_like_pid_files(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """A dead process's run record is pruned rather than surfaced,
+        mirroring legacy ``.pid`` file liveness pruning."""
+        _write_run_record("00000000", 99999999, 8083, "/tmp/wf.yaml", mode="bg")
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=False):
+            result = runner.invoke(app, ["stop", "--port", "8083"])
+
+        # The dead-pid record is pruned entirely, leaving no running
+        # workflows at all -- the "no workflows" branch, not the "found
+        # some, none match this port" branch.
+        assert result.exit_code == 0
+        assert "No workflows are currently running" in result.output
+
+    def test_legacy_pid_record_classifies_as_bg_and_is_stoppable(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """A pre-upgrade legacy ``.pid`` record is still listable and
+        stoppable, and (per D1) never classifies as anything but ``bg`` --
+        so it can never trigger the foreground-stop confirmation."""
+        pid = os.getpid()
+        _write_pid(pid_tmpdir, pid, 8084, "/tmp/legacy.yaml")
+
+        with (
+            _stops_cleanly(),
+            # Even a non-TTY, --yes-less invocation must not be blocked --
+            # a bg-only fleet (which a legacy record always is) never
+            # prompts, so stdin's TTY-ness is irrelevant here.
+            patch("conductor.cli.app._stdin_is_interactive", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop", "--port", "8084"])
+
+        assert result.exit_code == 0
+        assert "Stopped" in result.output
+
+
+class TestStopForegroundConfirmation:
+    """D1: confirmation prompt gating a foreground (``mode in {"fg",
+    "fg-web"}``) stop (E3-T3/E3-T4)."""
+
+    def test_confirm_yes_stops_the_foreground_run(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f1000001", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            _stops_cleanly(),
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=True) as mock_confirm,
+        ):
+            result = runner.invoke(app, ["stop"], input="y\n")
+
+        assert result.exit_code == 0
+        assert "Stopped" in result.output
+        mock_confirm.assert_called_once()
+
+    def test_confirm_no_stops_nothing_and_exits_zero(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f1000002", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill") as mock_kill,
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop"])
+
+        assert result.exit_code == 0
+        assert "Aborted" in result.output
+        mock_kill.assert_not_called()
+        from conductor.fleet.records import read_run_record
+
+        assert read_run_record("f1000002") is not None
+
+    def test_all_over_mixed_fleet_prompts_exactly_once(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f1000003", pid, None, "/tmp/wf-fg1.yaml", mode="fg")
+        _write_run_record("f1000004", pid + 1, 9001, "/tmp/wf-fg2.yaml", mode="fg-web")
+        _write_run_record("b1000005", pid + 2, 9002, "/tmp/wf-bg.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
+            _spy_stop_process() as mock_kill,
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=True) as mock_confirm,
+        ):
+            result = runner.invoke(app, ["stop", "--all"])
+
+        assert result.exit_code == 0
+        mock_confirm.assert_called_once()
+        assert mock_kill.call_count == 3
+        # The prompt names both foreground runs.
+        assert "wf-fg1" in result.output
+        assert "wf-fg2" in result.output
+
+    def test_all_over_bg_only_fleet_does_not_prompt(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("b1000006", pid, 9010, "/tmp/wf1.yaml", mode="bg")
+        _write_run_record("b1000007", pid + 1, 9011, "/tmp/wf2.yaml", mode="bg")
+
+        with (
+            _stops_cleanly(),
+            _spy_stop_process() as mock_kill,
+            patch("rich.prompt.Confirm.ask") as mock_confirm,
+        ):
+            result = runner.invoke(app, ["stop", "--all"])
+
+        assert result.exit_code == 0
+        mock_confirm.assert_not_called()
+        assert mock_kill.call_count == 2
+
+    def test_yes_flag_bypasses_the_prompt(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f1000008", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            _stops_cleanly(),
+            patch("rich.prompt.Confirm.ask") as mock_confirm,
+        ):
+            result = runner.invoke(app, ["stop", "--run-id", "f1000008", "--yes"])
+
+        assert result.exit_code == 0
+        assert "Stopped" in result.output
+        mock_confirm.assert_not_called()
+
+    def test_short_y_flag_bypasses_the_prompt(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f1000009", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            _stops_cleanly(),
+            patch("rich.prompt.Confirm.ask") as mock_confirm,
+        ):
+            result = runner.invoke(app, ["stop", "--run-id", "f1000009", "-y"])
+
+        assert result.exit_code == 0
+        mock_confirm.assert_not_called()
+
+    def test_non_tty_without_yes_signals_nothing_and_exits_nonzero(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("f100000a", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill") as mock_kill,
+            patch("conductor.cli.app._stdin_is_interactive", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop", "--run-id", "f100000a"])
+
+        assert result.exit_code != 0
+        mock_kill.assert_not_called()
+        from conductor.fleet.records import read_run_record
+
+        assert read_run_record("f100000a") is not None
+
+    def test_prompt_names_the_progress_loss_consequence(self, pid_tmpdir: Path) -> None:
+        """E3-T5: the confirmation text states in-flight progress is lost
+        unless periodic checkpoints are enabled."""
+        pid = os.getpid()
+        _write_run_record("f100000b", pid, None, "/tmp/wf.yaml", mode="fg", checkpoint_dir=None)
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop"])
+
+        assert "progress" in result.output.lower()
+        assert "checkpoint" in result.output.lower()
+
+    def test_prompt_reports_periodic_checkpoints_present(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """E3-T5: when a periodic checkpoint file actually matches this
+        run's ``run_id``, the prompt says so (not just that the directory
+        exists)."""
+        pid = os.getpid()
+        checkpoint_dir = tmp_path / "checkpoints"
+        _write_checkpoint_file(checkpoint_dir, "wf", "f100000c", trigger="periodic")
+        _write_run_record(
+            "f100000c", pid, None, "/tmp/wf.yaml", mode="fg", checkpoint_dir=str(checkpoint_dir)
+        )
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop"])
+
+        assert "periodic checkpoints found" in result.output.lower()
+
+    def test_prompt_reports_no_periodic_checkpoints(self, pid_tmpdir: Path, tmp_path: Path) -> None:
+        """A checkpoint *directory* existing (shared globally by every run)
+        is not, by itself, evidence that *this* run has any -- only a
+        checkpoint file whose own ``run_id`` matches counts (E3-T5)."""
+        pid = os.getpid()
+        checkpoint_dir = tmp_path / "checkpoints"
+        checkpoint_dir.mkdir()
+        # A checkpoint file exists in the (shared) directory, but for a
+        # *different* run_id -- must not be mistaken for this run's own.
+        _write_checkpoint_file(checkpoint_dir, "wf", "some-other-run-id", trigger="periodic")
+        _write_run_record(
+            "f100000d", pid, None, "/tmp/wf.yaml", mode="fg", checkpoint_dir=str(checkpoint_dir)
+        )
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop"])
+
+        assert "no periodic checkpoints found" in result.output.lower()
+
+    def test_prompt_ignores_a_failure_only_checkpoint(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """A ``trigger="failure"`` checkpoint for this run_id does not count
+        as "periodic checkpoints enabled" -- it doesn't protect *future*
+        in-flight progress the way an enabled periodic save would."""
+        pid = os.getpid()
+        checkpoint_dir = tmp_path / "checkpoints"
+        _write_checkpoint_file(checkpoint_dir, "wf", "f100000e", trigger="failure")
+        _write_run_record(
+            "f100000e", pid, None, "/tmp/wf.yaml", mode="fg", checkpoint_dir=str(checkpoint_dir)
+        )
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app._stdin_is_interactive", return_value=True),
+            patch("rich.prompt.Confirm.ask", return_value=False),
+        ):
+            result = runner.invoke(app, ["stop"])
+
+        assert "no periodic checkpoints found" in result.output.lower()
 
 
 class TestStopSelfExclusion:
@@ -318,7 +865,7 @@ class TestStopSelfExclusion:
         _write_pid(pid_tmpdir, _LIVE_PID, 8080, run_id="abc123")
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch.object(app_module, "_stop_process") as stop_spy,
         ):
             result = runner.invoke(app, ["stop"])
@@ -335,7 +882,7 @@ class TestStopSelfExclusion:
         monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset({_LIVE_PID}))
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch.object(app_module, "_stop_process") as stop_spy,
         ):
             result = runner.invoke(app, ["stop"])
@@ -361,7 +908,7 @@ class TestStopSelfExclusion:
         # Pins down *which* run was targeted: a classification that swapped
         # own/other would still print "Excluded"/"Stopped", just against the
         # wrong entry.
-        assert [c.args[0]["port"] for c in spy.call_args_list] == [9090]
+        assert [c.args[0].port for c in spy.call_args_list] == [9090]
 
     def test_all_with_only_self_sends_no_signal(
         self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
@@ -370,7 +917,7 @@ class TestStopSelfExclusion:
         _write_pid(pid_tmpdir, _LIVE_PID, 8080, run_id="self-run")
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch.object(app_module, "_stop_process") as stop_spy,
         ):
             result = runner.invoke(app, ["stop", "--all"])
@@ -386,7 +933,7 @@ class TestStopSelfExclusion:
         _write_pid(pid_tmpdir, _LIVE_PID, 8080, run_id="self-run")
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch.object(app_module, "_stop_process") as stop_spy,
         ):
             result = runner.invoke(app, ["stop", "--port", "8080"])
@@ -402,11 +949,11 @@ class TestStopSelfExclusion:
         monkeypatch.setenv("CONDUCTOR_RUN_ID", "self-run")
         _write_pid(pid_tmpdir, _LIVE_PID, 8080, run_id="self-run")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop", "--port", "9999"])
 
         assert result.exit_code == 1
-        assert "No background workflow found on port 9999" in result.output
+        assert "No running workflow found on port 9999" in result.output
         assert "Excluded" in result.output
         assert "Running workflows:" not in result.output
 
@@ -454,7 +1001,7 @@ class TestStopSelfExclusion:
         # classification would warn about the *other* entry instead, silently.
         assert result.output.count("Warning") == 1
         assert spy.call_count == 2
-        assert sorted(c.args[0]["port"] for c in spy.call_args_list) == [8080, 9090]
+        assert sorted(c.args[0].port for c in spy.call_args_list) == [8080, 9090]
 
     def test_no_flag_mixed_auto_stops_sole_other_and_notes_exclusion(
         self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
@@ -477,7 +1024,7 @@ class TestStopSelfExclusion:
         assert "Stopped" in result.output
         assert "9090" in result.output
         assert "Excluded" in result.output
-        assert [c.args[0]["port"] for c in spy.call_args_list] == [9090]
+        assert [c.args[0].port for c in spy.call_args_list] == [9090]
 
     def test_no_flag_mixed_lists_others_only_and_notes_exclusion(
         self, pid_tmpdir: Path, monkeypatch: pytest.MonkeyPatch
@@ -495,13 +1042,13 @@ class TestStopSelfExclusion:
         _write_pid(pid_tmpdir, 999004, 9091, "/tmp/other2.yaml", run_id="other-run-2")
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch.object(app_module, "_stop_process") as stop_spy,
         ):
             result = runner.invoke(app, ["stop"])
 
         assert result.exit_code == 1
-        assert "Multiple background workflows running (2)" in result.output
+        assert "Multiple workflows running (2)" in result.output
         assert "9090" in result.output
         assert "9091" in result.output
         assert "Excluded" in result.output

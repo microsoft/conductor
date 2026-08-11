@@ -29,6 +29,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links
 - **Safety limits** - Max iterations and timeout enforcement
 - **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
+- **[Fleet manager](docs/fleet.md)** - Discover, stop, and monitor every running `conductor` process (foreground, `--web`, or `--web-bg`) via `conductor stop`/`conductor fleet list`, plus an optional interactive TUI (`conductor fleet`, `pip install 'conductor-cli[tui]'`) for managing and launching runs across your fleet
 - **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
 
 ## Installation
@@ -352,6 +353,22 @@ Validate a workflow file without executing.
 conductor validate <workflow.yaml>
 ```
 
+### `conductor fleet`
+
+Discover and manage every running `conductor` process — foreground,
+`--web`, or `--web-bg` — via `conductor stop` and `conductor fleet list`
+(no extra dependency), or launch the interactive TUI with `conductor fleet`
+(requires `pip install 'conductor-cli[tui]'`):
+
+```bash
+conductor stop                # stop the only running workflow, or list them
+conductor fleet list           # non-interactive table of every live run
+conductor fleet                # interactive TUI (requires the `tui` extra)
+```
+
+See [docs/fleet.md](docs/fleet.md) for the TUI's screens, key bindings, and
+status vocabulary.
+
 **Full CLI documentation:** [docs/cli-reference.md](docs/cli-reference.md)
 
 ## Workflow Registries
@@ -401,6 +418,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 |----------|-------------|
 | [Workflow Syntax](./docs/workflow-syntax.md) | Complete YAML schema reference |
 | [CLI Reference](./docs/cli-reference.md) | Full command-line documentation |
+| [Fleet Manager](./docs/fleet.md) | `conductor fleet` TUI: screens, key bindings, gate resolvability, retention |
 | [Parallel Execution](./docs/parallel-execution.md) | Static parallel groups |
 | [Dynamic Parallel](./docs/dynamic-parallel.md) | For-each groups and array processing |
 | [Claude Provider](./docs/providers/claude.md) | Claude setup and configuration |

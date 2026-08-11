@@ -50,8 +50,54 @@ from conductor.cli.app import (
 from conductor.cli.pid import (
     Liveness,
     remove_pid_file_at,
-    write_pid_file,
 )
+from conductor.fleet.records import RunRecord
+
+
+def write_pid_file(
+    pid: int,
+    port: int,
+    workflow_path: str,
+    run_id: str = "",
+    stderr_log: str = "",
+    stdout_log: str = "",
+):
+    """Write a legacy-shaped ``.pid`` file for these tests.
+
+    Replicates the schema of the now-removed ``cli.pid.write_pid_file``
+    (the Fleet Manager deleted it -- every run path writes a ``run_id``-keyed
+    record via ``conductor.fleet.records.write_run_record`` instead). These
+    tests still need a pre-upgrade-shaped ``.pid`` file to exercise the
+    legacy-tolerance path, so they build one directly.
+
+    Calls ``cli_pid.pid_dir()`` as a module attribute (not a bound import) so
+    it honours each test's ``monkeypatch.setattr("conductor.cli.pid.pid_dir",
+    ...)`` redirection.
+    """
+    import json as _json
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    import conductor.cli.pid as _cli_pid
+
+    filepath = _cli_pid.pid_dir() / f"{_Path(workflow_path).stem}-{port}.pid"
+    filepath.write_text(
+        _json.dumps(
+            {
+                "pid": pid,
+                "port": port,
+                "workflow": str(workflow_path),
+                "started_at": _dt.now(_UTC).isoformat(),
+                "run_id": run_id,
+                "stderr_log": stderr_log,
+                "stdout_log": stdout_log,
+            },
+            indent=2,
+        )
+    )
+    return filepath
+
 
 runner = CliRunner()
 
@@ -64,6 +110,14 @@ def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()
     monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs_dir)
+
+    # `stop`/`status` discover runs via conductor.fleet.records, whose
+    # directory is CONDUCTOR_HOME-aware -- redirecting only pid_dir() would
+    # leave these tests reading (and acting on) the developer's real
+    # ~/.conductor/runs, i.e. their actually-running workflows.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
     return runs_dir
 
 
@@ -88,16 +142,30 @@ def no_self_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
 
 
-def _entry(pid: int = 4242, port: int = 8080, run_id: str = _RUN_ID) -> dict:
-    """Build a PID-file dict shaped like ``read_pid_files`` output."""
-    return {
-        "pid": pid,
-        "port": port,
-        "workflow": "/tmp/my-workflow.yaml",
-        "started_at": "2026-01-01T00:00:00+00:00",
-        "run_id": run_id,
-        "file": f"/tmp/runs/my-workflow-{port}.pid",
-    }
+def _entry(
+    pid: int = 4242,
+    port: int = 8080,
+    run_id: str = _RUN_ID,
+    workflow: str = "/tmp/my-workflow.yaml",
+) -> RunRecord:
+    """Build a run record shaped like ``read_run_records`` output.
+
+    Since the Fleet Manager, ``stop`` and its ladder operate on
+    :class:`RunRecord` rather than PID-file dicts -- ``read_run_records``
+    surfaces legacy ``.pid`` files in this same shape, so there is no longer
+    a dict form for these helpers to model.
+    """
+    return RunRecord(
+        run_id=run_id,
+        pid=pid,
+        workflow_path=workflow,
+        workflow_name=Path(workflow).stem,
+        started_at="2026-01-01T00:00:00+00:00",
+        event_log_path="",
+        port=port,
+        mode="bg",
+        checkpoint_dir=None,
+    )
 
 
 def _quiet() -> Console:
@@ -138,7 +206,7 @@ class TestWorkflowNamesArePrintedLiterally:
         for overrides, expected in rungs:
             buf = io.StringIO()
             con = make_console(file=buf, width=200)
-            entry = _entry() | {"workflow": f"/tmp/{stem}.yaml"}
+            entry = _entry(workflow=f"/tmp/{stem}.yaml")
             with (
                 patch(
                     "conductor.cli.pid.process_liveness",
@@ -174,7 +242,7 @@ class TestWorkflowNamesArePrintedLiterally:
 
         buf = io.StringIO()
         con = make_console(file=buf, width=200)
-        entry = _entry() | {"workflow": "/tmp/a[bold]c.yaml"}
+        entry = _entry(workflow="/tmp/a[bold]c.yaml")
         with (
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.app._confirm_identity", return_value=Identity.MISMATCHED),
@@ -197,7 +265,7 @@ class TestSurvivingRunIsNotOrphaned:
         # Every rung fails and the process refuses to die — the real Windows
         # behaviour that produced the bug report.
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
@@ -217,7 +285,7 @@ class TestSurvivingRunIsNotOrphaned:
         write_pid_file(4242, 8080, "/tmp/my-workflow.yaml", run_id=_RUN_ID)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
             patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
@@ -240,7 +308,7 @@ class TestSurvivingRunIsNotOrphaned:
             return Liveness.DEAD if pid == 1 else Liveness.ALIVE
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", side_effect=_wait),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
@@ -268,7 +336,7 @@ class TestSurvivingRunIsNotOrphaned:
         write_pid_file(4242, 8080, "/tmp/my-workflow.yaml", run_id=_RUN_ID)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.UNKNOWN),
@@ -295,7 +363,7 @@ class TestSurvivingRunIsNotOrphaned:
         write_pid_file(4242, 8080, "/tmp/my-workflow.yaml", run_id=_RUN_ID)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
@@ -769,7 +837,7 @@ class TestJsonOutput:
 
     def test_json_reports_unknown_port_as_an_error(self, pid_tmpdir: Path) -> None:
         write_pid_file(4242, 8080, "/tmp/wf.yaml", run_id=_RUN_ID)
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop", "--port", "9999", "--json"])
         assert result.exit_code == 1
         assert "error" in json.loads(result.stdout)
@@ -777,7 +845,7 @@ class TestJsonOutput:
     def test_json_reports_ambiguous_target_as_an_error(self, pid_tmpdir: Path) -> None:
         write_pid_file(1, 8080, "/tmp/wf1.yaml", run_id=_RUN_ID)
         write_pid_file(2, 9090, "/tmp/wf2.yaml", run_id="ffffffff")
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop", "--json"])
         # Nothing was stopped, so this must not look like success.
         assert result.exit_code == 1
@@ -787,7 +855,7 @@ class TestJsonOutput:
         write_pid_file(4242, 8080, "/tmp/wf.yaml", run_id=_RUN_ID)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.DEAD),
             patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
@@ -810,7 +878,7 @@ class TestJsonOutput:
         write_pid_file(4242, 8080, "/tmp/wf.yaml", run_id=_RUN_ID)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
             patch("conductor.cli.pid.terminate_process", return_value=Liveness.ALIVE),
@@ -846,7 +914,7 @@ class TestWritePidFileRecordsIdentity:
     def test_launcher_actually_forwards_run_id(self) -> None:
         """Guard the wiring, which is the part that was missing.
 
-        ``run_id`` was in the PID-file schema and in ``/api/info`` from the
+        ``run_id`` was in the discovery schema and in ``/api/info`` from the
         start, but the launcher never populated it, so it was always ``""``
         and no identity check was possible. Asserting on the source keeps this
         honest without standing up a real background process: every unit test
@@ -854,17 +922,19 @@ class TestWritePidFileRecordsIdentity:
         notice if the wiring regressed.
 
         ``_spawn_bg_child`` is the single choke point — both ``conductor run
-        --web-bg`` and ``conductor resume --web-bg`` reach the PID file
-        through it — so guarding it covers both launch paths.
+        --web-bg`` and ``conductor resume --web-bg`` reach discovery through
+        it — so guarding it covers both launch paths.
         """
         import inspect
 
         from conductor.cli import bg_runner
 
         finalize_src = inspect.getsource(bg_runner._finalize_background_launch)
-        assert "run_id=run_id" in finalize_src, (
-            "bg_runner must forward run_id to write_pid_file, or conductor stop "
-            "can never confirm a run's identity (issue #344)"
+        assert "read_run_record(run_id)" in finalize_src, (
+            "bg_runner must poll for the child's run record by run_id, or "
+            "conductor stop can never confirm a run's identity (issue #344). "
+            "The parent no longer writes a PID file (Fleet Manager D2) -- the "
+            "child writes its own record and this poll is the launch gate."
         )
         spawn_src = inspect.getsource(bg_runner._spawn_bg_child)
         assert "run_id=run_id" in spawn_src, (

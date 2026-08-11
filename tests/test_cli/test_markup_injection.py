@@ -148,6 +148,11 @@ class TestStatusAndStopRenderWorkflowNames:
         runs = tmp_path / "runs"
         runs.mkdir()
         monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs)
+        # `stop` discovers via conductor.fleet.records (CONDUCTOR_HOME-aware),
+        # so redirecting pid_dir() alone would read the developer's real runs.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
         # Issue #399: the hardcoded ``pid: 610745`` below must never be
         # misidentified as this test process's own run by a coincidental
         # ancestor PID, which would make this markup test flaky.
@@ -171,7 +176,7 @@ class TestStatusAndStopRenderWorkflowNames:
 
     def test_status_shows_the_whole_workflow_name(self, pid_dir: Path) -> None:
         self._write_pid(pid_dir, f"report {DELETED} run")
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"])
         assert result.exit_code == 0, result.output
         assert f"report {DELETED} run" in result.output
@@ -179,7 +184,7 @@ class TestStatusAndStopRenderWorkflowNames:
     def test_stop_listing_shows_the_whole_workflow_name(self, pid_dir: Path) -> None:
         self._write_pid(pid_dir, f"report {DELETED} run")
         self._write_pid(pid_dir, "other")
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["stop"])
         assert f"report {DELETED} run" in result.output
 

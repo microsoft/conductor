@@ -781,8 +781,74 @@ default_model: claude-3.5-sonnet  # Wrong: dot instead of dash
 
 The Claude provider only supports `stdio` MCP servers. If you are using `http` or `sse` servers, switch to the Copilot provider or use a stdio-based server instead. See the [MCP Tools guide](mcp-tools.md) for provider-specific details.
 
+## Machine-Wide Settings (`~/.conductor/config.toml`)
+
+Unlike everything above — which lives in a workflow's own YAML — some
+settings are cross-cutting and apply to every `conductor` invocation on the
+machine, regardless of which workflow is running. These live in a separate
+TOML file, alongside the existing `~/.conductor/registries.toml`.
+
+### Location
+
+```
+~/.conductor/config.toml
+```
+
+Respects the `CONDUCTOR_HOME` environment variable the same way
+`registries.toml` does: when set, the file is read from
+`$CONDUCTOR_HOME/config.toml` instead. A missing file is normal — every
+setting defaults cleanly, and `conductor run` is entirely unaffected by its
+absence.
+
+**Read-only in v1.** There is no `conductor config set` and no in-process
+writer — the file is hand-edited. A malformed file only breaks an explicit
+command that reads it (like `conductor fleet prune` with no `--keep-last`
+override); it never breaks `conductor run` or `conductor resume`, which
+swallow a settings load failure and simply skip the feature the setting
+configures.
+
+### `[fleet.retention]`
+
+Controls the Fleet Manager's opportunistic event-log retention sweep —
+bounding the otherwise-unbounded `$TMPDIR/conductor/` directory of JSONL
+event logs (one per run) that accumulates over time.
+
+```toml
+[fleet.retention]
+enabled = true
+keep_last = 200
+```
+
+| Key | Default | Description |
+|-----|---------|--------------|
+| `enabled` | `true` | Whether `conductor run` / `conductor resume` opportunistically prune old event logs at startup. |
+| `keep_last` | `200` | Number of most-recent event logs to retain. A value of `0` or negative is treated as "prune nothing," not "delete everything" — mirroring the same `keep_last` semantics used by periodic checkpoint rotation (see [Periodic Checkpoints](workflow-syntax.md#periodic-checkpoints)). |
+
+Retention never deletes:
+
+- The `checkpoints/` subdirectory (also under `$TMPDIR/conductor/`) or
+  anything inside it.
+- An event log still referenced by a currently-running (or currently
+  resuming) workflow.
+- The `.bg.stderr.log` / `.bg.stdout.log` companion files of a retained
+  `--web-bg` run's event log — the three artefacts of one run are always
+  kept or removed together.
+
+> **Consequence:** pruning an event log makes that run's history
+> unavailable to `conductor replay` — `replay` reads the JSONL event log
+> directly, so once it is deleted there is nothing left to replay. Set
+> `keep_last` generously if you rely on `replay` for older runs.
+
+`enabled = false` disables the automatic startup sweep (it defaults to
+`true`). `conductor fleet prune` (see the [CLI reference](cli-reference.md#conductor-fleet-prune))
+is the explicit manual entry point and always works regardless of this
+setting — pass `--keep-last` to override the configured value for a single
+invocation, or `--dry-run` to preview what would be deleted without
+actually deleting anything.
+
 ## See Also
 
+- [Fleet Manager](fleet.md)
 - [MCP Tools](mcp-tools.md)
 - [Claude Provider Documentation](providers/claude.md)
 - [Provider Comparison](providers/comparison.md)

@@ -1,10 +1,18 @@
 """Tests for PID file utilities (``conductor.cli.pid``).
 
 Covers:
-- ``write_pid_file`` / ``read_pid_files`` / ``remove_pid_file``
+- ``read_pid_files`` / ``remove_pid_file``
 - ``remove_pid_file_for_current_process``
 - Stale PID cleanup (process no longer alive)
-- ``_is_process_alive`` platform dispatch (POSIX + Windows)
+- ``is_process_alive`` / ``_is_process_alive`` platform dispatch (POSIX + Windows)
+
+``write_pid_file`` itself was removed in Fleet Manager E2 (no new ``.pid``
+files are ever written; every run path now writes a ``run_id``-keyed record
+via ``conductor.fleet.records.write_run_record`` instead) — see
+``cli/pid.py``'s module docstring. The read/remove functions remain to
+discover and clean up files written by a still-running, pre-upgrade
+background child, so this suite still needs to create legacy-shaped ``.pid``
+fixture files directly, via :func:`_write_legacy_pid_file` below.
 """
 
 from __future__ import annotations
@@ -12,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -21,11 +30,32 @@ from conductor.cli.pid import (
     _is_process_alive,
     _is_process_alive_posix,
     _is_process_alive_windows,
+    is_process_alive,
     read_pid_files,
     remove_pid_file,
     remove_pid_file_for_current_process,
-    write_pid_file,
 )
+
+
+def _write_legacy_pid_file(pid_dir: Path, pid: int, port: int, workflow_path: str) -> Path:
+    """Write a legacy-shaped ``.pid`` fixture file directly.
+
+    Mirrors the exact JSON shape the now-removed ``write_pid_file`` used to
+    produce, so ``read_pid_files`` / ``remove_pid_file`` /
+    ``remove_pid_file_for_current_process`` — which still must tolerate
+    pre-upgrade files on disk — continue to be exercised against real
+    on-disk fixtures rather than only in-memory data.
+    """
+    workflow_name = Path(workflow_path).stem
+    filepath = pid_dir / f"{workflow_name}-{port}.pid"
+    data = {
+        "pid": pid,
+        "port": port,
+        "workflow": str(workflow_path),
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    filepath.write_text(json.dumps(data, indent=2))
+    return filepath
 
 
 @pytest.fixture()
@@ -34,93 +64,22 @@ def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()
     monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs_dir)
+
+    # `stop`/`status` discover runs via conductor.fleet.records, whose
+    # directory is CONDUCTOR_HOME-aware -- redirecting only pid_dir() would
+    # leave these tests reading (and acting on) the developer's real
+    # ~/.conductor/runs, i.e. their actually-running workflows.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
     return runs_dir
-
-
-class TestWritePidFile:
-    """Tests for ``write_pid_file``."""
-
-    def test_creates_pid_file(self, pid_tmpdir: Path) -> None:
-        path = write_pid_file(12345, 8080, "/tmp/workflow.yaml")
-        assert path.exists()
-        data = json.loads(path.read_text())
-        assert data["pid"] == 12345
-        assert data["port"] == 8080
-        assert data["workflow"] == "/tmp/workflow.yaml"
-        assert "started_at" in data
-
-    def test_defaults_run_id_and_log_paths_to_empty_strings(self, pid_tmpdir: Path) -> None:
-        """A call with no explicit run_id/log paths still writes the keys."""
-        path = write_pid_file(12345, 8080, "/tmp/workflow.yaml")
-        data = json.loads(path.read_text())
-        assert data["run_id"] == ""
-        assert data["stderr_log"] == ""
-        assert data["stdout_log"] == ""
-
-    def test_round_trips_run_id_and_log_paths(self, pid_tmpdir: Path) -> None:
-        path = write_pid_file(
-            12345,
-            8080,
-            "/tmp/workflow.yaml",
-            run_id="a1b2c3d4",
-            stderr_log="/tmp/conductor/conductor-workflow-20260303-120000-a1b2c3d4.bg.stderr.log",
-            stdout_log="/tmp/conductor/conductor-workflow-20260303-120000-a1b2c3d4.bg.stdout.log",
-        )
-        data = json.loads(path.read_text())
-        assert data["run_id"] == "a1b2c3d4"
-        assert data["stderr_log"].endswith("bg.stderr.log")
-        assert data["stdout_log"].endswith("bg.stdout.log")
-
-    def test_filename_uses_workflow_stem_and_port(self, pid_tmpdir: Path) -> None:
-        path = write_pid_file(100, 9090, "/some/path/my-workflow.yaml")
-        assert path.name == "my-workflow-9090.pid"
-
-    def test_overwrites_existing_pid_file(self, pid_tmpdir: Path) -> None:
-        write_pid_file(100, 8080, "/tmp/wf.yaml")
-        write_pid_file(200, 8080, "/tmp/wf.yaml")
-        data = json.loads((pid_tmpdir / "wf-8080.pid").read_text())
-        assert data["pid"] == 200
-
-    def test_write_is_atomic_so_a_reader_never_sees_a_partial_file(self, pid_tmpdir: Path) -> None:
-        """A truncating write races every reader, and readers here delete.
-
-        ``read_pid_files`` treats unparseable JSON as a dead run and unlinks it,
-        so a ``stop`` or ``status`` landing inside a non-atomic rewrite window
-        silently deregisters a live workflow. Asserting the rename directly is
-        what pins the property: mocking the filesystem would only re-test the
-        mock.
-        """
-        write_pid_file(100, 8080, "/tmp/wf.yaml")
-        target = pid_tmpdir / "wf-8080.pid"
-
-        seen: list[str] = []
-        real_replace = os.replace
-
-        def _spy(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
-            # Before the rename the destination must still hold the OLD content
-            # in full — never a truncated or empty file.
-            seen.append(Path(str(dst)).read_text())
-            real_replace(src, dst)
-
-        with patch("conductor.cli.pid.os.replace", side_effect=_spy):
-            write_pid_file(200, 8080, "/tmp/wf.yaml")
-
-        assert len(seen) == 1, "write_pid_file must publish via a single atomic rename"
-        assert json.loads(seen[0])["pid"] == 100
-        assert json.loads(target.read_text())["pid"] == 200
-
-    def test_temp_file_is_not_left_behind(self, pid_tmpdir: Path) -> None:
-        """A stray temp file would be picked up by nothing and cleaned by nobody."""
-        write_pid_file(100, 8080, "/tmp/wf.yaml")
-        assert list(pid_tmpdir.glob("*.tmp")) == []
-        assert len(list(pid_tmpdir.glob("*.pid"))) == 1
 
 
 class TestReadPidFiles:
     """Tests for ``read_pid_files``."""
 
     def test_returns_alive_processes(self, pid_tmpdir: Path) -> None:
-        write_pid_file(os.getpid(), 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, os.getpid(), 8080, "/tmp/wf.yaml")
         results = read_pid_files()
         assert len(results) == 1
         assert results[0]["pid"] == os.getpid()
@@ -128,9 +87,9 @@ class TestReadPidFiles:
 
     def test_cleans_up_stale_pid_files(self, pid_tmpdir: Path) -> None:
         # Write a PID file for a non-existent process
-        write_pid_file(99999999, 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, 99999999, 8080, "/tmp/wf.yaml")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=False):
+        with patch("conductor.cli.pid.is_process_alive", return_value=False):
             results = read_pid_files()
 
         assert len(results) == 0
@@ -145,8 +104,8 @@ class TestReadPidFiles:
 
     def test_returns_multiple_processes(self, pid_tmpdir: Path) -> None:
         current = os.getpid()
-        write_pid_file(current, 8080, "/tmp/wf1.yaml")
-        write_pid_file(current, 9090, "/tmp/wf2.yaml")
+        _write_legacy_pid_file(pid_tmpdir, current, 8080, "/tmp/wf1.yaml")
+        _write_legacy_pid_file(pid_tmpdir, current, 9090, "/tmp/wf2.yaml")
         results = read_pid_files()
         assert len(results) == 2
         ports = {r["port"] for r in results}
@@ -157,12 +116,12 @@ class TestRemovePidFile:
     """Tests for ``remove_pid_file``."""
 
     def test_removes_by_port(self, pid_tmpdir: Path) -> None:
-        write_pid_file(12345, 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, 12345, 8080, "/tmp/wf.yaml")
         assert remove_pid_file(8080) is True
         assert list(pid_tmpdir.glob("*.pid")) == []
 
     def test_returns_false_for_unknown_port(self, pid_tmpdir: Path) -> None:
-        write_pid_file(12345, 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, 12345, 8080, "/tmp/wf.yaml")
         assert remove_pid_file(9999) is False
 
     def test_returns_false_when_no_pid_files(self, pid_tmpdir: Path) -> None:
@@ -173,17 +132,17 @@ class TestRemovePidFileForCurrentProcess:
     """Tests for ``remove_pid_file_for_current_process``."""
 
     def test_removes_own_pid_file(self, pid_tmpdir: Path) -> None:
-        write_pid_file(os.getpid(), 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, os.getpid(), 8080, "/tmp/wf.yaml")
         assert remove_pid_file_for_current_process() is True
         assert list(pid_tmpdir.glob("*.pid")) == []
 
     def test_returns_false_when_no_match(self, pid_tmpdir: Path) -> None:
-        write_pid_file(99999999, 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, 99999999, 8080, "/tmp/wf.yaml")
         assert remove_pid_file_for_current_process() is False
 
     def test_leaves_other_pid_files(self, pid_tmpdir: Path) -> None:
-        write_pid_file(os.getpid(), 8080, "/tmp/wf.yaml")
-        write_pid_file(99999999, 9090, "/tmp/wf2.yaml")
+        _write_legacy_pid_file(pid_tmpdir, os.getpid(), 8080, "/tmp/wf.yaml")
+        _write_legacy_pid_file(pid_tmpdir, 99999999, 9090, "/tmp/wf2.yaml")
         remove_pid_file_for_current_process()
         remaining = list(pid_tmpdir.glob("*.pid"))
         assert len(remaining) == 1
@@ -244,6 +203,50 @@ class TestIsProcessAliveDispatch:
             assert _is_process_alive(42) is False
             win.assert_called_once_with(42)
             posix.assert_not_called()
+
+
+class TestIsProcessAlivePublicAlias:
+    """Regression coverage for the E1-T1 promotion of ``_is_process_alive``
+    to a public ``is_process_alive``, keeping ``_is_process_alive`` bound to
+    the same function object as a backward-compatible alias (so existing
+    patch targets in ``tests/test_cli/test_stop.py`` keep resolving)."""
+
+    def test_alias_is_the_same_function_object(self) -> None:
+        assert is_process_alive is _is_process_alive
+
+    def test_public_name_dispatches_to_posix_on_non_windows(self) -> None:
+        with (
+            patch("conductor.cli.pid.sys.platform", "linux"),
+            patch("conductor.cli.pid._is_process_alive_posix", return_value=True) as posix,
+            patch("conductor.cli.pid._is_process_alive_windows") as win,
+        ):
+            assert is_process_alive(42) is True
+            posix.assert_called_once_with(42)
+            win.assert_not_called()
+
+    def test_public_name_dispatches_to_windows_on_win32(self) -> None:
+        with (
+            patch("conductor.cli.pid.sys.platform", "win32"),
+            patch("conductor.cli.pid._is_process_alive_windows", return_value=False) as win,
+            patch("conductor.cli.pid._is_process_alive_posix") as posix,
+        ):
+            assert is_process_alive(42) is False
+            win.assert_called_once_with(42)
+            posix.assert_not_called()
+
+    def test_patching_private_alias_still_affects_internal_call_sites(
+        self, pid_tmpdir: Path
+    ) -> None:
+        """``read_pid_files`` (and other in-module callers) reference the
+        private ``_is_process_alive`` name at call time, so patching that
+        name — the existing pattern in ``tests/test_cli/test_stop.py`` —
+        must keep working after the E1-T1 promotion."""
+        _write_legacy_pid_file(pid_tmpdir, os.getpid(), 8080, "/tmp/wf.yaml")
+        with patch("conductor.cli.pid._is_process_alive", return_value=False) as probe:
+            from conductor.cli.pid import read_pid_files
+
+            assert read_pid_files() == []
+            probe.assert_called_once_with(os.getpid())
 
 
 def _make_kernel32_mock(
@@ -380,7 +383,7 @@ class TestReadPidFilesDoesNotCrashOnOsError:
         reason="Patches os.kill, which the Windows path does not use.",
     )
     def test_unexpected_oserror_does_not_propagate(self, pid_tmpdir: Path) -> None:
-        write_pid_file(99999999, 8080, str(pid_tmpdir / "wf.yaml"))
+        _write_legacy_pid_file(pid_tmpdir, 99999999, 8080, str(pid_tmpdir / "wf.yaml"))
         with patch(
             "conductor.cli.pid.os.kill",
             side_effect=OSError(

@@ -8,6 +8,9 @@ Complete command-line reference for Conductor.
 - [`conductor run`](#conductor-run)
 - [`conductor status`](#conductor-status)
 - [`conductor stop`](#conductor-stop)
+- [`conductor fleet`](#conductor-fleet)
+- [`conductor fleet list`](#conductor-fleet-list)
+- [`conductor fleet prune`](#conductor-fleet-prune)
 - [`conductor gate respond`](#conductor-gate-respond)
 - [`conductor guide`](#conductor-guide)
 - [`conductor checkpoint list`](#conductor-checkpoint-list)
@@ -295,7 +298,9 @@ conductor status --json
 
 ## `conductor stop`
 
-Stop background workflow processes launched with `--web-bg`.
+Stop running workflow processes — foreground, foreground+web, or background
+(`--web-bg`). Discovers every run via its Fleet Manager run record
+(`~/.conductor/runs/`, keyed by run ID), not just `--web-bg` processes.
 
 ```bash
 conductor stop [OPTIONS]
@@ -305,27 +310,75 @@ conductor stop [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--port PORT` | Stop the workflow running on this specific port |
-| `--all` | Stop all *other* background conductor workflows (see Self-Exclusion) |
+| `--port PORT` | Stop the workflow whose dashboard is on this specific port |
+| `--run-id RUN_ID` | Stop the workflow with this run ID (the only selector that can target a foreground run, which has no dashboard port) |
+| `--all` | Stop all *other* running conductor workflows (see Self-Exclusion) |
 | `--allow-self` | Include the run this command is executing inside (refused by default) |
+| `--yes`, `-y` | Skip the confirmation prompt when stopping a foreground run |
 | `--force` | Proceed when the run's identity cannot be confirmed (see [Identity and `--force`](#identity-and---force)) |
 | `--json` | Emit a machine-readable result per workflow on stdout instead of prose |
 
-With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`. That listing shares its rendering with `conductor status`, so `Started` is shown at the same minute precision in UTC.
+With no options, `conductor stop` lists running workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--run-id`, `--port`, or `--all`. That listing shares its rendering with `conductor status`, so `Started` is shown at the same minute precision in UTC.
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | Every targeted workflow is confirmed stopped, or was already gone — including a self-only refusal (see Self-Exclusion) |
-| `1` | `--port` matched no running workflow, the target was ambiguous, or `--port` matched only your own run |
+| `1` | `--port`/`--run-id` matched no running workflow, the target was ambiguous, or the selector matched only your own run |
 | `2` | At least one workflow survived, or could not be confirmed stopped |
 
 Exit `2` is deliberately not a synonym for failure to signal — it means Conductor could not *prove* the process is gone. A run that ignored every rung and a run whose liveness could not be probed both land here, because both leave you with something you should look at by hand.
 
+Listing without stopping anything (the ambiguous case) is exit `1`, not `0`: it is a failure to act, and must not report success to a script.
+
+### Foreground confirmation
+
+Stopping a **foreground** run (no dashboard, or a dashboard started without
+`--web-bg`) requires confirmation, because — unlike a `--web-bg` process,
+where the dashboard's Stop/Kill controls checkpoint before terminating — a
+plain `SIGTERM` discards in-flight progress unless
+[periodic checkpoints](workflow-syntax.md#periodic-checkpoints) are enabled
+for that run. The prompt names every foreground run in scope and reports,
+per run, whether a periodic checkpoint was actually found for it. `--all`
+over a mixed fleet prompts **once**, naming all the foreground runs it would
+stop; a background-only fleet is never prompted.
+
+Use `--yes`/`-y` to skip the prompt (e.g. in scripts or CI). If stdin is not
+a terminal and `--yes` was not passed, `conductor stop` refuses to
+proceed — printing the runs it would have stopped and exiting non-zero —
+rather than silently defaulting to "yes".
+
+A pre-upgrade, legacy port-keyed `.pid` record (written by versions of
+Conductor before the Fleet Manager run-record system) is always treated as
+a background run and never triggers this prompt.
+
 ### How It Works
 
-When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The PID file also records the launch's `run_id` and the child's captured stderr/stdout log paths (see `conductor status --json` above), so a run stays correlatable to its forensic artefacts even after the launching terminal is gone. PID files are written atomically, so a concurrent `stop` can never read a half-written file. They are also cleaned up automatically when a background workflow completes normally.
+Every `conductor run` (and `resume`) writes a run record to
+`~/.conductor/runs/<run_id>.json` describing its mode (`fg`, `fg-web`, or
+`bg`), PID, workflow path, and (for a run with a dashboard) port. Records are
+written atomically, so a concurrent `stop` can never read a half-written one,
+and they are removed automatically when a workflow completes normally.
+
+`stop` reads these records, escalates until the target is confirmed gone (a
+graceful cancel via the dashboard, which lets the run checkpoint, then a
+platform signal, then forceful termination), and only removes a run record
+once its process is confirmed dead — so a workflow that survives stays
+discoverable instead of becoming an untracked orphan. On Windows there is no
+`SIGKILL` equivalent, so a still-running process is reported as such rather
+than declared stopped.
+
+A handful of pre-upgrade port-keyed `.pid` files may still exist under the
+same directory; they are read and cleaned up the same way, so a background
+run started before upgrading stays stoppable.
+
+> **Windows note:** `CTRL_BREAK_EVENT` is delivered via
+> `GenerateConsoleCtrlEvent`, which only reaches process groups attached to
+> the *sending* process's own console. A `conductor stop` invoked from a
+> different console window cannot reach a foreground `conductor run` (or a
+> `--web-bg` child, which is spawned in its own detached process group) in
+> another console.
 
 `stop` reads those files and escalates through a ladder, confirming each rung before moving to the next:
 
@@ -414,17 +467,134 @@ the full list of running workflows, including your own.
 ### Examples
 
 ```bash
-# Stop the only running background workflow
+# Stop the only running workflow
 conductor stop
 
-# Stop a specific workflow by port
+# Stop a specific workflow by dashboard port
 conductor stop --port 8080
 
-# Stop all other running background workflows
+# Stop a specific workflow by run ID (works even with no dashboard)
+conductor stop --run-id a1b2c3d4
+
+# Stop all other running workflows, confirming once if any are foreground
 conductor stop --all
 
 # Include the run this command is executing inside
 conductor stop --allow-self --port 8080
+
+# Stop all running workflows non-interactively (e.g. in a script)
+conductor stop --all --yes
+```
+
+## `conductor fleet`
+
+Monitor and manage the fleet of running Conductor workflows. With no
+subcommand, launches the interactive Textual TUI — see
+[`docs/fleet.md`](fleet.md) for the full guide to its screens, key
+bindings, and status vocabulary.
+
+```bash
+conductor fleet
+```
+
+The TUI requires the `tui` extra:
+
+```bash
+pip install 'conductor-cli[tui]'
+```
+
+Without it, the bare invocation prints an install hint and exits non-zero
+rather than raising an `ImportError` traceback:
+
+```bash
+$ conductor fleet
+Error: the interactive fleet manager requires the 'tui' extra.
+Install with: pip install 'conductor-cli[tui]'
+```
+
+`conductor fleet list` and `conductor fleet prune` (below) need nothing
+beyond a normal Conductor install — only the bare, no-subcommand
+invocation needs `textual`.
+
+### Examples
+
+```bash
+# Launch the interactive TUI
+conductor fleet
+```
+
+## `conductor fleet list`
+
+List every live Conductor run — foreground, foreground+web, or
+`--web-bg` — as a non-interactive Rich table. Discovers runs the same way
+`conductor stop` does, via the Fleet Manager run record
+(`~/.conductor/runs/`), so foreground runs show up here too, not just
+`--web-bg` ones. This is core functionality with no optional dependency —
+unlike the interactive `conductor fleet` TUI above, which requires the
+`tui` extra.
+
+```bash
+conductor fleet list
+```
+
+Each row shows the workflow name, mode (`fg`, `fg-web`, or `bg`), status,
+PID, dashboard port (`—` for a foreground run with no dashboard), and start
+time. When no runs are active, it prints a dim "No runs found." line and
+exits `0` — an empty fleet is a normal state, not an error.
+
+### Examples
+
+```bash
+# List every live run
+conductor fleet list
+```
+
+## `conductor fleet prune`
+
+Prune old event logs under `$TMPDIR/conductor/`, keeping only the
+most-recent `keep_last` (see
+[`~/.conductor/config.toml`](configuration.md#machine-wide-settings-conductorconfigtoml)'s
+`[fleet.retention]` table). This is the explicit manual entry point for
+retention and always works — regardless of whether the opportunistic
+startup sweep is enabled via `[fleet.retention].enabled`.
+
+```bash
+conductor fleet prune [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--keep-last N` | Number of most-recent event logs to retain, overriding `[fleet.retention].keep_last` from the settings file for this invocation only |
+| `--dry-run` | List what would be pruned without deleting anything |
+
+Never deletes the `checkpoints/` subdirectory or an event log still
+referenced by a live (or currently-resuming) run. A retained or live run's
+`.bg.stderr.log` / `.bg.stdout.log` companion files are always kept
+alongside its event log.
+
+> **Warning:** pruning an event log makes that run's history unavailable to
+> [`conductor replay`](#conductor-run) — `replay` reads the JSONL event log
+> directly, so once it's deleted there is nothing left to replay.
+
+With no `--keep-last`, the configured value from
+`~/.conductor/config.toml` is used (`200` if the file doesn't set one). A
+malformed settings file is reported as an error and exits non-zero in this
+case; passing `--keep-last` explicitly bypasses the settings file entirely,
+so a broken `config.toml` never blocks a manual override.
+
+### Examples
+
+```bash
+# Prune using the configured (or default) keep_last
+conductor fleet prune
+
+# Preview what would be pruned without deleting anything
+conductor fleet prune --dry-run
+
+# Override keep_last for this invocation only
+conductor fleet prune --keep-last 50
 ```
 
 ## `conductor gate respond`
@@ -867,6 +1037,7 @@ are hidden from `--help` and are slated for removal in a future release.
 
 ## See Also
 
+- [Fleet Manager](./fleet.md) - The `conductor fleet` TUI: screens, key bindings, gate resolvability, retention
 - [Workflow Syntax Reference](./workflow-syntax.md) - Complete YAML syntax
 - [Examples](../examples/) - Example workflows
 - [Providers](./providers/) - Provider-specific documentation

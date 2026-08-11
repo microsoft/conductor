@@ -8,6 +8,7 @@ the full rationale.
 """
 
 import re
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,44 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if mark_name in item.keywords:
                 item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_event_log_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect ``tempfile.gettempdir()`` to this test's own ``tmp_path`` for
+    *every* test, not just the ones that already know to isolate it.
+
+    ``conductor.fleet.retention.event_log_root()`` (and every other caller
+    of ``tempfile.gettempdir()`` -- ``engine/event_log.py``,
+    ``cli/bg_runner.py``) resolve ``$TMPDIR/conductor/`` from this same
+    function. Since Fleet Manager E5, ``run_workflow_async`` /
+    ``resume_workflow_async`` call ``maybe_prune_event_logs()`` on startup
+    with retention *enabled by default* (``keep_last = 200``) -- without
+    this guard, any test that drives those functions (directly, or via a
+    CLI command) prunes the *developer's actual* ``$TMPDIR/conductor/``,
+    permanently deleting real ``conductor replay`` material. This was
+    reproduced empirically: planting sentinel logs in the real
+    ``/tmp/conductor`` and running a single wiring test alone deleted two of
+    them.
+
+    Returns pytest's own ``tmp_path`` verbatim (not a nested subdirectory
+    of it) so that any other code in the same test which independently
+    builds a path under ``tmp_path`` and compares it against
+    ``tempfile.gettempdir()`` (e.g. ``mcp/manager.py``'s spill-dir
+    symlink policy, which checks ``spill_dir.is_relative_to(temp_root)``)
+    still sees a consistent root -- a nested subdirectory would make such
+    paths spuriously "outside" the patched temp root and change behavior
+    unrelated to this guard's purpose.
+
+    An autouse fixture here means no future test needs to remember to
+    isolate this itself. Tests that need a specific isolated root (e.g.
+    ``tests/test_fleet/test_retention.py``'s own ``temp_root`` fixture) can
+    still patch ``tempfile.gettempdir`` again themselves -- the later
+    ``monkeypatch.setattr`` simply wins, and both this fixture and theirs
+    ultimately point at a location under pytest's own ``tmp_path``, never
+    the real system temp directory.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
 
 
 @pytest.fixture

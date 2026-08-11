@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import _format_started_at, _print_running_list, app
+from conductor.fleet.records import RunRecord
 
 runner = CliRunner()
 
@@ -44,10 +46,19 @@ def _squash(text: str) -> str:
 
 @pytest.fixture()
 def pid_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Override ``pid_dir()`` to use a temporary directory."""
+    """Isolate both run records and legacy PID files.
+
+    ``conductor status`` reads run records (``scan_run_records``) as well as
+    legacy ``.pid`` files, so both locations must be redirected or these
+    tests would pick up the developer's real ``~/.conductor/``.
+    """
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()
     monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: runs_dir)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
     return runs_dir
 
 
@@ -57,32 +68,54 @@ def _write_pid(
     port: int,
     workflow: str = "/tmp/wf.yaml",
     *,
+    run_id: str | None = None,
     stderr_log: str = "/tmp/conductor/conductor-wf-20260303-000000-a1b2c3d4.bg.stderr.log",
     stdout_log: str = "/tmp/conductor/conductor-wf-20260303-000000-a1b2c3d4.bg.stdout.log",
 ) -> Path:
-    """Write a PID file via the real ``write_pid_file``, not hand-built JSON.
+    """Write a run record via the real ``write_run_record``, not hand-built JSON.
 
     A hand-built fixture with a 19-character naive ``started_at`` (rather than
     production's 32-character microsecond-precision value) is what let issue
     #405 through: the table looked fine against a timestamp shorter than any
-    real run ever produces. Delegating to ``write_pid_file`` means the widths
-    under test are the widths production actually writes. The ``pid_dir``
-    parameter is otherwise unused here, so asserting the returned path's
-    parent against it pins that the ``conductor.cli.pid.pid_dir`` monkeypatch
-    is actually honoured by ``write_pid_file`` (which resolves ``pid_dir()``
-    from module globals at call time).
+    real run ever produces. Delegating to the real writer means the widths
+    under test are the widths production actually writes. Since the Fleet
+    Manager that writer is ``conductor.fleet.records.write_run_record`` --
+    ``cli.pid.write_pid_file`` was removed, and ``status`` reads run records
+    now -- but the anti-hand-rolling reason for going through it is unchanged.
     """
-    from conductor.cli.pid import write_pid_file
+    from conductor.fleet.records import RunRecord, write_run_record
 
-    filepath = write_pid_file(
-        pid,
-        port,
-        workflow,
-        run_id=_RUN_ID,
-        stderr_log=stderr_log,
-        stdout_log=stdout_log,
+    # Run records are keyed by run_id, so two runs sharing one id would
+    # overwrite each other -- unlike the port-keyed .pid files this helper
+    # replaced. Default to a per-port id so multi-run tests get two records.
+    resolved_run_id = run_id if run_id is not None else f"{_RUN_ID[:4]}{port:04d}"
+
+    # `status --json` locates a bg run's capture logs on disk (they are not
+    # carried in the record), so they must actually exist for the lookup to
+    # report them -- which also keeps this fixture honest about what a real
+    # --web-bg launch leaves behind.
+    log_dir = pid_dir.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    stem = f"conductor-wf-20260303-000000-{resolved_run_id}"
+    (log_dir / f"{stem}.bg.stderr.log").write_text("")
+    (log_dir / f"{stem}.bg.stdout.log").write_text("")
+    events_log = log_dir / f"{stem}.events.jsonl"
+    events_log.write_text("")
+
+    filepath = write_run_record(
+        RunRecord(
+            run_id=resolved_run_id,
+            pid=pid,
+            workflow_path=workflow,
+            workflow_name=Path(workflow).stem,
+            started_at=datetime.now(UTC).isoformat(),
+            event_log_path=str(events_log),
+            port=port,
+            mode="bg",
+            checkpoint_dir=None,
+        )
     )
-    assert filepath.parent == pid_dir
+    assert pid_dir.exists()
     return filepath
 
 
@@ -98,7 +131,7 @@ class TestStatusNeverStops:
         _write_pid(pid_tmpdir, 4242, 8080)
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.app._stop_process") as stop_one,
             patch("conductor.cli.app.os.kill") as kill,
         ):
@@ -138,12 +171,12 @@ class TestStatusNeverStops:
         )
 
     def test_pid_files_are_left_in_place(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, 4242, 8080)
+        record = _write_pid(pid_tmpdir, 4242, 8080)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             runner.invoke(app, ["status"])
 
-        assert len(list(pid_tmpdir.glob("*.pid"))) == 1
+        assert record.exists()
 
     def test_a_pid_file_is_not_deleted_when_the_process_looks_dead(self, pid_tmpdir: Path) -> None:
         """Not stopping anything is only half of read-only.
@@ -156,22 +189,20 @@ class TestStatusNeverStops:
         reach here. Deleting on that evidence is how issue #344's orphan is
         reached through the command meant to be the safe one.
         """
-        _write_pid(pid_tmpdir, 4242, 8080)
+        record = _write_pid(pid_tmpdir, 4242, 8080)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=False):
+        with patch("conductor.cli.pid.is_process_alive", return_value=False):
             result = runner.invoke(app, ["status"])
 
         assert result.exit_code == 0
-        assert len(list(pid_tmpdir.glob("*.pid"))) == 1, (
-            "status deleted a PID file — a read-only command must not prune"
-        )
+        assert record.exists(), "status deleted a PID file — a read-only command must not prune"
 
     def test_an_unreadable_pid_file_is_not_deleted(self, pid_tmpdir: Path) -> None:
         """A half-written file is a live run mid-launch, not garbage."""
         corrupt = pid_tmpdir / "half-written-8080.pid"
         corrupt.write_text('{"pid": 4242, "por')
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"])
 
         assert result.exit_code == 0
@@ -187,7 +218,7 @@ class TestStatusNeverStops:
         (pid_tmpdir / "noport-1234.pid").write_text(json.dumps({"pid": 999}))
         _write_pid(pid_tmpdir, 4242, 8080)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"])
 
         assert result.exit_code == 0
@@ -198,7 +229,7 @@ class TestStatusNeverStops:
         _write_pid(pid_tmpdir, 2, 9090, "/tmp/wf2.yaml")
 
         with (
-            patch("conductor.cli.pid._is_process_alive", return_value=True),
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
             patch("conductor.cli.app._stop_process") as stop_one,
         ):
             result = runner.invoke(app, ["status"])
@@ -220,7 +251,7 @@ class TestStatusOutput:
         discovery is the main thing this command is for."""
         _write_pid(pid_tmpdir, 4242, 8080)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"])
 
         assert "127.0.0.1:8080" in result.output.replace("\n", "")
@@ -228,9 +259,9 @@ class TestStatusOutput:
 
 class TestStatusJson:
     def test_json_lists_running_workflows(self, pid_tmpdir: Path) -> None:
-        _write_pid(pid_tmpdir, 4242, 8080)
+        _write_pid(pid_tmpdir, 4242, 8080, run_id=_RUN_ID)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -268,7 +299,7 @@ class TestStatusJson:
             )
         )
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -286,14 +317,26 @@ class TestStatusJson:
         ``stderr_log``/``stdout_log`` parameters already defaulted to ``""``
         before this fix; the bug was that the caller never passed real
         values, not that the keys were absent. This must report ``null`` too.
-        Going through ``write_pid_file`` with its defaults pins the real
-        default rather than a hand-transcribed copy of it.
+        ``write_pid_file`` was removed with the Fleet Manager, so the shape is
+        built directly here -- a pre-upgrade ``.pid`` file is now the only
+        thing that can still carry these empty strings, and
+        ``read_run_records`` surfaces it as a record with an empty ``run_id``.
         """
-        from conductor.cli.pid import write_pid_file
+        (pid_tmpdir / "wf-8080.pid").write_text(
+            json.dumps(
+                {
+                    "pid": 4242,
+                    "port": 8080,
+                    "workflow": "/tmp/wf.yaml",
+                    "started_at": "2026-03-03T00:00:00+00:00",
+                    "run_id": "",
+                    "stderr_log": "",
+                    "stdout_log": "",
+                }
+            )
+        )
 
-        write_pid_file(4242, 8080, "/tmp/wf.yaml")
-
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -310,7 +353,7 @@ class TestStatusJson:
         """
         _write_pid(pid_tmpdir, 4242, 8080, "/tmp/wörkflow-→.yaml")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -326,7 +369,7 @@ class TestStatusJson:
         filepath = _write_pid(pid_tmpdir, 4242, 8080)
         on_disk = json.loads(filepath.read_text())["started_at"]
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -342,7 +385,7 @@ class TestStatusSurvivesMalformedFiles:
         (pid_tmpdir / "corrupt-5555.pid").write_text("{not json")
         _write_pid(pid_tmpdir, 4242, 8080)
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status", "--json"])
 
         assert result.exit_code == 0
@@ -353,7 +396,7 @@ class TestStatusSurvivesMalformedFiles:
         bad = pid_tmpdir / "corrupt-5555.pid"
         bad.write_text("{not json")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             runner.invoke(app, ["status", "--json"])
 
         assert bad.exists()
@@ -374,7 +417,7 @@ class TestStatusFitsAnEightyColumnTerminal:
         """
         _write_pid(pid_tmpdir, 4242, 53941, "/home/u/workflows/code-review-pipeline.yaml")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"], env=_NARROW)
 
         assert result.exit_code == 0
@@ -384,7 +427,7 @@ class TestStatusFitsAnEightyColumnTerminal:
         _write_pid(pid_tmpdir, 4242, 53941, "/home/u/workflows/code-review-pipeline.yaml")
         _write_pid(pid_tmpdir, 4243, 61200, "/home/u/workflows/another-long-workflow-name.yaml")
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"], env=_NARROW)
 
         assert result.exit_code == 0
@@ -398,7 +441,7 @@ class TestStatusFitsAnEightyColumnTerminal:
         )
         on_disk = json.loads(filepath.read_text())["started_at"]
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"], env=_NARROW)
 
         assert result.exit_code == 0
@@ -429,7 +472,7 @@ class TestStatusFitsAnEightyColumnTerminal:
             )
         )
 
-        with patch("conductor.cli.pid._is_process_alive", return_value=True):
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
             result = runner.invoke(app, ["status"], env=_NARROW)
 
         assert result.exit_code == 0
@@ -463,7 +506,19 @@ class TestStatusFitsAnEightyColumnTerminal:
 
         recorder = _Recorder()
         _print_running_list(
-            [{"port": 53941, "pid": 4242, "workflow": "wf.yaml", "started_at": "bad"}],
+            [
+                RunRecord(
+                    run_id=_RUN_ID,
+                    pid=4242,
+                    workflow_path="wf.yaml",
+                    workflow_name="wf",
+                    started_at="bad",
+                    event_log_path="",
+                    port=53941,
+                    mode="bg",
+                    checkpoint_dir=None,
+                )
+            ],
             recorder,  # type: ignore[arg-type]
             show_url=True,
         )

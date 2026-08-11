@@ -48,6 +48,10 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from conductor.fleet.records import RunRecord
 
 logger = logging.getLogger(__name__)
 
@@ -135,116 +139,114 @@ def own_run_pids() -> frozenset[int]:
 
 @dataclass(frozen=True, slots=True)
 class OwnRunPartition:
-    """The result of classifying PID-file entries against this process's identity."""
+    """The result of classifying run records against this process's identity."""
 
-    others: list[dict]
-    """Entries that are not this run — the only ones ``stop`` should target by default."""
+    others: list[RunRecord]
+    """Records that are not this run — the only ones ``stop`` should target by default."""
 
-    own: list[dict]
-    """Entries identified as this run."""
+    own: list[RunRecord]
+    """Records identified as this run."""
 
     reasons: dict[int, str]
-    """Why an entry (keyed by port) was classified as own: ``"run id"``,
-    ``"dashboard port"``, or ``"process ancestry"``. Logged at debug so a
-    false positive is diagnosable without being printed to the user."""
+    """Why a record (keyed by PID) was classified as own: ``"run id"``,
+    ``"dashboard port"``, or ``"process ancestry"``. Keyed by PID rather than
+    port because a foreground run has no port at all (Fleet Manager: ``fg``
+    records carry ``port=None``), so port would silently collapse every
+    portless record onto a single ``None`` key. Logged at debug so a false
+    positive is diagnosable without being printed to the user."""
 
     def __post_init__(self) -> None:
-        """Guard the one invariant that matters for safety: no entry is in both lists.
+        """Guard the one invariant that matters for safety: no record is in both lists.
 
-        ``others``/``own`` are both plain ``list[dict]`` — nothing in the type
-        system stops a future edit to :func:`partition_own_run` from swapping
-        them, which would silently invert exactly the safety property this
-        module exists to provide. Catching it here, at construction, turns
+        ``others``/``own`` are both plain ``list[RunRecord]`` — nothing in the
+        type system stops a future edit to :func:`partition_own_run` from
+        swapping them, which would silently invert exactly the safety property
+        this module exists to provide. Catching it here, at construction, turns
         that mistake into an immediate ``ValueError`` instead of a quiet
         misclassification.
         """
-        own_ports = {e.get("port") for e in self.own if isinstance(e.get("port"), int)}
-        other_ports = {e.get("port") for e in self.others if isinstance(e.get("port"), int)}
-        overlap = own_ports & other_ports
+        own_pids = {r.pid for r in self.own}
+        other_pids = {r.pid for r in self.others}
+        overlap = own_pids & other_pids
         if overlap:
             raise ValueError(
-                f"OwnRunPartition: entr{'y' if len(overlap) == 1 else 'ies'} on "
-                f"port(s) {sorted(overlap)} classified as both own and other"
+                f"OwnRunPartition: record{'' if len(overlap) == 1 else 's'} with "
+                f"PID(s) {sorted(overlap)} classified as both own and other"
             )
 
 
-def partition_own_run(entries: list[dict]) -> OwnRunPartition:
-    """Split PID-file entries into "others" and "own" (this process's run).
+def partition_own_run(records: list[RunRecord]) -> OwnRunPartition:
+    """Split run records into "others" and "own" (this process's run).
 
     Computes this process's identity (:func:`own_run_pids` plus the bg-launch
-    env vars) once, then classifies each entry against it in order:
+    env vars) once, then classifies each record against it in order:
     ``run_id`` match, then the legacy dashboard-port compatibility signal
-    (only for entries with no recorded ``run_id``), then process ancestry.
+    (only for records with no recorded ``run_id``), then process ancestry.
 
     Args:
-        entries: PID-file dicts, each with at least ``pid`` and ``port``
-            (and typically ``run_id``, ``workflow``).
+        records: Run records, as returned by
+            :func:`conductor.fleet.records.read_run_records` — which also
+            surfaces legacy port-keyed ``.pid`` files in this same shape, so
+            this function never needs to handle raw PID-file dicts.
 
     Returns:
         An :class:`OwnRunPartition` with ``others``/``own`` preserving the
-        input order, and a ``reasons`` map for diagnostics.
+        input order, and a ``reasons`` map (keyed by PID) for diagnostics.
     """
     my_pids = own_run_pids()
     my_run_id = os.environ.get(RUN_ID_ENV, "")
     web_bg = os.environ.get(WEB_BG_ENV) == "1"
     my_web_port = os.environ.get(WEB_PORT_ENV, "")
 
-    others: list[dict] = []
-    own: list[dict] = []
+    others: list[RunRecord] = []
+    own: list[RunRecord] = []
     reasons: dict[int, str] = {}
 
-    for entry in entries:
-        port = entry.get("port")
-        entry_run_id = entry.get("run_id") or ""
-        if not isinstance(entry_run_id, str):
-            # A malformed PID file (hand-edited, partially written, or from a
-            # future schema) could carry a non-string run_id. Don't let one
-            # bad file crash `stop` for every other run: log it and treat it
-            # as absent, matching pid.py::scan_pid_files' own "skip, don't
-            # raise" discipline for malformed entries.
-            logger.warning(
-                "PID-file entry on port %r has non-string run_id (%r); ignoring for self-exclusion",
-                port,
-                entry_run_id,
-            )
-            entry_run_id = ""
+    for record in records:
+        port = record.port
+        record_run_id = record.run_id or ""
         reason: str | None = None
 
-        if my_run_id and entry_run_id and entry_run_id.lower() == my_run_id.lower():
+        if my_run_id and record_run_id and record_run_id.lower() == my_run_id.lower():
             reason = "run id"
-        elif not entry_run_id and web_bg and my_web_port and str(port) == my_web_port:
+        elif not record_run_id and web_bg and my_web_port and str(port) == my_web_port:
             reason = "dashboard port"
-        elif entry.get("pid") in my_pids:
+        elif record.pid in my_pids:
             reason = "process ancestry"
 
         if reason is not None:
-            own.append(entry)
-            if isinstance(port, int):
-                reasons[port] = reason
-            logger.debug("PID-file entry on port %s identified as own run (%s)", port, reason)
+            own.append(record)
+            reasons[record.pid] = reason
+            logger.debug(
+                "Run record (PID %s, port %s) identified as own run (%s)",
+                record.pid,
+                port,
+                reason,
+            )
         else:
-            others.append(entry)
+            others.append(record)
 
     return OwnRunPartition(others=others, own=own, reasons=reasons)
 
 
-def describe_own_run(entry: dict) -> str:
+def describe_own_run(record: RunRecord) -> str:
     """Return the identity fragment used to name the caller's own run in messages.
 
     Args:
-        entry: The PID-file dict identified as this process's own run.
+        record: The run record identified as this process's own run.
 
     Returns:
-        The ``run_id`` when the PID file records one, otherwise
-        ``"<workflow-stem> (port N)"``. Always a plain ``str`` — never a
-        ``Text`` — since there's no styling to preserve here, and keeping it
-        a plain string forecloses a future f-string interpolation mistake
-        (markup guard rule F) regardless of which mechanism a caller uses to
-        print it.
+        The ``run_id`` when the record has one, otherwise
+        ``"<workflow-stem> (port N)"`` — or ``"<workflow-stem> (PID N)"`` for
+        a foreground run, which has no port to name it by. Always a plain
+        ``str`` — never a ``Text`` — since there's no styling to preserve
+        here, and keeping it a plain string forecloses a future f-string
+        interpolation mistake (markup guard rule F) regardless of which
+        mechanism a caller uses to print it.
     """
-    run_id = entry.get("run_id")
-    if run_id:
-        return str(run_id)
-    workflow_raw = entry.get("workflow") or "unknown"
-    workflow = Path(str(workflow_raw)).stem
-    return f"{workflow} (port {entry.get('port')})"
+    if record.run_id:
+        return record.run_id
+    workflow = record.workflow_name or Path(str(record.workflow_path or "unknown")).stem
+    if record.port is None:
+        return f"{workflow} (PID {record.pid})"
+    return f"{workflow} (port {record.port})"

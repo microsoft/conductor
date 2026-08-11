@@ -8,6 +8,9 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -26,6 +29,7 @@ if TYPE_CHECKING:
     # Typing-only: ``stop()`` imports ``conductor.cli.self_run`` lazily at
     # runtime, matching the existing lazy import of ``conductor.cli.pid``.
     from conductor.cli.self_run import OwnRunPartition
+    from conductor.fleet.records import RunRecord
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,7 @@ app = typer.Typer(
 
 # Register subcommand groups
 from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
+from conductor.cli.fleet import fleet_app  # noqa: E402
 from conductor.cli.gate import gate_app  # noqa: E402
 from conductor.cli.plugin import plugin_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
@@ -56,6 +61,7 @@ app.add_typer(registry_app, rich_help_panel="Environment")
 app.add_typer(plugin_app, rich_help_panel="Environment")
 app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
+app.add_typer(fleet_app, rich_help_panel="Run & Recover")
 
 # Rich console for formatted output
 console = make_console(stderr=True)
@@ -182,6 +188,42 @@ def print_error(error: Exception) -> None:
 
 _INTERACTIVE_STEP_TYPES = ("human_gate", "questions")
 """Step types that park the workflow waiting on a human."""
+
+
+def _bg_capture_logs(record: RunRecord) -> tuple[str | None, str | None]:
+    """Locate a background run's captured stderr/stdout logs.
+
+    These paths were dropped from the discovery schema when ``stop``/``status``
+    moved onto :class:`RunRecord` (which carries the authoritative
+    ``event_log_path`` and, by design, exactly nine fields). They are still
+    worth reporting -- they are where a silently-crashed ``--web-bg`` child
+    leaves its traceback -- so they are located rather than stored.
+
+    Located by globbing on ``run_id`` rather than by rewriting
+    ``event_log_path``'s suffix: the parent stamps the capture-log filenames
+    at launch and the child stamps its own events log a moment later, so the
+    two share a ``run_id`` but **not** a timestamp, and a stem swap silently
+    yields a path that does not exist.
+
+    Args:
+        record: The run whose capture logs to locate.
+
+    Returns:
+        ``(stderr_log, stdout_log)``, each ``None`` when absent -- which is
+        the normal case for a foreground run, since only ``--web-bg``
+        redirects a child's streams to files.
+    """
+    if not record.run_id or not record.event_log_path:
+        return None, None
+    try:
+        log_dir = Path(record.event_log_path).parent
+        stderr = next(iter(sorted(log_dir.glob(f"*-{record.run_id}.bg.stderr.log"))), None)
+        stdout = next(iter(sorted(log_dir.glob(f"*-{record.run_id}.bg.stdout.log"))), None)
+    except OSError:
+        # A listing failure must not take down `status`, whose entire promise
+        # is to observe without disturbing anything.
+        return None, None
+    return (str(stderr) if stderr else None, str(stdout) if stdout else None)
 
 
 def _optional_str(value: object) -> str | None:
@@ -1285,27 +1327,31 @@ def status(
     """
     import json
 
-    from conductor.cli.pid import scan_pid_files
+    from conductor.fleet.records import scan_run_records
 
-    # Deliberately not ``read_pid_files``: that one prunes as it reads, which
+    # Deliberately not ``read_run_records``: that one prunes as it reads, which
     # would make the read-only command destructive — the exact trap this
     # command exists to give people an alternative to.
-    running = scan_pid_files()
+    running = scan_run_records()
 
     if json_output:
-        payload = [
-            {
-                "pid": e["pid"],
-                "port": e["port"],
-                "workflow": str(e.get("workflow", "")),
-                "run_id": _optional_str(e.get("run_id")),
-                "started_at": e.get("started_at", ""),
-                "stderr_log": _optional_str(e.get("stderr_log")),
-                "stdout_log": _optional_str(e.get("stdout_log")),
-                "url": f"http://127.0.0.1:{e['port']}",
-            }
-            for e in running
-        ]
+        payload = []
+        for e in running:
+            stderr_log, stdout_log = _bg_capture_logs(e)
+            payload.append(
+                {
+                    "pid": e.pid,
+                    "port": e.port,
+                    "workflow": str(e.workflow_path or ""),
+                    "run_id": _optional_str(e.run_id),
+                    "started_at": e.started_at or "",
+                    "mode": e.mode,
+                    "event_log": _optional_str(e.event_log_path),
+                    "stderr_log": stderr_log,
+                    "stdout_log": stdout_log,
+                    "url": (f"http://127.0.0.1:{e.port}" if e.port is not None else None),
+                }
+            )
         output_console.print_json(json.dumps({"running": payload}), ensure_ascii=True)
         return
 
@@ -1321,13 +1367,353 @@ def status(
     )
 
 
+def _discover_running_records() -> list[RunRecord]:
+    """Discover every currently-running workflow via Fleet Manager run records.
+
+    As of Fleet Manager E3, ``conductor stop`` sources directly from
+    :func:`conductor.fleet.records.read_run_records`, which itself merges
+    the new ``run_id``-keyed records (every mode: ``fg``, ``fg-web``,
+    ``bg``) with legacy port-keyed ``.pid`` files (surfaced with
+    ``mode="bg"``, per D1, so they never trigger the foreground-stop
+    confirmation). This closes the design's blocking problem --
+    ``conductor stop``'s blindness to foreground runs -- and gives
+    ``--all`` a meaningful (not bg-only) scope.
+
+    Stale (dead-``pid``) and corrupt/unparseable records are pruned from
+    disk as a side effect of ``read_run_records()``; this function never
+    raises for a corrupt, vanished, unreadable, or legacy-shaped file.
+
+    Returns:
+        List of :class:`conductor.fleet.records.RunRecord` for every run
+        whose process is confirmed alive.
+    """
+    from conductor.fleet.records import read_run_records
+
+    return read_run_records()
+
+
+def _remove_stopped_record(record: RunRecord) -> None:
+    """Remove the backing run record (or legacy PID file) for a stopped run.
+
+    Removal is keyed by ``run_id`` (Fleet Manager E3-T6), falling back to the
+    legacy port-keyed removal for a pre-upgrade ``.pid`` file.
+
+    The fallback is deliberately **not** gated on ``run_id`` being empty. A
+    legacy ``.pid`` file records a ``run_id`` too (issue #411 added it), so
+    "has a run_id" does not imply "is a JSON run record" -- gating on that
+    would leave every pre-upgrade file with a recorded id undeletable, and
+    ``stop`` would report success while the entry stayed on disk forever.
+    Instead, the port-keyed removal is attempted whenever the record-keyed
+    one removed nothing.
+
+    Args:
+        record: The :class:`RunRecord` that was just confirmed stopped.
+    """
+    removed = False
+    if record.run_id:
+        from conductor.fleet.records import remove_run_record
+
+        removed = remove_run_record(record.run_id)
+
+    if not removed and record.port is not None:
+        from conductor.cli.pid import remove_pid_file
+
+        remove_pid_file(record.port)
+
+
+def _run_has_checkpoints(record: RunRecord) -> bool:
+    """Return True if a periodic checkpoint exists for this run (E3-T5).
+
+    Used by the D1 confirmation prompt to tell the user whether stopping a
+    foreground run is fully lossy or not: looks for
+    ``{workflow_name}-*.json`` files under the record's ``checkpoint_dir``
+    (the same, global, ``$TMPDIR``-rooted directory for every run -- see
+    ``RunRecord.checkpoint_dir``'s docstring) and checks whether *any* of
+    them actually belongs to this run (``run_id`` match) and was written
+    by the periodic-checkpoint path (``trigger == "periodic"``) rather
+    than an unrelated failure checkpoint from a previous crash of the same
+    ``run_id``. Merely checking the directory's existence would say
+    nothing about this specific run, since the directory is shared by
+    every run on the machine.
+
+    Best-effort: any error while listing/loading checkpoint files is
+    treated as "no checkpoints found" rather than raised -- this is
+    advisory text on a confirmation prompt, not a correctness-critical
+    check.
+
+    Args:
+        record: The run record to check.
+
+    Returns:
+        True if at least one periodic checkpoint file matches this run.
+    """
+    if not record.checkpoint_dir or not record.workflow_name or not record.run_id:
+        return False
+
+    from conductor.engine.checkpoint import CheckpointManager
+    from conductor.exceptions import CheckpointError
+
+    try:
+        candidates = list(Path(record.checkpoint_dir).glob(f"{record.workflow_name}-*.json"))
+    except OSError:
+        return False
+
+    for f in candidates:
+        try:
+            checkpoint = CheckpointManager.load_checkpoint(f)
+        except CheckpointError:
+            continue
+        if checkpoint.run_id == record.run_id and checkpoint.trigger == "periodic":
+            return True
+    return False
+
+
+def _stdin_is_interactive() -> bool:
+    """Return True if stdin is a real interactive terminal.
+
+    Factored out (rather than calling ``sys.stdin.isatty()`` inline) so
+    tests can simulate an interactive/non-interactive stdin directly --
+    Typer/Click's ``CliRunner`` always substitutes a non-tty stream for
+    ``sys.stdin`` for the duration of ``invoke()``, so patching the
+    ``sys.stdin`` object *before* invoking has no effect on the object the
+    command actually sees.
+    """
+    return sys.stdin.isatty()
+
+
+def _foreground_targets(targets: list[RunRecord]) -> list[RunRecord]:
+    """Return the subset of ``targets`` with ``mode in {"fg", "fg-web"}``.
+
+    Extracted (Fleet Manager E8-T1) so both :func:`_confirm_stop_targets`
+    (CLI) and the TUI's kill-confirmation message builder
+    (``conductor.fleet.tui.actions.build_kill_confirmation_message``) apply
+    the exact same "which of these targets is foreground" rule.
+    """
+    return [r for r in targets if r.mode in {"fg", "fg-web"}]
+
+
+def _foreground_stop_warning_lines(foreground: list[RunRecord]) -> list[str]:
+    """Build the per-run checkpoint-status warning lines for a foreground stop.
+
+    Extracted from :func:`_confirm_foreground_stop` (Fleet Manager E8-T1)
+    so the CLI's ``rich.prompt.Confirm`` prompt and the TUI's
+    kill-confirmation modal (``conductor.fleet.tui.actions``) show the
+    exact same per-run text -- one policy (what to say about a foreground
+    run's checkpoint-recoverability), two presentations (how each UI asks
+    the user to confirm). Each returned line is plain text (no Rich markup)
+    so either caller can style/wrap it however its own UI requires.
+
+    Args:
+        foreground: The subset of stop targets with ``mode in {"fg",
+            "fg-web"}``.
+
+    Returns:
+        One line per foreground run, in the same order given, reading
+        ``"<workflow> (PID <pid>): <checkpoint note>"``.
+    """
+    lines = []
+    for r in foreground:
+        workflow_name = Path(r.workflow_path or "unknown").stem
+        if _run_has_checkpoints(r):
+            note = "periodic checkpoints found -- resumable after stopping"
+        else:
+            note = "no periodic checkpoints found -- progress will be lost"
+        lines.append(f"{workflow_name} (PID {r.pid}): {note}")
+    return lines
+
+
+def _confirm_foreground_stop(foreground: list[RunRecord], con: Console) -> bool:
+    """Print the D1 confirmation prompt and return whether the user agreed.
+
+    Only called when at least one target has ``mode in {"fg", "fg-web"}``
+    (Fleet Manager E3-T3) -- the caller is responsible for the ``--yes``
+    bypass and the non-TTY refusal (E3-T4), since those two cases must not
+    reach ``rich.prompt.Confirm`` at all. Names every foreground run in
+    scope and states, per Open Question 1's working assumption, that
+    in-flight progress is lost unless periodic checkpoints are enabled for
+    that run (E3-T5).
+
+    Args:
+        foreground: The subset of stop targets with ``mode in {"fg",
+            "fg-web"}``. Never empty.
+        con: Rich Console to print to and prompt on.
+
+    Returns:
+        True if the user confirmed, False if they declined.
+    """
+    from rich.prompt import Confirm
+
+    names = ", ".join(
+        f"'{Path(r.workflow_path or 'unknown').stem}' (PID {r.pid})" for r in foreground
+    )
+    con.print(
+        styled(
+            "[bold yellow]Warning:[/bold yellow] this will stop {} foreground workflow run(s): {}.",
+            len(foreground),
+            names,
+        )
+    )
+    con.print(
+        Text.from_markup(
+            "[dim]In-flight progress will be lost unless periodic checkpoints are "
+            "enabled for the run:[/dim]"
+        )
+    )
+    for line in _foreground_stop_warning_lines(foreground):
+        con.print(styled("[dim]  - {}[/dim]", line))
+
+    return Confirm.ask("Continue?", console=con, default=False)
+
+
+def _confirm_stop_targets(targets: list[RunRecord], yes: bool, con: Console) -> bool:
+    """Gate the D1 confirmation, including the ``--yes`` bypass and non-TTY refusal.
+
+    Legacy ``.pid`` records and ``mode="bg"`` records never trigger a
+    prompt (D1) -- today's behavior for a bg-only fleet is byte-for-byte
+    preserved. When at least one target is a foreground run:
+
+    - ``--yes``/``-y`` bypasses the prompt unconditionally (E3-T4).
+    - A non-interactive ``stdin`` (``sys.stdin.isatty()`` is False)
+      without ``--yes`` refuses to proceed -- a non-TTY cannot confirm,
+      and defaulting to yes would reinstate the exact hazard D1 closes.
+      This case exits non-zero (``typer.Exit(1)``) having signalled
+      nothing, distinct from an interactive decline below.
+    - Otherwise, prompts once via :func:`_confirm_foreground_stop`, naming
+      every foreground run in scope (so ``--all`` over a mixed fleet
+      prompts exactly once).
+
+    Args:
+        targets: The full set of run records ``stop`` is about to act on.
+        yes: Whether ``--yes``/``-y`` was passed.
+        con: Rich Console for output/prompting.
+
+    Returns:
+        True if the caller should proceed to stop every target. False if
+        the user interactively declined the prompt -- the caller should
+        exit 0 having stopped nothing.
+
+    Raises:
+        typer.Exit: With code 1 when a foreground target requires
+            confirmation but stdin is not a terminal and ``--yes`` was
+            not passed.
+    """
+    foreground = _foreground_targets(targets)
+    if not foreground:
+        return True
+    if yes:
+        return True
+    if not _stdin_is_interactive():
+        con.print(
+            Text.from_markup(
+                "[bold red]Error:[/bold red] stopping a foreground workflow run requires "
+                "confirmation, but stdin is not a terminal. Re-run with --yes/-y to "
+                "confirm non-interactively."
+            )
+        )
+        con.print(Text.from_markup("[dim]Would stop:[/dim]"))
+        _print_running_list(targets, con)
+        # A non-TTY cannot confirm, and defaulting to yes would reinstate
+        # the hazard D1 closes -- exit non-zero having signalled nothing,
+        # distinct from the exit-0 "user declined" path below.
+        raise typer.Exit(code=1)
+    return _confirm_foreground_stop(foreground, con)
+
+
+@dataclass
+class StopOutcome:
+    """Outcome of a :func:`stop_records` call.
+
+    Attributes:
+        declined: True if the injected ``confirm`` callback returned
+            False, meaning nothing was attempted -- distinct from an
+            empty :attr:`stopped` caused by every target failing to
+            actually stop (permission denied, escalation failure, etc.),
+            which reports ``declined=False`` with an empty list.
+        stopped: Records confirmed stopped (:func:`_stop_process` polled
+            them dead, or found them already gone) and whose run record
+            was removed.
+    """
+
+    declined: bool
+    stopped: list[RunRecord]
+
+
+def stop_records(
+    targets: list[RunRecord],
+    con: Console,
+    *,
+    confirm: Callable[[list[RunRecord]], bool] | None = None,
+) -> StopOutcome:
+    """Stop every record in ``targets`` -- the one kill implementation shared
+    by ``conductor stop`` and the Fleet Manager TUI's kill/kill-all actions
+    (Fleet Manager E8-T1).
+
+    If ``confirm`` is given, it is called once with the full ``targets``
+    list before anything is touched; if it returns False, nothing is
+    stopped (``declined=True``). Passing ``confirm=None`` skips this gate
+    entirely -- for a caller (the TUI) that has already resolved its own
+    confirmation via an async modal before calling this function, since a
+    synchronous callback slot cannot itself ``await`` a Textual screen.
+    ``confirm`` may raise instead of returning (the CLI's non-interactive
+    refusal path raises ``typer.Exit``); this function does not catch
+    that, so it propagates unchanged to the caller.
+
+    Killing is deliberately **not** ``conductor fleet kill`` (per the
+    design) -- both callers funnel through this exact function rather than
+    each re-implementing "signal, verify, remove record".
+
+    Reuses :func:`_stop_process`'s verify-then-report contract (E3-T10): a
+    record is only removed, and only counted in the returned ``stopped``
+    list, once the process is actually confirmed gone (or was already
+    gone) -- never on signal-send alone. This is the guarantee the TUI
+    must inherit rather than reintroduce the fire-and-forget behavior
+    E3-T10 removed from the CLI.
+
+    Args:
+        targets: The run records to stop.
+        con: Rich Console for progress output. Also safe to pass a Console
+            writing to a non-terminal stream (e.g. the TUI's silent
+            console), since this function never assumes stdout ownership.
+        confirm: Optional gate called once with ``targets`` before
+            stopping anything.
+
+    Returns:
+        A :class:`StopOutcome` describing whether the caller declined and
+        which records were actually confirmed stopped.
+    """
+    if confirm is not None and not confirm(targets):
+        return StopOutcome(declined=True, stopped=[])
+
+    stopped: list[RunRecord] = []
+    for record in targets:
+        # ``_stop_process`` reports an outcome rather than a bool: only the
+        # two outcomes that mean "this process is definitively gone" may
+        # remove the record. ``survived``/``unconfirmed`` must not, or a
+        # still-running run becomes untracked.
+        result = _stop_process(record, con)
+        if result["outcome"] in ("stopped", "already-exited"):
+            _remove_stopped_record(record)
+            stopped.append(record)
+    return StopOutcome(declined=False, stopped=stopped)
+
+
 @app.command(rich_help_panel="Run & Recover")
 def stop(
     port: Annotated[
         int | None,
         typer.Option(
             "--port",
-            help="Stop the background workflow running on this port.",
+            help="Stop the workflow whose dashboard is on this port.",
+        ),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option(
+            "--run-id",
+            help=(
+                "Stop the workflow with this run ID. The only selector that can "
+                "name a foreground run, which has no dashboard port."
+            ),
         ),
     ] = None,
     all_workflows: Annotated[
@@ -1358,6 +1744,14 @@ def stop(
             ),
         ),
     ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip the confirmation prompt shown before stopping a foreground run.",
+        ),
+    ] = False,
     json_output: Annotated[
         bool,
         typer.Option(
@@ -1366,7 +1760,7 @@ def stop(
         ),
     ] = False,
 ) -> None:
-    """Stop background workflow processes launched with --web-bg.
+    """Stop running workflow processes.
 
     With no arguments, lists running background workflows. If exactly one
     is found, stops it automatically. If multiple are found, prints the
@@ -1409,18 +1803,18 @@ def stop(
     """
     import json
 
-    from conductor.cli.pid import read_pid_files, remove_pid_file_at
     from conductor.cli.self_run import partition_own_run
 
-    running = read_pid_files()
+    # Sources run records rather than PID files since the Fleet Manager, so
+    # foreground runs are stoppable too -- previously `stop` could only see
+    # `--web-bg` runs, and a plain `conductor run` was invisible to it.
+    running = _discover_running_records()
 
     if not running:
         if json_output:
             output_console.print_json(json.dumps({"stopped": [], "failed": []}), ensure_ascii=True)
         else:
-            console.print(
-                Text.from_markup("[dim]No background workflows are currently running.[/dim]")
-            )
+            console.print(Text.from_markup("[dim]No workflows are currently running.[/dim]"))
         return
 
     partition = partition_own_run(running)
@@ -1439,11 +1833,50 @@ def stop(
         targets = targetable
         if not allow_self and partition.own and not json_output:
             _print_self_exclusion(partition, console, blocking=False)
-    elif port is not None:
-        targets = [e for e in targetable if e["port"] == port]
+    elif run_id is not None:
+        # The only selector that can name a foreground run: `fg` records have
+        # no dashboard port, so --port cannot reach them.
+        targets = [e for e in targetable if e.run_id == run_id]
         if not targets:
             if not allow_self:
-                own_match = [e for e in partition.own if e["port"] == port]
+                own_match = [e for e in partition.own if e.run_id == run_id]
+                if own_match:
+                    if json_output:
+                        output_console.print_json(
+                            json.dumps(
+                                {
+                                    "error": (
+                                        f"run {run_id} is the run this command is executing "
+                                        "inside; pass --allow-self to include it"
+                                    )
+                                }
+                            ),
+                            ensure_ascii=True,
+                        )
+                    else:
+                        _print_self_refusal_line(own_match[0], console)
+                        _print_allow_self_hint(console)
+                    raise typer.Exit(code=1)
+            if json_output:
+                output_console.print_json(
+                    json.dumps({"error": f"no running workflow with run id {run_id}"}),
+                    ensure_ascii=True,
+                )
+            else:
+                console.print(
+                    styled(
+                        "[bold red]Error:[/bold red] No running workflow found with run ID {}.",
+                        run_id,
+                    )
+                )
+                console.print(Text.from_markup("[dim]Running workflows:[/dim]"))
+                _print_running_list(targetable, console)
+            raise typer.Exit(code=1)
+    elif port is not None:
+        targets = [e for e in targetable if e.port == port]
+        if not targets:
+            if not allow_self:
+                own_match = [e for e in partition.own if e.port == port]
                 if own_match:
                     if json_output:
                         output_console.print_json(
@@ -1463,13 +1896,14 @@ def stop(
                     raise typer.Exit(code=1)
             if json_output:
                 output_console.print_json(
-                    json.dumps({"error": f"no background workflow on port {port}"}),
+                    json.dumps({"error": f"no running workflow on port {port}"}),
                     ensure_ascii=True,
                 )
             else:
                 console.print(
                     styled(
-                        "[bold red]Error:[/bold red] No background workflow found on port {}.",
+                        "[bold red]Error:[/bold red] No running workflow found on port {}. "
+                        "(A foreground run without a dashboard has no port to match.)",
                         port,
                     )
                 )
@@ -1499,7 +1933,7 @@ def stop(
         else:
             console.print(
                 styled(
-                    "[bold yellow]Multiple background workflows running ({}).[/bold yellow]",
+                    "[bold yellow]Multiple workflows running ({}).[/bold yellow]",
                     len(targetable),
                 )
             )
@@ -1516,6 +1950,13 @@ def stop(
     # Prose goes to ``console`` (stderr); JSON goes to ``output_console``
     # (stdout). They cannot corrupt each other, so diagnostics stay visible
     # even in --json mode.
+    # Stopping a foreground run is newly possible (and more disruptive: there
+    # is no dashboard to resume from), so it is gated behind a confirmation
+    # unless --yes or --json. JSON mode is non-interactive by construction.
+    if not json_output and not _confirm_stop_targets(targets, yes, console):
+        console.print(Text.from_markup("[dim]Aborted: no workflows were stopped.[/dim]"))
+        return
+
     results = []
     for entry in targets:
         if allow_self:
@@ -1526,7 +1967,7 @@ def stop(
         if result["outcome"] in ("stopped", "already-exited"):
             # Identity-checked: only remove the file if it still describes the
             # process we just stopped, never merely "the file for this port".
-            remove_pid_file_at(entry["file"], entry["pid"])
+            _remove_stopped_record(entry)
         elif force and result["outcome"] == "unconfirmed" and result["rung"] == "terminate":
             # The #166 escape hatch. Reaching here means the liveness probe
             # itself failed, so we genuinely cannot say whether the process
@@ -1551,7 +1992,7 @@ def stop(
                     result["port"],
                 )
             )
-            remove_pid_file_at(entry["file"], entry["pid"])
+            _remove_stopped_record(entry)
 
     if json_output:
         payload = {
@@ -1569,7 +2010,7 @@ def stop(
         raise typer.Exit(code=2)
 
 
-def _print_self_refusal_line(entry: dict, con: Console) -> None:
+def _print_self_refusal_line(entry: RunRecord, con: Console) -> None:
     """Print the red refusal line naming the run this command is executing inside.
 
     Args:
@@ -1620,7 +2061,7 @@ def _print_self_exclusion(partition: OwnRunPartition, con: Console, *, blocking:
     _print_allow_self_hint(con)
 
 
-def _maybe_warn_stopping_self(entry: dict, partition: OwnRunPartition, con: Console) -> None:
+def _maybe_warn_stopping_self(entry: RunRecord, partition: OwnRunPartition, con: Console) -> None:
     """Print a yellow warning when about to signal the caller's own run.
 
     Only reachable via ``--allow-self`` -- without that flag, an entry
@@ -1634,7 +2075,7 @@ def _maybe_warn_stopping_self(entry: dict, partition: OwnRunPartition, con: Cons
     """
     from conductor.cli.self_run import describe_own_run
 
-    if any(o["port"] == entry["port"] for o in partition.own):
+    if any(o.pid == entry.pid for o in partition.own):
         con.print(
             styled(
                 "[yellow]Warning:[/yellow] stopping run {} — this is the run "
@@ -1660,7 +2101,7 @@ class Identity(str, Enum):
     MISMATCHED = "mismatched"
 
 
-def _confirm_identity(entry: dict, con: Console) -> Identity:
+def _confirm_identity(entry: RunRecord, con: Console) -> Identity:
     """Check that the process on ``entry['port']`` is the one ``entry`` describes.
 
     Between a PID file being written and ``conductor stop`` reading it, the
@@ -1686,7 +2127,7 @@ def _confirm_identity(entry: dict, con: Console) -> Identity:
     """
     import httpx
 
-    port = entry["port"]
+    port = entry.port
     try:
         resp = httpx.get(f"http://127.0.0.1:{port}/api/info", timeout=_IDENTITY_TIMEOUT)
         resp.raise_for_status()
@@ -1700,7 +2141,7 @@ def _confirm_identity(entry: dict, con: Console) -> Identity:
 
     reported_pid = info.get("pid")
     if isinstance(reported_pid, int):
-        if reported_pid == entry["pid"]:
+        if reported_pid == entry.pid:
             return Identity.CONFIRMED
         con.print(
             styled(
@@ -1708,13 +2149,13 @@ def _confirm_identity(entry: dict, con: Console) -> Identity:
                 "{}, but the PID file records {}. Refusing to act on it.",
                 port,
                 reported_pid,
-                entry["pid"],
+                entry.pid,
             )
         )
         return Identity.MISMATCHED
 
     # Older dashboard: fall back to run_id when both sides have one.
-    expected = str(entry.get("run_id") or "")
+    expected = str(entry.run_id or "")
     actual = str(info.get("run_id") or "")
     if not expected or not actual:
         return Identity.UNCONFIRMED
@@ -1762,7 +2203,7 @@ def _signal_process(pid: int) -> None:
         logger.debug("Polite signal to PID %s failed: %s", pid, exc)
 
 
-def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
+def _stop_process(entry: RunRecord, con: Console, force: bool = False) -> dict:
     """Stop one background workflow, escalating until it is confirmed dead.
 
     The ladder is graceful → polite signal → forceful, with a bounded wait
@@ -1784,16 +2225,16 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     """
     from conductor.cli.pid import Liveness, process_liveness, terminate_process, wait_for_exit
 
-    pid = entry["pid"]
-    port = entry["port"]
-    workflow = Path(entry.get("workflow", "unknown")).stem
+    pid = entry.pid
+    port = entry.port
+    workflow = entry.workflow_name or Path(str(entry.workflow_path or "unknown")).stem
 
     def _result(outcome: str, rung: str) -> dict:
         return {
             "pid": pid,
             "port": port,
             "workflow": workflow,
-            "run_id": entry.get("run_id", ""),
+            "run_id": entry.run_id,
             "outcome": outcome,
             "rung": rung,
         }
@@ -1814,8 +2255,12 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     # Rung 1 — ask the workflow to cancel itself. This is the only rung that
     # lets the run write a resume checkpoint, so it is always tried first, and
     # only when we are sure we are talking to the right run.
+    # ``port is not None`` is load-bearing, not a type appeasement: a
+    # foreground run has no dashboard, so there is nothing to ask and this
+    # rung is skipped straight to the signal below.
     if (
         identity is Identity.CONFIRMED
+        and port is not None
         and _request_graceful_kill(port)
         and wait_for_exit(pid, _GRACEFUL_TIMEOUT) is Liveness.DEAD
     ):
@@ -1985,15 +2430,21 @@ def _format_started_at(value: object) -> str:
         return value
 
 
-def _print_running_list(entries: list[dict], con: Console, show_url: bool = False) -> None:
-    """Print a table of running background workflows.
+def _print_running_list(entries: list[RunRecord], con: Console, show_url: bool = False) -> None:
+    """Print a table of running workflows.
 
     ``Started`` is rendered to minute precision (``_format_started_at``)
     regardless of ``show_url`` — ``conductor stop`` shares this function and
     gets the shorter timestamp too.
 
+    Sources :class:`RunRecord` rather than PID-file dicts since the Fleet
+    Manager, so foreground runs appear here too. That is why ``Port`` renders
+    ``—`` for a portless ``fg`` run instead of indexing a key that isn't
+    there, and why a ``Mode`` column exists at all: with foreground runs in
+    the listing, "no port" and "no dashboard" need to be distinguishable.
+
     Args:
-        entries: List of PID-file dicts.
+        entries: List of run records.
         con: Rich Console for output.
         show_url: Append a Dashboard URL column. Defaults to False;
             ``conductor status`` passes True, since discovery is its whole
@@ -2007,6 +2458,15 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
     table = Table(show_lines=False)
     table.add_column("Port", style="cyan")
     table.add_column("PID", style="yellow")
+    if not show_url:
+        # Mode and Run ID are omitted whenever the Dashboard column is shown:
+        # together they push the table past 80 columns, which folds the URL
+        # mid-string -- the exact defect issues #405/#413 fixed. Run ID earns
+        # its place in `stop`'s listing because --run-id is the only selector
+        # that can name a foreground run; `conductor status` exposes both
+        # fields via --json instead, and a portless run already shows "—".
+        table.add_column("Mode", style="magenta")
+        table.add_column("Run ID", style="green")
     table.add_column("Workflow", style="white")
     # Folds rather than crops: _format_started_at's happy path is a fixed
     # 17 characters, but its fallback for an unparseable/out-of-range value
@@ -2021,13 +2481,17 @@ def _print_running_list(entries: list[dict], con: Console, show_url: bool = Fals
 
     for e in entries:
         row = [
-            str(e["port"]),
-            str(e["pid"]),
-            Path(e.get("workflow", "unknown")).stem,
-            _format_started_at(e.get("started_at")),
+            str(e.port) if e.port is not None else "—",
+            str(e.pid),
+        ]
+        if not show_url:
+            row += [e.mode, e.run_id or "—"]
+        row += [
+            e.workflow_name or Path(str(e.workflow_path or "unknown")).stem,
+            _format_started_at(e.started_at),
         ]
         if show_url:
-            row.append(f"http://127.0.0.1:{e['port']}")
+            row.append(f"http://127.0.0.1:{e.port}" if e.port is not None else "—")
         table.add_row(*row)
 
     con.print(table)

@@ -20,8 +20,10 @@ from typer.testing import CliRunner
 from conductor.cli.app import app
 from conductor.cli.run import (
     InputCollector,
+    coerce_typed_value,
     coerce_value,
     parse_input_flags,
+    parse_input_json_flags,
 )
 from conductor.mcp_auth import resolve_mcp_env_vars
 
@@ -82,6 +84,24 @@ class TestCoerceValue:
         assert coerce_value("Hello World!") == "Hello World!"
         assert coerce_value("") == ""
 
+    def test_coerce_preserves_legacy_behavior_for_ambiguous_json_like_values(self) -> None:
+        """Guard against a regression (review round 2, Fleet Manager E12):
+        an internal fix for the background-launch boundary once applied
+        ``json.loads`` before this heuristic, which silently changed the
+        public, backward-compatibility-sensitive ``--input`` contract for
+        values that are valid JSON scalars but not part of the documented
+        heuristic -- ``1e3``/``NaN``/``Infinity`` (legacy: returned as
+        plain strings, since they don't parse as int/float here) and an
+        already-double-quoted string (legacy: quotes are part of the
+        literal value, not stripped as JSON). ``coerce_value`` must keep
+        returning exactly these legacy values regardless of any separate,
+        strict-JSON transport added elsewhere (see ``coerce_typed_value``
+        for that transport)."""
+        assert coerce_value("1e3") == "1e3"
+        assert coerce_value("NaN") == "NaN"
+        assert coerce_value("Infinity") == "Infinity"
+        assert coerce_value('"true"') == '"true"'
+
 
 class TestParseInputFlags:
     """Tests for parse_input_flags function."""
@@ -124,6 +144,54 @@ class TestParseInputFlags:
 
         with pytest.raises(typer.BadParameter, match="Empty input name"):
             parse_input_flags(["=value"])
+
+
+class TestCoerceTypedValue:
+    """Tests for the strict-JSON coerce_typed_value function (the
+    background-launch typed transport, separate from the public
+    coerce_value heuristic)."""
+
+    def test_decodes_json_scalars_and_containers(self) -> None:
+        assert coerce_typed_value("true") is True
+        assert coerce_typed_value("false") is False
+        assert coerce_typed_value("null") is None
+        assert coerce_typed_value("42") == 42
+        assert coerce_typed_value("3.14") == 3.14
+        assert coerce_typed_value("[1, 2]") == [1, 2]
+        assert coerce_typed_value('{"a": 1}') == {"a": 1}
+
+    def test_decodes_quoted_string_without_reinterpreting_it(self) -> None:
+        """A declared-``string``-typed value that looks like another type
+        (e.g. the boolean-like word ``true``) is JSON-quoted by the sender
+        and must decode back to the plain string, not ``True``."""
+        assert coerce_typed_value('"true"') == "true"
+        assert isinstance(coerce_typed_value('"true"'), str)
+
+    def test_invalid_json_raises_bad_parameter(self) -> None:
+        import typer
+
+        with pytest.raises(typer.BadParameter, match="Invalid --input-json value"):
+            coerce_typed_value("not json")
+
+
+class TestParseInputJsonFlags:
+    """Tests for parse_input_json_flags (the hidden --input-json flag)."""
+
+    def test_parses_strictly_typed_values(self) -> None:
+        result = parse_input_json_flags(['question="hello"', "verbose=true", "retries=3"])
+        assert result == {"question": "hello", "verbose": True, "retries": 3}
+
+    def test_missing_equals_raises(self) -> None:
+        import typer
+
+        with pytest.raises(typer.BadParameter, match="Invalid input-json format"):
+            parse_input_json_flags(["invalid"])
+
+    def test_empty_name_raises(self) -> None:
+        import typer
+
+        with pytest.raises(typer.BadParameter, match="Empty input name"):
+            parse_input_json_flags(["=true"])
 
 
 class TestResolveMcpEnvVars:

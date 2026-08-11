@@ -81,6 +81,36 @@ class TestGateRespondHappyPath:
         body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
         assert body["additional_input"] == "LGTM"
 
+    @patch("httpx.post")
+    def test_markup_like_agent_and_choice_do_not_crash_success_message(
+        self, mock_post: MagicMock
+    ) -> None:
+        """A workflow-controlled agent/choice value containing Rich markup
+        syntax (e.g. ``[/cyan]``) must not raise ``MarkupError`` when
+        printing the success message after an accepted (HTTP 200)
+        response -- doing so would make the Fleet Manager TUI's
+        ``_resolve_gate_sync`` misreport a successfully accepted response
+        as failed (review round 2)."""
+        mock_post.return_value = _mock_response(200, {"status": "accepted"})
+
+        result = runner.invoke(
+            app,
+            [
+                "gate",
+                "respond",
+                "--port",
+                "8080",
+                "--choice",
+                "[/cyan]evil-choice",
+                "--agent",
+                "[/cyan]evil-agent",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Gate resolved" in result.output
+        assert "[/cyan]evil-choice" in result.output
+        assert "[/cyan]evil-agent" in result.output
+
 
 class TestGateRespondUnreachablePort:
     """Unreachable port produces a clear error."""

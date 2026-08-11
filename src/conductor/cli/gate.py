@@ -87,6 +87,18 @@ def _gate_respond_impl(
 
     Shared implementation behind ``conductor gate respond`` and the
     deprecated ``conductor gate-respond`` alias, so both stay in lockstep.
+
+    Also consumed directly by the Fleet Manager TUI's gate-resolve action
+    (D4, Fleet Manager E13-T2) -- see
+    ``conductor.fleet.tui.actions.resolve_gate`` -- so this function must
+    not be narrowed to assume a CLI-only caller. It is unchanged for that
+    reuse: still synchronous, still makes blocking ``httpx`` calls (5s/10s
+    timeouts), still writes every message to the module-level ``console``
+    below, and still raises ``typer.Exit`` on every failure path. The TUI
+    caller is responsible for running it off the UI thread (a Textual
+    worker), temporarily redirecting ``console`` to capture its output
+    instead of the real terminal, and translating a raised ``typer.Exit``
+    into an in-UI result rather than letting it propagate.
     """
     base_url = f"http://127.0.0.1:{port}"
 

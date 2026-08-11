@@ -14,7 +14,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -1307,6 +1307,46 @@ def parse_input_flags(raw_inputs: list[str]) -> dict[str, Any]:
     return inputs
 
 
+def parse_input_json_flags(raw_inputs: list[str]) -> dict[str, Any]:
+    """Parse ``--input-json name=value`` flags, strictly JSON-decoding each value.
+
+    This is the Fleet Manager's background-launch typed transport (hidden,
+    internal-only flag): ``bg_runner.py::launch_background`` forwards
+    already-declared-type-coerced values here, JSON-encoded by
+    ``_serialize_input_value``, so they must be decoded with
+    :func:`coerce_typed_value` (strict ``json.loads``) rather than the
+    public ``--input`` heuristic in :func:`coerce_value`, which would
+    reinterpret an already-typed value (e.g. re-guess a JSON-quoted string).
+
+    Args:
+        raw_inputs: List of "name=value" strings, each value JSON-encoded.
+
+    Returns:
+        Dictionary of parsed input name-value pairs.
+
+    Raises:
+        typer.BadParameter: If the format is invalid or a value is not
+            valid JSON.
+    """
+    inputs: dict[str, Any] = {}
+
+    for raw in raw_inputs:
+        if "=" not in raw:
+            raise typer.BadParameter(
+                f"Invalid input-json format: '{raw}'. Expected format: name=value"
+            )
+
+        name, value = raw.split("=", 1)
+        name = name.strip()
+
+        if not name:
+            raise typer.BadParameter(f"Empty input name in: '{raw}'")
+
+        inputs[name] = coerce_typed_value(value)
+
+    return inputs
+
+
 def parse_metadata_flags(raw_metadata: list[str]) -> dict[str, str]:
     """Parse --metadata key=value flags into a dictionary.
 
@@ -1377,6 +1417,15 @@ def parse_guidance_flags(raw_guidance: list[str]) -> list[str]:
 def coerce_value(value: str) -> Any:
     """Coerce a string value to an appropriate Python type.
 
+    This is the public ``--input``/``--input.*`` parsing heuristic used for
+    values a user types directly on the command line -- it must not change,
+    since it is a public, backward-compatibility-sensitive contract (e.g.
+    ``1e3``, ``NaN``, ``Infinity``, and an already-JSON-quoted string like
+    ``'"true"'`` all have established meanings here that differ from strict
+    JSON). The Fleet Manager's background launch path has its own strict,
+    unambiguous typed transport instead of reusing this heuristic -- see
+    :func:`coerce_typed_value` and ``--input-json``.
+
     Args:
         value: The string value to coerce.
 
@@ -1410,6 +1459,33 @@ def coerce_value(value: str) -> Any:
 
     # Return as string
     return value
+
+
+def coerce_typed_value(value: str) -> Any:
+    """Strictly decode a JSON-encoded typed value.
+
+    Used only for the Fleet Manager's background-launch input transport
+    (the ``--input-json`` flag, populated by
+    ``bg_runner.py::launch_background`` from already-declared-type-coerced
+    values). Unlike :func:`coerce_value`'s public, user-facing heuristic,
+    this never guesses: the value was JSON-encoded by the sender (see
+    ``cli/bg_runner.py::_serialize_input_value``), so it is JSON-decoded
+    verbatim here, with no ambiguity between e.g. the string ``"true"`` and
+    the boolean ``true``.
+
+    Args:
+        value: A JSON-encoded string, e.g. ``'"true"'`` or ``'42'``.
+
+    Returns:
+        The decoded value.
+
+    Raises:
+        typer.BadParameter: If ``value`` is not valid JSON.
+    """
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        raise typer.BadParameter(f"Invalid --input-json value: {value!r} ({e})") from None
 
 
 class InputCollector:
@@ -1668,6 +1744,100 @@ def _print_loaded_instructions(detailed: list[DiscoveredInstruction]) -> None:
         )
 
 
+def _derive_run_mode(*, web: bool, web_bg: bool) -> str:
+    """Derive the fleet run-record ``mode`` field from web/web-bg flags.
+
+    Mirrors the ``bg_mode`` expression used elsewhere in this module to
+    configure ``WebDashboard`` and ``RunContext.bg_mode`` (the ``web_bg``
+    CLI flag OR the ``CONDUCTOR_WEB_BG`` env var set on a ``--web-bg``
+    detached child), so a run is never ``"fg-web"`` from the dashboard's
+    perspective but ``"bg"`` from the run record's.
+
+    Returns:
+        ``"bg"`` for a background run (D1 never prompts for stop
+        confirmation on these), ``"fg-web"`` for a foreground run with a
+        dashboard, or ``"fg"`` for a plain foreground run.
+    """
+    if web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1":
+        return "bg"
+    return "fg-web" if web else "fg"
+
+
+def _write_run_record_for_current_process(
+    *,
+    event_log_subscriber: Any,
+    dashboard: Any,
+    workflow_path: Path,
+    web: bool,
+    web_bg: bool,
+) -> None:
+    """Write (or replace) this process's Fleet Manager run record.
+
+    Called from both ``run_workflow_async`` and ``resume_workflow_async``
+    (Fleet Manager E2 — see
+    ``docs/projects/fleet-manager/fleet-manager.design.md``) once
+    ``run_id``, ``event_log_path``, and the dashboard's actual port (if
+    any) are all known, so every execution path — foreground, foreground
+    with a dashboard, background, and resumed — produces a discoverable
+    record, closing the design's blocking problem that only ``--web-bg``
+    runs used to be visible.
+
+    A resumed run reuses ``event_log_subscriber.run_id`` (the checkpoint's
+    ``existing_run_id`` when available), so calling this again for the
+    same ``run_id`` *replaces* the prior record (``write_run_record``'s
+    ``os.replace``) rather than creating a second one.
+
+    ``workflow_name`` is derived from ``workflow_path.stem`` rather than
+    the YAML-declared ``config.workflow.name`` — the two can differ, and
+    ``CheckpointManager`` names checkpoint files after the workflow file's
+    stem (``engine/checkpoint.py`` uses ``workflow_path.stem`` for both
+    the checkpoint filename prefix and the periodic-checkpoint glob), so a
+    fleet consumer resolving *this run's* checkpoints via
+    ``workflow_name`` + ``run_id`` needs the same stem or the lookup silently
+    finds nothing.
+
+    Never raises: a failure to write this diagnostic/discovery record must
+    not abort the workflow it describes.
+    """
+    from conductor.engine.checkpoint import CheckpointManager
+    from conductor.fleet.records import RunRecord, write_run_record
+
+    try:
+        write_run_record(
+            RunRecord(
+                run_id=event_log_subscriber.run_id,
+                pid=os.getpid(),
+                workflow_path=str(workflow_path),
+                workflow_name=workflow_path.stem,
+                started_at=datetime.now(UTC).isoformat(),
+                event_log_path=str(event_log_subscriber.path),
+                port=(dashboard.port if dashboard is not None else None),
+                mode=_derive_run_mode(web=web, web_bg=web_bg),
+                checkpoint_dir=str(CheckpointManager.get_checkpoints_dir()),
+            )
+        )
+    except Exception:
+        logger.warning("Failed to write fleet run record", exc_info=True)
+
+
+def _remove_run_record_for_current_process_safe() -> None:
+    """Remove this process's Fleet Manager run record, tolerating failure.
+
+    Wraps ``conductor.fleet.records.remove_run_record_for_current_process``
+    so a failure while scanning/removing the record (e.g. a permission
+    error creating/reading ``run_records_dir()``) cannot abort the rest of
+    the caller's ``finally`` block — stopping the dashboard, closing the
+    event log, and closing file logging must still happen even when this
+    diagnostic/discovery cleanup step fails.
+    """
+    from conductor.fleet.records import remove_run_record_for_current_process
+
+    try:
+        remove_run_record_for_current_process()
+    except Exception:
+        logger.warning("Failed to remove fleet run record", exc_info=True)
+
+
 async def run_workflow_async(
     workflow_path: Path,
     inputs: dict[str, Any],
@@ -1782,6 +1952,26 @@ async def run_workflow_async(
 
         event_log_subscriber = EventLogSubscriber(config.workflow.name)
         emitter.subscribe(event_log_subscriber.on_event)
+
+        # Write the Fleet Manager run record (E2): this is the first point
+        # where run_id, event_log_path, and the already-started dashboard's
+        # port (dashboard.start() ran earlier, above, before this try block)
+        # are all available.
+        _write_run_record_for_current_process(
+            event_log_subscriber=event_log_subscriber,
+            dashboard=dashboard,
+            workflow_path=workflow_path,
+            web=web,
+            web_bg=web_bg,
+        )
+
+        # Opportunistic event-log retention sweep (E5 — D3). Best-effort and
+        # settings-driven (enabled by default, keep_last = 200): never
+        # raises, and the design measured a full 1522-file scan at
+        # ~0.136s, so this cannot meaningfully delay a run.
+        from conductor.fleet.retention import maybe_prune_event_logs
+
+        maybe_prune_event_logs()
 
         # Subscribe console output to the event emitter
         console_subscriber = ConsoleEventSubscriber()
@@ -1975,12 +2165,15 @@ async def run_workflow_async(
                 raise terminate_exc
             return result
     finally:
-        # Clean up PID file if this is a background child process
-        is_bg_child = os.environ.get("CONDUCTOR_WEB_BG") == "1"
-        if is_bg_child:
-            from conductor.cli.pid import remove_pid_file_for_current_process
-
-            remove_pid_file_for_current_process()
+        # Clean up the Fleet Manager run record on every exit path (E2 —
+        # normal completion, an explicit WorkflowTerminated re-raise, or an
+        # unexpected exception all funnel through this finally). Unlike the
+        # legacy PID file (removed only by a background child), this runs
+        # unconditionally: foreground and foreground-with-dashboard runs now
+        # write a record too and must remove it on exit just the same.
+        # Guarded (never raises) so a failure here cannot prevent the
+        # dashboard/event-log/file-logging cleanup below from running.
+        _remove_run_record_for_current_process_safe()
 
         # Stop dashboard if it was started
         if dashboard is not None:
@@ -2474,6 +2667,23 @@ async def resume_workflow_async(
             )
             emitter.subscribe(event_log_subscriber.on_event)
 
+            # Write the Fleet Manager run record immediately, before any
+            # further setup (dashboard seeding, engine construction) that
+            # could take an arbitrary amount of time. `existing_log_path`
+            # was just reopened in append mode above, so it must be marked
+            # live as soon as possible -- otherwise a concurrent process's
+            # retention sweep (E5) could see it as an unreferenced,
+            # possibly-old event log and delete it out from under this
+            # resume. The final call below (after the dashboard's actual
+            # port is known) replaces this record rather than duplicating it.
+            _write_run_record_for_current_process(
+                event_log_subscriber=event_log_subscriber,
+                dashboard=dashboard,
+                workflow_path=resolved_workflow_path,
+                web=web,
+                web_bg=web_bg,
+            )
+
             # Subscribe console output to the event emitter (parity with run)
             console_subscriber = ConsoleEventSubscriber()
             emitter.subscribe(console_subscriber.on_event)
@@ -2519,7 +2729,26 @@ async def resume_workflow_async(
             #      resume — without this the dashboard would see two root
             #      starts and treat the live run as a child workflow.
             if dashboard is not None:
-                dashboard.prepend_workflow_started(await engine.build_workflow_started_data())
+                workflow_started_data = await engine.build_workflow_started_data()
+                dashboard.prepend_workflow_started(workflow_started_data)
+                # Persist a resume-generation marker directly to the JSONL
+                # log. The engine's own `workflow_started` emit is
+                # suppressed below (so the live dashboard doesn't see a
+                # duplicate root start) -- but that means a web-backed
+                # resume's *persisted* log would otherwise never record
+                # that a new execution attempt began here, leaving
+                # History's stale-terminal-state reset (E14 review round 1)
+                # unable to see it for a dashboard-backed resume (E14
+                # review round 2). Written directly to the subscriber,
+                # bypassing the emitter, so the dashboard is not handed a
+                # second copy of the same event.
+                from conductor.events import WorkflowEvent
+
+                event_log_subscriber.on_event(
+                    WorkflowEvent(
+                        type="workflow_started", timestamp=time.time(), data=workflow_started_data
+                    )
+                )
                 replayed = 0
                 if existing_log_path is not None:
                     replayed = dashboard.replay_events_from_jsonl(existing_log_path)
@@ -2556,6 +2785,29 @@ async def resume_workflow_async(
                     # running WebSocket for human gates / dialogs.
                     engine.clear_web_dashboard()
                     dashboard = None
+
+            # Re-write the Fleet Manager run record (E2) now that the
+            # dashboard's actual resolved port (dashboard.start() — or its
+            # failure — has just been handled above) is known. An earlier
+            # call right after opening the event log subscriber already
+            # marked this run live (see the retention-race comment there);
+            # this one replaces that record with the final port value,
+            # rather than creating a second one for the same run.
+            _write_run_record_for_current_process(
+                event_log_subscriber=event_log_subscriber,
+                dashboard=dashboard,
+                workflow_path=resolved_workflow_path,
+                web=web,
+                web_bg=web_bg,
+            )
+
+            # Opportunistic event-log retention sweep (E5 — D3), mirroring
+            # run_workflow_async. Best-effort and settings-driven (enabled
+            # by default, keep_last = 200): never raises, and cannot
+            # meaningfully delay a resumed run.
+            from conductor.fleet.retention import maybe_prune_event_logs
+
+            maybe_prune_event_logs()
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
             if dashboard is not None and interrupt_event is not None:
@@ -2644,12 +2896,12 @@ async def resume_workflow_async(
                 raise terminate_exc
             return result
     finally:
-        # Clean up PID file if this is a background child process
-        is_bg_child = os.environ.get("CONDUCTOR_WEB_BG") == "1"
-        if is_bg_child:
-            from conductor.cli.pid import remove_pid_file_for_current_process
-
-            remove_pid_file_for_current_process()
+        # Clean up the Fleet Manager run record on every exit path (E2 —
+        # mirrors run_workflow_async so a resumed run's record is removed
+        # the same way a fresh run's is). Guarded (never raises) so a
+        # failure here cannot prevent the dashboard/event-log/file-logging
+        # cleanup below from running.
+        _remove_run_record_for_current_process_safe()
 
         # Stop dashboard if it was started
         if dashboard is not None:

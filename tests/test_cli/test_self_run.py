@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,7 @@ from conductor.cli.self_run import (
     own_run_pids,
     partition_own_run,
 )
+from conductor.fleet.records import RunRecord
 
 
 @pytest.fixture(autouse=True)
@@ -166,8 +168,26 @@ class TestReadPpid:
         assert self_run._read_ppid(12345) == 42
 
 
-def _entry(pid: int, port: int, run_id: str = "", workflow: str = "/tmp/wf.yaml") -> dict:
-    return {"pid": pid, "port": port, "run_id": run_id, "workflow": workflow}
+def _entry(
+    pid: int, port: int | None, run_id: str = "", workflow: str = "/tmp/wf.yaml"
+) -> RunRecord:
+    """Build a run record for the partitioner.
+
+    ``partition_own_run`` operates on :class:`RunRecord` since the Fleet
+    Manager -- ``read_run_records`` surfaces legacy ``.pid`` files in that
+    same shape, so there is no dict form left to model.
+    """
+    return RunRecord(
+        run_id=run_id,
+        pid=pid,
+        workflow_path=workflow,
+        workflow_name=Path(workflow).stem,
+        started_at="2026-03-03T00:00:00+00:00",
+        event_log_path="",
+        port=port,
+        mode="bg" if port is not None else "fg",
+        checkpoint_dir=None,
+    )
 
 
 class TestPartitionOwnRun:
@@ -182,7 +202,7 @@ class TestPartitionOwnRun:
 
         assert partition.own == entries
         assert partition.others == []
-        assert partition.reasons[8080] == "run id"
+        assert partition.reasons[111] == "run id"
 
     def test_different_run_id_is_not_self_even_with_matching_port(
         self, monkeypatch: pytest.MonkeyPatch
@@ -212,7 +232,7 @@ class TestPartitionOwnRun:
 
         assert partition.own == entries
         assert partition.others == []
-        assert partition.reasons[8080] == "dashboard port"
+        assert partition.reasons[111] == "dashboard port"
 
     def test_ancestry_pid_is_self(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset({111}))
@@ -222,7 +242,7 @@ class TestPartitionOwnRun:
 
         assert partition.own == entries
         assert partition.others == []
-        assert partition.reasons[8080] == "process ancestry"
+        assert partition.reasons[111] == "process ancestry"
 
     def test_no_signal_leaves_own_empty_and_preserves_order(
         self, monkeypatch: pytest.MonkeyPatch
@@ -254,21 +274,30 @@ class TestPartitionOwnRun:
     def test_non_string_run_id_is_ignored_rather_than_crashing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A malformed PID file with a non-string ``run_id`` must not crash classification.
+        """A malformed ``run_id`` must not crash classification.
 
-        One corrupted/hand-edited PID file must not take down `stop` for
-        every other run (matching `pid.py::scan_pid_files`'s own "skip,
-        don't raise" discipline for malformed entries).
+        The partitioner no longer needs its own type guard: it takes
+        :class:`RunRecord`, and a hand-edited file with an integer id is
+        rejected by ``RunRecord.from_dict`` before it can ever reach here --
+        ``_load_record_file`` then skips that file. The guard moved down a
+        layer rather than disappearing.
         """
         monkeypatch.setenv(RUN_ID_ENV, "mine")
         monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
 
-        entry = _entry(111, 8080)
-        entry["run_id"] = 12345  # malformed: an int instead of a string
-        partition = partition_own_run([entry])
+        with pytest.raises(ValueError, match="run_id must be a string"):
+            RunRecord.from_dict(
+                {"pid": 111, "port": 8080, "run_id": 12345, "workflow": "/tmp/wf.yaml"}
+            )
 
+        # And a well-formed record still classifies normally afterwards, which
+        # is the property that actually matters: one bad file on disk is
+        # skipped by `_load_record_file` (see tests/test_fleet/test_records.py)
+        # rather than taking down classification for every other run.
+        other = _entry(222, 9090, run_id="theirs")
+        partition = partition_own_run([other])
         assert partition.own == []
-        assert partition.others == [entry]
+        assert partition.others == [other]
 
 
 class TestOwnRunPartitionInvariant:
@@ -291,8 +320,8 @@ class TestOwnRunPartitionInvariant:
         from conductor.cli.self_run import OwnRunPartition
 
         OwnRunPartition(
-            own=[{"pid": 1}],
-            others=[{"pid": 2}],
+            own=[_entry(1, 8080)],
+            others=[_entry(2, 8081)],
             reasons={},
         )
 
@@ -319,5 +348,5 @@ class TestDescribeOwnRun:
         is *absent*, not when it's present with value ``None`` -- so this
         exercises that exact gotcha.
         """
-        entry = {"pid": 111, "port": 8080, "run_id": "", "workflow": None}
+        entry = _entry(111, 8080, workflow="")
         assert describe_own_run(entry) == "unknown (port 8080)"

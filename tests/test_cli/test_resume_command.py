@@ -469,7 +469,10 @@ class TestLaunchBackgroundResume:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(12345, 9099),
+            ),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path,
@@ -516,7 +519,10 @@ class TestLaunchBackgroundResume:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(12345, 9100),
+            ),
         ):
             bg_runner.launch_background_resume(
                 workflow_path=None,
@@ -663,13 +669,14 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch("conductor.fleet.records.read_run_record") as mock_read,
             pytest.raises(RuntimeError, match="terminated"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
         proc.terminate.assert_called_once()
-        mock_write.assert_not_called()
+        # The dashboard never came up, so the record-poll gate is never reached.
+        mock_read.assert_not_called()
 
     def test_reports_immediate_child_exit(self, tmp_path: Path) -> None:
         """If the child died before the server came up, surface its exit code."""
@@ -685,17 +692,17 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch("conductor.fleet.records.read_run_record") as mock_read,
             pytest.raises(RuntimeError, match="exited immediately with code 7"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
-        # Child already dead -> no terminate, no PID file written.
+        # Child already dead -> no terminate, no run-record poll reached.
         proc.terminate.assert_not_called()
-        mock_write.assert_not_called()
+        mock_read.assert_not_called()
 
-    def test_terminates_child_on_pid_write_failure(self, tmp_path: Path) -> None:
-        """If write_pid_file raises, the running child is killed (no orphan)."""
+    def test_terminates_child_when_run_record_never_appears(self, tmp_path: Path) -> None:
+        """If the child never writes its run record, the running child is killed (no orphan)."""
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -708,15 +715,18 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file", side_effect=OSError("disk full")),
-            pytest.raises(RuntimeError, match="Failed to write PID file"),
+            patch("conductor.fleet.records.read_run_record", return_value=None),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            pytest.raises(RuntimeError, match="did not report a run record"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
         proc.terminate.assert_called_once()
 
-    def test_pid_file_written_with_workflow_path(self, tmp_path: Path) -> None:
-        """When workflow_path is provided, the PID file is keyed to it."""
+    def test_run_record_looked_up_with_workflow_path(self, tmp_path: Path) -> None:
+        """When workflow_path is provided, the launch still succeeds once the
+        child's run record (keyed by ``run_id``, not by workflow path) appears."""
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -729,23 +739,19 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9201),
+            ) as mock_read,
         ):
-            bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path, checkpoint_path=None, web_port=9201
             )
 
-        mock_write.assert_called_once()
-        args, kwargs = mock_write.call_args
-        assert args == (5555, 9201, wf_path)
-        # The run id must reach the PID file, or ``conductor stop`` has no way
-        # to confirm identity before force-terminating (issue #344).
-        assert kwargs["run_id"], "run_id must be recorded in the PID file"
-        assert kwargs["stderr_log"]
-        assert kwargs["stdout_log"]
+        mock_read.assert_called_once_with(launch.run_id)
 
-    def test_pid_file_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
-        """When only checkpoint_path is given, it is used for the PID file ref."""
+    def test_run_record_lookup_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
+        """When only checkpoint_path is given, the launch still resolves via ``run_id``."""
         from conductor.cli import bg_runner
 
         cp_path = tmp_path / "cp.json"
@@ -758,20 +764,16 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9202),
+            ) as mock_read,
         ):
-            bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9202
             )
 
-        mock_write.assert_called_once()
-        args, kwargs = mock_write.call_args
-        assert args == (5556, 9202, cp_path)
-        # The run id must reach the PID file, or ``conductor stop`` has no way
-        # to confirm identity before force-terminating (issue #344).
-        assert kwargs["run_id"], "run_id must be recorded in the PID file"
-        assert kwargs["stderr_log"]
-        assert kwargs["stdout_log"]
+        mock_read.assert_called_once_with(launch.run_id)
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
         """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
@@ -800,7 +802,10 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(1, 9203),
+            ),
         ):
             bg_runner.launch_background_resume(
                 workflow_path=wf_path, checkpoint_path=None, web_port=9203
@@ -839,6 +844,37 @@ class TestLaunchBackgroundResumeFailures:
         assert env["CONDUCTOR_BG_STDOUT_LOG"].endswith(".bg.stdout.log")
 
 
+def _write_checkpoint_with_log(tmp_path: Path, workflow_path: Path, run_id: str) -> Path:
+    """Checkpoint whose ``event_log_path`` points at a file that exists.
+
+    ``_peek_resume_run_id`` only adopts the checkpoint's run id when that log
+    survives -- mirroring ``EventLogSubscriber``, which reuses the id under
+    exactly the same condition. A checkpoint with a missing log makes the
+    child mint a fresh id, so the parent must not adopt either (it would then
+    poll a key the child never writes and terminate a healthy run). Creating
+    the log is therefore part of setting up the adoption case, not incidental.
+    """
+    log_path = tmp_path / f"conductor-run-{run_id}.events.jsonl"
+    log_path.write_text("")
+    return _write_checkpoint(tmp_path, workflow_path, run_id=run_id, event_log_path=str(log_path))
+
+
+def _record_poll_mock(pid: int, web_port: int):
+    """Stand in for the child writing its run record (Fleet Manager D2).
+
+    ``_finalize_background_launch`` polls ``read_run_record(run_id)`` and only
+    accepts a record matching the child's ``pid``/``mode``/``port``, so the
+    stub has to agree with the launch it is standing in for -- a mock with
+    fixed attributes would simply never match and the gate would time out.
+    """
+    from unittest.mock import MagicMock as _MagicMock
+
+    def _read(run_id: str):
+        return _MagicMock(run_id=run_id, pid=pid, mode="bg", port=web_port)
+
+    return _read
+
+
 class TestLaunchBackgroundResumeRunIdAdoption:
     """``launch_background_resume`` adopts the checkpoint's ``run_id`` (issue #404).
 
@@ -853,7 +889,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         from conductor.cli import bg_runner
 
         wf_path = _write_workflow(tmp_path)
-        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="deadbeef")
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "deadbeef")
 
         proc = MagicMock()
         proc.pid = 6001
@@ -862,24 +898,30 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9210),
+            ) as mock_write,
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9210
             )
 
+        # under this exact id and the launch gate polls that key, so folding
+        # the case here would poll a key the child never writes.
         assert launch.run_id == "deadbeef"
         assert "deadbeef" in launch.stderr_log.name
         assert "deadbeef" in launch.stdout_log.name
 
-        _, kwargs = mock_write.call_args
-        assert kwargs["run_id"] == "deadbeef"
+        # The launch gate polls for the child's record by run id, so the
+        # adopted id is what it must have asked for.
+        mock_write.assert_called_with("deadbeef")
 
     def test_explicit_from_checkpoint_run_id_wires_env(self, tmp_path: Path) -> None:
         from conductor.cli import bg_runner
 
         wf_path = _write_workflow(tmp_path)
-        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="deadbeef")
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "deadbeef")
 
         captured: dict[str, Any] = {}
 
@@ -893,7 +935,10 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(6002, 9211),
+            ),
         ):
             bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9211
@@ -908,7 +953,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         from conductor.cli import bg_runner
 
         wf_path = _write_workflow(tmp_path)
-        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="cafef00d")
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "cafef00d")
 
         proc = MagicMock()
         proc.pid = 6003
@@ -921,15 +966,17 @@ class TestLaunchBackgroundResumeRunIdAdoption:
             ),
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9212),
+            ) as mock_write,
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path, checkpoint_path=None, web_port=9212
             )
 
         assert launch.run_id == "cafef00d"
-        _, kwargs = mock_write.call_args
-        assert kwargs["run_id"] == "cafef00d"
+        mock_write.assert_called_with("cafef00d")
 
     def test_missing_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
         """A checkpoint with no ``run_id`` doesn't crash the launch."""
@@ -945,7 +992,10 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9213),
+            ),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9213
@@ -967,7 +1017,10 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9214),
+            ),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9214
@@ -990,7 +1043,10 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9215),
+            ),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=missing_cp, web_port=9215
@@ -998,18 +1054,25 @@ class TestLaunchBackgroundResumeRunIdAdoption:
 
         assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
 
-    def test_uppercase_checkpoint_run_id_is_lowercased_and_adopted(self, tmp_path: Path) -> None:
-        """A checkpoint's ``run_id`` is normalized to lowercase before adoption.
+    def test_uppercase_checkpoint_run_id_is_adopted_verbatim(self, tmp_path: Path) -> None:
+        """A checkpoint's uppercase ``run_id`` is adopted as-is, not folded.
 
-        Every current writer of a checkpoint's ``run_id`` (``EventLogSubscriber``,
-        ``secrets.token_hex``) already produces lowercase hex, but a
-        hand-edited or future-format checkpoint could carry uppercase hex —
-        this must still be recognized and adopted, not treated as malformed.
+        Every current writer of a checkpoint's ``run_id``
+        (``EventLogSubscriber``, ``secrets.token_hex``) produces lowercase
+        hex, but a hand-edited or future-format checkpoint could carry
+        uppercase — which must still be recognized and adopted, not treated
+        as malformed.
+
+        It must be adopted **verbatim**: ``EventLogSubscriber`` assigns
+        ``self._run_id = existing_run_id`` with no normalization, so the child
+        writes its run record under exactly this id. Lowercasing it here would
+        make the D2 launch gate poll a key that never appears and terminate a
+        perfectly healthy resumed run.
         """
         from conductor.cli import bg_runner
 
         wf_path = _write_workflow(tmp_path)
-        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="DEADBEEF")
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "DEADBEEF")
 
         proc = MagicMock()
         proc.pid = 6007
@@ -1018,15 +1081,22 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9216),
+            ) as mock_write,
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9216
             )
 
-        assert launch.run_id == "deadbeef"
-        _, kwargs = mock_write.call_args
-        assert kwargs["run_id"] == "deadbeef"
+        # Preserved verbatim, not lowercased: the child writes its run record
+        # under this exact id and the D2 launch gate polls that key, so folding
+        # the case here would poll a key the child never writes.
+        assert launch.run_id == "DEADBEEF"
+        # The launch gate polls for the child's record by run id, so the
+        # adopted id is what it must have asked for.
+        mock_write.assert_called_with("DEADBEEF")
 
     def test_non_string_checkpoint_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
         """A checkpoint whose ``run_id`` field is a non-string JSON value doesn't crash.
@@ -1051,7 +1121,10 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9217),
+            ),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9217
@@ -1082,7 +1155,10 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9218),
+            ),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9218
@@ -1536,6 +1612,93 @@ class TestResumeReplaysIntoDashboard:
         assert types[0] == "workflow_started"
         assert "agent_started" in types
         assert "agent_completed" in types
+
+    @pytest.mark.asyncio
+    async def test_web_backed_resume_persists_a_fresh_workflow_started_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """A web-backed resume (``--web``/``--web-bg``) suppresses the
+        engine's own ``workflow_started`` re-emit so the *live dashboard*
+        doesn't see a duplicate root start -- but the *persisted* JSONL
+        log must still record a fresh ``workflow_started`` marking this
+        resume as a new execution generation, so the Fleet Manager's
+        History screen can reset a stale prior terminal outcome (E14
+        review round 2). Without this, a dashboard-backed resume's log
+        would never regain a root-level ``workflow_started`` after the
+        first run, and History would keep reporting the earlier
+        failed/completed outcome indefinitely."""
+        from conductor.cli.run import resume_workflow_async
+
+        log_path = tmp_path / "conductor-test.events.jsonl"
+        log_path.write_text(
+            '{"type":"workflow_started","timestamp":1.0,"data":{"name":"test-workflow"}}\n'
+            '{"type":"agent_started","timestamp":2.0,"data":{"agent_name":"greeter"}}\n'
+            '{"type":"agent_completed","timestamp":3.0,'
+            '"data":{"agent_name":"greeter","output":{"greeting":"hi"}}}\n'
+            '{"type":"workflow_failed","timestamp":4.0,"data":{"error_type":"ProviderError"}}\n'
+        )
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(
+            tmp_path,
+            wf_path,
+            run_id="abc12345",
+            event_log_path=str(log_path),
+        )
+
+        captured: dict[str, Any] = {}
+        from conductor.web.server import WebDashboard as _RealDashboard
+
+        def _capture_dashboard(*args, **kwargs):
+            dash = _RealDashboard(*args, **kwargs)
+            dash.wait_for_clients_disconnect = AsyncMock(return_value=None)
+            captured["dashboard"] = dash
+            return dash
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.web.server.WebDashboard", side_effect=_capture_dashboard),
+        ):
+            mock_registry = AsyncMock()
+            mock_registry_cls.return_value = mock_registry
+            mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+            mock_engine = MagicMock()
+            mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+            mock_engine.config = MagicMock()
+            mock_engine.config.workflow.cost.show_summary = False
+            mock_engine.build_workflow_started_data = AsyncMock(
+                return_value={"name": "test-workflow"}
+            )
+            mock_engine_cls.return_value = mock_engine
+
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                web=True,
+                web_bg=True,
+                web_port=0,
+                no_interactive=True,
+            )
+
+        persisted_lines = log_path.read_text().strip().splitlines()
+        persisted_events = [json.loads(line) for line in persisted_lines]
+        persisted_types = [ev["type"] for ev in persisted_events]
+
+        # The original 4 events are untouched, and a fresh root-level
+        # ``workflow_started`` was appended marking the resume boundary.
+        assert persisted_types[:4] == [
+            "workflow_started",
+            "agent_started",
+            "agent_completed",
+            "workflow_failed",
+        ]
+        assert persisted_types[4] == "workflow_started"
+        # Strictly after the prior terminal event's timestamp, and not
+        # stamped with a subworkflow_path (a root-level event).
+        assert persisted_events[4]["timestamp"] > persisted_events[3]["timestamp"]
+        assert "subworkflow_path" not in persisted_events[4].get("data", {})
 
     @pytest.mark.asyncio
     async def test_falls_back_to_synthetic_when_log_missing(self, tmp_path: Path) -> None:
