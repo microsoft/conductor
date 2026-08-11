@@ -38,7 +38,17 @@ class TestHelpPanels:
     def test_flat_commands_listed(self) -> None:
         result = runner.invoke(app, ["--help"], env=_WIDE)
         assert result.exit_code == 0
-        for cmd in ("run", "resume", "stop", "replay", "validate", "show", "update", "doctor"):
+        for cmd in (
+            "run",
+            "resume",
+            "status",
+            "stop",
+            "replay",
+            "validate",
+            "show",
+            "update",
+            "doctor",
+        ):
             assert cmd in result.output
 
     def test_noun_groups_listed(self) -> None:
@@ -59,6 +69,7 @@ class TestHelpPanels:
         expected = {
             "run": "Run & Recover",
             "resume": "Run & Recover",
+            "status": "Run & Recover",
             "stop": "Run & Recover",
             "replay": "Run & Recover",
             "validate": "Author & Inspect",

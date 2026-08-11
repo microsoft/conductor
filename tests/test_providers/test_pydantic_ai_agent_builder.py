@@ -583,8 +583,12 @@ class TestClientConstruction:
         assert isinstance(pydantic_agent.model, AnthropicModel)
         assert pydantic_agent.model.client.timeout == 120.0
 
-    def test_auth_token_reaches_client(self) -> None:
-        """The provided auth_token must reach the Anthropic SDK client."""
+    def test_auth_token_reaches_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The provided auth_token must reach the Anthropic SDK client as the sole credential."""
+        # Requirement: an explicit auth_token is sent as Authorization: Bearer,
+        # and the ambient ANTHROPIC_API_KEY must not ride along (the Anthropic
+        # SDK sends both headers when both credentials are set).
+        monkeypatch.delenv("ANTHROPIC_API_KEY")
         agent_def = AgentDef(name="token_agent")
 
         pydantic_agent = build_agent(
@@ -596,6 +600,67 @@ class TestClientConstruction:
 
         assert isinstance(pydantic_agent.model, AnthropicModel)
         assert pydantic_agent.model.client.auth_token == "bearer-token"
+        assert pydantic_agent.model.client.auth_headers == {"Authorization": "Bearer bearer-token"}
+
+    def test_api_key_reaches_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The provided api_key must reach the Anthropic SDK client as the sole credential."""
+        # Requirement: an explicit api_key is sent as X-Api-Key, and an ambient
+        # ANTHROPIC_AUTH_TOKEN must not ride along (SDK unit semantics).
+        monkeypatch.delenv("ANTHROPIC_API_KEY")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
+        agent_def = AgentDef(name="key_agent")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            api_key="sk-explicit",
+        )
+
+        assert isinstance(pydantic_agent.model, AnthropicModel)
+        assert pydantic_agent.model.client.auth_headers == {"X-Api-Key": "sk-explicit"}
+
+    def test_explicit_auth_token_suppresses_ambient_env_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit auth_token must not mix with an ambient ANTHROPIC_API_KEY."""
+        # Requirement: credentials resolve as a unit (SDK semantics) — an
+        # explicit credential disables env credential resolution, otherwise the
+        # ambient key would leak to whatever base_url points at via X-Api-Key.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+        agent_def = AgentDef(name="unit_agent")
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            auth_token="bearer-token",
+        )
+
+        assert isinstance(pydantic_agent.model, AnthropicModel)
+        assert pydantic_agent.model.client.auth_headers == {"Authorization": "Bearer bearer-token"}
+
+    def test_both_credentials_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Setting both credentials must log a both-headers-sent warning."""
+        # Requirement: when both credentials are effectively set, Conductor
+        # warns instead of silently shipping both auth headers (parity with
+        # the Copilot provider's api_key/bearer_token warning).
+        monkeypatch.delenv("ANTHROPIC_API_KEY")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        agent_def = AgentDef(name="both_agent")
+
+        with caplog.at_level("WARNING"):
+            build_agent(
+                agent_def,
+                system_prompt="",
+                rendered_prompt="",
+                api_key="sk-explicit",
+                auth_token="bearer-token",
+            )
+
+        assert any("Both api_key and auth_token" in r.message for r in caplog.records)
 
 
 class TestToolSchemaSanitization:
