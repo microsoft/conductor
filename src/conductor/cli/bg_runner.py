@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -40,6 +41,8 @@ from dataclasses import dataclass
 from io import IOBase
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Windows process creation flags. Exposed via ``getattr`` with documented
 # fallbacks so this module can be imported on POSIX (where these attributes do
@@ -175,7 +178,12 @@ class BackgroundLaunch:
             first place to look when a bg run misbehaves silently.
         stdout_log: Path to the file capturing the child's stdout.
         run_id: 8-hex-character run id that ties this bg launch to its
-            ``.events.jsonl`` peer via ``CONDUCTOR_RUN_ID``.
+            ``.events.jsonl`` peer via ``CONDUCTOR_RUN_ID``. On resume, this
+            is adopted from the checkpoint's ``run_id`` when resolvable (see
+            ``_checkpoint_run_id``), so the PID file, ``/api/info``, the
+            events JSONL, and the capture-log filenames all agree on one id
+            instead of the launcher minting an id that correlates with
+            nothing.
 
     Invariants (enforced in ``__post_init__``):
         * ``run_id`` is exactly 8 lowercase hex characters.
@@ -278,13 +286,14 @@ def _sanitize_name(name: str) -> str:
     return cleaned or "workflow"
 
 
-def _open_bg_log_files(workflow_ref: Path) -> tuple[str, Path, Path, IOBase, IOBase]:
+def _open_bg_log_files(
+    workflow_ref: Path, *, run_id: str | None = None
+) -> tuple[str, Path, Path, IOBase, IOBase]:
     """Create the bg child's stderr/stdout log files and return open handles.
 
-    Generates a fresh 8-hex-character run id and opens two log files in
-    ``$TMPDIR/conductor/`` whose names match the convention used by
-    ``EventLogSubscriber`` (timestamp + run id) so all three artefacts of a
-    single bg run group together by filename.
+    Opens two log files in ``$TMPDIR/conductor/`` whose names match the
+    convention used by ``EventLogSubscriber`` (timestamp + run id) so all
+    three artefacts of a single bg run group together by filename.
 
     The caller is responsible for closing the returned handles once
     ``subprocess.Popen`` has returned (the child has its own inherited OS
@@ -293,6 +302,10 @@ def _open_bg_log_files(workflow_ref: Path) -> tuple[str, Path, Path, IOBase, IOB
     Args:
         workflow_ref: The workflow file (or checkpoint) used to derive the
             ``<name>`` segment of the filename.
+        run_id: When given and it matches ``_RUN_ID_PATTERN_LOCAL`` (8
+            lowercase hex chars), reuse it instead of minting a fresh one —
+            used on resume so the whole launch adopts the checkpoint's run
+            id. Otherwise a fresh ``secrets.token_hex(4)`` id is generated.
 
     Returns:
         Tuple of ``(run_id, stderr_path, stdout_path, stderr_handle,
@@ -303,14 +316,16 @@ def _open_bg_log_files(workflow_ref: Path) -> tuple[str, Path, Path, IOBase, IOB
             cannot be opened. The caller is expected to surface this as a
             ``RuntimeError`` with context.
     """
-    run_id = secrets.token_hex(4)
+    resolved_run_id = (
+        run_id if run_id is not None and _RUN_ID_PATTERN_LOCAL.fullmatch(run_id) else None
+    ) or secrets.token_hex(4)
     ts = time.strftime("%Y%m%d-%H%M%S")
     base = _sanitize_name(workflow_ref.stem) if workflow_ref.stem else "workflow"
     log_dir = Path(tempfile.gettempdir()) / "conductor"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    stderr_path = log_dir / f"conductor-{base}-{ts}-{run_id}.bg.stderr.log"
-    stdout_path = log_dir / f"conductor-{base}-{ts}-{run_id}.bg.stdout.log"
+    stderr_path = log_dir / f"conductor-{base}-{ts}-{resolved_run_id}.bg.stderr.log"
+    stdout_path = log_dir / f"conductor-{base}-{ts}-{resolved_run_id}.bg.stdout.log"
     # Line-buffered text mode so a tail of the file shows fresh output as
     # the child writes it. ``errors="replace"`` keeps the file readable
     # even if the child emits invalid UTF-8 (e.g. raw bytes from a
@@ -321,7 +336,7 @@ def _open_bg_log_files(workflow_ref: Path) -> tuple[str, Path, Path, IOBase, IOB
     stdout_handle = open(  # noqa: SIM115 - caller closes after Popen
         stdout_path, "w", encoding="utf-8", errors="replace", buffering=1
     )
-    return run_id, stderr_path, stdout_path, stderr_handle, stdout_handle
+    return resolved_run_id, stderr_path, stdout_path, stderr_handle, stdout_handle
 
 
 def _close_quietly(*handles: IOBase) -> None:
@@ -353,7 +368,9 @@ def _finalize_background_launch(
     web_port: int,
     pid_workflow_ref: Path,
     stderr_log: Path,
-    run_id: str = "",
+    *,
+    run_id: str,
+    stdout_log: Path,
 ) -> None:
     """Wait for the dashboard to come up and write the PID file.
 
@@ -363,6 +380,10 @@ def _finalize_background_launch(
     is included in the RuntimeError so callers can point users at the
     captured crash output.
 
+    The PID file records ``run_id`` and both capture-log paths so a bg run
+    can be correlated to its events JSONL (via ``run_id``) and its captured
+    stderr/stdout after the launching terminal is gone.
+
     Args:
         proc: The detached child process.
         web_port: The TCP port the child should be listening on.
@@ -370,10 +391,10 @@ def _finalize_background_launch(
             inside it for ``conductor stop`` to display.
         stderr_log: Path to the file capturing the child's stderr. Included
             in failure messages so users know where to look.
-        run_id: The run id propagated to the child via ``CONDUCTOR_RUN_ID``.
-            Recorded in the PID file so ``conductor stop`` can confirm that
-            the dashboard answering on ``web_port`` really is this run before
-            escalating to a forceful kill (issue #344).
+        run_id: The run id shared with the child via ``CONDUCTOR_RUN_ID``,
+            recorded in the PID file.
+        stdout_log: Path to the file capturing the child's stdout, recorded
+            in the PID file.
 
     Raises:
         RuntimeError: If the child died early, the dashboard didn't start
@@ -396,7 +417,14 @@ def _finalize_background_launch(
     from conductor.cli.pid import write_pid_file
 
     try:
-        write_pid_file(proc.pid, web_port, pid_workflow_ref, run_id=run_id)
+        write_pid_file(
+            proc.pid,
+            web_port,
+            pid_workflow_ref,
+            run_id=run_id,
+            stderr_log=str(stderr_log),
+            stdout_log=str(stdout_log),
+        )
     except Exception as exc:
         _terminate_child(proc)
         raise RuntimeError(
@@ -438,6 +466,7 @@ def _spawn_bg_child(
     cmd: list[str],
     web_port: int,
     pid_workflow_ref: Path,
+    run_id: str | None = None,
 ) -> BackgroundLaunch:
     """Open the bg log files, spawn the detached child, and finalize the launch.
 
@@ -453,6 +482,10 @@ def _spawn_bg_child(
         web_port: The TCP port the child should listen on.
         pid_workflow_ref: Workflow or checkpoint path used both as the source
             of the log filename stem and as the PID file's recorded reference.
+        run_id: Optional run id to adopt for this launch (e.g. resolved from a
+            checkpoint on resume) instead of minting a fresh one. Passed
+            through to :func:`_open_bg_log_files`, which falls back to a
+            fresh id if this doesn't match the expected 8-hex-char shape.
 
     Returns:
         ``BackgroundLaunch`` describing the live launch.
@@ -463,7 +496,7 @@ def _spawn_bg_child(
     """
     try:
         run_id, stderr_path, stdout_path, stderr_handle, stdout_handle = _open_bg_log_files(
-            pid_workflow_ref
+            pid_workflow_ref, run_id=run_id
         )
     except OSError as exc:
         raise RuntimeError(f"Failed to create background log files: {exc}") from exc
@@ -486,7 +519,14 @@ def _spawn_bg_child(
                 f"Failed to start background process: {exc}. See child stderr log: {stderr_path}"
             ) from exc
 
-        _finalize_background_launch(proc, web_port, pid_workflow_ref, stderr_path, run_id=run_id)
+        _finalize_background_launch(
+            proc,
+            web_port,
+            pid_workflow_ref,
+            stderr_path,
+            run_id=run_id,
+            stdout_log=stdout_path,
+        )
     finally:
         # The child has its own duplicated OS handles by now (or never got
         # them, if Popen raised) — either way the parent's Python file
@@ -597,6 +637,72 @@ def launch_background(
     return _spawn_bg_child(cmd=cmd, web_port=web_port, pid_workflow_ref=workflow_path)
 
 
+def _checkpoint_run_id(workflow_path: Path | None, checkpoint_path: Path | None) -> str | None:
+    """Resolve the run id the resumed child will adopt from its checkpoint.
+
+    Mirrors the checkpoint-resolution precedence in
+    ``cli/run.py::resume_workflow_async`` (explicit ``checkpoint_path`` first,
+    else the latest checkpoint for ``workflow_path``) so the launcher and the
+    child agree on which checkpoint is in play, and therefore on its
+    ``run_id``. That id is what ``EventLogSubscriber`` adopts via
+    ``existing_run_id`` whenever the original JSONL still exists, so using it
+    here too is what keeps the PID file, ``/api/info``, and the events log
+    agreeing with each other.
+
+    A launcher must never fail a launch over checkpoint parsing — the child
+    will surface the real error — so any failure here is swallowed and
+    ``None`` is returned, which falls back to a fresh id. The except clause
+    is deliberately broad (rather than naming only ``CheckpointManager``'s
+    documented exceptions) because a hand-edited or corrupted checkpoint can
+    fail in shapes ``CheckpointManager`` doesn't itself guard against — e.g.
+    a top-level JSON value that isn't an object (``AttributeError`` from
+    ``.get()``) or a ``run_id`` field that parsed as a non-string JSON value
+    (``AttributeError`` from ``.lower()`` below). Every such failure is
+    logged at warning level so the fallback leaves a forensic trail instead
+    of silently reusing a fresh id with no explanation (this module's own
+    stated philosophy — see the module docstring).
+
+    Args:
+        workflow_path: Optional workflow YAML path, used to find the latest
+            checkpoint when ``checkpoint_path`` is not given.
+        checkpoint_path: Optional explicit checkpoint path.
+
+    Returns:
+        The checkpoint's ``run_id`` lowercased, when it is 8 hex chars
+        (matching ``BackgroundLaunch``'s invariant). ``None`` otherwise, or
+        when no checkpoint could be resolved/loaded.
+    """
+    from conductor.engine.checkpoint import CheckpointManager
+
+    try:
+        resolved_path = checkpoint_path
+        if resolved_path is None and workflow_path is not None:
+            resolved_path = CheckpointManager.find_latest_checkpoint(workflow_path)
+        if resolved_path is None:
+            return None
+        cp = CheckpointManager.load_checkpoint(resolved_path)
+        # ``CheckpointData.run_id`` is a ``str`` type hint, not an enforced
+        # constraint — a hand-edited or malformed checkpoint could carry a
+        # non-string value here, which would otherwise raise a bare
+        # ``AttributeError`` from ``.lower()``.
+        candidate = str(cp.run_id or "").lower()
+    except Exception as exc:  # must never fail a launch over checkpoint parsing; see docstring
+        logger.warning(
+            "Could not adopt run_id from checkpoint %s (%s: %s); minting a "
+            "fresh id instead. If the resumed child adopts the checkpoint's "
+            "real run_id from its own events JSONL, the PID file may not "
+            "correlate with it.",
+            resolved_path,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+    if _RUN_ID_PATTERN_LOCAL.fullmatch(candidate):
+        return candidate
+    return None
+
+
 def launch_background_resume(
     *,
     workflow_path: Path | None,
@@ -617,6 +723,12 @@ def launch_background_resume(
 
     Either ``workflow_path`` or ``checkpoint_path`` (or both) must be
     provided — at least one is required by the resume command.
+
+    The launch adopts the checkpoint's ``run_id`` (when it resolves to 8 hex
+    chars via :func:`_checkpoint_run_id`) instead of minting a fresh one, so
+    the PID file, ``/api/info``, the events JSONL, and the capture-log
+    filenames all agree on one id — matching what the resumed child's own
+    ``EventLogSubscriber`` adopts when the original JSONL still exists.
 
     Args:
         workflow_path: Optional path to the workflow YAML file. Used to find
@@ -694,7 +806,16 @@ def launch_background_resume(
     # where both are None; the ``or`` here picks the first non-None.
     pid_workflow_ref: Path = workflow_path or checkpoint_path  # type: ignore[assignment]
 
-    return _spawn_bg_child(cmd=cmd, web_port=web_port, pid_workflow_ref=pid_workflow_ref)
+    # Adopt the checkpoint's run id (when resolvable) so the whole launch —
+    # PID file, bg capture-log filenames, ``CONDUCTOR_RUN_ID`` — agrees with
+    # the id the resumed child's ``EventLogSubscriber`` will itself adopt.
+    # Falls back to a fresh id via ``_spawn_bg_child``/``_open_bg_log_files``
+    # when the checkpoint has no usable id.
+    resumed_run_id = _checkpoint_run_id(workflow_path, checkpoint_path)
+
+    return _spawn_bg_child(
+        cmd=cmd, web_port=web_port, pid_workflow_ref=pid_workflow_ref, run_id=resumed_run_id
+    )
 
 
 def _serialize_value(value: Any) -> str:

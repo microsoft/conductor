@@ -49,6 +49,28 @@ class TestWritePidFile:
         assert data["workflow"] == "/tmp/workflow.yaml"
         assert "started_at" in data
 
+    def test_defaults_run_id_and_log_paths_to_empty_strings(self, pid_tmpdir: Path) -> None:
+        """A call with no explicit run_id/log paths still writes the keys."""
+        path = write_pid_file(12345, 8080, "/tmp/workflow.yaml")
+        data = json.loads(path.read_text())
+        assert data["run_id"] == ""
+        assert data["stderr_log"] == ""
+        assert data["stdout_log"] == ""
+
+    def test_round_trips_run_id_and_log_paths(self, pid_tmpdir: Path) -> None:
+        path = write_pid_file(
+            12345,
+            8080,
+            "/tmp/workflow.yaml",
+            run_id="a1b2c3d4",
+            stderr_log="/tmp/conductor/conductor-workflow-20260303-120000-a1b2c3d4.bg.stderr.log",
+            stdout_log="/tmp/conductor/conductor-workflow-20260303-120000-a1b2c3d4.bg.stdout.log",
+        )
+        data = json.loads(path.read_text())
+        assert data["run_id"] == "a1b2c3d4"
+        assert data["stderr_log"].endswith("bg.stderr.log")
+        assert data["stdout_log"].endswith("bg.stdout.log")
+
     def test_filename_uses_workflow_stem_and_port(self, pid_tmpdir: Path) -> None:
         path = write_pid_file(100, 9090, "/some/path/my-workflow.yaml")
         assert path.name == "my-workflow-9090.pid"

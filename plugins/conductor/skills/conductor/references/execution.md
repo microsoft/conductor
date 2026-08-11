@@ -102,6 +102,8 @@ conductor status [OPTIONS]
 
 Use this rather than a bare `conductor stop` to answer "what is running?". `conductor stop` with no arguments **stops** the workflow when exactly one is running, so the natural reflex is destructive precisely when there is a single run to lose. `status` never terminates anything, and it prints each run's dashboard URL, which is otherwise unrecoverable once the launching terminal is gone.
 
+`--json` payload per running entry: `pid`, `port`, `workflow`, `run_id`, `started_at`, `stderr_log`, `stdout_log`, `url`. `run_id` is the join key to the run's events JSONL (`conductor-<name>-<ts>-<run_id>.events.jsonl`); `stderr_log`/`stdout_log` are the child's captured console output paths. All three are `null` for a PID file written before this field existed.
+
 **Examples:**
 
 ```bash

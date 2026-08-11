@@ -30,6 +30,7 @@ sleeps.
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -81,6 +82,89 @@ def _entry(pid: int = 4242, port: int = 8080, run_id: str = _RUN_ID) -> dict:
 def _quiet() -> Console:
     """A console that renders nothing, so tests assert behaviour not prose."""
     return Console(quiet=True)
+
+
+class TestWorkflowNamesArePrintedLiterally:
+    """A workflow name is data, and the surrounding styling is not.
+
+    Conductor consoles are built with ``markup=False`` and style through
+    ``styled()`` (issue #406). An f-string written against the old
+    markup-parsing console therefore fails in one of two ways depending on
+    which side of #406 it runs on: the console parses ``deploy[prod]`` as a
+    tag and drops it, or it stops parsing and the ``[green]`` scaffolding is
+    printed at the user verbatim.
+
+    That matters here more than in most output: after issue #344 the entire job
+    of these messages is telling the operator *which* run survived so they can
+    go and kill it by hand.
+
+    Note a ``/`` cannot appear inside a filename, so the shapes worth testing
+    are the lowercase-initial ones rich reads as an opening tag.
+    """
+
+    @pytest.mark.parametrize(
+        "stem",
+        ["deploy[prod]", "run[task1]", "x[dim]y", "q[not a tag]z"],
+    )
+    def test_bracketed_workflow_name_survives_every_rung(self, stem: str) -> None:
+        from conductor.console import make_console
+
+        rungs = [
+            ({"process_liveness": Liveness.DEAD}, "already-exited"),
+            ({"terminate": Liveness.ALIVE}, "survived"),
+            ({"terminate": Liveness.UNKNOWN}, "unconfirmed"),
+        ]
+        for overrides, expected in rungs:
+            buf = io.StringIO()
+            con = make_console(file=buf, width=200)
+            entry = _entry() | {"workflow": f"/tmp/{stem}.yaml"}
+            with (
+                patch(
+                    "conductor.cli.pid.process_liveness",
+                    return_value=overrides.get("process_liveness", Liveness.ALIVE),
+                ),
+                patch("conductor.cli.pid.wait_for_exit", return_value=Liveness.ALIVE),
+                patch(
+                    "conductor.cli.pid.terminate_process",
+                    return_value=overrides.get("terminate", Liveness.DEAD),
+                ),
+                patch("conductor.cli.app._confirm_identity", return_value=Identity.CONFIRMED),
+                patch("conductor.cli.app._request_graceful_kill", return_value=False),
+                patch("conductor.cli.app._signal_process"),
+            ):
+                result = _stop_process(entry, con)
+
+            out = buf.getvalue()
+            assert result["outcome"] == expected
+            assert stem in out, f"{expected!r} rung mangled the workflow name: {out!r}"
+            # No template of ours has a closing tag left in it, and none of the
+            # names above contain ``[/`` — so this catches styling that leaked
+            # through as literal text.
+            assert "[/" not in out, f"{expected!r} rung leaked raw markup: {out!r}"
+
+    def test_mismatch_warning_keeps_the_name_intact(self) -> None:
+        """The mismatch path interpolates into the longest template, so it is
+        the easiest one to regress when the wording is edited.
+
+        A ``/`` cannot appear inside a filename, so the dangerous shapes here
+        are the lowercase-initial ones rich reads as opening tags.
+        """
+        from conductor.console import make_console
+
+        buf = io.StringIO()
+        con = make_console(file=buf, width=200)
+        entry = _entry() | {"workflow": "/tmp/a[bold]c.yaml"}
+        with (
+            patch("conductor.cli.pid.process_liveness", return_value=Liveness.ALIVE),
+            patch("conductor.cli.app._confirm_identity", return_value=Identity.MISMATCHED),
+            patch("conductor.cli.app._signal_process") as signal,
+        ):
+            result = _stop_process(entry, con)
+
+        assert result["outcome"] == "mismatched"
+        signal.assert_not_called()
+        assert "a[bold]c" in buf.getvalue()
+        assert "[/" not in buf.getvalue()
 
 
 class TestSurvivingRunIsNotOrphaned:
@@ -725,10 +809,18 @@ class TestWritePidFileRecordsIdentity:
     """Identity can only be checked if it was recorded in the first place."""
 
     def test_run_id_round_trips(self, pid_tmpdir: Path) -> None:
-        path = write_pid_file(1, 8080, "/tmp/wf.yaml", run_id=_RUN_ID, log_file="/tmp/e.jsonl")
+        path = write_pid_file(
+            1,
+            8080,
+            "/tmp/wf.yaml",
+            run_id=_RUN_ID,
+            stderr_log="/tmp/e.stderr.log",
+            stdout_log="/tmp/e.stdout.log",
+        )
         data = json.loads(path.read_text())
         assert data["run_id"] == _RUN_ID
-        assert data["log_file"] == "/tmp/e.jsonl"
+        assert data["stderr_log"] == "/tmp/e.stderr.log"
+        assert data["stdout_log"] == "/tmp/e.stdout.log"
 
     def test_launcher_actually_forwards_run_id(self) -> None:
         """Guard the wiring, which is the part that was missing.

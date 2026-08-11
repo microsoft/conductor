@@ -249,6 +249,33 @@ It is also read-only on disk: unlike `stop`, it never removes a PID file, so a r
 
 The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone.
 
+### `--json` Payload
+
+```json
+{
+  "running": [
+    {
+      "pid": 12345,
+      "port": 8080,
+      "workflow": "my-workflow.yaml",
+      "run_id": "a1b2c3d4",
+      "started_at": "2026-03-03T12:00:00+00:00",
+      "stderr_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stderr.log",
+      "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log",
+      "url": "http://127.0.0.1:8080"
+    }
+  ]
+}
+```
+
+`run_id` is the join key to the run's events JSONL
+(`conductor-<name>-<ts>-<run_id>.events.jsonl` under `$TMPDIR/conductor/`);
+`stderr_log`/`stdout_log` are the paths to the child's captured console
+output (see [Debugging `--web-bg` failures](../AGENTS.md#debugging---web-bg-failures)).
+All three are `null` — never `""` — for a PID file written before this field
+existed. A resumed run whose checkpoint carried no usable run id still gets
+a freshly-minted `run_id` (and matching log paths), not `null`.
+
 ### Exit Codes
 
 | Code | Meaning |
@@ -296,7 +323,7 @@ Exit `2` is deliberately not a synonym for failure to signal — it means Conduc
 
 ### How It Works
 
-When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. PID files are written atomically, so a concurrent `stop` can never read a half-written file. They are also cleaned up automatically when a background workflow completes normally.
+When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The PID file also records the launch's `run_id` and the child's captured stderr/stdout log paths (see `conductor status --json` above), so a run stays correlatable to its forensic artefacts even after the launching terminal is gone. PID files are written atomically, so a concurrent `stop` can never read a half-written file. They are also cleaned up automatically when a background workflow completes normally.
 
 `stop` reads those files and escalates through a ladder, confirming each rung before moving to the next:
 

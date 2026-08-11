@@ -14,9 +14,10 @@ import logging
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
-from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
+from conductor.console import MarkupFreeConsole, join, styled
 from conductor.providers.capabilities import known_provider_names
 from conductor.providers.diagnostics import (
     ALL_SECTIONS,
@@ -34,9 +35,9 @@ if TYPE_CHECKING:
     from conductor.providers.diagnostics import Section
 
 
-_CHECK = "[green]✓[/green]"
-_CROSS = "[red]✗[/red]"
-_DASH = "[dim]—[/dim]"
+_CHECK = Text.from_markup("[green]✓[/green]")
+_CROSS = Text.from_markup("[red]✗[/red]")
+_DASH = Text.from_markup("[dim]—[/dim]")
 _OPTIONAL_MARK = "○"
 """Neutral glyph for an absent *optional* credential — deliberately not the
 red ``✗`` used for a genuinely missing required credential (issue #319)."""
@@ -49,8 +50,8 @@ def run_doctor(
     check: bool,
     models: bool,
     as_json: bool,
-    console: Console,
-    err_console: Console,
+    console: MarkupFreeConsole,
+    err_console: MarkupFreeConsole,
 ) -> int:
     """Gather and render diagnostics, returning a process exit code.
 
@@ -74,15 +75,21 @@ def run_doctor(
 
     if section is not None and section not in ALL_SECTIONS:
         err_console.print(
-            f"[bold red]Error:[/bold red] Unknown section {section!r}. "
-            f"Choose from: {', '.join(ALL_SECTIONS)}."
+            styled(
+                "[bold red]Error:[/bold red] Unknown section {!r}. Choose from: {}.",
+                section,
+                ", ".join(ALL_SECTIONS),
+            )
         )
         return 1
 
     if provider is not None and provider not in known_provider_names():
         err_console.print(
-            f"[bold red]Error:[/bold red] Unknown provider {provider!r}. "
-            f"Known providers: {', '.join(known_provider_names())}."
+            styled(
+                "[bold red]Error:[/bold red] Unknown provider {!r}. Known providers: {}.",
+                provider,
+                ", ".join(known_provider_names()),
+            )
         )
         return 1
 
@@ -174,13 +181,13 @@ def _render_env(env: EnvDiagnostic, console: Console) -> None:
     table.add_row("Platform", env.platform)
 
     if not env.update_checked:
-        update = "[dim]check skipped (CONDUCTOR_NO_UPDATE_CHECK)[/dim]"
+        update = Text.from_markup("[dim]check skipped (CONDUCTOR_NO_UPDATE_CHECK)[/dim]")
     elif env.update_available is None:
-        update = "[dim]unavailable (offline?)[/dim]"
+        update = Text.from_markup("[dim]unavailable (offline?)[/dim]")
     elif env.update_available:
-        update = f"[yellow]v{env.latest_version} available[/yellow]"
+        update = styled("[yellow]v{} available[/yellow]", env.latest_version)
     else:
-        update = "[green]up to date[/green]"
+        update = Text.from_markup("[green]up to date[/green]")
     table.add_row("Update", update)
 
     console.print(table)
@@ -188,7 +195,7 @@ def _render_env(env: EnvDiagnostic, console: Console) -> None:
 
 def _render_providers(
     providers: list[ProviderDiagnostic],
-    console: Console,
+    console: MarkupFreeConsole,
     *,
     check: bool,
     models: bool,
@@ -222,16 +229,16 @@ def _render_providers(
     console.print(table)
 
 
-def _tier_cell(tier: str | None) -> str:
+def _tier_cell(tier: str | None) -> Text:
     """Format the tier cell."""
     if tier is None:
         return _DASH
     if tier == "experimental":
-        return "[yellow]experimental[/yellow]"
-    return tier
+        return Text.from_markup("[yellow]experimental[/yellow]")
+    return Text(tier)
 
 
-def _credentials_cell(diag: ProviderDiagnostic) -> str:
+def _credentials_cell(diag: ProviderDiagnostic) -> Text:
     """Format credential env-var presence (presence only, never values).
 
     A present credential is a green ``✓``. An absent credential renders as a
@@ -243,29 +250,29 @@ def _credentials_cell(diag: ProviderDiagnostic) -> str:
     """
     if not diag.credential_env_vars:
         return _DASH
-    lines: list[str] = []
+    lines: list[Text] = []
     for cred in diag.credential_env_vars:
         if cred.present:
-            lines.append(f"{_CHECK} {cred.name}")
+            lines.append(styled("{} {}", _CHECK, cred.name))
         elif diag.credentials_optional:
-            lines.append(f"[dim]{_OPTIONAL_MARK} {cred.name}[/dim]")
+            lines.append(styled("[dim]{} {}[/dim]", _OPTIONAL_MARK, cred.name))
         else:
-            lines.append(f"[dim]{_CROSS} {cred.name}[/dim]")
-    return "\n".join(lines)
+            lines.append(styled("[dim]{} {}[/dim]", _CROSS, cred.name))
+    return join("\n", lines)
 
 
-def _connection_cell(diag: ProviderDiagnostic) -> str:
+def _connection_cell(diag: ProviderDiagnostic) -> Text:
     """Format the connection-check result cell."""
     if not diag.checked or diag.connection_ok is None:
         return _DASH
     if diag.connection_ok:
-        return f"{_CHECK} connected"
+        return styled("{} connected", _CHECK)
     if diag.connection_error:
-        return f"{_CROSS} [dim]{escape(diag.connection_error)}[/dim]"
-    return f"{_CROSS} [dim]connection failed[/dim]"
+        return styled("{} [dim]{}[/dim]", _CROSS, diag.connection_error)
+    return styled("{} [dim]connection failed[/dim]", _CROSS)
 
 
-def _models_cell(diag: ProviderDiagnostic) -> str:
+def _models_cell(diag: ProviderDiagnostic) -> Text:
     """Format the models cell in the Providers summary table.
 
     Shows a count/status only — per-model reasoning-effort and
@@ -274,40 +281,40 @@ def _models_cell(diag: ProviderDiagnostic) -> str:
     models is ``None`` (not enumerated), ``(none)`` for an empty list.
     """
     if diag.models_error:
-        return f"{_CROSS} [dim]{escape(diag.models_error)}[/dim]"
+        return styled("{} [dim]{}[/dim]", _CROSS, diag.models_error)
     if diag.models is None:
-        return "[dim]n/a[/dim]"
+        return Text.from_markup("[dim]n/a[/dim]")
     count = len(diag.models)
     if not count:
-        return "[dim](none)[/dim]"
-    return f"{_CHECK} {count} model{'s' if count != 1 else ''}"
+        return Text.from_markup("[dim](none)[/dim]")
+    return styled("{} {} model{}", _CHECK, count, "s" if count != 1 else "")
 
 
-def _format_tokens(value: int | None) -> str:
+def _format_tokens(value: int | None) -> Text:
     """Format a token-limit value with grouped digits, or ``—`` when unknown."""
     if value is None:
         return _DASH
-    return f"{value:,}"
+    return Text(f"{value:,}")
 
 
-def _efforts_cell(model: ModelDiagnostic) -> str:
+def _efforts_cell(model: ModelDiagnostic) -> Text:
     """Format the supported-reasoning-efforts cell.
 
     ``n/a`` when unknown (``None``), ``none`` for a definitive empty list
     (e.g. a non-thinking Claude model), otherwise a comma-separated list.
     """
     if model.supported_reasoning_efforts is None:
-        return "[dim]n/a[/dim]"
+        return Text.from_markup("[dim]n/a[/dim]")
     if not model.supported_reasoning_efforts:
-        return "[dim]none[/dim]"
-    return ", ".join(escape(effort) for effort in model.supported_reasoning_efforts)
+        return Text.from_markup("[dim]none[/dim]")
+    return Text(", ".join(model.supported_reasoning_efforts))
 
 
-def _default_effort_cell(model: ModelDiagnostic) -> str:
+def _default_effort_cell(model: ModelDiagnostic) -> Text:
     """Format the default-reasoning-effort cell."""
     if model.default_reasoning_effort is None:
         return _DASH
-    return escape(model.default_reasoning_effort)
+    return Text(model.default_reasoning_effort)
 
 
 def _render_models(providers: list[ProviderDiagnostic], console: Console) -> None:
@@ -331,7 +338,7 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
 
         for model in diag.models:
             table.add_row(
-                escape(model.id),
+                model.id,
                 _efforts_cell(model),
                 _default_effort_cell(model),
                 _format_tokens(model.max_prompt_tokens),
@@ -345,10 +352,12 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
 def _render_registries(registries: RegistryDiagnostic, console: Console) -> None:
     """Render the registries section."""
     if registries.error is not None:
-        console.print(f"{_CROSS} [dim]failed to load registries: {escape(registries.error)}[/dim]")
+        console.print(
+            styled("{} [dim]failed to load registries: {}[/dim]", _CROSS, registries.error)
+        )
         return
     if not registries.registries:
-        console.print("[dim]No registries configured.[/dim]")
+        console.print(Text.from_markup("[dim]No registries configured.[/dim]"))
         return
 
     table = Table(title="Registries", show_lines=False)
@@ -359,9 +368,9 @@ def _render_registries(registries: RegistryDiagnostic, console: Console) -> None
 
     for reg in registries.registries:
         table.add_row(
-            escape(reg.name),
-            escape(reg.type),
-            escape(reg.source),
+            reg.name,
+            reg.type,
+            reg.source,
             _CHECK if reg.is_default else _DASH,
         )
 

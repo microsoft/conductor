@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-console = Console(stderr=True)
-output_console = Console()
+from conductor.console import make_console, styled
+
+console = make_console(stderr=True)
+output_console = make_console()
 
 checkpoint_app = typer.Typer(
     name="checkpoint",
@@ -56,7 +58,9 @@ def _list_checkpoints_impl(workflow: Path | None) -> None:
     if workflow is not None:
         resolved_workflow = workflow.resolve()
         if not resolved_workflow.exists():
-            console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
+            console.print(
+                styled("[bold red]Error:[/bold red] Workflow file not found: {}", workflow)
+            )
             raise typer.Exit(code=1)
 
     checkpoint_list = CheckpointManager.list_checkpoints(resolved_workflow)
@@ -64,10 +68,10 @@ def _list_checkpoints_impl(workflow: Path | None) -> None:
     if not checkpoint_list:
         if resolved_workflow:
             output_console.print(
-                f"[dim]No checkpoints found for workflow: {resolved_workflow.name}[/dim]"
+                styled("[dim]No checkpoints found for workflow: {}[/dim]", resolved_workflow.name)
             )
         else:
-            output_console.print("[dim]No checkpoints found.[/dim]")
+            output_console.print(Text.from_markup("[dim]No checkpoints found.[/dim]"))
         return
 
     table = Table(title="Workflow Checkpoints", show_lines=True)
@@ -93,4 +97,4 @@ def _list_checkpoints_impl(workflow: Path | None) -> None:
         table.add_row(workflow_name, timestamp, trigger, agent, error_type, file_path)
 
     output_console.print(table)
-    output_console.print(f"\n[dim]Total: {len(checkpoint_list)} checkpoint(s)[/dim]")
+    output_console.print(styled("\n[dim]Total: {} checkpoint(s)[/dim]", len(checkpoint_list)))

@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+from conductor.console import make_console, styled
 from conductor.exceptions import WorkflowTerminated
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,8 @@ app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 
 # Rich console for formatted output
-console = Console(stderr=True)
-output_console = Console()
+console = make_console(stderr=True)
+output_console = make_console()
 
 # Stop-ladder timings (issue #344). A stop request is only an acknowledgement,
 # so each rung is followed by a bounded wait before escalating. The graceful
@@ -144,7 +145,7 @@ def format_error(error: Exception) -> Panel:
 
     return Panel(
         content,
-        title=f"[bold red]❌ {error_type}[/bold red]",
+        title=styled("[bold red]❌ {}[/bold red]", error_type),
         border_style="red",
         padding=(1, 2),
     )
@@ -166,7 +167,7 @@ def print_error(error: Exception) -> None:
         content.append(str(error), style="red")
         panel = Panel(
             content,
-            title=f"[bold red]❌ {type(error).__name__}[/bold red]",
+            title=styled("[bold red]❌ {}[/bold red]", type(error).__name__),
             border_style="red",
             padding=(1, 2),
         )
@@ -175,6 +176,26 @@ def print_error(error: Exception) -> None:
 
 _INTERACTIVE_STEP_TYPES = ("human_gate", "questions")
 """Step types that park the workflow waiting on a human."""
+
+
+def _optional_str(value: object) -> str | None:
+    """Coerce a PID-file field to ``str | None`` for JSON output.
+
+    A PID file written before ``run_id``/``stderr_log``/``stdout_log``
+    existed has the key absent; ``write_pid_file`` with no explicit value
+    writes an empty string. Both should surface as JSON ``null`` rather than
+    ``""``, so a scripted reader can distinguish "no id recorded" from an
+    id that happens to be the empty string — which never legitimately
+    occurs, but collapsing it to ``""`` would make it indistinguishable
+    from "field absent" if it ever did.
+
+    Args:
+        value: The raw value read from the PID file JSON.
+
+    Returns:
+        ``value`` if it is a non-empty string, otherwise ``None``.
+    """
+    return value if isinstance(value, str) and value else None
 
 
 def _workflow_has_human_gate(workflow_path: Path) -> bool:
@@ -222,10 +243,13 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     port = urlparse(url).port
     port_hint = str(port) if port is not None else "<port>"
     console.print(
-        "[yellow]This workflow contains steps that wait for you[/yellow] "
-        "(human_gate / questions). Resolve them from "
-        "the dashboard above, or run "
-        f"[bold]conductor gate respond --port {port_hint} --choice <value>[/bold]."
+        styled(
+            "[yellow]This workflow contains steps that wait for "
+            "you[/yellow] (human_gate / questions). Resolve them from "
+            "the dashboard above, or run [bold]conductor gate respond "
+            "--port {} --choice <value>[/bold].",
+            port_hint,
+        )
     )
 
 
@@ -298,7 +322,13 @@ def run(
     workflow: Annotated[
         str,
         typer.Argument(
-            help="Workflow file path or registry reference (name[@registry][@version]).",
+            # Typer renders help through rich (``rich_markup_mode="rich"``),
+            # so this string *is* markup-parsed and the console convention
+            # does not reach it. ``[@registry]`` starts with ``@``, which rich
+            # reads as a tag and deletes -- the syntax this line documents was
+            # missing from ``--help`` entirely. Escaped rather than wrapped in
+            # ``Text``: typer takes a ``str`` here (#406).
+            help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
     provider: Annotated[
@@ -529,11 +559,13 @@ def run(
                 print_loaded_instructions=print_loaded_instructions,
             )
             if is_verbose():
-                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
-                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
+                console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
                 console.print(
-                    "[dim]Workflow running in background. Dashboard auto-shuts down after "
-                    "workflow completes and all clients disconnect.[/dim]"
+                    Text.from_markup(
+                        "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                        "workflow completes and all clients disconnect.[/dim]"
+                    )
                 )
                 if notify_gate:
                     _print_web_bg_human_gate_notice(launch.url)
@@ -580,11 +612,15 @@ def run(
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
-                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+                styled(
+                    "[yellow]Warning:[/yellow] could not serialise terminate output: {}", json_exc
+                )
             )
-        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        console.print(
+            styled("[red]Workflow terminated[/red] at '{}': {}", e.terminated_by, e.reason)
+        )
         if e.suggestion:
-            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+            console.print(styled("[dim]Suggestion: {}[/dim]", e.suggestion))
         raise typer.Exit(code=1) from None
     except Exception as e:
         print_error(e)
@@ -596,7 +632,13 @@ def validate(
     workflow: Annotated[
         str,
         typer.Argument(
-            help="Workflow file path or registry reference (name[@registry][@version]).",
+            # Typer renders help through rich (``rich_markup_mode="rich"``),
+            # so this string *is* markup-parsed and the console convention
+            # does not reach it. ``[@registry]`` starts with ``@``, which rich
+            # reads as a tag and deletes -- the syntax this line documents was
+            # missing from ``--help`` entirely. Escaped rather than wrapped in
+            # ``Text``: typer takes a ``str`` here (#406).
+            help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
 ) -> None:
@@ -642,7 +684,13 @@ def show(
     workflow: Annotated[
         str,
         typer.Argument(
-            help="Workflow file path or registry reference (name[@registry][@version]).",
+            # Typer renders help through rich (``rich_markup_mode="rich"``),
+            # so this string *is* markup-parsed and the console convention
+            # does not reach it. ``[@registry]`` starts with ``@``, which rich
+            # reads as a tag and deletes -- the syntax this line documents was
+            # missing from ``--help`` entirely. Escaped rather than wrapped in
+            # ``Text``: typer takes a ``str`` here (#406).
+            help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
 ) -> None:
@@ -667,7 +715,9 @@ def show(
             assert ref.path is not None
             workflow_path = ref.path
             if not workflow_path.exists():
-                console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
+                console.print(
+                    styled("[bold red]Error:[/bold red] Workflow file not found: {}", workflow)
+                )
                 raise typer.Exit(code=1)
         else:
             workflow_path = resolve_and_fetch(ref)
@@ -680,20 +730,20 @@ def show(
 
         config = load_workflow_config(workflow_path)
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] Failed to parse workflow: {e}")
+        console.print(styled("[bold red]Error:[/bold red] Failed to parse workflow: {}", e))
         raise typer.Exit(code=1) from None
 
     wf = config.workflow
-    output_console.print(f"[bold]Name:[/bold]        {wf.name}")
+    output_console.print(styled("[bold]Name:[/bold]        {}", wf.name))
     if wf.description:
-        output_console.print(f"[bold]Description:[/bold] {wf.description}")
-    output_console.print(f"[bold]Entry point:[/bold] {wf.entry_point}")
-    output_console.print(f"[bold]Source:[/bold]      {workflow_path}")
+        output_console.print(styled("[bold]Description:[/bold] {}", wf.description))
+    output_console.print(styled("[bold]Entry point:[/bold] {}", wf.entry_point))
+    output_console.print(styled("[bold]Source:[/bold]      {}", workflow_path))
 
     if ref.kind == "registry":
-        output_console.print(f"[bold]Registry:[/bold]    {ref.registry_name}")
+        output_console.print(styled("[bold]Registry:[/bold]    {}", ref.registry_name))
         if ref.ref:
-            output_console.print(f"[bold]Version:[/bold]     {ref.ref}")
+            output_console.print(styled("[bold]Version:[/bold]     {}", ref.ref))
 
     from rich.table import Table
 
@@ -757,9 +807,9 @@ def show(
     ref_str = workflow if ref.kind == "registry" else str(workflow_path)
     if inputs:
         input_args = " ".join(f'--input {name}="..."' for name in inputs)
-        output_console.print(f"\n[dim]conductor run {ref_str} {input_args}[/dim]")
+        output_console.print(styled("\n[dim]conductor run {} {}[/dim]", ref_str, input_args))
     else:
-        output_console.print(f"\n[dim]conductor run {ref_str}[/dim]")
+        output_console.print(styled("\n[dim]conductor run {}[/dim]", ref_str))
 
 
 @app.command(rich_help_panel="Run & Recover")
@@ -767,8 +817,10 @@ def resume(
     workflow: Annotated[
         str | None,
         typer.Argument(
+            # Escaped, not wrapped: typer renders help through rich, so an
+            # unescaped ``[@registry]`` is parsed as a tag and deleted (#406).
             help=(
-                "Workflow file path or registry reference (name[@registry][@version]). "
+                r"Workflow file path or registry reference (name\[@registry]\[@version]). "
                 "Finds the latest checkpoint for this workflow."
             ),
         ),
@@ -889,12 +941,16 @@ def resume(
     # Validate arguments
     if workflow is None and from_checkpoint is None:
         console.print(
-            "[bold red]Error:[/bold red] "
-            "Provide a workflow file or use --from to specify a checkpoint."
+            Text.from_markup(
+                "[bold red]Error:[/bold red] "
+                "Provide a workflow file or use --from to specify a checkpoint."
+            )
         )
         console.print(
-            "[dim]Usage: conductor resume workflow.yaml "
-            "or conductor resume --from <checkpoint.json>[/dim]"
+            Text.from_markup(
+                "[dim]Usage: conductor resume workflow.yaml "
+                "or conductor resume --from <checkpoint.json>[/dim]"
+            )
         )
         raise typer.Exit(code=1)
 
@@ -916,7 +972,7 @@ def resume(
                 resolved_workflow = ref.path.resolve()
                 if not resolved_workflow.exists():
                     console.print(
-                        f"[bold red]Error:[/bold red] Workflow file not found: {workflow}"
+                        styled("[bold red]Error:[/bold red] Workflow file not found: {}", workflow)
                     )
                     raise typer.Exit(code=1)
             else:
@@ -931,7 +987,7 @@ def resume(
         resolved_checkpoint = from_checkpoint.resolve()
         if not resolved_checkpoint.exists():
             console.print(
-                f"[bold red]Error:[/bold red] Checkpoint file not found: {from_checkpoint}"
+                styled("[bold red]Error:[/bold red] Checkpoint file not found: {}", from_checkpoint)
             )
             raise typer.Exit(code=1)
 
@@ -988,11 +1044,13 @@ def resume(
                 metadata=cli_metadata,
             )
             if is_verbose():
-                console.print(f"[bold cyan]Dashboard:[/bold cyan] {launch.url}")
-                console.print(f"[dim]Child stderr log: {launch.stderr_log}[/dim]")
+                console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
+                console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
                 console.print(
-                    "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
-                    "after workflow completes and all clients disconnect.[/dim]"
+                    Text.from_markup(
+                        "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
+                        "after workflow completes and all clients disconnect.[/dim]"
+                    )
                 )
                 if notify_gate:
                     _print_web_bg_human_gate_notice(launch.url)
@@ -1028,11 +1086,15 @@ def resume(
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
-                f"[yellow]Warning:[/yellow] could not serialise terminate output: {json_exc}"
+                styled(
+                    "[yellow]Warning:[/yellow] could not serialise terminate output: {}", json_exc
+                )
             )
-        console.print(f"[red]Workflow terminated[/red] at '{e.terminated_by}': {e.reason}")
+        console.print(
+            styled("[red]Workflow terminated[/red] at '{}': {}", e.terminated_by, e.reason)
+        )
         if e.suggestion:
-            console.print(f"[dim]Suggestion: {e.suggestion}[/dim]")
+            console.print(styled("[dim]Suggestion: {}[/dim]", e.suggestion))
         raise typer.Exit(code=1) from None
     except Exception as e:
         print_error(e)
@@ -1050,8 +1112,10 @@ def checkpoints(
 ) -> None:
     """Deprecated alias for 'conductor checkpoint list'."""
     console.print(
-        "[yellow]Warning:[/yellow] 'conductor checkpoints' is deprecated and will "
-        "be removed in a future release. Use 'conductor checkpoint list' instead."
+        Text.from_markup(
+            "[yellow]Warning:[/yellow] 'conductor checkpoints' is deprecated and will "
+            "be removed in a future release. Use 'conductor checkpoint list' instead."
+        )
     )
     from conductor.cli.checkpoint import _list_checkpoints_impl
 
@@ -1106,8 +1170,8 @@ def replay(
 
         await dashboard.start()
         if is_verbose():
-            console.print(f"\n[bold green]▶ Replay dashboard:[/] {dashboard.url}\n")
-            console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+            console.print(styled("\n[bold green]▶ Replay dashboard:[/] {}\n", dashboard.url))
+            console.print(Text.from_markup("[dim]Press Ctrl+C to exit[/dim]\n"))
 
         try:
             await asyncio.Event().wait()
@@ -1120,7 +1184,7 @@ def replay(
         asyncio.run(_run_replay())
     except KeyboardInterrupt:
         if is_verbose():
-            console.print("\n[dim]Replay stopped.[/dim]")
+            console.print(Text.from_markup("\n[dim]Replay stopped.[/dim]"))
 
 
 @app.command(rich_help_panel="Run & Recover")
@@ -1168,9 +1232,10 @@ def status(
                 "pid": e["pid"],
                 "port": e["port"],
                 "workflow": str(e.get("workflow", "")),
-                "run_id": e.get("run_id", ""),
+                "run_id": _optional_str(e.get("run_id")),
                 "started_at": e.get("started_at", ""),
-                "log_file": e.get("log_file", ""),
+                "stderr_log": _optional_str(e.get("stderr_log")),
+                "stdout_log": _optional_str(e.get("stdout_log")),
                 "url": f"http://127.0.0.1:{e['port']}",
             }
             for e in running
@@ -1179,12 +1244,14 @@ def status(
         return
 
     if not running:
-        console.print("[dim]No background workflows are currently running.[/dim]")
+        console.print(Text.from_markup("[dim]No background workflows are currently running.[/dim]"))
         return
 
     _print_running_list(running, console, show_url=True)
     console.print(
-        f"\n[dim]{len(running)} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]"
+        styled(
+            "\n[dim]{} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]", len(running)
+        )
     )
 
 
@@ -1265,7 +1332,9 @@ def stop(
         if json_output:
             output_console.print_json(json.dumps({"stopped": [], "failed": []}), ensure_ascii=True)
         else:
-            console.print("[dim]No background workflows are currently running.[/dim]")
+            console.print(
+                Text.from_markup("[dim]No background workflows are currently running.[/dim]")
+            )
         return
 
     if all_workflows:
@@ -1280,9 +1349,12 @@ def stop(
                 )
             else:
                 console.print(
-                    f"[bold red]Error:[/bold red] No background workflow found on port {port}."
+                    styled(
+                        "[bold red]Error:[/bold red] No background workflow found on port {}.",
+                        port,
+                    )
                 )
-                console.print("[dim]Running workflows:[/dim]")
+                console.print(Text.from_markup("[dim]Running workflows:[/dim]"))
                 _print_running_list(running, console)
             raise typer.Exit(code=1)
     elif len(running) == 1:
@@ -1297,11 +1369,15 @@ def stop(
             )
         else:
             console.print(
-                f"[bold yellow]Multiple background workflows running "
-                f"({len(running)}).[/bold yellow]"
+                styled(
+                    "[bold yellow]Multiple background workflows running ({}).[/bold yellow]",
+                    len(running),
+                )
             )
             console.print(
-                "[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n"
+                Text.from_markup(
+                    "[dim]Specify --port to stop a specific one, or --all to stop all.[/dim]\n"
+                )
             )
             _print_running_list(running, console)
         raise typer.Exit(code=1)
@@ -1329,11 +1405,16 @@ def stop(
             # for ``survived`` (the process is demonstrably alive, and removing
             # its file would orphan it).
             console.print(
-                f"[bold yellow]Warning:[/bold yellow] removing the PID file for workflow "
-                f"[cyan]'{result['workflow']}'[/cyan] (PID {result['pid']}, port "
-                f"{result['port']}) without confirming it stopped, because --force was "
-                f"given and its liveness could not be probed. If that process is still "
-                f"alive it is now untracked and must be stopped by hand."
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] removing the PID file for workflow "
+                    "[cyan]'{}'[/cyan] (PID {}, port {}) without confirming it stopped, "
+                    "because --force was given and its liveness could not be probed. If "
+                    "that process is still alive it is now untracked and must be stopped "
+                    "by hand.",
+                    result["workflow"],
+                    result["pid"],
+                    result["port"],
+                )
             )
             remove_pid_file_at(entry["file"], entry["pid"])
 
@@ -1407,8 +1488,13 @@ def _confirm_identity(entry: dict, con: Console) -> Identity:
         if reported_pid == entry["pid"]:
             return Identity.CONFIRMED
         con.print(
-            f"[bold yellow]Warning:[/bold yellow] the dashboard on port {port} is PID "
-            f"{reported_pid}, but the PID file records {entry['pid']}. Refusing to act on it."
+            styled(
+                "[bold yellow]Warning:[/bold yellow] the dashboard on port {} is PID "
+                "{}, but the PID file records {}. Refusing to act on it.",
+                port,
+                reported_pid,
+                entry["pid"],
+            )
         )
         return Identity.MISMATCHED
 
@@ -1499,7 +1585,12 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
 
     if process_liveness(pid) is Liveness.DEAD:
         con.print(
-            f"[dim]Process already exited:[/dim] workflow '{workflow}' (PID {pid}, port {port})"
+            styled(
+                "[dim]Process already exited:[/dim] workflow '{}' (PID {}, port {})",
+                workflow,
+                pid,
+                port,
+            )
         )
         return _result("already-exited", "none")
 
@@ -1514,7 +1605,12 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
         and wait_for_exit(pid, _GRACEFUL_TIMEOUT) is Liveness.DEAD
     ):
         con.print(
-            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
+            styled(
+                "[green]Stopped[/green] workflow [cyan]'{}'[/cyan] (PID {}, port {})",
+                workflow,
+                pid,
+                port,
+            )
         )
         return _result("stopped", "api-kill")
 
@@ -1526,17 +1622,27 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     # older versions, where a signal is all the previous code ever sent.
     if identity is Identity.MISMATCHED:
         con.print(
-            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
-            f"(PID {pid}, port {port}): the process on that port is a different run, "
-            f"so nothing was signalled."
+            styled(
+                "[bold red]Could not stop[/bold red] workflow [cyan]'{}'[/cyan] "
+                "(PID {}, port {}): the process on that port is a different run, "
+                "so nothing was signalled.",
+                workflow,
+                pid,
+                port,
+            )
         )
-        con.print("[dim]The PID file has been left in place.[/dim]")
+        con.print(Text.from_markup("[dim]The PID file has been left in place.[/dim]"))
         return _result("mismatched", "refused")
 
     _signal_process(pid)
     if wait_for_exit(pid, _SIGNAL_TIMEOUT) is Liveness.DEAD:
         con.print(
-            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] (PID {pid}, port {port})"
+            styled(
+                "[green]Stopped[/green] workflow [cyan]'{}'[/cyan] (PID {}, port {})",
+                workflow,
+                pid,
+                port,
+            )
         )
         return _result("stopped", "signal")
 
@@ -1549,47 +1655,82 @@ def _stop_process(entry: dict, con: Console, force: bool = False) -> dict:
     identity = _confirm_identity(entry, con)
     if identity is Identity.MISMATCHED:
         con.print(
-            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
-            f"(PID {pid}, port {port}): the process on that port is a different run, "
-            f"so it was not force-terminated."
+            styled(
+                "[bold red]Could not stop[/bold red] workflow [cyan]'{}'[/cyan] "
+                "(PID {}, port {}): the process on that port is a different run, "
+                "so it was not force-terminated.",
+                workflow,
+                pid,
+                port,
+            )
         )
-        con.print("[dim]The PID file has been left in place.[/dim]")
+        con.print(Text.from_markup("[dim]The PID file has been left in place.[/dim]"))
         return _result("mismatched", "refused")
     if not (identity is Identity.CONFIRMED or force):
         con.print(
-            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
-            f"(PID {pid}, port {port}): it is still running, and its identity could not be "
-            f"confirmed, so it was not force-terminated."
+            styled(
+                "[bold red]Could not stop[/bold red] workflow [cyan]'{}'[/cyan] "
+                "(PID {}, port {}): it is still running, and its identity could not be "
+                "confirmed, so it was not force-terminated.",
+                workflow,
+                pid,
+                port,
+            )
         )
         con.print(
-            "[dim]Re-run with --force if you are certain this PID is the workflow. "
-            "The PID file has been left in place.[/dim]"
+            Text.from_markup(
+                "[dim]Re-run with --force if you are certain this PID is the workflow. "
+                "The PID file has been left in place.[/dim]"
+            )
         )
         return _result("unconfirmed", "refused")
 
     state = terminate_process(pid, _TERMINATE_TIMEOUT)
     if state is Liveness.DEAD:
         con.print(
-            f"[green]Stopped[/green] workflow [cyan]'{workflow}'[/cyan] "
-            f"(PID {pid}, port {port}) [dim]— required forceful termination[/dim]"
+            styled(
+                "[green]Stopped[/green] workflow [cyan]'{}'[/cyan] "
+                "(PID {}, port {}) [dim]— required forceful termination[/dim]",
+                workflow,
+                pid,
+                port,
+            )
         )
         return _result("stopped", "terminate")
 
     if state is Liveness.ALIVE:
         con.print(
-            f"[bold red]Could not stop[/bold red] workflow [cyan]'{workflow}'[/cyan] "
-            f"(PID {pid}, port {port}): the process survived forceful termination."
+            styled(
+                "[bold red]Could not stop[/bold red] workflow [cyan]'{}'[/cyan] "
+                "(PID {}, port {}): the process survived forceful termination.",
+                workflow,
+                pid,
+                port,
+            )
         )
-        con.print("[dim]The PID file has been left in place so the run stays discoverable.[/dim]")
+        con.print(
+            Text.from_markup(
+                "[dim]The PID file has been left in place so the run stays discoverable.[/dim]"
+            )
+        )
         return _result("survived", "terminate")
 
     # Liveness.UNKNOWN — the probe itself failed, so we genuinely do not know
     # whether it died. Reporting "survived" here would assert more than we know.
     con.print(
-        f"[bold yellow]Could not confirm[/bold yellow] whether workflow "
-        f"[cyan]'{workflow}'[/cyan] (PID {pid}, port {port}) stopped: the liveness probe failed."
+        styled(
+            "[bold yellow]Could not confirm[/bold yellow] whether workflow "
+            "[cyan]'{}'[/cyan] (PID {}, port {}) stopped: the liveness probe failed.",
+            workflow,
+            pid,
+            port,
+        )
     )
-    con.print("[dim]The PID file has been left in place so the run stays discoverable.[/dim]")
+    con.print(
+        Text.from_markup(
+            "[dim]The PID file has been left in place so the run stays discoverable.[/dim]"
+        )
+    )
     return _result("unconfirmed", "terminate")
 
 
@@ -1671,8 +1812,10 @@ def gate_respond(
 ) -> None:
     """Deprecated alias for 'conductor gate respond'."""
     console.print(
-        "[yellow]Warning:[/yellow] 'conductor gate-respond' is deprecated and will "
-        "be removed in a future release. Use 'conductor gate respond' instead."
+        Text.from_markup(
+            "[yellow]Warning:[/yellow] 'conductor gate-respond' is deprecated and will "
+            "be removed in a future release. Use 'conductor gate respond' instead."
+        )
     )
     from conductor.cli.gate import _gate_respond_impl
 
