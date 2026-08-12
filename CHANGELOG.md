@@ -183,6 +183,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Live provider pricing works again** (#386). `CopilotProvider.get_model_pricing`
+  reads `billing.token_prices`, and `github-copilot-sdk` 1.0.1 — the version the
+  lock pinned — parsed the `models.list` response with a hand-written
+  `client.ModelBilling` that declared only `multiplier` and discarded the
+  `tokenPrices` wire field. The field never left the API and is still modelled in
+  the SDK's generated types; only the client dataclass dropped it. The hook
+  therefore returned `None` for every model, so the resolution chain #265 built
+  (workflow override → provider hook → static table → unpriced) ran permanently
+  on its fallback, and models absent from `DEFAULT_PRICING` reported no cost at
+  all. SDK 1.0.9 parses the field again, so the floor moves to `>=1.0.9` rather
+  than the lock alone: the old floor let an existing environment keep 1.0.1 and
+  silently keep dead pricing. `_default_permission_handler` picks up the
+  matching `PermissionInvocation` annotation, which 1.0.9 narrowed from
+  `dict[str, str]`. That release also made `approve_all` raise when
+  `managed_settings_enabled` is set, which Conductor cannot reach — the flag
+  comes from the `enable_managed_settings` opt-in on `create_session`, which it
+  never passes. No per-token rates were invented for the missing models; with
+  the hook alive they price from the SDK.
+
+  The existing hook tests built their models from `SimpleNamespace`, so they
+  asserted what Conductor does with a billing object rather than whether the SDK
+  still supplies one, and stayed green throughout. Two tests now build the model
+  through the SDK's own `ModelInfo.from_dict`, so the next SDK release that
+  stops carrying the field fails the build instead of quietly reverting every
+  run to static pricing.
+
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused
   `AgentOutput.input_tokens` — a *billing* total summed across every API call

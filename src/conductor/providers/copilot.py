@@ -42,6 +42,8 @@ from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
+    from copilot.session import PermissionInvocation
+
     from conductor.config.schema import AgentDef, OutputField, ProviderSettings
     from conductor.engine.pricing import ModelPricing
 
@@ -396,13 +398,19 @@ class CopilotProvider(AgentProvider):
     @staticmethod
     def _default_permission_handler(
         request: Any,
-        invocation: dict[str, str],
+        invocation: PermissionInvocation,
     ) -> Any:
         """Default permission handler that approves all requests.
 
         The SDK requires a permission handler on session creation.
         In orchestration mode, we approve all tool permissions since the
         workflow author controls which tools are available to each agent.
+
+        ``invocation`` is the SDK's ``PermissionInvocation`` TypedDict. SDK
+        1.0.9 narrowed it from ``dict[str, str]``, and ``approve_all`` now
+        raises when ``managed_settings_enabled`` is set. That is unreachable
+        here: the flag is populated from the ``enable_managed_settings``
+        opt-in on ``create_session``, which Conductor never passes.
 
         Returns a PermissionRequestResult from the SDK.
         """
