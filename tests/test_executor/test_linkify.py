@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from conductor.executor.linkify import linkify_markdown
+import pytest
+
+from conductor.executor.linkify import MAX_LINKIFY_CHARS, linkify_markdown
 
 # ---------------------------------------------------------------------------
 # Whitespace normalisation
@@ -211,3 +214,192 @@ class TestCombined:
         """Paths that escape base_dir should not be linked."""
         result = linkify_markdown("See ../../../etc/passwd.txt", base_dir=tmp_path)
         assert "[../../../etc/passwd.txt]" not in result
+
+
+# ---------------------------------------------------------------------------
+# Fenced code block edge cases (issue #395 rewrite)
+# ---------------------------------------------------------------------------
+
+
+class TestFencedCodeEdgeCases:
+    """Pins the fenced-code semantics the possessive-quantifier rewrite must
+    preserve — deterministic, no wall-clock assertions."""
+
+    def test_well_formed_fence_protects_contents(self) -> None:
+        text = "```\nsrc/config/schema.py\n```"
+        assert linkify_markdown(text) == text
+
+    def test_language_tag_works(self) -> None:
+        text = "```py\nsrc/config/schema.py\n```"
+        assert linkify_markdown(text) == text
+
+    def test_tilde_fence_works(self) -> None:
+        text = "~~~\nsrc/config/schema.py\n~~~"
+        assert linkify_markdown(text) == text
+
+    def test_two_fences_each_protect_independently(self) -> None:
+        text = "```\nsrc/a.py\n```\n\ntext\n\n```\nsrc/b.py\n```"
+        result = linkify_markdown(text)
+        assert "[src/a.py]" not in result
+        assert "[src/b.py]" not in result
+
+    def test_unclosed_fence_protects_nothing(self) -> None:
+        """An unclosed fence keeps today's behaviour: it protects nothing,
+        so a bare path after it is still linkified (issue #395 Q1)."""
+        text = "```\ncode here\nmore docs/a.md"
+        result = linkify_markdown(text)
+        assert "[docs/a.md](docs/a.md)" in result
+
+    def test_empty_fence_matches(self) -> None:
+        text = "```\n```"
+        assert linkify_markdown(text) == text
+
+
+# ---------------------------------------------------------------------------
+# Existing markdown link protection (issue #395 rewrite)
+# ---------------------------------------------------------------------------
+
+
+class TestExistingLinkProtection:
+    """Pins the ``_find_existing_link_spans`` scanner against the shapes
+    fuzzed against the regex it replaces — output must equal input since
+    nothing here should be re-linkified."""
+
+    def test_simple_paren_link(self) -> None:
+        text = "See [a](b) for details"
+        assert linkify_markdown(text) == text
+
+    def test_simple_bracket_ref_link(self) -> None:
+        text = "See [a][b] for details"
+        assert linkify_markdown(text) == text
+
+    def test_nested_image_link(self) -> None:
+        text = "[![img](i.png)](u)"
+        # Matches the current regex's actual (non-greedy-across-`]`) behaviour:
+        # only the inner "[![img](i.png)" is protected, so the result is
+        # unchanged from input either way (no path/URL content to linkify).
+        assert linkify_markdown(text) == text
+
+    def test_adjacent_links(self) -> None:
+        text = "[x](y)[z](w)"
+        assert linkify_markdown(text) == text
+
+    def test_unterminated_paren_link(self) -> None:
+        text = "before [a]( after"
+        assert linkify_markdown(text) == text
+
+    def test_unterminated_bracket_link(self) -> None:
+        text = "before [a][ after"
+        assert linkify_markdown(text) == text
+
+    def test_bare_bracket_wall(self) -> None:
+        text = "[[[[[[[[[["
+        assert linkify_markdown(text) == text
+
+    def test_mixed_walls(self) -> None:
+        text = "[[[[[]]]]]"
+        assert linkify_markdown(text) == text
+
+
+# ---------------------------------------------------------------------------
+# Pathological-input performance (issue #395)
+# ---------------------------------------------------------------------------
+
+
+class TestPathologicalInputPerformance:
+    """Guards against the O(n^2) regressions issue #395 fixed.
+
+    CI runs ``-m "not real_api and not performance"``, so a
+    ``performance``-marked test alone would not guard this regression in CI.
+    The wall-clock assertions below are unmarked and deliberately generous
+    (~500x margin over the fixed-code runtime) so they run in CI and still
+    fail loudly if the quadratic behaviour returns, without being flaky
+    under CI load.
+    """
+
+    def test_backtick_wall_completes_quickly(self) -> None:
+        text = "`" * 100_000
+        start = time.perf_counter()
+        linkify_markdown(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"backtick wall took {elapsed:.3f}s (expected < 2s)"
+
+    def test_bracket_wall_completes_quickly(self) -> None:
+        text = "[" * 100_000
+        start = time.perf_counter()
+        linkify_markdown(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"bracket wall took {elapsed:.3f}s (expected < 2s)"
+
+    def test_quote_token_completes_quickly(self) -> None:
+        text = '"' * 100_000
+        start = time.perf_counter()
+        linkify_markdown(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"quote token took {elapsed:.3f}s (expected < 2s)"
+
+    @pytest.mark.performance
+    def test_backtick_wall_scales_near_linearly(self) -> None:
+        small = "`" * 40_000
+        large = "`" * 80_000
+
+        start = time.perf_counter()
+        linkify_markdown(small)
+        small_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        linkify_markdown(large)
+        large_time = time.perf_counter() - start
+
+        # Guard against a division by (near) zero making the ratio meaningless.
+        floor = 1e-4
+        ratio = max(large_time, floor) / max(small_time, floor)
+        assert ratio < 2.5, f"doubling input scaled cost by {ratio:.2f}x (expected < 2.5x)"
+
+    @pytest.mark.performance
+    def test_bracket_wall_scales_near_linearly(self) -> None:
+        small = "[" * 20_000 + "]" * 20_000
+        large = "[" * 40_000 + "]" * 40_000
+
+        start = time.perf_counter()
+        linkify_markdown(small)
+        small_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        linkify_markdown(large)
+        large_time = time.perf_counter() - start
+
+        floor = 1e-4
+        ratio = max(large_time, floor) / max(small_time, floor)
+        assert ratio < 2.5, f"doubling input scaled cost by {ratio:.2f}x (expected < 2.5x)"
+
+    @pytest.mark.performance
+    def test_quote_token_scales_near_linearly(self) -> None:
+        small = '"' * 40_000
+        large = '"' * 80_000
+
+        start = time.perf_counter()
+        linkify_markdown(small)
+        small_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        linkify_markdown(large)
+        large_time = time.perf_counter() - start
+
+        floor = 1e-4
+        ratio = max(large_time, floor) / max(small_time, floor)
+        assert ratio < 2.5, f"doubling input scaled cost by {ratio:.2f}x (expected < 2.5x)"
+
+    def test_cap_skips_linkification_but_still_normalizes(self) -> None:
+        """A string longer than MAX_LINKIFY_CHARS skips linkification (a
+        would-be-linkified path stays bare) but whitespace is still
+        normalized."""
+        padding = "x" * MAX_LINKIFY_CHARS
+        text = f"{padding}\n\n\ndocs/a.md"
+        assert len(text) > MAX_LINKIFY_CHARS
+
+        result = linkify_markdown(text)
+
+        assert "[docs/a.md](docs/a.md)" not in result
+        assert "docs/a.md" in result
+        assert "\n\n\n" not in result
