@@ -275,12 +275,24 @@ class TestMCPManagerConnectServer:
             return mgr
 
     async def test_connect_server_mocked(self, manager: Any) -> None:
-        """Test connect_server with fully mocked MCP client."""
-        # Create mock tool
-        mock_tool = MagicMock()
-        mock_tool.name = "search"
-        mock_tool.description = "Search the web"
-        mock_tool.inputSchema = {"type": "object", "properties": {"query": {"type": "string"}}}
+        """Requirement: tool discovery accepts MCP 2.x snake-case model fields."""
+        from pydantic import BaseModel, Field
+
+        class MCP2Tool(BaseModel):
+            name: str
+            description: str | None = None
+            input_schema: dict[str, Any] = Field(alias="inputSchema")
+
+        mock_tool = MCP2Tool.model_validate(
+            {
+                "name": "search",
+                "description": "Search the web",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            }
+        )
 
         # Create mock list_tools response
         mock_list_tools_response = MagicMock()
@@ -335,6 +347,10 @@ class TestMCPManagerConnectServer:
             assert tools[0]["original_name"] == "search"
             assert tools[0]["server"] == "web-search"
             assert tools[0]["description"] == "Search the web"
+            assert tools[0]["input_schema"] == {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }
 
             # Verify internal state
             assert "web-search" in manager.sessions

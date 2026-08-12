@@ -204,7 +204,7 @@ class MCPManager:
                             {
                                 "name": prefixed_name,
                                 "description": tool.description or "",
-                                "input_schema": tool.inputSchema,
+                                "input_schema": tool.model_dump(by_alias=True)["inputSchema"],
                                 "server": name,
                                 "original_name": tool.name,
                             }
