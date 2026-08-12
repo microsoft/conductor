@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import json
 import logging
@@ -100,7 +101,11 @@ class TestValidateConnection:
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_validate_connection_returns_true_when_bundled_cli_present(self) -> None:
-        """The SDK ships a bundled CLI under _bundled/claude — detection should succeed."""
+        """The SDK ships a bundled CLI under ``_bundled/`` — detection should succeed.
+
+        The binary is named per-platform (``claude.exe`` on Windows, ``claude``
+        elsewhere), matching the SDK's own ``_find_bundled_cli``.
+        """
         provider = ClaudeAgentSdkProvider()
         # The installed claude-agent-sdk extra includes the bundled binary,
         # so this should return True in any env where the test runs.
@@ -1913,7 +1918,10 @@ class TestMcpConfigFile:
             _remove_mcp_config(path)
 
         # 0600: resolved env values and Authorization headers live in here.
-        assert mode == 0o600
+        # Windows has no POSIX mode bits — S_IMODE reports 0o666 whatever was requested —
+        # so the exact-mode guarantee is asserted on POSIX only.
+        if os.name != "nt":
+            assert mode == 0o600
         # The CLI rejects a bare mapping: "mcpServers: Invalid input:
         # expected record, received undefined".
         assert payload == {"mcpServers": servers}
@@ -2606,3 +2614,57 @@ class TestSkillsWiring:
         with pytest.raises(ProviderError, match="Two different plugins") as exc:
             _resolve_skill_plugins([str(a / "skills" / "s"), str(b / "skills" / "s")])
         assert exc.value.is_retryable is False
+
+
+class TestValidateConnectionProbeSetPerPlatform:
+    """The Windows branch had no test behind it.
+
+    On Linux ``is_windows`` is always False, and on the Windows runner the
+    bundled ``claude.exe`` ships in the wheel and short-circuits at the bundled
+    probe -- so the fallback block never ran on any CI leg. The whole branch
+    could be deleted and all three stayed green.
+
+    Asserting the probe *set* per platform is what catches a mismatch with the
+    SDK, because it forces the expectation to be written down as a literal.
+    """
+
+    def _probed(self, *, windows: bool) -> list[str]:
+        """Return the fallback paths ``validate_connection`` stats."""
+        seen: list[str] = []
+
+        def _spy(self: Path) -> bool:
+            seen.append(self.as_posix())
+            return False
+
+        with (
+            patch(
+                "conductor.providers.claude_agent_sdk.sys.platform",
+                "win32" if windows else "linux",
+            ),
+            patch("shutil.which", return_value=None),
+            patch.object(Path, "exists", _spy),
+        ):
+            provider = ClaudeAgentSdkProvider()
+            with contextlib.suppress(Exception):
+                asyncio.run(provider.validate_connection())
+        return seen
+
+    def test_posix_probes_the_driveless_path(self) -> None:
+        assert any(p == "/usr/local/bin/claude" for p in self._probed(windows=False))
+
+    def test_windows_skips_only_the_driveless_path(self) -> None:
+        """A rooted, driveless path resolves against the current drive.
+
+        ``/usr/local/bin/claude`` becomes ``C:\\usr\\local\\bin\\claude``, which
+        any unprivileged local user can create. The other five are
+        ``Path.home()``-anchored and carry no such risk -- dropping them reported
+        "no CLI" for a Windows user whose CLI sits at ``~/.claude/local/claude``,
+        where Claude Code's own local installer puts it, and which the pinned SDK
+        (0.2.87) probes and would happily run.
+        """
+        probed = self._probed(windows=True)
+        assert not any(p == "/usr/local/bin/claude" for p in probed)
+        assert any(p.endswith(".claude/local/claude") for p in probed), (
+            "a Windows user's local install must still be found"
+        )
+        assert any(p.endswith(".npm-global/bin/claude") for p in probed)

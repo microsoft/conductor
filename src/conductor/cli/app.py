@@ -601,7 +601,7 @@ def run(
         )
 
         # Output as JSON to stdout
-        output_console.print_json(json.dumps(result))
+        output_console.print_json(json.dumps(result), ensure_ascii=True)
 
     except WorkflowTerminated as e:
         # Explicit `type: terminate` with `status: failed`. Print the
@@ -614,7 +614,7 @@ def run(
         # transform could produce a non-trivial Python object that would
         # otherwise crash the CLI here and lose the termination message.
         try:
-            output_console.print_json(json.dumps(e.output, default=str))
+            output_console.print_json(json.dumps(e.output, default=str), ensure_ascii=True)
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
@@ -1099,13 +1099,13 @@ def resume(
         )
 
         # Output as JSON to stdout
-        output_console.print_json(json.dumps(result))
+        output_console.print_json(json.dumps(result), ensure_ascii=True)
 
     except WorkflowTerminated as e:
         # Mirror of the `run` handler — see commentary there for the
         # `default=str` and `try/except` rationale.
         try:
-            output_console.print_json(json.dumps(e.output, default=str))
+            output_console.print_json(json.dumps(e.output, default=str), ensure_ascii=True)
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(

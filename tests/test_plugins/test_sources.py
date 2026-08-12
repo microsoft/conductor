@@ -125,6 +125,45 @@ class TestLocalPaths:
         """Anchoring needs the workflow directory, which the parser lacks."""
         assert parse_plugin_source("./vendor/plugins").location == "./vendor/plugins"
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "file://C:/src/repo",
+            "file://C:\\src\\repo",
+            "file:///srv/src/repo",
+            "file://C:/a/very/deeply/nested/checkout/under/a/long/temporary/path/repo",
+        ],
+    )
+    def test_a_file_url_cache_key_stays_inside_the_cache(self, raw):
+        """The key must name a directory *under* the cache root, everywhere.
+
+        A Windows ``file://`` source used to break this three ways, all of
+        which put the checkout somewhere other than where the key said:
+        backslashes survived as separators because the splitter only knew
+        ``/``; the drive colon made ``C:_src`` read as a drive rather than a
+        name; and flattening a deep path into one segment produced a name
+        long enough that ``git`` could not create ``.git`` inside it.
+
+        Asserted on every platform rather than gated on Windows: one workflow
+        file must resolve to the same cache layout wherever it runs, and CI's
+        Linux legs would skip a Windows-gated test entirely.
+        """
+        key = parse_plugin_source(raw).cache_key
+
+        assert not key.is_absolute()
+        for part in key.parts:
+            assert part not in ("", ".", "..")
+            assert not set(part) & set(':<>"|?*\\/'), f"unsafe character in {part!r}"
+            assert len(part) <= 24, f"segment too long for a 260-char path: {part!r}"
+
+    def test_file_url_keys_stay_distinct_when_shortened(self):
+        """Shortening must not collapse two different sources onto one key."""
+        base = "file://C:/a/very/deeply/nested/checkout/under/a/long/temporary/path"
+        first = parse_plugin_source(f"{base}/one/repo").cache_key
+        second = parse_plugin_source(f"{base}/two/repo").cache_key
+
+        assert first != second
+
 
 class TestPinning:
     """Only a full SHA is immutable."""

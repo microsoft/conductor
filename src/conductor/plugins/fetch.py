@@ -60,6 +60,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -235,9 +236,20 @@ def _run_git(arguments: Sequence[str], *, timeout: int, context: str) -> str:
         "SSH_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
     }
+    # ``core.longpaths`` is git-for-Windows' opt-in to the Win32 extended-length
+    # API; without it git refuses any path over 260 characters. The plugin cache
+    # is inherently deep -- cache root, then host, owner, repo-digest, a staging
+    # directory, and then whatever the repository itself nests -- so a user whose
+    # cache lives under a long home directory could not clone at all, failing on
+    # git's own `.git/hooks/*.sample` before any project file was written.
+    #
+    # Set per-invocation rather than asking users to configure it globally: this
+    # is a property of the paths Conductor generates, not a preference of theirs.
+    # A no-op on POSIX, where the limit does not exist.
+    git_config = ["-c", "protocol.ext.allow=never", "-c", "core.longpaths=true"]
     try:
         completed = subprocess.run(  # noqa: S603
-            ["git", "-c", "protocol.ext.allow=never", *arguments],  # noqa: S607
+            ["git", *git_config, *arguments],  # noqa: S607
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -483,7 +495,19 @@ def _publish(temporary: Path, destination: Path) -> None:
         # Only the lost-race errnos. Treating EACCES or ENOSPC as "someone
         # else got there first" would report a broken checkout as a
         # successful one, on the strength of the directory merely existing.
-        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST) and destination.is_dir():
+        #
+        # Windows is the exception, and needs naming rather than adding
+        # EACCES globally: replacing a directory that already exists raises
+        # ERROR_ACCESS_DENIED (WinError 5, surfaced as EACCES) instead of
+        # ENOTEMPTY, so the POSIX-only list never fired and a second source
+        # resolving to the same SHA failed the whole fetch. Safe because the
+        # readiness sentinel is written *after* this returns: a winner that
+        # died mid-clone leaves no sentinel, `is_cached` reports a miss, and
+        # the tree is re-fetched rather than read half-written.
+        lost_race = exc.errno in (errno.ENOTEMPTY, errno.EEXIST) or (
+            sys.platform == "win32" and getattr(exc, "winerror", None) == 5
+        )
+        if lost_race and destination.is_dir():
             shutil.rmtree(temporary, ignore_errors=True)
             return
         raise

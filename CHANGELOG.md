@@ -223,7 +223,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops carrying the field fails the build instead of quietly reverting every
   run to static pricing, and the permission handler has behavioural coverage for
   the first time.
-
+- **Plugin checkouts from a `file://` source no longer land outside the plugin
+  cache on Windows.** The cache key is derived from the URL's path segments, but
+  the splitter only knew `/`, so a native Windows path arrived as a single
+  segment with its backslashes intact — and the key kept them, putting the
+  checkout at a drive-absolute location rather than under the cache root, which
+  is the same escape the `..` check exists to prevent. Two further problems sat
+  behind it: a drive colon made an owner of `C:_src` read as a drive (or, in the
+  middle of a name, as an NTFS alternate data stream), and flattening a deep
+  path into one segment produced a directory name long enough that `git` refused
+  to create `.git` inside it. Separators are now folded, the characters that
+  change a path's meaning on Windows are substituted, and an over-long segment
+  is replaced by a digest of itself — on every platform, so one workflow file
+  resolves to the same cache layout wherever it runs.
+- **Two sources resolving to the same commit no longer fail the whole fetch on
+  Windows.** Publishing a completed checkout tolerates losing the race to a
+  concurrent fetch, but recognised only the POSIX errnos for "destination
+  already exists"; Windows reports that as `ERROR_ACCESS_DENIED`, so the
+  tolerance never applied and the second source raised. Safe to accept because
+  the readiness sentinel is written after publishing: a winner that died
+  mid-clone leaves no sentinel, so the tree is re-fetched rather than read
+  half-written.
+- **A local path is recognised the same way on every platform** — `_is_local_path`
+  asked `pathlib.Path`, which is the *running* platform's flavour, so a POSIX
+  absolute path such as `/srv/plugins` was refused as an unrecognised source on
+  Windows. Both conventions are now consulted.
+- **Registry names are validated before they can corrupt the config** — a name
+  containing a quote, a space, `=` or `#` was accepted, written into
+  `registries.toml` as an unescaped table key, and then failed to parse. Since
+  `registry add`, `remove` and `get` all load the config first, the user could
+  not remove the entry that broke it and every unrelated registry went down
+  with it. Names are now restricted to letters, digits, `.`, `_` and `-`, which
+  also keeps them legal as cache directory names on Windows, and the table key
+  is quoted so a dotted name stays one registry instead of becoming a nested
+  table.
+- **`conductor doctor` no longer reports a missing Claude CLI on Windows** —
+  the CLI probe dropped five `~`-anchored fallback locations on Windows,
+  including `~/.claude/local/claude` where Claude Code's own installer puts it,
+  so `validate_connection()` returned False for a CLI the SDK would find and
+  run. Only `/usr/local/bin/claude` is now skipped there: it is rooted but
+  driveless, so it resolves against the current drive, which any unprivileged
+  local user can write to.
+- **Registry TOML values are escaped** — a registry whose source or type
+  contained a quote or a backslash produced a file that could not be re-read.
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused
   `AgentOutput.input_tokens` — a *billing* total summed across every API call
@@ -376,6 +418,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand with a 19-character naive `started_at`, well short of production's
   32-character value — it now goes through the real `write_pid_file`, so the
   widths under test match the widths production writes.
+- **JSON result output no longer crashes on a legacy Windows stdout** (#342).
+  On a `cp1252` console, `conductor run` exited non-zero with
+  `UnicodeEncodeError` *after* the workflow had already succeeded, having
+  written a truncated document callers could not parse. `json.dumps` emits
+  ASCII by default, but rich's `print_json` re-parses and re-serialises with
+  `ensure_ascii=False` immediately before the write, restoring the character it
+  had escaped. Every JSON sink now passes `ensure_ascii=True`. Results carry
+  `\uXXXX` escapes on all platforms as a result, which is valid JSON and decodes
+  identically. `conductor doctor`'s default *table* output is unaffected by this
+  change and still fails on such a console (#401).
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing

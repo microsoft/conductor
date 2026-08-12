@@ -7,7 +7,8 @@
 # Jobs:
 # - lint: Runs ruff linter and formatter check
 # - typecheck: Runs ty (Red Knot) type checker
-# - test: Runs pytest with coverage on Python 3.12 and 3.13
+# - test: Runs pytest with coverage on Python 3.12 + 3.13 (Ubuntu) and 3.13
+#         (Windows, where the platform-specific code actually lives)
 # - validate-examples: Validates all example workflow YAML files
 # - build: Verifies the package builds correctly
 # - frontend: Type-checks, tests (Vitest), and builds the web dashboard
@@ -81,12 +82,27 @@ jobs:
         run: uv run ty check src
 
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: [lint, typecheck]
     strategy:
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13"]
+        # Windows carries a substantial amount of platform-specific code —
+        # cli/pid.py is an entire OpenProcess/GetExitCodeProcess ctypes
+        # implementation, cli/bg_runner.py handles process groups and job-object
+        # breakaway — and none of it was executed anywhere. The existing tests
+        # cover that logic on Linux by monkey-patching a `_kernel32` mock, which
+        # is good design but means nothing validates the real ctypes signatures.
+        #
+        # Deliberately ONE Python version on Windows rather than a full 2x2: the
+        # platform is the variable here, not the interpreter, and the
+        # install-scripts job already provisions a Windows runner on every PR so
+        # this is incremental cost rather than a new platform commitment.
+        include:
+          - os: windows-latest
+            python-version: "3.13"
       fail-fast: false
 
     steps:
@@ -109,13 +125,33 @@ jobs:
         run: uv sync --group dev --extra claude-agent-sdk
 
       - name: Remove bundled Copilot CLI binary
+        # `shell: bash` so this runs identically on the Windows runner (Git Bash
+        # is preinstalled). Without it the step fails on Windows, where a bare
+        # `find` resolves to the unrelated DOS search tool in System32.
+        shell: bash
         run: |
-          # Copilot SDK <1.0.2 shipped platform wheels with a bundled CLI binary
-          # that tries to authenticate with GitHub on startup. Newer wheels are
-          # pure-Python and fetch the CLI on first use instead, which
-          # COPILOT_SKIP_CLI_DOWNLOAD blocks below — this only matters for a
-          # local venv restored from an older lock.
-          find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
+          set -euo pipefail
+          # Copilot SDK <1.0.2 shipped per-platform wheels with a bundled CLI
+          # binary that tries to authenticate with GitHub on startup. Remove it
+          # so a test taking the real CLI path fails fast instead of hanging on
+          # auth.
+          #
+          # The binary ships inside the package (copilot/bin/), not in the venv's
+          # scripts directory — there is no console-script entry point — so one
+          # pattern covers both platforms: the leading */ absorbs lib/pythonX.Y/
+          # or Lib/, and the trailing * absorbs the .exe suffix on Windows.
+          #
+          # Finding nothing is expected on the pinned SDK and is not an error:
+          # the wheel is pure-Python from 1.0.2 on and fetches the CLI on first
+          # use instead of bundling it. What stops that fetch from reinstating
+          # the same hang is COPILOT_SKIP_CLI_DOWNLOAD in the test step's env,
+          # so this step is now only for a venv restored from an older lock.
+          removed=$(find .venv -path '*/copilot/bin/copilot*' -print -delete)
+          if [ -n "$removed" ]; then
+            echo "Removed bundled CLI: $removed"
+          else
+            echo "No bundled CLI present (expected for github-copilot-sdk >=1.0.2)."
+          fi
 
       - name: Run tests with coverage
         timeout-minutes: 10
@@ -134,7 +170,9 @@ jobs:
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
-        if: matrix.python-version == '3.12'
+        # One upload per commit. Without the os guard a second runner would
+        # upload a partial report for the same commit and skew the totals.
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
