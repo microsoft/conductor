@@ -64,7 +64,7 @@ class TestEventLogSubscriber:
         sub.close()
 
         parsed = json.loads(sub.path.read_text().strip())
-        assert parsed["data"]["path"] == "/some/path"
+        assert parsed["data"]["path"] == str(Path("/some/path"))
         assert parsed["data"]["raw"] == "bytes-data"
 
     def test_safe_after_close(self, tmp_path, monkeypatch):

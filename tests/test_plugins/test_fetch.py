@@ -10,7 +10,6 @@ remote falling back to cache — are all properties of git itself.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import pytest
@@ -27,7 +26,7 @@ from conductor.plugins.fetch import (
 )
 from conductor.plugins.sources import parse_plugin_source
 
-from .conftest import make_git_repo, make_plugin
+from .conftest import make_git_repo, make_plugin, rmtree
 
 
 @pytest.fixture
@@ -133,7 +132,7 @@ class TestPinning:
     def test_pinned_source_resolves_without_the_remote(self, repo, plugin_cache_home: Path):
         root, sha = repo
         fetch_source(parse_plugin_source(_url(root, sha)))
-        shutil.rmtree(root)
+        rmtree(root)
 
         result = fetch_source(parse_plugin_source(_url(root, sha)))
 
@@ -178,7 +177,7 @@ class TestOfflineFallback:
         root, sha = repo
         source = parse_plugin_source(_url(root, "v1.0.0"))
         fetch_source(source)
-        shutil.rmtree(root)
+        rmtree(root)
         clear_resolution_memo()
 
         warnings: list[str] = []
@@ -208,7 +207,7 @@ class TestOfflineFallback:
         assert json.loads(pointers[0].read_text())["sha"] == sha
 
         pointers[0].unlink()
-        shutil.rmtree(root)
+        rmtree(root)
         clear_resolution_memo()
 
         with pytest.raises(PluginFetchError):

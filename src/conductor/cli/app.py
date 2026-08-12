@@ -647,7 +647,7 @@ def run(
         )
 
         # Output as JSON to stdout
-        output_console.print_json(json.dumps(result))
+        output_console.print_json(json.dumps(result), ensure_ascii=True)
 
     except WorkflowTerminated as e:
         # Explicit `type: terminate` with `status: failed`. Print the
@@ -660,7 +660,7 @@ def run(
         # transform could produce a non-trivial Python object that would
         # otherwise crash the CLI here and lose the termination message.
         try:
-            output_console.print_json(json.dumps(e.output, default=str))
+            output_console.print_json(json.dumps(e.output, default=str), ensure_ascii=True)
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
@@ -953,6 +953,13 @@ def resume(
             ),
         ),
     ] = False,
+    guidance: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--guidance",
+            help=("Mid-run guidance text to apply before the resumed agent runs. Can be repeated."),
+        ),
+    ] = None,
 ) -> None:
     """Resume a workflow from a checkpoint after failure.
 
@@ -980,12 +987,14 @@ def resume(
         conductor resume workflow.yaml --web
         conductor resume workflow.yaml --web --web-port 8080
         conductor resume workflow.yaml --web-bg
+        conductor resume workflow.yaml --guidance "Skip the benchmark step"
     """
     import asyncio
     import json
 
     from conductor.cli.run import (
         generate_log_path,
+        parse_guidance_flags,
         parse_metadata_flags,
         resume_workflow_async,
     )
@@ -1048,6 +1057,12 @@ def resume(
     if raw_metadata:
         cli_metadata.update(parse_metadata_flags(raw_metadata))
 
+    # Validate --guidance flags up front (empty/oversized entries rejected
+    # the same way POST /api/guidance rejects them), before any checkpoint
+    # restore or --web-bg fork.
+    if guidance:
+        guidance = parse_guidance_flags(guidance)
+
     # Resolve log file path
     resolved_log_file: Path | None = None
     if log_file is not None:
@@ -1094,6 +1109,7 @@ def resume(
                 log_file=resolved_log_file,
                 web_port=web_port,
                 metadata=cli_metadata,
+                guidance=guidance,
             )
             if is_verbose():
                 if not launch.still_running:
@@ -1134,17 +1150,18 @@ def resume(
                 web_port=web_port,
                 web_bg=web_bg,
                 metadata=cli_metadata,
+                guidance=guidance,
             )
         )
 
         # Output as JSON to stdout
-        output_console.print_json(json.dumps(result))
+        output_console.print_json(json.dumps(result), ensure_ascii=True)
 
     except WorkflowTerminated as e:
         # Mirror of the `run` handler — see commentary there for the
         # `default=str` and `try/except` rationale.
         try:
-            output_console.print_json(json.dumps(e.output, default=str))
+            output_console.print_json(json.dumps(e.output, default=str), ensure_ascii=True)
         except (TypeError, ValueError) as json_exc:
             logger.exception("Failed to serialise terminate output")
             console.print(
@@ -1161,6 +1178,49 @@ def resume(
     except Exception as e:
         print_error(e)
         raise typer.Exit(code=1) from None
+
+
+@app.command(rich_help_panel="Interact")
+def guide(
+    text: Annotated[
+        str,
+        typer.Option(
+            "--text",
+            "-t",
+            help="Guidance text to send to the running workflow.",
+        ),
+    ],
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            "-p",
+            help="Dashboard port of the running workflow (auto-discovered if omitted).",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option(
+            "--token",
+            help="Auth token (also reads from CONDUCTOR_GATE_TOKEN env var).",
+        ),
+    ] = None,
+) -> None:
+    """Send mid-run guidance to a workflow running with --web or --web-bg.
+
+    The guidance is applied at the next step boundary, or immediately if an
+    agent is currently paused (dashboard Stop, or an Esc/Ctrl+G interrupt)
+    — in which case the agent resumes with the guidance applied.
+
+    \b
+    Examples:
+        conductor guide --text "Prefer Python 3.12 examples"
+        conductor guide --port 8080 --text "Skip the benchmark step"
+        conductor guide --text "Use the staging endpoint" --token secret123
+    """
+    from conductor.cli.guide import guide_impl
+
+    guide_impl(text, port, token)
 
 
 @app.command(hidden=True)

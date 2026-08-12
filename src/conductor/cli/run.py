@@ -1166,6 +1166,22 @@ class ConsoleEventSubscriber:
                 style="yellow",
             )
 
+        elif t == "guidance_received":
+            pending = d.get("pending", 1)
+            verbose_log(
+                f"  Guidance received (pending: {pending}): {d.get('text', '')}",
+                style="cyan",
+            )
+
+        elif t == "guidance_applied":
+            source = d.get("source", "?")
+            agent_name = d.get("agent_name")
+            target = f" before '{agent_name}'" if agent_name else ""
+            verbose_log(
+                f"  Guidance applied ({source}){target}: {d.get('text', '')}",
+                style="cyan",
+            )
+
 
 def _validator_label(data: dict[str, Any]) -> str:
     """Build an agent label including a for-each ``item_key`` when present."""
@@ -1354,6 +1370,38 @@ def parse_metadata_flags(raw_metadata: list[str]) -> dict[str, str]:
 
         result[key] = value
 
+    return result
+
+
+def parse_guidance_flags(raw_guidance: list[str]) -> list[str]:
+    """Validate ``--guidance`` flags, mirroring ``POST /api/guidance``.
+
+    ``resume --guidance`` calls :meth:`WorkflowEngine.add_user_guidance`
+    directly rather than going through the HTTP endpoint, so without this it
+    would skip the non-empty/length checks that endpoint enforces (issue
+    #400 review). Validating here — at the CLI boundary, before any
+    checkpoint restore or background-process fork — gives the same
+    ``typer.BadParameter`` treatment ``--metadata`` gets rather than letting
+    an empty or oversized entry reach the engine.
+
+    Args:
+        raw_guidance: List of raw ``--guidance`` values from the CLI.
+
+    Returns:
+        The stripped, validated guidance texts, in the order given.
+
+    Raises:
+        typer.BadParameter: If any entry is empty after stripping, or
+            exceeds :data:`conductor.engine.guidance.MAX_GUIDANCE_CHARS`.
+    """
+    from conductor.engine.guidance import validate_guidance_text
+
+    result: list[str] = []
+    for raw in raw_guidance:
+        try:
+            result.append(validate_guidance_text(raw))
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
     return result
 
 
@@ -1902,6 +1950,13 @@ async def run_workflow_async(
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            # Share the guidance sink with the dashboard so POST /api/guidance
+            # can push mid-run text into the engine (issue #400). Unlike
+            # set_interrupt_event this doesn't need interrupt_event -- a plain
+            # --web run with no keyboard listener still accepts guidance.
+            if dashboard is not None:
+                dashboard.set_guidance_sink(engine.submit_guidance)
+
             terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
@@ -2229,6 +2284,11 @@ def _print_resume_instructions(engine: WorkflowEngine) -> None:
                 "[dim]Or resume latest checkpoint:[/dim] conductor resume {}", engine.workflow_path
             )
         )
+    _verbose_console.print(
+        Text.from_markup(
+            '[dim]Add guidance for the resumed run with:[/dim] --guidance "correction text"'
+        )
+    )
     _verbose_console.print()
 
 
@@ -2244,6 +2304,7 @@ async def resume_workflow_async(
     web_port: int = 0,
     web_bg: bool = False,
     metadata: dict[str, str] | None = None,
+    guidance: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resume a workflow from a checkpoint.
 
@@ -2272,6 +2333,11 @@ async def resume_workflow_async(
             disconnect.
         metadata: Optional CLI metadata to merge on top of YAML-declared
             metadata for the resumed run.
+        guidance: Optional mid-run guidance text(s) applied to the restored
+            context before the resumed agent runs (issue #400). Applied via
+            ``engine.add_user_guidance(text, source="cli")`` for each entry,
+            in order, before the dashboard's ``workflow_started`` is
+            prepended so the seeded history reflects the applied guidance.
 
     Returns:
         The workflow output as a dictionary.
@@ -2493,6 +2559,13 @@ async def resume_workflow_async(
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)
 
+            # Apply any --guidance flags to the restored context before the
+            # dashboard is seeded, so the prepended workflow_started (which
+            # inserts at index 0) ends up before these guidance_applied
+            # events in history order (issue #400).
+            for guidance_text in guidance or []:
+                engine.add_user_guidance(guidance_text, source="cli")
+
             # Seed the dashboard with the original timeline so previously
             # completed agents remain visible. Order matters:
             #   1. Prepend a fresh ``workflow_started`` built from the
@@ -2563,6 +2636,13 @@ async def resume_workflow_async(
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
+
+            # Share the guidance sink with the dashboard so POST /api/guidance
+            # can push mid-run text into the engine (issue #400). Unlike
+            # set_interrupt_event this doesn't need interrupt_event -- a plain
+            # --web run with no keyboard listener still accepts guidance.
+            if dashboard is not None:
+                dashboard.set_guidance_sink(engine.submit_guidance)
 
             terminate_exc: WorkflowTerminated | None = None
             try:

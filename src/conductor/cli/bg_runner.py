@@ -1052,6 +1052,7 @@ def launch_background_resume(
     log_file: Path | None = None,
     web_port: int = 0,
     metadata: dict[str, str] | None = None,
+    guidance: list[str] | None = None,
 ) -> BackgroundLaunch:
     """Fork a detached child process resuming the workflow with a web dashboard.
 
@@ -1079,6 +1080,8 @@ def launch_background_resume(
         log_file: Optional log file path.
         web_port: Desired port (0 = auto-select).
         metadata: Optional CLI metadata key=value pairs.
+        guidance: Optional mid-run guidance text(s) to apply before the
+            resumed agent runs. Forwarded as repeated ``--guidance`` flags.
 
     Returns:
         A ``BackgroundLaunch`` describing the launch (dashboard URL,
@@ -1130,6 +1133,11 @@ def launch_background_resume(
     if metadata:
         for key, value in metadata.items():
             cmd.extend(["--metadata", f"{key}={_serialize_value(value)}"])
+
+    # Forward guidance
+    if guidance:
+        for text in guidance:
+            cmd.extend(["--guidance", text])
 
     if provider_override:
         cmd.extend(["--provider", provider_override])

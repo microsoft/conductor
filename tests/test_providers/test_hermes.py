@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
@@ -819,7 +820,7 @@ class TestHermesHome:
 
         called_path = mock_hermes_constants.set_hermes_home_override.call_args[0][0]
         assert "~" not in called_path
-        assert called_path.endswith(".hermes/profiles/chloe")
+        assert called_path.endswith(os.path.join(".hermes", "profiles", "chloe"))
 
 
 class TestHermesClose:

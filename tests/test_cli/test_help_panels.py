@@ -75,6 +75,7 @@ class TestHelpPanels:
             "validate": "Author & Inspect",
             "show": "Author & Inspect",
             "gate": "Interact",
+            "guide": "Interact",
             "checkpoint": "State",
             "registry": "Environment",
             "plugin": "Environment",

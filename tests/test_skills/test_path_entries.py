@@ -202,8 +202,8 @@ class TestOrderingAndDeduplication:
 
 class TestUnreadableDirectory:
     @pytest.mark.skipif(
-        hasattr(os, "geteuid") and os.geteuid() == 0,
-        reason="root bypasses directory permissions",
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        reason="POSIX permission semantics; chmod(0o000) blocks neither Windows owners nor root",
     )
     def test_unreadable_directory_is_reported_not_raised_raw(self, tmp_path: Path) -> None:
         """A stat-able but unreadable directory must name the entry rather than
@@ -261,8 +261,8 @@ class TestNameCollisions:
 
 class TestUnreadableParent:
     @pytest.mark.skipif(
-        hasattr(os, "geteuid") and os.geteuid() == 0,
-        reason="root bypasses directory permissions",
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        reason="POSIX permission semantics; chmod(0o000) blocks neither Windows owners nor root",
     )
     def test_unreadable_parent_is_reported_not_raised_raw(self, tmp_path: Path) -> None:
         """``exists`` and ``is_dir`` sit inside the OSError guard for this case;
@@ -298,6 +298,31 @@ class TestSkillsRootDiagnostics:
     """
 
     def test_subdirectory_without_skill_md_is_reported(self, tmp_path: Path) -> None:
+        root = tmp_path / "skills"
+        _make_skill(root / "alpha")
+        (root / "oops").mkdir()
+        (root / "oops" / "notes.md").write_text("a file that is not a skill manifest")
+
+        warnings: list[str] = []
+        resolved = resolve_skills([str(root)], on_warning=warnings.append)
+
+        assert [item.name for item in resolved] == ["alpha"]
+        assert len(warnings) == 1
+        assert "oops" in warnings[0]
+        assert "SKILL.md" in warnings[0]
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Windows filesystems are case-insensitive, so 'Skill.md' resolves as SKILL.md "
+        "and the mis-cased-filename scenario cannot occur",
+    )
+    def test_mis_cased_skill_md_is_reported(self, tmp_path: Path) -> None:
+        """Mis-casing the manifest is the mistake this diagnostic was written for.
+
+        It is a Windows-authoring hazard specifically — `Skill.md` resolves fine
+        on a case-insensitive filesystem and then vanishes for everyone else —
+        which is why the general case above uses a fixture that survives here.
+        """
         root = tmp_path / "skills"
         _make_skill(root / "alpha")
         (root / "oops").mkdir()

@@ -1365,6 +1365,7 @@ class TestReplayEventsFromJsonl:
             "iteration_limit_resolved",
             "dialog_started",
             "dialog_completed",
+            "guidance_received",
         ],
     )
     @pytest.mark.parametrize("sub_path", [None, ["sub"], ["sub", "deeper"]])
@@ -1462,6 +1463,42 @@ class TestReplayEventsFromJsonl:
 
         assert count == 1
         assert [ev["type"] for ev in dashboard._event_history] == ["dialog_message"]
+
+    def test_preserves_guidance_applied_when_guidance_received_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """``guidance_received`` is skipped, but ``guidance_applied`` is kept.
+
+        ``guidance_received`` is only the opening half of a pair whose closer
+        is ``guidance_applied`` — a submission still pending when the
+        original run died would otherwise replay as a phantom "pending" entry
+        forever. ``guidance_applied`` is deliberately preserved:
+        ``WorkflowContext.from_dict`` restores ``user_guidance``, so that
+        guidance really is still in effect on the resumed run and must stay
+        listed (issue #400).
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "guidance_received",
+                    "timestamp": 1.0,
+                    "data": {"text": "Be concise", "pending": 1},
+                },
+                {
+                    "type": "guidance_applied",
+                    "timestamp": 1.1,
+                    "data": {"text": "Be concise", "source": "dashboard", "agent_name": "a"},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["guidance_applied"]
 
     def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
         """Subworkflow-level workflow_started/completed (identified by a non-empty

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
+  previously offered only Stop, Resume, and Kill — there was no way to
+  correct a run's course without stopping it first. `conductor guide --text
+  "..."` (auto-discovering the dashboard port) and a dashboard **Guide**
+  button both POST to a new `POST /api/guidance` endpoint, which feeds a
+  `GuidanceChannel` the engine drains at the next step boundary (agents,
+  parallel groups, for-each groups, scripts, sets, and waits alike) or
+  immediately if an agent is currently paused, in which case it resumes with
+  the guidance applied — reusing a Copilot follow-up on the same session when
+  one is available. The TTY Esc/Ctrl+G interrupt path now goes through the
+  same `add_user_guidance` entry point, so that guidance is visible in the
+  dashboard and JSONL log too, and parallel/for-each group members now
+  receive the current guidance section (previously always omitted). `resume
+  --guidance "..."` (repeatable) applies guidance to the restored context
+  before the resumed agent runs. Protected by the same `CONDUCTOR_GATE_TOKEN`
+  as `conductor gate respond` when configured.
 - **`conductor status` — see what is running without stopping it** (#384).
   `conductor stop` with no arguments lists background workflows, but stops one
   when exactly one is running, so the natural "what's running?" reflex was
@@ -192,6 +208,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   URL is still printed, alongside a note that the workflow hasn't reported
   starting yet.
 
+- **Live provider pricing works again** (#386). Every Copilot model was being
+  costed from the static `DEFAULT_PRICING` table instead of the live rates the
+  SDK reports, and models absent from that table reported no cost at all.
+  `CopilotProvider.get_model_pricing` reads `billing.token_prices`, and
+  `github-copilot-sdk` 1.0.1 — the version the lock pinned — parsed the
+  `models.list` response with a hand-written `client.ModelBilling` that declared
+  only `multiplier` and discarded the `tokenPrices` wire field. The field never
+  left the API and is still modelled in the SDK's generated types; only the
+  client dataclass dropped it. The hook therefore returned `None` for every
+  model, so the resolution chain #265 built (workflow override → provider hook →
+  static table → unpriced) ran permanently on its fallback. No per-token rates
+  were invented for the missing models; with the hook alive they price from the
+  SDK.
+
+  The field was restored in SDK 1.0.7; the floor moves to `>=1.0.9`, the version
+  tested here. Moving the floor rather than only the lock is the point — the old
+  `>=1.0.0` was satisfied by 1.0.1, so an existing environment kept dead pricing
+  while reporting a healthy dependency. 1.0.9 also splits the cached-token rate
+  into separate read and write prices and deprecates the single `cache_price`
+  the hook read, which would have silently priced cache reads at $0.00, and it
+  ships a pure-Python wheel that fetches the CLI binary on first use instead of
+  bundling it per platform.
+
+  `_default_permission_handler` no longer forwards `approve_all`'s result
+  blindly. That helper stopped being unconditional: it abstains with
+  `PermissionNoResult` when the runtime marks a request `managed_approval_required`,
+  and raises when managed settings are enabled. Conductor is the only connected
+  client, so an abstention is never answered — the CLI blocks on a pending
+  permission request until idle recovery gives up minutes later and reports a
+  timeout that blames the network. Both cases now decline explicitly and say
+  why. Declining rather than approving is deliberate: managed approval is a
+  policy control, and overriding it would turn a hang into a bypass.
+
+  The existing hook tests built their models from `SimpleNamespace`, so they
+  asserted what Conductor does with a billing object rather than whether the SDK
+  still supplies one, and stayed green throughout. Tests now build the model
+  through the SDK's own `ModelInfo.from_dict`, so the next SDK release that
+  stops carrying the field fails the build instead of quietly reverting every
+  run to static pricing, and the permission handler has behavioural coverage for
+  the first time.
+- **Plugin checkouts from a `file://` source no longer land outside the plugin
+  cache on Windows.** The cache key is derived from the URL's path segments, but
+  the splitter only knew `/`, so a native Windows path arrived as a single
+  segment with its backslashes intact — and the key kept them, putting the
+  checkout at a drive-absolute location rather than under the cache root, which
+  is the same escape the `..` check exists to prevent. Two further problems sat
+  behind it: a drive colon made an owner of `C:_src` read as a drive (or, in the
+  middle of a name, as an NTFS alternate data stream), and flattening a deep
+  path into one segment produced a directory name long enough that `git` refused
+  to create `.git` inside it. Separators are now folded, the characters that
+  change a path's meaning on Windows are substituted, and an over-long segment
+  is replaced by a digest of itself — on every platform, so one workflow file
+  resolves to the same cache layout wherever it runs.
+- **Two sources resolving to the same commit no longer fail the whole fetch on
+  Windows.** Publishing a completed checkout tolerates losing the race to a
+  concurrent fetch, but recognised only the POSIX errnos for "destination
+  already exists"; Windows reports that as `ERROR_ACCESS_DENIED`, so the
+  tolerance never applied and the second source raised. Safe to accept because
+  the readiness sentinel is written after publishing: a winner that died
+  mid-clone leaves no sentinel, so the tree is re-fetched rather than read
+  half-written.
+- **A local path is recognised the same way on every platform** — `_is_local_path`
+  asked `pathlib.Path`, which is the *running* platform's flavour, so a POSIX
+  absolute path such as `/srv/plugins` was refused as an unrecognised source on
+  Windows. Both conventions are now consulted.
+- **Registry names are validated before they can corrupt the config** — a name
+  containing a quote, a space, `=` or `#` was accepted, written into
+  `registries.toml` as an unescaped table key, and then failed to parse. Since
+  `registry add`, `remove` and `get` all load the config first, the user could
+  not remove the entry that broke it and every unrelated registry went down
+  with it. Names are now restricted to letters, digits, `.`, `_` and `-`, which
+  also keeps them legal as cache directory names on Windows, and the table key
+  is quoted so a dotted name stays one registry instead of becoming a nested
+  table.
+- **`conductor doctor` no longer reports a missing Claude CLI on Windows** —
+  the CLI probe dropped five `~`-anchored fallback locations on Windows,
+  including `~/.claude/local/claude` where Claude Code's own installer puts it,
+  so `validate_connection()` returned False for a CLI the SDK would find and
+  run. Only `/usr/local/bin/claude` is now skipped there: it is rooted but
+  driveless, so it resolves against the current drive, which any unprivileged
+  local user can write to.
+- **Registry TOML values are escaped** — a registry whose source or type
+  contained a quote or a backslash produced a file that could not be re-read.
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused
   `AgentOutput.input_tokens` — a *billing* total summed across every API call
@@ -344,6 +443,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand with a 19-character naive `started_at`, well short of production's
   32-character value — it now goes through the real `write_pid_file`, so the
   widths under test match the widths production writes.
+- **JSON result output no longer crashes on a legacy Windows stdout** (#342).
+  On a `cp1252` console, `conductor run` exited non-zero with
+  `UnicodeEncodeError` *after* the workflow had already succeeded, having
+  written a truncated document callers could not parse. `json.dumps` emits
+  ASCII by default, but rich's `print_json` re-parses and re-serialises with
+  `ensure_ascii=False` immediately before the write, restoring the character it
+  had escaped. Every JSON sink now passes `ensure_ascii=True`. Results carry
+  `\uXXXX` escapes on all platforms as a result, which is valid JSON and decodes
+  identically. `conductor doctor`'s default *table* output is unaffected by this
+  change and still fails on such a console (#401).
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing

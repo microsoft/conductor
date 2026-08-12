@@ -9,6 +9,7 @@ Complete command-line reference for Conductor.
 - [`conductor status`](#conductor-status)
 - [`conductor stop`](#conductor-stop)
 - [`conductor gate respond`](#conductor-gate-respond)
+- [`conductor guide`](#conductor-guide)
 - [`conductor checkpoint list`](#conductor-checkpoint-list)
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
@@ -378,16 +379,23 @@ Between a PID file being written and `stop` reading it, the OS may have recycled
 
 `--force` has one further effect. If a run's liveness cannot be probed at all, its entry would otherwise be permanent — bare `stop` stays ambiguous and `stop --all` exits `2` forever, which wedges CI teardown ([#166](https://github.com/microsoft/conductor/issues/166)). `--force` clears such an entry, printing a warning: if that process is still alive it is now untracked and must be stopped by hand. This is deliberately narrow, and does not fire for a mismatch or for a process demonstrably still alive.
 
-The web dashboard also exposes terminate controls that always preserve progress:
+The web dashboard also exposes these run-time controls:
 
 - **Stop** (`POST /api/stop`) interrupts the current agent and pauses it, then
   offers **Resume** (re-run the agent) or **Kill**. If clicked during the brief
   startup window before the engine is ready, the Stop is queued and honored as
   soon as the engine binds its interrupt event (rather than hard-cancelling).
+  This and **Kill** always preserve progress.
 - **Kill** (`POST /api/kill`) stops the workflow entirely. A best-effort
   checkpoint is written so you can `conductor resume` later, and the dashboard
   shows a **"Workflow Stopped"** banner with the checkpoint path (or a clear
   explanation if no checkpoint could be saved).
+- **Guide** sends mid-run guidance text (`POST /api/guidance`) to the running
+  workflow — applied at the next step boundary, or immediately if an agent is
+  currently paused (in which case it resumes with the guidance applied).
+  Unlike Stop/Kill, this does not pause or terminate anything — it corrects
+  the run's course without interrupting it. See
+  [`conductor guide`](#conductor-guide) below for the CLI equivalent.
 
 ### Self-Exclusion
 
@@ -505,6 +513,64 @@ CONDUCTOR_GATE_TOKEN=my-secret conductor gate respond -p 8080 -c approve
 | 0 | Gate resolved successfully |
 | 1 | Connection error, auth failure, validation error, or no gate waiting |
 
+## `conductor guide`
+
+Send mid-run guidance text to a workflow running with `--web` or `--web-bg`,
+without stopping it first. Useful for correcting course from an SSH session
+or any headless environment where the dashboard UI is unreachable.
+
+The guidance is applied at the next step boundary (before the next agent,
+parallel group, for-each group, script, set, or wait step), or immediately if
+an agent is currently paused (a dashboard **Stop**, or an Esc/Ctrl+G TTY
+interrupt) — in which case the agent resumes with the guidance applied.
+
+```bash
+conductor guide [OPTIONS]
+```
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--text TEXT` | `-t` | Guidance text to send to the running workflow (**required**) |
+| `--port PORT` | `-p` | Dashboard port of the running workflow (auto-discovered via `~/.conductor/runs/` if omitted) |
+| `--token SECRET` | | Auth token (also reads from `CONDUCTOR_GATE_TOKEN` env var) |
+
+### Auto-Discovery
+
+When `--port` is omitted, `conductor guide` scans `~/.conductor/runs/` for
+running background workflows (the same read-only mechanism `conductor
+status` uses). If exactly one is running, its port is used automatically. If
+none are running, or more than one is, the command prints the list and exits
+with code 1.
+
+### Authentication
+
+Uses the same `CONDUCTOR_GATE_TOKEN` mechanism as `conductor gate respond` —
+if the running workflow was launched with a gate token configured, requests
+without a matching token are rejected with HTTP 403.
+
+### Examples
+
+```bash
+# Auto-discover the running workflow's port
+conductor guide --text "Prefer Python 3.12 examples"
+
+# Target a specific dashboard port
+conductor guide --port 8080 --text "Skip the benchmark step"
+
+# Provide auth token via flag or environment variable
+conductor guide --text "Use the staging endpoint" --token my-secret
+CONDUCTOR_GATE_TOKEN=my-secret conductor guide --text "Use the staging endpoint"
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Guidance accepted |
+| 1 | Connection error, auth failure, validation error, no workflow running, or the workflow has already completed |
+
 ## `conductor checkpoint list`
 
 List saved workflow checkpoints (failure and periodic), newest first. Each row shows the workflow name, timestamp, trigger, the agent that was running (or about to run), the error type for failure checkpoints, and the checkpoint file path.
@@ -529,7 +595,10 @@ conductor checkpoint list
 conductor checkpoint list workflow.yaml
 ```
 
-Resume a failed run from its latest checkpoint with `conductor resume`.
+Resume a failed run from its latest checkpoint with `conductor resume`. Pass
+`--guidance "correction text"` (repeatable) to apply mid-run guidance to the
+restored context before the resumed agent runs — see
+[Mid-run guidance](#conductor-guide) above.
 
 > **Deprecated alias:** `conductor checkpoints` still works but prints a
 > deprecation warning and will be removed in a future release. Use
@@ -814,7 +883,7 @@ are hidden from `--help` and are slated for removal in a future release.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) and by `conductor guide` (checked by `POST /api/guidance`) when the workflow dashboard is started with a gate token |
 
 ## Exit Codes
 
