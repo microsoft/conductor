@@ -183,31 +183,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Live provider pricing works again** (#386). `CopilotProvider.get_model_pricing`
-  reads `billing.token_prices`, and `github-copilot-sdk` 1.0.1 — the version the
-  lock pinned — parsed the `models.list` response with a hand-written
-  `client.ModelBilling` that declared only `multiplier` and discarded the
-  `tokenPrices` wire field. The field never left the API and is still modelled in
-  the SDK's generated types; only the client dataclass dropped it. The hook
-  therefore returned `None` for every model, so the resolution chain #265 built
-  (workflow override → provider hook → static table → unpriced) ran permanently
-  on its fallback, and models absent from `DEFAULT_PRICING` reported no cost at
-  all. SDK 1.0.9 parses the field again, so the floor moves to `>=1.0.9` rather
-  than the lock alone: the old floor let an existing environment keep 1.0.1 and
-  silently keep dead pricing. `_default_permission_handler` picks up the
-  matching `PermissionInvocation` annotation, which 1.0.9 narrowed from
-  `dict[str, str]`. That release also made `approve_all` raise when
-  `managed_settings_enabled` is set, which Conductor cannot reach — the flag
-  comes from the `enable_managed_settings` opt-in on `create_session`, which it
-  never passes. No per-token rates were invented for the missing models; with
-  the hook alive they price from the SDK.
+- **Live provider pricing works again** (#386). Every Copilot model was being
+  costed from the static `DEFAULT_PRICING` table instead of the live rates the
+  SDK reports, and models absent from that table reported no cost at all.
+  `CopilotProvider.get_model_pricing` reads `billing.token_prices`, and
+  `github-copilot-sdk` 1.0.1 — the version the lock pinned — parsed the
+  `models.list` response with a hand-written `client.ModelBilling` that declared
+  only `multiplier` and discarded the `tokenPrices` wire field. The field never
+  left the API and is still modelled in the SDK's generated types; only the
+  client dataclass dropped it. The hook therefore returned `None` for every
+  model, so the resolution chain #265 built (workflow override → provider hook →
+  static table → unpriced) ran permanently on its fallback. No per-token rates
+  were invented for the missing models; with the hook alive they price from the
+  SDK.
+
+  The field was restored in SDK 1.0.7; the floor moves to `>=1.0.9`, the version
+  tested here. Moving the floor rather than only the lock is the point — the old
+  `>=1.0.0` was satisfied by 1.0.1, so an existing environment kept dead pricing
+  while reporting a healthy dependency. 1.0.9 also splits the cached-token rate
+  into separate read and write prices and deprecates the single `cache_price`
+  the hook read, which would have silently priced cache reads at $0.00, and it
+  ships a pure-Python wheel that fetches the CLI binary on first use instead of
+  bundling it per platform.
+
+  `_default_permission_handler` no longer forwards `approve_all`'s result
+  blindly. That helper stopped being unconditional: it abstains with
+  `PermissionNoResult` when the runtime marks a request `managed_approval_required`,
+  and raises when managed settings are enabled. Conductor is the only connected
+  client, so an abstention is never answered — the CLI blocks on a pending
+  permission request until idle recovery gives up minutes later and reports a
+  timeout that blames the network. Both cases now decline explicitly and say
+  why. Declining rather than approving is deliberate: managed approval is a
+  policy control, and overriding it would turn a hang into a bypass.
 
   The existing hook tests built their models from `SimpleNamespace`, so they
   asserted what Conductor does with a billing object rather than whether the SDK
-  still supplies one, and stayed green throughout. Two tests now build the model
+  still supplies one, and stayed green throughout. Tests now build the model
   through the SDK's own `ModelInfo.from_dict`, so the next SDK release that
   stops carrying the field fails the build instead of quietly reverting every
-  run to static pricing.
+  run to static pricing, and the permission handler has behavioural coverage for
+  the first time.
 
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused

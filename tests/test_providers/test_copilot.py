@@ -2944,7 +2944,8 @@ class TestPricingSurvivesTheRealSDKShape:
             {
                 "id": "claude-opus-5",
                 "name": "Claude Opus 5",
-                "capabilities": {"maxPromptTokens": 200_000, "maxOutputTokens": 64_000},
+                # Required by ModelInfo.from_dict; only ``billing`` is under test here.
+                "capabilities": {},
                 "billing": {
                     "multiplier": 1.0,
                     "tokenPrices": {
@@ -2975,7 +2976,8 @@ class TestPricingSurvivesTheRealSDKShape:
             {
                 "id": "claude-opus-5",
                 "name": "Claude Opus 5",
-                "capabilities": {"maxPromptTokens": 200_000, "maxOutputTokens": 64_000},
+                # Required by ModelInfo.from_dict; only ``billing`` is under test here.
+                "capabilities": {},
                 "billing": {
                     "multiplier": 1.0,
                     "tokenPrices": {
@@ -2996,3 +2998,123 @@ class TestPricingSurvivesTheRealSDKShape:
         assert pricing is not None, "SDK-parsed billing data must yield live pricing"
         assert pricing.input_per_mtok == pytest.approx(15.0)
         assert pricing.output_per_mtok == pytest.approx(75.0)
+
+    @pytest.mark.asyncio
+    async def test_cache_rates_come_from_the_non_deprecated_fields(self) -> None:
+        """Copilot SDK >=1.0.9 splits the cached-token rate into read and write.
+
+        The hook read only ``cache_price``, which that release deprecates. A
+        model shipping just the replacements priced cache reads at $0.00 —
+        silently, and with every other figure correct, which is the #386
+        failure one field over.
+        """
+        model = self._model_from_wire(
+            {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                "capabilities": {},
+                "billing": {
+                    "tokenPrices": {
+                        "batchSize": 1_000,
+                        "inputPrice": 1.5,
+                        "outputPrice": 7.5,
+                        "cacheReadPrice": 0.15,
+                        "cacheWritePrice": 1.8,
+                    }
+                },
+            }
+        )
+
+        async def _list_models() -> list[Any]:
+            return [model]
+
+        provider = TestGetModelPricing._provider_with_list_models(_list_models)
+        pricing = await provider.get_model_pricing("claude-opus-5")
+
+        assert pricing is not None
+        assert pricing.cache_read_per_mtok == pytest.approx(1.5)
+        assert pricing.cache_write_per_mtok == pytest.approx(18.0)
+
+    @pytest.mark.asyncio
+    async def test_the_deprecated_cache_field_still_works(self) -> None:
+        """Kept as a fallback: an older payload must not lose its cache rate."""
+        model = self._model_from_wire(
+            {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                "capabilities": {},
+                "billing": {
+                    "tokenPrices": {
+                        "batchSize": 1_000,
+                        "inputPrice": 1.5,
+                        "outputPrice": 7.5,
+                        "cachePrice": 0.15,
+                    }
+                },
+            }
+        )
+
+        async def _list_models() -> list[Any]:
+            return [model]
+
+        provider = TestGetModelPricing._provider_with_list_models(_list_models)
+        pricing = await provider.get_model_pricing("claude-opus-5")
+
+        assert pricing is not None
+        assert pricing.cache_read_per_mtok == pytest.approx(1.5)
+
+
+class TestDefaultPermissionHandler:
+    """``approve_all`` does not always approve (Copilot SDK >=1.0.9).
+
+    It abstains with ``PermissionNoResult`` when the runtime sets
+    ``managed_approval_required`` on the request, and raises when managed
+    settings are enabled. Conductor is the only connected client, so an
+    abstention is never answered: the CLI blocks on a pending permission
+    request until idle recovery gives up minutes later and reports a timeout
+    that blames the network.
+
+    Nothing called this handler before — every reference asserted only that it
+    was passed to ``create_session`` — which is why the abstention went
+    unnoticed when the SDK floor moved.
+    """
+
+    @staticmethod
+    def _request(**fields: Any) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(tool_name="shell", **fields)
+
+    @staticmethod
+    def _handle(request: Any, invocation: dict[str, Any] | None = None) -> Any:
+        return CopilotProvider._default_permission_handler(
+            request, invocation or {"session_id": "s1"}
+        )
+
+    def test_an_ordinary_request_is_approved(self) -> None:
+        result = self._handle(self._request())
+        assert type(result).__name__ == "PermissionDecisionApproveOnce"
+
+    def test_managed_approval_is_declined_not_abstained(self) -> None:
+        """The load-bearing case: abstaining would hang the run."""
+        from copilot.session import PermissionNoResult
+
+        result = self._handle(self._request(managed_approval_required=True))
+
+        assert not isinstance(result, PermissionNoResult), (
+            "returning the SDK's abstention sentinel leaves the permission "
+            "request unanswered and blocks the CLI until the idle timeout"
+        )
+        assert type(result).__name__ == "PermissionDecisionUserNotAvailable"
+
+    def test_managed_settings_does_not_escape_as_an_exception(self) -> None:
+        """The SDK swallows exceptions from this callback onto its own logger.
+
+        An unguarded raise would surface as every tool being denied with no
+        reason Conductor ever states.
+        """
+        result = self._handle(
+            self._request(),
+            {"session_id": "s1", "managed_settings_enabled": True},
+        )
+        assert type(result).__name__ == "PermissionDecisionUserNotAvailable"

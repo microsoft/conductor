@@ -110,9 +110,11 @@ jobs:
 
       - name: Remove bundled Copilot CLI binary
         run: |
-          # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
-          # authenticate with GitHub on startup. Remove it so tests that invoke
-          # the real CLI path fail fast instead of hanging on auth.
+          # Copilot SDK <1.0.2 shipped platform wheels with a bundled CLI binary
+          # that tries to authenticate with GitHub on startup. Newer wheels are
+          # pure-Python and fetch the CLI on first use instead, which
+          # COPILOT_SKIP_CLI_DOWNLOAD blocks below — this only matters for a
+          # local venv restored from an older lock.
           find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
 
       - name: Run tests with coverage
@@ -125,6 +127,10 @@ jobs:
           # contain timing-sensitive assertions that are flaky on shared CI runners.
           # This ensures CI tests are fast, free, and don't leak credentials.
           ANTHROPIC_API_KEY: "sk-ant-test-fake-key-for-mocking"
+          # The Copilot SDK fetches its CLI binary from GitHub Releases on
+          # first use. A test that reaches the real CLI path should fail fast
+          # rather than pull ~90MB inside a 10-minute job and then hang on auth.
+          COPILOT_SKIP_CLI_DOWNLOAD: "1"
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
