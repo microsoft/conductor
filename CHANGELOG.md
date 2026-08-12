@@ -167,6 +167,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--web-bg` no longer reports success and prints a URL for workflows that
+  never actually started** (#410). The launcher's readiness check used to
+  trust a bare TCP connect: the moment *anything* accepted a connection on
+  the dashboard port, it wrote the PID file, printed the URL, and exited 0
+  — even for a workflow that failed `load_config` moments later. Two
+  changes close this: (1) `WebDashboard.start()` (which binds the port) now
+  runs *after* `load_config` succeeds in `run_workflow_async`, so a
+  `ConfigurationError` from a broken workflow never binds a port in the
+  first place; (2) `_finalize_background_launch` now confirms the workflow
+  actually started, not just that a socket answered. `_wait_for_server`
+  checks the child's exit status on every iteration of its connect loop, so
+  a dead child is detected in well under a second instead of after the full
+  15s timeout; a stage-two probe then polls `GET /api/info` (the same
+  identity endpoint `conductor stop` already uses) for up to 30s
+  (`CONDUCTOR_WEB_BG_START_TIMEOUT`, `0` disables it) until it reports a
+  `workflow_started` event, exiting 1 with the exit code and a tail of the
+  captured stderr log if the child dies first, or naming the conflicting
+  PID if the port turns out to be held by an unrelated process. The PID
+  file is written as soon as the port opens — before this second wait —
+  so a slow-starting run stays visible to `conductor status`/`stop`
+  throughout; if the child then dies, the entry is removed. Passing the
+  30s deadline with the child still alive is not treated as a failure — the
+  URL is still printed, alongside a note that the workflow hasn't reported
+  starting yet.
+
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused
   `AgentOutput.input_tokens` — a *billing* total summed across every API call

@@ -157,6 +157,51 @@ class TestWebBgMutualExclusion:
         assert result.exit_code != 0
 
 
+class TestWorkflowStartedNotice:
+    """Issue #410: a note is printed when the launcher never confirmed the start."""
+
+    def test_run_web_bg_not_started_prints_note(self, workflow_file: Path) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=False,
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "has not reported starting" in combined
+        assert "CONDUCTOR_WEB_BG_START_TIMEOUT" in combined
+
+    def test_run_web_bg_started_prints_no_note(self, workflow_file: Path) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=True,
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "has not reported starting" not in combined
+
+
 class TestLaunchBackgroundSilentFlag:
     """Regression tests for issue #196 — bg_runner must not pass --silent.
 
@@ -192,6 +237,7 @@ class TestLaunchBackgroundSilentFlag:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background(
@@ -287,6 +333,42 @@ class TestDashboardStartupFailure:
                 web=True,
             )
             assert result == {"result": "done"}
+
+    @pytest.mark.asyncio
+    async def test_dashboard_start_not_awaited_when_config_load_fails(self) -> None:
+        """Regression guard for issue #410: a bad workflow must never bind the port.
+
+        ``dashboard.start()`` is only reached after ``load_config`` succeeds
+        (see ``run_workflow_async``) — moved there so a workflow that fails
+        to even parse leaves no live socket for a ``--web-bg`` launcher to
+        mistake for "started".
+        """
+        from conductor.cli.run import run_workflow_async
+        from conductor.exceptions import ConfigurationError
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.start = AsyncMock()
+        mock_dashboard.stop = AsyncMock()
+
+        mock_web_module = MagicMock()
+        mock_web_module.WebDashboard.return_value = mock_dashboard
+
+        with (
+            patch(
+                "conductor.cli.run.load_config",
+                side_effect=ConfigurationError("bad workflow"),
+            ),
+            patch.dict(sys.modules, {"conductor.web.server": mock_web_module}),
+            pytest.raises(ConfigurationError),
+        ):
+            await run_workflow_async(
+                Path("/tmp/fake.yaml"),
+                {},
+                web=True,
+            )
+
+        mock_dashboard.start.assert_not_awaited()
+        mock_dashboard.stop.assert_awaited()
 
 
 # ---------------------------------------------------------------------------

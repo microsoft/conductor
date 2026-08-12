@@ -613,6 +613,7 @@ class TestBgRunnerInstructionFlags:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -638,6 +639,7 @@ class TestBgRunnerInstructionFlags:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -669,6 +671,7 @@ class TestBgRunnerInstructionFlags:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -699,6 +702,7 @@ class TestBgRunnerInstructionFlags:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 

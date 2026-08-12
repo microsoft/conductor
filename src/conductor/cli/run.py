@@ -1693,24 +1693,6 @@ async def run_workflow_async(
             workflow_root=Path(workflow_path).resolve().parent,
         )
 
-        try:
-            await dashboard.start()
-            from conductor.cli.app import is_verbose
-
-            if is_verbose():
-                _verbose_console.print(
-                    styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
-                )
-        except Exception as e:
-            _verbose_console.print(
-                styled(
-                    "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
-                    "start: {}. Continuing without dashboard.",
-                    e,
-                )
-            )
-            dashboard = None
-
     try:
         # Log workflow loading
         verbose_log(f"Loading workflow: {workflow_path}")
@@ -1728,6 +1710,33 @@ async def run_workflow_async(
         verbose_log(f"Workflow: {config.workflow.name}")
         verbose_log(f"Entry point: {config.workflow.entry_point}")
         verbose_log(f"Agents: {len(config.agents)}")
+
+        # Start the dashboard only after config validation succeeds — never
+        # before. Binding the port before ``load_config`` meant a workflow
+        # that fails to even parse still left a live socket that
+        # ``--web-bg``'s launcher (and a concurrent ``conductor status``)
+        # would read as "started" (issue #410). Deliberately placed here
+        # rather than after ``_build_mcp_servers`` / plugin prefetch below:
+        # those can take tens of seconds (git clone), and the launcher's own
+        # port-reachability probe must not have to wait them out.
+        if dashboard is not None:
+            try:
+                await dashboard.start()
+                from conductor.cli.app import is_verbose
+
+                if is_verbose():
+                    _verbose_console.print(
+                        styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
+                    )
+            except Exception as e:
+                _verbose_console.print(
+                    styled(
+                        "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
+                        "start: {}. Continuing without dashboard.",
+                        e,
+                    )
+                )
+                dashboard = None
 
         # Start JSONL event log subscriber (always-on structured diagnostics)
         from conductor.engine.event_log import EventLogSubscriber

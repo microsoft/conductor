@@ -332,6 +332,27 @@ class TestResumeCommand:
         assert kwargs["web_port"] == 9092
         assert kwargs["metadata"] == {"tracker": "ado"}
 
+    def test_resume_web_bg_not_started_prints_note(self, tmp_path: Path) -> None:
+        """Issue #410: resume --web-bg also surfaces the "still initializing" note."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9094",
+                stderr_log=tmp_path / "stub-fadedbee.bg.stderr.log",
+                stdout_log=tmp_path / "stub-fadedbee.bg.stdout.log",
+                run_id="fadedbee",
+                workflow_started=False,
+            )
+            result = runner.invoke(app, ["resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "has not reported starting" in combined
+        assert "CONDUCTOR_WEB_BG_START_TIMEOUT" in combined
+
     def test_silent_resume_web_bg_suppresses_dashboard_output(self, tmp_path: Path) -> None:
         """Test --silent suppresses resume --web-bg parent-process dashboard output."""
         from conductor.cli.bg_runner import BackgroundLaunch
@@ -410,6 +431,7 @@ class TestLaunchBackgroundResume:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(
@@ -457,6 +479,7 @@ class TestLaunchBackgroundResume:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             bg_runner.launch_background_resume(
@@ -649,6 +672,7 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file", side_effect=OSError("disk full")),
             pytest.raises(RuntimeError, match="Failed to write PID file"),
         ):
@@ -670,6 +694,7 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             bg_runner.launch_background_resume(
@@ -699,6 +724,7 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             bg_runner.launch_background_resume(
@@ -741,6 +767,7 @@ class TestLaunchBackgroundResumeFailures:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             bg_runner.launch_background_resume(
@@ -803,6 +830,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             launch = bg_runner.launch_background_resume(
@@ -834,6 +862,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             bg_runner.launch_background_resume(
@@ -862,6 +891,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
             ),
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             launch = bg_runner.launch_background_resume(
@@ -886,6 +916,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(
@@ -908,6 +939,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(
@@ -931,6 +963,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(
@@ -959,6 +992,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             launch = bg_runner.launch_background_resume(
@@ -992,6 +1026,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(
@@ -1023,6 +1058,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(

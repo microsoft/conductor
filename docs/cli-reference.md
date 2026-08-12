@@ -133,6 +133,36 @@ The `--web-bg` flag is a convenience shortcut: it forks a background process run
 
 `--web` and `--web-bg` are mutually exclusive.
 
+**Readiness contract** (issue #410) — the launcher confirms the workflow
+actually started before it prints a URL and exits 0, rather than trusting a
+bare TCP connection. This happens in two stages:
+
+1. **Port reachability** — the launcher waits (up to 15s) for the child's
+   dashboard port to accept connections, checking the child's exit status on
+   every iteration. If the child dies before the port opens, the launcher
+   exits 1 immediately (typically well under a second) with the exit code
+   and a bounded tail of the child's captured stderr log — e.g. a
+   `ConfigurationError` from a workflow that fails to even parse. A clean
+   (exit code 0) sub-second run is not treated as a failure.
+2. **Workflow start** — once the port is reachable and the PID file is
+   written, the launcher polls `GET /api/info` (the same identity endpoint
+   `conductor stop` uses) for up to 30s, waiting for it to report the
+   workflow has actually started (not just that the dashboard's HTTP server
+   is up). If the child dies during this wait, the launcher removes the PID
+   file it just wrote and exits 1 with the exit code and stderr tail. If a
+   *different* process already holds the requested port, the launcher
+   terminates the child, removes the PID file, and exits 1 naming the
+   conflicting PID and suggesting `--web-port`.
+
+If the 30s workflow-start wait elapses with the child still alive and
+listening, that is **not** treated as a failure: the URL is still printed
+and the CLI still exits 0, since the workflow may simply be slow to start
+(plugin fetch, MCP server startup, provider connection). In that case a
+note is printed alongside the URL suggesting the dashboard or stderr log be
+checked. Tune the wait (or disable it entirely) via
+`CONDUCTOR_WEB_BG_START_TIMEOUT` (seconds; default `30`; `0` disables the
+stage-two probe, restoring the pre-#410 behavior of trusting the port alone).
+
 **`--web-bg` and `human_gate`** — background runs support human gates through
 the dashboard. When the workflow reaches a `human_gate`, the detached process
 waits for a response from the web dashboard (the gate modal) or the

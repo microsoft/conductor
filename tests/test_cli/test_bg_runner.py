@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -248,6 +249,7 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
         with (
             patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
             patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background(
@@ -277,6 +279,7 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
         with (
             patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
             patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background_resume(
@@ -403,6 +406,7 @@ class TestLaunchBackgroundDiagnostics:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background(
@@ -442,6 +446,7 @@ class TestLaunchBackgroundDiagnostics:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             bg_runner.launch_background(
@@ -481,6 +486,7 @@ class TestLaunchBackgroundDiagnostics:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file"),
         ):
             bg_runner.launch_background(
@@ -547,6 +553,7 @@ class TestLaunchBackgroundDiagnostics:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             launch = bg_runner.launch_background(
@@ -586,6 +593,7 @@ class TestLaunchBackgroundDiagnostics:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
             patch("conductor.cli.pid.write_pid_file") as mock_write,
         ):
             launch = bg_runner.launch_background(
@@ -687,3 +695,441 @@ class TestSanitizeName:
 
         assert _sanitize_name("") == "workflow"
         assert _sanitize_name("///") == "workflow"
+
+
+# ---------------------------------------------------------------------------
+# Issue #410 — two-stage readiness contract
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForServerEarlyExit:
+    """``_wait_for_server`` must notice a dead child well before its timeout."""
+
+    def test_returns_false_immediately_when_child_already_exited(self) -> None:
+        proc = MagicMock()
+        proc.poll.return_value = 1
+
+        start = time.monotonic()
+        result = bg_runner._wait_for_server(9400, timeout=15.0, proc=proc)
+        elapsed = time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 2.0
+
+    def test_ignores_proc_when_not_given(self) -> None:
+        """Without ``proc``, behavior is unchanged: only the timeout applies."""
+        with patch.object(bg_runner.socket, "create_connection", side_effect=OSError("no")):
+            result = bg_runner._wait_for_server(9401, timeout=0.3)
+        assert result is False
+
+
+class TestResolveStartTimeout:
+    """Env parsing for ``CONDUCTOR_WEB_BG_START_TIMEOUT``."""
+
+    def test_unset_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(bg_runner._START_TIMEOUT_ENV, raising=False)
+        assert bg_runner._resolve_start_timeout() == bg_runner._START_TIMEOUT_DEFAULT
+
+    def test_valid_value_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(bg_runner._START_TIMEOUT_ENV, "5")
+        assert bg_runner._resolve_start_timeout() == 5.0
+
+    def test_zero_disables_the_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(bg_runner._START_TIMEOUT_ENV, "0")
+        assert bg_runner._resolve_start_timeout() == 0.0
+
+    def test_garbage_value_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(bg_runner._START_TIMEOUT_ENV, "not-a-number")
+        assert bg_runner._resolve_start_timeout() == bg_runner._START_TIMEOUT_DEFAULT
+
+    def test_negative_value_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(bg_runner._START_TIMEOUT_ENV, "-5")
+        assert bg_runner._resolve_start_timeout() == bg_runner._START_TIMEOUT_DEFAULT
+
+
+class TestTailLog:
+    """``_tail_log`` bounds and never raises."""
+
+    def test_missing_file_returns_empty_string(self, tmp_path: Path) -> None:
+        assert bg_runner._tail_log(tmp_path / "does-not-exist.log") == ""
+
+    def test_returns_last_lines(self, tmp_path: Path) -> None:
+        log = tmp_path / "out.log"
+        log.write_text("\n".join(f"line {i}" for i in range(50)))
+
+        tail = bg_runner._tail_log(log, max_lines=5)
+
+        assert "line 49" in tail
+        assert "line 0" not in tail
+        assert str(log) in tail
+
+    def test_bounds_total_chars(self, tmp_path: Path) -> None:
+        log = tmp_path / "huge.log"
+        log.write_text("x" * 10_000)
+
+        tail = bg_runner._tail_log(log, max_lines=1, max_chars=100)
+
+        assert len(tail) <= 100 + len(f"\n--- last 1 line(s) of {log} ---\n")
+
+    def test_empty_file_returns_empty_string(self, tmp_path: Path) -> None:
+        log = tmp_path / "empty.log"
+        log.write_text("")
+        assert bg_runner._tail_log(log) == ""
+
+
+class TestWaitForWorkflowStart:
+    """``_wait_for_workflow_start`` outcome coverage via ``_probe_workflow_info``."""
+
+    def test_started_when_started_at_key_present(self) -> None:
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+
+        with patch.object(
+            bg_runner, "_probe_workflow_info", return_value={"pid": 123, "started_at": 0}
+        ):
+            result = bg_runner._wait_for_workflow_start(9410, proc, timeout=5.0)
+
+        assert result is bg_runner.StartProbe.STARTED
+
+    def test_started_at_zero_still_counts_as_started(self) -> None:
+        """``started_at`` can legitimately be falsy 0 — key presence is what matters."""
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+
+        with patch.object(
+            bg_runner, "_probe_workflow_info", return_value={"pid": 123, "started_at": 0}
+        ):
+            result = bg_runner._wait_for_workflow_start(9411, proc, timeout=5.0)
+
+        assert result is bg_runner.StartProbe.STARTED
+
+    def test_child_exited_takes_priority_over_probe(self) -> None:
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        proc.pid = 123
+
+        with patch.object(bg_runner, "_probe_workflow_info") as mock_probe:
+            result = bg_runner._wait_for_workflow_start(9412, proc, timeout=5.0)
+
+        assert result is bg_runner.StartProbe.CHILD_EXITED
+        mock_probe.assert_not_called()
+
+    def test_port_conflict_when_reported_pid_differs(self) -> None:
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+
+        with patch.object(bg_runner, "_probe_workflow_info", return_value={"pid": 999}):
+            result = bg_runner._wait_for_workflow_start(9413, proc, timeout=5.0)
+
+        assert result is bg_runner.StartProbe.PORT_CONFLICT
+
+    def test_timed_out_when_never_started(self) -> None:
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+
+        with patch.object(bg_runner, "_probe_workflow_info", return_value=None):
+            result = bg_runner._wait_for_workflow_start(9414, proc, timeout=0.5)
+
+        assert result is bg_runner.StartProbe.TIMED_OUT
+
+    def test_none_probe_result_keeps_waiting(self) -> None:
+        """A probe returning ``None`` (e.g. connection refused) doesn't end the wait early."""
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+
+        responses = [None, None, {"pid": 123, "started_at": 1.0}]
+
+        with patch.object(bg_runner, "_probe_workflow_info", side_effect=responses):
+            result = bg_runner._wait_for_workflow_start(9415, proc, timeout=5.0)
+
+        assert result is bg_runner.StartProbe.STARTED
+
+
+class TestFinalizeBackgroundLaunchStageTwo:
+    """``_finalize_background_launch``'s post-PID-write stage-two behavior."""
+
+    def _make_proc(self, pid: int = 111) -> MagicMock:
+        proc = MagicMock()
+        proc.pid = pid
+        proc.poll.return_value = None
+        return proc
+
+    def test_pid_file_written_before_stage_two_wait(self, tmp_path: Path) -> None:
+        """The PID file must exist even while the stage-two wait is still pending."""
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+        order: list[str] = []
+
+        def _fake_write_pid_file(*args: Any, **kwargs: Any) -> Path:
+            order.append("write_pid_file")
+            return tmp_path / "fake.pid"
+
+        def _fake_wait_for_start(*args: Any, **kwargs: Any) -> bg_runner.StartProbe:
+            order.append("wait_for_workflow_start")
+            return bg_runner.StartProbe.STARTED
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", side_effect=_fake_write_pid_file),
+            patch.object(bg_runner, "_wait_for_workflow_start", side_effect=_fake_wait_for_start),
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc,
+                9420,
+                wf_path,
+                tmp_path / "err.log",
+                run_id="deadbeef",
+                stdout_log=tmp_path / "out.log",
+            )
+
+        assert result is True
+        assert order == ["write_pid_file", "wait_for_workflow_start"]
+
+    def test_timed_out_returns_false_and_leaves_pid_file(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", return_value=tmp_path / "fake.pid"),
+            patch("conductor.cli.pid.remove_pid_file_at") as mock_remove,
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.TIMED_OUT
+            ),
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc,
+                9421,
+                wf_path,
+                tmp_path / "err.log",
+                run_id="deadbeef",
+                stdout_log=tmp_path / "out.log",
+            )
+
+        assert result is False
+        mock_remove.assert_not_called()
+
+    def test_start_timeout_zero_skips_stage_two(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", return_value=tmp_path / "fake.pid"),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
+            patch.object(bg_runner, "_wait_for_workflow_start") as mock_wait,
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc,
+                9422,
+                wf_path,
+                tmp_path / "err.log",
+                run_id="deadbeef",
+                stdout_log=tmp_path / "out.log",
+            )
+
+        assert result is True
+        mock_wait.assert_not_called()
+
+    def test_child_exited_zero_after_pid_write_returns_true(self, tmp_path: Path) -> None:
+        """A workflow that completes within the stage-two window is a success."""
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", return_value=tmp_path / "fake.pid"),
+            patch("conductor.cli.pid.remove_pid_file_at") as mock_remove,
+            patch.object(
+                bg_runner,
+                "_wait_for_workflow_start",
+                return_value=bg_runner.StartProbe.CHILD_EXITED,
+            ),
+        ):
+            proc.poll.return_value = 0
+            result = bg_runner._finalize_background_launch(
+                proc,
+                9423,
+                wf_path,
+                tmp_path / "err.log",
+                run_id="deadbeef",
+                stdout_log=tmp_path / "out.log",
+            )
+
+        assert result is True
+        mock_remove.assert_not_called()
+
+    def test_child_exited_nonzero_after_pid_write_removes_pid_file_and_raises(
+        self, tmp_path: Path
+    ) -> None:
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+        stderr_log = tmp_path / "err.log"
+        stderr_log.write_text("boom: traceback here\n")
+        pid_path = tmp_path / "fake.pid"
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", return_value=pid_path),
+            patch("conductor.cli.pid.remove_pid_file_at") as mock_remove,
+            patch.object(
+                bg_runner,
+                "_wait_for_workflow_start",
+                return_value=bg_runner.StartProbe.CHILD_EXITED,
+            ),
+        ):
+            proc.poll.return_value = 3
+            with pytest.raises(RuntimeError, match="exited before the workflow started"):
+                bg_runner._finalize_background_launch(
+                    proc,
+                    9424,
+                    wf_path,
+                    stderr_log,
+                    run_id="deadbeef",
+                    stdout_log=tmp_path / "out.log",
+                )
+
+        mock_remove.assert_called_once_with(pid_path, proc.pid)
+
+    def test_port_conflict_removes_pid_file_and_raises_naming_port(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc(pid=111)
+        pid_path = tmp_path / "fake.pid"
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", return_value=pid_path),
+            patch("conductor.cli.pid.remove_pid_file_at") as mock_remove,
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(
+                bg_runner,
+                "_wait_for_workflow_start",
+                return_value=bg_runner.StartProbe.PORT_CONFLICT,
+            ),
+            patch.object(bg_runner, "_probe_workflow_info", return_value={"pid": 999}),
+            pytest.raises(RuntimeError, match="already in use") as exc_info,
+        ):
+            bg_runner._finalize_background_launch(
+                proc,
+                9425,
+                wf_path,
+                tmp_path / "err.log",
+                run_id="deadbeef",
+                stdout_log=tmp_path / "out.log",
+            )
+
+        assert "9425" in str(exc_info.value)
+        assert "999" in str(exc_info.value)
+        assert "--web-port" in str(exc_info.value)
+        mock_terminate.assert_called_once_with(proc)
+        mock_remove.assert_called_once_with(pid_path, proc.pid)
+
+    def test_stderr_tail_included_in_child_exited_error(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+        stderr_log = tmp_path / "err.log"
+        stderr_log.write_text("Traceback (most recent call last):\nConfigurationError: bad yaml\n")
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file", return_value=tmp_path / "fake.pid"),
+            patch("conductor.cli.pid.remove_pid_file_at"),
+            patch.object(
+                bg_runner,
+                "_wait_for_workflow_start",
+                return_value=bg_runner.StartProbe.CHILD_EXITED,
+            ),
+        ):
+            proc.poll.return_value = 1
+            with pytest.raises(RuntimeError) as exc_info:
+                bg_runner._finalize_background_launch(
+                    proc,
+                    9426,
+                    wf_path,
+                    stderr_log,
+                    run_id="deadbeef",
+                    stdout_log=tmp_path / "out.log",
+                )
+
+        assert "ConfigurationError: bad yaml" in str(exc_info.value)
+
+    def test_early_exit_zero_returns_true_without_writing_pid_file(self, tmp_path: Path) -> None:
+        """A sub-second clean exit is a success and has no PID file to write."""
+        wf_path = _write_workflow(tmp_path)
+        proc = self._make_proc()
+        proc.poll.return_value = 0
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=False),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc,
+                9427,
+                wf_path,
+                tmp_path / "err.log",
+                run_id="deadbeef",
+                stdout_log=tmp_path / "out.log",
+            )
+
+        assert result is True
+        mock_write.assert_not_called()
+
+
+class TestSpawnBgChildPropagatesWorkflowStarted:
+    """``_spawn_bg_child`` threads the stage-two result into ``BackgroundLaunch``."""
+
+    def test_workflow_started_false_reaches_background_launch(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.TIMED_OUT
+            ),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9430,
+            )
+
+        assert launch.workflow_started is False
+
+    def test_workflow_started_true_by_default(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.STARTED
+            ),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9431,
+            )
+
+        assert launch.workflow_started is True

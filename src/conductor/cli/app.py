@@ -259,6 +259,24 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     )
 
 
+def _print_web_bg_not_started_notice() -> None:
+    """Note that the launcher's wait deadline passed without a confirmed start.
+
+    Not a failure: the child is still alive and listening — it just hasn't
+    reported a ``workflow_started`` event yet (issue #410). Printed only in
+    verbose mode, alongside the dashboard URL / stderr log lines above it.
+    """
+    console.print(
+        Text.from_markup(
+            "[yellow]Note:[/yellow] the workflow has not reported starting "
+            "yet. It may still be initializing (plugin fetch, MCP server "
+            "startup, provider connection) — check the dashboard or the "
+            "stderr log above. Set [bold]CONDUCTOR_WEB_BG_START_TIMEOUT[/bold] "
+            "to tune how long the launcher waits before printing this note."
+        )
+    )
+
+
 def version_callback(value: bool) -> None:
     """Display version information and exit."""
     if value:
@@ -573,6 +591,8 @@ def run(
                         "workflow completes and all clients disconnect.[/dim]"
                     )
                 )
+                if not launch.workflow_started:
+                    _print_web_bg_not_started_notice()
                 if notify_gate:
                     _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
@@ -1058,6 +1078,8 @@ def resume(
                         "after workflow completes and all clients disconnect.[/dim]"
                     )
                 )
+                if not launch.workflow_started:
+                    _print_web_bg_not_started_notice()
                 if notify_gate:
                     _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
