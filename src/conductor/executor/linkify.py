@@ -69,9 +69,23 @@ _LINKABLE_SUFFIXES = tuple(LINKABLE_EXTENSIONS)
 # opener one character at a time — trying `` ` * n ``, then `` ` * (n-1) ``,
 # and so on — which is O(n^2) and stalls the event loop on a ~80KB run of
 # backticks. The possessive quantifier forbids backtracking into the run it
-# just matched, making the whole match attempt O(1) per starting position.
+# just matched, so the opener is consumed exactly once instead of being
+# retried at every shorter length — O(n) overall instead of O(n^2).
 # Do not "simplify" this back to `{3,}` — see
 # tests/test_executor/test_linkify.py::TestPathologicalInputPerformance.
+#
+# Semantic side effect: possessiveness also means a fence whose opener is
+# longer than its closer (e.g. a 4-backtick opener followed by a 3-backtick
+# closer) is no longer protected — the old greedy `{3,}` would backtrack the
+# opener down to match the shorter closer, but `{3,}+` forbids that, so the
+# regex fails to match and the block's contents get linkified. This is the
+# CommonMark-correct reading (a closing fence must be at least as long as
+# the opener) but is a behaviour change from the pre-fix regex — see
+# test_longer_opener_than_closer_no_longer_protects.
+#
+# The `[^\n]*\n` after the opener group is semantically inert given the
+# `^...^\1` anchoring under re.MULTILINE (a successful match already implies
+# a newline follows the opener), and is retained only for explicitness.
 _FENCED_CODE_RE = re.compile(r"^(`{3,}+|~{3,}+)[^\n]*\n.*?^\1", re.MULTILINE | re.DOTALL)
 
 # Inline code span (`...`)
@@ -190,7 +204,10 @@ def _find_existing_link_spans(text: str) -> list[tuple[int, int]]:
     This is a single forward pass with :meth:`str.find`, exactly equivalent
     to (and replacing) the regex
     ``r"\\[[^\\]]*\\]\\([^)]*\\)|\\[[^\\]]*\\]\\[[^\\]]*\\]"`` — but linear
-    instead of quadratic on a long run of ``[`` characters.
+    instead of quadratic, both on a long run of ``[`` characters and on a
+    ``"[](" * k`` shape (a failed ``find`` can never succeed from a later
+    start position, so ``last_bracket``/``last_paren`` guard each lookup
+    once the rest of the string is known to hold no more delimiters).
 
     The equivalence argument: for any ``[`` at position *i*, the character
     class ``[^\\]]*`` in both regex alternatives is greedy but excludes
@@ -211,9 +228,16 @@ def _find_existing_link_spans(text: str) -> list[tuple[int, int]]:
     """
     spans: list[tuple[int, int]] = []
     n = len(text)
+    # A failed `find` can never succeed from a later start position, so
+    # precompute the last occurrence of each delimiter and skip the lookup
+    # entirely once we're past it — otherwise a shape like "[](" * k makes
+    # every failed find(")", ...) rescan to the end of the string while the
+    # cursor only advances ~3 characters, which is O(n^2).
+    last_bracket = text.rfind("]")
+    last_paren = text.rfind(")")
     i = text.find("[")
     while i != -1:
-        close_bracket = text.find("]", i + 1)
+        close_bracket = text.find("]", i + 1) if last_bracket > i else -1
         if close_bracket == -1:
             # No more "]" anywhere after this "[" — no "[" at or after this
             # position can ever find one either, so nothing further can match.
@@ -222,14 +246,14 @@ def _find_existing_link_spans(text: str) -> list[tuple[int, int]]:
         matched = False
         next_pos = close_bracket + 1
         if next_pos < n and text[next_pos] == "(":
-            close_paren = text.find(")", next_pos + 1)
+            close_paren = text.find(")", next_pos + 1) if last_paren > next_pos else -1
             if close_paren != -1:
                 spans.append((i, close_paren + 1))
                 i = text.find("[", close_paren + 1)
                 matched = True
 
         if not matched and next_pos < n and text[next_pos] == "[":
-            second_close = text.find("]", next_pos + 1)
+            second_close = text.find("]", next_pos + 1) if last_bracket > next_pos else -1
             if second_close != -1:
                 spans.append((i, second_close + 1))
                 i = text.find("[", second_close + 1)

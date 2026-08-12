@@ -254,6 +254,20 @@ class TestFencedCodeEdgeCases:
         text = "```\n```"
         assert linkify_markdown(text) == text
 
+    def test_longer_opener_than_closer_no_longer_protects(self) -> None:
+        """The possessive quantifier is CommonMark-correct (a closer must be
+        at least as long as the opener) but is a behaviour change from the
+        pre-fix greedy regex, which backtracked the opener to match a
+        shorter closer. Pins the new behaviour: a 4-backtick opener closed
+        by a 3-backtick fence no longer matches, so its contents are
+        linkified."""
+        text = "````\nsrc/a.py\n```\n"
+        assert "[src/a.py](src/a.py)" in linkify_markdown(text)
+
+    def test_longer_tilde_opener_than_closer_no_longer_protects(self) -> None:
+        text = "~~~~\nsrc/a.py\n~~~\n"
+        assert "[src/a.py](src/a.py)" in linkify_markdown(text)
+
 
 # ---------------------------------------------------------------------------
 # Existing markdown link protection (issue #395 rewrite)
@@ -263,14 +277,33 @@ class TestFencedCodeEdgeCases:
 class TestExistingLinkProtection:
     """Pins the ``_find_existing_link_spans`` scanner against the shapes
     fuzzed against the regex it replaces — output must equal input since
-    nothing here should be re-linkified."""
+    nothing here should be re-linkified.
+
+    Note: several of the shapes below (bare bracket/paren walls with no
+    linkable content) can't actually detect whether protection fired, since
+    the assertion holds whether or not the scanner works. The tests that
+    embed real linkable content (paths/URLs) inside the candidate link are
+    the ones that actually exercise the scanner.
+    """
 
     def test_simple_paren_link(self) -> None:
         text = "See [a](b) for details"
         assert linkify_markdown(text) == text
 
+    def test_simple_paren_link_with_linkable_content(self) -> None:
+        """A path inside an existing link must stay unlinked."""
+        text = "See [config](src/config/schema.py) for details"
+        assert linkify_markdown(text) == text
+
     def test_simple_bracket_ref_link(self) -> None:
         text = "See [a][b] for details"
+        assert linkify_markdown(text) == text
+
+    def test_bracket_ref_link_with_linkable_content(self) -> None:
+        """A URL inside the text half of a ``[text][ref]`` link must stay
+        unlinked — this only holds if the bracket-ref alternative is
+        actually evaluated (not merely deleted)."""
+        text = "[see https://example.com here][ref]"
         assert linkify_markdown(text) == text
 
     def test_nested_image_link(self) -> None:
@@ -283,6 +316,14 @@ class TestExistingLinkProtection:
     def test_adjacent_links(self) -> None:
         text = "[x](y)[z](w)"
         assert linkify_markdown(text) == text
+
+    def test_span_end_is_exclusive_of_following_content(self) -> None:
+        """Pins the exact span boundary: a path immediately following a
+        closed link (no separator) must still be linkified on its own,
+        which only holds if the span end is `close_paren + 1`, not
+        `close_paren`."""
+        text = "x [a](b)docs/a.md"
+        assert linkify_markdown(text) == "x [a](b)[docs/a.md](docs/a.md)"
 
     def test_unterminated_paren_link(self) -> None:
         text = "before [a]( after"
@@ -331,12 +372,37 @@ class TestPathologicalInputPerformance:
         elapsed = time.perf_counter() - start
         assert elapsed < 2.0, f"bracket wall took {elapsed:.3f}s (expected < 2s)"
 
+    def test_bracket_and_close_wall_completes_quickly(self) -> None:
+        """Unlike a bare bracket wall (which exits the scanner loop on its
+        first iteration and never exercises the skip-past-`]` logic the
+        design rests on), a balanced wall of `[`s followed by `]`s reaches
+        that path on every iteration. Pre-fix, this shape measures ~2.2s."""
+        text = "[" * 50_000 + "]" * 50_000
+        start = time.perf_counter()
+        linkify_markdown(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"bracket+close wall took {elapsed:.3f}s (expected < 2s)"
+
+    def test_paren_wall_completes_quickly(self) -> None:
+        """Guards the `"[](" * k` shape: pre-fix, every `)` lookup failed
+        and rescanned to the end of the string while the cursor advanced
+        only ~3 characters per iteration."""
+        text = "[](" * 30_000
+        start = time.perf_counter()
+        linkify_markdown(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"paren wall took {elapsed:.3f}s (expected < 2s)"
+
     def test_quote_token_completes_quickly(self) -> None:
         text = '"' * 100_000
         start = time.perf_counter()
         linkify_markdown(text)
         elapsed = time.perf_counter() - start
-        assert elapsed < 2.0, f"quote token took {elapsed:.3f}s (expected < 2s)"
+        # Tightened from the original 2.0s budget: fixed code measures
+        # ~3ms here (still ~15x headroom), while the pre-fix quadratic
+        # strip loop measures ~0.10s — so this threshold actually fails
+        # on a revert, unlike a round 2.0s (see issue #395 review).
+        assert elapsed < 0.05, f"quote token took {elapsed:.3f}s (expected < 0.05s)"
 
     @pytest.mark.performance
     def test_backtick_wall_scales_near_linearly(self) -> None:
