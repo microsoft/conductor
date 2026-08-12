@@ -219,7 +219,9 @@ class BackgroundLaunch:
             contradicts it. ``False`` means the deadline passed with the
             child still alive but not yet reporting a start; callers should
             surface this as a "still initializing" note rather than a
-            failure — see issue #410.
+            failure — see issue #410. Only meaningful once ``still_running``
+            has already been checked (see below) — check ``still_running``
+            first.
         still_running: Whether the child process was still alive when the
             launcher finished waiting. ``True`` in the common case (the
             workflow is a genuine long-running background run). ``False``
@@ -227,11 +229,15 @@ class BackgroundLaunch:
             wait window — either before the port opened or during the
             stage-two workflow-start probe. This is deliberately a separate
             field from ``workflow_started``: a clean sub-second run makes
-            both ``True``, but callers must not report a URL/"running in
-            background" for a process that has already exited (issue #410)
-            — printing that message unconditionally on ``workflow_started``
-            alone would reintroduce a narrower form of the same false-success
-            bug this PR fixes.
+            ``workflow_started`` stay ``True`` while ``still_running``
+            becomes ``False`` — the two fields deliberately diverge in
+            exactly this case, rather than both reading ``True``, because
+            callers must not report a URL/"running in background" for a
+            process that has already exited (issue #410) — printing that
+            message unconditionally on ``workflow_started`` alone would
+            reintroduce a narrower form of the same false-success bug this
+            PR fixes. Check this field *before* ``workflow_started``: the
+            latter is only meaningful when this one is ``True``.
 
     Invariants (enforced in ``__post_init__``):
         * ``run_id`` is exactly 8 lowercase hex characters.
@@ -793,7 +799,10 @@ def _spawn_bg_child(
 
     Raises:
         RuntimeError: If the log files cannot be created, the child fails to
-            start, or the dashboard doesn't become reachable.
+            start, the dashboard doesn't become reachable, or the child is
+            found to have exited with a non-zero code in the narrow window
+            between ``_finalize_background_launch`` reporting success and
+            this function's own final liveness check.
     """
     try:
         run_id, stderr_path, stdout_path, stderr_handle, stdout_handle = _open_bg_log_files(
@@ -834,14 +843,33 @@ def _spawn_bg_child(
         # objects can be released without affecting the child.
         _close_quietly(stderr_handle, stdout_handle)
 
-    # ``_finalize_background_launch`` returns bare ``True`` for a clean
-    # (exit code 0) completion it observed *during* its own wait, in
-    # addition to the common "genuinely still running" case — see its
-    # docstring. ``proc`` is still in hand here, so re-check it directly
+    # ``_finalize_background_launch`` returns bare ``True`` (or ``False`` for
+    # ``StartProbe.TIMED_OUT``) from several paths that don't check the
+    # child's exit code, because at the moment they returned the child was
+    # confirmed either alive or cleanly exited (0) — see the function's own
+    # docstring. ``proc`` is still in hand here, so re-poll it directly
     # rather than widening that function's return type: this is what lets
-    # ``BackgroundLaunch.still_running`` distinguish the two without callers
-    # printing a live dashboard URL for an already-exited process (#410).
-    still_running = proc.poll() is None
+    # ``BackgroundLaunch.still_running`` distinguish "genuinely running" from
+    # "already exited" without callers printing a live dashboard URL for an
+    # already-exited process (#410).
+    retcode = proc.poll()
+    still_running = retcode is None
+    if not still_running and retcode != 0:
+        # The child crashed in the narrow window between
+        # _finalize_background_launch's last liveness check (STARTED,
+        # TIMED_OUT, and the CONDUCTOR_WEB_BG_START_TIMEOUT=0 escape hatch
+        # all return without re-checking the exit code, since the child was
+        # confirmed alive or the check was skipped entirely moments before)
+        # and this re-poll. Reporting this as a clean "Workflow completed"
+        # success would be exactly the false-success bug class issue #410
+        # exists to close, so raise instead of returning a BackgroundLaunch
+        # — the same treatment _finalize_background_launch already gives a
+        # non-zero exit it catches directly (StartProbe.CHILD_EXITED above).
+        raise RuntimeError(
+            f"Background process exited unexpectedly (code {retcode}) while "
+            f"the launcher was finishing up. See child stderr log: "
+            f"{stderr_path}{_tail_log(stderr_path)}"
+        )
 
     return BackgroundLaunch(
         url=f"http://127.0.0.1:{web_port}",

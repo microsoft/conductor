@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -202,6 +203,65 @@ class TestWorkflowStartedNotice:
         assert "has not reported starting" not in combined
 
 
+class TestStillRunningNotice:
+    """Issue #410 follow-up: suppress the live URL for an already-exited child.
+
+    ``BackgroundLaunch.still_running=False`` means the child completed
+    (cleanly) inside the launcher's own wait window -- printing the
+    dashboard URL / "running in background" for a process that no longer
+    exists would be a narrower recurrence of the false-success bug this PR
+    closes.
+    """
+
+    def test_run_web_bg_still_running_false_prints_completed_notice(
+        self, workflow_file: Path
+    ) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=True,
+                still_running=False,
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "Workflow completed" in combined
+        assert "Dashboard:" not in combined
+        assert "running in background" not in combined
+
+    def test_run_web_bg_still_running_true_prints_dashboard_url(self, workflow_file: Path) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=True,
+                still_running=True,
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "Dashboard:" in combined
+        assert "running in background" in combined
+        assert "Workflow completed" not in combined
+
+
 class TestLaunchBackgroundSilentFlag:
     """Regression tests for issue #196 — bg_runner must not pass --silent.
 
@@ -279,12 +339,19 @@ class TestDashboardStartupFailure:
             assert result.exit_code == 0
 
     @pytest.mark.asyncio
-    async def test_dashboard_start_oserror_is_non_fatal(self) -> None:
+    async def test_dashboard_start_oserror_is_non_fatal(self, monkeypatch: Any) -> None:
         """Test the actual code path: dashboard.start() OSError is caught.
 
         Mocks WebDashboard so start() raises OSError, verifies the
         workflow result is still returned (dashboard=None after failure).
+
+        Explicitly clears ``CONDUCTOR_WEB_BG``/``CONDUCTOR_WEB_PORT``: this
+        test asserts the non-bg fallback behavior, which must not depend on
+        ambient environment state possibly leaked from a --web-bg parent
+        process (this repo's own dogfooding pattern can do exactly that).
         """
+        monkeypatch.delenv("CONDUCTOR_WEB_BG", raising=False)
+        monkeypatch.delenv("CONDUCTOR_WEB_PORT", raising=False)
         from conductor.cli.run import run_workflow_async
 
         mock_dashboard = MagicMock()
@@ -333,6 +400,140 @@ class TestDashboardStartupFailure:
                 web=True,
             )
             assert result == {"result": "done"}
+
+    @pytest.mark.asyncio
+    async def test_dashboard_start_failure_falls_back_despite_leaked_bg_env(
+        self, monkeypatch: Any
+    ) -> None:
+        """A non-bg invocation must not be misidentified as the tracked bg child.
+
+        Regression guard: ``CONDUCTOR_WEB_BG`` is a normal env var inherited
+        by every descendant of a --web-bg child (see ``cli/self_run.py``'s
+        docstring), so a workflow that shells out and spawns a fresh,
+        non-bg ``conductor run --web`` would otherwise inherit it and be
+        wrongly treated as the launcher-tracked child — turning a should-be
+        graceful dashboard-start failure into a hard crash. Simulates that
+        exact leak: ``CONDUCTOR_WEB_BG=1`` present but ``CONDUCTOR_WEB_PORT``
+        naming a *different* port than this invocation's own ``web_port``.
+        """
+        monkeypatch.setenv("CONDUCTOR_WEB_BG", "1")
+        monkeypatch.setenv("CONDUCTOR_WEB_PORT", "55555")  # not this invocation's port
+        from conductor.cli.run import run_workflow_async
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.start = AsyncMock(side_effect=OSError("Address already in use"))
+        mock_dashboard.stop = AsyncMock()
+
+        mock_web_module = MagicMock()
+        mock_web_module.WebDashboard.return_value = mock_dashboard
+
+        mock_config = MagicMock()
+        mock_config.workflow.name = "test"
+        mock_config.workflow.entry_point = "agent1"
+        mock_config.agents = []
+        mock_config.workflow.runtime.provider = ProviderSettings(name="copilot")
+        mock_config.workflow.limits.max_iterations = 50
+        mock_config.workflow.limits.timeout_seconds = None
+        mock_config.workflow.cost.show_summary = False
+        mock_config.tools = None
+        mock_config.mcp_servers = []
+
+        mock_engine = MagicMock()
+        mock_engine.run = AsyncMock(return_value={"result": "done"})
+        mock_engine._last_checkpoint_path = None
+        mock_engine.get_execution_summary.return_value = {}
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch.dict(sys.modules, {"conductor.web.server": mock_web_module}),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = False
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            # web_port defaults to 0 here, which never equals the leaked
+            # CONDUCTOR_WEB_PORT=55555 -- this invocation must fall back
+            # gracefully rather than raising.
+            result = await run_workflow_async(
+                Path("/tmp/fake.yaml"),
+                {},
+                web=True,
+            )
+            assert result == {"result": "done"}
+
+    @pytest.mark.asyncio
+    async def test_dashboard_start_failure_raises_in_web_bg_child(self) -> None:
+        """A genuine ``--web-bg`` child must propagate a dashboard-start failure.
+
+        Complements the two fallback tests above: when this invocation
+        really is the tracked bg child (``web_bg=True``), a dashboard
+        failure must surface as a ``RuntimeError`` so the launcher's
+        "process exited" path reports the real cause (issue #410), instead
+        of silently continuing and leaving the port never reachable.
+
+        Also guards the ordering fix: ``dashboard.stop()`` must never be
+        awaited after a failed ``start()`` -- awaiting a dashboard whose
+        serve task never came up would re-raise (or replace) the very error
+        this test asserts on.
+        """
+        from conductor.cli.run import run_workflow_async
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.start = AsyncMock(side_effect=OSError("Address already in use"))
+        mock_dashboard.stop = AsyncMock()
+
+        mock_web_module = MagicMock()
+        mock_web_module.WebDashboard.return_value = mock_dashboard
+
+        mock_config = MagicMock()
+        mock_config.workflow.name = "test"
+        mock_config.workflow.entry_point = "agent1"
+        mock_config.agents = []
+        mock_config.workflow.runtime.provider = ProviderSettings(name="copilot")
+        mock_config.workflow.limits.max_iterations = 50
+        mock_config.workflow.limits.timeout_seconds = None
+        mock_config.workflow.cost.show_summary = False
+        mock_config.tools = None
+        mock_config.mcp_servers = []
+
+        mock_engine = MagicMock()
+        mock_engine.run = AsyncMock(return_value={"result": "done"})
+        mock_engine._last_checkpoint_path = None
+        mock_engine.get_execution_summary.return_value = {}
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch.dict(sys.modules, {"conductor.web.server": mock_web_module}),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = False
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            with pytest.raises(RuntimeError, match="Dashboard failed to start"):
+                await run_workflow_async(
+                    Path("/tmp/fake.yaml"),
+                    {},
+                    web=True,
+                    web_bg=True,
+                )
+
+        mock_dashboard.stop.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dashboard_start_not_awaited_when_config_load_fails(self) -> None:

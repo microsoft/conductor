@@ -831,9 +831,7 @@ class TestProbeWorkflowInfo:
             result = bg_runner._probe_workflow_info(9444)
 
         assert result is None
-        assert any(
-            "unexpected TypeError" in record.getMessage() for record in caplog.records
-        )
+        assert any("unexpected TypeError" in record.getMessage() for record in caplog.records)
 
     def test_valid_dict_body_passed_through(self) -> None:
         with patch("httpx.get") as get:
@@ -1236,9 +1234,7 @@ class TestSpawnBgChildPropagatesStillRunning:
         assert launch.still_running is True
         assert launch.workflow_started is True
 
-    def test_still_running_false_when_child_exited_during_stage_two(
-        self, tmp_path: Path
-    ) -> None:
+    def test_still_running_false_when_child_exited_during_stage_two(self, tmp_path: Path) -> None:
         """A workflow that completes during stage-two must not look 'running'."""
         wf_path = _write_workflow(tmp_path)
         fake_proc = MagicMock()
@@ -1295,3 +1291,41 @@ class TestSpawnBgChildPropagatesStillRunning:
         assert launch.workflow_started is True
         mock_write.assert_not_called()
 
+    def test_crash_raced_between_started_and_final_repoll_raises(self, tmp_path: Path) -> None:
+        """A crash right after STARTED but before the final re-poll must not
+
+        be reported as a clean "Workflow completed" success.
+
+        ``_wait_for_workflow_start`` returning ``StartProbe.STARTED`` makes
+        ``_finalize_background_launch`` return ``True`` without re-checking
+        the exit code (the child was confirmed alive moments before, by
+        ``_wait_for_workflow_start``'s own last ``proc.poll()``). If the
+        child then crashes with a non-zero code before ``_spawn_bg_child``'s
+        own final re-poll, that must surface as a failure rather than
+        silently becoming ``still_running=False`` with no distinction from
+        a genuine clean completion (issue #410).
+        """
+        wf_path = _write_workflow(tmp_path)
+        fake_proc = MagicMock()
+        fake_proc.pid = 1
+        # Alive when write_pid_file / _wait_for_workflow_start run; crashed
+        # (non-zero) by the time _spawn_bg_child does its final re-poll.
+        fake_proc.poll.return_value = 1
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            return fake_proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.STARTED
+            ),
+            pytest.raises(RuntimeError, match="exited unexpectedly"),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9435,
+            )
