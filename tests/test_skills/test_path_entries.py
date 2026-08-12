@@ -297,12 +297,32 @@ class TestSkillsRootDiagnostics:
     used to turn that same mistake into silence — one fewer skill, no message.
     """
 
+    def test_subdirectory_without_skill_md_is_reported(self, tmp_path: Path) -> None:
+        root = tmp_path / "skills"
+        _make_skill(root / "alpha")
+        (root / "oops").mkdir()
+        (root / "oops" / "notes.md").write_text("a file that is not a skill manifest")
+
+        warnings: list[str] = []
+        resolved = resolve_skills([str(root)], on_warning=warnings.append)
+
+        assert [item.name for item in resolved] == ["alpha"]
+        assert len(warnings) == 1
+        assert "oops" in warnings[0]
+        assert "SKILL.md" in warnings[0]
+
     @pytest.mark.skipif(
         os.name == "nt",
         reason="Windows filesystems are case-insensitive, so 'Skill.md' resolves as SKILL.md "
         "and the mis-cased-filename scenario cannot occur",
     )
-    def test_subdirectory_without_skill_md_is_reported(self, tmp_path: Path) -> None:
+    def test_mis_cased_skill_md_is_reported(self, tmp_path: Path) -> None:
+        """Mis-casing the manifest is the mistake this diagnostic was written for.
+
+        It is a Windows-authoring hazard specifically — `Skill.md` resolves fine
+        on a case-insensitive filesystem and then vanishes for everyone else —
+        which is why the general case above uses a fixture that survives here.
+        """
         root = tmp_path / "skills"
         _make_skill(root / "alpha")
         (root / "oops").mkdir()
