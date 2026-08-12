@@ -15,12 +15,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
 
+from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.executor.linkify import linkify_markdown
 
 if TYPE_CHECKING:
@@ -148,7 +148,7 @@ class DialogHandler:
 
     def __init__(
         self,
-        console: Console | None = None,
+        console: MarkupFreeConsole | None = None,
         skip_dialogs: bool = False,
         emitter: WorkflowEventEmitter | None = None,
         web_dashboard: WebDashboard | None = None,
@@ -161,7 +161,7 @@ class DialogHandler:
             emitter: Optional event emitter for dialog events.
             web_dashboard: Optional web dashboard for web-based dialog input.
         """
-        self.console = console or Console()
+        self.console = console or make_console()
         self.skip_dialogs = skip_dialogs
         self.emitter = emitter
         self.web_dashboard = web_dashboard
@@ -309,7 +309,10 @@ class DialogHandler:
                     exc_info=True,
                 )
                 self.console.print(
-                    "[dim red]  (Agent response failed — you can continue or type 'done')[/dim red]"
+                    Text.from_markup(
+                        "[dim red]  (Agent response failed — you can continue "
+                        "or type 'done')[/dim red]"
+                    )
                 )
                 continue
 
@@ -335,7 +338,7 @@ class DialogHandler:
 
                 # Ask user if they approve
                 approval = await self._get_user_input(
-                    prompt_text="[bold]Continue?[/bold] ([green]yes[/green]/no)"
+                    prompt_text=styled("[bold]Continue?[/bold] ([green]yes[/green]/no)")
                 )
                 if approval is None or approval.lower() in ("yes", "y", ""):
                     self._display_dialog_end(dismissed_by="agent_approved")
@@ -600,13 +603,14 @@ class DialogHandler:
         self.console.print()
         self.console.print(
             Panel(
-                Text.from_markup(
-                    f"[bold]Agent '{agent.name}'[/bold] would like to discuss "
-                    f"its output with you.\n"
-                    f"[dim]Type your responses below. Say [bold]done[/bold] or "
-                    f"[bold]/done[/bold] when finished.[/dim]"
+                styled(
+                    "[bold]Agent '{}'[/bold] would like to discuss "
+                    "its output with you.\n"
+                    "[dim]Type your responses below. Say [bold]done[/bold] or "
+                    "[bold]/done[/bold] when finished.[/dim]",
+                    agent.name,
                 ),
-                title="[bold magenta]Dialog Mode[/bold magenta]",
+                title=Text.from_markup("[bold magenta]Dialog Mode[/bold magenta]"),
                 border_style="magenta",
             )
         )
@@ -626,7 +630,7 @@ class DialogHandler:
         self.console.print(
             Panel(
                 RichMarkdown(f"```json\n{output_display}\n```"),
-                title="[bold cyan]Agent Output (Full Context)[/bold cyan]",
+                title=Text.from_markup("[bold cyan]Agent Output (Full Context)[/bold cyan]"),
                 border_style="cyan",
                 expand=True,
             )
@@ -638,7 +642,7 @@ class DialogHandler:
         self.console.print(
             Panel(
                 RichMarkdown(question_display),
-                title=f"[bold yellow]{agent.name}[/bold yellow]",
+                title=styled("[bold yellow]{}[/bold yellow]", agent.name),
                 border_style="yellow",
             )
         )
@@ -656,7 +660,7 @@ class DialogHandler:
     def _display_continue_proposal(self) -> None:
         """Display the agent's proposal to continue."""
         self.console.print()
-        msg = (
+        msg = Text.from_markup(
             "[bold magenta]  ↳ The agent believes it has enough "
             "information to continue.[/bold magenta]"
         )
@@ -667,14 +671,22 @@ class DialogHandler:
         self.console.print()
         if dismissed_by == "user":
             self.console.print(
-                "[dim magenta]  ✓ Dialog ended by user — agent resuming.[/dim magenta]"
+                Text.from_markup(
+                    "[dim magenta]  ✓ Dialog ended by user — agent resuming.[/dim magenta]"
+                )
             )
         elif dismissed_by == "agent_approved":
-            self.console.print("[dim magenta]  ✓ Agent continuing — dialog complete.[/dim magenta]")
+            self.console.print(
+                Text.from_markup(
+                    "[dim magenta]  ✓ Agent continuing — dialog complete.[/dim magenta]"
+                )
+            )
         elif dismissed_by == "declined":
             self.console.print(
-                "[dim magenta]  ✓ Dialog declined — agent will do"
-                " its best and continue.[/dim magenta]"
+                Text.from_markup(
+                    "[dim magenta]  ✓ Dialog declined — agent will do"
+                    " its best and continue.[/dim magenta]"
+                )
             )
         self.console.print()
 
@@ -685,13 +697,17 @@ class DialogHandler:
             "engage" if the user wants to chat, "decline" to skip.
         """
         self.console.print()
-        self.console.print("[bold]How would you like to proceed?[/bold]")
-        self.console.print("  [cyan][1][/cyan] Discuss this with the agent")
-        self.console.print("  [cyan][2][/cyan] Do your best and continue [dim](skip dialog)[/dim]")
+        self.console.print(Text.from_markup("[bold]How would you like to proceed?[/bold]"))
+        self.console.print(Text.from_markup("  [cyan][1][/cyan] Discuss this with the agent"))
+        self.console.print(
+            Text.from_markup(
+                "  [cyan][2][/cyan] Do your best and continue [dim](skip dialog)[/dim]"
+            )
+        )
 
         def _ask() -> str:
             return Prompt.ask(
-                "\n[bold]Select[/bold]",
+                Text.from_markup("\n[bold]Select[/bold]"),
                 choices=["1", "2"],
                 default="1",
                 show_choices=True,
@@ -702,19 +718,27 @@ class DialogHandler:
 
     async def _get_user_input(
         self,
-        prompt_text: str = "[bold magenta]You[/bold magenta]",
+        prompt_text: Text | None = None,
     ) -> str | None:
         """Get user input from the terminal.
 
         Runs in a thread to avoid blocking the event loop.
 
+        Args:
+            prompt_text: Pre-styled prompt. ``Text`` rather than ``str``
+                because ``Prompt`` parses a ``str`` prompt with
+                ``Text.from_markup`` regardless of the console's
+                ``markup=False`` (#406), so the type keeps a caller from
+                passing an interpolated f-string here.
+
         Returns:
             User input text, or None on EOF/error.
         """
+        prompt = styled("[bold magenta]You[/bold magenta]") if prompt_text is None else prompt_text
         try:
 
             def _ask() -> str:
-                return Prompt.ask(prompt_text)
+                return Prompt.ask(prompt)
 
             return await asyncio.to_thread(_ask)
         except (EOFError, KeyboardInterrupt):

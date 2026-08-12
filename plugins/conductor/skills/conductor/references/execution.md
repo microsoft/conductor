@@ -102,6 +102,8 @@ conductor status [OPTIONS]
 
 Use this rather than a bare `conductor stop` to answer "what is running?". `conductor stop` with no arguments **stops** the workflow when exactly one is running, so the natural reflex is destructive precisely when there is a single run to lose. `status` never terminates anything, and it prints each run's dashboard URL, which is otherwise unrecoverable once the launching terminal is gone.
 
+`--json` payload per running entry: `pid`, `port`, `workflow`, `run_id`, `started_at`, `stderr_log`, `stdout_log`, `url`. `run_id` is the join key to the run's events JSONL (`conductor-<name>-<ts>-<run_id>.events.jsonl`); `stderr_log`/`stdout_log` are the child's captured console output paths. All three are `null` for a PID file written before this field existed.
+
 **Examples:**
 
 ```bash
@@ -139,6 +141,24 @@ conductor stop --port 8080
 # Stop all running background workflows
 conductor stop --all
 ```
+
+### conductor guide
+
+Send mid-run guidance to a `--web`/`--web-bg` workflow without stopping it:
+
+```bash
+conductor guide [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--text`, `-t TEXT` | Guidance text (**required**) |
+| `--port`, `-p PORT` | Dashboard port (auto-discovered if omitted) |
+| `--token SECRET` | Auth token (also reads `CONDUCTOR_GATE_TOKEN`) |
+
+Applied at the next step boundary, or immediately if paused.
+
+**Example:** `conductor guide --text "Prefer Python 3.12 examples"`
 
 ### conductor update
 
@@ -183,6 +203,7 @@ conductor resume --from <checkpoint.json> [OPTIONS]
 | `--web` | Start real-time web dashboard for the resumed run |
 | `--web-port PORT` | Port for the dashboard (0 = auto) |
 | `--web-bg` | Fork a detached resume + dashboard process and exit |
+| `--guidance TEXT` | Mid-run guidance applied before the resumed agent runs (repeatable) |
 
 `--web` and `--web-bg` are mutually exclusive. The dashboard only shows events from the resumed agent forward — events emitted in the original process before the checkpoint are not replayed.
 
@@ -566,6 +587,10 @@ During execution, press **Esc** or **Ctrl+G** to pause the workflow. An interact
 Guidance text accumulates across multiple interrupts and is injected into agent context.
 
 Disable with `--no-interactive`. In `--skip-gates` mode, interrupts auto-cancel.
+
+A `--web-bg` run has no TTY for this menu. Use `conductor guide --text
+"..."` or the dashboard's **Guide** button instead — see
+[`conductor guide`](#conductor-guide) above.
 
 ## Checkpoint & Resume
 

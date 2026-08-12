@@ -1015,6 +1015,99 @@ class TestTokenAccounting:
         assert output.output_tokens == 100
 
 
+class TestContextWindowLastCallInputTokens:
+    """Issue #412: last_call_input_tokens is the last call's prompt size, not
+    a cumulative total, and must add in cache tokens the Anthropic-shaped
+    usage dict reports separately from input_tokens."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_last_assistant_message_wins(self) -> None:
+        """The last AssistantMessage's usage determines the figure, not the sum."""
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={"input_tokens": 1000, "output_tokens": 500},
+            )
+            yield _assistant(
+                content=[TextBlock(text="t2")],
+                usage={"input_tokens": 1500, "output_tokens": 750},
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.last_call_input_tokens == 1500
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_cache_tokens_are_added_into_the_figure(self) -> None:
+        """Anthropic-shaped usage reports cache tokens separately; the bare
+        input_tokens would understate the prompt on a cached conversation."""
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 25,
+                },
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.last_call_input_tokens == 100 + 400 + 25
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_cumulative_result_message_does_not_overwrite_it(self) -> None:
+        """ResultMessage.usage is a cumulative session total and must not
+        replace the per-call figure the way it legitimately replaces the
+        billing totals."""
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={"input_tokens": 1000, "output_tokens": 500},
+            )
+            yield _assistant(
+                content=[TextBlock(text="t2")],
+                usage={"input_tokens": 1500, "output_tokens": 750},
+            )
+            # Cumulative session total across both calls above.
+            yield _result(
+                result="done",
+                usage={"input_tokens": 2500, "output_tokens": 1250},
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # Billing totals follow the cumulative ResultMessage figure...
+        assert output.input_tokens == 2500
+        # ...but the context figure stays pinned to the last single call.
+        assert output.last_call_input_tokens == 1500
+
+
 class TestErrorClassification:
     """Differentiated error suggestions per failure mode (#241 / A5).
 

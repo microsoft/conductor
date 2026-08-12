@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -261,12 +262,71 @@ class TestResumeCommand:
             "work_item_id": "1814",
         }
 
+    def test_resume_with_guidance(self, tmp_path: Path) -> None:
+        """--guidance flags are forwarded to resume_workflow_async as a list."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(
+                app,
+                [
+                    "resume",
+                    str(wf_path),
+                    "--guidance",
+                    "Skip the benchmark step",
+                    "--guidance",
+                    "Prefer Python 3.12",
+                ],
+            )
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["guidance"] == [
+            "Skip the benchmark step",
+            "Prefer Python 3.12",
+        ]
+
     def test_resume_invalid_metadata_format(self, tmp_path: Path) -> None:
         """Test resume rejects malformed --metadata values."""
         wf_path = _write_workflow(tmp_path)
 
         result = runner.invoke(app, ["resume", str(wf_path), "--metadata", "no_equals"])
         assert result.exit_code != 0
+
+    def test_resume_guidance_stripped(self, tmp_path: Path) -> None:
+        """--guidance entries are stripped before being forwarded (issue #400)."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(app, ["resume", str(wf_path), "--guidance", "  padded text  "])
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["guidance"] == ["padded text"]
+
+    def test_resume_rejects_empty_guidance(self, tmp_path: Path) -> None:
+        """--guidance rejects a blank/whitespace-only entry, matching POST /api/guidance."""
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(app, ["resume", str(wf_path), "--guidance", "   "])
+        assert result.exit_code != 0
+        assert "empty" in result.output.lower()
+
+    def test_resume_rejects_oversized_guidance(self, tmp_path: Path) -> None:
+        """--guidance rejects text over MAX_GUIDANCE_CHARS, matching POST /api/guidance."""
+        from conductor.engine.guidance import MAX_GUIDANCE_CHARS
+
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(
+            app, ["resume", str(wf_path), "--guidance", "x" * (MAX_GUIDANCE_CHARS + 1)]
+        )
+        assert result.exit_code != 0
+        assert "maximum length" in result.output.lower()
 
     def test_resume_with_web(self, tmp_path: Path) -> None:
         """Test resume passes --web and --web-port through."""
@@ -675,7 +735,14 @@ class TestLaunchBackgroundResumeFailures:
                 workflow_path=wf_path, checkpoint_path=None, web_port=9201
             )
 
-        mock_write.assert_called_once_with(5555, 9201, wf_path)
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (5555, 9201, wf_path)
+        # The run id must reach the PID file, or ``conductor stop`` has no way
+        # to confirm identity before force-terminating (issue #344).
+        assert kwargs["run_id"], "run_id must be recorded in the PID file"
+        assert kwargs["stderr_log"]
+        assert kwargs["stdout_log"]
 
     def test_pid_file_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
         """When only checkpoint_path is given, it is used for the PID file ref."""
@@ -697,7 +764,14 @@ class TestLaunchBackgroundResumeFailures:
                 workflow_path=None, checkpoint_path=cp_path, web_port=9202
             )
 
-        mock_write.assert_called_once_with(5556, 9202, cp_path)
+        mock_write.assert_called_once()
+        args, kwargs = mock_write.call_args
+        assert args == (5556, 9202, cp_path)
+        # The run id must reach the PID file, or ``conductor stop`` has no way
+        # to confirm identity before force-terminating (issue #344).
+        assert kwargs["run_id"], "run_id must be recorded in the PID file"
+        assert kwargs["stderr_log"]
+        assert kwargs["stdout_log"]
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
         """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
@@ -763,6 +837,258 @@ class TestLaunchBackgroundResumeFailures:
         assert len(env["CONDUCTOR_RUN_ID"]) == 8
         assert env["CONDUCTOR_BG_STDERR_LOG"].endswith(".bg.stderr.log")
         assert env["CONDUCTOR_BG_STDOUT_LOG"].endswith(".bg.stdout.log")
+
+
+class TestLaunchBackgroundResumeRunIdAdoption:
+    """``launch_background_resume`` adopts the checkpoint's ``run_id`` (issue #404).
+
+    Without this, the launcher always minted a fresh id — one that matches
+    neither the resumed child's ``EventLogSubscriber`` (which reuses the
+    checkpoint's ``run_id`` whenever the original JSONL still exists) nor the
+    events JSONL filename, leaving the PID file's ``run_id`` correlating with
+    nothing.
+    """
+
+    def test_explicit_from_checkpoint_run_id_is_adopted(self, tmp_path: Path) -> None:
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="deadbeef")
+
+        proc = MagicMock()
+        proc.pid = 6001
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9210
+            )
+
+        assert launch.run_id == "deadbeef"
+        assert "deadbeef" in launch.stderr_log.name
+        assert "deadbeef" in launch.stdout_log.name
+
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == "deadbeef"
+
+    def test_explicit_from_checkpoint_run_id_wires_env(self, tmp_path: Path) -> None:
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="deadbeef")
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 6002
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9211
+            )
+
+        assert captured["env"]["CONDUCTOR_RUN_ID"] == "deadbeef"
+
+    def test_workflow_only_resume_mirrors_child_latest_checkpoint_resolution(
+        self, tmp_path: Path
+    ) -> None:
+        """A bare ``workflow_path`` resume finds the latest checkpoint, same as the child."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="cafef00d")
+
+        proc = MagicMock()
+        proc.pid = 6003
+        proc.poll.return_value = None
+
+        with (
+            patch(
+                "conductor.engine.checkpoint.CheckpointManager.find_latest_checkpoint",
+                return_value=cp_path,
+            ),
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=wf_path, checkpoint_path=None, web_port=9212
+            )
+
+        assert launch.run_id == "cafef00d"
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == "cafef00d"
+
+    def test_missing_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint with no ``run_id`` doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="")
+
+        proc = MagicMock()
+        proc.pid = 6004
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9213
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_malformed_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint whose ``run_id`` isn't 8 hex chars doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="not-a-valid-run-id")
+
+        proc = MagicMock()
+        proc.pid = 6005
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9214
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_unreadable_checkpoint_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """An unreadable/absent checkpoint doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        missing_cp = tmp_path / "does-not-exist.json"
+
+        proc = MagicMock()
+        proc.pid = 6006
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=missing_cp, web_port=9215
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_uppercase_checkpoint_run_id_is_lowercased_and_adopted(self, tmp_path: Path) -> None:
+        """A checkpoint's ``run_id`` is normalized to lowercase before adoption.
+
+        Every current writer of a checkpoint's ``run_id`` (``EventLogSubscriber``,
+        ``secrets.token_hex``) already produces lowercase hex, but a
+        hand-edited or future-format checkpoint could carry uppercase hex —
+        this must still be recognized and adopted, not treated as malformed.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="DEADBEEF")
+
+        proc = MagicMock()
+        proc.pid = 6007
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9216
+            )
+
+        assert launch.run_id == "deadbeef"
+        _, kwargs = mock_write.call_args
+        assert kwargs["run_id"] == "deadbeef"
+
+    def test_non_string_checkpoint_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint whose ``run_id`` field is a non-string JSON value doesn't crash.
+
+        ``CheckpointData.run_id: str`` is a type hint, not an enforced
+        constraint — a hand-edited or corrupted checkpoint can carry e.g. a
+        JSON number for ``run_id``, which would otherwise raise a bare
+        ``AttributeError`` from ``.lower()`` and crash the whole launch.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+        checkpoint = json.loads(cp_path.read_text())
+        checkpoint["run_id"] = 12345678  # a JSON number, not a string
+        cp_path.write_text(json.dumps(checkpoint))
+
+        proc = MagicMock()
+        proc.pid = 6008
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9217
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_non_dict_checkpoint_content_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint file whose top-level JSON isn't an object doesn't crash.
+
+        ``CheckpointManager.load_checkpoint`` calls ``.get()`` on the parsed
+        JSON without an ``isinstance(data, dict)`` guard, so a checkpoint
+        file that is syntactically valid JSON but not an object (e.g. a bare
+        list) raises ``AttributeError`` rather than ``CheckpointError`` —
+        this must still degrade to a fresh id rather than crash the launch.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        cp_path = tmp_path / "wf-20260224-153000.json"
+        cp_path.write_text(json.dumps([1, 2, 3]))
+
+        proc = MagicMock()
+        proc.pid = 6009
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9218
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
 
 
 # ---------------------------------------------------------------------------

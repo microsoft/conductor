@@ -9,6 +9,7 @@ Complete command-line reference for Conductor.
 - [`conductor status`](#conductor-status)
 - [`conductor stop`](#conductor-stop)
 - [`conductor gate respond`](#conductor-gate-respond)
+- [`conductor guide`](#conductor-guide)
 - [`conductor checkpoint list`](#conductor-checkpoint-list)
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
@@ -247,7 +248,34 @@ conductor status [OPTIONS]
 
 It is also read-only on disk: unlike `stop`, it never removes a PID file, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
 
-The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone.
+The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone. The table renders `Started` to minute precision in UTC, and the dashboard URL wraps onto a second line rather than being cropped on a narrow terminal. `--json` reports the exact recorded `started_at` value regardless.
+
+### `--json` Payload
+
+```json
+{
+  "running": [
+    {
+      "pid": 12345,
+      "port": 8080,
+      "workflow": "my-workflow.yaml",
+      "run_id": "a1b2c3d4",
+      "started_at": "2026-03-03T12:00:00+00:00",
+      "stderr_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stderr.log",
+      "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log",
+      "url": "http://127.0.0.1:8080"
+    }
+  ]
+}
+```
+
+`run_id` is the join key to the run's events JSONL
+(`conductor-<name>-<ts>-<run_id>.events.jsonl` under `$TMPDIR/conductor/`);
+`stderr_log`/`stdout_log` are the paths to the child's captured console
+output (see [Debugging `--web-bg` failures](../AGENTS.md#debugging---web-bg-failures)).
+All three are `null` — never `""` — for a PID file written before this field
+existed. A resumed run whose checkpoint carried no usable run id still gets
+a freshly-minted `run_id` (and matching log paths), not `null`.
 
 ### Exit Codes
 
@@ -278,24 +306,110 @@ conductor stop [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--port PORT` | Stop the workflow running on this specific port |
-| `--all` | Stop all background conductor workflows |
+| `--all` | Stop all *other* background conductor workflows (see Self-Exclusion) |
+| `--allow-self` | Include the run this command is executing inside (refused by default) |
+| `--force` | Proceed when the run's identity cannot be confirmed (see [Identity and `--force`](#identity-and---force)) |
+| `--json` | Emit a machine-readable result per workflow on stdout instead of prose |
 
-With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`.
+With no options, `conductor stop` lists running background workflows. If exactly one is found, it stops automatically. If multiple are running, it prints the list and asks you to specify `--port`. That listing shares its rendering with `conductor status`, so `Started` is shown at the same minute precision in UTC.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every targeted workflow is confirmed stopped, or was already gone — including a self-only refusal (see Self-Exclusion) |
+| `1` | `--port` matched no running workflow, the target was ambiguous, or `--port` matched only your own run |
+| `2` | At least one workflow survived, or could not be confirmed stopped |
+
+Exit `2` is deliberately not a synonym for failure to signal — it means Conductor could not *prove* the process is gone. A run that ignored every rung and a run whose liveness could not be probed both land here, because both leave you with something you should look at by hand.
 
 ### How It Works
 
-When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The `stop` command reads these PID files, sends `SIGTERM` to the process, and cleans up the file. PID files are also automatically cleaned up when a background workflow completes normally.
+When a workflow is launched with `--web-bg`, Conductor writes a PID file to `~/.conductor/runs/` tracking the background process. The PID file also records the launch's `run_id` and the child's captured stderr/stdout log paths (see `conductor status --json` above), so a run stays correlatable to its forensic artefacts even after the launching terminal is gone. PID files are written atomically, so a concurrent `stop` can never read a half-written file. They are also cleaned up automatically when a background workflow completes normally.
 
-The web dashboard also exposes terminate controls that always preserve progress:
+`stop` reads those files and escalates through a ladder, confirming each rung before moving to the next:
+
+1. **Ask the dashboard to cancel** (`POST /api/kill`) — the graceful rung, which lets the run write a checkpoint so you can `conductor resume` later.
+2. **Send a platform signal** — `SIGTERM` on POSIX, `CTRL_BREAK_EVENT` on Windows.
+3. **Force-terminate** — `SIGKILL` / `TerminateProcess`.
+
+A PID file is removed **only once its process is confirmed gone**. A workflow that survives every rung keeps its file and stays discoverable, rather than becoming an untracked orphan still holding its port.
+
+### Identity and `--force`
+
+Between a PID file being written and `stop` reading it, the OS may have recycled that PID onto an unrelated process. Every PID-directed rung is therefore gated on the dashboard confirming its own PID first. Three outcomes:
+
+| Identity | Meaning | Behavior |
+|----------|---------|----------|
+| **confirmed** | The dashboard reports the PID we recorded | Proceed |
+| **unconfirmed** | The dashboard could not be reached, or is too old to report a PID | Refuse, unless `--force` |
+| **mismatched** | The dashboard reports a *different* PID | Refuse — `--force` does **not** override this |
+
+`--force` overrides *uncertainty* only. A positive mismatch means the PID demonstrably belongs to something else, so signalling it would be signalling a stranger; no flag lifts that.
+
+`--force` has one further effect. If a run's liveness cannot be probed at all, its entry would otherwise be permanent — bare `stop` stays ambiguous and `stop --all` exits `2` forever, which wedges CI teardown ([#166](https://github.com/microsoft/conductor/issues/166)). `--force` clears such an entry, printing a warning: if that process is still alive it is now untracked and must be stopped by hand. This is deliberately narrow, and does not fire for a mismatch or for a process demonstrably still alive.
+
+The web dashboard also exposes these run-time controls:
 
 - **Stop** (`POST /api/stop`) interrupts the current agent and pauses it, then
   offers **Resume** (re-run the agent) or **Kill**. If clicked during the brief
   startup window before the engine is ready, the Stop is queued and honored as
   soon as the engine binds its interrupt event (rather than hard-cancelling).
+  This and **Kill** always preserve progress.
 - **Kill** (`POST /api/kill`) stops the workflow entirely. A best-effort
   checkpoint is written so you can `conductor resume` later, and the dashboard
   shows a **"Workflow Stopped"** banner with the checkpoint path (or a clear
   explanation if no checkpoint could be saved).
+- **Guide** sends mid-run guidance text (`POST /api/guidance`) to the running
+  workflow — applied at the next step boundary, or immediately if an agent is
+  currently paused (in which case it resumes with the guidance applied).
+  Unlike Stop/Kill, this does not pause or terminate anything — it corrects
+  the run's course without interrupting it. See
+  [`conductor guide`](#conductor-guide) below for the CLI equivalent.
+
+### Self-Exclusion
+
+`conductor stop` never targets the run it is executing inside by default — an
+agent smoke-testing this command must not terminate its own workflow (issue
+#399). This matters because nothing about a PID-file entry says "this is the
+workflow driving you" — an agent's `bash` tool, and any `conductor stop` it
+spawns, sits inside that very run's process tree, so a naive `stop` treats it
+as fair game just like any other run.
+
+The caller's own run is identified by three signals, tried in order (first
+match wins):
+
+1. **`CONDUCTOR_RUN_ID`** env var matching the PID file's `run_id`
+   (case-insensitively, since a manually-exported env var could differ in
+   case from the minted lowercase id). Set on every `--web-bg` child (and
+   inherited by its descendants, including a spawned `conductor stop`).
+2. **`CONDUCTOR_WEB_BG=1` + `CONDUCTOR_WEB_PORT`** matching the entry's port —
+   a compatibility signal used only for PID files written before `run_id`
+   existed (empty `run_id`).
+3. **Process ancestry** — a `/proc/<pid>/status` `PPid:` walk plus a session-id
+   check, so any descendant of the background process (however it was
+   re-parented) still resolves to it.
+
+Effects:
+
+- `conductor stop` (no flags) and `conductor stop --all` never stop your own
+  run; `--all` means "stop all *other* runs." If only your own run is alive,
+  both print a refusal and exit `0` (nothing was requested by name and
+  nothing failed).
+- `conductor stop --port <your own port>` is refused and exits `1`, naming
+  `--allow-self` as the remedy — here a specific target was named and
+  declined.
+- `conductor stop --allow-self [...]` restores the pre-#399 targeting exactly
+  (same processes, same counts), but now prints a yellow warning when the run
+  being stopped is your own.
+
+**Windows caveat**: process ancestry (signal 3) is POSIX-only. On Windows,
+self-identification relies solely on the `CONDUCTOR_RUN_ID` /
+`CONDUCTOR_WEB_BG`+`CONDUCTOR_WEB_PORT` env vars — an agent whose tool runner
+strips `CONDUCTOR_*` env vars before spawning its shell is still exposed.
+
+See [`conductor status`](#conductor-status) for a non-destructive way to see
+the full list of running workflows, including your own.
 
 ### Examples
 
@@ -306,8 +420,11 @@ conductor stop
 # Stop a specific workflow by port
 conductor stop --port 8080
 
-# Stop all running background workflows
+# Stop all other running background workflows
 conductor stop --all
+
+# Include the run this command is executing inside
+conductor stop --allow-self --port 8080
 ```
 
 ## `conductor gate respond`
@@ -366,6 +483,64 @@ CONDUCTOR_GATE_TOKEN=my-secret conductor gate respond -p 8080 -c approve
 | 0 | Gate resolved successfully |
 | 1 | Connection error, auth failure, validation error, or no gate waiting |
 
+## `conductor guide`
+
+Send mid-run guidance text to a workflow running with `--web` or `--web-bg`,
+without stopping it first. Useful for correcting course from an SSH session
+or any headless environment where the dashboard UI is unreachable.
+
+The guidance is applied at the next step boundary (before the next agent,
+parallel group, for-each group, script, set, or wait step), or immediately if
+an agent is currently paused (a dashboard **Stop**, or an Esc/Ctrl+G TTY
+interrupt) — in which case the agent resumes with the guidance applied.
+
+```bash
+conductor guide [OPTIONS]
+```
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--text TEXT` | `-t` | Guidance text to send to the running workflow (**required**) |
+| `--port PORT` | `-p` | Dashboard port of the running workflow (auto-discovered via `~/.conductor/runs/` if omitted) |
+| `--token SECRET` | | Auth token (also reads from `CONDUCTOR_GATE_TOKEN` env var) |
+
+### Auto-Discovery
+
+When `--port` is omitted, `conductor guide` scans `~/.conductor/runs/` for
+running background workflows (the same read-only mechanism `conductor
+status` uses). If exactly one is running, its port is used automatically. If
+none are running, or more than one is, the command prints the list and exits
+with code 1.
+
+### Authentication
+
+Uses the same `CONDUCTOR_GATE_TOKEN` mechanism as `conductor gate respond` —
+if the running workflow was launched with a gate token configured, requests
+without a matching token are rejected with HTTP 403.
+
+### Examples
+
+```bash
+# Auto-discover the running workflow's port
+conductor guide --text "Prefer Python 3.12 examples"
+
+# Target a specific dashboard port
+conductor guide --port 8080 --text "Skip the benchmark step"
+
+# Provide auth token via flag or environment variable
+conductor guide --text "Use the staging endpoint" --token my-secret
+CONDUCTOR_GATE_TOKEN=my-secret conductor guide --text "Use the staging endpoint"
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Guidance accepted |
+| 1 | Connection error, auth failure, validation error, no workflow running, or the workflow has already completed |
+
 ## `conductor checkpoint list`
 
 List saved workflow checkpoints (failure and periodic), newest first. Each row shows the workflow name, timestamp, trigger, the agent that was running (or about to run), the error type for failure checkpoints, and the checkpoint file path.
@@ -390,7 +565,10 @@ conductor checkpoint list
 conductor checkpoint list workflow.yaml
 ```
 
-Resume a failed run from its latest checkpoint with `conductor resume`.
+Resume a failed run from its latest checkpoint with `conductor resume`. Pass
+`--guidance "correction text"` (repeatable) to apply mid-run guidance to the
+restored context before the resumed agent runs — see
+[Mid-run guidance](#conductor-guide) above.
 
 > **Deprecated alias:** `conductor checkpoints` still works but prints a
 > deprecation warning and will be removed in a future release. Use
@@ -675,7 +853,7 @@ are hidden from `--help` and are slated for removal in a future release.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) and by `conductor guide` (checked by `POST /api/guidance`) when the workflow dashboard is started with a gate token |
 
 ## Exit Codes
 

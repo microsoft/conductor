@@ -913,6 +913,7 @@ class ClaudeProvider(AgentProvider):
                 tokens_used=total_usage.get("total_tokens"),
                 input_tokens=total_usage.get("request_tokens"),
                 output_tokens=total_usage.get("response_tokens"),
+                last_call_input_tokens=outcome.last_call_input_tokens,
                 partial=True,
                 model=model_name,
             )
@@ -930,6 +931,7 @@ class ClaudeProvider(AgentProvider):
             raw_response=outcome.result,
             usage=outcome.result.usage,
             model=model_name,
+            last_call_input_tokens=outcome.last_call_input_tokens,
         )
 
     def _model_name_from_pydantic_agent(self, pydantic_agent: Any) -> str:

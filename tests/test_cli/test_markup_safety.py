@@ -30,6 +30,7 @@ from unittest.mock import patch
 import pytest
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
 from conductor.cli import run as run_module
 
@@ -136,24 +137,31 @@ class TestFileConsoleRendersAgentTextSafely:
         assert "".join(MARKUP_TRIGGERS[0].split()) in written
 
 
-class TestConsoleSinkEscapesAgentText:
-    """The verbose console sink keeps markup for conductor's own styling, so
-    agent text must be escaped rather than the console de-featured."""
+class TestConsoleSinkRendersAgentTextSafely:
+    """The verbose console sink.
 
-    def test_escaped_content_does_not_raise_with_markup_enabled(self) -> None:
-        from rich.markup import escape
+    When #382 was fixed this console still parsed markup for conductor's own
+    ``[cyan]`` title, so the content had to be wrapped at the call site. Issue
+    #406 inverted that default — ``_verbose_console`` is now markup-free like
+    the file console — but the call-site wrapper is still what the tests here
+    pin, because it is what keeps the panel *body* exact.
+    """
 
+    def test_wrapped_content_does_not_raise_with_markup_enabled(self) -> None:
+        """The old mechanism, kept as the isolating case.
+
+        A ``Text`` is safe even on a console that still parses markup, so this
+        fails if the call-site wrapper is dropped on the assumption that
+        ``markup=False`` alone now covers it — which is true for the body but
+        not for a ``Panel`` title.
+        """
         buf = io.StringIO()
         console = _plain_console(buf, markup=True)
         for content in MARKUP_TRIGGERS:
-            console.print(Panel(escape(content), title="[cyan]Prompt[/cyan]", border_style="dim"))
+            console.print(Panel(Text(content), title=Text("Prompt"), border_style="dim"))
 
-    def test_verbose_section_escapes_before_rendering(self) -> None:
+    def test_verbose_section_renders_agent_text_intact(self) -> None:
         """Drive the real console path and assert it does not raise.
-
-        Without the ``Text`` wrapper at the call site this raises
-        ``MarkupError``, because ``_verbose_console`` deliberately keeps
-        ``markup=True`` for the ``[cyan]`` title.
 
         Deliberately no ``init_file_logging`` here. Pulling the file sink in
         costs the isolating signal: reverting ``markup=False`` alone would kill
@@ -232,9 +240,10 @@ class TestEveryVerboseSinkIsSafe:
 class TestExperimentalBannerIsNotMarkupInTheLog:
     """The banner prints one Panel to both consoles.
 
-    ``_file_console`` has ``markup=False``, so a markup-bearing string writes
-    its tags out literally -- a readability regression in the log file that no
-    existing test could observe, because they swap the console for a MagicMock.
+    Both are markup-free (the file console since #382, the verbose console
+    since #406), so a markup-bearing string writes its tags out literally --
+    a readability regression in the log file that no existing test could
+    observe, because they swap the console for a MagicMock.
     """
 
     def test_banner_is_styled_not_tagged_in_the_file_log(self, tmp_path: Path) -> None:

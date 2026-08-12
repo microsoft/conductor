@@ -817,7 +817,7 @@ class TestDryRunDisplayFunctions:
         from conductor.cli.run import format_routes
 
         routes = [{"to": "next_agent", "when": None, "is_conditional": False}]
-        result = format_routes(routes)
+        result = format_routes(routes).plain
         assert "next_agent" in result
         assert "if" not in result.lower()
 
@@ -826,7 +826,7 @@ class TestDryRunDisplayFunctions:
         from conductor.cli.run import format_routes
 
         routes = [{"to": "next_agent", "when": "output.success", "is_conditional": True}]
-        result = format_routes(routes)
+        result = format_routes(routes).plain
         assert "next_agent" in result
         assert "if" in result.lower()
 

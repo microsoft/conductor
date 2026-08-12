@@ -186,6 +186,7 @@ def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str,
         output_tokens=output.output_tokens,
         cache_read_tokens=output.cache_read_tokens,
         cache_write_tokens=output.cache_write_tokens,
+        last_call_input_tokens=output.last_call_input_tokens,
         partial=output.partial,
         session_seconds=session_seconds,
     ).model_dump(mode="json")

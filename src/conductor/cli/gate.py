@@ -7,9 +7,11 @@ from typing import Annotated, Any
 
 import httpx
 import typer
-from rich.console import Console
+from rich.text import Text
 
-console = Console(stderr=True)
+from conductor.console import make_console, styled
+
+console = make_console(stderr=True)
 
 gate_app = typer.Typer(
     name="gate",
@@ -99,7 +101,9 @@ def _gate_respond_impl(
             resp.raise_for_status()
             status = resp.json()
             if not status.get("waiting"):
-                console.print(f"[yellow]No gate is currently waiting on port {port}.[/yellow]")
+                console.print(
+                    styled("[yellow]No gate is currently waiting on port {}.[/yellow]", port)
+                )
                 raise typer.Exit(code=1)
             agent = status["agent_name"]
             # Echo the staleness token back. A questions node presents every
@@ -109,12 +113,17 @@ def _gate_respond_impl(
             prompt_id = status.get("prompt_id")
         except httpx.ConnectError:
             console.print(
-                f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
-                "Is the workflow running with --web or --web-bg?"
+                styled(
+                    "[bold red]Error:[/bold red] Cannot connect to dashboard on "
+                    "port {}. Is the workflow running with --web or --web-bg?",
+                    port,
+                )
             )
             raise typer.Exit(code=1) from None
         except httpx.HTTPError as exc:
-            console.print(f"[bold red]Error:[/bold red] Failed to query gate status: {exc}")
+            console.print(
+                styled("[bold red]Error:[/bold red] Failed to query gate status: {}", exc)
+            )
             raise typer.Exit(code=1) from None
 
     # Build request body
@@ -140,34 +149,47 @@ def _gate_respond_impl(
         resp = httpx.post(f"{base_url}/api/gate-respond", json=body, headers=headers, timeout=10)
     except httpx.ConnectError:
         console.print(
-            f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
-            "Is the workflow running with --web or --web-bg?"
+            styled(
+                "[bold red]Error:[/bold red] Cannot connect to dashboard on "
+                "port {}. Is the workflow running with --web or --web-bg?",
+                port,
+            )
         )
         raise typer.Exit(code=1) from None
     except httpx.HTTPError as exc:
-        console.print(f"[bold red]Error:[/bold red] Request failed: {exc}")
+        console.print(styled("[bold red]Error:[/bold red] Request failed: {}", exc))
         raise typer.Exit(code=1) from None
 
     if resp.status_code == 403:
         console.print(
-            "[bold red]Error:[/bold red] Authentication failed. "
-            "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
+            Text.from_markup(
+                "[bold red]Error:[/bold red] Authentication failed. "
+                "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
+            )
         )
         raise typer.Exit(code=1)
     if resp.status_code == 409:
         detail = resp.json().get("error", "Gate is not waiting for this response")
-        console.print(f"[bold red]Error:[/bold red] {detail}")
+        console.print(styled("[bold red]Error:[/bold red] {}", detail))
         raise typer.Exit(code=1)
     if resp.status_code == 422:
         detail = resp.json().get("error", "Validation error")
-        console.print(f"[bold red]Error:[/bold red] {detail}")
+        console.print(styled("[bold red]Error:[/bold red] {}", detail))
         raise typer.Exit(code=1)
     if resp.status_code != 200:
         console.print(
-            f"[bold red]Error:[/bold red] Unexpected response ({resp.status_code}): {resp.text}"
+            styled(
+                "[bold red]Error:[/bold red] Unexpected response ({}): {}",
+                resp.status_code,
+                resp.text,
+            )
         )
         raise typer.Exit(code=1)
 
     console.print(
-        f"[green]Gate resolved:[/green] agent=[cyan]{agent}[/cyan] choice=[cyan]{choice}[/cyan]"
+        styled(
+            "[green]Gate resolved:[/green] agent=[cyan]{}[/cyan] choice=[cyan]{}[/cyan]",
+            agent,
+            choice,
+        )
     )

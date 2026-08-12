@@ -35,6 +35,7 @@ from conductor.providers._pydantic_ai.events import (
     emit_output_recovery_event,
     emit_pydantic_event,
 )
+from conductor.providers._pydantic_ai.usage import last_request_input_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,9 @@ class RunOutcome:
         is_cancelled: Whether the run was cancelled (hard abort).
         total_usage: Aggregated token usage across all model calls in this
             helper. May be ``None`` when no usage information is available.
+        last_call_input_tokens: Prompt tokens of the most recent single API
+            call, for the context-window bar (issue #412) — distinct from
+            ``total_usage``, which aggregates the whole run.
     """
 
     result: AgentRunResult[Any] | None = None
@@ -87,6 +91,7 @@ class RunOutcome:
     is_partial: bool = False
     is_cancelled: bool = False
     total_usage: dict[str, Any] | None = None
+    last_call_input_tokens: int | None = None
 
 
 def _make_interrupt_message(has_output_schema: bool) -> UserPromptPart:
@@ -312,7 +317,11 @@ async def run_with_interrupt(
     final_result = run.result
     if final_result is None:
         raise RuntimeError("Pydantic AI run ended without a result")
-    return RunOutcome(result=final_result, total_usage=_usage_from_result(final_result))
+    return RunOutcome(
+        result=final_result,
+        total_usage=_usage_from_result(final_result),
+        last_call_input_tokens=last_request_input_tokens(final_result.all_messages()),
+    )
 
 
 async def _request_partial_output(
@@ -346,4 +355,5 @@ async def _request_partial_output(
         partial_output=result.output,
         is_partial=True,
         total_usage=_usage_from_result(result),
+        last_call_input_tokens=last_request_input_tokens(result.all_messages()),
     )

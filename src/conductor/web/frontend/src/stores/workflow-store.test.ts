@@ -992,3 +992,68 @@ describe('workflow-store — a counterpart event clears its latch', () => {
     expect(useWorkflowStore.getState().activeDialog).toBeNull();
   });
 });
+
+describe('workflow-store — context_pct clears when context_window_used is unmeasurable (#412)', () => {
+  it('agent_completed with a null context_window_used clears a previous iteration\'s context_pct', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('agent_started', { agent_name: 'writer', iteration: 1 }));
+    processEvent(event('agent_completed', {
+      agent_name: 'writer',
+      iteration: 1,
+      context_window_used: 500,
+      context_window_max: 1000,
+    }));
+
+    expect(useWorkflowStore.getState().nodes.writer?.context_pct).toBe(50);
+
+    processEvent(event('agent_started', { agent_name: 'writer', iteration: 2 }));
+    processEvent(event('agent_completed', {
+      agent_name: 'writer',
+      iteration: 2,
+      context_window_used: null,
+      context_window_max: 1000,
+    }));
+
+    expect(useWorkflowStore.getState().nodes.writer?.context_pct).toBeUndefined();
+  });
+
+  it('agent_started on a re-running node clears the prior context_pct', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('agent_started', { agent_name: 'writer', iteration: 1 }));
+    processEvent(event('agent_completed', {
+      agent_name: 'writer',
+      iteration: 1,
+      context_window_used: 500,
+      context_window_max: 1000,
+    }));
+    expect(useWorkflowStore.getState().nodes.writer?.context_pct).toBe(50);
+
+    processEvent(event('agent_started', { agent_name: 'writer', iteration: 2 }));
+
+    expect(useWorkflowStore.getState().nodes.writer?.context_pct).toBeUndefined();
+  });
+
+  it('parallel_agent_completed with a null context_window_used clears a previous context_pct', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('parallel_started', { group_name: 'team', agents: ['r1'] }));
+    processEvent(event('parallel_agent_completed', {
+      group_name: 'team',
+      agent_name: 'r1',
+      context_window_used: 500,
+      context_window_max: 1000,
+    }));
+    expect(useWorkflowStore.getState().nodes.r1?.context_pct).toBe(50);
+
+    processEvent(event('parallel_agent_completed', {
+      group_name: 'team',
+      agent_name: 'r1',
+      context_window_used: null,
+      context_window_max: 1000,
+    }));
+
+    expect(useWorkflowStore.getState().nodes.r1?.context_pct).toBeUndefined();
+  });
+});
