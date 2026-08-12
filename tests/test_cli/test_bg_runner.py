@@ -1,6 +1,6 @@
 """Tests for ``conductor.cli.bg_runner``.
 
-Covers two issues that landed together:
+Covers three issues that landed together:
 
 - **#195 / Windows job breakaway**: ``_detachment_kwargs`` returns the right
   kwargs for POSIX vs Windows; ``_spawn_detached`` happy path requests
@@ -14,6 +14,12 @@ Covers two issues that landed together:
   stderr/stdout log files — log-file creation, env-var wiring,
   error-message threading, handle cleanup, and the ``_sanitize_name`` helper
   used to build the log filename.
+- **#410 / two-stage readiness contract**: ``_wait_for_server``'s early-exit
+  detection via ``proc.poll()``, the ``StartProbe`` enum and
+  ``_wait_for_workflow_start``'s polling loop, ``_resolve_start_timeout``'s
+  env-var parsing, ``_tail_log``'s bounded tail, and
+  ``_finalize_background_launch``'s reworked control flow — see the
+  "Issue #410" section below.
 
 Neither group of tests actually spawns a child process. ``subprocess.Popen``
 is patched in every test so nothing leaks into the test runner.
@@ -777,6 +783,65 @@ class TestTailLog:
         assert bg_runner._tail_log(log) == ""
 
 
+class TestProbeWorkflowInfo:
+    """``_probe_workflow_info``'s narrowed exception handling (issue #410 follow-up).
+
+    Only connection/timeout/HTTP-status errors and JSON-decode failures are
+    "not ready yet" — an unexpected exception type must not be silently
+    folded into the same bucket, or a persistent bug in this function would
+    be indistinguishable from normal startup latency for the caller's full
+    wait window.
+    """
+
+    def test_connect_error_returns_none(self) -> None:
+        import httpx
+
+        with patch("httpx.get", side_effect=httpx.ConnectError("refused")):
+            assert bg_runner._probe_workflow_info(9440) is None
+
+    def test_http_status_error_returns_none(self) -> None:
+        import httpx
+
+        with patch("httpx.get") as get:
+            get.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "not found", request=MagicMock(), response=MagicMock(status_code=404)
+            )
+            assert bg_runner._probe_workflow_info(9441) is None
+
+    def test_non_json_body_returns_none(self) -> None:
+        with patch("httpx.get") as get:
+            get.return_value.raise_for_status.return_value = None
+            get.return_value.json.side_effect = ValueError("not json")
+            assert bg_runner._probe_workflow_info(9442) is None
+
+    def test_non_dict_body_returns_none(self) -> None:
+        with patch("httpx.get") as get:
+            get.return_value.raise_for_status.return_value = None
+            get.return_value.json.return_value = [1, 2, 3]
+            assert bg_runner._probe_workflow_info(9443) is None
+
+    def test_unexpected_exception_logged_at_warning_not_debug(self, caplog: Any) -> None:
+        """A bug in this function must not masquerade as 'still starting'."""
+        import logging
+
+        with (
+            patch("httpx.get", side_effect=TypeError("boom")),
+            caplog.at_level(logging.WARNING, logger="conductor.cli.bg_runner"),
+        ):
+            result = bg_runner._probe_workflow_info(9444)
+
+        assert result is None
+        assert any(
+            "unexpected TypeError" in record.getMessage() for record in caplog.records
+        )
+
+    def test_valid_dict_body_passed_through(self) -> None:
+        with patch("httpx.get") as get:
+            get.return_value.raise_for_status.return_value = None
+            get.return_value.json.return_value = {"pid": 1, "started_at": 5.0}
+            assert bg_runner._probe_workflow_info(9445) == {"pid": 1, "started_at": 5.0}
+
+
 class TestWaitForWorkflowStart:
     """``_wait_for_workflow_start`` outcome coverage via ``_probe_workflow_info``."""
 
@@ -1133,3 +1198,100 @@ class TestSpawnBgChildPropagatesWorkflowStarted:
             )
 
         assert launch.workflow_started is True
+
+
+class TestSpawnBgChildPropagatesStillRunning:
+    """``_spawn_bg_child`` re-checks ``proc.poll()`` for ``BackgroundLaunch.still_running``.
+
+    ``_finalize_background_launch`` returns bare ``True`` for both a
+    genuinely-still-running child and one that already exited cleanly (issue
+    #410) — see its docstring. ``still_running`` is what lets a caller (e.g.
+    ``cli/app.py``) tell those two apart without printing a live dashboard
+    URL for an already-exited process.
+    """
+
+    def test_still_running_true_when_child_alive(self, tmp_path: Path) -> None:
+        wf_path = _write_workflow(tmp_path)
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = 1
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.STARTED
+            ),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9432,
+            )
+
+        assert launch.still_running is True
+        assert launch.workflow_started is True
+
+    def test_still_running_false_when_child_exited_during_stage_two(
+        self, tmp_path: Path
+    ) -> None:
+        """A workflow that completes during stage-two must not look 'running'."""
+        wf_path = _write_workflow(tmp_path)
+        fake_proc = MagicMock()
+        fake_proc.pid = 1
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            return fake_proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.cli.pid.write_pid_file"),
+            patch.object(
+                bg_runner,
+                "_wait_for_workflow_start",
+                return_value=bg_runner.StartProbe.CHILD_EXITED,
+            ),
+        ):
+            # The child is alive when write_pid_file runs, then exits cleanly
+            # by the time _finalize_background_launch re-checks proc.poll().
+            fake_proc.poll.return_value = 0
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9433,
+            )
+
+        assert launch.still_running is False
+        # A clean exit within the wait window is still a success.
+        assert launch.workflow_started is True
+
+    def test_still_running_false_on_early_clean_exit(self, tmp_path: Path) -> None:
+        """A sub-second workflow that exits before the port ever opens."""
+        wf_path = _write_workflow(tmp_path)
+        fake_proc = MagicMock()
+        fake_proc.pid = 1
+        fake_proc.poll.return_value = 0
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            return fake_proc
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_wait_for_server", return_value=False),
+            patch("conductor.cli.pid.write_pid_file") as mock_write,
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9434,
+            )
+
+        assert launch.still_running is False
+        assert launch.workflow_started is True
+        mock_write.assert_not_called()
+

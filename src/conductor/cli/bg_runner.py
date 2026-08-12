@@ -220,6 +220,18 @@ class BackgroundLaunch:
             child still alive but not yet reporting a start; callers should
             surface this as a "still initializing" note rather than a
             failure — see issue #410.
+        still_running: Whether the child process was still alive when the
+            launcher finished waiting. ``True`` in the common case (the
+            workflow is a genuine long-running background run). ``False``
+            when the child completed (exit code 0) inside the launcher's
+            wait window — either before the port opened or during the
+            stage-two workflow-start probe. This is deliberately a separate
+            field from ``workflow_started``: a clean sub-second run makes
+            both ``True``, but callers must not report a URL/"running in
+            background" for a process that has already exited (issue #410)
+            — printing that message unconditionally on ``workflow_started``
+            alone would reintroduce a narrower form of the same false-success
+            bug this PR fixes.
 
     Invariants (enforced in ``__post_init__``):
         * ``run_id`` is exactly 8 lowercase hex characters.
@@ -235,6 +247,7 @@ class BackgroundLaunch:
     stdout_log: Path
     run_id: str
     workflow_started: bool = True
+    still_running: bool = True
 
     def __post_init__(self) -> None:
         if not _RUN_ID_PATTERN_LOCAL.fullmatch(self.run_id):
@@ -485,9 +498,14 @@ def _probe_workflow_info(port: int) -> dict[str, Any] | None:
 
     Returns:
         The parsed JSON body when the request succeeds, returns a 2xx status,
-        and decodes to a dict. ``None`` on any exception, non-2xx response,
-        or non-dict body (logged at debug — a single failed probe is
-        expected and not actionable on its own).
+        and decodes to a dict. ``None`` on a connection/timeout/HTTP-status
+        failure or a non-dict body (logged at debug — a single failed probe
+        is expected while the child is still starting up and not actionable
+        on its own). An exception outside that expected set (a bug in this
+        function, or a body large enough to raise on decode) is logged at
+        *warning* instead of being folded into the same "not ready yet"
+        bucket — a genuinely broken probe must not be indistinguishable from
+        normal startup latency for the caller's full wait window.
     """
     import httpx
 
@@ -495,8 +513,26 @@ def _probe_workflow_info(port: int) -> dict[str, Any] | None:
         resp = httpx.get(f"http://127.0.0.1:{port}/api/info", timeout=1.0)
         resp.raise_for_status()
         info = resp.json()
-    except Exception as exc:  # noqa: BLE001 - a failed probe just means "not ready yet"
+    except httpx.HTTPError as exc:
+        # Connection refused/reset, timeout, or a non-2xx status (including a
+        # foreign, non-Conductor process answering the port) — all expected
+        # "not ready yet" outcomes for a dashboard that hasn't bound the port
+        # or started serving yet.
         logger.debug("Workflow-start probe on port %s failed: %s", port, exc)
+        return None
+    except ValueError as exc:
+        # ``.json()`` raises a ``JSONDecodeError`` (a ``ValueError`` subclass)
+        # on a non-JSON body — plausible from the same foreign-process case
+        # above. Still just "not ready yet" from this caller's perspective.
+        logger.debug("Workflow-start probe on port %s returned unparseable JSON: %s", port, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - see docstring: log loudly, don't hide a real bug
+        logger.warning(
+            "Workflow-start probe on port %s failed with an unexpected %s: %s",
+            port,
+            type(exc).__name__,
+            exc,
+        )
         return None
     return info if isinstance(info, dict) else None
 
@@ -798,12 +834,22 @@ def _spawn_bg_child(
         # objects can be released without affecting the child.
         _close_quietly(stderr_handle, stdout_handle)
 
+    # ``_finalize_background_launch`` returns bare ``True`` for a clean
+    # (exit code 0) completion it observed *during* its own wait, in
+    # addition to the common "genuinely still running" case — see its
+    # docstring. ``proc`` is still in hand here, so re-check it directly
+    # rather than widening that function's return type: this is what lets
+    # ``BackgroundLaunch.still_running`` distinguish the two without callers
+    # printing a live dashboard URL for an already-exited process (#410).
+    still_running = proc.poll() is None
+
     return BackgroundLaunch(
         url=f"http://127.0.0.1:{web_port}",
         stderr_log=stderr_path,
         stdout_log=stdout_path,
         run_id=run_id,
         workflow_started=workflow_started,
+        still_running=still_running,
     )
 
 

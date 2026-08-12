@@ -1729,6 +1729,17 @@ async def run_workflow_async(
                         styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
                     )
             except Exception as e:
+                if bg_mode:
+                    # In a ``--web-bg`` child, silently continuing without a
+                    # dashboard would leave the port never reachable, which
+                    # the launcher's own probe (``bg_runner._wait_for_server``)
+                    # interprets as either a false success (fast workflow) or
+                    # a reason to kill an otherwise-healthy long-running
+                    # workflow (issue #410) — neither of which reports the
+                    # real cause. Propagate instead so the child exits
+                    # non-zero and the launcher's existing "process exited"
+                    # path surfaces this actual error via the stderr log.
+                    raise RuntimeError(f"Dashboard failed to start: {e}") from e
                 _verbose_console.print(
                     styled(
                         "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
@@ -2479,6 +2490,15 @@ async def resume_workflow_async(
                             styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
                         )
                 except Exception as e:
+                    if bg_mode:
+                        # Same reasoning as run_workflow_async: silently
+                        # continuing without a dashboard in a ``--web-bg``
+                        # child leaves the port never reachable, which the
+                        # launcher's probe reads as either a false success
+                        # or a reason to kill an otherwise-healthy resumed
+                        # workflow (issue #410). Propagate so the child
+                        # exits non-zero with the real cause.
+                        raise RuntimeError(f"Dashboard failed to start: {e}") from e
                     _verbose_console.print(
                         styled(
                             "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
