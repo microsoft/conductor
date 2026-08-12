@@ -32,17 +32,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import TYPE_CHECKING, cast
 
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Static
 
 from conductor.config.schema import InputDef
 from conductor.console import styled
 from conductor.fleet.launch import LaunchError, ResolvedWorkflow, launch_workflow, resolve_workflow
+
+if TYPE_CHECKING:
+    # The app module imports this screen module, so a top-level import of
+    # FleetApp here would cycle (same reason runs.py defers it).
+    from conductor.fleet.tui.app import FleetApp
 
 logger = logging.getLogger(__name__)
 
@@ -59,22 +65,26 @@ def _default_to_raw(input_def: InputDef) -> str:
     return str(input_def.default)
 
 
-def _field_label(name: str, input_def: InputDef) -> Text:
-    """Render a form field's label: name, a required marker, and its
-    description (E12-T3) -- mirrors the field set ``conductor show`` /
-    the Registries drill-down's inputs screen already render.
+def _field_heading(name: str, input_def: InputDef) -> Text:
+    """Render a form field's heading: name, declared type, required marker.
 
-    ``name`` and ``input_def.description`` are data, not authored Rich
-    markup, so the label is built as a ``Text`` -- a value containing e.g.
-    ``[/red]`` renders as literal text instead of raising ``MarkupError``,
-    without routing it through ``rich.markup.escape`` (which is not
-    byte-exact and cannot round-trip a backslash before a bracket).
+    Deliberately excludes the description, which is rendered as its own
+    wrapping line below (see :meth:`NewRunScreen._rebuild_input_fields`).
+    Appending a workflow's prose to this line is what made the form
+    unreadable: a real description runs to several hundred characters, and
+    a heading is laid out ``width: auto``, so it extended past the right
+    edge and took the field's own name off screen with it.
+
+    ``name`` is data, not authored Rich markup, so the heading is built as
+    a ``Text`` -- a value containing e.g. ``[/red]`` renders as literal
+    text instead of raising ``MarkupError``, without routing it through
+    ``rich.markup.escape`` (which is not byte-exact and cannot round-trip
+    a backslash before a bracket).
     """
-    text = Text(f"{name} ({input_def.type})")
+    text = Text(name, style="bold")
+    text.append(f"  {input_def.type}", style="dim")
     if input_def.required:
-        text.append(" *")
-    if input_def.description:
-        text.append(f" — {input_def.description}")
+        text.append("  required", style="italic yellow")
     return text
 
 
@@ -82,10 +92,106 @@ class NewRunScreen(Screen):
     """Resolve a workflow reference, render its inputs as a form, and
     launch it in the background (E12)."""
 
+    DEFAULT_CSS = """
+    NewRunScreen {
+        /* Every rule here exists because its absence was visible: with no
+           CSS at all, Textual laid every widget out `width: auto`, so a
+           label ran off the right edge instead of wrapping, a Checkbox with
+           no label collapsed to a truncated "X…", nothing had spacing, and
+           the Launch button sat below a full-height scroller rather than
+           where it could be seen. */
+        layout: vertical;
+    }
+
+    #ref-row {
+        height: auto;
+        padding: 1 2 0 2;
+    }
+
+    #workflow-ref {
+        width: 1fr;
+    }
+
+    #resolve-button {
+        width: auto;
+        min-width: 12;
+        margin-left: 1;
+    }
+
+    #resolve-message {
+        height: auto;
+        padding: 0 2;
+    }
+
+    #input-fields {
+        /* 1fr, so the field list absorbs the spare space and the launch bar
+           below it stays on screen instead of being pushed off. */
+        height: 1fr;
+        padding: 1 2;
+    }
+
+    .field {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    .field-heading {
+        width: 100%;
+    }
+
+    .field-description {
+        /* width: 100% is what makes a long description wrap rather than
+           run off the right edge -- the defect that made this form
+           unreadable. */
+        width: 100%;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    .field-widget {
+        width: 100%;
+    }
+
+    Checkbox.field-widget {
+        /* auto, not 100%: a full-width checkbox draws its focus rule across
+           the whole screen. It is legible because it now carries its own
+           label (an unlabelled Checkbox is the "X…" blob). */
+        width: auto;
+    }
+
+    #launch-bar {
+        height: auto;
+        padding: 0 2 1 2;
+    }
+
+    #launch-button {
+        width: auto;
+        min-width: 12;
+    }
+
+    #launch-message {
+        height: auto;
+        padding: 0 2;
+    }
+
+    #empty-inputs {
+        color: $text-muted;
+    }
+    """
+
     BINDINGS = [("escape", "back", "Back")]
 
-    def __init__(self) -> None:
+    def __init__(self, initial_ref: str | None = None) -> None:
+        """
+        Args:
+            initial_ref: A workflow reference to pre-fill and resolve on
+                mount. Passed by the Registries drill-down so ``n`` on a
+                workflow launches *that* workflow instead of dropping the
+                user on an empty form to retype a reference they just
+                navigated through.
+        """
         super().__init__()
+        self._initial_ref = initial_ref
         self._resolved: ResolvedWorkflow | None = None
         self._input_widgets: dict[str, Input | Checkbox] = {}
         self._widget_names: dict[Input | Checkbox, str] = {}
@@ -113,20 +219,32 @@ class NewRunScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield VerticalScroll(
-            Label("Workflow (file path or registry reference):"),
+        yield Horizontal(
             Input(
-                placeholder="e.g. ./my-workflow.yaml or qa-bot@my-registry",
+                placeholder="Workflow: ./my-workflow.yaml or qa-bot@my-registry",
                 id="workflow-ref",
             ),
             Button("Resolve", id="resolve-button", variant="primary"),
-            Static(id="resolve-message"),
-            Vertical(id="input-fields"),
-            Button("Launch", id="launch-button", variant="success", disabled=True),
-            Static(id="launch-message"),
-            id="new-run-form",
+            id="ref-row",
         )
+        yield Static(id="resolve-message")
+        yield VerticalScroll(id="input-fields")
+        yield Horizontal(
+            Button("Launch", id="launch-button", variant="success", disabled=True),
+            id="launch-bar",
+        )
+        yield Static(id="launch-message")
         yield Footer()
+
+    def on_mount(self) -> None:
+        """Focus the reference field, pre-filling and resolving it when the
+        caller supplied one (the Registries drill-down's ``n``)."""
+        ref_input = self.query_one("#workflow-ref", Input)
+        if self._initial_ref:
+            ref_input.value = self._initial_ref
+            self.action_resolve()
+        else:
+            ref_input.focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Pressing Enter in the workflow-reference field resolves it,
@@ -183,11 +301,13 @@ class NewRunScreen(Screen):
         self.query_one("#launch-message", Static).update("")
 
         if not ref:
-            message.update("[red]Enter a workflow path or registry reference.[/red]")
+            message.update(
+                Text.from_markup("[red]Enter a workflow path or registry reference.[/red]")
+            )
             await self._rebuild_input_fields({})
             return
 
-        message.update("[dim]Resolving…[/dim]")
+        message.update(Text.from_markup("[dim]Resolving…[/dim]"))
         try:
             resolved = await asyncio.to_thread(resolve_workflow, ref)
         except LaunchError as e:
@@ -208,45 +328,84 @@ class NewRunScreen(Screen):
         await self._rebuild_input_fields(resolved.inputs)
         launch_button.disabled = False
 
+        # Land the cursor on the first field (or Launch, for an input-less
+        # workflow) so the form is immediately usable from the keyboard.
+        first_widget = next(iter(self._input_widgets.values()), None)
+        if first_widget is not None:
+            first_widget.focus()
+        else:
+            launch_button.focus()
+
     async def _rebuild_input_fields(self, inputs: dict[str, InputDef]) -> None:
-        """Replace the input-fields container's children with one
-        label + widget pair per declared input, defaults pre-filled
-        (E12-T3)."""
-        container = self.query_one("#input-fields", Vertical)
+        """Replace the input-fields container's children with one field block
+        per declared input, defaults pre-filled (E12-T3).
+
+        Each block is a ``.field`` container holding a heading, an optional
+        wrapping description line, and the widget itself -- rather than the
+        single run-on label this used to emit, which put a workflow's entire
+        prose description on the same unwrappable line as its field name.
+        """
+        container = self.query_one("#input-fields", VerticalScroll)
         await container.remove_children()
         self._input_widgets = {}
         self._widget_names = {}
         self._checkbox_touched = set()
 
-        widgets: list[Label | Input | Checkbox] = []
+        if not inputs:
+            if self._resolved is not None:
+                # A workflow with no declared inputs is a normal, launchable
+                # state, not an error -- say so rather than showing a blank
+                # panel that reads as "still loading".
+                await container.mount(
+                    Static(
+                        Text("This workflow declares no inputs — press Launch to run it."),
+                        id="empty-inputs",
+                    )
+                )
+            return
+
+        blocks: list[Vertical] = []
         for index, (name, input_def) in enumerate(inputs.items()):
-            widgets.append(Label(_field_label(name, input_def)))
             # An opaque, index-based id -- a declared input name (e.g.
             # "user.email" or "full name") is schema-valid but not a legal
             # Textual widget identifier, which would raise BadIdentifier.
             # The real name is retained via ``_input_widgets``/``_widget_names``.
             widget_id = f"input-{index}"
+            widget: Input | Checkbox
             if input_def.type == "boolean":
                 has_default = input_def.default is not None
-                checkbox = Checkbox(
+                # The name is carried as the Checkbox's own label: an
+                # unlabelled Checkbox renders as a bare, truncated "X…" with
+                # nothing to say which field it belongs to.
+                widget = Checkbox(
+                    Text(name),
                     value=bool(input_def.default) if has_default else False,
                     id=widget_id,
+                    classes="field-widget",
                 )
-                widgets.append(checkbox)
-                self._input_widgets[name] = checkbox
-                self._widget_names[checkbox] = name
                 if has_default:
                     # A declared default is already a legitimate value --
                     # only an untouched, default-less checkbox stays unset.
                     self._checkbox_touched.add(name)
             else:
-                field_input = Input(value=_default_to_raw(input_def), id=widget_id)
-                widgets.append(field_input)
-                self._input_widgets[name] = field_input
-                self._widget_names[field_input] = name
+                widget = Input(
+                    value=_default_to_raw(input_def),
+                    id=widget_id,
+                    classes="field-widget",
+                )
 
-        if widgets:
-            await container.mount_all(widgets)
+            self._input_widgets[name] = widget
+            self._widget_names[widget] = name
+
+            children: list[Label | Static | Input | Checkbox] = [
+                Label(_field_heading(name, input_def), classes="field-heading")
+            ]
+            if input_def.description:
+                children.append(Static(Text(input_def.description), classes="field-description"))
+            children.append(widget)
+            blocks.append(Vertical(*children, classes="field"))
+
+        await container.mount_all(blocks)
 
     def _raw_value_for(self, name: str) -> str:
         """Read a form widget's current value as the raw string
@@ -294,7 +453,7 @@ class NewRunScreen(Screen):
             return
 
         message = self.query_one("#launch-message", Static)
-        message.update("[dim]Launching…[/dim]")
+        message.update(Text.from_markup("[dim]Launching…[/dim]"))
         raw_values = {name: self._raw_value_for(name) for name in resolved.inputs}
 
         try:
@@ -311,6 +470,9 @@ class NewRunScreen(Screen):
         # Success: hand off to the Runs screen, whose own poll timer will
         # pick up the new (already-discoverable, per D2) run record --
         # this screen never tracks the launched run itself (viewer, not
-        # supervisor).
-        self.app.pop_screen()
-        self.app.notify(f"Launched: {launch.url}")
+        # supervisor). Unwinds to Runs rather than popping one level: this
+        # screen can also be reached from two levels inside the Registries
+        # drill-down, where a single pop would land back on a workflow's
+        # inputs with the just-started run nowhere in sight.
+        cast("FleetApp", self.app).return_to_runs()
+        self.app.notify(f"Launched: {launch.url}", markup=False)

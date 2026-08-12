@@ -67,7 +67,7 @@ class FleetApp(App):
         """
         self.push_screen(RegistriesScreen())
 
-    def push_new_run(self) -> None:
+    def push_new_run(self, initial_ref: str | None = None) -> None:
         """Push the New-run screen (E12) onto the screen stack.
 
         Mirrors :meth:`push_registries`'s centralization rationale (E12-T4)
@@ -76,8 +76,16 @@ class FleetApp(App):
         back to Runs itself on both ``escape`` and a successful launch,
         reusing the same stack; the newly-launched run then appears via
         the Runs screen's own next poll tick.
+
+        Args:
+            initial_ref: A workflow reference to pre-fill and resolve on
+                mount. Passed by the Registries drill-down's own ``n``
+                binding, so launching the workflow you are already looking
+                at does not mean retyping a reference you just navigated
+                through. Omitted (``None``) for the Runs screen's ``n``,
+                which starts from an empty form.
         """
-        self.push_screen(NewRunScreen())
+        self.push_screen(NewRunScreen(initial_ref))
 
     def push_history(self) -> None:
         """Push the History screen (E14) onto the screen stack.
@@ -89,3 +97,26 @@ class FleetApp(App):
         stack.
         """
         self.push_screen(HistoryScreen())
+
+    def return_to_runs(self) -> None:
+        """Unwind the screen stack back to the Runs (home) screen.
+
+        A successful launch pops *to Runs* rather than popping one level,
+        because the New-run screen can be reached from more than one depth:
+        directly from Runs (``n``), or from two levels inside the Registries
+        drill-down (its own ``n``). Popping a single screen from the latter
+        lands back on a workflow's inputs, where the run that was just
+        started is nowhere to be seen -- the opposite of the hand-off this
+        is supposed to make ("the new run appears on the Runs screen's next
+        poll tick").
+
+        Pops by count rather than looping on ``screen_stack[-1]`` so a
+        stack that somehow contains no ``RunsScreen`` cannot spin forever;
+        in that case nothing is popped.
+        """
+        stack = self.screen_stack
+        for depth, screen in enumerate(stack):
+            if isinstance(screen, RunsScreen):
+                for _ in range(len(stack) - depth - 1):
+                    self.pop_screen()
+                return

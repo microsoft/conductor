@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING, cast
 
 from rich.text import Text
 from textual import work
@@ -42,6 +43,11 @@ from conductor.console import styled
 from conductor.providers.diagnostics import RegistryDiagnostic, gather_registries
 from conductor.registry.config import RegistryEntry, get_registry
 from conductor.registry.index import RegistryIndex, load_index
+
+if TYPE_CHECKING:
+    # The app module imports this screen module, so a top-level import of
+    # FleetApp here would cycle (same reason runs.py defers it).
+    from conductor.fleet.tui.app import FleetApp
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +140,10 @@ class RegistriesScreen(Screen):
 class RegistryWorkflowsScreen(Screen):
     """Workflows listed in one registry's index (E11-T2)."""
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        ("escape", "back", "Back"),
+        ("n", "new_run", "Run"),
+    ]
 
     def __init__(self, registry_name: str) -> None:
         super().__init__()
@@ -221,6 +230,24 @@ class RegistryWorkflowsScreen(Screen):
             )
         )
 
+    def action_new_run(self) -> None:
+        """Launch the highlighted workflow -- bound to ``n``.
+
+        Uses the same key the Runs screen binds to New Run, acting on the
+        highlighted row the way ``k``/``g`` do there. The reference is
+        rebuilt as ``<workflow>@<registry>`` (``registry/resolver.py``'s
+        own syntax), so the New-run screen resolves it through the
+        ordinary path rather than being handed a pre-fetched file.
+        """
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        wf_name = row_key.value
+        if wf_name is None:
+            return
+        cast("FleetApp", self.app).push_new_run(f"{wf_name}@{self._registry_name}")
+
 
 # ---------------------------------------------------------------------------
 # A workflow's inputs
@@ -234,7 +261,10 @@ class WorkflowInputsScreen(Screen):
     ``conductor show``'s Inputs table (``cli/app.py``) exactly.
     """
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        ("escape", "back", "Back"),
+        ("n", "new_run", "Run"),
+    ]
 
     def __init__(self, *, registry_name: str, entry: RegistryEntry, workflow_name: str) -> None:
         super().__init__()
@@ -246,6 +276,16 @@ class WorkflowInputsScreen(Screen):
         """Pop back to the workflows screen -- bound to ``escape``. Only
         one level unwinds per press, matching the real screen stack."""
         self.app.pop_screen()
+
+    def action_new_run(self) -> None:
+        """Launch this workflow -- bound to ``n``.
+
+        The inputs listed on this screen are exactly the form the New-run
+        screen renders, so this is the natural place to act on them:
+        without it, the user has to escape back out of the drill-down and
+        retype a reference they just navigated through.
+        """
+        cast("FleetApp", self.app).push_new_run(f"{self._workflow_name}@{self._registry_name}")
 
     def compose(self) -> ComposeResult:
         yield Header()

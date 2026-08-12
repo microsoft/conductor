@@ -96,7 +96,10 @@ stack rather than each managing its own navigation state.
   one level at a time. A malformed registry config is reported as an
   error, not silently presented as "no registries." Index/workflow loading
   can hit the network for a GitHub-backed registry, so it is always an
-  explicit action, never on the poll timer.
+  explicit action, never on the poll timer. Pressing `n` on either of the
+  two deeper screens opens **New run** with that workflow's reference
+  already filled in and resolved, so launching what you are looking at
+  does not mean escaping back out and retyping it.
 - **New run** (`n`) — enter a file path or registry reference, resolve it,
   and fill in a form generated from the workflow's declared `input:`
   block (required fields marked, defaults pre-filled, descriptions shown).
@@ -136,6 +139,11 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `h` | History |
 | `q` | Quit |
 | `escape` | Back (on any drill-down screen) |
+
+Inside the Registries drill-down, `n` runs the highlighted (or currently
+displayed) workflow rather than starting from an empty form. A launch
+started from there returns to Runs — not to the screen it was launched
+from — since that is where the new run actually shows up.
 
 Kill always confirms — even a single `k` — per the design's *What
 single-user removes*: "Kill-all safety interlocks | No risk of killing

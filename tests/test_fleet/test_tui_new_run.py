@@ -159,6 +159,22 @@ class TestNewRunNavigation:
 # ---------------------------------------------------------------------------
 
 
+def _form_text(screen) -> str:
+    """Flatten every heading/description line the rendered form shows.
+
+    Each input is now a ``.field`` container holding a heading, an optional
+    description, and the widget -- so the direct children of
+    ``#input-fields`` are containers, not the labels themselves, and have
+    nothing renderable of their own to assert against.
+    """
+    parts: list[str] = []
+    for widget in screen.query(".field-heading"):
+        parts.append(str(widget.render()))
+    for widget in screen.query(".field-description"):
+        parts.append(str(widget.render()))
+    return "\n".join(parts)
+
+
 class TestNewRunForm:
     async def test_form_renders_from_resolved_inputs(
         self, fleet_env: Path, fixture_workflow: Path
@@ -191,10 +207,9 @@ class TestNewRunForm:
             await _goto_new_run(pilot)
             await _resolve(pilot, fixture_workflow)
 
-            fields_container = app.screen.query_one("#input-fields")
-            text = "\n".join(str(w.render()) for w in fields_container.children)
+            text = _form_text(app.screen)
             assert "question" in text
-            assert "*" in text  # required marker
+            assert "required" in text  # required marker
 
     async def test_unresolvable_reference_shows_error_and_disables_launch(
         self, fleet_env: Path, tmp_path: Path
@@ -379,8 +394,7 @@ class TestNewRunMarkupSafety:
             # Resolving and rendering the form raised no MarkupError, and
             # the already-rendered label contains the literal source text
             # rather than having "[/red]"/"[/bold]" interpreted as markup.
-            fields_container = app.screen.query_one("#input-fields")
-            text = "\n".join(str(w.render()) for w in fields_container.children)
+            text = _form_text(app.screen)
             assert "[/red]evil description[/bold]" in text
 
 

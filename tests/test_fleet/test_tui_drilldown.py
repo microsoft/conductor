@@ -18,13 +18,15 @@ E10-T5:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from textual.widgets import DataTable, Static
+from textual.widgets import Button, DataTable, Input, Static
 
 from conductor.fleet.tui.app import FleetApp
+from conductor.fleet.tui.screens.new_run import NewRunScreen
 from conductor.fleet.tui.screens.providers import ProvidersScreen
 from conductor.fleet.tui.screens.registries import (
     RegistriesScreen,
@@ -1023,3 +1025,99 @@ agents:
 
             assert row[3].plain == "[/bold]evil default[/red]"
             assert row[4].plain == "[/bold]evil description[/red]"
+
+
+# ---------------------------------------------------------------------------
+# Launching a registry workflow with `n`
+# ---------------------------------------------------------------------------
+
+
+class TestRunFromRegistryDrilldown:
+    """`n` launches the workflow you are looking at, from either drill-down
+    level, instead of making you escape out and retype a reference you just
+    navigated through."""
+
+    async def test_n_on_workflows_list_opens_prefilled_new_run(self, fleet_env: Path) -> None:
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("n")
+            await pilot.pause()
+
+            assert isinstance(app.screen, NewRunScreen)
+            assert app.screen.query_one("#workflow-ref", Input).value == "test-workflow@my-reg"
+
+    async def test_n_on_inputs_screen_opens_prefilled_new_run(self, fleet_env: Path) -> None:
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, WorkflowInputsScreen)
+
+            await pilot.press("n")
+            await pilot.pause()
+
+            assert isinstance(app.screen, NewRunScreen)
+            assert app.screen.query_one("#workflow-ref", Input).value == "test-workflow@my-reg"
+
+    async def test_prefilled_reference_resolves_into_a_form(self, fleet_env: Path) -> None:
+        """The pre-filled reference is resolved on mount, so the user lands on
+        a usable form rather than on a filled box they still have to submit."""
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("n")
+
+            for _ in range(50):
+                await pilot.pause()
+                if isinstance(app.screen, NewRunScreen) and app.screen._input_widgets:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert isinstance(app.screen, NewRunScreen)
+            assert set(app.screen._input_widgets) == {"question", "verbose"}
+            assert app.screen.query_one("#launch-button", Button).disabled is False
+
+    async def test_return_to_runs_unwinds_the_whole_drilldown(self, fleet_env: Path) -> None:
+        """A launch started three levels deep hands back to Runs, where the new
+        run is actually visible -- popping one screen would land on a
+        workflow's inputs instead."""
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            await pilot.press("n")
+            await pilot.pause()
+
+            assert isinstance(app.screen, NewRunScreen)
+
+            app.return_to_runs()
+            await pilot.pause()
+
+            assert isinstance(app.screen, RunsScreen)
