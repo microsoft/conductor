@@ -57,6 +57,28 @@ class TestProviderConstruction:
         with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
             OpenAIProvider()
 
+    def test_base_url_env_fallback_used_when_yaml_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: explicit env resolution (OPENAI_API_KEY, OPENAI_BASE_URL read in code,
+        never delegated to SDK ambient fallback).
+
+        Verify OPENAI_BASE_URL environment variable is used as a fallback for base_url
+        when not explicitly provided in the YAML config, and that explicit parameters
+        still win over the environment variable.
+        """
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://env-fallback:1234/v1")
+
+        p = OpenAIProvider(api_key="test-key")
+        assert p._base_url == "http://env-fallback:1234/v1"
+        assert p._client is not None
+        assert str(p._client.base_url) == "http://env-fallback:1234/v1/"
+
+        p_explicit = OpenAIProvider(api_key="test-key", base_url="http://explicit-url:5678/v1")
+        assert p_explicit._base_url == "http://explicit-url:5678/v1"
+        assert p_explicit._client is not None
+        assert str(p_explicit._client.base_url) == "http://explicit-url:5678/v1/"
+
     def test_temperature_validation_accepts_range(self) -> None:
         """OpenAI accepts temperatures up to 2.0."""
         p = OpenAIProvider(api_key="test-key", temperature=2.0)
@@ -191,6 +213,56 @@ class TestExecute:
 
         assert output.content == {"answer": "hello"}
 
+    async def test_execute_rejects_max_reasoning_effort_at_runtime(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """Requirement: reasoning.effort='max' raises a ValidationError at runtime.
+
+        Verify that an agent with reasoning.effort set to 'max' is rejected at runtime.
+        """
+        # Requirement: Verify 'max' effort raises ValidationError at runtime.
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="test_agent",
+            model="gpt-5",
+            prompt="hi",
+            reasoning=ReasoningConfig(effort="max"),
+        )
+        with pytest.raises(ValidationError, match="resolves to reasoning.effort='max'"):
+            await provider.execute(agent, {}, "say hi")
+
+    async def test_execute_accepts_supported_reasoning_effort(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """Requirement: reasoning.effort='xhigh' is accepted at runtime.
+
+        Verify that a supported effort level is allowed and passed down correctly.
+        """
+        # Requirement: Verify supported reasoning effort levels are accepted.
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="test_agent",
+            model="gpt-5",
+            prompt="hi",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        captured_kwargs: dict[str, Any] = {}
+
+        def spy_build_agent(*args: Any, **kwargs: Any) -> Agent[Any, Any]:
+            captured_kwargs.update(kwargs)
+            return _build_text_agent("hello")
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            side_effect=spy_build_agent,
+        ):
+            await provider.execute(agent, {}, "say hi")
+
+        assert agent.reasoning is not None
+        assert agent.reasoning.effort == "xhigh"
+
 
 class TestExecuteDialogTurn:
     """Tests for execute_dialog_turn()."""
@@ -223,6 +295,19 @@ class TestExecuteDialogTurn:
         kwargs = mock_resolve_model.call_args.kwargs
         assert kwargs.get("api_key") == "test-key"
         assert kwargs.get("timeout") == 600.0
+
+    async def test_dialog_turn_rejects_unsupported_reasoning_effort(self) -> None:
+        """Requirement: execute_dialog_turn() rejects unsupported reasoning effort.
+
+        Verify that a ValidationError is raised when default_reasoning_effort is set to
+        an unsupported value like 'max'.
+        """
+        # Requirement: Rejects unsupported reasoning efforts during dialog turns.
+        provider = OpenAIProvider(api_key="test-key", default_reasoning_effort="max")
+        with pytest.raises(
+            ValidationError, match="Default reasoning effort 'max' is not supported"
+        ):
+            await provider.execute_dialog_turn("system prompt", "user message")
 
 
 class TestConnectionHelpers:

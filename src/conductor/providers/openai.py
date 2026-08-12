@@ -34,7 +34,7 @@ from conductor.providers.base import (
     ModelCapabilityInfo,
 )
 from conductor.providers.capabilities import ProviderCapabilities
-from conductor.providers.reasoning import ReasoningEffort
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
     from conductor.engine.pricing import ModelPricing
@@ -223,6 +223,9 @@ class OpenAIProvider(AgentProvider):
         self._mcp_servers_config = mcp_servers
         self._mcp_managers: dict[str, MCPManager] = {}
         self._mcp_manager_locks: dict[str, asyncio.Lock] = {}
+
+        if self._base_url is None:
+            self._base_url = os.environ.get("OPENAI_BASE_URL")
 
         self._initialize_client()
 
@@ -485,6 +488,18 @@ class OpenAIProvider(AgentProvider):
         model_settings["max_tokens"] = max_tokens
 
         if self._default_reasoning_effort is not None:
+            assert self.CAPABILITIES is not None
+            supported = self.CAPABILITIES.reasoning_effort
+            if supported is None or self._default_reasoning_effort not in supported:
+                supported_list = sorted(supported) if supported else []
+                raise ValidationError(
+                    f"Default reasoning effort {self._default_reasoning_effort!r} is not supported "
+                    f"by the OpenAI provider. Supported efforts: {supported_list}.",
+                    suggestion=(
+                        "Choose a supported reasoning effort level, or use the "
+                        "Copilot or Claude provider for 'max'."
+                    ),
+                )
             model_settings["openai_reasoning_effort"] = self._default_reasoning_effort
 
         try:
@@ -560,6 +575,22 @@ class OpenAIProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories, custom_agents, extra_mcp_servers
+
+        effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        if effort is not None:
+            assert self.CAPABILITIES is not None
+            supported = self.CAPABILITIES.reasoning_effort
+            if supported is None or effort not in supported:
+                raise ValidationError(
+                    f"Agent {agent.name!r} resolves to reasoning.effort={effort!r}, "
+                    f"but the OpenAI provider supports only "
+                    f"{sorted(supported) if supported else []}.",
+                    suggestion=(
+                        "Choose a supported reasoning effort level, or use the "
+                        "Copilot or Claude provider for 'max'."
+                    ),
+                )
+
         from conductor.providers._pydantic_ai.agent_builder import build_agent
         from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
         from conductor.providers._pydantic_ai.runner import run_agent_pipeline

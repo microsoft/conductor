@@ -1844,6 +1844,7 @@ skill* — but the mechanism and its cost differ:
 | `claude-agent-sdk` | owning plugin registered, skill enabled by `<plugin>:<skill>` | progressive |
 | `claude` | eager injection into the rendered prompt | **full body on every call** |
 | `hermes` | eager injection into the rendered prompt | **full body on every call** |
+| `openai` | eager injection into the rendered prompt | **full body on every call** |
 | `aca` | not supported (`skills=False`) — rejected by `conductor validate` and by the executor at run time | n/a |
 
 Two consequences worth knowing:
