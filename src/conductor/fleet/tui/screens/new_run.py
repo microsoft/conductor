@@ -39,7 +39,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Static
+from textual.widgets import Checkbox, Footer, Header, Input, Label, Static
 
 from conductor.config.schema import InputDef
 from conductor.console import styled
@@ -112,11 +112,6 @@ class NewRunScreen(Screen):
         width: 1fr;
     }
 
-    #resolve-button {
-        width: auto;
-        min-width: 12;
-        margin-left: 1;
-    }
 
     #resolve-message {
         height: auto;
@@ -159,14 +154,10 @@ class NewRunScreen(Screen):
         width: auto;
     }
 
-    #launch-bar {
+    #form-hint {
         height: auto;
-        padding: 0 2 1 2;
-    }
-
-    #launch-button {
-        width: auto;
-        min-width: 12;
+        padding: 0 2;
+        color: $text-muted;
     }
 
     #launch-message {
@@ -179,7 +170,19 @@ class NewRunScreen(Screen):
     }
     """
 
-    BINDINGS = [("escape", "back", "Back")]
+    # Two blocky buttons used to carry these actions: a primary "Resolve"
+    # floating at the top right and a "Launch" stranded below a full-height
+    # scroller. Both are keystrokes now -- Enter already resolved the
+    # reference, so the Resolve button was a second way to do what the
+    # field itself did, and a form whose submit control is off the bottom
+    # of its own scroll region is worse than one you submit from anywhere.
+    # Control keys (not bare letters) because a text input has focus for
+    # most of this screen's life and would otherwise swallow them.
+    BINDINGS = [
+        ("escape", "back", "Back"),
+        ("ctrl+r", "resolve", "Resolve"),
+        ("ctrl+s", "launch", "Launch"),
+    ]
 
     def __init__(self, initial_ref: str | None = None) -> None:
         """
@@ -217,6 +220,25 @@ class NewRunScreen(Screen):
         """Pop back to the Runs screen -- bound to ``escape``."""
         self.app.pop_screen()
 
+    def _update_hint(self) -> None:
+        """Refresh the line that says what this screen is waiting for.
+
+        Replaces the affordance the Launch button used to carry through its
+        ``disabled`` state: with no button, "you cannot launch yet" has to
+        be said in words, and saying *why* is more useful than a greyed-out
+        control was.
+        """
+        hint = self.query_one("#form-hint", Static)
+        if self._resolved is None:
+            hint.update(
+                Text.from_markup(
+                    "[dim]Enter a workflow reference above, then press "
+                    "[/dim]enter[dim] to resolve it.[/dim]"
+                )
+            )
+            return
+        hint.update(Text.from_markup("[dim]Press [/dim]ctrl+s[dim] to launch this workflow.[/dim]"))
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Horizontal(
@@ -224,21 +246,18 @@ class NewRunScreen(Screen):
                 placeholder="Workflow: ./my-workflow.yaml or qa-bot@my-registry",
                 id="workflow-ref",
             ),
-            Button("Resolve", id="resolve-button", variant="primary"),
             id="ref-row",
         )
         yield Static(id="resolve-message")
         yield VerticalScroll(id="input-fields")
-        yield Horizontal(
-            Button("Launch", id="launch-button", variant="success", disabled=True),
-            id="launch-bar",
-        )
+        yield Static(id="form-hint")
         yield Static(id="launch-message")
         yield Footer()
 
     def on_mount(self) -> None:
         """Focus the reference field, pre-filling and resolving it when the
         caller supplied one (the Registries drill-down's ``n``)."""
+        self._update_hint()
         ref_input = self.query_one("#workflow-ref", Input)
         if self._initial_ref:
             ref_input.value = self._initial_ref
@@ -251,16 +270,6 @@ class NewRunScreen(Screen):
         mirroring the "Resolve" button."""
         if event.input.id == "workflow-ref":
             self.action_resolve()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "resolve-button":
-            self.action_resolve()
-        elif event.button.id == "launch-button":
-            if self._launching:
-                return
-            self._launching = True
-            event.button.disabled = True
-            self.action_launch()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         """Mark a boolean input as explicitly set once the user toggles it
@@ -293,8 +302,7 @@ class NewRunScreen(Screen):
         self._resolve_generation += 1
         generation = self._resolve_generation
         self._resolved = None
-        launch_button = self.query_one("#launch-button", Button)
-        launch_button.disabled = True
+        self._update_hint()
 
         ref = self.query_one("#workflow-ref", Input).value.strip()
         message = self.query_one("#resolve-message", Static)
@@ -326,15 +334,13 @@ class NewRunScreen(Screen):
         self._resolved = resolved
         message.update(styled("[green]Resolved:[/green] {}", resolved.name))
         await self._rebuild_input_fields(resolved.inputs)
-        launch_button.disabled = False
+        self._update_hint()
 
-        # Land the cursor on the first field (or Launch, for an input-less
-        # workflow) so the form is immediately usable from the keyboard.
+        # Land the cursor on the first field so the form is immediately
+        # usable from the keyboard.
         first_widget = next(iter(self._input_widgets.values()), None)
         if first_widget is not None:
             first_widget.focus()
-        else:
-            launch_button.focus()
 
     async def _rebuild_input_fields(self, inputs: dict[str, InputDef]) -> None:
         """Replace the input-fields container's children with one field block
@@ -442,15 +448,20 @@ class NewRunScreen(Screen):
         re-enabled here only on failure -- on success the screen pops away
         entirely, so there is nothing left to re-enable.
         """
-        resolved = self._resolved
-        launch_button = self.query_one("#launch-button", Button)
-        if resolved is None:
-            # Defensive: Launch is disabled whenever there is no resolved
-            # workflow, so this should be unreachable in practice. Reset the
-            # click guard but leave the button disabled -- there is nothing
-            # valid to launch.
-            self._launching = False
+        if self._launching:
+            # A second ctrl+s while a launch is in flight would start a
+            # duplicate (billable) run. This guard used to live on the
+            # button's `disabled` state; with no button it belongs here.
             return
+
+        resolved = self._resolved
+        if resolved is None:
+            self.query_one("#launch-message", Static).update(
+                Text.from_markup("[yellow]Resolve a workflow first (ctrl+r).[/yellow]")
+            )
+            return
+
+        self._launching = True
 
         message = self.query_one("#launch-message", Static)
         message.update(Text.from_markup("[dim]Launching…[/dim]"))
@@ -464,7 +475,6 @@ class NewRunScreen(Screen):
             logger.warning("Failed to launch workflow %s", resolved.path, exc_info=True)
             message.update(styled("[red]{}[/red]", str(e)))
             self._launching = False
-            launch_button.disabled = False
             return
 
         # Success: hand off to the Runs screen, whose own poll timer will

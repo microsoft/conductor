@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from textual.widgets import Button, DataTable, Input, Static
+from textual.widgets import DataTable, Input, Static
 
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.new_run import NewRunScreen
@@ -1097,7 +1097,7 @@ class TestRunFromRegistryDrilldown:
 
             assert isinstance(app.screen, NewRunScreen)
             assert set(app.screen._input_widgets) == {"question", "verbose"}
-            assert app.screen.query_one("#launch-button", Button).disabled is False
+            assert app.screen._resolved is not None  # launchable
 
     async def test_return_to_runs_unwinds_the_whole_drilldown(self, fleet_env: Path) -> None:
         """A launch started three levels deep hands back to Runs, where the new

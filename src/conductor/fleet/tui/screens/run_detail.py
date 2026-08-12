@@ -30,16 +30,28 @@ from textual.widgets import DataTable, Footer, Header, Static
 from conductor.console import styled
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import AgentDetail, RunSummary, derive_run_detail, derive_run_summary
+from conductor.fleet.tui.theme import muted, status_label
 
 logger = logging.getLogger(__name__)
 
 
-_STATUS_LABELS: dict[str, str] = {
-    "pending": "pending",
-    "running": "▶ running",
-    "completed": "✓ completed",
-    "failed": "✗ failed",
-}
+def _agent_status_cell(status: str) -> Text:
+    """Render an agent's status, deferring to the shared vocabulary.
+
+    ``pending`` is rendered dim here rather than added to the shared map:
+    it describes a step that has not started, which is an agent-level idea
+    with no run-level equivalent, so putting it in the run-status
+    vocabulary would make that map mean two different things.
+    """
+    if status == _PENDING_STATUS:
+        return muted(status)
+    return status_label(status)
+
+
+# Agent-status badges/colours come from `tui/theme.py` (shared with Runs and
+# History). "pending" is local: it is an agent-level state with no run-level
+# counterpart, so it has no entry in the shared run-status vocabulary.
+_PENDING_STATUS = "pending"
 
 _PLACEHOLDER_TEXT = (
     "[bold]No topology available for this run.[/bold]\n\n"
@@ -233,7 +245,7 @@ class RunDetailScreen(Screen):
         table.add_row(
             name_cell,
             agent.type,
-            _STATUS_LABELS.get(agent.status, agent.status),
+            _agent_status_cell(agent.status),
             _format_duration(agent.elapsed_seconds()),
             _format_agent_tokens(agent.tokens),
             _format_agent_cost(agent.cost_usd),

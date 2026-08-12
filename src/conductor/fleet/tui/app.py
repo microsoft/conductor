@@ -26,8 +26,106 @@ class FleetApp(App):
 
     TITLE = "Conductor Fleet"
 
+    DEFAULT_THEME = "tokyo-night"
+    """Applied in :meth:`on_mount`, **not** as a ``theme = ...`` class
+    attribute: ``App.theme`` is a Textual ``reactive``, and assigning a
+    plain string in the class body replaces that descriptor outright. The
+    app still starts up looking themed, but nothing watches the attribute
+    any more -- so picking a theme from the command palette silently does
+    nothing. Set it on the instance instead, which goes *through* the
+    reactive and leaves the palette working."""
+
+    CSS = """
+    /* ------------------------------------------------------------------
+       App-level design system.
+
+       Five of the six screens previously carried no CSS at all, so Textual
+       laid them out with raw defaults: tables flush against column 0, no
+       spacing between sections, and every cell the same visual weight as
+       its neighbours. These rules are deliberately app-level rather than
+       per-screen -- the defect was that styling was per-screen (and so
+       mostly absent), not that any one screen was styled wrongly.
+       ------------------------------------------------------------------ */
+
+    /* No `background:` here on purpose. Setting `$surface` painted every
+       screen in the theme's *elevated* colour (nord: #3B4252) rather than
+       its base background (#2E3440), which is what made the whole app look
+       hazy -- a flat mid-grey with dim text on top of it. Screens default
+       to `$background`; the surface colour is for things that sit on top. */
+
+    /* Tables carry the app's data, so they get the padding the raw default
+       lacks, and inherit the screen background rather than imposing their
+       own lighter one. */
+    DataTable {
+        background: transparent;
+        scrollbar-size-vertical: 1;
+    }
+
+    DataTable > .datatable--header {
+        background: transparent;
+        color: $text-accent;
+        text-style: bold;
+    }
+
+    DataTable > .datatable--cursor {
+        background: $primary 30%;
+        color: $text;
+        text-style: bold;
+    }
+
+    /* A screen's title bar: where you are, in one line, styled once here
+       rather than re-invented per drill-down. */
+    .screen-title {
+        width: 100%;
+        padding: 0 2;
+        background: $panel;
+        color: $text;
+        text-style: bold;
+    }
+
+    /* The summary strip beneath a title (counts, totals). Muted, so it
+       reads as context rather than as another row of data. */
+    .summary-bar {
+        width: 100%;
+        height: auto;
+        padding: 0 2;
+        color: $text-muted;
+    }
+
+    /* A bordered region that groups related content -- the treatment that
+       makes a table read as a panel rather than as loose text. */
+    .panel {
+        border: round $primary 40%;
+        padding: 0 1;
+        margin: 0 1;
+    }
+
+    /* Body text that is context rather than content. */
+    .muted {
+        color: $text-muted;
+    }
+
+    /* Empty states: centred and padded, rather than a paragraph abandoned
+       in the top-left corner of an otherwise blank screen. */
+    .empty-state {
+        width: 100%;
+        height: 1fr;
+        content-align: center middle;
+        padding: 2 4;
+        color: $text-muted;
+    }
+
+    /* An inline error/notice line under a table or form. */
+    .notice {
+        width: 100%;
+        height: auto;
+        padding: 0 2;
+    }
+    """
+
     def on_mount(self) -> None:
-        """Push the Runs (home) screen onto the app's screen stack at startup."""
+        """Apply the default theme and push the Runs (home) screen (E7-T3)."""
+        self.theme = self.DEFAULT_THEME
         self.push_screen(RunsScreen())
 
     def push_run_detail(self, record: RunRecord) -> None:

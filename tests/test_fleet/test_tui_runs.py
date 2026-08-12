@@ -38,6 +38,12 @@ def _event(etype: str, data: dict[str, Any] | None = None, *, ts: float | None =
     )
 
 
+def _write_events(path: Path, lines: list[str]) -> Path:
+    """Write serialized JSONL event lines to ``path``."""
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 @pytest.fixture()
 def fleet_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect both the run-record directory and the legacy ``.pid`` directory.
@@ -140,7 +146,7 @@ class TestRunsScreenTable:
             table = app.screen.query_one(DataTable)
 
             assert table.row_count == 2
-            workflows = {table.get_row_at(i)[0] for i in range(table.row_count)}
+            workflows = {str(table.get_row_at(i)[0]) for i in range(table.row_count)}
             assert any("alpha" in w for w in workflows)
             assert any("beta" in w for w in workflows)
 
@@ -396,7 +402,7 @@ class TestGateDetailMarkupSafety:
             table.move_cursor(row=0)
             await pilot.pause()
 
-            panel = app.screen.query_one("#gate-detail", Static)
+            panel = app.screen.query_one("#run-preview", Static)
             assert panel.display is True
             text = str(panel.render())
             assert "[/red]evil agent[/bold]" in text
@@ -486,3 +492,141 @@ class TestGateResolveDuplicateGuard:
                 await pilot.pause(0.3)
 
         assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Summary bar and preview pane
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryBar:
+    """The fleet-wide line above the table: what previously could only be
+    learned by counting rows by eye."""
+
+    async def test_counts_are_grouped_by_status(self, fleet_env: Path, tmp_path: Path) -> None:
+        _write_record(tmp_path, "aaaa0001", workflow_name="one")
+        _write_record(tmp_path, "aaaa0002", workflow_name="two")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = str(app.screen.query_one("#summary-bar", Static).render())
+            assert "2 running" in bar
+
+    async def test_empty_fleet_says_so_rather_than_zero(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = str(app.screen.query_one("#summary-bar", Static).render())
+            assert "no runs" in bar
+            assert "0 " not in bar
+
+    async def test_totals_appear_once_a_run_has_usage(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "usage.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "a"}),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "a", "tokens": 124226, "cost_usd": 0.65},
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0003", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = str(app.screen.query_one("#summary-bar", Static).render())
+            assert "124k tok" in bar
+            assert "$0.65" in bar
+
+
+class TestPreviewPane:
+    """The pane that reclaims the space a short table used to leave empty."""
+
+    async def test_hidden_when_nothing_is_running(self, fleet_env: Path) -> None:
+        """An empty bordered pane would only crowd the empty state's own
+        launch hint."""
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.query_one("#preview-pane").display is False
+
+    async def test_shows_the_selected_run(self, fleet_env: Path, tmp_path: Path) -> None:
+        _write_record(tmp_path, "aaaa0004", workflow_name="alpha", port=8410, mode="bg")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane = app.screen.query_one("#preview-pane")
+            assert pane.display is True
+            text = str(app.screen.query_one("#run-preview", Static).render())
+            assert "alpha" in text
+            # Facts the one-line table row has no column for.
+            assert str(os.getpid()) in text
+            assert "8410" in text
+
+    async def test_lists_the_workflow_topology(self, fleet_env: Path, tmp_path: Path) -> None:
+        """Showing the run's steps is what makes the preview worth reading
+        rather than a restatement of the row above it."""
+        log = tmp_path / "topo.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event(
+                    "workflow_started",
+                    {
+                        "workflow_name": "wf",
+                        "entry_point": "first",
+                        "agents": [
+                            {"name": "first", "type": "agent"},
+                            {"name": "second", "type": "agent"},
+                        ],
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0005", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = str(app.screen.query_one("#run-preview", Static).render())
+            assert "first" in text
+            assert "second" in text
+
+    async def test_open_gate_is_surfaced_without_drilling_in(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "gate.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event(
+                    "gate_presented",
+                    {
+                        "agent_name": "planner",
+                        "gate_id": "g1",
+                        "prompt": "Approve the plan?",
+                        "options": ["approve", "revise"],
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0006", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = str(app.screen.query_one("#run-preview", Static).render())
+            assert "Approve the plan?" in text
+            assert "approve" in text

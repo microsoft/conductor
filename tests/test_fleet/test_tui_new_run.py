@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from textual.widgets import Button, DataTable, Input, Static
+from textual.widgets import DataTable, Input, Static
 
 from conductor.fleet.launch import LaunchError
 from conductor.fleet.records import RunRecord, write_run_record
@@ -102,7 +102,7 @@ async def _resolve(pilot, path: Path) -> None:
     """Type ``path`` into the workflow-reference field and resolve it."""
     ref_input = pilot.app.screen.query_one("#workflow-ref", Input)
     ref_input.value = str(path)
-    await pilot.click("#resolve-button")
+    await pilot.press("ctrl+r")
     await pilot.pause(0.3)
 
 
@@ -196,8 +196,7 @@ class TestNewRunForm:
             retries_input = app.screen._input_widgets["retries"]
             assert retries_input.value == "3"  # default pre-filled
 
-            launch_button = app.screen.query_one("#launch-button", Button)
-            assert launch_button.disabled is False
+            assert app.screen._resolved is not None  # launchable
 
     async def test_required_field_marked_in_label(
         self, fleet_env: Path, fixture_workflow: Path
@@ -222,8 +221,7 @@ class TestNewRunForm:
             message = app.screen.query_one("#resolve-message", Static)
             assert "not found" in str(message.render()).lower()
 
-            launch_button = app.screen.query_one("#launch-button", Button)
-            assert launch_button.disabled is True
+            assert app.screen._resolved is None  # not launchable
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +248,7 @@ class TestNewRunSubmission:
             verbose_checkbox = app.screen._input_widgets["verbose"]
             verbose_checkbox.value = True
 
-            await pilot.click("#launch-button")
+            await pilot.press("ctrl+s")
             await pilot.pause(0.3)
 
         launch_mock.assert_called_once()
@@ -281,7 +279,7 @@ class TestNewRunSubmission:
             question_input = app.screen._input_widgets["question"]
             question_input.value = "What is Python?"
 
-            await pilot.click("#launch-button")
+            await pilot.press("ctrl+s")
             await pilot.pause(0.3)
 
             assert isinstance(app.screen, RunsScreen)
@@ -311,7 +309,7 @@ class TestNewRunSubmission:
             await _resolve(pilot, fixture_workflow)
             # Leave the required "question" field blank.
 
-            await pilot.click("#launch-button")
+            await pilot.press("ctrl+s")
             await pilot.pause(0.3)
 
             message = app.screen.query_one("#launch-message", Static)
@@ -341,7 +339,7 @@ class TestNewRunSubmission:
             question_input = app.screen._input_widgets["question"]
             question_input.value = "What is Python?"
 
-            await pilot.click("#launch-button")
+            await pilot.press("ctrl+s")
             await pilot.pause(0.3)
 
             message = app.screen.query_one("#launch-message", Static)
@@ -495,7 +493,7 @@ class TestNewRunRequiredBooleanUnset:
                 await _resolve(pilot, required_boolean_workflow)
                 # Leave the required "confirm" checkbox untouched.
 
-                await pilot.click("#launch-button")
+                await pilot.press("ctrl+s")
                 await pilot.pause(0.3)
 
                 message = app.screen.query_one("#launch-message", Static)
@@ -521,7 +519,7 @@ class TestNewRunRequiredBooleanUnset:
             await pilot.click(checkbox)
             await pilot.pause()
 
-            await pilot.click("#launch-button")
+            await pilot.press("ctrl+s")
             await pilot.pause(0.3)
 
         launch_mock.assert_called_once()
@@ -533,7 +531,7 @@ class TestNewRunRequiredBooleanUnset:
 
 
 class TestNewRunLaunchGuard:
-    async def test_launch_button_disabled_immediately_on_click(
+    async def test_second_launch_keystroke_does_not_start_a_duplicate_run(
         self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A second, rapid click must not start a duplicate (potentially
@@ -565,16 +563,15 @@ class TestNewRunLaunchGuard:
             question_input = app.screen._input_widgets["question"]
             question_input.value = "What is Python?"
 
-            launch_button = app.screen.query_one("#launch-button", Button)
-            await pilot.click("#launch-button")
+            await pilot.press("ctrl+s")
             await pilot.pause()
 
-            # Disabled synchronously -- before the still in-flight launch
+            # Flagged synchronously -- before the still in-flight launch
             # worker has finished.
-            assert launch_button.disabled is True
+            assert app.screen._launching is True
 
-            # A second click while disabled must not start a second launch.
-            await pilot.click("#launch-button")
+            # A second keystroke while in flight must not start a second launch.
+            await pilot.press("ctrl+s")
             await pilot.pause()
 
             release_launch.set()
@@ -594,25 +591,23 @@ class TestNewRunResolveRace:
     ) -> None:
         """Starting a new resolve must synchronously invalidate the
         previously resolved workflow and disable Launch -- Launch must
-        never be clickable while resolution against a new reference is
+        never be launchable while resolution against a new reference is
         still in flight."""
         app = FleetApp()
         async with app.run_test() as pilot:
             await _goto_new_run(pilot)
             await _resolve(pilot, fixture_workflow)
 
-            launch_button = app.screen.query_one("#launch-button", Button)
-            assert launch_button.disabled is False
+            assert app.screen._resolved is not None  # launchable
 
             ref_input = app.screen.query_one("#workflow-ref", Input)
             ref_input.value = str(tmp_path / "does-not-exist.yaml")
-            await pilot.click("#resolve-button")
+            await pilot.press("ctrl+r")
             # No pause() yet -- assert immediately after the click is
             # dispatched (the resolve worker's synchronous prefix has run,
             # invalidating the prior result before the network-capable
             # part of the resolve is awaited).
-            assert launch_button.disabled is True
-            assert app.screen._resolved is None
+            assert app.screen._resolved is None  # not launchable
             await pilot.pause(0.3)
 
     async def test_out_of_order_resolve_does_not_overwrite_newer_result(
@@ -648,11 +643,11 @@ class TestNewRunResolveRace:
 
                 ref_input = app.screen.query_one("#workflow-ref", Input)
                 ref_input.value = str(fixture_workflow)
-                await pilot.click("#resolve-button")
+                await pilot.press("ctrl+r")
                 await pilot.pause(0.3)
 
                 ref_input.value = str(dotted_name_workflow)
-                await pilot.click("#resolve-button")
+                await pilot.press("ctrl+r")
                 await pilot.pause(1.5)
 
                 assert app.screen._resolved is not None

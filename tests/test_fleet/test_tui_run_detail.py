@@ -264,8 +264,8 @@ class TestRunDetailTopologyRows:
             # The running agent's row is visually marked (E9-T2) -- distinct
             # from a not-yet-started agent's row.
             assert "▶" in researcher_row[0] or "bold" in researcher_row[0]
-            assert "running" in researcher_row[2].lower()
-            assert "pending" in writer_row[2].lower()
+            assert "running" in str(researcher_row[2]).lower()
+            assert "pending" in str(writer_row[2]).lower()
 
     async def test_completed_agent_shows_elapsed_tokens_cost(
         self, fleet_env: Path, tmp_path: Path
@@ -297,7 +297,7 @@ class TestRunDetailTopologyRows:
 
             table = app.screen.query_one(DataTable)
             row = table.get_row_at(0)
-            assert "completed" in row[2].lower()
+            assert "completed" in str(row[2]).lower()
             assert "12" in row[3]
             assert "500" in row[4] or "tok" in row[4]
             assert "0.05" in row[5]
@@ -429,7 +429,7 @@ class TestRunDetailPolling:
 
             table = app.screen.query_one(DataTable)
             row = table.get_row_at(0)
-            assert "running" in row[2].lower()
+            assert "running" in str(row[2]).lower()
 
             with log_path.open("a") as f:
                 f.write(
@@ -451,7 +451,7 @@ class TestRunDetailPolling:
             await pilot.pause()
 
             row = table.get_row_at(0)
-            assert "completed" in row[2].lower()
+            assert "completed" in str(row[2]).lower()
             assert "300" in row[4] or "tok" in row[4]
 
     async def test_recovers_from_placeholder_once_workflow_started_arrives(

@@ -32,14 +32,15 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from conductor.fleet.history import HistoryEntry, build_history_entries
+from conductor.fleet.tui.theme import status_label
 
 logger = logging.getLogger(__name__)
 
-_OUTCOME_LABELS: dict[str, str] = {
-    "completed": "✓ completed",
-    "failed": "✗ failed",
-    "unknown": "? unknown",
-}
+# Outcome badges/colours come from `tui/theme.py`, shared with the Runs and
+# run-detail screens -- previously each defined its own glyph map, so the
+# same run could read differently depending on which screen showed it, and
+# none of them carried colour (a wall of "unknown" rows landed with the same
+# weight as a failure).
 
 _EMPTY_STATE_TEXT = (
     "[bold]No run history yet.[/bold]\n\n"
@@ -183,7 +184,7 @@ class HistoryScreen(Screen):
         """Add one history entry's row: workflow, outcome, duration, tokens, cost."""
         table.add_row(
             Text(entry.workflow_name),
-            _OUTCOME_LABELS.get(entry.outcome, entry.outcome),
+            status_label(entry.outcome),
             _format_duration(entry.duration_seconds),
             _format_tokens(entry.total_tokens),
             _format_cost(entry),
