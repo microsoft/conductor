@@ -1788,8 +1788,22 @@ def _request_graceful_kill(port: int) -> bool:
     """
     import httpx
 
+    from conductor.web.auth import resolve_cli_token
+
+    # POST /api/kill is a mutating route protected by OriginHostGuard (issue
+    # #397): it needs both the resolved token and a JSON Content-Type, even
+    # though the request body itself is empty. A stale/missing token here
+    # just means this rung of the stop ladder degrades — the caller already
+    # falls through to signal-based termination on any failure.
+    token = resolve_cli_token(port, None)
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+
     try:
-        resp = httpx.post(f"http://127.0.0.1:{port}/api/kill", timeout=_IDENTITY_TIMEOUT)
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/api/kill", headers=headers, timeout=_IDENTITY_TIMEOUT
+        )
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001 - fall through to the next rung
         logger.debug("POST /api/kill on port %s failed: %s", port, exc)

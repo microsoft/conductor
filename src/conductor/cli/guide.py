@@ -9,13 +9,12 @@ command is actually modeled on it.
 
 from __future__ import annotations
 
-import os
-
 import httpx
 import typer
 from rich.text import Text
 
 from conductor.console import make_console, styled
+from conductor.web.auth import resolve_cli_token
 
 console = make_console(stderr=True)
 
@@ -60,7 +59,9 @@ def guide_impl(text: str, port: int | None, token: str | None) -> None:
         resolved_port = running[0]["port"]
 
     base_url = f"http://127.0.0.1:{resolved_port}"
-    resolved_token = token or os.environ.get("CONDUCTOR_GATE_TOKEN")
+    # Resolve token: flag > CONDUCTOR_GATE_TOKEN env var > the per-run token
+    # file written by WebDashboard.start() (issue #397).
+    resolved_token = resolve_cli_token(resolved_port, token)
 
     headers: dict[str, str] = {}
     if resolved_token is not None:
@@ -87,7 +88,8 @@ def guide_impl(text: str, port: int | None, token: str | None) -> None:
         console.print(
             Text.from_markup(
                 "[bold red]Error:[/bold red] Authentication failed. "
-                "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
+                "Provide a valid token with --token, CONDUCTOR_GATE_TOKEN env var, "
+                "or the auto-discovered token file in ~/.conductor/runs/."
             )
         )
         raise typer.Exit(code=1)

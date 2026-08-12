@@ -659,11 +659,28 @@ class TestIdentityConfirmation:
 class TestGracefulKillRequest:
     """Rung 1 talks to the run's own dashboard."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_runs_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Point the token-file lookup at tmp_path (issue #397).
+
+        ``_request_graceful_kill`` resolves a token via
+        ``conductor.web.auth.resolve_cli_token``, which reads
+        ``conductor.rundir.runs_dir()`` when no flag/env token is set.
+        Without this, these tests would read the developer's real
+        ``~/.conductor/runs``.
+        """
+        runs_dir = tmp_path / "runs"
+        runs_dir.mkdir()
+        monkeypatch.setattr("conductor.rundir.runs_dir", lambda: runs_dir)
+
     def test_posts_to_api_kill_and_reports_acceptance(self) -> None:
         with patch("httpx.post") as post:
             post.return_value.raise_for_status.return_value = None
             assert _request_graceful_kill(8080) is True
         assert post.call_args.args[0] == "http://127.0.0.1:8080/api/kill"
+        # POST /api/kill is a mutating route (issue #397): a JSON
+        # Content-Type is required even though the body is empty.
+        assert post.call_args.kwargs["headers"]["Content-Type"] == "application/json"
 
     def test_unreachable_dashboard_reports_failure(self) -> None:
         with patch("httpx.post", side_effect=OSError("connection refused")):
@@ -673,6 +690,17 @@ class TestGracefulKillRequest:
         with patch("httpx.post") as post:
             post.return_value.raise_for_status.side_effect = RuntimeError("500")
             assert _request_graceful_kill(8080) is False
+
+    def test_sends_authorization_header_when_token_resolved(self) -> None:
+        """A token file for the target port is picked up and presented."""
+        from conductor.web.auth import write_token_file
+
+        write_token_file(8080, "file-token")
+
+        with patch("httpx.post") as post:
+            post.return_value.raise_for_status.return_value = None
+            assert _request_graceful_kill(8080) is True
+        assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer file-token"
 
 
 class TestSignalProcess:

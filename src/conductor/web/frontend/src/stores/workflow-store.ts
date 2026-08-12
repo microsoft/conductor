@@ -57,6 +57,7 @@ import type {
   GuidanceAppliedData,
 } from '@/types/events';
 import { mergeGuidance, type GuidanceEntry } from '@/lib/guidance';
+import { authHeaders } from '@/lib/auth';
 
 export interface ActivityEntry {
   type: string;
@@ -912,7 +913,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     try {
       const res = await fetch('/api/guidance', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ text }),
       });
       const body = (await res.json().catch(() => ({}))) as {

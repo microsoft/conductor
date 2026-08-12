@@ -134,6 +134,19 @@ The `--web-bg` flag is a convenience shortcut: it forks a background process run
 
 `--web` and `--web-bg` are mutually exclusive.
 
+**Security:** the dashboard is origin/host-restricted and token-protected by
+default (issue #397). Requests must present a `Host` header naming the bound
+machine (loopback aliases or the configured bind host); a present `Origin`
+header must match too, though most non-browser clients (curl, `httpx`,
+`conductor gate respond`) send none and are unaffected. Mutating routes
+(`/api/stop`, `/api/kill`, `/api/resume`, `/api/gate-respond`,
+`/api/guidance`) and the `/ws` WebSocket handshake additionally require a
+bearer token — see [Authentication](#conductor-gate-respond) under
+`conductor gate respond` for the token precedence order and discovery. Set
+`CONDUCTOR_WEB_ALLOW_ORIGINS` (comma-separated full origins) to admit an
+extra development origin, e.g. Vite's `http://localhost:5173`, without
+disabling the check for anything else.
+
 **Readiness contract** (issue #410) — the launcher confirms the workflow
 actually started before it prints a URL and exits 0, rather than trusting a
 bare TCP connection. This happens in two stages:
@@ -477,7 +490,21 @@ conductor gate respond [OPTIONS]
 
 ### Authentication
 
-If the running workflow was launched with a gate token configured, requests without a matching token are rejected with HTTP 403. Supply the token via `--token` or set the `CONDUCTOR_GATE_TOKEN` environment variable (the flag takes precedence when both are present).
+Every request requires a valid token (issue #397): a per-run token is minted
+automatically for every dashboard, so the protected configuration is the
+default rather than something you must opt into. Requests without a
+matching token are rejected with HTTP 403. The token is resolved in this
+order:
+
+1. `--token SECRET`
+2. the `CONDUCTOR_GATE_TOKEN` environment variable
+3. the per-run token file at `~/.conductor/runs/dashboard-<port>.token`
+   (written with mode `0600` by the dashboard on startup, removed on
+   shutdown), auto-discovered by port so most invocations need neither flag
+   nor env var
+
+The first source found wins; a later source in the list is never consulted
+once an earlier one supplies a value.
 
 ### Auto-Discovery
 
@@ -546,9 +573,8 @@ with code 1.
 
 ### Authentication
 
-Uses the same `CONDUCTOR_GATE_TOKEN` mechanism as `conductor gate respond` —
-if the running workflow was launched with a gate token configured, requests
-without a matching token are rejected with HTTP 403.
+Same token precedence and auto-discovery as `conductor gate respond`: `--token` >
+`CONDUCTOR_GATE_TOKEN` > the per-run token file in `~/.conductor/runs/`.
 
 ### Examples
 
@@ -883,7 +909,8 @@ are hidden from `--help` and are slated for removal in a future release.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) and by `conductor guide` (checked by `POST /api/guidance`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_GATE_TOKEN` | Overrides the dashboard's per-run minted auth token. Checked by `POST /api/stop`, `/api/kill`, `/api/resume`, `/api/gate-respond`, and `/api/guidance`, and by the `/ws` WebSocket handshake; also read by `conductor gate respond` and `conductor guide` |
+| `CONDUCTOR_WEB_ALLOW_ORIGINS` | Comma-separated list of additional origins (`scheme://host:port`) the dashboard's `OriginHostGuard` accepts, on top of the loopback aliases and configured bind host. Dev-server escape hatch (e.g. Vite's `http://localhost:5173`); nothing else is disabled by setting it |
 
 ## Exit Codes
 

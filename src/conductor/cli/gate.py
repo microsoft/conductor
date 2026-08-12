@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Annotated, Any
 
 import httpx
@@ -10,6 +9,7 @@ import typer
 from rich.text import Text
 
 from conductor.console import make_console, styled
+from conductor.web.auth import resolve_cli_token
 
 console = make_console(stderr=True)
 
@@ -90,8 +90,9 @@ def _gate_respond_impl(
     """
     base_url = f"http://127.0.0.1:{port}"
 
-    # Resolve token from flag or environment variable
-    resolved_token = token or os.environ.get("CONDUCTOR_GATE_TOKEN")
+    # Resolve token: flag > CONDUCTOR_GATE_TOKEN env var > the per-run token
+    # file written by WebDashboard.start() (issue #397).
+    resolved_token = resolve_cli_token(port, token)
 
     # Auto-discover agent name if not provided
     prompt_id: str | None = None
@@ -164,7 +165,8 @@ def _gate_respond_impl(
         console.print(
             Text.from_markup(
                 "[bold red]Error:[/bold red] Authentication failed. "
-                "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
+                "Provide a valid token with --token, CONDUCTOR_GATE_TOKEN env var, "
+                "or the auto-discovered token file in ~/.conductor/runs/."
             )
         )
         raise typer.Exit(code=1)

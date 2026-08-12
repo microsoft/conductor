@@ -3,6 +3,7 @@ import { Activity, Square, Play, X, Download, FileCode, MessageSquarePlus } from
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { YamlViewer } from '@/components/layout/YamlViewer';
 import { GuidanceModal } from '@/components/dialogs/GuidanceModal';
+import { authHeaders } from '@/lib/auth';
 
 export function Header() {
   const workflowName = useWorkflowStore((s) => s.workflowName);
@@ -40,7 +41,10 @@ export function Header() {
     setPending(true);
     setControlError(null);
     try {
-      const res = await fetch(path, { method: 'POST' });
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      });
       // On success the pending flag stays set — the effect above clears it
       // once the run leaves the paused state.
       if (res.ok) return;

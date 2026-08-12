@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowEvent } from '@/types/events';
+import { withToken } from '@/lib/auth';
 
 const MAX_RECONNECT_DELAY = 30000;
 
@@ -47,7 +48,7 @@ export function useWebSocket() {
         }
 
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${proto}//${window.location.host}/ws`;
+        const wsUrl = withToken(`${proto}//${window.location.host}/ws`);
 
         try {
           const ws = new WebSocket(wsUrl);

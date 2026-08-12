@@ -36,9 +36,9 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from conductor import rundir
 
-_PID_DIR_NAME = "runs"
+logger = logging.getLogger(__name__)
 
 
 class Liveness(str, Enum):
@@ -136,9 +136,7 @@ def pid_dir() -> Path:
     Returns:
         Path to ``~/.conductor/runs/``.
     """
-    d = Path.home() / ".conductor" / _PID_DIR_NAME
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return rundir.runs_dir()
 
 
 def write_pid_file(

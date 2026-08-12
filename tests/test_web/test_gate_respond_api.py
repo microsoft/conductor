@@ -6,7 +6,7 @@ Covers:
 - agent_name not matching the waiting gate returns 409
 - no gate waiting returns 409
 - Token mismatch when CONDUCTOR_GATE_TOKEN is set returns 403 (Authorization header)
-- No token required when env var is unset
+- A token is always required, even when CONDUCTOR_GATE_TOKEN is unset (issue #397)
 - Gate-status returns waiting state correctly
 """
 
@@ -21,6 +21,7 @@ from starlette.testclient import TestClient
 
 from conductor.events import WorkflowEventEmitter
 from conductor.web.server import WebDashboard
+from tests.test_web.conftest import TEST_PORT, make_client
 
 
 def _make_dashboard() -> tuple[WorkflowEventEmitter, WebDashboard]:
@@ -36,7 +37,7 @@ class TestGateRespondValidRequest:
     def test_valid_request_accepted(self) -> None:
         _, dashboard = _make_dashboard()
         dashboard._gate_waiting_agent = "review-gate"
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 json={
@@ -56,7 +57,7 @@ class TestGateRespondValidRequest:
     def test_valid_request_with_additional_input(self) -> None:
         _, dashboard = _make_dashboard()
         dashboard._gate_waiting_agent = "review-gate"
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 json={
@@ -76,7 +77,7 @@ class TestGateRespondMissingFields:
 
     def test_missing_selected_value(self) -> None:
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 json={"agent_name": "review-gate"},
@@ -86,7 +87,7 @@ class TestGateRespondMissingFields:
 
     def test_missing_agent_name(self) -> None:
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 json={"selected_value": "approve"},
@@ -100,7 +101,7 @@ class TestGateRespondMalformedBody:
 
     def test_invalid_json_body(self) -> None:
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 content="not json",
@@ -111,7 +112,7 @@ class TestGateRespondMalformedBody:
 
     def test_non_dict_json_body(self) -> None:
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 content='["a", "b"]',
@@ -122,7 +123,7 @@ class TestGateRespondMalformedBody:
 
     def test_null_json_body(self) -> None:
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 content="null",
@@ -133,13 +134,29 @@ class TestGateRespondMalformedBody:
 
 
 class TestGateRespondTokenAuth:
-    """Token authentication for POST /api/gate-respond."""
+    """Token authentication for POST /api/gate-respond.
+
+    Since issue #397, a token is *always* required -- the per-run minted
+    token when ``CONDUCTOR_GATE_TOKEN`` is unset, or the env var's value
+    when it is set. These tests build a bare client (host-matched, no
+    default Authorization header) so each one controls exactly what
+    token is presented.
+    """
+
+    def _bare_client(self, dashboard: WebDashboard) -> TestClient:
+        """A host-matched client presenting no default Authorization header."""
+        dashboard._actual_port = TEST_PORT
+        return TestClient(
+            dashboard.app,
+            base_url=f"http://127.0.0.1:{TEST_PORT}",
+            headers={"Content-Type": "application/json"},
+        )
 
     def test_token_mismatch_returns_403(self) -> None:
         _, dashboard = _make_dashboard()
         with (
             patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
-            TestClient(dashboard.app) as client,
+            self._bare_client(dashboard) as client,
         ):
             resp = client.post(
                 "/api/gate-respond",
@@ -156,7 +173,7 @@ class TestGateRespondTokenAuth:
         _, dashboard = _make_dashboard()
         with (
             patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
-            TestClient(dashboard.app) as client,
+            self._bare_client(dashboard) as client,
         ):
             resp = client.post(
                 "/api/gate-respond",
@@ -172,7 +189,7 @@ class TestGateRespondTokenAuth:
         _, dashboard = _make_dashboard()
         with (
             patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
-            TestClient(dashboard.app) as client,
+            self._bare_client(dashboard) as client,
         ):
             resp = client.post(
                 "/api/gate-respond",
@@ -189,7 +206,7 @@ class TestGateRespondTokenAuth:
         dashboard._gate_waiting_agent = "review-gate"
         with (
             patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
-            TestClient(dashboard.app) as client,
+            self._bare_client(dashboard) as client,
         ):
             resp = client.post(
                 "/api/gate-respond",
@@ -201,13 +218,20 @@ class TestGateRespondTokenAuth:
             )
             assert resp.status_code == 200
 
-    def test_no_token_required_when_env_unset(self) -> None:
+    def test_minted_token_required_when_env_unset(self) -> None:
+        """A token is required even when CONDUCTOR_GATE_TOKEN is unset (issue #397).
+
+        Replaces the pre-#397 ``test_no_token_required_when_env_unset``,
+        which encoded the opposite behavior -- "unset env var means no
+        auth" -- that this change ends. The per-run minted token
+        (``dashboard.token``) must now be presented regardless.
+        """
         _, dashboard = _make_dashboard()
         dashboard._gate_waiting_agent = "review-gate"
         env = {k: v for k, v in os.environ.items() if k != "CONDUCTOR_GATE_TOKEN"}
         with (
             patch.dict(os.environ, env, clear=True),
-            TestClient(dashboard.app) as client,
+            self._bare_client(dashboard) as client,
         ):
             resp = client.post(
                 "/api/gate-respond",
@@ -215,6 +239,16 @@ class TestGateRespondTokenAuth:
                     "agent_name": "review-gate",
                     "selected_value": "approve",
                 },
+            )
+            assert resp.status_code == 403
+
+            resp = client.post(
+                "/api/gate-respond",
+                json={
+                    "agent_name": "review-gate",
+                    "selected_value": "approve",
+                },
+                headers={"Authorization": f"Bearer {dashboard.token}"},
             )
             assert resp.status_code == 200
 
@@ -225,7 +259,7 @@ class TestGateRespondAgentMatch:
     def test_no_gate_waiting_returns_409(self) -> None:
         _, dashboard = _make_dashboard()
         # _gate_waiting_agent defaults to None (no gate parked)
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 json={"agent_name": "review-gate", "selected_value": "approve"},
@@ -237,7 +271,7 @@ class TestGateRespondAgentMatch:
     def test_mismatched_agent_returns_409(self) -> None:
         _, dashboard = _make_dashboard()
         dashboard._gate_waiting_agent = "review-gate"
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post(
                 "/api/gate-respond",
                 json={"agent_name": "other-gate", "selected_value": "approve"},
@@ -255,7 +289,7 @@ class TestGateStatus:
 
     def test_no_gate_waiting(self) -> None:
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/gate-status")
             assert resp.status_code == 200
             data = resp.json()
@@ -266,7 +300,7 @@ class TestGateStatus:
         _, dashboard = _make_dashboard()
         # Simulate the engine setting the gate waiting state
         dashboard._gate_waiting_agent = "review-gate"
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/gate-status")
             assert resp.status_code == 200
             data = resp.json()
@@ -298,9 +332,14 @@ class TestGateRespondAuthOrdering:
         required) before passing auth.
         """
         _, dashboard = _make_dashboard()
+        dashboard._actual_port = TEST_PORT
         with (
             patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "correct-token"}),
-            TestClient(dashboard.app) as client,
+            TestClient(
+                dashboard.app,
+                base_url=f"http://127.0.0.1:{TEST_PORT}",
+                headers={"Content-Type": "application/json"},
+            ) as client,
         ):
             # Empty body: a valid JSON object but missing agent_name/selected_value
             # and carrying no Authorization header.
@@ -327,8 +366,16 @@ class TestGateRespondEndToEnd:
         assert dashboard._gate_waiting_agent == "review-gate"
 
         # Client side: resolve it through the real ASGI endpoint in this loop.
+        dashboard._actual_port = TEST_PORT
         transport = httpx.ASGITransport(app=dashboard.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=f"http://127.0.0.1:{TEST_PORT}",
+            headers={
+                "Authorization": f"Bearer {dashboard.token}",
+                "Content-Type": "application/json",
+            },
+        ) as client:
             resp = await client.post(
                 "/api/gate-respond",
                 json={

@@ -25,6 +25,8 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from conductor.web.auth import OriginHostGuard
+
 logger = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -115,12 +117,26 @@ class ReplayDashboard:
 
         self._app = self._create_app()
 
+    @property
+    def port(self) -> int:
+        """Resolved TCP port the dashboard is listening on."""
+        return self._actual_port if self._actual_port is not None else self._port
+
     def _create_app(self) -> FastAPI:
         """Create the FastAPI application with replay routes."""
+        dashboard = self
         app = FastAPI(
             title="Conductor Replay Dashboard",
             docs_url=None,
             redoc_url=None,
+        )
+
+        # Origin/Host validation (issue #397) — no token, since the replay
+        # app is GET-only and has no /ws or mutating routes.
+        app.add_middleware(
+            OriginHostGuard,  # ty: ignore[invalid-argument-type]
+            get_bound=lambda: (dashboard._host, dashboard.port),
+            get_expected_token=lambda: "",
         )
 
         events = self._events
