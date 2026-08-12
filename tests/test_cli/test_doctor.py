@@ -17,6 +17,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
+from conductor.console import make_console
 from conductor.providers.diagnostics import (
     CredentialEnvVar,
     DoctorReport,
@@ -46,10 +47,15 @@ def _no_update_check(monkeypatch: pytest.MonkeyPatch) -> None:
     Rich table cells, which would break substring assertions on the rendered
     output. Pinning both consoles to a fixed width makes rendering
     deterministic regardless of the environment.
+
+    ``make_console`` rather than a bare ``Console``: the production consoles
+    are markup-free (#406), and substituting a markup-parsing one here would
+    make the markup-safety tests below assert against a console the CLI never
+    uses — which is exactly the bug they exist to catch.
     """
     monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", "1")
-    monkeypatch.setattr(_app_module, "output_console", Console(width=200))
-    monkeypatch.setattr(_app_module, "console", Console(stderr=True, width=200))
+    monkeypatch.setattr(_app_module, "output_console", make_console(width=200))
+    monkeypatch.setattr(_app_module, "console", make_console(stderr=True, width=200))
 
 
 def _prov(

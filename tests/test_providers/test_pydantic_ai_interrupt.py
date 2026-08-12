@@ -117,6 +117,25 @@ class TestInterruptBeforeRun:
         assert outcome.is_partial is True
         assert outcome.result is None
 
+    @pytest.mark.asyncio
+    async def test_last_call_input_tokens_populated_on_partial_path(self) -> None:
+        """Issue #412: the context-window figure is populated on the partial
+        (interrupted) path too, from the one-shot partial request's usage."""
+        signal = asyncio.Event()
+        signal.set()
+
+        outcome = await run_with_interrupt(
+            _make_text_agent(),
+            "say hello",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=False,
+        )
+
+        assert outcome.is_partial is True
+        assert outcome.last_call_input_tokens is not None
+        assert outcome.last_call_input_tokens > 0
+
 
 class TestInterruptMidRun:
     """Requirement: an interrupt between tool/model iterations returns partial output."""
@@ -252,6 +271,23 @@ class TestNormalCompletion:
         assert outcome.is_cancelled is False
         assert outcome.result is not None
         assert outcome.partial_output is None
+
+    @pytest.mark.asyncio
+    async def test_last_call_input_tokens_populated_on_normal_completion(self) -> None:
+        """Issue #412: the context-window figure is populated from the final
+        model response's per-request usage on a normal (non-partial) run."""
+        signal = asyncio.Event()
+
+        outcome = await run_with_interrupt(
+            _make_text_agent(),
+            "say hello",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=False,
+        )
+
+        assert outcome.last_call_input_tokens is not None
+        assert outcome.last_call_input_tokens > 0
 
     @pytest.mark.asyncio
     async def test_tool_execution_emits_one_start_event(self) -> None:

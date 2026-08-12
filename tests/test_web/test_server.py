@@ -39,6 +39,44 @@ def _make_event(event_type: str, **data: object) -> WorkflowEvent:
     return WorkflowEvent(type=event_type, timestamp=time.time(), data=dict(data))
 
 
+class TestGetApiInfoIdentity:
+    """``/api/info`` is what ``conductor stop`` uses to confirm identity (#344).
+
+    The dashboard runs in the same process as the workflow, so its own PID is
+    direct proof that a recorded PID really is the process listening on a port
+    and has not been recycled onto something unrelated.
+    """
+
+    def test_pid_reported_before_any_workflow_started_event(self) -> None:
+        """Identity must not depend on the workflow having started.
+
+        A run killed during startup has an empty event history. If identity
+        were only derivable from ``workflow_started``, it could never be
+        confirmed, and ``conductor stop`` would refuse to force-terminate
+        exactly when it is most needed. It also must not depend on ``run_id``,
+        which legitimately differs from the launcher's id on resume.
+        """
+        import os
+
+        _, dashboard = _make_dashboard()
+        with TestClient(dashboard.app) as client:
+            resp = client.get("/api/info")
+            assert resp.status_code == 200
+            assert resp.json()["pid"] == os.getpid()
+
+    def test_pid_still_reported_alongside_workflow_fields(self) -> None:
+        emitter, dashboard = _make_dashboard()
+        import os
+
+        with TestClient(dashboard.app) as client:
+            emitter.emit(_make_event("workflow_started", run_id="abcd1234", name="wf"))
+            info = client.get("/api/info").json()
+
+        assert info["pid"] == os.getpid()
+        assert info["run_id"] == "abcd1234"
+        assert info["workflow_name"] == "wf"
+
+
 class TestGetApiState:
     """Tests for GET /api/state endpoint."""
 
@@ -1327,6 +1365,7 @@ class TestReplayEventsFromJsonl:
             "iteration_limit_resolved",
             "dialog_started",
             "dialog_completed",
+            "guidance_received",
         ],
     )
     @pytest.mark.parametrize("sub_path", [None, ["sub"], ["sub", "deeper"]])
@@ -1424,6 +1463,42 @@ class TestReplayEventsFromJsonl:
 
         assert count == 1
         assert [ev["type"] for ev in dashboard._event_history] == ["dialog_message"]
+
+    def test_preserves_guidance_applied_when_guidance_received_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """``guidance_received`` is skipped, but ``guidance_applied`` is kept.
+
+        ``guidance_received`` is only the opening half of a pair whose closer
+        is ``guidance_applied`` — a submission still pending when the
+        original run died would otherwise replay as a phantom "pending" entry
+        forever. ``guidance_applied`` is deliberately preserved:
+        ``WorkflowContext.from_dict`` restores ``user_guidance``, so that
+        guidance really is still in effect on the resumed run and must stay
+        listed (issue #400).
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "guidance_received",
+                    "timestamp": 1.0,
+                    "data": {"text": "Be concise", "pending": 1},
+                },
+                {
+                    "type": "guidance_applied",
+                    "timestamp": 1.1,
+                    "data": {"text": "Be concise", "source": "dashboard", "agent_name": "a"},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["guidance_applied"]
 
     def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
         """Subworkflow-level workflow_started/completed (identified by a non-empty

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
+  previously offered only Stop, Resume, and Kill — there was no way to
+  correct a run's course without stopping it first. `conductor guide --text
+  "..."` (auto-discovering the dashboard port) and a dashboard **Guide**
+  button both POST to a new `POST /api/guidance` endpoint, which feeds a
+  `GuidanceChannel` the engine drains at the next step boundary (agents,
+  parallel groups, for-each groups, scripts, sets, and waits alike) or
+  immediately if an agent is currently paused, in which case it resumes with
+  the guidance applied — reusing a Copilot follow-up on the same session when
+  one is available. The TTY Esc/Ctrl+G interrupt path now goes through the
+  same `add_user_guidance` entry point, so that guidance is visible in the
+  dashboard and JSONL log too, and parallel/for-each group members now
+  receive the current guidance section (previously always omitted). `resume
+  --guidance "..."` (repeatable) applies guidance to the restored context
+  before the resumed agent runs. Protected by the same `CONDUCTOR_GATE_TOKEN`
+  as `conductor gate respond` when configured.
 - **`conductor status` — see what is running without stopping it** (#384).
   `conductor stop` with no arguments lists background workflows, but stops one
   when exactly one is running, so the natural "what's running?" reflex was
@@ -167,6 +183,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dashboard context-window bar no longer reports cumulative input tokens as
+  a false red at >100% of the cap** (#412). The bar reused
+  `AgentOutput.input_tokens` — a *billing* total summed across every API call
+  in an agent's execution — as a *context* measurement, so a multi-turn
+  tool-calling agent (or a Copilot parse-recovery retry) could report more
+  tokens than the model's context window physically allows. A new
+  `AgentOutput.last_call_input_tokens` field carries only the prompt size of
+  the most recent single API call, populated by every provider, and the
+  engine now sources `context_window_used` from it instead. When a provider
+  cannot isolate one call's prompt size, the field is `None` and the
+  dashboard hides the bar rather than showing a misleading number; a
+  `used > max` pair (impossible for one real API call) is dropped to `None`
+  entirely, logged at debug on every occurrence and at warning once per run
+  (nothing reads debug logs in production), since either the usage figure or
+  the looked-up cap is untrustworthy. Riding along: `copilot.py`'s
+  `assistant.usage` handler previously *overwrote* its running token counts
+  on every event instead of summing them, so a 20-turn tool-calling agent's
+  cost was billed only for its final API call — this under-report is fixed
+  at the same time, since fixing it alone (without the new field) would have
+  made the context bar report the sum of every turn rather than just the
+  last, making the original defect worse. The event's dedup guard (which
+  prevents a repeated `assistant.usage` event from double-billing the same
+  API call) keys on `api_call_id`, falling back to `provider_call_id` then
+  `service_request_id` when the SDK omits it, since all three are
+  independently optional. Cost figures for multi-turn Copilot agents will
+  rise as a result; a `cost.budget_usd` tuned against the old
+  under-reported total may now trip its limit sooner.
+
+- **`conductor stop` no longer kills the run it is executing inside** (#399).
+  An agent smoke-testing `conductor stop` from its own workflow's `bash` tool
+  inherited that workflow's background environment and terminated itself —
+  the process printed "Stopped" and was killed by what it printed. `stop` now
+  identifies the run it is executing inside via `CONDUCTOR_RUN_ID` (set on
+  every `--web-bg` child and inherited by descendants), the legacy
+  `CONDUCTOR_WEB_BG`/`CONDUCTOR_WEB_PORT` pair (for PID files predating
+  #411's `run_id` field), and POSIX process ancestry, and excludes it from
+  targeting by default: `--all` now means "stop all *other* runs", the
+  no-flag auto-stop skips it, and `--port <your own port>` is refused (exit
+  `1`, naming `--allow-self` as the remedy). If only your own run is alive, `stop`/`stop --all`
+  print a refusal and exit `0` rather than erroring, since nothing named was
+  declined. Pass `--allow-self` to restore the previous targeting exactly; a
+  yellow warning is printed whenever it actually causes your own run to be
+  signalled. Process-ancestry detection is POSIX-only — Windows relies on
+  the env-var signals alone.
+
+- **A pricing hook that silently prices nothing is now reported** (#386). #265
+  warns when the provider pricing hook *raises*; the companion case — a hook
+  that never raises and returns `None` for everything — looked identical to
+  "these models are simply unpriced", so live pricing could be dead for a whole
+  run with no symptom beyond newer models showing up as unpriced. The verdict is
+  drawn once when the run ends — however it ends, so a run that dies part way
+  still reports it, which is when a partial cost total most needs the caveat —
+  and is emitted as a `pricing_hook_silent` event as well as a log line, so it
+  reaches the event log and the console rather than only unattributed stderr.
+  The run summary gains `usage.live_pricing_degraded` and the cost breakdown
+  prints a matching caveat, because a model priced from the static table still
+  reports a confident cost and would otherwise carry no qualification.
+  Providers that do not implement the hook are excluded: returning
+  `None` is the documented default, so counting them accused four of the five
+  providers of a broken SDK for behaving correctly.
+- **`conductor stop` now confirms the process actually stopped, and never
+  stops the wrong one** (#344). `stop` sent one signal and reported success
+  without checking, so a workflow that ignored it was reported as stopped and
+  its PID file deleted — leaving a live run untracked, invisible to `stop`,
+  and holding its port. Termination is now a ladder (ask the dashboard to
+  cancel, then signal, then force-terminate), each rung confirmed before the
+  next, and the PID file is removed only once the process is confirmed gone.
+  Every PID-directed rung is gated on the dashboard confirming its own PID,
+  because between a PID file being written and `stop` reading it the OS may
+  have recycled that PID onto an unrelated process. `--force` overrides
+  *uncertainty* only: a positive identity mismatch blocks every rung, force
+  included. PID files are written atomically, so a concurrent `stop` can no
+  longer read a half-written file and deregister a live run, and the reader
+  logs before deleting anything it cannot parse. `--force` can clear an entry
+  whose liveness cannot be probed, which would otherwise wedge `stop --all`
+  at exit 2 permanently (#166).
+- **Bracketed text no longer crashes or corrupts CLI output** (#406). The same
+  defect as #382, which #387 fixed only in `cli/run.py`. `conductor validate`
+  died with an unhandled `MarkupError` traceback on a workflow whose `name:`
+  contained `[/bold]`, and silently deleted the token when it contained
+  `[dim]`. The quiet half is the more damaging one: a listing that drops part
+  of a name looks like it worked. Rich treats a bracketed token as a style tag
+  when its first character is lowercase, `#`, `/` or `@`, so `[0]` is fine,
+  `[task1]` disappears, and `[/etc/x]` raises — and `style=` does not turn
+  parsing off, which is what made the earlier fix look complete.
+
+  Two consequences shipped unnoticed. Every for-each iteration's verbose panel
+  read the same, because the engine qualifies a member's name as
+  `<agent>[<key>]` so interleaved output can be attributed to one iteration,
+  and a `key_by:` key of `task1` erased exactly that identity — while a key
+  starting with `/`, which `key_by:` over paths or URLs produces, killed the
+  run from a logging call. This needed no flags: verbose and full mode both
+  default on. Separately, `conductor status` (#389) and `conductor plugin
+  list` (#398) were written against the unfixed pattern in files #387 never
+  touched, and #398 made these strings third-party rather than the author's
+  own YAML, since plugin, marketplace, skill and subagent names are now read
+  out of git-cloned repositories.
+
+  Rather than escape ~450 call sites, the default is inverted: every console
+  is built by the new `conductor.console.make_console()` with `markup=False`,
+  so a plain string is literal unless it asks to be styled, and conductor's
+  own styling goes through `styled("<template>", value)`, which parses the
+  template but inserts values verbatim and byte-exact. `Panel` titles and
+  `Prompt` prompts are handled separately because rich parses those
+  regardless of the console setting — that is the trap that left #387
+  incomplete one line from the code it changed. `rich.markup.escape` is no
+  longer used anywhere: it cannot round-trip a value containing a backslash
+  before a bracket, so an ordinary regex came out mangled. Eight static guards
+  now read the source and fail with file:line if a new call site reintroduces
+  any of these shapes — including a `Text` flattened back into an f-string,
+  which is how the defect kept coming back, and unescaped brackets in `typer`
+  help text, which had silently cost `conductor run --help` the whole
+  `[@registry][@version]` syntax.
+- **`conductor status --json` no longer ships two permanently dead fields**
+  (#404). `--web-bg`'s launcher wrote every PID file's `run_id` empty and its
+  `log_file` was a promise it could never keep — the JSONL path is derived
+  inside the child by `EventLogSubscriber`, after the PID file is already
+  written. `write_pid_file` now records the launch's actual `run_id` and
+  `stderr_log`/`stdout_log` (replacing `log_file`, which the parent
+  legitimately knows) — the same three artefacts `_finalize_background_launch`
+  already had in scope but never threaded through. `run_id` is the join key to
+  the run's `conductor-<name>-<ts>-<run_id>.events.jsonl`, so a populated value
+  makes that file findable by glob without storing a path the parent would
+  otherwise have to guess. `conductor resume --web-bg` goes further: it now
+  resolves the checkpoint exactly as the resumed child does (`--from` first,
+  else the latest checkpoint for the workflow) and adopts *its* `run_id` for
+  the whole launch, rather than minting a fresh one that matches neither the
+  child's `EventLogSubscriber` (which reuses the checkpoint's id whenever the
+  original JSONL still exists) nor the events log filename. A checkpoint with
+  a missing or malformed `run_id` falls back to a fresh id rather than
+  failing the launch. `conductor status --json` also now emits `null` for an
+  absent/empty `run_id`/`stderr_log`/`stdout_log` instead of `""`, so a PID
+  file predating this fix is distinguishable from one that legitimately has
+  no run id. `conductor status` is unreleased, so the `log_file` →
+  `stderr_log`/`stdout_log` rename costs no released contract.
+- **`conductor status`'s dashboard URL no longer gets cropped at a default
+  80-column terminal** (#405). At that width, the `Dashboard` column — the
+  one field the command exists to surface — was the one rich elided,
+  leaving `http://127.0.0.1:…` reconstructable only by hand from the `Port`
+  column. Both the `Started` and `Dashboard` columns now fold onto a second
+  line instead of cropping — a folded value is complete and readable, a
+  cropped one is unrecoverable from the output. `Started` also renders to
+  minute precision in UTC (`2026-08-11 12:48Z`, down from a 32-character
+  microsecond-precision timestamp), leaving more room for `Workflow` before
+  folding is ever needed. The table is a glance-at listing, not an audit
+  log, so `--json` keeps reporting the exact recorded timestamp untouched —
+  only the human-readable rendering changed. `_print_running_list` is
+  shared with `conductor stop`, so its listing gets the shorter timestamp
+  too. The test fixture that let this through built its own PID-file JSON by
+  hand with a 19-character naive `started_at`, well short of production's
+  32-character value — it now goes through the real `write_pid_file`, so the
+  widths under test match the widths production writes.
 - **JSON result output no longer crashes on a legacy Windows stdout** (#342).
   On a `cp1252` console, `conductor run` exited non-zero with
   `UnicodeEncodeError` *after* the workflow had already succeeded, having
