@@ -1242,3 +1242,84 @@ class TestQuarantineStatFailureDoesNotOrphan:
         assert len(records_after) == 1
         assert records_after[0].run_id == "racer4"
         assert records_after[0].pid == os.getpid()
+
+
+class TestLegacyEventLogRecovery:
+    """A pre-Fleet-Manager ``.pid`` file records no event-log path, so every
+    derived detail (step, tokens, cost, topology) came out blank in the TUI
+    even though the log was on disk beside it. The record does carry the run
+    id, and the log's filename ends in it."""
+
+    @pytest.fixture()
+    def log_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        d = tmp_path / "tmp"
+        d.mkdir()
+        (d / "conductor").mkdir()
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(d))
+        return d / "conductor"
+
+    def test_unique_log_is_recovered(self, log_dir: Path) -> None:
+        log = log_dir / "conductor-ship-20260812-180146-293d3f34.events.jsonl"
+        log.write_text("")
+
+        record = RunRecord.from_dict(
+            {"pid": 1, "port": 8080, "workflow": "/tmp/wf.yaml", "run_id": "293d3f34"}
+        )
+        assert record.event_log_path == str(log)
+
+    def test_ambiguous_match_is_not_adopted(self, log_dir: Path) -> None:
+        """Run ids are 8 hex chars and a resumed run reuses its predecessor's,
+        so one id can legitimately name several logs. Showing one run's
+        details against another's log is worse than showing none."""
+        for stem in ("alpha-20260812-100000", "beta-20260812-110000"):
+            (log_dir / f"conductor-{stem}-293d3f34.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict(
+            {"pid": 1, "port": 8080, "workflow": "/tmp/wf.yaml", "run_id": "293d3f34"}
+        )
+        assert record.event_log_path == ""
+
+    def test_no_match_leaves_it_empty(self, log_dir: Path) -> None:
+        record = RunRecord.from_dict(
+            {"pid": 1, "port": 8080, "workflow": "/tmp/wf.yaml", "run_id": "nomatch1"}
+        )
+        assert record.event_log_path == ""
+
+    def test_explicit_path_is_never_overridden(self, log_dir: Path) -> None:
+        """A modern record already knows its log; the search must not second-
+        guess it even when a same-id file happens to exist."""
+        (log_dir / "conductor-other-20260812-100000-293d3f34.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict(
+            {
+                "pid": 1,
+                "port": 8080,
+                "workflow": "/tmp/wf.yaml",
+                "run_id": "293d3f34",
+                "event_log_path": "/explicit/path.jsonl",
+            }
+        )
+        assert record.event_log_path == "/explicit/path.jsonl"
+
+    def test_blank_run_id_searches_for_nothing(self, log_dir: Path) -> None:
+        """A record with no run id has nothing to match on -- the glob would
+        otherwise be `conductor-*-.events.jsonl`."""
+        (log_dir / "conductor-x-20260812-100000-abc.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict({"pid": 1, "port": 8080, "workflow": "/tmp/wf.yaml"})
+        assert record.event_log_path == ""
+
+    def test_missing_log_directory_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lookup is read-only and must not create the directory (or
+        raise) just because a record was parsed."""
+        empty = tmp_path / "no-tmp"
+        empty.mkdir()
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(empty))
+
+        record = RunRecord.from_dict(
+            {"pid": 1, "port": 8080, "workflow": "/tmp/wf.yaml", "run_id": "293d3f34"}
+        )
+        assert record.event_log_path == ""
+        assert not (empty / "conductor").exists()

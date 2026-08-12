@@ -338,8 +338,20 @@ class RunRecord:
             _first_present(data, "event_log_path", "log_file"), "event_log_path"
         )
 
+        run_id = _coerce_optional_str(data.get("run_id"), "run_id")
+        if not event_log_path and run_id:
+            # A legacy `.pid` file has no event-log field at all, so every
+            # derived detail (current step, tokens, cost, topology) came out
+            # empty even though the log was sitting on disk the whole time.
+            # It does record the run id, and the log's filename ends in it,
+            # so the pairing is recoverable -- see `find_event_log_for_run`
+            # for why this only ever adopts an unambiguous match.
+            recovered = find_event_log_for_run(run_id)
+            if recovered is not None:
+                event_log_path = str(recovered)
+
         return cls(
-            run_id=_coerce_optional_str(data.get("run_id"), "run_id"),
+            run_id=run_id,
             pid=pid,
             workflow_path=workflow_path,
             workflow_name=workflow_name,
@@ -710,6 +722,52 @@ def _read_and_prune(files: list[Path], *, require_run_id_match: bool = False) ->
             logger.debug("Cleaning up stale run record: %s (PID %s)", f, record.pid)
             _delete_if_unchanged(f, stat_before)
     return results
+
+
+def find_event_log_for_run(run_id: str) -> Path | None:
+    """Locate the event log belonging to ``run_id``, if it is unambiguous.
+
+    ``EventLogSubscriber`` names its file
+    ``conductor-<workflow>-<timestamp>-<run_id>.events.jsonl``, so a run id
+    is enough to find the log even when the record that should have carried
+    its path does not (a pre-Fleet-Manager ``.pid`` file, which has no such
+    field). Without this, a run launched by an older installed Conductor
+    shows up in the TUI with every derived column blank -- current step,
+    tokens, cost, topology -- while its log sits on disk beside it.
+
+    **Only an unambiguous match is adopted.** Run ids are short (8 hex
+    chars) and a resumed run deliberately reuses its predecessor's id, so
+    the same id can legitimately name several logs; a test suite that pins
+    an id produces dozens. Showing one run's details against another run's
+    log would be worse than showing none, so anything other than exactly
+    one candidate returns ``None``.
+
+    Args:
+        run_id: The run identifier to search for.
+
+    Returns:
+        The single matching log's path, or ``None`` when there is no match,
+        more than one, or the directory cannot be listed.
+    """
+    if not run_id:
+        return None
+    try:
+        # Not `retention.event_log_root()`: that one *creates* the directory
+        # (and refuses a symlinked one) because it is about to delete inside
+        # it. This is a read-only lookup on a path that may not exist yet.
+        log_dir = Path(tempfile.gettempdir()) / "conductor"
+        matches = sorted(log_dir.glob(f"conductor-*-{run_id}.events.jsonl"))
+    except OSError:
+        logger.debug("Could not scan for an event log for run_id=%s", run_id, exc_info=True)
+        return None
+
+    if len(matches) != 1:
+        if matches:
+            logger.debug(
+                "Not adopting an event log for run_id=%s: %d candidates", run_id, len(matches)
+            )
+        return None
+    return matches[0]
 
 
 def scan_run_records() -> list[RunRecord]:

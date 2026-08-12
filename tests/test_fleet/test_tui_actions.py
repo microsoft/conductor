@@ -158,10 +158,20 @@ class TestDashboardAction:
         self, fleet_env: Path, tmp_path: Path
     ) -> None:
         """`w` on a run with a dashboard port invokes the browser opener
-        with the right http://127.0.0.1:<port> URL."""
+        with the right http://127.0.0.1:<port> URL.
+
+        Patches `_is_wsl` off so this asserts the ordinary `webbrowser`
+        path regardless of where the suite runs -- on a WSL host the real
+        detection routes around `webbrowser` entirely (see
+        `TestDashboardOnWsl`), which would otherwise make this pass or fail
+        by accident of the developer's machine.
+        """
         _write_record(tmp_path, "run-web", port=9123, mode="fg-web")
 
-        with patch.object(tui_actions.webbrowser, "open") as mock_open:
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=False),
+            patch.object(tui_actions.webbrowser, "open", return_value=True) as mock_open,
+        ):
             app = FleetApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
@@ -172,7 +182,10 @@ class TestDashboardAction:
 
     async def test_no_selection_does_not_crash(self, fleet_env: Path) -> None:
         """Pressing `w` with no runs at all (empty state) is a no-op, not a crash."""
-        with patch.object(tui_actions.webbrowser, "open") as mock_open:
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=False),
+            patch.object(tui_actions.webbrowser, "open") as mock_open,
+        ):
             app = FleetApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
@@ -668,3 +681,77 @@ class TestResolveGateSyncConcurrency:
         assert "resolved yes" in messages
         assert "resolved no" in messages
         assert gate_module.console is original
+
+
+class TestDashboardOnWsl:
+    """WSL has no working Linux browser handler, so `webbrowser` must not be
+    the mechanism there: on a stock WSL2 image it falls through to `gio`,
+    which answers "Operation not supported" and opens nothing."""
+
+    def test_wsl_uses_wslview_when_available(self) -> None:
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=True),
+            patch.object(tui_actions.shutil, "which", return_value="/usr/bin/wslview"),
+            patch.object(tui_actions.subprocess, "run") as mock_run,
+        ):
+            mock_run.return_value = Mock(returncode=0, stderr=b"")
+            assert tui_actions.open_url("http://127.0.0.1:9123") is True
+
+        argv = mock_run.call_args.args[0]
+        assert argv[0] == "wslview"
+        assert argv[-1] == "http://127.0.0.1:9123"
+
+    def test_wsl_falls_back_to_powershell(self) -> None:
+        """`wslview` ships in `wslu`, which is not installed by default."""
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=True),
+            patch.object(tui_actions.shutil, "which", return_value=None),
+            patch.object(tui_actions.subprocess, "run") as mock_run,
+        ):
+            mock_run.return_value = Mock(returncode=0, stderr=b"")
+            assert tui_actions.open_url("http://127.0.0.1:9123") is True
+
+        argv = mock_run.call_args.args[0]
+        assert argv[0] == "powershell.exe"
+        assert argv[-1] == "http://127.0.0.1:9123"
+
+    def test_wsl_never_uses_a_shell(self) -> None:
+        """List-form argv only -- a URL must never be concatenated into a
+        shell command line."""
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=True),
+            patch.object(tui_actions.shutil, "which", return_value=None),
+            patch.object(tui_actions.subprocess, "run") as mock_run,
+        ):
+            mock_run.return_value = Mock(returncode=0, stderr=b"")
+            tui_actions.open_url("http://127.0.0.1:9123")
+
+        assert isinstance(mock_run.call_args.args[0], list)
+        assert mock_run.call_args.kwargs.get("shell") is not True
+
+    def test_failed_open_reports_false(self) -> None:
+        """The caller shows the URL for hand-copying when this is False, so
+        a non-zero exit must not be reported as success."""
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=True),
+            patch.object(tui_actions.shutil, "which", return_value=None),
+            patch.object(tui_actions.subprocess, "run") as mock_run,
+        ):
+            mock_run.return_value = Mock(returncode=1, stderr=b"nope")
+            assert tui_actions.open_url("http://127.0.0.1:9123") is False
+
+    def test_opener_raising_does_not_propagate(self) -> None:
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=True),
+            patch.object(tui_actions.shutil, "which", return_value=None),
+            patch.object(tui_actions.subprocess, "run", side_effect=OSError("boom")),
+        ):
+            assert tui_actions.open_url("http://127.0.0.1:9123") is False
+
+    def test_non_wsl_uses_webbrowser(self) -> None:
+        with (
+            patch.object(tui_actions, "_is_wsl", return_value=False),
+            patch.object(tui_actions.webbrowser, "open", return_value=True) as mock_open,
+        ):
+            assert tui_actions.open_url("http://x") is True
+        mock_open.assert_called_once_with("http://x")

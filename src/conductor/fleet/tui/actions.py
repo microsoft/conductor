@@ -34,6 +34,10 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import platform
+import shutil
+import subprocess
 import threading
 import webbrowser
 from dataclasses import dataclass
@@ -105,8 +109,78 @@ def open_dashboard(record: RunRecord) -> bool:
     url = dashboard_url(record)
     if url is None:
         return False
-    webbrowser.open(url)
-    return True
+    return open_url(url)
+
+
+def _is_wsl() -> bool:
+    """Detect WSL, where a Linux browser opener usually cannot work.
+
+    WSL has no X display and typically no real browser installed, so
+    Python's ``webbrowser`` falls through to whatever generic handler it
+    can find -- on a stock WSL2 image that is ``gio``, which answers
+    ``Operation not supported`` and opens nothing. The browser that should
+    receive the URL is on the Windows side.
+    """
+    if platform.system() != "Linux":
+        return False
+    if "microsoft" in platform.release().lower():
+        return True
+    # WSL1 kernels do not always carry "microsoft" in the release string,
+    # but the interop env var is set in both.
+    return bool(os.environ.get("WSL_DISTRO_NAME"))
+
+
+def _wsl_open(url: str) -> bool:
+    """Hand ``url`` to the Windows side from WSL. True if a handler ran.
+
+    Tries ``wslview`` (from ``wslu``) first because it is the purpose-built
+    tool and respects the user's configured browser, then falls back to
+    PowerShell's ``Start-Process``, which is present on every WSL host.
+
+    ``explorer.exe`` is deliberately not used even though it also works:
+    it exits non-zero on success, so its return code cannot distinguish
+    "opened" from "failed" -- which is the whole thing this function needs
+    to report.
+    """
+    if shutil.which("wslview"):
+        candidates = [["wslview", url]]
+    else:
+        candidates = [["powershell.exe", "-NoProfile", "-Command", "Start-Process", url]]
+
+    for argv in candidates:
+        try:
+            # No shell: the URL is built from an int port, but a list-form
+            # call keeps it that way regardless of what a record contains.
+            result = subprocess.run(argv, capture_output=True, timeout=15, check=False)
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("WSL browser opener %s failed", argv[0], exc_info=True)
+            continue
+        if result.returncode == 0:
+            return True
+        logger.debug(
+            "WSL browser opener %s exited %s: %s",
+            argv[0],
+            result.returncode,
+            result.stderr.decode(errors="replace").strip(),
+        )
+    return False
+
+
+def open_url(url: str) -> bool:
+    """Open ``url`` in the user's browser. True if an opener reported success.
+
+    Exists because ``webbrowser.open`` is not enough on WSL (see
+    :func:`_is_wsl`) and because its own return value was previously
+    discarded -- so a failed open reported success to the caller and the
+    user was told the dashboard had been opened when nothing had happened.
+    """
+    if _is_wsl():
+        return _wsl_open(url)
+    try:
+        return webbrowser.open(url)
+    except Exception:  # noqa: BLE001 - a failed open must not kill the TUI
+        logger.debug("webbrowser.open failed for %s", url, exc_info=True)
+        return False
 
 
 # ---------------------------------------------------------------------------

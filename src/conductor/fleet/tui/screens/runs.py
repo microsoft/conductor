@@ -700,8 +700,20 @@ class RunsScreen(Screen):
         if reason is not None:
             self.notify(f"Dashboard unavailable: {reason}", severity="warning")
             return
-        open_dashboard(record)
-        self.notify(f"Opened dashboard: {dashboard_url(record)}")
+        url = dashboard_url(record)
+        if open_dashboard(record):
+            self.notify(f"Opened dashboard: {url}", markup=False)
+            return
+        # Reporting success unconditionally is how a failed open (a WSL host
+        # with no working handler, a headless box) still told the user the
+        # dashboard had been opened. The URL is included so it stays usable
+        # by hand -- it is the only thing the user actually needs.
+        self.notify(
+            f"Could not open a browser. Dashboard: {url}",
+            severity="warning",
+            timeout=15,
+            markup=False,
+        )
 
     # -----------------------------------------------------------------
     # Kill / kill-all actions (E8-T3)
