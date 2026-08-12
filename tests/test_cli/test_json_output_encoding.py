@@ -15,12 +15,16 @@ These tests drive the **production call sites** -- the module-level
 kwarg shape in :mod:`conductor.cli.doctor` -- through a stream bound to strict
 ``cp1252``. Patching only the console, never the code under test, means
 reverting an ``ensure_ascii=True`` argument fails a test that exercised that
-sink. That now holds for all five sinks: with the source-level guard disabled,
-reverting any one of them fails exactly one behavioural test.
+sink. That holds for the five sinks ``TestRealSinksThroughTheCli`` covers --
+the ones that existed when #342 was diagnosed: with the source-level guard
+disabled, reverting any one of them fails exactly one behavioural test. The
+module has since grown further sinks (``status``/``stop``'s ``--json``
+payloads); those are covered by the source guard alone, which is the check
+that catches an *omission*, and all of them already carry the keyword.
 
 That was not true when this file was first written: every behavioural test
 built its own Console, so reverting any of the five call sites failed only the
-source-level AST guard at the bottom. ``TestRealSinksThroughTheCli`` closes
+source-level AST guard below. ``TestRealSinksThroughTheCli`` closes
 that, using the same ``run_workflow_async`` patch ``test_run.py`` already
 relies on -- what the earlier attempt was missing was that mock, not a process
 boundary. The ``doctor`` case took a second pass for the same reason in
@@ -125,9 +129,11 @@ def test_negative_control_unfixed_sink_still_raises(char: str) -> None:
 # The contract tests above construct their own Console, so on their own they
 # would still pass if someone deleted ``ensure_ascii=True`` from a call site.
 # It asserts the source rather than the behaviour, which is cheap and runs
-# anywhere. ``TestRealSinksThroughTheCli`` covers the behaviour, so this
-# guard's remaining job is the narrower one: catching a *new* sink added
-# without the keyword, which is what a source assertion is actually good at.
+# anywhere. ``TestRealSinksThroughTheCli`` covers the behaviour for the five
+# sinks #342 was about, so this guard's job is the broader-but-shallower one:
+# catching a *new* sink added without the keyword, which is what a source
+# assertion is actually good at. That is most of them now -- ``app.py`` has
+# grown several ``--json`` payloads since, and this is their only cover.
 #
 # Its blind spot is the module list below: a sink added to a module that is
 # not listed is invisible here. ``cli/checkpoint.py`` already owns a stdout
