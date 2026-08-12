@@ -337,7 +337,12 @@ class TestFetchedPluginMetadataRenders:
             '  entry_point: "start"\n'
             "  runtime:\n"
             "    provider: copilot\n"
-            f'    plugins: ["{root}"]\n'
+            # json.dumps rather than an f-string: a YAML double-quoted scalar
+            # processes backslash escapes, so a Windows tmp_path interpolated
+            # raw makes "C:\\Users" read as the Unicode escape \\U and the
+            # fixture fails to parse. YAML is a superset of JSON, so JSON
+            # string escaping produces a valid scalar on every platform.
+            f"    plugins: [{json.dumps(str(root))}]\n"
             "agents:\n"
             '  - name: "start"\n'
             '    prompt: "hi"\n'
