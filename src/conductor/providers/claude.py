@@ -826,6 +826,10 @@ class ClaudeProvider(AgentProvider):
                 name="dialog_agent",
                 model=resolved_model,
                 prompt="",
+                max_depth=None,
+                timeout_seconds=None,
+                max_session_seconds=None,
+                max_agent_iterations=None,
             )
             pydantic_model = _resolve_anthropic_model(
                 agent=dummy_agent,
