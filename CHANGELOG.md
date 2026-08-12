@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.28...HEAD)
+
+## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
 
 ### Added
 
@@ -464,6 +466,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three of the five sinks; two of those were reachable on a bare `conductor run`
   with no flags. Opening tags such as `[bold]` were the quieter half of the same
   bug: rich consumed them without raising and the text simply disappeared.
+- **Non-ASCII workflow inputs are shown literally in verbose output**
+  ([#391](https://github.com/microsoft/conductor/pull/391)). The verbose
+  "Workflow Inputs" panel serialised inputs with `json.dumps`' default
+  `ensure_ascii=True`, so a Cyrillic, CJK or emoji input was displayed as
+  `\uXXXX` escapes rather than the text the user typed. Every other JSON
+  display path in the repo already passed `ensure_ascii=False` (#356); this
+  was the last one that did not. Machine-readable JSON *results* are
+  unaffected and still ASCII-escaped, which is what keeps them safe on a
+  legacy Windows console (#342).
 - **Structured `runtime.provider` for `name: claude` no longer drops a
   YAML-declared `api_key`** — the schema accepted `api_key` (alongside
   `base_url` and `auth_token`) but the provider factory silently discarded it,
