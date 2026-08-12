@@ -555,6 +555,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native OpenAI provider** — new stable `openai` provider built on the shared
+  Pydantic AI runtime. Works with the real OpenAI API and any OpenAI-compatible
+  Chat Completions endpoint (Ollama, vLLM, LM Studio, OpenRouter, corporate
+  proxies). Supports MCP tools, structured output, interrupts, reasoning effort
+  (`low`/`medium`/`high`/`xhigh`), and full temperature range `0.0`–`2.0`.
+  See `docs/providers/openai.md` and `examples/openai-compatible.yaml`.
 - **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
   previously offered only Stop, Resume, and Kill — there was no way to
   correct a run's course without stopping it first. `conductor guide --text
