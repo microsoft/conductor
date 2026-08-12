@@ -7,7 +7,8 @@
 # Jobs:
 # - lint: Runs ruff linter and formatter check
 # - typecheck: Runs ty (Red Knot) type checker
-# - test: Runs pytest with coverage on Python 3.12 and 3.13
+# - test: Runs pytest with coverage on Python 3.12 + 3.13 (Ubuntu) and 3.13
+#         (Windows, where the platform-specific code actually lives)
 # - validate-examples: Validates all example workflow YAML files
 # - build: Verifies the package builds correctly
 # - frontend: Type-checks, tests (Vitest), and builds the web dashboard
@@ -125,17 +126,32 @@ jobs:
 
       - name: Remove bundled Copilot CLI binary
         # `shell: bash` so this runs identically on the Windows runner (Git Bash
-        # is preinstalled). Without it the step fails on Windows, since `find`
-        # is not a native command there.
+        # is preinstalled). Without it the step fails on Windows, where a bare
+        # `find` resolves to the unrelated DOS search tool in System32.
         shell: bash
         run: |
+          set -euo pipefail
           # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
           # authenticate with GitHub on startup. Remove it so tests that invoke
           # the real CLI path fail fast instead of hanging on auth.
-          # The Windows venv puts scripts under Scripts/ rather than lib/, and
-          # the binary carries a .exe suffix, so match both layouts.
-          find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
-          find .venv -iname 'copilot.exe' -delete 2>/dev/null || true
+          #
+          # The binary ships inside the package (copilot/bin/), not in the venv's
+          # scripts directory — there is no console-script entry point — so one
+          # pattern covers both platforms: the leading */ absorbs lib/pythonX.Y/
+          # or Lib/, and the trailing * absorbs the .exe suffix on Windows.
+          #
+          # Checked rather than best-effort: `find` exits 0 when it matches
+          # nothing, so a silent no-op reinstates the auth hang this step exists
+          # to prevent, and it surfaces ten minutes later as a bare job timeout
+          # naming neither the CLI nor this step.
+          removed=$(find .venv -path '*/copilot/bin/copilot*' -print -delete)
+          if [ -z "$removed" ]; then
+            echo "::error::No bundled Copilot CLI matched '*/copilot/bin/copilot*'."
+            echo "The github-copilot-sdk layout changed — update this pattern, or"
+            echo "tests taking the real CLI path will hang until the job timeout."
+            exit 1
+          fi
+          echo "Removed: $removed"
 
       - name: Run tests with coverage
         timeout-minutes: 10
