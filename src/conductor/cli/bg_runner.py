@@ -881,17 +881,23 @@ def _serialize_value(value: Any) -> str:
 
 
 def _serialize_input_value(value: Any) -> str:
-    """Serialize an already-typed input value for the ``--input`` CLI boundary.
+    """Serialize an already-typed input value for the ``--input-json`` boundary.
 
     Unlike :func:`_serialize_value`, this **always** JSON-encodes -- including
-    plain strings -- so a declared ``"string"``-typed value like ``"true"``
-    round-trips as ``'"true"'`` rather than the bare ``true`` a str
-    passthrough would produce. The child's own ``cli/run.py::coerce_value``
-    parses ``--input`` values by attempting ``json.loads`` first, so a
-    quoted string decodes back to a plain string instead of being
-    reinterpreted as a bool/int/None/list (issue: declared-type coercion
-    was otherwise lost across the ``launch_background`` subprocess
-    boundary -- see Fleet Manager E12).
+    plain strings -- and is decoded on the other side by
+    ``cli/run.py::coerce_typed_value`` (a strict ``json.loads``) via the
+    hidden ``--input-json`` flag.
+
+    The pairing matters because values reaching here are already coerced to
+    their **declared** types (``fleet/launch.py::_coerce_input`` maps the
+    New Run form's fields onto the workflow's ``input:`` schema, returning a
+    ``string``-typed value verbatim), and nothing downstream restores that
+    typing: the engine's ``_apply_input_defaults`` only fills in *missing*
+    inputs, so whatever the child's CLI parse produces is final. Routing
+    these through the public ``--input`` flag instead would hand them to
+    ``coerce_value``, whose command-line heuristic re-guesses a bare
+    ``true``/``42``/``[1,2]`` into a bool/int/list -- silently discarding the
+    declared ``string`` type the form was careful to preserve.
 
     Args:
         value: The already-coerced value to serialize.

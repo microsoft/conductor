@@ -395,6 +395,18 @@ def run(
             help="Workflow inputs in name=value format. Can be repeated.",
         ),
     ] = None,
+    raw_inputs_json: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--input-json",
+            hidden=True,
+            help=(
+                "Internal: workflow inputs in name=<json> format, strictly "
+                "JSON-decoded. Used by the background launcher to round-trip "
+                "already-typed values."
+            ),
+        ),
+    ] = None,
     raw_metadata: Annotated[
         list[str] | None,
         typer.Option(
@@ -543,6 +555,7 @@ def run(
         display_execution_plan,
         generate_log_path,
         parse_input_flags,
+        parse_input_json_flags,
         parse_metadata_flags,
         run_workflow_async,
     )
@@ -567,6 +580,12 @@ def run(
     # Parse --input name=value style
     if raw_inputs:
         inputs.update(parse_input_flags(raw_inputs))
+
+    # Parse the hidden --input-json name=<json> style. Applied after
+    # --input so a value the background launcher round-tripped verbatim
+    # wins over the public flag's type-guessing heuristic.
+    if raw_inputs_json:
+        inputs.update(parse_input_json_flags(raw_inputs_json))
 
     # Also parse --input.name=value style from sys.argv
     inputs.update(InputCollector.extract_from_args())

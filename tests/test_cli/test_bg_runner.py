@@ -1328,3 +1328,116 @@ class TestSanitizeName:
 
         assert _sanitize_name("") == "workflow"
         assert _sanitize_name("///") == "workflow"
+
+
+def _declared_option_strings(subcommand: str) -> set[str]:
+    """Every ``--flag`` the real CLI declares for ``subcommand``.
+
+    Reads the actual Click command Typer builds, so this reflects what a
+    spawned child would genuinely accept rather than a restatement of it.
+    """
+    import typer.main
+
+    from conductor.cli.app import app
+
+    command = typer.main.get_command(app).commands[subcommand]  # ty: ignore[possibly-unbound-attribute]
+    return {opt for param in command.params for opt in param.opts if opt.startswith("--")}
+
+
+def _flags_in(cmd: list[str]) -> set[str]:
+    """The ``--flag`` tokens of a built argv (values are never flag-shaped here)."""
+    return {token for token in cmd if token.startswith("--")}
+
+
+class TestLaunchedArgvIsAcceptedByTheChildCLI:
+    """Every flag the launcher emits must exist on the command it spawns.
+
+    These tests never spawn a process -- ``subprocess.Popen`` is patched out
+    across this module -- so asserting on the argv the launcher *builds*
+    proves only that it built what the test expected, not that anything
+    could run it. That gap shipped a real bug: ``bg_runner`` forwarded
+    inputs via ``--input-json``, a flag ``conductor run`` never declared, so
+    every ``--web-bg`` launch carrying an input died instantly with exit
+    code 2 -- including every launch from the Fleet Manager's New Run
+    screen, whose form is built from the workflow's declared inputs and
+    therefore essentially always passes some.
+
+    Checking the built argv against the child command's real, declared
+    options closes that gap without paying for a subprocess.
+    """
+
+    def _build_run_cmd(self, tmp_path: Path, inputs: dict[str, Any]) -> list[str]:
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        fake_proc = MagicMock(pid=1)
+        fake_proc.poll.return_value = None
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=MagicMock(pid=1, mode="bg", port=9401),
+            ),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs=inputs,
+                web_port=9401,
+                metadata={"tracker": "ado"},
+                provider_override="copilot",
+                skip_gates=True,
+            )
+
+        return mock_spawn.call_args.args[0]
+
+    def test_run_launcher_emits_only_declared_flags(self, tmp_path: Path) -> None:
+        cmd = self._build_run_cmd(
+            tmp_path,
+            # One of every shape ``_serialize_input_value`` round-trips, since
+            # the flag carrying them is the one that was missing.
+            {"topic": "tidal power", "count": 3, "deep": True, "tags": ["a", "b"]},
+        )
+
+        undeclared = _flags_in(cmd) - _declared_option_strings("run")
+        assert not undeclared, f"launcher emits flags `conductor run` rejects: {sorted(undeclared)}"
+
+    def test_run_launcher_forwards_inputs_at_all(self, tmp_path: Path) -> None:
+        """Guards the other direction: a launcher that silently dropped
+        inputs would trivially satisfy the check above."""
+        cmd = self._build_run_cmd(tmp_path, {"topic": "tidal power"})
+
+        assert "--input-json" in cmd
+        assert 'topic="tidal power"' in cmd
+
+    def test_resume_launcher_emits_only_declared_flags(self, tmp_path: Path) -> None:
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        fake_proc = MagicMock(pid=2)
+        fake_proc.poll.return_value = None
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=MagicMock(pid=2, mode="bg", port=9402),
+            ),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=wf_path,
+                checkpoint_path=None,
+                web_port=9402,
+                metadata={"tracker": "ado"},
+                provider_override="copilot",
+                skip_gates=True,
+                guidance=["Skip the benchmark step"],
+            )
+
+        cmd = mock_spawn.call_args.args[0]
+        undeclared = _flags_in(cmd) - _declared_option_strings("resume")
+        assert not undeclared, (
+            f"launcher emits flags `conductor resume` rejects: {sorted(undeclared)}"
+        )

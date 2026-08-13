@@ -29,7 +29,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links
 - **Safety limits** - Max iterations and timeout enforcement
 - **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
-- **[Fleet manager](docs/fleet.md)** - Discover, stop, and monitor every running `conductor` process (foreground, `--web`, or `--web-bg`) via `conductor stop`/`conductor fleet list`, plus an optional interactive TUI (`conductor fleet`, `pip install 'conductor-cli[tui]'`) for managing and launching runs across your fleet
+- **[Fleet Manager](#fleet-manager-tui)** - An interactive TUI over every running `conductor` process (foreground, `--web`, or `--web-bg`): live status, tokens and cost, gate alerts you can answer, step-level drill-down, and launching new runs — plus non-interactive `conductor stop` / `conductor fleet list`
 - **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
 
 ## Installation
@@ -212,6 +212,40 @@ conductor guide --text "Prefer Python 3.12 examples"
 conductor stop
 ```
 
+## Fleet Manager (TUI)
+
+The dashboard shows you one run in depth. The **Fleet Manager** shows you *every* run at once — and it's where you go when something needs you. Launch it with `conductor fleet`:
+
+```bash
+pip install 'conductor-cli[tui]'   # one-time: the TUI ships as an optional extra
+conductor fleet
+```
+
+![Fleet Manager](docs/img/fleet-manager.png)
+
+> **TUI = breadth. Dashboard = depth.**
+>
+> The TUI answers *"what's happening across my fleet, and what needs me?"* The dashboard answers *"what exactly is this one run doing?"* They compose — press `w` on any run to open its dashboard in a browser.
+
+**Key features:**
+
+- **Every run is discoverable** — Foreground, `--web`, and `--web-bg` runs all appear. Previously only `--web-bg` runs were visible to `conductor stop`; a plain `conductor run` had to be hunted down and killed by hand.
+- **Live fleet table** — Each run's status, current step, elapsed time, tokens, cost, and a token-burn sparkline, polled continuously and sorted by recency
+- **Gates that find you** — A run blocked on a human gate is badged in the table and fires a terminal bell, so a waiting workflow doesn't sit unnoticed. Press `g` to answer it without leaving the TUI.
+- **Drill down** — `enter` opens a run's per-agent breakdown, then `enter` again on any step shows what it actually did: its input, output, and activity stream
+- **Launch new runs** — `n` builds a form from a workflow's declared `input:` block and starts it in the background, so the TUI both watches and starts work
+- **Browse and re-run** — Providers and model diagnostics (`p`), registries and their workflows (`r`), and History (`h`) for finished runs, which hands off to `conductor replay`
+- **Kill safely** — `k` stops the selected run, `K` the whole fleet. Both confirm first, and a foreground run is named explicitly, since stopping one discards in-flight progress unless periodic checkpoints are enabled.
+
+```bash
+# Not interactive? These need no extra dependency:
+conductor fleet list           # table of every live run
+conductor stop                 # stop the only running workflow, or list them
+conductor fleet prune          # bound the event logs in $TMPDIR/conductor
+```
+
+See [docs/fleet.md](docs/fleet.md) for every screen, key binding, the status vocabulary, and retention settings.
+
 ## Providers
 
 Conductor supports multiple AI providers. Choose based on your needs:
@@ -356,14 +390,13 @@ conductor validate <workflow.yaml>
 ### `conductor fleet`
 
 Discover and manage every running `conductor` process — foreground,
-`--web`, or `--web-bg` — via `conductor stop` and `conductor fleet list`
-(no extra dependency), or launch the interactive TUI with `conductor fleet`
-(requires `pip install 'conductor-cli[tui]'`):
+`--web`, or `--web-bg`. See [Fleet Manager](#fleet-manager-tui) above for
+the interactive TUI; these need no extra dependency:
 
 ```bash
 conductor stop                # stop the only running workflow, or list them
-conductor fleet list           # non-interactive table of every live run
-conductor fleet                # interactive TUI (requires the `tui` extra)
+conductor fleet list          # non-interactive table of every live run
+conductor fleet               # interactive TUI (requires the `tui` extra)
 ```
 
 See [docs/fleet.md](docs/fleet.md) for the TUI's screens, key bindings, and
