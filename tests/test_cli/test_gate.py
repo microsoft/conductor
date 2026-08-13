@@ -15,30 +15,14 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
-import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
 
 runner = CliRunner()
-
-
-@pytest.fixture(autouse=True)
-def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the token-file lookup at tmp_path (issue #397).
-
-    ``gate respond`` resolves a token via ``conductor.web.auth.resolve_cli_token``,
-    which falls back to reading the dashboard token file for the target port
-    when neither ``--token`` nor ``CONDUCTOR_GATE_TOKEN`` is set. Without
-    this, tests would read the developer's real ``~/.conductor/runs``.
-    """
-    runs_dir = tmp_path / "runs"
-    runs_dir.mkdir()
-    monkeypatch.setattr("conductor.rundir.runs_dir", lambda: runs_dir)
 
 
 def _mock_response(status_code: int = 200, json_data: dict | None = None) -> MagicMock:

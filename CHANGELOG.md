@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.28...HEAD)
 
+### Security
+
+- **Hardened the web dashboard's HTTP/WebSocket surface** (#397). Every
+  mutating route (`POST /api/stop`, `/api/kill`, `/api/resume`,
+  `/api/gate-respond`, `/api/guidance`) and the `/ws` handshake now require a
+  per-run token by default — previously the only protection was the
+  optional `CONDUCTOR_GATE_TOKEN` env var, and requests were unauthenticated
+  when it was unset. The token is minted automatically per run and
+  discoverable by `conductor gate respond` / `guide` / `stop` via a new
+  `0600` file at `~/.conductor/runs/dashboard-<port>.token`;
+  `CONDUCTOR_GATE_TOKEN` still overrides it when set. A new pure-ASGI
+  `OriginHostGuard` middleware also validates the `Host` and (when present)
+  `Origin` headers on every HTTP and WebSocket request, closing the
+  DNS-rebinding and CSRF-from-another-open-page angles; `CONDUCTOR_WEB_ALLOW_ORIGINS`
+  (comma-separated origins) extends the allowlist for local dev servers.
+  **Breaking for external API callers:** every mutating route now also
+  requires `Content-Type: application/json` (415 otherwise), including the
+  previously bodyless control POSTs, and a request whose `Host`/`Origin`
+  doesn't match the bound dashboard is rejected with 403 regardless of
+  token. Read-only routes (`/api/state`, `/api/info`, `/api/logs`,
+  `/api/gate-status`, `/api/files/*`, and the replay dashboard) remain
+  unauthenticated, protected by Origin/Host only.
+
 ## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
 
 ### Added

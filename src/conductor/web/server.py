@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json
 import logging
 import os
@@ -38,6 +37,7 @@ from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.executor.linkify import LINKABLE_EXTENSIONS
 from conductor.web.auth import (
     OriginHostGuard,
+    constant_time_match,
     mint_token,
     remove_token_file,
     resolve_expected_token,
@@ -1076,7 +1076,7 @@ class WebDashboard:
         """
         expected_token = resolve_expected_token(self._token)
         scheme, _, presented = (auth_header or "").partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(presented, expected_token)
+        return scheme.lower() == "bearer" and constant_time_match(presented, expected_token)
 
     def _validate_gate_target(self, agent_name: str, prompt_id: str | None = None) -> str | None:
         """Validate that a gate response targets the currently-waiting prompt.
@@ -1434,8 +1434,13 @@ class WebDashboard:
         # bound port is only known after the socket binds, and this method
         # runs for both --web and --web-bg (cli/run.py calls start()/stop()
         # on both the run and resume paths, and the --web-bg child goes
-        # through the same code).
-        write_token_file(self._actual_port, self._token)
+        # through the same code). Written as *resolved* token
+        # (CONDUCTOR_GATE_TOKEN if set, else the minted one) — the guard
+        # validates against resolve_expected_token(self._token), not the
+        # raw minted value, so writing the minted value here would make the
+        # file useless (and CLI auto-discovery would always 403) whenever
+        # the env var override is set.
+        write_token_file(self._actual_port, resolve_expected_token(self._token))
 
     async def stop(self) -> None:
         """Shut down the server gracefully.
@@ -1464,17 +1469,26 @@ class WebDashboard:
         except RuntimeError:
             pass  # No running loop (e.g. during interpreter shutdown)
 
+        # Remove the token file (issue #397) — best-effort, and identity-
+        # checked against the token *this* run wrote: the socket was just
+        # released above, so a concurrent run can already have bound the
+        # same port and overwritten the file by the time we get here.
+        # Deleting it unconditionally would delete that newer run's token
+        # file out from under it, exactly the port-reuse hazard
+        # cli/pid.py::remove_pid_file_at already guards against. Placed
+        # before the WebSocket drain (rather than after) so it isn't
+        # delayed by however long that unbounded per-connection loop takes.
+        if self._actual_port is not None:
+            try:
+                remove_token_file(self._actual_port, resolve_expected_token(self._token))
+            except OSError as exc:
+                logger.warning("Failed to remove dashboard token file: %s", exc)
+
         # Close remaining WebSocket connections
         for ws in list(self._connections):
             with contextlib.suppress(Exception):
                 await ws.close()
         self._connections.clear()
-
-        # Remove the token file (issue #397) — best-effort; a run killed
-        # before reaching here just leaves a stale file that a later run on
-        # the same port overwrites.
-        if self._actual_port is not None:
-            remove_token_file(self._actual_port)
 
         # Unsubscribe from emitter
         self._emitter.unsubscribe(self._on_event)

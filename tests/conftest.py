@@ -95,3 +95,33 @@ def tmp_workflow_file(tmp_path: Path, sample_workflow_yaml: str) -> Path:
     workflow_file = tmp_path / "test-workflow.yaml"
     workflow_file.write_text(sample_workflow_yaml)
     return workflow_file
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ``conductor.rundir.runs_dir()`` at ``tmp_path`` for every test.
+
+    ``conductor.rundir.runs_dir()`` backs both the PID registry
+    (``cli/pid.py``) and the dashboard token file (``web/auth.py``, issue
+    #397); several call paths (``conductor gate respond`` / ``guide`` /
+    the graceful-kill rung of ``conductor stop``, and ``WebDashboard.start``/
+    ``stop``) read or write it when no explicit ``--token``/env var is
+    supplied. Making this autouse and global — rather than the four
+    hand-copied per-file versions it replaces — closes the gap where a test
+    module that never opted in (``test_markup_injection.py``) read the
+    developer's real ``~/.conductor/runs`` and, on a machine with a live
+    dashboard, its live token.
+
+    Also asserts, on every call, that the resolved directory is never the
+    real home — a meta-guard in case a future test bypasses the monkeypatch
+    (e.g. by importing ``runs_dir`` before this fixture runs).
+    """
+    runs_dir = tmp_path / "runs_isolated_for_tests"
+    runs_dir.mkdir()
+    real_home_runs_dir = Path.home() / ".conductor" / "runs"
+
+    def _isolated() -> Path:
+        assert runs_dir != real_home_runs_dir
+        return runs_dir
+
+    monkeypatch.setattr("conductor.rundir.runs_dir", _isolated)

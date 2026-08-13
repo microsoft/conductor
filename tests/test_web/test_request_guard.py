@@ -25,11 +25,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from conductor.events import WorkflowEventEmitter
-from conductor.web.auth import read_token_file, resolve_expected_token, token_file_path
+from conductor.web.auth import (
+    OriginHostGuard,
+    read_token_file,
+    resolve_expected_token,
+    token_file_path,
+)
 from conductor.web.replay import ReplayDashboard
 from conductor.web.server import WebDashboard
 from tests.test_web.conftest import TEST_PORT, make_client, make_replay_client, ws_connect
@@ -203,6 +209,116 @@ class TestMutatingRouteTokenAuth:
             assert resp.status_code == 200
 
 
+class TestNonAsciiTokenDoesNotCrash:
+    """A non-ASCII presented token must 403, never crash the guard (issue #397).
+
+    ``hmac.compare_digest`` raises ``TypeError`` on any ``str`` containing a
+    non-ASCII character. ``presented`` is fully attacker-controlled: a
+    latin-1-decoded ``Authorization`` header, or a ``?token=`` value that
+    already went through ``token_from_scope``'s ``errors="replace"`` decode
+    (which manufactures U+FFFD from a malformed percent-escape like
+    ``%FF``). Before the fix, both of these turned an unauthenticated 403
+    into an unhandled 500 with a traceback on every request.
+    """
+
+    def test_non_ascii_bearer_token_rejected_not_crashed(self) -> None:
+        _, dashboard = _make_dashboard()
+        dashboard._actual_port = TEST_PORT
+        client = TestClient(
+            dashboard.app,
+            base_url=f"http://127.0.0.1:{TEST_PORT}",
+            headers={"Content-Type": "application/json"},
+        )
+        # Raw bytes with the high bit set: httpx.Headers rejects a plain str
+        # value it can't ascii-encode, but the wire itself carries bytes --
+        # Starlette decodes the raw Authorization header via latin-1, which
+        # is exactly what produces a non-ASCII `str` for constant_time_match
+        # to compare.
+        with client:
+            resp = client.post(
+                "/api/stop", headers=[(b"Authorization", "Bearer tökén".encode("latin-1"))]
+            )
+            assert resp.status_code == 403
+
+    def test_percent_encoded_invalid_utf8_query_token_rejected_not_crashed(self) -> None:
+        _, dashboard = _make_dashboard()
+        dashboard._actual_port = TEST_PORT
+        client = TestClient(
+            dashboard.app,
+            base_url=f"http://127.0.0.1:{TEST_PORT}",
+            headers={"Content-Type": "application/json"},
+        )
+        with client:
+            resp = client.post("/api/stop?token=%FF%FE")
+            assert resp.status_code == 403
+
+    def test_non_ascii_ws_query_token_rejected_not_crashed(self) -> None:
+        _, dashboard = _make_dashboard()
+        dashboard._actual_port = TEST_PORT
+        bare = TestClient(dashboard.app, base_url=f"http://127.0.0.1:{TEST_PORT}")
+        with (
+            bare as client,
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            ws_connect(client, dashboard, path="/ws?token=%FF%FE"),
+        ):
+            pass
+        assert exc_info.value.code == 1008
+
+
+def _guard_kwargs(dashboard: WebDashboard) -> dict[str, object]:
+    """Return the ``OriginHostGuard`` middleware's constructor kwargs.
+
+    Reads them back off the live app (``app.user_middleware``) rather than
+    importing the hardcoded route lists from ``server.py``, so this stays a
+    genuine regression check on the *registered* middleware rather than a
+    second copy of the same list.
+    """
+    for mw in dashboard.app.user_middleware:
+        if mw.cls is OriginHostGuard:
+            return dict(mw.kwargs)
+    raise AssertionError("OriginHostGuard is not registered on the app")
+
+
+class TestGuardCoversEveryMutatingRoute:
+    """Mutation-proof: the guard's route lists must cover every real route.
+
+    Mutation testing (dropping `/api/gate-respond` / `/api/guidance` from
+    `protected_paths` in `server.py`) passed the full suite before this test
+    existed, because the parametrizations above hardcode the route list
+    rather than deriving it from `app.routes`. These two tests instead read
+    the actual FastAPI route table and assert it is a subset of what the
+    guard protects, so a newly added mutating route or WebSocket route that
+    isn't registered with the guard fails here even if no other test
+    exercises it directly.
+    """
+
+    def test_every_mutating_http_route_is_registered_with_the_guard(self) -> None:
+        _, dashboard = _make_dashboard()
+        protected_paths = _guard_kwargs(dashboard)["protected_paths"]
+        mutating_methods = {"POST", "PUT", "PATCH", "DELETE"}
+
+        unprotected = []
+        for route in dashboard.app.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            if route.methods & mutating_methods and route.path not in protected_paths:
+                unprotected.append(route.path)
+
+        assert unprotected == [], f"Mutating routes missing from protected_paths: {unprotected}"
+
+    def test_every_websocket_route_is_registered_with_the_guard(self) -> None:
+        _, dashboard = _make_dashboard()
+        websocket_paths = _guard_kwargs(dashboard)["websocket_paths"]
+
+        unprotected = [
+            route.path
+            for route in dashboard.app.routes
+            if isinstance(route, APIWebSocketRoute) and route.path not in websocket_paths
+        ]
+
+        assert unprotected == [], f"WebSocket routes missing from websocket_paths: {unprotected}"
+
+
 class TestWebSocketHandshakeTokenAuth:
     """The /ws handshake authenticates the connection; no per-message auth exists."""
 
@@ -227,6 +343,41 @@ class TestWebSocketHandshakeTokenAuth:
             ws_connect(client, dashboard, path=f"/ws?token={dashboard.token}") as ws,
         ):
             assert ws is not None
+
+    def test_handshake_rejected_with_wrong_query_param_token(self) -> None:
+        """Mutation-proof: weakening constant_time_match must not pass this.
+
+        Weakening `constant_time_match` to `presented is not None` (in
+        `auth.py`) passed the full suite before this test existed, because
+        the only prior WS token tests covered an *absent* token and the
+        *correct* one -- never a wrong one. WS has no per-message auth (only
+        the handshake), so this is the one test standing between a typo'd
+        comparison and every mutating dashboard action being reachable with
+        any non-empty token.
+        """
+        _, dashboard = _make_dashboard()
+        dashboard._actual_port = TEST_PORT
+        bare = TestClient(dashboard.app, base_url=f"http://127.0.0.1:{TEST_PORT}")
+        with (
+            bare as client,
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            ws_connect(client, dashboard, path="/ws?token=definitely-the-wrong-token"),
+        ):
+            pass
+        assert exc_info.value.code == 1008
+
+    def test_handshake_rejected_with_wrong_authorization_header_token(self) -> None:
+        """Same as above, via the `Authorization: Bearer` extraction branch."""
+        _, dashboard = _make_dashboard()
+        dashboard._actual_port = TEST_PORT
+        bare = TestClient(dashboard.app, base_url=f"http://127.0.0.1:{TEST_PORT}")
+        with (
+            bare as client,
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            ws_connect(client, dashboard, headers={"Authorization": "Bearer wrong-token"}),
+        ):
+            pass
+        assert exc_info.value.code == 1008
 
     def test_rejected_handshake_leaves_gate_and_dialog_queues_empty(self) -> None:
         """Once the handshake is rejected the socket never reaches accept(),
@@ -308,6 +459,33 @@ class TestIndexTokenInjection:
             assert resp.status_code == 403
 
 
+class TestAntiClickjackingHeaders:
+    """Every HTTP response through the guard carries anti-framing headers.
+
+    Without these, any page can `<iframe>` the dashboard and position it so
+    a click lands on Kill/Stop/a gate Approve -- those clicks execute inside
+    the dashboard's own origin, so the Host check, Origin check and token
+    all pass by construction.
+    """
+
+    def test_index_response_has_security_headers(self) -> None:
+        _, dashboard = _make_dashboard()
+        with make_client(dashboard) as client:
+            resp = client.get("/")
+            assert resp.headers["x-frame-options"] == "DENY"
+            assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+            assert resp.headers["x-content-type-options"] == "nosniff"
+            assert resp.headers["referrer-policy"] == "no-referrer"
+
+    def test_rejected_response_still_has_security_headers(self) -> None:
+        """The headers must apply even on a 403 (a guard-rejected iframe load)."""
+        _, dashboard = _make_dashboard()
+        with make_client(dashboard) as client:
+            resp = client.get("/api/state", headers={"Host": "evil.example"})
+            assert resp.status_code == 403
+            assert resp.headers["x-frame-options"] == "DENY"
+
+
 class TestTokenFileLifecycle:
     """The token file is written on start(), removed on stop(), and round-trips."""
 
@@ -330,6 +508,27 @@ class TestTokenFileLifecycle:
 
         assert not token_file_path(port).exists()
 
+    async def test_stop_does_not_delete_a_newer_runs_token_file(self) -> None:
+        """A draining stop() must not delete a *newer* run's file on the same port.
+
+        Mirrors the port-reuse hazard ``cli/pid.py::remove_pid_file_at``
+        already guards against for PID files: run A's cleanup must not
+        clobber run B's token file after the port has been reused.
+        """
+        from conductor.web.auth import write_token_file
+
+        emitter, dashboard = _make_dashboard()
+        await dashboard.start()
+        port = dashboard.port
+
+        # Simulate a newer run overwriting the file on the same port before
+        # this dashboard's own stop() cleanup runs.
+        write_token_file(port, "a-different-runs-token")
+
+        await dashboard.stop()
+
+        assert read_token_file(port) == "a-different-runs-token"
+
     async def test_round_trips_through_reader(self) -> None:
         emitter, dashboard = _make_dashboard()
         await dashboard.start()
@@ -338,6 +537,23 @@ class TestTokenFileLifecycle:
             assert read_back == resolve_expected_token(dashboard._token)
         finally:
             await dashboard.stop()
+
+    async def test_written_token_matches_conductor_gate_token_override(self) -> None:
+        """The file must hold the *resolved* token, not the raw minted one.
+
+        Every validation path checks ``resolve_expected_token(self._token)``
+        (``CONDUCTOR_GATE_TOKEN`` if set, else the minted token). Writing the
+        raw minted value here would mean the file is useless -- and CLI
+        auto-discovery guaranteed to 403 -- whenever the env var override is
+        set, exactly the scenario this test pins.
+        """
+        emitter, dashboard = _make_dashboard()
+        with patch.dict(os.environ, {"CONDUCTOR_GATE_TOKEN": "env-secret-123"}):
+            await dashboard.start()
+            try:
+                assert read_token_file(dashboard.port) == "env-secret-123"
+            finally:
+                await dashboard.stop()
 
     def test_read_missing_token_file_returns_none(self) -> None:
         assert read_token_file(999999) is None

@@ -657,21 +657,13 @@ class TestIdentityConfirmation:
 
 
 class TestGracefulKillRequest:
-    """Rung 1 talks to the run's own dashboard."""
+    """Rung 1 talks to the run's own dashboard.
 
-    @pytest.fixture(autouse=True)
-    def _isolated_runs_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Point the token-file lookup at tmp_path (issue #397).
-
-        ``_request_graceful_kill`` resolves a token via
-        ``conductor.web.auth.resolve_cli_token``, which reads
-        ``conductor.rundir.runs_dir()`` when no flag/env token is set.
-        Without this, these tests would read the developer's real
-        ``~/.conductor/runs``.
-        """
-        runs_dir = tmp_path / "runs"
-        runs_dir.mkdir()
-        monkeypatch.setattr("conductor.rundir.runs_dir", lambda: runs_dir)
+    Run-registry isolation (``rundir.runs_dir()`` -> a temp directory,
+    needed since ``_request_graceful_kill`` resolves a token via
+    ``conductor.web.auth.resolve_cli_token``) is provided globally by the
+    autouse ``_isolated_runs_dir`` fixture in ``tests/conftest.py``.
+    """
 
     def test_posts_to_api_kill_and_reports_acceptance(self) -> None:
         with patch("httpx.post") as post:

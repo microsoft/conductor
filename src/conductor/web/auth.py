@@ -31,9 +31,9 @@ from __future__ import annotations
 import hmac
 import os
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
 from starlette.datastructures import Headers
@@ -124,8 +124,28 @@ def read_token_file(port: int) -> str | None:
         return None
 
 
-def remove_token_file(port: int) -> None:
-    """Remove the dashboard token file for ``port``, if present."""
+def remove_token_file(port: int, expected: str | None = None) -> None:
+    """Remove the dashboard token file for ``port``, if present.
+
+    When ``expected`` is given, the file is only removed if its contents
+    match — a run's cleanup must not delete a *newer* run's token file after
+    a port has been reused (the same hazard
+    ``cli/pid.py::remove_pid_file_at`` already guards for PID files). With
+    no ``expected`` value the old unconditional unlink applies.
+
+    Args:
+        port: The bound dashboard port.
+        expected: The token this run wrote, or None to unlink unconditionally.
+    """
+    if expected is None:
+        token_file_path(port).unlink(missing_ok=True)
+        return
+    try:
+        current = read_token_file(port)
+    except OSError:
+        return
+    if current is not None and current != expected:
+        return
     token_file_path(port).unlink(missing_ok=True)
 
 
@@ -307,10 +327,24 @@ def token_from_scope(scope: Scope) -> str | None:
 
 
 def constant_time_match(presented: str | None, expected: str) -> bool:
-    """Compare a presented token against the expected one in constant time."""
+    """Compare a presented token against the expected one in constant time.
+
+    Compares UTF-8 bytes rather than ``str`` values: ``hmac.compare_digest``
+    raises ``TypeError`` on any ``str`` containing a non-ASCII character,
+    and ``presented`` is fully attacker-controlled (a raw ``Authorization``
+    header or a percent-decoded ``?token=`` value, the latter already
+    passed through ``errors="replace"`` by :func:`token_from_scope` — which
+    manufactures exactly the U+FFFD replacement character that trips this).
+    ``surrogatepass`` keeps a lone surrogate (from a malformed percent-escape)
+    encodable instead of raising a second, different exception.
+    """
+    if not expected:
+        return False
     if presented is None:
         return False
-    return hmac.compare_digest(presented, expected)
+    return hmac.compare_digest(
+        presented.encode("utf-8", "surrogatepass"), expected.encode("utf-8", "surrogatepass")
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +382,35 @@ async def _reject_websocket(receive: Receive, send: Send, code: int = 1008) -> N
     """
     await receive()
     await send({"type": "websocket.close", "code": code})
+
+
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-frame-options", b"DENY"),
+    (b"content-security-policy", b"frame-ancestors 'none'"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+)
+
+
+def _with_security_headers(send: Send) -> Send:
+    """Wrap ``send`` to add anti-clickjacking/anti-sniffing headers to every response.
+
+    Without ``X-Frame-Options``/``frame-ancestors``, any page can ``<iframe>``
+    the dashboard and position it so a click lands on Kill/Stop/a gate
+    Approve — those clicks execute inside the dashboard's own origin, so the
+    Host check, Origin check and token all pass by construction. Applied to
+    every HTTP response the guard lets through (not just ``GET /``), so a
+    future route can't accidentally ship without it.
+    """
+
+    async def _send(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            headers = list(message.get("headers") or [])
+            headers.extend(_SECURITY_HEADERS)
+            message = {**message, "headers": headers}
+        await send(message)
+
+    return _send
 
 
 class OriginHostGuard:
@@ -396,6 +459,9 @@ class OriginHostGuard:
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
+
+        if scope["type"] == "http":
+            send = _with_security_headers(send)
 
         headers = Headers(scope=scope)
         bound_host, bound_port = self._get_bound()

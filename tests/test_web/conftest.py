@@ -8,14 +8,16 @@ resolved token. ``starlette.testclient.TestClient`` defaults to
 a bare ``TestClient(dashboard.app)`` now gets a 403 on almost everything.
 Tests in this package should build clients via :func:`make_client` /
 :func:`make_replay_client` instead.
+
+Run-registry isolation (``rundir.runs_dir()`` -> a temp directory) is
+provided globally by the autouse ``_isolated_runs_dir`` fixture in
+``tests/conftest.py``.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import pytest
 from starlette.testclient import TestClient, WebSocketTestSession
 
 from conductor.web.replay import ReplayDashboard
@@ -25,20 +27,6 @@ from conductor.web.server import WebDashboard
 # WebDashboard.port only reflects a real bound port once start() runs (which
 # most tests here never call), so tests instead pin _actual_port to this.
 TEST_PORT = 18080
-
-
-@pytest.fixture(autouse=True)
-def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the run-registry directory at ``tmp_path`` for every test here.
-
-    ``tests/conftest.py`` has no home-isolation fixture. Without this, a
-    test that calls the real ``WebDashboard.start()``/``stop()`` (which
-    write/remove the token file, see ``web/auth.py``) would touch the
-    developer's real ``~/.conductor/runs``.
-    """
-    runs_dir = tmp_path / "runs"
-    runs_dir.mkdir()
-    monkeypatch.setattr("conductor.rundir.runs_dir", lambda: runs_dir)
 
 
 def make_client(dashboard: WebDashboard, *, port: int = TEST_PORT) -> TestClient:
