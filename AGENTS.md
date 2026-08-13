@@ -466,6 +466,47 @@ it will pick up the developer's real token (see
   sandbox session — the same posture `claude_agent_sdk.py` and `hermes.py`
   declare, but for a different underlying reason (remote ephemeral
   filesystem vs. local CLI process state).
+- **Runner hardening (issue #396):** the MVP runner's posture depended
+  entirely on the session-gateway network boundary; five independent,
+  none-load-bearing layers now defend in depth, mirroring
+  `web/auth.py`'s issue #397 framing. (1) `aca_runner/__main__.py` binds
+  `127.0.0.1` by default (the container image's `Dockerfile` sets
+  `ACA_RUNNER_HOST=0.0.0.0` explicitly, so it is unaffected). (2)
+  `aca_runner/auth.py::resolve_runner_token` reads the opt-in
+  `ACA_RUNNER_AUTH_TOKEN`; when set, `/execute` requires a matching
+  `X-Conductor-Runner-Token` header (compared via the existing
+  `web/auth.py::constant_time_match`, reused rather than re-derived) and
+  rejects with 401 otherwise — checked *before* the inner Copilot provider
+  is constructed. `/execute` is chosen over `Authorization` because the
+  ACA session gateway consumes that header itself (it carries the AAD
+  token). `GET /health` stays unauthenticated (the image's own
+  `HEALTHCHECK` sends no header) but reports `auth_required` and
+  `auth_token_present` — the latter is header *presence* only, never
+  validity, so it cannot become a brute-force oracle — letting
+  `AcaRuntimeProvider._warn_on_auth_skew` (alongside the existing
+  `_warn_on_version_skew`, both inside `validate_connection()`'s
+  `contextlib.suppress(Exception)` block) warn when a gateway is silently
+  stripping the header, or when the host has a token configured but the
+  runner doesn't enforce one. (3) `aca_runner/auth.py
+  ::check_inner_provider_settings` rejects any `inner_provider_settings`
+  key outside `ALLOWED_INNER_PROVIDER_SETTINGS_KEYS` (`base_url`/`api_key`/
+  `bearer_token`/`github_token` — the four `AcaRuntimeProvider
+  ._resolve_inner_provider_settings` actually produces), closing off
+  `runtime_url`/`headers` injection that no `base_url` allowlist alone
+  would catch; `ACA_RUNNER_ALLOWED_BASE_URLS` additionally restricts which
+  BYOK `base_url` values are accepted. (4) The runner token header is
+  merged into the `Authorization` headers dict at the three
+  runner-forwarded call sites only (`execute()`, `_send_interrupt()`,
+  `validate_connection()`) — **not** `_stop_session()`, whose `DELETE
+  {endpoint}/session` is an ACA management-plane operation that never
+  reaches the runner, so adding the header there would leak the runner
+  credential to the Azure control plane instead. (5) `identifier` is
+  reconciled by documentation rather than code: it remains gateway
+  routing metadata the runner never inspects as an authentication signal
+  (the runner has no independent source of truth for which identifier it
+  should be serving, and the container `HEALTHCHECK` sends none at all) —
+  see `docs/projects/aca/aca-provider.design.md`'s *Identifier as a
+  capability* bullet and `docs/providers/aca.md#security`.
 
 Full architecture, the runner `/execute`/`/health` contract, the NDJSON
 frame schema, and the credential/security model are documented in

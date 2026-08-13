@@ -21,6 +21,17 @@
 #   FROM conductor-agent-runner:<tag>
 #   RUN pip install --no-cache-dir my-extra-mcp-server
 #
+# Optional pool-level hardening env vars (issue #396 — none required, the
+# image works unchanged with neither set):
+#   ACA_RUNNER_AUTH_TOKEN         — opt-in transport-token gate on /execute;
+#                                   set the same value on both the pool and
+#                                   the host (COPILOT_PROVIDER_RUNTIME_TOKEN
+#                                   is unrelated — this is the runner's own
+#                                   credential, not the inner Copilot's).
+#   ACA_RUNNER_ALLOWED_BASE_URLS  — comma-separated allowlist restricting
+#                                   which BYOK inner_provider_settings
+#                                   base_url values the runner accepts.
+#
 # `CONDUCTOR_VERSION` is any git ref (tag or commit SHA) accepted by
 # `pip install pkg @ git+https://...@<ref>` that must include the
 # `conductor.aca_runner` module added by epic E4 — pin it explicitly (rather
@@ -109,6 +120,11 @@ RUN pip install --no-cache-dir \
     "conductor-cli @ git+https://github.com/microsoft/conductor.git@${CONDUCTOR_VERSION}"
 
 ARG TARGET_PORT
+# Issue #396: the runner binds loopback (127.0.0.1) by default now — this
+# override is load-bearing here, not redundant, since ACA must reach the
+# port from outside the container's network namespace. The port must never
+# be reachable from anywhere except the session gateway; see
+# docs/providers/aca.md#security.
 ENV ACA_RUNNER_HOST=0.0.0.0
 ENV ACA_RUNNER_PORT=${TARGET_PORT}
 
