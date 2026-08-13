@@ -1014,6 +1014,174 @@ class TestTokenAccounting:
         assert output.input_tokens == 200
         assert output.output_tokens == 100
 
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_result_message_reports_cache_inclusive_totals(self) -> None:
+        """A ResultMessage carrying cache keys sets all three prompt figures.
+
+        This is the branch that determines billing in every normal completed
+        run — ``ResultMessage.usage`` replaces the per-message running sum —
+        so it is where the cache buckets have to survive. Reverting it to the
+        pre-fix form (ignoring the cache keys) leaves cached tokens billed at
+        nothing at all.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 60,
+                    "output_tokens": 40,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 25,
+                },
+            )
+            # Cumulative session total, Anthropic-shaped: cached prompt tokens
+            # sit OUTSIDE input_tokens and must be folded in.
+            yield _result(
+                result="done",
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 900,
+                    "cache_creation_input_tokens": 50,
+                },
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # 100 fresh + 900 read + 50 written = the whole prompt.
+        assert output.input_tokens == 1050
+        assert output.cache_read_tokens == 900
+        assert output.cache_write_tokens == 50
+        assert output.output_tokens == 50
+        # The contract AgentOutput.input_tokens declares.
+        assert output.cache_read_tokens + output.cache_write_tokens <= output.input_tokens
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_result_message_without_input_tokens_keeps_running_totals(self) -> None:
+        """A partial usage dict must not mix accumulated and reported figures.
+
+        ``ResultMessage.usage`` is a bare dict with no guaranteed keys. Adding
+        its cache counts onto a running sum that already contains them
+        re-creates the double-count this provider was fixed for; taking a
+        fresh input total while keeping stale cache counters drives
+        ``input_tokens`` below the buckets it is supposed to contain.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 5000,
+                    "cache_creation_input_tokens": 200,
+                },
+            )
+            # No input_tokens: not a trustworthy prompt figure.
+            yield _result(result="done", usage={"output_tokens": 50})
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # The per-message running sum survives intact — 5300, not 10500.
+        assert output.input_tokens == 5300
+        assert output.cache_read_tokens == 5000
+        assert output.cache_write_tokens == 200
+        assert output.cache_read_tokens + output.cache_write_tokens <= output.input_tokens
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_cache_buckets_accumulate_across_turns(self) -> None:
+        """Cache counts sum over turns rather than tracking only the last one.
+
+        A single-turn fixture cannot tell ``+=`` from ``=``, and the
+        degradation is silent: under-reported buckets inflate the derived
+        uncached input, so cost drifts back up.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 500,
+                    "cache_creation_input_tokens": 20,
+                },
+            )
+            yield _assistant(
+                content=[TextBlock(text="t2")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 30,
+                },
+            )
+            # No ResultMessage: the running sum is the answer.
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.cache_read_tokens == 900
+        assert output.cache_write_tokens == 50
+        assert output.input_tokens == 1150
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_partial_output_carries_cache_buckets(self) -> None:
+        """An interrupted run is still billed, so its cache buckets must survive."""
+        interrupt = asyncio.Event()
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="part1")],
+                usage={
+                    "input_tokens": 60,
+                    "output_tokens": 30,
+                    "cache_read_input_tokens": 500,
+                    "cache_creation_input_tokens": 50,
+                },
+            )
+            interrupt.set()
+            yield _assistant(
+                content=[TextBlock(text="never processed")],
+                usage={"input_tokens": 999, "output_tokens": 999},
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                interrupt_signal=interrupt,
+            )
+
+        assert output.partial is True
+        assert output.input_tokens == 610
+        assert output.cache_read_tokens == 500
+        assert output.cache_write_tokens == 50
+
 
 class TestContextWindowLastCallInputTokens:
     """Issue #412: last_call_input_tokens is the last call's prompt size, not

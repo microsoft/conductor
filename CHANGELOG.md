@@ -30,6 +30,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/api/gate-status`, `/api/files/*`, and the replay dashboard) remain
   unauthenticated, protected by Origin/Host only.
 
+### Fixed
+
+- **Token cost is no longer massively overstated for cached, tool-calling
+  agents.** `AgentOutput.input_tokens` is the *whole* prompt and already
+  contains `cache_read_tokens` / `cache_write_tokens`, but `calculate_cost`
+  billed all four buckets additively — charging every cached token at the
+  full input rate *and again* at the cache rate (11x on `claude-sonnet-5`).
+  Because a long agentic loop re-reads almost its entire prompt from cache on
+  every turn, the error compounded across turns: a real run reporting
+  **$51.08** actually cost about **$8**. A cached bucket is now subtracted
+  from the input bucket before the input rate is applied, so each physical
+  token is priced exactly once — the same treatment `genai-prices` uses,
+  including its rule that a bucket is only subtracted when a rate exists to
+  charge it at (a `0.0` cache rate in the table means "no published rate",
+  not "free"). Cost figures on the dashboard, the CLI summary,
+  `agent_completed` events and the JSONL event log all drop accordingly; no
+  workflow config changes. The Claude Agent SDK provider, whose
+  Anthropic-shaped usage dict reports cached tokens *outside* `input_tokens`,
+  now folds them in and reports both cache buckets, so cached tokens there
+  are billed at the cache rate instead of not being billed at all — note this
+  also makes that provider's reported `input_tokens` / `tokens_used` counts
+  cache-inclusive, matching Copilot, so token totals rise even as cost falls.
+
+  **If you set `limits.budget_usd`:** existing values were calibrated against
+  the inflated figures and now permit correspondingly more real spend. Review
+  them, particularly under `budget_mode: enforce`.
+
+- **`claude-opus-5` and the dotted Claude 4.5 names are no longer unpriced.**
+  `DEFAULT_PRICING` had no `claude-opus-5` entry, and `get_pricing`'s
+  versioned-suffix fallback only extends a key with a `-` delimiter — so the
+  SDK-advertised `claude-haiku-4.5` never matched the dashed
+  `claude-haiku-4-5` entry either. Those models fell back to `None` and were
+  reported as unpriced whenever the provider's live pricing hook was
+  unavailable (an older Copilot SDK, or a non-Copilot provider). Added
+  `claude-opus-5`, `claude-opus-4.5`, `claude-sonnet-4.5` and
+  `claude-haiku-4.5` at the published Anthropic rates. Both spellings are
+  kept: the dashed keys are what price the date-suffixed Anthropic ids
+  (`claude-haiku-4-5-20251001`).
+
 ## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
 
 ### Added
@@ -207,33 +246,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reproduces on another machine.
 
 ### Fixed
-
-- **Token cost is no longer massively overstated for cached, tool-calling
-  agents.** `AgentOutput.input_tokens` is the *whole* prompt and already
-  contains `cache_read_tokens` / `cache_write_tokens`, but `calculate_cost`
-  billed all four buckets additively — charging every cached token at the
-  full input rate *and again* at the cache rate (11x on `claude-sonnet-5`).
-  Because a long agentic loop re-reads almost its entire prompt from cache on
-  every turn, the error compounded across turns: a real run reporting
-  **$51.08** actually cost about **$8**. Cached tokens are now subtracted
-  from the input bucket before the input rate is applied, so each physical
-  token is priced exactly once — the same treatment `genai-prices` uses.
-  Cost figures on the dashboard, the CLI summary, `agent_completed` events
-  and the JSONL event log all drop accordingly; no workflow config changes.
-  The Claude Agent SDK provider, whose Anthropic-shaped usage dict reports
-  cached tokens *outside* `input_tokens`, now folds them in and reports both
-  cache buckets, so cached tokens there are billed at the cache rate instead
-  of not being billed at all.
-
-- **`claude-opus-5` and the dotted Claude 4.5 names are no longer unpriced.**
-  `DEFAULT_PRICING` had no `claude-opus-5` entry, and `get_pricing`'s
-  versioned-suffix fallback only extends a key with a `-` delimiter — so the
-  SDK-advertised `claude-haiku-4.5` never matched the dashed
-  `claude-haiku-4-5` entry either. Those models fell back to `None` and were
-  reported as unpriced whenever the provider's live pricing hook was
-  unavailable (an older Copilot SDK, or a non-Copilot provider). Added
-  `claude-opus-5`, `claude-opus-4.5`, `claude-sonnet-4.5` and
-  `claude-haiku-4.5` at the published Anthropic rates.
 
 - **`--web-bg` no longer reports success and prints a URL for workflows that
   never actually started** (#410). The launcher's readiness check used to
