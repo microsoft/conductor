@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.28...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.29...HEAD)
+
+## [0.1.29](https://github.com/microsoft/conductor/compare/v0.1.28...v0.1.29) - 2026-08-13
 
 ### Security
 
@@ -31,8 +33,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token. Read-only routes (`/api/state`, `/api/info`, `/api/logs`,
   `/api/gate-status`, `/api/files/*`, and the replay dashboard) remain
   unauthenticated, protected by Origin/Host only.
+- **Hardened the ACA agent runner's transport surface** (#396). The
+  experimental `aca` provider's in-container runner previously relied
+  entirely on the Azure session-gateway network boundary; it now adds four
+  independent layers, none individually load-bearing. The runner binds
+  `127.0.0.1` by default (the shipped container image sets
+  `ACA_RUNNER_HOST=0.0.0.0` explicitly, so a deployed pool is unaffected —
+  only a runner started by hand changes behaviour). An opt-in transport
+  token, `ACA_RUNNER_AUTH_TOKEN`, makes `/execute` require a matching
+  `X-Conductor-Runner-Token` header — checked before the inner Copilot
+  provider is constructed — and `401` otherwise; the host sends the header
+  automatically when the same value is set on its side. `GET /health` stays
+  unauthenticated (the image's own `HEALTHCHECK` sends no header) but now
+  reports `auth_required` and `auth_token_present`, letting the host warn
+  when a gateway is silently stripping the header or when only one side has
+  a token configured. The runner also rejects any `inner_provider_settings`
+  key outside `base_url` / `api_key` / `bearer_token` / `github_token`,
+  closing off `runtime_url` and `headers` injection, and
+  `ACA_RUNNER_ALLOWED_BASE_URLS` optionally restricts which BYOK `base_url`
+  values are accepted. See `docs/providers/aca.md#security`.
 
 ### Fixed
+
+- **A pathological gate or dialog prompt no longer stalls the event loop**
+  (#395). `linkify_markdown` — which runs on human-gate prompts, dialog
+  turns, and rendered agent prompts — degraded to quadratic time on inputs
+  containing long unterminated runs of backticks/tildes or `[` characters,
+  so agent-generated text could freeze every concurrent agent sharing the
+  loop. The fenced-code opener no longer backtracks character-by-character,
+  and existing-markdown-link detection is now a linear single-pass scanner
+  (fuzz-verified equivalent to the regex it replaces). A defensive 256K
+  character cap skips linkification entirely on anything larger — whitespace
+  is still normalized — so a future pathological shape degrades gracefully
+  rather than hanging.
 
 - **Token cost is no longer massively overstated for cached, tool-calling
   agents.** `AgentOutput.input_tokens` is the *whole* prompt and already
