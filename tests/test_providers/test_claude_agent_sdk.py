@@ -1074,6 +1074,66 @@ class TestContextWindowLastCallInputTokens:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_billing_totals_are_cache_inclusive_and_priced_once(self) -> None:
+        """``input_tokens`` follows the cross-provider "cache-inclusive" contract
+        and the cache buckets are surfaced, so ``calculate_cost`` can price each
+        physical token exactly once.
+
+        The Anthropic-shaped usage dict reports cached tokens outside its own
+        ``input_tokens``; leaving them out entirely meant cached tokens were
+        billed at nothing, while adding them without also reporting the buckets
+        would bill them at the full input rate.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 25,
+                },
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.input_tokens == 100 + 400 + 25
+        assert output.cache_read_tokens == 400
+        assert output.cache_write_tokens == 25
+
+        from conductor.engine.pricing import ModelPricing, calculate_cost
+
+        pricing = ModelPricing(
+            input_per_mtok=3.0,
+            output_per_mtok=15.0,
+            cache_read_per_mtok=0.3,
+            cache_write_per_mtok=3.75,
+        )
+        cost = calculate_cost(
+            model="stub",
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens or 0,
+            cache_read_tokens=output.cache_read_tokens or 0,
+            cache_write_tokens=output.cache_write_tokens or 0,
+            pricing=pricing,
+        )
+        expected = (
+            100 / 1_000_000 * 3.0
+            + 50 / 1_000_000 * 15.0
+            + 400 / 1_000_000 * 0.3
+            + 25 / 1_000_000 * 3.75
+        )
+        assert cost == pytest.approx(expected, rel=1e-9)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_cumulative_result_message_does_not_overwrite_it(self) -> None:
         """ResultMessage.usage is a cumulative session total and must not
         replace the per-call figure the way it legitimately replaces the

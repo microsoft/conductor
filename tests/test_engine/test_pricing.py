@@ -258,22 +258,55 @@ class TestCalculateCost:
         assert cost == pytest.approx(18.0, rel=1e-6)
 
     def test_calculate_cost_with_cache_tokens(self) -> None:
-        """Test cost calculation with cache tokens."""
-        # Using claude-sonnet-4:
-        # input: 1M * $3/M = $3
-        # output: 1M * $15/M = $15
-        # cache_read: 1M * $0.3/M = $0.3
-        # cache_write: 1M * $3.75/M = $3.75
+        """Cache buckets are subsets of ``input_tokens``, not additions to it."""
+        # Using claude-sonnet-4, with a 3M-token prompt of which 1M was read
+        # from cache and 1M written to cache, leaving 1M uncached:
+        # uncached input: 1M * $3/M    = $3
+        # output:         1M * $15/M   = $15
+        # cache_read:     1M * $0.3/M  = $0.3
+        # cache_write:    1M * $3.75/M = $3.75
         # Total = $22.05
         cost = calculate_cost(
             model="claude-sonnet-4",
-            input_tokens=1_000_000,
+            input_tokens=3_000_000,
             output_tokens=1_000_000,
             cache_read_tokens=1_000_000,
             cache_write_tokens=1_000_000,
         )
         assert cost is not None
         assert cost == pytest.approx(22.05, rel=1e-6)
+
+    def test_cache_tokens_are_not_billed_twice(self) -> None:
+        """A fully-cached prompt costs the cache rate, not input + cache.
+
+        Regression guard for the cost blow-up on long tool-calling agents:
+        ``input_tokens`` is the whole prompt and already contains the cached
+        buckets, so billing them additively charged every cached token at
+        ``input + cache_read`` (11x for claude-sonnet-4) and reported tens of
+        dollars for a workflow that cost a few.
+        """
+        # Entire 1M-token prompt served from cache; nothing fresh.
+        cost = calculate_cost(
+            model="claude-sonnet-4",
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cache_read_tokens=1_000_000,
+        )
+        assert cost is not None
+        # 1M * $0.3/M — the cache-read rate alone, not $3.00 + $0.30.
+        assert cost == pytest.approx(0.3, rel=1e-6)
+
+    def test_calculate_cost_clamps_inconsistent_cache_counts(self) -> None:
+        """Cache counts exceeding ``input_tokens`` clamp instead of going negative."""
+        cost = calculate_cost(
+            model="claude-sonnet-4",
+            input_tokens=1000,
+            output_tokens=0,
+            cache_read_tokens=5000,
+        )
+        assert cost is not None
+        # Uncached input floors at 0, so only the cache read is charged.
+        assert cost == pytest.approx(5000 / 1_000_000 * 0.3, rel=1e-6)
 
     def test_calculate_cost_small_tokens(self) -> None:
         """Test cost calculation with small token counts."""

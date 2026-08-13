@@ -749,6 +749,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
         structured_output: Any = None
         total_input_tokens = 0
         total_output_tokens = 0
+        # Anthropic reports cached prompt tokens OUTSIDE its own
+        # ``input_tokens`` counter, unlike Copilot and pydantic-ai. Track them
+        # so ``total_input_tokens`` can be made inclusive before it reaches
+        # ``AgentOutput`` — that field's cross-provider contract is "total
+        # prompt, cache buckets included" (see ``AgentOutput.input_tokens``),
+        # and ``calculate_cost`` subtracts them back out to price each token
+        # once. Reporting the bare figure here instead left cached tokens
+        # billed at nothing at all.
+        total_cache_read_tokens = 0
+        total_cache_write_tokens = 0
         # Prompt size of the most recent AssistantMessage carrying usage — a
         # point-in-time context measurement for the dashboard bar (issue
         # #412), distinct from the cumulative total_input_tokens above.
@@ -802,6 +812,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         result_model,
                         total_input_tokens,
                         total_output_tokens,
+                        cache_read_tokens=total_cache_read_tokens,
+                        cache_write_tokens=total_cache_write_tokens,
                         last_call_input_tokens=last_call_input_tokens,
                         partial=True,
                     )
@@ -856,18 +868,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     if hasattr(msg, "model") and msg.model:
                         result_model = msg.model
                     if hasattr(msg, "usage") and msg.usage:
-                        total_input_tokens += msg.usage.get("input_tokens", 0)
-                        total_output_tokens += msg.usage.get("output_tokens", 0)
+                        cache_read = msg.usage.get("cache_read_input_tokens", 0)
+                        cache_write = msg.usage.get("cache_creation_input_tokens", 0)
                         # Unlike Copilot and pydantic-ai, the Anthropic-shaped
                         # usage dict here reports cached prompt tokens
-                        # separately from ``input_tokens``, so the context
-                        # figure must add them in — the bare ``input_tokens``
-                        # understates the prompt badly on a cached
-                        # conversation.
+                        # separately from ``input_tokens``, so both the
+                        # billing total and the context figure must add them
+                        # in — the bare ``input_tokens`` understates the
+                        # prompt badly on a cached conversation.
+                        total_input_tokens += (
+                            msg.usage.get("input_tokens", 0) + cache_read + cache_write
+                        )
+                        total_output_tokens += msg.usage.get("output_tokens", 0)
+                        total_cache_read_tokens += cache_read
+                        total_cache_write_tokens += cache_write
                         last_call_input_tokens = (
-                            msg.usage.get("input_tokens", 0)
-                            + msg.usage.get("cache_read_input_tokens", 0)
-                            + msg.usage.get("cache_creation_input_tokens", 0)
+                            msg.usage.get("input_tokens", 0) + cache_read + cache_write
                         )
 
                     # If this turn requested tool calls, the SDK will run
@@ -904,8 +920,18 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     # exists only as a fallback when no ResultMessage arrives
                     # (e.g. mid-stream interrupt).
                     if hasattr(msg, "usage") and msg.usage:
-                        total_input_tokens = msg.usage.get("input_tokens", total_input_tokens)
+                        total_input_tokens = (
+                            msg.usage.get("input_tokens", total_input_tokens)
+                            + msg.usage.get("cache_read_input_tokens", 0)
+                            + msg.usage.get("cache_creation_input_tokens", 0)
+                        )
                         total_output_tokens = msg.usage.get("output_tokens", total_output_tokens)
+                        total_cache_read_tokens = msg.usage.get(
+                            "cache_read_input_tokens", total_cache_read_tokens
+                        )
+                        total_cache_write_tokens = msg.usage.get(
+                            "cache_creation_input_tokens", total_cache_write_tokens
+                        )
                     if getattr(msg, "is_error", False):
                         raise ProviderError(
                             self._build_error_message(msg),
@@ -945,6 +971,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
             result_model,
             total_input_tokens,
             total_output_tokens,
+            cache_read_tokens=total_cache_read_tokens,
+            cache_write_tokens=total_cache_write_tokens,
             last_call_input_tokens=last_call_input_tokens,
         )
 
@@ -1260,6 +1288,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         model: str | None,
         input_tokens: int,
         output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
         last_call_input_tokens: int | None = None,
         partial: bool = False,
     ) -> AgentOutput:
@@ -1280,8 +1310,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
             structured_output: SDK ``ResultMessage.structured_output`` value.
             agent: Agent definition (used for schema awareness and error msg).
             model: SDK-reported model identifier.
-            input_tokens: Cumulative input tokens.
+            input_tokens: Cumulative input tokens, inclusive of the cache
+                counts below (see ``AgentOutput.input_tokens``).
             output_tokens: Cumulative output tokens.
+            cache_read_tokens: Cumulative tokens read from the prompt cache.
+            cache_write_tokens: Cumulative tokens written to the prompt cache.
             last_call_input_tokens: Prompt tokens of the most recent single
                 API call (issue #412), or ``None`` when unavailable.
             partial: True when the output is from a mid-stream interrupt.
@@ -1368,6 +1401,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
             tokens_used=total if total else None,
             input_tokens=input_tokens or None,
             output_tokens=output_tokens or None,
+            cache_read_tokens=cache_read_tokens or None,
+            cache_write_tokens=cache_write_tokens or None,
             last_call_input_tokens=last_call_input_tokens,
             model=model,
             partial=partial,

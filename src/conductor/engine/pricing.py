@@ -320,9 +320,22 @@ def calculate_cost(
 ) -> float | None:
     """Calculate cost in USD for a model execution.
 
+    ``input_tokens`` is the **total** prompt size and already contains
+    ``cache_read_tokens`` and ``cache_write_tokens`` — every provider reports
+    it that way (see :attr:`~conductor.providers.base.AgentOutput.input_tokens`).
+    The cached portions are therefore subtracted out before the full input rate
+    is applied, so each physical token is charged exactly once at its own rate.
+    Billing the buckets additively instead charges a cached token at
+    ``input + cache_read``, which on a long tool-calling conversation (where
+    almost the entire prompt is re-read from cache every turn) overstates cost
+    by roughly an order of magnitude. This matches the reference treatment in
+    ``genai_prices.types.ModelPrice.calc_price``, which derives its priced text
+    input the same way.
+
     Args:
         model: The model name used.
-        input_tokens: Number of input tokens.
+        input_tokens: Total prompt tokens, **inclusive** of the cache
+            read/write counts below.
         output_tokens: Number of output tokens.
         cache_read_tokens: Number of tokens read from cache (default 0).
         cache_write_tokens: Number of tokens written to cache (default 0).
@@ -338,8 +351,14 @@ def calculate_cost(
     if pricing is None:
         return None
 
+    # Clamp rather than raise: a provider that under-reports ``input_tokens``
+    # relative to its own cache counters would otherwise abort a workflow over
+    # a cost annotation. Charging the cached buckets alone is the closest
+    # defensible answer, and it can never exceed the additive figure.
+    uncached_input_tokens = max(0, input_tokens - cache_read_tokens - cache_write_tokens)
+
     cost = (
-        (input_tokens / 1_000_000) * pricing.input_per_mtok
+        (uncached_input_tokens / 1_000_000) * pricing.input_per_mtok
         + (output_tokens / 1_000_000) * pricing.output_per_mtok
         + (cache_read_tokens / 1_000_000) * pricing.cache_read_per_mtok
         + (cache_write_tokens / 1_000_000) * pricing.cache_write_per_mtok

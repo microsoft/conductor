@@ -111,10 +111,13 @@ class AgentOutput:
         content: Parsed structured output matching the agent's output schema.
         raw_response: Provider-specific raw response for debugging/logging.
         tokens_used: Total token count (input + output) if provided by the SDK.
-        input_tokens: Number of input/prompt tokens used.
+        input_tokens: Total prompt tokens summed across every API call,
+            **inclusive** of ``cache_read_tokens`` and ``cache_write_tokens``.
         output_tokens: Number of output/completion tokens generated.
-        cache_read_tokens: Tokens read from cache (Claude prompt caching).
-        cache_write_tokens: Tokens written to cache (Claude prompt caching).
+        cache_read_tokens: Tokens read from cache (prompt caching). A subset
+            of ``input_tokens``, not an addition to it.
+        cache_write_tokens: Tokens written to cache (prompt caching). A subset
+            of ``input_tokens``, not an addition to it.
         last_call_input_tokens: Prompt tokens of the most recent single API
             call in this execution. A point-in-time context measurement,
             unlike ``input_tokens`` which sums every call for billing.
@@ -137,16 +140,27 @@ class AgentOutput:
     """Total token count (input + output) if provided by the SDK."""
 
     input_tokens: int | None = None
-    """Number of input/prompt tokens used."""
+    """Total prompt tokens summed across every API call in this execution.
+
+    **Inclusive** of :attr:`cache_read_tokens` and :attr:`cache_write_tokens`
+    — the cached buckets are subsets of this figure, not additions to it.
+    Providers whose SDK reports cached tokens *outside* its own input counter
+    (the raw Anthropic shape) must add them in before populating this field,
+    so one convention holds across providers and
+    :func:`conductor.engine.pricing.calculate_cost` can price each physical
+    token exactly once.
+    """
 
     output_tokens: int | None = None
     """Number of output/completion tokens generated."""
 
     cache_read_tokens: int | None = None
-    """Tokens read from cache (Claude prompt caching)."""
+    """Tokens read from cache (prompt caching); a subset of
+    :attr:`input_tokens`."""
 
     cache_write_tokens: int | None = None
-    """Tokens written to cache (Claude prompt caching)."""
+    """Tokens written to cache (prompt caching); a subset of
+    :attr:`input_tokens`."""
 
     last_call_input_tokens: int | None = None
     """Prompt tokens of the most recent single API call in this execution.

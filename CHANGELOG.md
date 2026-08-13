@@ -208,6 +208,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Token cost is no longer massively overstated for cached, tool-calling
+  agents.** `AgentOutput.input_tokens` is the *whole* prompt and already
+  contains `cache_read_tokens` / `cache_write_tokens`, but `calculate_cost`
+  billed all four buckets additively — charging every cached token at the
+  full input rate *and again* at the cache rate (11x on `claude-sonnet-5`).
+  Because a long agentic loop re-reads almost its entire prompt from cache on
+  every turn, the error compounded across turns: a real run reporting
+  **$51.08** actually cost about **$8**. Cached tokens are now subtracted
+  from the input bucket before the input rate is applied, so each physical
+  token is priced exactly once — the same treatment `genai-prices` uses.
+  Cost figures on the dashboard, the CLI summary, `agent_completed` events
+  and the JSONL event log all drop accordingly; no workflow config changes.
+  The Claude Agent SDK provider, whose Anthropic-shaped usage dict reports
+  cached tokens *outside* `input_tokens`, now folds them in and reports both
+  cache buckets, so cached tokens there are billed at the cache rate instead
+  of not being billed at all.
+
 - **`--web-bg` no longer reports success and prints a URL for workflows that
   never actually started** (#410). The launcher's readiness check used to
   trust a bare TCP connect: the moment *anything* accepted a connection on
