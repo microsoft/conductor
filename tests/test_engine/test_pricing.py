@@ -60,6 +60,26 @@ class TestGetPricing:
         assert pricing.cache_read_per_mtok == 0.3
         assert pricing.cache_write_per_mtok == 3.75
 
+    def test_dotted_claude_names_are_priced(self) -> None:
+        """The SDK-advertised dotted names must resolve, not fall through to None.
+
+        ``get_pricing``'s versioned-suffix fallback only extends a key with a
+        ``-`` delimiter, so ``claude-haiku-4.5`` never matched the dashed
+        ``claude-haiku-4-5`` entry and the newest models priced as ``None``.
+        """
+        for name, expected_input in (
+            ("claude-opus-5", 5.0),
+            ("claude-opus-4.5", 5.0),
+            ("claude-sonnet-4.5", 3.0),
+            ("claude-haiku-4.5", 1.0),
+        ):
+            pricing = get_pricing(name)
+            assert pricing is not None, f"{name} has no pricing"
+            assert pricing.input_per_mtok == expected_input
+            # A Claude model priced without a cache-read rate would bill
+            # cached tokens at zero once calculate_cost splits the buckets.
+            assert pricing.cache_read_per_mtok > 0
+
     def test_get_pricing_fuzzy_match_versioned(self) -> None:
         """Test fuzzy matching for versioned model names."""
         # Model with date suffix should match base model

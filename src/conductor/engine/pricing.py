@@ -83,6 +83,12 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "o1-preview": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
     "o3-mini": ModelPricing(input_per_mtok=1.10, output_per_mtok=4.40),
     # Claude 5 Series (newest)
+    "claude-opus-5": ModelPricing(
+        input_per_mtok=5.00,
+        output_per_mtok=25.00,
+        cache_read_per_mtok=0.50,
+        cache_write_per_mtok=6.25,
+    ),
     "claude-sonnet-5": ModelPricing(
         input_per_mtok=3.00,
         output_per_mtok=15.00,
@@ -103,6 +109,29 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         cache_write_per_mtok=3.75,
     ),
     "claude-haiku-4-5": ModelPricing(
+        input_per_mtok=1.00,
+        output_per_mtok=5.00,
+        cache_read_per_mtok=0.10,
+        cache_write_per_mtok=1.25,
+    ),
+    # Dotted full names for the Claude 4.5 Series. The SDKs advertise
+    # `claude-haiku-4.5`, not the dashed `claude-haiku-4-5` above, and the
+    # versioned-suffix fallback in `get_pricing` cannot bridge the two (it
+    # only extends a key with `-`, so `claude-haiku-4.5` matches nothing).
+    # Without these the newest 4.5 models price as `None`.
+    "claude-opus-4.5": ModelPricing(
+        input_per_mtok=5.00,
+        output_per_mtok=25.00,
+        cache_read_per_mtok=0.50,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-sonnet-4.5": ModelPricing(
+        input_per_mtok=3.00,
+        output_per_mtok=15.00,
+        cache_read_per_mtok=0.30,
+        cache_write_per_mtok=3.75,
+    ),
+    "claude-haiku-4.5": ModelPricing(
         input_per_mtok=1.00,
         output_per_mtok=5.00,
         cache_read_per_mtok=0.10,

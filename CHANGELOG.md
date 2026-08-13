@@ -225,6 +225,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache buckets, so cached tokens there are billed at the cache rate instead
   of not being billed at all.
 
+- **`claude-opus-5` and the dotted Claude 4.5 names are no longer unpriced.**
+  `DEFAULT_PRICING` had no `claude-opus-5` entry, and `get_pricing`'s
+  versioned-suffix fallback only extends a key with a `-` delimiter — so the
+  SDK-advertised `claude-haiku-4.5` never matched the dashed
+  `claude-haiku-4-5` entry either. Those models fell back to `None` and were
+  reported as unpriced whenever the provider's live pricing hook was
+  unavailable (an older Copilot SDK, or a non-Copilot provider). Added
+  `claude-opus-5`, `claude-opus-4.5`, `claude-sonnet-4.5` and
+  `claude-haiku-4.5` at the published Anthropic rates.
+
 - **`--web-bg` no longer reports success and prints a URL for workflows that
   never actually started** (#410). The launcher's readiness check used to
   trust a bare TCP connect: the moment *anything* accepted a connection on
