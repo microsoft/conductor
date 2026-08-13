@@ -13,14 +13,16 @@ Covers:
 - Non-JSON Content-Type on a mutating route -> 415
 - GET / injects the token; the replay app's / does not, and the replay app
   still enforces origin/host
-- Token file: written on start() with mode 0600, removed on stop(), and
-  round-trips through the reader
+- Token file: written on start() and round-trips through the reader,
+  removed on stop(); mode 0600 on POSIX (Windows cannot express POSIX
+  permission bits, so that assertion is skipped there)
 """
 
 from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -489,7 +491,22 @@ class TestAntiClickjackingHeaders:
 class TestTokenFileLifecycle:
     """The token file is written on start(), removed on stop(), and round-trips."""
 
-    async def test_written_on_start_with_mode_0600(self) -> None:
+    async def test_written_on_start(self) -> None:
+        emitter, dashboard = _make_dashboard()
+        await dashboard.start()
+        try:
+            path = token_file_path(dashboard.port)
+            assert path.exists()
+        finally:
+            await dashboard.stop()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits are not implemented on Windows; "
+        "os.open's pmode only honours the write bit, so a writable "
+        "file always reports 0o666.",
+    )
+    async def test_written_with_mode_0600(self) -> None:
         emitter, dashboard = _make_dashboard()
         await dashboard.start()
         try:

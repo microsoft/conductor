@@ -88,11 +88,16 @@ def token_file_path(port: int) -> Path:
 
 
 def write_token_file(port: int, token: str) -> Path:
-    """Write the dashboard token file for ``port``, mode ``0600``.
+    """Write the dashboard token file for ``port``, mode ``0600`` on POSIX.
 
     Written atomically (temp file + ``os.replace``), mirroring
     ``cli/pid.py::write_pid_file``'s reasoning: a reader must never observe
     a partially-written token.
+
+    The ``0600`` mode is honoured on POSIX only. On Windows, ``os.open``'s
+    ``pmode`` argument only ever toggles the read-only attribute, so the
+    file inherits the ``%USERPROFILE%`` NTFS ACL instead of gaining
+    per-owner permission bits.
 
     Args:
         port: The bound dashboard port.
@@ -104,6 +109,9 @@ def write_token_file(port: int, token: str) -> Path:
     path = token_file_path(port)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
+        # 0o600 is correct and effective on POSIX; on Windows it is silently
+        # ignored (the file is protected by the user-profile ACL instead), so
+        # it is still passed rather than special-cased.
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         try:
             os.write(fd, token.encode("utf-8"))

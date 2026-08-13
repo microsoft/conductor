@@ -466,6 +466,17 @@ class MCPManager:
             spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             # If the leaf directory already existed, harden it before writing
             # potentially sensitive tool output into it.
+            #
+            # On Windows, stat() always reports 0o777 for a directory (POSIX
+            # permission bits are not implemented), so this branch always
+            # fires and the subsequent os.chmod() is a documented no-op there
+            # (it can only toggle the read-only attribute) — the directory is
+            # protected by its parent's NTFS ACL instead. This is accepted
+            # deliberately rather than guarded with a sys.platform check:
+            # guarding it would also skip tests/test_mcp/test_manager_truncation.py
+            # ::test_spill_dir_chmod_failure_is_rejected on Windows, giving up
+            # real coverage of the "chmod failed -> refuse to write" refusal
+            # path (issue #425).
             current_mode = stat.S_IMODE(spill_dir.stat().st_mode)
             if current_mode & 0o077:
                 try:

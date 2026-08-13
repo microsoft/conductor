@@ -499,9 +499,10 @@ order:
 1. `--token SECRET`
 2. the `CONDUCTOR_GATE_TOKEN` environment variable
 3. the per-run token file at `~/.conductor/runs/dashboard-<port>.token`
-   (written with mode `0600` by the dashboard on startup, removed on
-   shutdown), auto-discovered by port so most invocations need neither flag
-   nor env var
+   (written with mode `0600` on POSIX by the dashboard on startup, removed
+   on shutdown; on Windows the mode bits are not honoured and the file is
+   protected by the user-profile NTFS ACL instead), auto-discovered by port
+   so most invocations need neither flag nor env var
 
 The first source found wins; a later source in the list is never consulted
 once an earlier one supplies a value.
