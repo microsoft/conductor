@@ -1,11 +1,14 @@
 """Transport-token gate and request-body narrowing for the runner (issue #396).
 
-A small leaf module (stdlib + Pydantic + `conductor.web.auth`), matching the
-repository's convention of single-purpose leaves (`rundir.py`, `console.py`,
-`duration.py`, `web/auth.py`). Keeps `server.py` focused on the wire contract
-while giving this policy a directly unit-testable surface, and lets both the
-runner (`server.py`) and the host provider (`providers/aca.py`) import the
-same header name so the two can never drift.
+A small leaf module (stdlib + Pydantic + `conductor.web.auth` +
+`conductor.providers.aca_protocol`), matching the repository's convention of
+single-purpose leaves (`rundir.py`, `console.py`, `duration.py`,
+`web/auth.py`). Keeps `server.py` focused on the wire contract while giving
+this policy a directly unit-testable surface. `RUNNER_TOKEN_HEADER` itself is
+defined in `aca_protocol.py` (a genuine leaf both sides already import) and
+re-exported here, so the runner (`server.py`) and the host provider
+(`providers/aca.py`) share the same header name without either side dragging
+the other's dependency tree in.
 
 Five independent hardening layers, none individually load-bearing (mirroring
 `web/auth.py`'s own framing for issue #397):
@@ -34,12 +37,17 @@ from typing import Any
 from pydantic import SecretStr
 
 from conductor.exceptions import ProviderError
+from conductor.providers.aca_protocol import RUNNER_TOKEN_HEADER
 from conductor.web.auth import constant_time_match
 
-# The one definition of the header name, imported by both the runner
-# (`server.py`) and the host provider (`providers/aca.py`) so the two sides
-# of the transport-token gate can never drift apart.
-RUNNER_TOKEN_HEADER = "X-Conductor-Runner-Token"
+__all__ = [
+    "RUNNER_TOKEN_HEADER",
+    "ALLOWED_INNER_PROVIDER_SETTINGS_KEYS",
+    "resolve_runner_token",
+    "resolve_allowed_base_urls",
+    "check_inner_provider_settings",
+    "token_gate",
+]
 
 # The four `inner_provider_settings` keys `AcaRuntimeProvider
 # ._resolve_inner_provider_settings` actually produces: the BYOK branch
@@ -97,8 +105,9 @@ def _unwrap(value: Any) -> Any:
 
     `AcaExecuteRequest._redact_inner_provider_secrets` wraps known credential
     keys in `SecretStr` before the runner ever sees them; `base_url` is not a
-    secret key, so it always arrives as a plain `str` — but this is applied
-    uniformly so a future secret-key addition here can't be forgotten.
+    secret key, so it is never wrapped here, but it also arrives typed as
+    `Any` — a caller can send any JSON value, not necessarily a `str` — so
+    this unwrap is applied uniformly rather than assuming the shape.
     """
     return value.get_secret_value() if isinstance(value, SecretStr) else value
 
@@ -144,9 +153,18 @@ def check_inner_provider_settings(
             is_retryable=False,
         )
 
+    base_url = _unwrap(settings.get("base_url"))
+    if base_url is not None and not isinstance(base_url, str):
+        raise ProviderError(
+            f"aca runner: inner_provider_settings.base_url must be a string, "
+            f"got {type(base_url).__name__}.",
+            suggestion="Send base_url as a JSON string, or omit it.",
+            provider_name="aca",
+            is_retryable=False,
+        )
+
     if allowed_base_urls is None:
         return
-    base_url = _unwrap(settings.get("base_url"))
     if base_url is None:
         return
     normalized = base_url.rstrip("/")

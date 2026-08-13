@@ -453,14 +453,19 @@ def create_app() -> FastAPI:
     ) -> Response:
         """Run one agent turn, streaming NDJSON event frames (E4-T2/T3/T4).
 
-        Gated by the optional transport-token check (issue #396) *before*
-        any request parsing: a missing/incorrect `X-Conductor-Runner-Token`
-        header (when `ACA_RUNNER_AUTH_TOKEN` is configured) returns a plain
-        401 in the same `{"error": {"message": ...}}` envelope
+        Gated by the optional transport-token check (issue #396) before any
+        application-level work: the header is checked first thing in the
+        handler, so a missing/incorrect `X-Conductor-Runner-Token` header
+        (when `ACA_RUNNER_AUTH_TOKEN` is configured) returns a plain 401 in
+        the same `{"error": {"message": ...}}` envelope
         `AcaRuntimeProvider._error_from_response` already parses, and never
-        constructs the inner Copilot provider. `identifier` remains gateway
-        routing metadata only, exactly as on `/health` — never inspected as
-        an authentication signal.
+        runs `_validate_execute_request` or constructs the inner Copilot
+        provider. Note FastAPI validates the `AcaExecuteRequest` body
+        parameter *before* this handler runs, so a malformed body from an
+        unauthenticated caller still returns FastAPI's own 422 rather than a
+        401 — the gate protects execution, not the parser. `identifier`
+        remains gateway routing metadata only, exactly as on `/health` —
+        never inspected as an authentication signal.
 
         Review fix: agent reconstruction (`_build_agent`, via
         `_validate_execute_request`) and the provider-cache lookup both run

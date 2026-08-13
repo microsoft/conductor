@@ -477,9 +477,9 @@ it will pick up the developer's real token (see
   `X-Conductor-Runner-Token` header (compared via the existing
   `web/auth.py::constant_time_match`, reused rather than re-derived) and
   rejects with 401 otherwise — checked *before* the inner Copilot provider
-  is constructed. `/execute` is chosen over `Authorization` because the
-  ACA session gateway consumes that header itself (it carries the AAD
-  token). `GET /health` stays unauthenticated (the image's own
+  is constructed. `X-Conductor-Runner-Token` is chosen over `Authorization`
+  because the ACA session gateway consumes that header itself (it carries
+  the AAD token). `GET /health` stays unauthenticated (the image's own
   `HEALTHCHECK` sends no header) but reports `auth_required` and
   `auth_token_present` — the latter is header *presence* only, never
   validity, so it cannot become a brute-force oracle — letting

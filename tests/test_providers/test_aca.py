@@ -18,10 +18,9 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from conductor.aca_runner.auth import RUNNER_TOKEN_HEADER
 from conductor.config.schema import AgentDef, ProviderSettings, SandboxConfig, ToolOutputConfig
 from conductor.exceptions import ProviderError
-from conductor.providers.aca_protocol import AcaExecuteRequest
+from conductor.providers.aca_protocol import RUNNER_TOKEN_HEADER, AcaExecuteRequest
 from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
 from conductor.providers.factory import create_provider
 

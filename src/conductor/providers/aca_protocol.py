@@ -78,6 +78,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+# The one definition of the transport-token header name (issue #396),
+# imported by both the runner (`aca_runner/server.py`, via
+# `aca_runner/auth.py`) and the host provider (`providers/aca.py`) so the two
+# sides of the transport-token gate can never drift apart.
+RUNNER_TOKEN_HEADER = "X-Conductor-Runner-Token"
+
 # `inner_provider_settings` keys that carry a credential (as opposed to
 # `base_url`, which is not secret). Kept in one place so the redaction
 # validator below and any future field additions stay in sync.
@@ -182,7 +188,7 @@ class AcaExecuteRequest(BaseModel):
 
     Issue #396: the runner rejects any key outside the four named above
     (``aca_runner/auth.py::ALLOWED_INNER_PROVIDER_SETTINGS_KEYS``) with a
-    401/400, and optionally checks ``base_url`` against
+    400, and optionally checks ``base_url`` against
     ``ACA_RUNNER_ALLOWED_BASE_URLS``. See that module's docstring."""
 
     @field_validator("inner_provider_settings", mode="after")

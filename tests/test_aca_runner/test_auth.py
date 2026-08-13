@@ -149,6 +149,19 @@ class TestCheckInnerProviderSettings:
                 {"runtime_url": SecretStr("value")}, allowed_base_urls=None
             )
 
+    @pytest.mark.parametrize("base_url", [123, ["a"], {"a": 1}, True])
+    def test_rejects_non_string_base_url(self, base_url: object) -> None:
+        with pytest.raises(ProviderError, match="must be a string"):
+            check_inner_provider_settings({"base_url": base_url}, allowed_base_urls=None)
+
+    @pytest.mark.parametrize("base_url", [123, ["a"], {"a": 1}, True])
+    def test_rejects_non_string_base_url_with_allowlist_configured(self, base_url: object) -> None:
+        with pytest.raises(ProviderError, match="must be a string"):
+            check_inner_provider_settings(
+                {"base_url": base_url},
+                allowed_base_urls=("http://localhost:11434/v1",),
+            )
+
 
 class TestTokenGate:
     """`token_gate` — the runner-side comparison wrapper."""

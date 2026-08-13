@@ -703,6 +703,20 @@ class TestRunnerAuthGate:
             )
         assert _FakeCopilotProvider.instances == []
 
+    def test_malformed_body_from_unauthenticated_caller_returns_422_not_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pinned contract (review finding B2): FastAPI validates the
+        `AcaExecuteRequest` body *before* the handler's token check ever
+        runs, so a malformed body with no token header returns FastAPI's own
+        422 rather than the gate's 401 — the gate protects execution, not
+        the parser. See `execute_endpoint`'s docstring."""
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            response = client.post("/execute", json={"bogus": 1})
+            assert response.status_code == 422
+            assert _FakeCopilotProvider.instances == []
+
 
 class TestHealthReportsAuthPosture:
     """`GET /health`'s `auth_required` / `auth_token_present` fields (issue #396)."""
@@ -818,3 +832,20 @@ class TestInnerProviderSettingsAllowlist:
             )
             assert response.status_code == 200
             _parse_ndjson(response.text)
+
+    def test_non_string_base_url_returns_400_not_500_with_allowlist_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a non-string `base_url` must not crash with an
+        unhandled `AttributeError` -> 500 (review finding B1) — it must
+        return a clean, non-retryable 400 like every other malformed
+        `inner_provider_settings` value."""
+        monkeypatch.setenv("ACA_RUNNER_ALLOWED_BASE_URLS", "http://localhost:11434/v1")
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(inner_provider_settings={"base_url": 123}),
+            )
+            assert response.status_code == 400
+            assert "message" in response.json().get("error", {})
+            assert _FakeCopilotProvider.instances == []

@@ -38,9 +38,9 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from pydantic import SecretStr
 
-from conductor.aca_runner.auth import RUNNER_TOKEN_HEADER
 from conductor.exceptions import ProviderError
 from conductor.providers.aca_protocol import (
+    RUNNER_TOKEN_HEADER,
     AcaAgentPayload,
     AcaErrorData,
     AcaExecuteRequest,
@@ -651,7 +651,7 @@ class AcaRuntimeProvider(AgentProvider):
         keys (``aca_runner/auth.py::ALLOWED_INNER_PROVIDER_SETTINGS_KEYS`` —
         exactly ``base_url``/``api_key``/``bearer_token``/``github_token``),
         rejecting anything else (e.g. ``runtime_url``, ``headers``) with a
-        401/400. A future key added to this method's returned dict must be
+        400. A future key added to this method's returned dict must be
         added to that allowlist too, or the runner will reject every request
         that carries it.
 
@@ -693,11 +693,16 @@ class AcaRuntimeProvider(AgentProvider):
         """Read the runner transport-token gate's expected value, if configured.
 
         Issue #396: `ACA_RUNNER_AUTH_TOKEN` is the host-side half of the
-        opt-in transport-token gate on the runner's `/execute` (and
-        `/interrupt`/`/health`, for skew detection) — the runner-side half
-        reads the same env var via `aca_runner/auth.py::resolve_runner_token`.
-        `None` when unset (the gate is disabled by default — no new
-        configuration is required for existing deployments).
+        opt-in transport-token gate the runner enforces on `/execute` only
+        — the runner-side half reads the same env var via
+        `aca_runner/auth.py::resolve_runner_token`. The host also sends
+        this header on `validate_connection()`'s `/health` probe (which
+        never requires it) so `_warn_on_auth_skew` can compare the two
+        postures, and on `_send_interrupt()`'s POST — a route the MVP
+        runner does not yet implement, so that header is currently
+        forward-looking. `None` when unset (the gate is disabled by
+        default — no new configuration is required for existing
+        deployments).
         """
         value = _clean_env("ACA_RUNNER_AUTH_TOKEN")
         return SecretStr(value) if value is not None else None
