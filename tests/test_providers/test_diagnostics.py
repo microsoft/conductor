@@ -504,6 +504,76 @@ class TestGatherProviderCheck:
         by_id = {m.id: m for m in diag.models}
         assert by_id["gpt-4"].supported_reasoning_efforts is None
 
+    async def test_to_dict_with_unexpected_key_degrades_to_id_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``to_dict()`` returning a key ``ModelDiagnostic`` doesn't accept
+        must degrade only that model — regression guard for a bug where
+        ``ModelDiagnostic(...)`` construction moved outside the per-model
+        try/except, so the resulting ``TypeError`` escaped the loop and
+        discarded every already-built entry for the whole provider."""
+        from types import SimpleNamespace
+
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-5", "gpt-4", "gpt-3"])
+        good_caps = SimpleNamespace(
+            to_dict=lambda: {"supported_reasoning_efforts": ["low", "medium"]}
+        )
+        bad_caps = SimpleNamespace(
+            to_dict=lambda: {
+                "supported_reasoning_efforts": ["low"],
+                "bogus_extra_key": 1,
+            }
+        )
+
+        def _capabilities_for(model_id: str) -> Any:
+            if model_id == "gpt-4":
+                return bad_caps
+            return good_caps
+
+        provider.get_model_capabilities.side_effect = _capabilities_for
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models_error is None
+        assert diag.models is not None
+        by_id = {m.id: m for m in diag.models}
+        assert set(by_id) == {"gpt-5", "gpt-4", "gpt-3"}
+        assert by_id["gpt-5"].supported_reasoning_efforts == ["low", "medium"]
+        assert by_id["gpt-3"].supported_reasoning_efforts == ["low", "medium"]
+        # The offending model degrades to id-only rather than the loop
+        # raising and discarding gpt-5/gpt-3.
+        assert by_id["gpt-4"].supported_reasoning_efforts is None
+
+    async def test_to_dict_colliding_with_pricing_key_degrades_to_id_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``to_dict()`` returning a key that collides with one of the
+        explicitly-passed pricing kwargs (``input_per_mtok``) must degrade
+        that model rather than raising
+        ``TypeError: got multiple values for keyword argument``."""
+        from types import SimpleNamespace
+
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-4o"])
+        colliding_caps = SimpleNamespace(to_dict=lambda: {"input_per_mtok": 1.0})
+        provider.get_model_capabilities.side_effect = lambda model_id: colliding_caps
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models_error is None
+        assert diag.models is not None
+        model = diag.models[0]
+        assert model.id == "gpt-4o"
+        assert model.supported_reasoning_efforts is None
+        # Pricing still resolves via the table for the degraded row.
+        assert model.pricing_source == "table"
+        assert model.input_per_mtok == 2.50
+
 
 class TestModelPricingDiagnostics:
     """Tests for per-model pricing resolution in ``--models`` (issue #386)."""
@@ -565,7 +635,11 @@ class TestModelPricingDiagnostics:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A raising get_model_pricing must not fail the whole --models
-        probe — the never-raise contract."""
+        probe — the never-raise contract. It also must not skip the
+        DEFAULT_PRICING fallback: gpt-4o is in the static table, so a
+        raising hook still resolves it via the table (matching what an
+        actual workflow run would price it at); only a model with no
+        table entry genuinely fails to resolve."""
         monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
         provider = _fake_provider(
             ok=True,
@@ -579,25 +653,34 @@ class TestModelPricingDiagnostics:
         diag = await d.gather_provider("copilot", list_models=True)
         assert diag.models is not None
         by_id = {m.id: m for m in diag.models}
-        # Both models degrade to "pricing resolution failed" since the hook
-        # itself raises for every call — pricing_source stays None (distinct
-        # from the determined "none"), and neither model is dropped.
+        # "gpt-5" has no DEFAULT_PRICING entry, so it genuinely fails to
+        # resolve — pricing_source stays None (distinct from "none").
         assert by_id["gpt-5"].pricing_source is None
         assert by_id["gpt-5"].input_per_mtok is None
-        assert by_id["gpt-4o"].pricing_source is None
-        assert by_id["gpt-4o"].input_per_mtok is None
+        # "gpt-4o" IS in DEFAULT_PRICING, so the raising hook must still
+        # fall through to the table rather than reporting unresolvable.
+        assert by_id["gpt-4o"].pricing_source == "table"
+        assert by_id["gpt-4o"].input_per_mtok == 2.50
+        assert by_id["gpt-4o"].output_per_mtok == 10.00
 
     async def test_hook_failure_isolated_to_one_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A failure resolving pricing for one model must not affect the
-        pricing already resolved for its neighbors in the same list."""
+        pricing already resolved for its neighbors in the same list. A
+        raising hook falls through to DEFAULT_PRICING when the model has an
+        entry there (gpt-4o), matching engine/workflow.py's handling of the
+        identical exception; only a model absent from the table (here
+        "totally-unknown-model-xyz") reaches the genuine failure state."""
         monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
-        provider = _fake_provider(ok=True, models=["gpt-4.1", "gpt-4o", "gpt-4"])
+        provider = _fake_provider(
+            ok=True,
+            models=["gpt-4.1", "gpt-4o", "gpt-4", "totally-unknown-model-xyz"],
+        )
 
         def _pricing_for(model_id: str) -> Any:
-            if model_id == "gpt-4o":
-                raise RuntimeError("pricing boom for gpt-4o only")
+            if model_id in ("gpt-4o", "totally-unknown-model-xyz"):
+                raise RuntimeError(f"pricing boom for {model_id} only")
             return None  # falls through to the static table for the others
 
         provider.get_model_pricing.side_effect = _pricing_for
@@ -610,8 +693,13 @@ class TestModelPricingDiagnostics:
         by_id = {m.id: m for m in diag.models}
         assert by_id["gpt-4.1"].pricing_source == "table"
         assert by_id["gpt-4"].pricing_source == "table"
-        assert by_id["gpt-4o"].pricing_source is None
-        assert by_id["gpt-4o"].input_per_mtok is None
+        # Raising hook still falls through to the table for a known model.
+        assert by_id["gpt-4o"].pricing_source == "table"
+        assert by_id["gpt-4o"].input_per_mtok == 2.50
+        assert by_id["gpt-4o"].output_per_mtok == 10.00
+        # No table entry either -> genuine failure, distinct from "none".
+        assert by_id["totally-unknown-model-xyz"].pricing_source is None
+        assert by_id["totally-unknown-model-xyz"].input_per_mtok is None
 
     async def test_to_dict_carries_pricing_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)

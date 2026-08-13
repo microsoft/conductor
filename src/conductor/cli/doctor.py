@@ -329,11 +329,15 @@ _PRICING_SOURCE_CELLS: dict[str, Text] = {
     "provider": Text.from_markup("[green]provider[/green]"),
     "table": Text.from_markup("[dim]table[/dim]"),
     "none": Text.from_markup("[red]none[/red]"),
+    "error": Text.from_markup("[yellow]error[/yellow]"),
 }
 """Pre-built cells for each :attr:`ModelDiagnostic.pricing_source` literal
-(issue #386). Built as module-level constants rather than interpolated at
-render time — no runtime value ever reaches the markup parser, keeping this
-inside the repo's console rules (see AGENTS.md "Console Output")."""
+(issue #386), plus the synthetic ``"error"`` key used for ``None`` (pricing
+resolution itself failed). Built as module-level constants to avoid
+re-parsing the same markup literal on every table row (matching the
+``_CHECK``/``_CROSS``/``_DASH`` constants above) — each markup argument is
+still a literal template, not an interpolated value, keeping this inside the
+repo's console rules (see AGENTS.md "Console Output")."""
 
 
 def _rate_cell(value: float | None) -> Text:
@@ -349,9 +353,16 @@ def _rate_cell(value: float | None) -> Text:
 
 
 def _pricing_source_cell(model: ModelDiagnostic) -> Text:
-    """Format the pricing-source cell (``provider`` / ``table`` / ``none`` / ``—``)."""
+    """Format the pricing-source cell (``provider`` / ``table`` / ``none`` / ``error``).
+
+    ``None`` means resolution itself failed (distinct from the determined
+    ``"none"``) and renders as a visible ``error`` rather than the same
+    ``—`` glyph used elsewhere for "provider doesn't expose this" — that
+    glyph would make a systemic pricing-hook break indistinguishable from a
+    boring provider.
+    """
     if model.pricing_source is None:
-        return _DASH
+        return _PRICING_SOURCE_CELLS["error"]
     return _PRICING_SOURCE_CELLS.get(model.pricing_source, Text(model.pricing_source))
 
 

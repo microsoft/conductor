@@ -675,6 +675,95 @@ class TestDoctorModelsPricing:
         assert "0.00" not in model_lines[0]
         assert "none" in model_lines[0]
 
+    def test_genuine_zero_rate_renders_as_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A genuinely free model (rate 0.0, distinct from unpriced ``None``)
+        must render `0.00`, not `—` — ``CopilotProvider.get_model_pricing``
+        returns exactly this for free models (see test_copilot.py)."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="free-model",
+                            input_per_mtok=0.0,
+                            output_per_mtok=0.0,
+                            pricing_source="provider",
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "free-model" in line]
+        assert model_lines, "model row not found in output"
+        assert "0.00" in model_lines[0]
+
+    def test_pricing_resolution_failure_renders_distinct_from_unpriced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``pricing_source=None`` (resolution itself failed) must render
+        distinctly from the determined ``"none"`` — both used to collapse
+        to the same `—` glyph the table uses for "provider doesn't expose
+        this", hiding a systemic pricing-hook break behind a boring-looking
+        row."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[ModelDiagnostic(id="broken-model", pricing_source=None)],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "broken-model" in line]
+        assert model_lines, "model row not found in output"
+        assert "error" in model_lines[0]
+
+    def test_degraded_capabilities_still_gets_pricing_columns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A model whose capabilities call failed (all capability fields
+        ``None``) must still render its independently-resolved pricing."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="gpt-4o",
+                            supported_reasoning_efforts=None,
+                            input_per_mtok=2.50,
+                            output_per_mtok=10.00,
+                            pricing_source="table",
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "gpt-4o" in line]
+        assert model_lines, "model row not found in output"
+        assert "n/a" in model_lines[0]
+        assert "2.50" in model_lines[0]
+        assert "10.00" in model_lines[0]
+        assert "table" in model_lines[0]
+
     def test_json_includes_pricing_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         report = DoctorReport(
             providers=[

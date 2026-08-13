@@ -78,9 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gemini-3.6-flash`, `mai-code-1.1-flash`, and `mai-code-1-flash-picker`
   remain **deliberately** unpriced in the static table pending a published
   rate; an invented rate would print as a confident cost, which is worse
-  than the honest `(N unpriced)` marker. With a Copilot SDK `>=1.0.9`
-  (#418), the live provider-pricing hook now prices all of these anyway —
-  the static-table gap only matters when that hook is unavailable.
+  than the honest `(N unpriced)` marker. The live provider-pricing hook
+  prices any model whose SDK metadata carries `billing.token_prices`
+  (verified for `claude-opus-5` in #418, on Copilot SDK `>=1.0.9` —
+  already the hard floor pinned in `pyproject.toml`) — the static-table
+  gap only matters when that hook is unavailable or the model's metadata
+  lacks a rate.
 
 ### Added
 
@@ -89,12 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns — the last distinguishing `provider` (live
   `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback),
   and `none` (genuinely unpriced) so "why is my run unpriced" is answerable
-  with one read-only, network-free command (the probe reuses the same
-  `list_models()` call `--models` already makes). `--json` gains matching
+  with one read-only command (pricing resolution adds no new network
+  round-trip — the Copilot SDK memoizes `list_models()` for the process).
+  `--json` gains matching
   `input_per_mtok` / `output_per_mtok` / `pricing_source` fields on each
   model object.
 
-
+## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
 
 ### Added
 

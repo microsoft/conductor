@@ -101,6 +101,10 @@ class ModelPricing:
 # Context-window metadata is sourced from each provider's SDK at runtime via
 # ``AgentProvider.get_max_prompt_tokens()`` — see ``providers/base.py``.
 # Sources: OpenAI pricing page, Anthropic pricing page, provider docs.
+# A model absent from this table is deliberately unpriced pending a published
+# rate — do not "complete" a family by guessing an unpublished price; an
+# invented rate would print as a confident cost, which is worse than the
+# honest unpriced state (#386).
 DEFAULT_PRICING: dict[str, ModelPricing] = {
     # OpenAI / Copilot models
     "gpt-4-turbo": ModelPricing(input_per_mtok=10.00, output_per_mtok=30.00),
@@ -118,9 +122,7 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.4-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
     "gpt-5-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
-    # GPT-5.6 variants priced at the existing GPT-5.x family rate (#386). Grok,
-    # Gemini-3.6, and the MAI-Code ids are deliberately absent pending a
-    # published rate — do not "complete" this set by guessing.
+    # GPT-5.6 variants priced at the existing GPT-5.x family rate (#386).
     "gpt-5.6-sol": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.6-terra": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.6-luna": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),

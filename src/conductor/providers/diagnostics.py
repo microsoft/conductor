@@ -47,9 +47,17 @@ Section = Literal["env", "providers", "registries"]
 ALL_SECTIONS: tuple[Section, ...] = ("env", "providers", "registries")
 """Default set of sections rendered when no positional ``SECTION`` is given."""
 
+PricingSource = Literal["provider", "table", "none"]
+"""How a model's per-Mtok rates were resolved (see #386)."""
+
 # Provider names that are known to the schema/factory but not yet implemented.
 # Surfaced as an informational note, not an error.
 _NOT_IMPLEMENTED: frozenset[str] = frozenset({"openai-agents"})
+
+# One-shot latch so a systemically-raising get_model_pricing hook logs once
+# per process rather than once per model (mirrors
+# WorkflowEngine._pricing_hook_failed_warned in engine/workflow.py).
+_pricing_hook_failed_warned = False
 
 
 @dataclass(frozen=True)
@@ -151,7 +159,7 @@ class ModelDiagnostic:
     max_context_window_tokens: int | None = None
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
-    pricing_source: str | None = None
+    pricing_source: PricingSource | None = None
     """How ``input_per_mtok``/``output_per_mtok`` were resolved (see #386):
     ``"provider"`` (live :meth:`~conductor.providers.base.AgentProvider.get_model_pricing`
     hook), ``"table"`` (static ``DEFAULT_PRICING`` fallback), ``"none"``
@@ -430,7 +438,7 @@ def gather_registries() -> RegistryDiagnostic:
 
 async def _resolve_model_pricing(
     provider: Any, model_id: str
-) -> tuple[float | None, float | None, str | None]:
+) -> tuple[float | None, float | None, PricingSource | None]:
     """Resolve a model's per-Mtok rates and where they came from (never raises).
 
     Mirrors the cost-resolution chain in ``engine/pricing.py::get_pricing``
@@ -438,10 +446,13 @@ async def _resolve_model_pricing(
     minus the workflow override — ``doctor`` has no workflow context.
 
     Note ``get_pricing`` may resolve via its versioned-suffix fuzzy path and
-    log a one-time warning (see #137); ``doctor`` already runs the whole
-    gather inside ``_suppressed_logging`` (``cli/doctor.py``), and the
-    process is short-lived, so the module-level fuzzy-match latch cannot
-    leak into a workflow run.
+    log a one-time warning (see #137). Any such warning is invisible during
+    ``doctor`` because ``gather`` runs under ``_suppressed_logging``
+    (``cli/doctor.py``) whenever pricing is resolved. The module-level
+    fuzzy-match latch IS still mutated by that call — logging suppression
+    has no effect on it — but that is harmless only because ``doctor`` is a
+    standalone, short-lived CLI process (``gather`` has exactly one caller)
+    that never shares a process with a workflow run.
 
     Returns:
         A ``(input_per_mtok, output_per_mtok, source)`` tuple. ``source`` is
@@ -449,21 +460,43 @@ async def _resolve_model_pricing(
         (with rates ``None`` in the ``"none"`` case), or ``None`` when
         resolution itself failed — distinct from the determined ``"none"``.
     """
+    from conductor.engine.pricing import get_pricing
+
+    global _pricing_hook_failed_warned
+
+    hook_failed = False
+    provider_pricing = None
     try:
-        from conductor.engine.pricing import get_pricing
-
         provider_pricing = await provider.get_model_pricing(model_id)
-        if provider_pricing is not None:
-            return provider_pricing.input_per_mtok, provider_pricing.output_per_mtok, "provider"
-
-        table_pricing = get_pricing(model_id)
-        if table_pricing is not None:
-            return table_pricing.input_per_mtok, table_pricing.output_per_mtok, "table"
-
-        return None, None, "none"
     except Exception as e:  # noqa: BLE001 - diagnostics must never raise
-        logger.debug("Failed to resolve pricing for %r: %s", model_id, e)
+        hook_failed = True
+        logger.debug("Failed to resolve provider pricing for %r: %s", model_id, e)
+        # A raising hook usually means a systemic break (SDK auth /
+        # model-listing failure) rather than a per-model fluke, and doctor's
+        # `_suppressed_logging` disables this logger entirely — so warn
+        # once here too, matching the same one-shot warning
+        # engine/workflow.py emits for the identical exception.
+        if not _pricing_hook_failed_warned:
+            _pricing_hook_failed_warned = True
+            logger.warning(
+                "Provider pricing hook failed for model %r (%s); live pricing is "
+                "unavailable and rates will fall back to the static table or show "
+                "as unresolvable. Further failures are logged at debug level.",
+                model_id,
+                e,
+            )
+
+    if provider_pricing is not None:
+        return provider_pricing.input_per_mtok, provider_pricing.output_per_mtok, "provider"
+
+    table_pricing = get_pricing(model_id)
+    if table_pricing is not None:
+        return table_pricing.input_per_mtok, table_pricing.output_per_mtok, "table"
+
+    if hook_failed:
         return None, None, None
+
+    return None, None, "none"
 
 
 async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[ModelDiagnostic]:
@@ -486,40 +519,27 @@ async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[
     """
     result: list[ModelDiagnostic] = []
     for model_id in model_ids:
+        input_per_mtok, output_per_mtok, pricing_source = await _resolve_model_pricing(
+            provider, model_id
+        )
+        pricing_fields: dict[str, Any] = {
+            "input_per_mtok": input_per_mtok,
+            "output_per_mtok": output_per_mtok,
+            "pricing_source": pricing_source,
+        }
         try:
             caps = await provider.get_model_capabilities(model_id)
             # ModelCapabilityInfo.to_dict() keys mirror ModelDiagnostic's
             # capability fields exactly, so it doubles as the kwargs for
-            # constructing this model's diagnostic. A misbehaving provider
-            # whose return value lacks to_dict() (or isn't None) is caught
-            # below and degrades to id-only, same as any other failure.
+            # constructing this model's diagnostic. The try wraps both the
+            # call and the construction below: a misbehaving provider whose
+            # return value lacks to_dict() (or isn't None) is caught below
+            # and degrades to id-only, same as any other failure.
             fields = caps.to_dict() if caps is not None else {}
+            result.append(ModelDiagnostic(id=model_id, **pricing_fields, **fields))
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to get model capabilities for %r: %s", model_id, e)
-            fields = None
-
-        input_per_mtok, output_per_mtok, pricing_source = await _resolve_model_pricing(
-            provider, model_id
-        )
-        if fields is None:
-            result.append(
-                ModelDiagnostic(
-                    id=model_id,
-                    input_per_mtok=input_per_mtok,
-                    output_per_mtok=output_per_mtok,
-                    pricing_source=pricing_source,
-                )
-            )
-        else:
-            result.append(
-                ModelDiagnostic(
-                    id=model_id,
-                    input_per_mtok=input_per_mtok,
-                    output_per_mtok=output_per_mtok,
-                    pricing_source=pricing_source,
-                    **fields,
-                )
-            )
+            result.append(ModelDiagnostic(id=model_id, **pricing_fields))
     return result
 
 

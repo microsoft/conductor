@@ -725,8 +725,8 @@ support and context-window limits:
 | Reasoning efforts | `reasoning.effort` levels the model accepts (e.g. `low, medium, high, xhigh`), `none` when the model definitively supports none (e.g. a non-thinking Claude model), or `n/a` when the provider can't determine support. |
 | Default | The model's default reasoning-effort level, or `—` when unknown/not applicable. |
 | Prompt / Output / Context | Maximum prompt (input), output (completion), and total context-window tokens, or `—` when the provider doesn't expose that limit. |
-| Input $/Mtok / Output $/Mtok | Resolved per-million-token input/output rate (USD), or `—` when unpriced (never `0.00` — a zero would read as "free"). |
-| Pricing | Where the rate came from (see #386): `provider` (live rate from the provider's `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback), `none` (unpriced — the run's cost summary will show `~$X (N unpriced)`), or `—` when pricing resolution itself failed. |
+| Input $/Mtok / Output $/Mtok | Resolved per-million-token input/output rate (USD), or `—` when unpriced; a displayed `0.00` means a genuinely free rate reported by the provider, never "unknown". |
+| Pricing | Where the rate came from (see #386): `provider` (live rate from the provider's `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback), `none` (unpriced — the run's cost summary will show `~$X (N unpriced)`), or `error` when pricing resolution itself failed. |
 
 Coverage varies by provider — every field degrades independently to `n/a` /
 `—` rather than failing the command:
