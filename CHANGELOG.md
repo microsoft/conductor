@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optional `CONDUCTOR_GATE_TOKEN` env var, and requests were unauthenticated
   when it was unset. The token is minted automatically per run and
   discoverable by `conductor gate respond` / `guide` / `stop` via a new
-  `0600` file at `~/.conductor/runs/dashboard-<port>.token`;
+  `0600` file (POSIX; on Windows the mode bits are not honoured and the
+  file relies on the user-profile ACL instead — see #425) at
+  `~/.conductor/runs/dashboard-<port>.token`;
   `CONDUCTOR_GATE_TOKEN` still overrides it when set. A new pure-ASGI
   `OriginHostGuard` middleware also validates the `Host` and (when present)
   `Origin` headers on every HTTP and WebSocket request, closing the

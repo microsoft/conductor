@@ -506,7 +506,7 @@ class TestTokenFileLifecycle:
         "os.open's pmode only honours the write bit, so a writable "
         "file always reports 0o666.",
     )
-    async def test_written_with_mode_0600(self) -> None:
+    async def test_written_on_start_with_mode_0600(self) -> None:
         emitter, dashboard = _make_dashboard()
         await dashboard.start()
         try:

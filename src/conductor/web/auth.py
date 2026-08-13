@@ -16,8 +16,9 @@ Three layers, none of them individually load-bearing:
    the default. ``CONDUCTOR_GATE_TOKEN`` overrides it when set (the
    documented escape hatch predating this change).
 3. A token *file* at ``~/.conductor/runs/dashboard-<port>.token`` (mode
-   ``0600``) so a CLI invocation with no explicit ``--token`` and no env
-   var set can still discover the running dashboard's token.
+   ``0600`` on POSIX; see :func:`write_token_file` for the Windows caveat)
+   so a CLI invocation with no explicit ``--token`` and no env var set can
+   still discover the running dashboard's token.
 
 Read-only routes (``GET /api/state``, ``/api/info``, ``/api/logs``,
 ``/api/gate-status``, ``/api/files/*``, the replay app) are protected by
@@ -95,9 +96,10 @@ def write_token_file(port: int, token: str) -> Path:
     a partially-written token.
 
     The ``0600`` mode is honoured on POSIX only. On Windows, ``os.open``'s
-    ``pmode`` argument only ever toggles the read-only attribute, so the
-    file inherits the ``%USERPROFILE%`` NTFS ACL instead of gaining
-    per-owner permission bits.
+    ``pmode`` argument only ever toggles the read-only attribute, so on
+    Windows the file's protection comes from the inherited ACL of its parent
+    directory (``rundir.runs_dir()``, i.e. ``%USERPROFILE%\\.conductor\\runs``
+    by default) rather than from per-owner permission bits.
 
     Args:
         port: The bound dashboard port.
@@ -109,9 +111,6 @@ def write_token_file(port: int, token: str) -> Path:
     path = token_file_path(port)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        # 0o600 is correct and effective on POSIX; on Windows it is silently
-        # ignored (the file is protected by the user-profile ACL instead), so
-        # it is still passed rather than special-cased.
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         try:
             os.write(fd, token.encode("utf-8"))

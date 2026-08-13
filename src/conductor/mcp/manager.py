@@ -416,8 +416,10 @@ class MCPManager:
     ) -> str | None:
         """Write the full tool result to a process-private temporary file.
 
-        Files are created with mode 0o600 and may contain raw tool output
-        (possibly including secrets). The caller is responsible for lifecycle.
+        Files are created with mode 0o600 on POSIX (Windows does not honour
+        permission bits — see the note in the body) and may contain raw tool
+        output (possibly including secrets). The caller is responsible for
+        lifecycle.
 
         This method is best-effort and must never raise. Any failure (invalid
         path, symlink, permission, I/O, encoding) is logged as a warning and
@@ -464,19 +466,31 @@ class MCPManager:
 
             spill_dir = spill_dir.resolve()
             spill_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # If the leaf directory already existed, harden it before writing
-            # potentially sensitive tool output into it.
+            # Harden a pre-existing leaf directory before writing potentially
+            # sensitive tool output into it. On POSIX this chmod is the only
+            # protection ever applied to a directory the caller (not
+            # Conductor) may have already created, since spill_dir can be a
+            # user-configured path outside the system temp root.
             #
-            # On Windows, stat() always reports 0o777 for a directory (POSIX
-            # permission bits are not implemented), so this branch always
-            # fires and the subsequent os.chmod() is a documented no-op there
-            # (it can only toggle the read-only attribute) — the directory is
-            # protected by its parent's NTFS ACL instead. This is accepted
-            # deliberately rather than guarded with a sys.platform check:
-            # guarding it would also skip tests/test_mcp/test_manager_truncation.py
-            # ::test_spill_dir_chmod_failure_is_rejected on Windows, giving up
-            # real coverage of the "chmod failed -> refuse to write" refusal
-            # path (issue #425).
+            # On Windows, POSIX permission bits are not implemented: stat()
+            # reports 0o777 for a directory (0o555 when the read-only
+            # attribute is set), so the low bits are always non-zero and this
+            # branch always fires. The subsequent os.chmod() only maps the
+            # owner-write bit onto FILE_ATTRIBUTE_READONLY, which Windows
+            # ignores as an access control for directories, so it succeeds
+            # without restricting access — the "harden or refuse" invariant
+            # below is POSIX-only. The default spill dir inherits the
+            # per-user temp directory's ACL; a configured spill_dir gets only
+            # whatever ACL that path carries, and Conductor cannot tighten it
+            # on Windows.
+            #
+            # This is accepted deliberately rather than guarded with a
+            # sys.platform check: guarding it would also skip
+            # test_manager_truncation.py::test_spill_dir_chmod_failure_is_rejected
+            # on Windows, giving up real coverage of the refusal path below
+            # (issue #425). The failure path still refuses the write; a
+            # chmod failure on Windows is a genuine anomaly, not expected
+            # noise.
             current_mode = stat.S_IMODE(spill_dir.stat().st_mode)
             if current_mode & 0o077:
                 try:
