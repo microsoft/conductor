@@ -18,8 +18,9 @@ agents happen to still be inside the tail window.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -31,6 +32,10 @@ from conductor.console import styled
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import AgentDetail, RunSummary, derive_run_detail, derive_run_summary
 from conductor.fleet.tui.theme import muted, status_label
+
+if TYPE_CHECKING:
+    # app.py imports this module, so a top-level import would cycle.
+    from conductor.fleet.tui.app import FleetApp
 
 logger = logging.getLogger(__name__)
 
@@ -99,29 +104,6 @@ def _format_agent_cost(cost_usd: float | None) -> str:
     return f"~${cost_usd:.2f}"
 
 
-def _gate_detail_text(summary: RunSummary) -> Text:
-    """Render the gate-detail panel's text for a run with an open gate
-    (E13-T1): its prompt and the available option labels/values -- the
-    payload E6-T6 already carries on ``RunSummary.gate``.
-
-    Duplicated from ``conductor.fleet.tui.screens.runs`` (rather than
-    imported) to keep each screen module's rendering self-contained --
-    matching that module's own precedent (see ``_format_duration``'s
-    docstring above).
-
-    ``gate.agent_name``/``gate.prompt``/``gate.options`` are workflow-
-    controlled data, not authored Rich markup -- escaped so a value
-    containing e.g. ``[/red]`` renders as literal text instead of raising
-    MarkupError.
-    """
-    gate = summary.gate
-    assert gate is not None
-    parts = [styled("[bold]Gate:[/bold] {}", gate.agent_name), Text(gate.prompt)]
-    if gate.options:
-        parts.append(Text("Options: " + ", ".join(gate.options)))
-    return Text("\n").join(parts)
-
-
 class RunDetailScreen(Screen):
     """Per-run detail: topology as discrete per-agent rows, current step
     highlighted. Not a DAG; no agent messages; no tool output (E9-T2)."""
@@ -138,15 +120,60 @@ class RunDetailScreen(Screen):
         super().__init__()
         self._record = record
         self._poll_timer: Timer | None = None
+        # Seeded from the record (the workflow file's stem) and upgraded to
+        # the log's declared name as soon as the detail read supplies it,
+        # so the title agrees with the Runs and History screens.
+        self._display_name = record.workflow_name
+
+    def _update_title(self, title: Static) -> None:
+        """Render the heading from the current best-known workflow name."""
+        title.update(styled("[bold]{}[/bold] ({})", self._display_name, self._record.run_id or ""))
 
     def action_back(self) -> None:
         """Pop back to the Runs screen -- bound to ``escape`` (E9-T1)."""
         self.app.pop_screen()
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open the step drill-down for the selected agent (``enter``).
+
+        The table says whether a step succeeded and what it cost; this is
+        how you see what it actually *did* -- the prompt it was given and
+        the output it produced (or, while it is still running and has no
+        output yet, what it has been doing).
+        """
+        key = event.row_key.value
+        if key is None:
+            return
+        # Row keys are `<agent-name>-<index>` (agent names are not unique),
+        # so the trailing index is stripped back off here.
+        agent_name = key.rsplit("-", 1)[0]
+        cast("FleetApp", self.app).push_step_detail(self._record, agent_name)
+
+    def _update_inputs(self, summary: RunSummary | None) -> None:
+        """Show the values this run was launched with, when the log has them.
+
+        Two runs of the same workflow are otherwise distinguishable only by
+        id; the inputs are what actually say which is which.
+        """
+        panel = self.query_one("#run-inputs", Static)
+        inputs = summary.inputs if summary is not None else None
+        if not inputs:
+            panel.display = False
+            panel.update("")
+            return
+        text = Text()
+        text.append("Inputs", style="bold")
+        for name, value in inputs.items():
+            text.append("\n  ")
+            text.append(f"{name} ", style="dim")
+            text.append(str(value))
+        panel.display = True
+        panel.update(text)
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(id="detail-title")
-        yield Static(id="gate-detail")
+        yield Static(id="run-inputs")
         yield DataTable(id="detail-table")
         yield Static(_PLACEHOLDER_TEXT, id="detail-placeholder")
         yield Footer()
@@ -155,7 +182,7 @@ class RunDetailScreen(Screen):
         table = self.query_one(DataTable)
         table.add_columns("Agent", "Type", "Status", "Elapsed", "Tokens", "Cost")
         table.cursor_type = "row"
-        self.query_one("#gate-detail", Static).display = False
+        self.query_one("#run-inputs", Static).display = False
         self.refresh_detail()
         self._poll_timer = self.set_interval(self.POLL_INTERVAL_SECONDS, self.refresh_detail)
 
@@ -174,16 +201,19 @@ class RunDetailScreen(Screen):
         than crashing the screen.
         """
         title = self.query_one("#detail-title", Static)
-        gate_panel = self.query_one("#gate-detail", Static)
         table = self.query_one(DataTable)
         placeholder = self.query_one("#detail-placeholder", Static)
 
-        title.update(f"[bold]{self._record.workflow_name}[/bold] ({self._record.run_id})")
+        self._update_title(title)
 
-        # The gate payload (agent_name/prompt/options, E6-T6) lives on
-        # RunSummary, not RunDetail -- reuse the same bounded tail-read
-        # derivation the Runs screen's row already relies on, rather than
-        # threading gate fields through RunDetail as well (E13-T1).
+        # `RunSummary` (a bounded tail read) rather than `RunDetail`: the
+        # inputs section below needs what the run was launched with, which
+        # only the summary carries.
+        #
+        # An open gate is deliberately *not* repeated here. The Runs screen's
+        # preview already shows it along with the key that answers it, and
+        # repeating it above this table pushed the per-agent rows -- the
+        # reason to open this screen at all -- below the fold on a gated run.
         try:
             summary = derive_run_summary(self._record)
         except Exception:
@@ -192,12 +222,7 @@ class RunDetailScreen(Screen):
             )
             summary = None
 
-        if summary is not None and summary.gate is not None:
-            gate_panel.display = True
-            gate_panel.update(_gate_detail_text(summary))
-        else:
-            gate_panel.display = False
-            gate_panel.update("")
+        self._update_inputs(summary)
 
         try:
             detail = derive_run_detail(self._record)
@@ -206,6 +231,10 @@ class RunDetailScreen(Screen):
                 "Failed to derive run detail for run_id=%s", self._record.run_id, exc_info=True
             )
             detail = None
+
+        if detail is not None and detail.workflow_name:
+            self._display_name = detail.workflow_name
+            self._update_title(title)
 
         if detail is None or detail.topology is None or not detail.agents:
             # A missing/unreadable event log, or one with no (yet-visible)
@@ -218,6 +247,13 @@ class RunDetailScreen(Screen):
 
         table.display = True
         placeholder.display = False
+
+        # Preserve the cursor across the rebuild. Without this every poll
+        # tick reset it to row 0, so holding `down` on a long agent list
+        # fought the refresh and snapped back to the top -- the same
+        # protection `runs.py` already applies to its own table.
+        previous_row = table.cursor_coordinate.row if table.row_count else 0
+
         table.clear()
 
         for index, agent in enumerate(detail.agents):
@@ -234,6 +270,10 @@ class RunDetailScreen(Screen):
             except Exception:
                 logger.warning("Failed to add detail row for agent=%s", agent.name, exc_info=True)
                 continue
+
+        if previous_row and table.row_count:
+            with contextlib.suppress(Exception):
+                table.move_cursor(row=min(previous_row, table.row_count - 1))
 
     def _add_row(self, table: DataTable, agent: AgentDetail, key: str) -> None:
         """Add one agent's row: status, elapsed, tokens, cost -- the

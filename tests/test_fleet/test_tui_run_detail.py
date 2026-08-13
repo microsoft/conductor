@@ -46,11 +46,11 @@ def _write_jsonl(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def _workflow_started_event(agent_names: list[str]) -> str:
+def _workflow_started_event(agent_names: list[str], name: str = "wf") -> str:
     return _event(
         "workflow_started",
         {
-            "name": "wf",
+            "name": name,
             "entry_point": agent_names[0] if agent_names else None,
             "agents": [
                 {"name": n, "type": "agent", "model": "gpt-5", "provider_name": "copilot"}
@@ -157,8 +157,8 @@ class TestRunDetailNavigation:
         whichever run happens to be first."""
         log_a = tmp_path / "run-a.events.jsonl"
         log_b = tmp_path / "run-b.events.jsonl"
-        _write_jsonl(log_a, [_workflow_started_event(["researcher"])])
-        _write_jsonl(log_b, [_workflow_started_event(["writer"])])
+        _write_jsonl(log_a, [_workflow_started_event(["researcher"], name="alpha")])
+        _write_jsonl(log_b, [_workflow_started_event(["writer"], name="beta")])
         _write_record(
             tmp_path,
             "run-a",
@@ -188,6 +188,110 @@ class TestRunDetailNavigation:
             assert isinstance(detail_screen, RunDetailScreen)
             title = detail_screen.query_one("#detail-title", Static)
             assert "alpha" in str(title.content)
+            assert "run-a" in str(title.content)
+
+    async def test_title_prefers_the_declared_workflow_name(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The heading shows the log's declared name, not the file's stem.
+
+        A repo that stores each workflow as ``<name>/workflow.yaml`` gives
+        every run record the stem "workflow", which made this screen
+        disagree with the Runs and History screens about what the run was.
+        """
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"], name="ship")])
+        _write_record(tmp_path, "run-a", workflow_name="workflow", event_log_path=str(log_path))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            detail_screen = app.screen
+            assert isinstance(detail_screen, RunDetailScreen)
+            title = str(detail_screen.query_one("#detail-title", Static).content)
+            assert "ship" in title
+            assert "workflow" not in title
+
+
+class TestGateIsNotRepeatedHere:
+    """The Runs screen's preview already shows an open gate *and* the key
+    that answers it. Repeating the prompt above this table pushed the
+    per-agent rows -- the reason to open this screen -- below the fold on
+    exactly the runs a reader is most likely to be inspecting."""
+
+    async def test_gate_prompt_is_not_shown_on_the_detail_screen(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(
+            log,
+            [
+                _workflow_started_event(["planner"]),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event(
+                    "gate_presented",
+                    {
+                        "agent_name": "planner",
+                        "gate_id": "g1",
+                        "prompt": "UNIQUE-GATE-PROMPT-MARKER",
+                        "options": ["approve"],
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, "run-a", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, RunDetailScreen)
+            painted = "".join(
+                "".join(segment.text for segment in strip)
+                for strip in app.screen._compositor.render_strips()
+            )
+            assert "UNIQUE-GATE-PROMPT-MARKER" not in painted
+            # The gated step itself is still listed -- only the duplicated
+            # prompt panel is gone.
+            assert "planner" in painted
+
+    async def test_a_gated_step_is_marked_as_such_not_as_running(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Dropping the prompt panel must not drop the *fact* of the gate.
+
+        A step waiting on a person is not a step doing work, and with the
+        panel gone this row is the only place the detail screen can say so.
+        """
+        log = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(
+            log,
+            [
+                _workflow_started_event(["planner"]),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event(
+                    "gate_presented",
+                    {"agent_name": "planner", "gate_id": "g1", "prompt": "?", "options": ["y"]},
+                ),
+            ],
+        )
+        _write_record(tmp_path, "run-a", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            table = app.screen.query_one(DataTable)
+            status = str(table.get_row_at(0)[2])
+            assert "gate" in status.lower()
+            assert "running" not in status.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,15 @@ from __future__ import annotations
 from textual.app import App
 
 from conductor.fleet.records import RunRecord
+from conductor.fleet.tui.anim import animations_enabled
 from conductor.fleet.tui.screens.history import HistoryScreen
 from conductor.fleet.tui.screens.new_run import NewRunScreen
 from conductor.fleet.tui.screens.providers import ProvidersScreen
 from conductor.fleet.tui.screens.registries import RegistriesScreen
 from conductor.fleet.tui.screens.run_detail import RunDetailScreen
 from conductor.fleet.tui.screens.runs import RunsScreen
+from conductor.fleet.tui.screens.splash import SplashScreen
+from conductor.fleet.tui.screens.step_detail import StepDetailScreen
 
 
 class FleetApp(App):
@@ -127,6 +130,12 @@ class FleetApp(App):
         """Apply the default theme and push the Runs (home) screen (E7-T3)."""
         self.theme = self.DEFAULT_THEME
         self.push_screen(RunsScreen())
+        # Pushed *on top of* Runs rather than before it, so the fleet scan
+        # is already underway behind the splash and the home screen is fully
+        # drawn the moment it pops -- the splash covers that work instead of
+        # adding to it.
+        if animations_enabled():
+            self.push_screen(SplashScreen())
 
     def push_run_detail(self, record: RunRecord) -> None:
         """Push the run-detail screen (E9) for ``record`` onto the screen stack.
@@ -184,6 +193,15 @@ class FleetApp(App):
                 which starts from an empty form.
         """
         self.push_screen(NewRunScreen(initial_ref))
+
+    def push_step_detail(self, record: RunRecord, agent_name: str) -> None:
+        """Push the step drill-down for one agent of ``record``.
+
+        Mirrors the other push helpers' centralization rationale -- the
+        run-detail screen's row selection calls this rather than
+        constructing :class:`StepDetailScreen` itself.
+        """
+        self.push_screen(StepDetailScreen(record, agent_name))
 
     def push_history(self) -> None:
         """Push the History screen (E14) onto the screen stack.

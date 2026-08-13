@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 RunStatus = Literal["running", "at-gate", "paused", "completed", "failed"]
 
-AgentDetailStatus = Literal["pending", "running", "completed", "failed"]
+AgentDetailStatus = Literal["pending", "running", "at-gate", "completed", "failed"]
 
 # Bounded read windows. Neither grows with the file's size, satisfying the
 # "bounded, not whole-file" requirement even for a very long-running
@@ -65,6 +66,10 @@ _DEFAULT_TAIL_BYTES = 512 * 1024
 # `workflow_completed`/`workflow_failed`) silently truncated rather than
 # read in full -- an accepted, documented limitation, not a crash.
 _DEFAULT_FULL_LOG_MAX_BYTES = 8 * 1024 * 1024
+
+_STEP_ACTIVITY_LIMIT = 200
+"""How many activity lines the step drill-down keeps. A long agentic loop
+emits hundreds of tool calls; this is a drill-down, not a log viewer."""
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,9 @@ class AgentDetail:
 
     status: AgentDetailStatus
     """``"pending"`` -- never seen an ``agent_started`` for this agent in
-    the full log. ``"running"`` -- currently the open step. ``"completed"``
+    the full log. ``"running"`` -- currently the open step. ``"at-gate"`` --
+    the open step, with a presented gate nobody has answered yet.
+    ``"completed"``
     -- closed via ``agent_completed`` (or another step type's own
     ``*_completed``/``gate_resolved``). ``"failed"`` -- closed via
     ``agent_failed`` or ``parallel_agent_failed``."""
@@ -157,6 +164,7 @@ class RunDetail:
     run_id: str
     workflow_name: str
     topology: RunTopology | None
+
     """``None`` when the log is missing/unreadable, empty, or its
     ``workflow_started`` event fell outside the (bounded) read window --
     the detail screen renders a placeholder in this case rather than an
@@ -219,6 +227,7 @@ class RunSummary:
 
     gate: GateInfo | None
     gate_resolvable: bool
+
     """True when this run's gate (if any) can be resolved remotely via
     ``conductor gate respond`` (D4): true whenever the record has a
     dashboard port (``fg-web`` or ``bg``), false for a plain foreground
@@ -232,7 +241,16 @@ class RunSummary:
     the first line of the log, so this is populated for a just-started run;
     for an older run whose log has grown past the tail window, this is
     ``None`` until a dedicated full-log read is added (E9-T3) for the
-    run-detail screen."""
+    run-detail screen. A head read now recovers it for a long run, whose
+    log has always outgrown the tail window by definition."""
+
+    cwd: str | None = None
+    """Directory conductor was launched from (``workflow_started``'s
+    ``system`` block). Not on the run record, and what distinguishes two
+    runs of the same workflow started from different checkouts."""
+
+    inputs: dict[str, Any] | None = None
+    """The values this run was launched with, when the log records them."""
 
     @property
     def has_unpriced(self) -> bool:
@@ -294,6 +312,40 @@ def _parse_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
         if isinstance(obj, dict):
             events.append(obj)
     return events
+
+
+_HEAD_BYTES = 512 * 1024
+"""How much of a log's *start* is read for topology.
+
+``workflow_started`` is the first event a run writes, so on any log longer
+than the tail window it is the one event guaranteed to be outside it -- which
+is why a long-running workflow's step list silently disappeared while a young
+one still showed it.
+
+Sized to hold that one line, which is far larger than "one event" suggests:
+it carries the whole workflow definition (every step, route, parallel and
+for-each group, plus provider and metadata blocks), and a real 23-step
+workflow measured **77 KB**. A window smaller than the line truncates it
+mid-JSON, and a truncated line is discarded like any other malformed one --
+so an under-sized window does not degrade the result, it removes it
+entirely, which is exactly the bug this constant exists to fix.
+"""
+
+
+def read_event_log_head(path: Path, *, head_bytes: int = _HEAD_BYTES) -> list[dict[str, Any]]:
+    """Read the first ``head_bytes`` of a JSONL event log, parsed into events.
+
+    The mirror of :func:`read_event_log_tail`, and bounded the same way: a
+    trailing line cut off by the byte limit fails to parse and is skipped
+    like any other malformed line.
+    """
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(head_bytes)
+    except OSError:
+        logger.debug("Could not read head of event log %s", path, exc_info=True)
+        return []
+    return _parse_jsonl_bytes(chunk)
 
 
 def read_event_log_tail(
@@ -402,6 +454,11 @@ _AGENT_CLOSE_EVENT_TYPES = frozenset(
         "gate_resolved",
         "subworkflow_completed",
         "parallel_agent_completed",
+        # A `questions` node closes with its own event rather than
+        # `agent_completed`. Without it here the node stayed "running" for
+        # the rest of the run -- visibly so, since the workflow had already
+        # moved on to the next step.
+        "questions_completed",
     }
 )
 
@@ -436,6 +493,9 @@ class _ScanResult:
     total_cost_usd: float | None = None
     unpriced_agent_count: int = 0
     topology: RunTopology | None = None
+    workflow_name: str | None = None
+    cwd: str | None = None
+    inputs: dict[str, Any] | None = None
 
 
 def _close_step(open_steps: list[tuple[str, str, float]], step_type: str, name: str) -> None:
@@ -485,6 +545,28 @@ def _scan_events(events: list[dict[str, Any]]) -> _ScanResult:
             continue
         ts = evt.get("timestamp")
 
+        if etype == "workflow_started" and result.workflow_name is None:
+            # The workflow's *declared* name (`workflow.name`), which is not
+            # the file stem the run record carries: a repo that stores each
+            # workflow as `<name>/workflow.yaml` makes every run show up as
+            # "workflow". History reads this same declared name out of the
+            # log filename, which is why the two screens disagreed.
+            declared = data.get("name")
+            if isinstance(declared, str) and declared:
+                result.workflow_name = declared
+
+            # Where conductor was launched from, and what it was launched
+            # with -- neither is on the run record, and both are what tells
+            # two runs of the same workflow apart.
+            system = data.get("system")
+            if isinstance(system, dict):
+                cwd = system.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    result.cwd = cwd
+            inputs = data.get("inputs")
+            if isinstance(inputs, dict):
+                result.inputs = inputs
+
         if etype == "workflow_started" and result.topology is None:
             result.topology = _extract_topology(data)
 
@@ -498,6 +580,16 @@ def _scan_events(events: list[dict[str, Any]]) -> _ScanResult:
                 result.open_steps.append(("agent", str(name), float(ts)))
             if result.status == "paused":
                 result.status = "running"
+            # A step starting means the run is executing, not waiting on a
+            # human -- so any gate still on record is stale. Needed because
+            # `gate_resolved` is not guaranteed: a `questions` node emitted
+            # only `gate_presented` until the engine was fixed to pair them,
+            # and every log written before that fix still has the unpaired
+            # events in it. Without this, such a run shows "at gate" forever.
+            if result.gate is not None and str(name) != result.gate.agent_name:
+                result.gate = None
+                if result.status == "at-gate":
+                    result.status = "running"
 
         elif etype in _AGENT_CLOSE_EVENT_TYPES:
             name = data.get("agent_name")
@@ -506,6 +598,15 @@ def _scan_events(events: list[dict[str, Any]]) -> _ScanResult:
             if etype == "gate_resolved":
                 result.status = "running"
                 result.gate = None
+            elif (
+                result.gate is not None and name is not None and str(name) == result.gate.agent_name
+            ):
+                # The agent that presented the gate has finished, so the gate
+                # went with it even if no `gate_resolved` was ever written
+                # (see the note in the `agent_started` branch above).
+                result.gate = None
+                if result.status == "at-gate":
+                    result.status = "running"
             elif etype in ("agent_completed", "parallel_agent_completed"):
                 tokens = data.get("tokens")
                 if isinstance(tokens, int | float):
@@ -618,6 +719,11 @@ def _scan_agent_details(
     cumulative_tokens: dict[str, int] = {}
     cumulative_cost: dict[str, float | None] = {}
     started_at_by_name: dict[str, float] = {}
+    # Steps with a presented-but-unresolved gate. An open step that is
+    # waiting on a person is not the same as one that is working, and the
+    # run-detail screen has no other way to say so now that it no longer
+    # repeats the Runs screen's gate panel.
+    gated: set[str] = set()
 
     for evt in events:
         etype = evt.get("type")
@@ -646,12 +752,19 @@ def _scan_agent_details(
                 # prior *status* so it reflects the latest attempt. Its
                 # cumulative usage (tracked separately) is untouched.
                 closed.pop(name, None)
+                gated.discard(name)
+
+        elif etype == "gate_presented":
+            name = data.get("agent_name")
+            if name is not None:
+                gated.add(str(name))
 
         elif etype in _AGENT_CLOSE_EVENT_TYPES:
             name = data.get("agent_name")
             if name is not None:
                 name = str(name)
                 _close_step(open_steps, "agent", name)
+                gated.discard(name)
                 elapsed = data.get("elapsed")
                 if etype in ("agent_completed", "parallel_agent_completed"):
                     tokens = data.get("tokens")
@@ -744,7 +857,7 @@ def _scan_agent_details(
                     type=ta.type,
                     model=ta.model,
                     provider_name=ta.provider_name,
-                    status="running",
+                    status="at-gate" if ta.name in gated else "running",
                     started_at=started_at_by_name.get(ta.name),
                     reported_elapsed_seconds=None,
                     tokens=cum_tokens,
@@ -820,10 +933,23 @@ def derive_run_summary(
         event visible within the tail window.
     """
     events: list[dict[str, Any]] = []
+    head_events: list[dict[str, Any]] = []
     if record.event_log_path:
-        events = read_event_log_tail(Path(record.event_log_path), tail_bytes=tail_bytes)
+        log_path = Path(record.event_log_path)
+        events = read_event_log_tail(log_path, tail_bytes=tail_bytes)
+        # `workflow_started` is the log's first event, so on a run long
+        # enough to outgrow the tail window it is always outside it -- the
+        # topology (and with it the preview's step list) disappeared exactly
+        # when a run got interesting enough to want it.
+        head_events = read_event_log_head(log_path)
 
     scan = _scan_events(events)
+    if head_events and (scan.topology is None or scan.workflow_name is None):
+        head_scan = _scan_events(head_events)
+        scan.topology = scan.topology or head_scan.topology
+        scan.workflow_name = scan.workflow_name or head_scan.workflow_name
+        scan.cwd = scan.cwd or head_scan.cwd
+        scan.inputs = scan.inputs if scan.inputs is not None else head_scan.inputs
 
     if scan.open_steps:
         current_step_type, current_step, current_step_started_at = scan.open_steps[-1]
@@ -832,7 +958,8 @@ def derive_run_summary(
 
     return RunSummary(
         run_id=record.run_id,
-        workflow_name=record.workflow_name,
+        # Declared name when the log carries one, else the record's file stem.
+        workflow_name=scan.workflow_name or record.workflow_name,
         mode=record.mode,
         port=record.port,
         started_at=record.started_at,
@@ -846,7 +973,136 @@ def derive_run_summary(
         gate=scan.gate,
         gate_resolvable=record.port is not None,
         topology=scan.topology,
+        cwd=scan.cwd,
+        inputs=scan.inputs,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityLine:
+    """One line of a step's activity stream (a message, a tool call, …)."""
+
+    kind: str
+    """``message`` / ``reasoning`` / ``tool`` / ``tool_result`` / ``turn``."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class StepDetail:
+    """One step's input, output and activity -- the step drill-down (enter on
+    a row of the run-detail screen).
+
+    Answers "what did this step actually do", which neither the Runs table
+    (state) nor the run-detail table (per-step status/usage) can: the prompt
+    that went in, the structured output that came out, and -- while it is
+    still running, when there is no output yet -- what it has been doing.
+    """
+
+    agent_name: str
+    status: str
+    prompt: str | None
+    output: Any | None
+    activity: list[ActivityLine]
+    workflow_name: str
+    """The run's declared name, not the workflow file's stem."""
+
+
+def derive_step_detail(
+    record: RunRecord, agent_name: str, *, max_bytes: int = _DEFAULT_FULL_LOG_MAX_BYTES
+) -> StepDetail:
+    """Extract one step's input/output/activity from a run's event log.
+
+    Reads the **full** (bounded) log rather than the tail, for the same
+    reason :func:`derive_run_detail` does: a step's prompt is emitted once,
+    when it started, which on a long run is far outside the tail window.
+
+    Activity is bounded to the most recent :data:`_STEP_ACTIVITY_LIMIT`
+    entries -- a long agentic loop emits hundreds of tool calls, and this is
+    a drill-down, not a log viewer.
+    """
+    events: list[dict[str, Any]] = []
+    if record.event_log_path:
+        events = read_event_log_full(Path(record.event_log_path), max_bytes=max_bytes)
+
+    prompt: str | None = None
+    output: Any | None = None
+    status = "pending"
+    activity: deque[ActivityLine] = deque(maxlen=_STEP_ACTIVITY_LIMIT)
+
+    for evt in events:
+        data = evt.get("data")
+        if not isinstance(data, dict) or data.get("subworkflow_path"):
+            continue
+        if data.get("agent_name") != agent_name:
+            continue
+        etype = evt.get("type")
+
+        if etype in ("agent_started", "parallel_agent_started"):
+            status = "running"
+            # A re-run (loop-back) supersedes the previous attempt's result.
+            output = None
+            activity.clear()
+        elif etype == "agent_prompt_rendered":
+            rendered = data.get("rendered_prompt")
+            if isinstance(rendered, str):
+                prompt = rendered
+        elif etype in ("agent_completed", "parallel_agent_completed"):
+            status = "completed"
+            output = data.get("output")
+        elif etype == "questions_completed" or etype in _AGENT_CLOSE_EVENT_TYPES:
+            status = "completed"
+        elif etype in _AGENT_FAILED_EVENT_TYPES:
+            status = "failed"
+
+        if etype == "agent_message":
+            content = data.get("content")
+            if isinstance(content, str) and content.strip():
+                activity.append(ActivityLine("message", content.strip()))
+        elif etype == "agent_reasoning":
+            content = data.get("content")
+            if isinstance(content, str) and content.strip():
+                activity.append(ActivityLine("reasoning", content.strip()))
+        elif etype == "agent_tool_start":
+            activity.append(ActivityLine("tool", str(data.get("tool_name") or "tool")))
+        elif etype == "agent_tool_complete":
+            activity.append(ActivityLine("tool_result", str(data.get("tool_name") or "tool")))
+
+    return StepDetail(
+        agent_name=agent_name,
+        status=status,
+        prompt=prompt,
+        output=output,
+        activity=list(activity),
+        workflow_name=_declared_workflow_name(events) or record.workflow_name,
+    )
+
+
+def _declared_workflow_name(events: list[dict[str, Any]]) -> str | None:
+    """Return the root run's *declared* workflow name, if the log has it.
+
+    The run record carries the workflow file's stem, so a repo that stores
+    each workflow as ``<name>/workflow.yaml`` labels every run "workflow".
+    The declared name is in the log, and it is what the Runs and History
+    screens already show -- the drill-downs read it here so all four agree.
+
+    Args:
+        events: Parsed event dicts from the run's log.
+
+    Returns:
+        The declared name, or ``None`` when no root ``workflow_started``
+        carries one.
+    """
+    for evt in events:
+        if evt.get("type") != "workflow_started":
+            continue
+        data = evt.get("data")
+        if not isinstance(data, dict) or data.get("subworkflow_path"):
+            continue
+        declared = data.get("name")
+        if isinstance(declared, str) and declared:
+            return declared
+    return None
 
 
 def derive_run_detail(
@@ -893,7 +1149,7 @@ def derive_run_detail(
 
     return RunDetail(
         run_id=record.run_id,
-        workflow_name=record.workflow_name,
+        workflow_name=_declared_workflow_name(events) or record.workflow_name,
         topology=topology,
         agents=agents,
         current_step=current_step,

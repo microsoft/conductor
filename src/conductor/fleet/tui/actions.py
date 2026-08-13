@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING
 import typer
 from rich.console import Console
 from rich.text import Text
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
@@ -360,14 +360,42 @@ class GateOptionsModal(ModalScreen[str | None]):
         align: center middle;
     }
     #gate-modal {
-        width: auto;
-        height: auto;
+        /* Bounded, not `auto`: a real gate prompt is routinely longer than
+           the terminal is tall (a plan-approval gate carries the whole
+           plan), and an auto-sized modal simply grew past the screen --
+           taking its own option list off the bottom with it. */
+        width: 90%;
+        max-width: 120;
+        height: 80%;
         border: thick $warning;
         padding: 1 2;
     }
+    #gate-prompt-scroll {
+        /* 1fr: the prompt absorbs the modal's spare height, so the option
+           list and hint below it stay visible no matter how long it is. */
+        height: 1fr;
+        scrollbar-size-vertical: 1;
+    }
+    #gate-option-list {
+        height: auto;
+        max-height: 40%;
+        margin-top: 1;
+    }
     """
 
-    BINDINGS = [("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        # Plain up/down belong to the OptionList (which holds focus, and is
+        # how an option gets chosen), so scrolling the prompt needs its own
+        # keys rather than stealing those.
+        # Deliberately not pageup/pagedown: the OptionList holds focus and
+        # binds those for its own option navigation, so a screen-level
+        # binding never fires. ctrl+shift+arrows page instead.
+        ("ctrl+down", "scroll_prompt_down", "Scroll"),
+        ("ctrl+up", "scroll_prompt_up", "Scroll up"),
+        ("ctrl+shift+down", "prompt_page_down", "Page down"),
+        ("ctrl+shift+up", "prompt_page_up", "Page up"),
+    ]
 
     def __init__(self, gate: GateInfo) -> None:
         super().__init__()
@@ -382,7 +410,16 @@ class GateOptionsModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static(self._gate.prompt, markup=False, id="gate-prompt"),
+            VerticalScroll(
+                Static(self._gate.prompt, markup=False, id="gate-prompt"),
+                id="gate-prompt-scroll",
+                # A scroll container is focusable by default and would take
+                # focus ahead of the option list, sending arrows and Enter to
+                # the prompt instead of to the choices. The prompt is scrolled
+                # by its own bindings (ctrl+arrows / page keys) precisely so it
+                # never has to hold focus.
+                can_focus=False,
+            ),
             OptionList(
                 *[
                     Option(Text(_option_label(self._gate, value)), id=option_id)
@@ -390,9 +427,37 @@ class GateOptionsModal(ModalScreen[str | None]):
                 ],
                 id="gate-option-list",
             ),
-            Static("[dim]Escape to cancel[/dim]", id="gate-hint"),
+            Static(
+                Text.from_markup(
+                    "[dim]↑↓ choose · enter select · ctrl+↑/↓ scroll · esc cancel[/dim]"
+                ),
+                id="gate-hint",
+            ),
             id="gate-modal",
         )
+
+    def on_mount(self) -> None:
+        """Put focus on the options, which is what the user is here to pick."""
+        self.query_one("#gate-option-list", OptionList).focus()
+
+    def _prompt_scroll(self) -> VerticalScroll:
+        return self.query_one("#gate-prompt-scroll", VerticalScroll)
+
+    def action_scroll_prompt_down(self) -> None:
+        """Scroll the prompt down a line -- bound to ctrl+down."""
+        self._prompt_scroll().scroll_down()
+
+    def action_scroll_prompt_up(self) -> None:
+        """Scroll the prompt up a line -- bound to ctrl+up."""
+        self._prompt_scroll().scroll_up()
+
+    def action_prompt_page_down(self) -> None:
+        """Scroll the prompt a page down -- bound to pagedown."""
+        self._prompt_scroll().scroll_page_down()
+
+    def action_prompt_page_up(self) -> None:
+        """Scroll the prompt a page up -- bound to pageup."""
+        self._prompt_scroll().scroll_page_up()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_id = event.option_id

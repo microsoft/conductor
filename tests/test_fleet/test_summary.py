@@ -1368,3 +1368,193 @@ class TestDeriveRunDetailGracefulDegradation:
 
         assert detail.run_id == "run-detail-1"
         assert detail.workflow_name == "detail-flow"
+
+
+class TestStaleGateClosing:
+    """A gate must not latch on forever when no ``gate_resolved`` arrives.
+
+    A ``questions`` node emitted only ``gate_presented`` until the engine was
+    fixed to pair the two, and every log written before that fix still has
+    the unpaired events in it -- so the summary has to close a gate the run
+    has visibly moved past, not just one it was told about.
+    """
+
+    def test_gate_closes_when_a_later_step_starts(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask_questions"}),
+                _event("gate_presented", {"agent_name": "ask_questions", "prompt": "Q?"}),
+                # No gate_resolved -- the run simply moves on.
+                _event("agent_started", {"agent_name": "planner"}),
+            ],
+        )
+        summary = derive_run_summary(_make_record(tmp_path))
+        assert summary.gate is None
+        assert summary.status == "running"
+
+    def test_gate_closes_when_its_own_agent_completes(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask_questions"}),
+                _event("gate_presented", {"agent_name": "ask_questions", "prompt": "Q?"}),
+                _event("agent_completed", {"agent_name": "ask_questions", "tokens": 10}),
+            ],
+        )
+        summary = derive_run_summary(_make_record(tmp_path))
+        assert summary.gate is None
+        assert summary.status == "running"
+
+    def test_an_open_gate_still_reads_as_open(self, tmp_path: Path) -> None:
+        """The closing rules must not swallow a gate that is genuinely open --
+        the presenting agent stays started while it waits."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask_questions"}),
+                _event("gate_presented", {"agent_name": "ask_questions", "prompt": "Q?"}),
+            ],
+        )
+        summary = derive_run_summary(_make_record(tmp_path))
+        assert summary.gate is not None
+        assert summary.gate.agent_name == "ask_questions"
+        assert summary.status == "at-gate"
+
+    def test_repeated_prompts_from_one_node_stay_open(self, tmp_path: Path) -> None:
+        """A questions node presents repeatedly under one name; each new
+        prompt replaces the last rather than closing the gate."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask_questions"}),
+                _event("gate_presented", {"agent_name": "ask_questions", "prompt": "Q1?"}),
+                _event("gate_presented", {"agent_name": "ask_questions", "prompt": "Q2?"}),
+            ],
+        )
+        summary = derive_run_summary(_make_record(tmp_path))
+        assert summary.gate is not None
+        assert summary.gate.prompt == "Q2?"
+        assert summary.status == "at-gate"
+
+    def test_explicit_gate_resolved_still_closes(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "plan_approval"}),
+                _event("gate_presented", {"agent_name": "plan_approval", "prompt": "OK?"}),
+                _event("gate_resolved", {"agent_name": "plan_approval", "selected_option": "yes"}),
+            ],
+        )
+        summary = derive_run_summary(_make_record(tmp_path))
+        assert summary.gate is None
+        assert summary.status == "running"
+
+
+class TestQuestionsNodeCloses:
+    """A `questions` node closes with `questions_completed`, not
+    `agent_completed` -- so it showed as "running" for the rest of the run,
+    visibly wrong once the workflow had moved on to the next step."""
+
+    def test_questions_completed_closes_the_step(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event(
+                    "workflow_started",
+                    {"workflow_name": "wf", "agents": [{"name": "ask", "type": "questions"}]},
+                ),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event("questions_completed", {"agent_name": "ask", "outcome": "completed"}),
+            ],
+        )
+        detail = derive_run_detail(_make_record(tmp_path))
+        statuses = {a.name: a.status for a in detail.agents}
+        assert statuses.get("ask") == "completed"
+
+    def test_is_at_gate_before_it_completes(self, tmp_path: Path) -> None:
+        """An unanswered question is *waiting on a person*, which is a
+        sharper statement than "running" and the only one the run-detail
+        screen makes now that it no longer repeats the gate prompt."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event(
+                    "workflow_started",
+                    {"workflow_name": "wf", "agents": [{"name": "ask", "type": "questions"}]},
+                ),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event("gate_presented", {"agent_name": "ask", "prompt": "Q?"}),
+            ],
+        )
+        detail = derive_run_detail(_make_record(tmp_path))
+        statuses = {a.name: a.status for a in detail.agents}
+        assert statuses.get("ask") == "at-gate"
+
+    def test_it_also_closes_the_current_step(self, tmp_path: Path) -> None:
+        """The Runs screen's current-step tracking reads the same set."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event("questions_completed", {"agent_name": "ask"}),
+            ],
+        )
+        summary = derive_run_summary(_make_record(tmp_path))
+        assert summary.current_step is None
+
+
+class TestDeclaredWorkflowName:
+    """A repo that stores each workflow as `<name>/workflow.yaml` made every
+    run show up as "workflow" on the Runs screen, while History (which reads
+    the log filename) showed the real name."""
+
+    def test_declared_name_wins_over_the_file_stem(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(path, [_event("workflow_started", {"name": "ship"})])
+        summary = derive_run_summary(_make_record(tmp_path, workflow_name="workflow"))
+        assert summary.workflow_name == "ship"
+
+    def test_falls_back_to_the_record_when_undeclared(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(path, [_event("agent_started", {"agent_name": "a"})])
+        summary = derive_run_summary(_make_record(tmp_path, workflow_name="from-record"))
+        assert summary.workflow_name == "from-record"
+
+
+class TestTopologySurvivesALongLog:
+    """`workflow_started` is the log's first event, so on any run long enough
+    to outgrow the tail window it is the one event guaranteed to be outside
+    it -- the step list disappeared exactly when a run got interesting."""
+
+    def test_topology_read_from_the_head_when_the_tail_misses_it(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        lines = [
+            _event(
+                "workflow_started",
+                {"workflow_name": "wf", "agents": [{"name": "first", "type": "agent"}]},
+            )
+        ]
+        # Push it well outside a deliberately tiny tail window.
+        lines += [
+            _event("agent_message", {"agent_name": "a", "text": "x" * 200}) for _ in range(80)
+        ]
+        _write_jsonl(path, lines)
+
+        summary = derive_run_summary(_make_record(tmp_path), tail_bytes=2048)
+        assert summary.topology is not None
+        assert [a.name for a in summary.topology.agents] == ["first"]

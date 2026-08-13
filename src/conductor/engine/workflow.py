@@ -1144,6 +1144,12 @@ class WorkflowEngine:
             ],
             **self._yaml_source_field(),
             "metadata": self.config.workflow.metadata,
+            # The values this run was launched with. Recorded so a reader
+            # coming to the log later can tell *which* run this was -- two
+            # runs of the same workflow are otherwise indistinguishable
+            # apart from their ids. No new exposure: the rendered prompts
+            # already in this log interpolate these same values.
+            "inputs": dict(self.context.workflow_inputs),
             "system": self._system_metadata,
             "run_id": self._run_id,
             "log_file": self._log_file,
@@ -3083,6 +3089,27 @@ class WorkflowEngine:
                 response = await self._resolve_human_prompt(gate_prompt)
             finally:
                 await self._resume_listener()
+
+            # Close the gate the emit above opened. A questions node reuses
+            # `gate_presented` (see the comment on that emit) but used to
+            # stop there, so every consumer of the event stream was left
+            # holding a gate that never closed -- a `human_gate` a few
+            # hundred lines below always paired the two. Any reader that
+            # tracks "is this run waiting on a human" by these events (the
+            # Fleet Manager's run summary, the dashboard) showed the run as
+            # parked at a question it had already answered, for the rest of
+            # the run.
+            self._emit(
+                "gate_resolved",
+                {
+                    "agent_name": agent.name,
+                    "selected_option": response.value,
+                    "route": "",
+                    "additional_input": response.additional_input,
+                    "prompt_id": gate_prompt.prompt_id,
+                    "step_type": "questions",
+                },
+            )
 
             if response.value == questions_mod.NAV_FINISH:
                 return questions_mod.OUTCOME_COMPLETED

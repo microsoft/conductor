@@ -19,7 +19,8 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from textual.widgets import DataTable, Static
+from textual.binding import Binding
+from textual.widgets import DataTable, Footer, Static
 
 from conductor.cli import pid as cli_pid
 from conductor.fleet.records import RunRecord, write_run_record
@@ -61,6 +62,25 @@ def fleet_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("conductor.cli.pid.pid_dir", lambda: legacy_dir)
 
     return home
+
+
+_BLOCK_RULE = "▏"
+"""The glyph Textual's ``vkey`` border paints -- the rule ``BlockFooter``
+draws between the row-scoped and fleet-scoped key blocks (and the same one
+Textual itself uses to fence off the docked command-palette key)."""
+
+
+def _rendered_footer(app: FleetApp) -> str:
+    """Return the footer as actually painted, for assertions about what a
+    user can see.
+
+    Reaches through the screen's compositor because that is the only place
+    the border glyphs exist: ``Footer`` is a container, so rendering the
+    widget alone yields nothing, and the marker class on a ``FooterKey``
+    says only that styling was *requested*, not that it landed.
+    """
+    strips = list(app.screen._compositor.render_strips())
+    return "".join(segment.text for segment in strips[-1])
 
 
 def _write_record(
@@ -363,7 +383,11 @@ class TestRunsScreenCursorPreservation:
             await asyncio.sleep(0.3)
             await pilot.pause()
 
-            assert table.get_row_at(table.cursor_row) == selected_row
+            # Compared on the workflow cell rather than the whole row: the
+            # Burn sparkline legitimately changes between polls (that is
+            # what it is for), so a whole-row comparison would assert the
+            # run is *static* rather than that it is still *selected*.
+            assert table.get_row_at(table.cursor_row)[0] == selected_row[0]
 
 
 # ---------------------------------------------------------------------------
@@ -559,19 +583,48 @@ class TestPreviewPane:
             await pilot.pause()
             assert app.screen.query_one("#preview-pane").display is False
 
-    async def test_shows_the_selected_run(self, fleet_env: Path, tmp_path: Path) -> None:
+    async def test_pid_and_port_are_columns_not_preview_text(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """PID and port moved into the table, so the preview no longer
+        restates them -- with one run the preview was near-identical to the
+        row it sat under."""
         _write_record(tmp_path, "aaaa0004", workflow_name="alpha", port=8410, mode="bg")
 
         app = FleetApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            pane = app.screen.query_one("#preview-pane")
-            assert pane.display is True
+            row = " ".join(str(c) for c in app.screen.query_one(DataTable).get_row_at(0))
+            assert "alpha" in row
+            assert str(os.getpid()) in row
+            assert "8410" in row
+
             text = str(app.screen.query_one("#run-preview", Static).render())
-            assert "alpha" in text
-            # Facts the one-line table row has no column for.
-            assert str(os.getpid()) in text
-            assert "8410" in text
+            assert str(os.getpid()) not in text
+            assert "8410" not in text
+
+    async def test_pane_is_shown_when_a_run_has_something_to_add(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The pane still appears for a run whose log carries a topology --
+        that (and an open gate) is all it now carries."""
+        log = tmp_path / "topo2.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event(
+                    "workflow_started",
+                    {"workflow_name": "wf", "agents": [{"name": "only", "type": "agent"}]},
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0009", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.query_one("#preview-pane").display is True
+            assert "only" in str(app.screen.query_one("#run-preview", Static).render())
 
     async def test_lists_the_workflow_topology(self, fleet_env: Path, tmp_path: Path) -> None:
         """Showing the run's steps is what makes the preview worth reading
@@ -630,3 +683,383 @@ class TestPreviewPane:
             text = str(app.screen.query_one("#run-preview", Static).render())
             assert "Approve the plan?" in text
             assert "approve" in text
+
+    async def test_gate_preview_offers_the_key_that_answers_it(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The pane's job is "a decision is waiting and this is the key that
+        takes it" -- not to be somewhere the whole prompt gets read."""
+        log = tmp_path / "gate.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event(
+                    "gate_presented",
+                    {
+                        "agent_name": "planner",
+                        "gate_id": "g1",
+                        "prompt": "Approve the plan?",
+                        "options": ["approve"],
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0016", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = str(app.screen.query_one("#run-preview", Static).render())
+            assert "to respond" in text
+
+    async def test_a_long_gate_prompt_is_clipped_and_says_so(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """A gate prompt is routinely hundreds of lines of markdown. Clipped
+        rather than scrollable -- a second focusable scroller under the table
+        would compete with it for the arrow keys."""
+        log = tmp_path / "gate.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event(
+                    "gate_presented",
+                    {
+                        "agent_name": "planner",
+                        "gate_id": "g1",
+                        "prompt": "\n".join(f"line {i}" for i in range(400)),
+                        "options": ["approve"],
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0017", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test(size=(100, 26)) as pilot:
+            await pilot.pause()
+            text = str(app.screen.query_one("#run-preview", Static).render())
+            assert "more lines" in text
+            # The call to action survives the clipping -- it is the point.
+            assert "to respond" in text
+            assert len(text.splitlines()) < 40
+
+    async def test_the_preview_pane_does_not_scroll(self, fleet_env: Path, tmp_path: Path) -> None:
+        log = tmp_path / "gate.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event(
+                    "gate_presented",
+                    {
+                        "agent_name": "planner",
+                        "gate_id": "g1",
+                        "prompt": "\n".join(f"line {i}" for i in range(400)),
+                        "options": ["approve"],
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0018", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test(size=(100, 26)) as pilot:
+            await pilot.pause()
+            pane = app.screen.query_one("#preview-pane")
+            assert not pane.allow_vertical_scroll
+
+
+class TestGateBindingVisibility:
+    """`g` is hidden unless the selected run is actually at a gate: most rows
+    never have one, and a permanently-visible key crowds a footer that
+    truncates rather than wraps."""
+
+    async def test_hidden_when_the_selected_run_has_no_gate(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "aaaa0010", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.check_action("resolve_gate", ()) is False
+
+    async def test_shown_when_the_selected_run_is_at_a_gate(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "gated.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event("gate_presented", {"agent_name": "planner", "prompt": "Approve?"}),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0011", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.check_action("resolve_gate", ()) is True
+
+    async def test_hidden_with_no_runs_at_all(self, fleet_env: Path) -> None:
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.check_action("resolve_gate", ()) is False
+
+    async def test_fleet_scoped_bindings_are_unaffected(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Navigation and whole-fleet keys never depend on a selection --
+        returning False for any of them would silently disable the rest of
+        the screen."""
+        _write_record(tmp_path, "aaaa0012", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for action in ("quit", "kill_all", "open_history", "open_new_run"):
+                assert app.screen.check_action(action, ()) is True
+
+    async def test_row_scoped_bindings_need_a_selected_run(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """With a run on the table the row keys are offered; they are the
+        keys that act on the highlighted run."""
+        _write_record(tmp_path, "aaaa0013", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for action in ("open_detail", "open_dashboard", "kill"):
+                assert app.screen.check_action(action, ()) is True
+
+    async def test_row_scoped_bindings_hide_on_an_empty_fleet(self, fleet_env: Path) -> None:
+        """An empty table has no run to act on, so every row-scoped key
+        retires -- the footer should not advertise `Kill` with nothing to
+        kill, and the reclaimed width is what lets `Detail` fit."""
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for action in ("open_detail", "open_dashboard", "kill", "resolve_gate"):
+                assert app.screen.check_action(action, ()) is False
+            # Fleet-scoped keys survive an empty fleet.
+            for action in ("quit", "open_history", "open_new_run"):
+                assert app.screen.check_action(action, ()) is True
+
+    async def test_kill_all_is_not_adjacent_to_kill(self) -> None:
+        """`K` is fleet-scoped and must not sit next to the single-run `k`,
+        which put "kill everything" one stray Shift away from "kill this
+        one". Also pins the two-block ordering the footer relies on, since
+        Textual renders BINDINGS in order and there is no separator widget.
+        """
+        keys = [b.key if isinstance(b, Binding) else b[0] for b in RunsScreen.BINDINGS]
+        assert keys.index("K") > keys.index("k") + 1
+
+        row_scoped = ["enter", "w", "k", "g"]
+        fleet_scoped = ["n", "p", "r", "h", "K", "q"]
+        assert keys == row_scoped + fleet_scoped
+
+    async def test_a_rule_is_drawn_between_the_two_blocks(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The block boundary must be *visible*, not merely ordered.
+
+        Ordering the bindings put each block together but every key renders
+        with identical styling and spacing, so the footer still read as one
+        undifferentiated run of nine keys. Asserting on the rendered line
+        rather than just the marker class is the point: the class was applied
+        correctly while nothing was painted.
+        """
+        _write_record(tmp_path, "aaaa0017", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            line = _rendered_footer(app)
+
+        assert "Kill  " in line and "n New" in line
+        between = line[line.index("k Kill") : line.index("n New")]
+        assert _BLOCK_RULE in between, f"no rule between the blocks: {line!r}"
+
+    async def test_no_leading_rule_on_an_empty_fleet(self, fleet_env: Path) -> None:
+        """With every row-scoped key hidden, `New` leads the footer -- a rule
+        hanging off it with nothing to its left reads as a rendering fault
+        rather than a grouping."""
+        app = FleetApp()
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            line = _rendered_footer(app)
+
+        assert line.lstrip().startswith("n New"), line
+        assert _BLOCK_RULE not in line[: line.index("n New")], line
+
+    async def test_footer_fits_without_truncation(self, fleet_env: Path, tmp_path: Path) -> None:
+        """Every visible footer key must fit inside the footer.
+
+        The footer is a single non-wrapping line: once the keys overrun it,
+        Textual clips the tail rather than wrapping, which is how `h History`
+        silently disappeared once already. Adding a binding (or lengthening a
+        description) should fail here instead of dropping `q Quit` off the
+        right-hand edge unnoticed.
+
+        Checked at 100 columns -- comfortably under the width the 12-column
+        runs table itself needs, so this is a floor on the footer, not an
+        assertion about the terminal anyone actually uses.
+        """
+        _write_record(tmp_path, "aaaa0016", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            footer = app.screen.query_one(Footer)
+            overflowing = [
+                (child.region.x, child.region.right, getattr(child, "description", "?"))
+                for child in footer.children
+                if child.display and child.region.right > footer.region.width
+            ]
+            assert not overflowing, f"footer keys clipped at 100 cols: {overflowing}"
+
+    async def test_detail_binding_survives_datatables_own_enter(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """`Detail` must actually reach the footer.
+
+        `DataTable` binds `enter` itself with `show=False` and, as the
+        focused widget, precedes the screen in the binding chain -- so
+        without `priority` its hidden binding shadows ours and the
+        drill-down silently vanishes from the footer while still working.
+        """
+        _write_record(tmp_path, "aaaa0015", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Detail" in shown
+            # And the two blocks stay contiguous in the rendered order.
+            assert shown.index("Kill") < shown.index("New")
+            assert shown.index("Kill all") > shown.index("History")
+
+    async def test_enter_pushes_exactly_one_detail_screen(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """`enter` is bound twice over -- DataTable's own hidden binding and
+        the screen's visible one -- so prove the two paths stay mutually
+        exclusive and don't stack two identical screens."""
+        _write_record(tmp_path, "aaaa0014", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(app.screen_stack) == before + 1
+
+
+class TestChainedGateResolution:
+    """A `questions` node asks one question per gate, so answering one opens
+    the next. Dismissing to the table after each answer turned a four-question
+    node into four separate `g` presses."""
+
+    async def test_next_question_is_presented_automatically(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.fleet.summary import GateInfo
+        from conductor.fleet.tui.actions import GateResolveOutcome
+
+        log = tmp_path / "q.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event("gate_presented", {"agent_name": "ask", "prompt": "Q1?", "options": ["a"]}),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0020", workflow_name="wf", event_log_path=str(log))
+
+        presented: list[str] = []
+
+        async def _fake_resolve(app, record, gate):
+            presented.append(gate.prompt)
+            return GateResolveOutcome(success=True, message="ok")
+
+        # Second question, then the node finishes.
+        follow_ups = [
+            GateInfo(agent_name="ask", prompt="Q2?", options=["a"], option_details=[]),
+            None,
+        ]
+
+        async def _fake_next(self, record, *, after, timeout=8.0):
+            return follow_ups.pop(0) if follow_ups else None
+
+        monkeypatch.setattr("conductor.fleet.tui.screens.runs.resolve_gate", _fake_resolve)
+        monkeypatch.setattr(RunsScreen, "_await_next_gate", _fake_next)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("g")
+            for _ in range(40):
+                await pilot.pause()
+                if len(presented) >= 2:
+                    break
+                await asyncio.sleep(0.05)
+
+        assert presented == ["Q1?", "Q2?"], (
+            "answering the first question must re-present the next one "
+            "instead of dropping back to the table"
+        )
+
+    async def test_cancelling_stops_the_chain(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Escape means "stop", not "ask me the next one"."""
+        log = tmp_path / "q2.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event("gate_presented", {"agent_name": "ask", "prompt": "Q1?", "options": ["a"]}),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0021", workflow_name="wf", event_log_path=str(log))
+
+        calls: list[str] = []
+
+        async def _fake_resolve(app, record, gate):
+            calls.append(gate.prompt)
+            return None  # cancelled
+
+        async def _fail_next(self, record, *, after, timeout=8.0):
+            raise AssertionError("must not wait for another gate after a cancel")
+
+        monkeypatch.setattr("conductor.fleet.tui.screens.runs.resolve_gate", _fake_resolve)
+        monkeypatch.setattr(RunsScreen, "_await_next_gate", _fail_next)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("g")
+            for _ in range(20):
+                await pilot.pause()
+                if calls:
+                    break
+                await asyncio.sleep(0.05)
+
+        assert calls == ["Q1?"]

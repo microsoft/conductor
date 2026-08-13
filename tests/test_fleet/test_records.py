@@ -1267,15 +1267,76 @@ class TestLegacyEventLogRecovery:
         )
         assert record.event_log_path == str(log)
 
-    def test_ambiguous_match_is_not_adopted(self, log_dir: Path) -> None:
+    def test_ambiguous_match_without_started_at_is_not_adopted(self, log_dir: Path) -> None:
         """Run ids are 8 hex chars and a resumed run reuses its predecessor's,
-        so one id can legitimately name several logs. Showing one run's
-        details against another's log is worse than showing none."""
+        so one id can legitimately name several logs. With nothing to
+        disambiguate on, showing one run's details against another's log is
+        worse than showing none."""
         for stem in ("alpha-20260812-100000", "beta-20260812-110000"):
             (log_dir / f"conductor-{stem}-293d3f34.events.jsonl").write_text("")
 
         record = RunRecord.from_dict(
             {"pid": 1, "port": 8080, "workflow": "/tmp/wf.yaml", "run_id": "293d3f34"}
+        )
+        assert record.event_log_path == ""
+
+    def test_started_at_disambiguates_a_crowded_id(self, log_dir: Path) -> None:
+        """The stamp in the filename is the one the record already carries.
+
+        This is not hypothetical: the test suite writes its own logs into the
+        very directory real runs use and pins run ids, so a live run's id
+        matched 21 files and the TUI blanked every derived column for it
+        while the right log sat on disk.
+        """
+        wanted = log_dir / "conductor-ship-20260812-183544-1764e163.events.jsonl"
+        wanted.write_text("")
+        for stem in ("test-20260812-190115", "multi-20260812-190037"):
+            (log_dir / f"conductor-{stem}-1764e163.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict(
+            {
+                "pid": 1,
+                "port": 8080,
+                "workflow": "/tmp/wf.yaml",
+                "run_id": "1764e163",
+                # The record stamps UTC; the filename stamps naive local
+                # time, so this only resolves if the two are reconciled.
+                "started_at": datetime(2026, 8, 12, 18, 35, 44).astimezone().isoformat(),
+            }
+        )
+        assert record.event_log_path == str(wanted)
+
+    def test_started_at_far_from_every_candidate_is_not_adopted(self, log_dir: Path) -> None:
+        """Outside the tolerance window nothing is claimed: a same-id log from
+        an unrelated run must not be adopted just for being closest."""
+        for stem in ("a-20260812-100000", "b-20260812-110000"):
+            (log_dir / f"conductor-{stem}-293d3f34.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict(
+            {
+                "pid": 1,
+                "port": 8080,
+                "workflow": "/tmp/wf.yaml",
+                "run_id": "293d3f34",
+                "started_at": datetime(2026, 8, 12, 18, 0, 0).astimezone().isoformat(),
+            }
+        )
+        assert record.event_log_path == ""
+
+    def test_equidistant_candidates_are_not_adopted(self, log_dir: Path) -> None:
+        """A tie is still ambiguous -- picking either would be a coin flip."""
+        # Exactly 60 seconds either side of the record's start time.
+        for stem in ("a-20260812-175900", "b-20260812-180100"):
+            (log_dir / f"conductor-{stem}-293d3f34.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict(
+            {
+                "pid": 1,
+                "port": 8080,
+                "workflow": "/tmp/wf.yaml",
+                "run_id": "293d3f34",
+                "started_at": datetime(2026, 8, 12, 18, 0, 0).astimezone().isoformat(),
+            }
         )
         assert record.event_log_path == ""
 

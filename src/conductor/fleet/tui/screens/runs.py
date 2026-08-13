@@ -14,20 +14,30 @@ Per the design's *Refresh model*, there is deliberately no file watcher.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import DataTable, Header, Static
 
 from conductor.console import styled
 from conductor.fleet.records import RunRecord, read_run_records
-from conductor.fleet.summary import RunSummary, RunTopology, derive_run_summary
+from conductor.fleet.summary import (
+    GateInfo,
+    RunSummary,
+    derive_run_summary,
+)
 from conductor.fleet.tui.actions import (
     GateResolveOutcome,
     dashboard_disabled_reason,
@@ -37,6 +47,16 @@ from conductor.fleet.tui.actions import (
     open_dashboard,
     resolve_gate,
 )
+from conductor.fleet.tui.anim import (
+    FRAME_INTERVAL,
+    animations_enabled,
+    breath_style,
+    progress_bar,
+    sparkline,
+    spinner,
+)
+from conductor.fleet.tui.art import EMPTY_STAGE
+from conductor.fleet.tui.dag import render_score, step_statuses
 from conductor.fleet.tui.notify import TransitionNotifier, emit_terminal_notification
 from conductor.fleet.tui.theme import (
     EMPTY,
@@ -46,6 +66,7 @@ from conductor.fleet.tui.theme import (
     status_badge,
     status_style,
 )
+from conductor.fleet.tui.widgets import BlockFooter
 
 if TYPE_CHECKING:
     # Guarded to avoid a runtime circular import: app.py imports RunsScreen
@@ -58,16 +79,40 @@ logger = logging.getLogger(__name__)
 # the History and run-detail screens, rather than the three overlapping
 # glyph maps these screens each used to define.
 
-_TOPOLOGY_PREVIEW_LIMIT = 12
-"""How many step names the preview pane lists before summarising the rest.
-The run-detail screen (``enter``) renders every one; this is a glance."""
+#: Statuses whose badge moves. Everything else is repainted only by the
+#: data poll, so a fleet of finished runs costs nothing to display.
+_ANIMATED_STATUSES = frozenset({"running", "at-gate"})
+
+#: Cells in the Burn sparkline. Sized to be readable in a table column
+#: without crowding the numeric columns either side of it.
+_BURN_WIDTH = 10
+
+#: How many lines the flowed progress view may occupy in the preview before
+#: the remaining steps are summarised. Run-detail renders all of them.
+_SCORE_MAX_LINES = 3
+
+#: Lines the gate section spends on things that are not prompt text: its
+#: heading, the truncation marker, the options line, and the "press g" hint.
+#: Subtracted from the pane's height to leave the prompt everything else.
+_GATE_CHROME_LINES = 4
+
+#: Horizontal padding the preview pane's CSS costs the content's usable width.
+_PREVIEW_PADDING = 4
+
+#: Vertical padding (top + bottom) the preview pane's CSS costs it.
+_PREVIEW_VERTICAL_PADDING = 2
+
+_NEXT_GATE_POLL_SECONDS = 0.4
+"""How often to re-read a run's log while waiting for its next question."""
 
 # Built here rather than at the call site so ``Text.from_markup`` receives a
 # string literal: the markup guard (rule C) cannot prove a *name* holds one,
 # and the point of that rule is that a non-literal may carry runtime data.
-_EMPTY_STATE_TEXT = Text.from_markup(
-    "[bold]No workflows are currently running.[/bold]\n\n"
-    "Launch one with  [cyan]conductor run <workflow.yaml> --web-bg[/cyan]\n"
+# The art is composed as `Text` rather than concatenated into the markup
+# string: `Text.from_markup` takes a literal only (markup guard rule C), and
+# a bracket in the art would otherwise be parsed as a style tag.
+_EMPTY_STATE_TEXT = Text(EMPTY_STAGE, style="dim cyan") + Text.from_markup(
+    "\nLaunch one with  [cyan]conductor run <workflow.yaml> --web-bg[/cyan]\n"
     "or press  [cyan]n[/cyan]  to start one from here.\n\n"
     "[dim]p providers · r registries · h history · q quit[/dim]"
 )
@@ -121,6 +166,39 @@ def _format_cost(summary: RunSummary) -> str:
     return f"~${summary.total_cost_usd:.2f}"
 
 
+def _started_cell(started_at: str | None) -> Text:
+    """Render a run's launch time as local ``HH:MM`` (or ``MM-DD HH:MM``).
+
+    Times are stored UTC and shown local: a fleet is read by the person
+    sitting at the machine, for whom "was this the run I kicked off before
+    lunch" is the actual question.
+    """
+    if not started_at:
+        return empty_cell()
+    try:
+        moment = datetime.fromisoformat(started_at).astimezone()
+    except (TypeError, ValueError):
+        return empty_cell()
+    now = datetime.now().astimezone()
+    if moment.date() == now.date():
+        return Text(moment.strftime("%H:%M"), style="dim")
+    return Text(moment.strftime("%m-%d %H:%M"), style="dim")
+
+
+def _directory_cell(cwd: str | None) -> Text:
+    """Render the directory conductor was launched from, home-shortened.
+
+    Two runs of the same workflow are otherwise indistinguishable in the
+    table; in practice they are usually the *same* workflow against
+    different checkouts, which is exactly what this column separates.
+    """
+    if not cwd:
+        return empty_cell()
+    home = str(Path.home())
+    shown = f"~{cwd[len(home) :]}" if cwd.startswith(home) else cwd
+    return Text(shown, style="dim")
+
+
 def _dim_if_empty(value: str) -> Text:
     """Render a formatted cell, dimming it when it is only a placeholder.
 
@@ -133,7 +211,29 @@ def _dim_if_empty(value: str) -> Text:
     return Text(value)
 
 
-def _workflow_cell(summary: RunSummary, record: RunRecord) -> Text:
+def _animated_badge(status: str, frame: int) -> Text:
+    """Render a status badge that *moves* while the run is live.
+
+    A fleet table refreshed every couple of seconds is otherwise
+    indistinguishable from a screenshot of itself, which is the specific
+    thing that makes a monitoring UI feel dead: the reader cannot tell
+    "three runs are working" from "three runs are wedged". Motion is spent
+    only on the two statuses where it means something -- a spinner for work
+    in progress, a slower pulse for a gate that is waiting on the reader --
+    and every other status keeps its static badge.
+    """
+    if not animations_enabled():
+        return status_badge(status)
+
+    style = status_style(status)
+    if status == "running":
+        return Text(spinner(frame), style=style.color or "")
+    if status == "at-gate":
+        return Text(style.badge, style=breath_style(frame, style.color))
+    return status_badge(status)
+
+
+def _workflow_cell(summary: RunSummary, record: RunRecord, frame: int = 0) -> Text:
     """Render the Workflow column's badge + name (D4, E13-T3).
 
     A ``mode == "fg"`` run at a gate (no HTTP channel to resolve it
@@ -147,12 +247,40 @@ def _workflow_cell(summary: RunSummary, record: RunRecord) -> Text:
     row rendered at one weight, leaving the workflow name (the thing being
     looked for) no more prominent than its own placeholder dashes.
     """
-    cell = status_badge(summary.status)
+    cell = _animated_badge(summary.status, frame)
     cell.append(" ")
     cell.append(summary.workflow_name, style="bold")
     if summary.status == "at-gate" and not summary.gate_resolvable:
         cell.append(f"  terminal · PID {record.pid}", style="dim")
     return cell
+
+
+#: Dollar thresholds at which a run's cost cell changes colour. A number
+#: that is merely *printed* does not register -- these runs reach tens of
+#: dollars, and the point of the column is to notice before it does.
+_COST_HEAT: tuple[tuple[float, str], ...] = (
+    (25.0, "bold red"),
+    (10.0, "red"),
+    (2.0, "yellow"),
+)
+
+
+def _cost_style(cost: float | None) -> str:
+    """Return the style for a run's cost, warming as it climbs."""
+    if cost is None:
+        return ""
+    for threshold, style in _COST_HEAT:
+        if cost >= threshold:
+            return style
+    return ""
+
+
+def _cost_cell(summary: RunSummary) -> Text:
+    """Render the cost cell, warmed by magnitude."""
+    text = _format_cost(summary)
+    if text == EMPTY:
+        return empty_cell()
+    return Text(text, style=_cost_style(summary.total_cost_usd))
 
 
 def _summary_bar_text(summaries: list[RunSummary]) -> Text:
@@ -196,7 +324,71 @@ def _summary_bar_text(summaries: list[RunSummary]) -> Text:
     return line
 
 
-def _preview_text(summary: RunSummary, record: RunRecord) -> Text:
+def _gate_section(gate: GateInfo, resolvable: bool, width: int, max_prompt_lines: int) -> Text:
+    """Render an open gate as a *summary plus a call to action*.
+
+    Deliberately clipped rather than scrollable. A gate prompt is routinely
+    hundreds of lines of markdown, and a scrollable preview answered the
+    wrong question twice over: it invited the reader to read the whole
+    prompt in a pane too small for it, and it put a second focusable
+    scroller under a table whose own arrow keys the reader was already
+    using. The pane's job is to say *a decision is waiting here and this is
+    the key that takes it* -- the full prompt belongs in the ``g`` modal,
+    which is built for it.
+
+    Clipped to a *measured* budget rather than a fixed line count: the pane
+    takes whatever height the table leaves it, so a fixed cap wasted a tall
+    terminal and overflowed a short one.
+
+    Args:
+        gate: The open gate.
+        resolvable: Whether ``g`` can answer it from here.
+        width: Available width in cells; longer lines are clipped.
+        max_prompt_lines: How many lines of the prompt to show.
+    """
+    out = Text()
+    out.append("Gate", style="bold yellow")
+    if gate.agent_name:
+        out.append(f"  {gate.agent_name}", style="dim")
+    out.append("\n")
+
+    lines = [line for line in gate.prompt.splitlines() if line.strip()]
+    shown = lines[: max(1, max_prompt_lines)]
+    for index, line in enumerate(shown):
+        if index:
+            out.append("\n")
+        clipped = line if len(line) <= width else line[: max(1, width - 1)] + "…"
+        out.append(clipped)
+    if len(lines) > len(shown):
+        out.append("\n")
+        out.append(f"… +{len(lines) - len(shown)} more lines", style="dim")
+
+    if gate.options:
+        out.append("\n")
+        out.append("Options: ", style="dim")
+        out.append(", ".join(gate.options))
+
+    out.append("\n")
+    if resolvable:
+        out.append("Press ", style="dim")
+        out.append("g", style="bold cyan")
+        out.append(" to respond", style="dim")
+    else:
+        out.append(
+            "This run has no dashboard — answer it in its own terminal.",
+            style="dim italic",
+        )
+    return out
+
+
+def _preview_text(
+    summary: RunSummary,
+    record: RunRecord,
+    *,
+    width: int = 100,
+    height: int = 12,
+    frame: int = 0,
+) -> Text:
     """Render the selected run's detail for the preview pane.
 
     The Runs table is deliberately one line per run, so everything that
@@ -206,56 +398,35 @@ def _preview_text(summary: RunSummary, record: RunRecord) -> Text:
     is what lets the home screen answer "what is this run doing" without a
     screen change.
     """
-    style = status_style(summary.status)
-    line = Text()
-    line.append_text(status_badge(summary.status))
-    line.append(" ")
-    line.append(summary.workflow_name, style="bold")
-    line.append("  ")
-    line.append(style.label, style=style.color)
-    line.append("  ·  ")
-    line.append_text(mode_label(summary.mode))
-    line.append(f"  ·  PID {record.pid}", style="dim")
-    if summary.port is not None:
-        line.append(f"  ·  :{summary.port}", style="dim")
-
-    facts: list[tuple[str, Text]] = [
-        ("step", Text(summary.current_step) if summary.current_step else empty_cell()),
-        ("elapsed", Text(_format_duration(summary.total_elapsed_seconds()))),
-        ("tokens", Text(_format_tokens(summary.total_tokens))),
-        ("cost", Text(_format_cost(summary))),
-    ]
-    second = Text()
-    for index, (label, value) in enumerate(facts):
-        if index:
-            second.append("   ", style="dim")
-        second.append(f"{label} ", style="dim")
-        second.append_text(value)
-
+    # Deliberately *not* a restatement of the row above: every column the
+    # table already carries (step, elapsed, tokens, cost, mode -- and now PID
+    # and port) is left out. What remains is the two things a one-line row
+    # cannot hold: an open gate's full prompt, and the shape of the workflow.
     out = Text()
-    out.append_text(line)
-    out.append("\n")
-    out.append_text(second)
+
+    # Built first so its height is known: the progress view is bounded
+    # (`_SCORE_MAX_LINES`) while the gate prompt is not, so the fixed
+    # section is measured and the variable one is given what remains.
+    progress = _progress_section(summary, width=width, frame=frame)
+    progress_lines = len(progress.plain.splitlines()) if progress.plain else 0
 
     gate = summary.gate
     if gate is not None:
-        out.append("\n\n")
-        out.append("Gate", style="bold yellow")
-        if gate.agent_name:
-            out.append(f"  {gate.agent_name}", style="dim")
-        out.append("\n")
-        out.append(gate.prompt)
-        if gate.options:
-            out.append("\n")
-            out.append("Options: ", style="dim")
-            out.append(", ".join(gate.options))
-        if not summary.gate_resolvable:
-            out.append("\n")
-            out.append(
-                "This run has no dashboard — answer it in its own terminal.",
-                style="dim italic",
-            )
+        budget = height - progress_lines - _GATE_CHROME_LINES
+        if progress_lines:
+            budget -= 1  # the blank line separating the two sections
+        out.append_text(_gate_section(gate, summary.gate_resolvable, width, max(1, budget)))
 
+    if progress.plain:
+        if gate is not None:
+            out.append("\n\n")
+        out.append_text(progress)
+    return out
+
+
+def _progress_section(summary: RunSummary, *, width: int, frame: int) -> Text:
+    """Render the run's position in its workflow, or empty if unknown."""
+    out = Text()
     topology = summary.topology
     if topology is not None and topology.agents:
         # The steps a run will take are already in its `workflow_started`
@@ -263,34 +434,24 @@ def _preview_text(summary: RunSummary, record: RunRecord) -> Text:
         # workflow (and where in it this run has got to) is what turns the
         # preview from a restatement of the row above it into a reason not
         # to drill in at all.
-        out.append("\n\n")
-        out.append("Steps", style="bold")
-        out.append(f"  {len(topology.agents)}", style="dim")
+        statuses = step_statuses([a.name for a in topology.agents], summary.current_step)
+        done = sum(1 for v in statuses.values() if v == "completed")
+
+        out.append("Progress", style="bold")
+        out.append(f"  {done}/{len(topology.agents)}  ", style="dim")
+        out.append_text(progress_bar(done, len(topology.agents)))
         out.append("\n")
-        out.append_text(_topology_line(topology, summary.current_step))
+        out.append_text(
+            render_score(
+                topology,
+                statuses,
+                width=width,
+                frame=frame,
+                animate=animations_enabled(),
+                max_lines=_SCORE_MAX_LINES,
+            )
+        )
     return out
-
-
-def _topology_line(topology: RunTopology, current_step: str | None) -> Text:
-    """Render a run's steps in order, marking the one it is on.
-
-    Truncated to a bounded number of names: a large workflow would
-    otherwise push everything else out of the pane, and the run-detail
-    screen (``enter``) is where the full list belongs.
-    """
-    line = Text()
-    shown = topology.agents[:_TOPOLOGY_PREVIEW_LIMIT]
-    for index, agent in enumerate(shown):
-        if index:
-            line.append(" → ", style="dim")
-        if agent.name == current_step:
-            line.append(agent.name, style="bold reverse")
-        else:
-            line.append(agent.name, style="dim")
-    remaining = len(topology.agents) - len(shown)
-    if remaining > 0:
-        line.append(f"  +{remaining} more", style="dim italic")
-    return line
 
 
 def _notification_message(summary: RunSummary) -> str:
@@ -334,24 +495,30 @@ class RunsScreen(Screen):
 
     RunsScreen #runs-table {
         /* auto (capped), not 1fr: a three-run fleet in a 1fr table left a
-           dozen blank rows between the last run and the pane below it. The
-           cap keeps a long fleet from pushing the preview off screen --
-           past it the table scrolls. */
+           dozen blank striped rows between the last run and the pane below
+           it. The cap keeps a long fleet from squeezing the preview -- past
+           it the table scrolls, and the preview keeps its share. */
         height: auto;
         max-height: 60%;
         padding: 0 1;
     }
 
     RunsScreen #preview-pane {
-        /* Takes whatever the table does not, so there is no dead band
-           between them. It resizes only when the *number* of runs changes,
-           never on a cursor move, so the preview does not jump around
-           under the arrow keys. */
+        /* Takes the remainder rather than hugging its content. With both
+           this and the table sized to their content, a short fleet in a
+           tall terminal left everything crammed against the top above a
+           screen of dead space -- and the thing worth spending that space
+           on is right here: the selected run's topology. The table is
+           capped rather than 1fr so a long fleet cannot squeeze this to
+           nothing, and `min-height` holds a floor when it is. */
         height: 1fr;
         min-height: 6;
         border-top: solid $primary 40%;
         padding: 1 2;
-        overflow-y: auto;
+        /* Not scrollable: every section here is line-bounded on purpose
+           (see `_gate_section`), and a focusable scroller under the table
+           would compete with it for the arrow keys. */
+        overflow: hidden hidden;
     }
     """
 
@@ -365,17 +532,45 @@ class RunsScreen(Screen):
     # longer wording ("Dashboard", "Resolve Gate") overflowed it, and an
     # overflowing footer does not wrap -- it truncates mid-word and drops
     # whatever came after, which is how `h History` disappeared entirely.
+    # The full set currently needs ~91 columns; `test_footer_fits_without_
+    # truncation` pins that, so adding a binding fails a test rather than
+    # silently dropping the last one off the edge again.
+    #
+    # Ordered in two blocks, because these keys are not one flat set: the
+    # first acts on whichever run the cursor is on, the second navigates the
+    # app or commands the whole fleet. Textual renders the footer in this
+    # order, so the ordering is what puts each block together -- and
+    # `BlockFooter` draws the rule between them, because ordering alone is
+    # invisible when every key has identical styling and spacing. `K` (kill
+    # *all*) sits in the fleet block despite pairing visually with `k`: it is
+    # fleet-scoped, and leaving the two adjacent put "kill everything" one
+    # stray Shift away from "kill this one".
     BINDINGS = [
-        ("q", "quit", "Quit"),
+        # Row-scoped -- operate on the highlighted run.
+        #
+        # `enter` must be `priority` to be seen at all: `DataTable` binds it
+        # itself (to `select_cursor`, `show=False`) and, as the focused
+        # widget, sits ahead of the screen in the binding chain -- so without
+        # priority its hidden binding shadows this one and the drill-down,
+        # the most-used action here, never appears in the footer.
+        Binding("enter", "open_detail", "Detail", priority=True),
         ("w", "open_dashboard", "Dash"),
         ("k", "kill", "Kill"),
-        ("K", "kill_all", "Kill all"),
         ("g", "resolve_gate", "Gate"),
+        # Fleet-scoped -- navigation and whole-fleet commands.
         ("n", "open_new_run", "New"),
         ("p", "open_providers", "Providers"),
         ("r", "open_registries", "Registries"),
         ("h", "open_history", "History"),
+        ("K", "kill_all", "Kill all"),
+        ("q", "quit", "Quit"),
     ]
+
+    _ROW_SCOPED_ACTIONS = frozenset({"open_detail", "open_dashboard", "kill"})
+    """Actions that need a highlighted run to mean anything. Hidden by
+    :meth:`check_action` while the table is empty. ``resolve_gate`` is
+    row-scoped too but has a stricter condition of its own, so it is
+    checked separately rather than listed here."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -392,6 +587,16 @@ class RunsScreen(Screen):
         (E13-T2) needs a selected row's ``gate``/``gate_resolvable``,
         which :attr:`_displayed_records` (plain ``RunRecord``\\ s) doesn't
         carry."""
+        self._frame = 0
+        """Animation clock, advanced by :meth:`_tick`. Every moving glyph on
+        this screen derives its appearance from this one number so they stay
+        in phase (see :mod:`conductor.fleet.tui.anim`)."""
+        self._burn_history: dict[str, deque[float]] = {}
+        """Per-row token-burn samples (tokens gained between polls), oldest
+        first, feeding the Burn sparkline."""
+        self._burn_totals: dict[str, float] = {}
+        """Last-seen cumulative token total per row, so the next poll can
+        take a delta from it."""
         self._notifier = TransitionNotifier()
         """Debounces gate-entry/failure notifications (E13-T4) so a poll
         re-read of a run that stays ``at-gate``/``failed`` across
@@ -454,15 +659,92 @@ class RunsScreen(Screen):
         yield DataTable(id="runs-table")
         yield Static(_EMPTY_STATE_TEXT, id="empty-state", classes="empty-state")
         yield Vertical(Static(id="run-preview"), id="preview-pane")
-        yield Footer()
+        yield BlockFooter(first_block_actions=self._ROW_SCOPED_ACTIONS | {"resolve_gate"})
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        table.add_columns("Workflow", "Step", "Elapsed", "On Step", "Tokens", "Cost", "Mode")
+        # The first key is kept because `_tick` repaints that column in
+        # place: `update_cell` addresses a column by key, not by index.
+        self._workflow_column, *_rest = table.add_columns(
+            "Workflow",
+            "Step",
+            "Elapsed",
+            "On Step",
+            "Tokens",
+            "Cost",
+            "Burn",
+            "Mode",
+            "PID",
+            "Port",
+            "Started",
+            "Directory",
+        )
         table.cursor_type = "row"
         table.zebra_stripes = True
         self.refresh_runs()
         self.set_interval(self.POLL_INTERVAL_SECONDS, self.refresh_runs)
+        if animations_enabled():
+            # A second, much faster timer driving *only* repaints of the
+            # cells that move. Deliberately not folded into the data poll:
+            # animation wants ~10fps and rescanning the run-record
+            # directory that often would be gratuitous I/O for the sake of
+            # a spinner.
+            self.set_interval(FRAME_INTERVAL, self._tick)
+
+    def _tick(self) -> None:
+        """Advance the animation clock and repaint only what moves.
+
+        Rebuilding the whole table at frame rate would fight the cursor and
+        the reader's scroll position, so this updates the animated cell of
+        each live row in place and re-renders the preview, which owns the
+        one other moving thing (the score's live step).
+        """
+        self._frame += 1
+        table = self.query_one(DataTable)
+        if not table.display:
+            return
+
+        for key, summary in self._displayed_summaries.items():
+            if summary.status not in _ANIMATED_STATUSES:
+                continue
+            record = self._displayed_records.get(key)
+            if record is None:
+                continue
+            try:
+                table.update_cell(
+                    key, self._workflow_column, _workflow_cell(summary, record, self._frame)
+                )
+            except Exception:  # noqa: BLE001 - a row can vanish mid-tick
+                logger.debug("Skipped animating row %s", key, exc_info=True)
+
+        self._update_gate_detail()
+
+    def _burn_cell(self, key: str) -> Text:
+        """Render this run's recent token-burn sparkline.
+
+        The Tokens column answers "how much has this cost so far"; it cannot
+        answer "is this run still doing anything", which on a long run is the
+        more urgent question. Sampling the delta between polls does -- a
+        stalled agent flatlines visibly while a busy one stays ragged.
+        """
+        history = self._burn_history.get(key)
+        if not history:
+            return empty_cell()
+        return Text(sparkline(list(history), width=_BURN_WIDTH), style="cyan")
+
+    def _sample_burn(self, key: str, summary: RunSummary) -> None:
+        """Record one token-burn sample for ``key``."""
+        total = float(summary.total_tokens or 0)
+        previous = self._burn_totals.get(key)
+        self._burn_totals[key] = total
+        if previous is None:
+            # The first sample of a run that has been going for an hour is
+            # its entire history, which would dwarf every later delta and
+            # flatten the rest of the sparkline to nothing.
+            return
+        self._burn_history.setdefault(key, deque(maxlen=_BURN_WIDTH)).append(
+            max(0.0, total - previous)
+        )
 
     def refresh_runs(self) -> None:
         """Rescan run records and repopulate the table (or show the empty state).
@@ -541,6 +823,7 @@ class RunsScreen(Screen):
             # would collide on this row key across two such records and
             # raise DuplicateKey -- fall back to a per-refresh unique key.
             key = summary.run_id or f"_no-run-id-{index}"
+            self._sample_burn(key, summary)
             try:
                 self._add_row(table, summary, record, key)
             except Exception:
@@ -583,8 +866,16 @@ class RunsScreen(Screen):
             _dim_if_empty(_format_duration(summary.total_elapsed_seconds())),
             _dim_if_empty(_format_duration(summary.elapsed_on_step_seconds())),
             _dim_if_empty(_format_tokens(summary.total_tokens)),
-            _dim_if_empty(_format_cost(summary)),
+            _cost_cell(summary),
+            self._burn_cell(key),
             mode_label(summary.mode),
+            # PID and port live in the table rather than only in the preview:
+            # they are per-run identity, so putting them here is what let the
+            # preview stop restating the row it was sitting under.
+            Text(str(record.pid), style="dim"),
+            Text(str(summary.port), style="dim") if summary.port is not None else empty_cell(),
+            _started_cell(summary.started_at),
+            _directory_cell(summary.cwd),
             key=key,
         )
 
@@ -646,10 +937,63 @@ class RunsScreen(Screen):
             # empty state's own launch hint.
             pane.display = False
             panel.update("")
+            self._refresh_row_bindings()
             return
 
         pane.display = True
-        panel.update(_preview_text(summary, record))
+        panel.update(
+            _preview_text(
+                summary,
+                record,
+                width=max(20, pane.size.width - _PREVIEW_PADDING),
+                height=max(4, pane.size.height - _PREVIEW_VERTICAL_PADDING),
+                frame=self._frame,
+            )
+        )
+        self._refresh_row_bindings()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide row-scoped bindings that the highlighted run can't support.
+
+        Textual consults this for every binding when it builds the footer.
+        Returning ``False`` hides a key outright rather than greying it out,
+        which keeps the single, non-wrapping footer line short enough to
+        survive (see the truncation note on :attr:`BINDINGS`).
+
+        Two conditions, both row-scoped:
+
+        - Every key in :attr:`_ROW_SCOPED_ACTIONS` needs a highlighted run,
+          so all of them disappear while the fleet is empty — the footer then
+          advertises only what an empty table can actually do.
+        - ``g`` additionally needs that run to be *at* a gate. A gate is the
+          exception rather than the norm, so a permanently-visible "Gate" key
+          would be noise even when a row is selected.
+
+        Deliberately *not* conditional: ``w`` on a portless (``mode == "fg"``)
+        run. A dashboard is the norm, so hiding it per-row would make the key
+        flicker as the cursor moves; ``action_open_dashboard`` explains the
+        specific reason in a notification instead.
+
+        Fleet-scoped actions (navigation, ``K``, ``q``) return ``True``
+        unchanged — they never depend on a selection.
+        """
+        if action == "resolve_gate":
+            summary = self._selected_summary()
+            return summary is not None and summary.gate is not None
+        if action in self._ROW_SCOPED_ACTIONS:
+            return self._selected_key() is not None
+        return True
+
+    def _refresh_row_bindings(self) -> None:
+        """Ask Textual to re-evaluate the footer after the selection moves.
+
+        ``check_action`` is only consulted when bindings are refreshed, so a
+        gate opening or closing between polls — or the last run in the fleet
+        exiting, which retires every row-scoped key at once — would otherwise
+        leave the footer showing yesterday's answer until some other event
+        forced a redraw.
+        """
+        self.refresh_bindings()
 
     def _update_summary_bar(self, summaries: list[RunSummary]) -> None:
         """Refresh the fleet-wide counts/totals line above the table."""
@@ -676,6 +1020,25 @@ class RunsScreen(Screen):
         key = event.row_key.value
         if key is None:
             return
+        self._push_detail_for(key)
+
+    def action_open_detail(self) -> None:
+        """Open the highlighted run's detail screen -- the ``enter`` binding.
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_push_detail_for`, and since keyboard and mouse take exactly
+        one path each, ``enter`` cannot push two screens.
+        """
+        key = self._selected_key()
+        if key is None:
+            return
+        self._push_detail_for(key)
+
+    def _push_detail_for(self, key: str) -> None:
+        """Push the run-detail screen for ``key``, if it still resolves."""
         record = self._displayed_records.get(key)
         if record is None:
             return
@@ -787,14 +1150,56 @@ class RunsScreen(Screen):
 
         self._resolving_gate = True
         try:
-            outcome: GateResolveOutcome | None = await resolve_gate(self.app, record, summary.gate)
+            gate = summary.gate
+            while True:
+                outcome: GateResolveOutcome | None = await resolve_gate(self.app, record, gate)
+                if outcome is None:
+                    self.notify("Gate resolution cancelled.", severity="warning")
+                    return
+                if not outcome.success:
+                    self.notify(f"Gate resolution failed: {outcome.message}", severity="error")
+                    return
+
+                self.notify(outcome.message)
+
+                # A `questions` node asks one question per gate, so answering
+                # one immediately opens the next. Dismissing back to the table
+                # and making the user press `g` again for every question turned
+                # a four-question node into four round trips. Re-present as
+                # long as the run keeps asking; anything else (the run moves
+                # on, the gate closes) falls out of the loop.
+                gate = await self._await_next_gate(record, after=gate)
+                if gate is None:
+                    return
         finally:
             self._resolving_gate = False
-        if outcome is None:
-            self.notify("Gate resolution cancelled.", severity="warning")
-            return
-        if outcome.success:
-            self.notify(outcome.message)
-        else:
-            self.notify(f"Gate resolution failed: {outcome.message}", severity="error")
-        self.refresh_runs()
+            self.refresh_runs()
+
+    async def _await_next_gate(
+        self, record: RunRecord, *, after: GateInfo, timeout: float = 8.0
+    ) -> GateInfo | None:
+        """Wait briefly for the run to present a *different* gate.
+
+        Returns the new gate, or ``None`` if the run stopped asking (or the
+        wait timed out). Bounded because a run that has genuinely moved on
+        never presents another gate, and an unbounded wait would hold the
+        resolve guard -- and the user -- indefinitely.
+
+        Compared on prompt rather than agent name: a questions node presents
+        every question under the same name, so the name alone cannot tell a
+        new question from the one just answered.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_NEXT_GATE_POLL_SECONDS)
+            try:
+                summary = derive_run_summary(record)
+            except Exception:
+                logger.warning("Failed to re-read run summary after a gate", exc_info=True)
+                return None
+            gate = summary.gate
+            if gate is None:
+                return None
+            if gate.prompt != after.prompt or gate.options != after.options:
+                return gate
+        return None

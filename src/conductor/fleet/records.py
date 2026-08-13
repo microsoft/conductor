@@ -41,6 +41,7 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,16 @@ _VALID_MODES = frozenset({"fg", "fg-web", "bg"})
 # both ``..`` traversal and a value like ``"foo/../../etc"``; ``/`` and
 # ``\`` are excluded outright, which rules out absolute paths and separators.
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+
+# The ``YYYYMMDD-HHMMSS`` stamp `EventLogSubscriber` puts in a log's name,
+# anchored to the ``-<run_id>.events.jsonl`` tail so a workflow name that
+# happens to contain digits cannot be mistaken for it.
+_LOG_STEM_TIMESTAMP_RE = re.compile(r"-(\d{8}-\d{6})-[^-]+\.events\.jsonl$")
+
+# How far a candidate log's start time may sit from the record's before it
+# stops being considered the same run. The child writes its log moments
+# after the parent stamps the record, so this only has to absorb startup.
+_LOG_MATCH_TOLERANCE_SECONDS = 120.0
 
 
 def is_valid_run_id(run_id: str) -> bool:
@@ -346,7 +357,9 @@ class RunRecord:
             # It does record the run id, and the log's filename ends in it,
             # so the pairing is recoverable -- see `find_event_log_for_run`
             # for why this only ever adopts an unambiguous match.
-            recovered = find_event_log_for_run(run_id)
+            recovered = find_event_log_for_run(
+                run_id, _coerce_optional_str(data.get("started_at"), "started_at")
+            )
             if recovered is not None:
                 event_log_path = str(recovered)
 
@@ -724,8 +737,54 @@ def _read_and_prune(files: list[Path], *, require_run_id_match: bool = False) ->
     return results
 
 
-def find_event_log_for_run(run_id: str) -> Path | None:
-    """Locate the event log belonging to ``run_id``, if it is unambiguous.
+def _log_stem_timestamp(path: Path) -> datetime | None:
+    """Extract the ``YYYYMMDD-HHMMSS`` start time from an event log's name.
+
+    ``EventLogSubscriber`` formats that stamp with a naive ``datetime.now()``,
+    so the value read back here is naive local time and is compared as such.
+
+    Args:
+        path: The candidate event log path.
+
+    Returns:
+        The parsed local start time, or ``None`` if the name does not carry
+        one in the expected position.
+    """
+    m = _LOG_STEM_TIMESTAMP_RE.search(path.name)
+    if m is None:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+
+
+def _started_at_as_local_naive(started_at: str | None) -> datetime | None:
+    """Parse a record's ``started_at`` into naive local time.
+
+    Event log names carry a naive *local* stamp while ``started_at`` is
+    written as an aware UTC timestamp, so the two are only comparable once
+    the latter is converted and flattened.
+
+    Args:
+        started_at: ISO 8601 timestamp from a run record, or ``None``.
+
+    Returns:
+        The equivalent naive local ``datetime``, or ``None`` if unparseable.
+    """
+    if not started_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(started_at)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def find_event_log_for_run(run_id: str, started_at: str | None = None) -> Path | None:
+    """Locate the event log belonging to ``run_id``.
 
     ``EventLogSubscriber`` names its file
     ``conductor-<workflow>-<timestamp>-<run_id>.events.jsonl``, so a run id
@@ -735,19 +794,28 @@ def find_event_log_for_run(run_id: str) -> Path | None:
     shows up in the TUI with every derived column blank -- current step,
     tokens, cost, topology -- while its log sits on disk beside it.
 
-    **Only an unambiguous match is adopted.** Run ids are short (8 hex
-    chars) and a resumed run deliberately reuses its predecessor's id, so
-    the same id can legitimately name several logs; a test suite that pins
-    an id produces dozens. Showing one run's details against another run's
-    log would be worse than showing none, so anything other than exactly
-    one candidate returns ``None``.
+    Run ids are short (8 hex chars) and a resumed run deliberately reuses
+    its predecessor's, so one id can legitimately name several logs — and a
+    test suite that pins an id produces dozens in the very same directory a
+    real run writes to. Adopting the wrong one would show a run's details
+    against another run's log, which is worse than showing none.
+
+    ``started_at`` is what resolves that safely rather than giving up: the
+    same stamp the filename carries is already in the record, so a candidate
+    is only adopted when its embedded start time is the single nearest one
+    within :data:`_LOG_MATCH_TOLERANCE_SECONDS` of it. Ambiguity that
+    survives that — no ``started_at``, nothing inside the window, or two
+    candidates equidistant — still returns ``None``.
 
     Args:
         run_id: The run identifier to search for.
+        started_at: The record's ISO 8601 start time, used to disambiguate
+            when the id alone matches more than one log.
 
     Returns:
-        The single matching log's path, or ``None`` when there is no match,
-        more than one, or the directory cannot be listed.
+        The matching log's path, or ``None`` when there is no match, the
+        match cannot be resolved unambiguously, or the directory cannot be
+        listed.
     """
     if not run_id:
         return None
@@ -761,13 +829,48 @@ def find_event_log_for_run(run_id: str) -> Path | None:
         logger.debug("Could not scan for an event log for run_id=%s", run_id, exc_info=True)
         return None
 
-    if len(matches) != 1:
-        if matches:
-            logger.debug(
-                "Not adopting an event log for run_id=%s: %d candidates", run_id, len(matches)
-            )
+    if not matches:
         return None
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+
+    target = _started_at_as_local_naive(started_at)
+    if target is None:
+        logger.debug(
+            "Not adopting an event log for run_id=%s: %d candidates and no usable started_at",
+            run_id,
+            len(matches),
+        )
+        return None
+
+    scored: list[tuple[float, Path]] = []
+    for candidate in matches:
+        stamp = _log_stem_timestamp(candidate)
+        if stamp is None:
+            continue
+        delta = abs((stamp - target).total_seconds())
+        if delta <= _LOG_MATCH_TOLERANCE_SECONDS:
+            scored.append((delta, candidate))
+
+    if not scored:
+        logger.debug(
+            "Not adopting an event log for run_id=%s: none of %d candidates started near %s",
+            run_id,
+            len(matches),
+            started_at,
+        )
+        return None
+
+    scored.sort(key=lambda pair: pair[0])
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        logger.debug(
+            "Not adopting an event log for run_id=%s: %d candidates tie at %.0fs from start",
+            run_id,
+            len(scored),
+            scored[0][0],
+        )
+        return None
+    return scored[0][1]
 
 
 def scan_run_records() -> list[RunRecord]:

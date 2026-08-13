@@ -755,3 +755,83 @@ class TestDashboardOnWsl:
         ):
             assert tui_actions.open_url("http://x") is True
         mock_open.assert_called_once_with("http://x")
+
+
+class TestGateModalScrolling:
+    """A real gate prompt (a plan-approval gate carries the whole plan) is
+    routinely longer than the terminal is tall. The modal used to be
+    `height: auto`, so it grew past the screen and took its own option list
+    off the bottom with it."""
+
+    def _long_gate(self):
+        from conductor.fleet.summary import GateInfo
+
+        return GateInfo(
+            agent_name="plan_approval",
+            prompt="\n".join(f"plan line {i}" for i in range(400)),
+            options=["approve", "abort"],
+            option_details=[],
+        )
+
+    async def test_options_stay_on_screen_with_a_long_prompt(self, fleet_env: Path) -> None:
+        from textual.widgets import OptionList
+
+        from conductor.fleet.tui.actions import GateOptionsModal
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(GateOptionsModal(self._long_gate()))
+            await pilot.pause()
+
+            option_list = app.screen.query_one(OptionList)
+            screen_height = app.screen.size.height
+            assert option_list.region.y + option_list.region.height <= screen_height, (
+                "the option list must stay within the screen -- an auto-sized "
+                "modal pushed it off the bottom"
+            )
+
+    async def test_option_list_holds_focus_not_the_scroller(self, fleet_env: Path) -> None:
+        """A scroll container is focusable by default and would otherwise take
+        arrows and Enter away from the choices."""
+        from textual.widgets import OptionList
+
+        from conductor.fleet.tui.actions import GateOptionsModal
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(GateOptionsModal(self._long_gate()))
+            await pilot.pause()
+            assert isinstance(app.screen.focused, OptionList)
+
+    async def test_ctrl_down_scrolls_the_prompt(self, fleet_env: Path) -> None:
+        from textual.containers import VerticalScroll
+
+        from conductor.fleet.tui.actions import GateOptionsModal
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(GateOptionsModal(self._long_gate()))
+            await pilot.pause()
+
+            scroller = app.screen.query_one("#gate-prompt-scroll", VerticalScroll)
+            assert scroller.scroll_offset.y == 0
+            await pilot.press("ctrl+down")
+            await pilot.pause()
+            assert scroller.scroll_offset.y > 0, "ctrl+down must scroll the prompt"
+
+    async def test_page_binding_scrolls_further_than_a_line(self, fleet_env: Path) -> None:
+        """Not pageup/pagedown: the focused OptionList binds those for option
+        navigation, so a screen-level binding for them never fires."""
+        from textual.containers import VerticalScroll
+
+        from conductor.fleet.tui.actions import GateOptionsModal
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(GateOptionsModal(self._long_gate()))
+            await pilot.pause()
+
+            scroller = app.screen.query_one("#gate-prompt-scroll", VerticalScroll)
+            await pilot.press("ctrl+shift+down")
+            await pilot.pause()
+            assert scroller.scroll_offset.y > 1
