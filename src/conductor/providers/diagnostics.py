@@ -149,6 +149,14 @@ class ModelDiagnostic:
     max_prompt_tokens: int | None = None
     max_output_tokens: int | None = None
     max_context_window_tokens: int | None = None
+    input_per_mtok: float | None = None
+    output_per_mtok: float | None = None
+    pricing_source: str | None = None
+    """How ``input_per_mtok``/``output_per_mtok`` were resolved (see #386):
+    ``"provider"`` (live :meth:`~conductor.providers.base.AgentProvider.get_model_pricing`
+    hook), ``"table"`` (static ``DEFAULT_PRICING`` fallback), ``"none"``
+    (genuinely unpriced), or ``None`` (pricing resolution itself failed —
+    distinct from the determined ``"none"``)."""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation."""
@@ -159,6 +167,9 @@ class ModelDiagnostic:
             "max_prompt_tokens": self.max_prompt_tokens,
             "max_output_tokens": self.max_output_tokens,
             "max_context_window_tokens": self.max_context_window_tokens,
+            "input_per_mtok": self.input_per_mtok,
+            "output_per_mtok": self.output_per_mtok,
+            "pricing_source": self.pricing_source,
         }
 
 
@@ -417,6 +428,44 @@ def gather_registries() -> RegistryDiagnostic:
     return RegistryDiagnostic(default=config.default, registries=registries)
 
 
+async def _resolve_model_pricing(
+    provider: Any, model_id: str
+) -> tuple[float | None, float | None, str | None]:
+    """Resolve a model's per-Mtok rates and where they came from (never raises).
+
+    Mirrors the cost-resolution chain in ``engine/pricing.py::get_pricing``
+    (workflow override → provider hook → ``DEFAULT_PRICING`` → ``None``),
+    minus the workflow override — ``doctor`` has no workflow context.
+
+    Note ``get_pricing`` may resolve via its versioned-suffix fuzzy path and
+    log a one-time warning (see #137); ``doctor`` already runs the whole
+    gather inside ``_suppressed_logging`` (``cli/doctor.py``), and the
+    process is short-lived, so the module-level fuzzy-match latch cannot
+    leak into a workflow run.
+
+    Returns:
+        A ``(input_per_mtok, output_per_mtok, source)`` tuple. ``source`` is
+        ``"provider"``, ``"table"``, or ``"none"`` when resolution completed
+        (with rates ``None`` in the ``"none"`` case), or ``None`` when
+        resolution itself failed — distinct from the determined ``"none"``.
+    """
+    try:
+        from conductor.engine.pricing import get_pricing
+
+        provider_pricing = await provider.get_model_pricing(model_id)
+        if provider_pricing is not None:
+            return provider_pricing.input_per_mtok, provider_pricing.output_per_mtok, "provider"
+
+        table_pricing = get_pricing(model_id)
+        if table_pricing is not None:
+            return table_pricing.input_per_mtok, table_pricing.output_per_mtok, "table"
+
+        return None, None, "none"
+    except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+        logger.debug("Failed to resolve pricing for %r: %s", model_id, e)
+        return None, None, None
+
+
 async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[ModelDiagnostic]:
     """Build a :class:`ModelDiagnostic` per model id (never raises).
 
@@ -430,6 +479,10 @@ async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[
     ``ModelCapabilityInfo`` (or ``None``) must degrade only that one model,
     not raise out of the loop and silently discard every already-built
     entry for models processed earlier in this same list.
+
+    Pricing (see #386) is resolved independently via :func:`_resolve_model_pricing`
+    for every model, including one whose capabilities call failed — a
+    degraded capabilities row still gets its pricing columns.
     """
     result: list[ModelDiagnostic] = []
     for model_id in model_ids:
@@ -441,10 +494,32 @@ async def _build_model_diagnostics(provider: Any, model_ids: list[str]) -> list[
             # whose return value lacks to_dict() (or isn't None) is caught
             # below and degrades to id-only, same as any other failure.
             fields = caps.to_dict() if caps is not None else {}
-            result.append(ModelDiagnostic(id=model_id, **fields))
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to get model capabilities for %r: %s", model_id, e)
-            result.append(ModelDiagnostic(id=model_id))
+            fields = None
+
+        input_per_mtok, output_per_mtok, pricing_source = await _resolve_model_pricing(
+            provider, model_id
+        )
+        if fields is None:
+            result.append(
+                ModelDiagnostic(
+                    id=model_id,
+                    input_per_mtok=input_per_mtok,
+                    output_per_mtok=output_per_mtok,
+                    pricing_source=pricing_source,
+                )
+            )
+        else:
+            result.append(
+                ModelDiagnostic(
+                    id=model_id,
+                    input_per_mtok=input_per_mtok,
+                    output_per_mtok=output_per_mtok,
+                    pricing_source=pricing_source,
+                    **fields,
+                )
+            )
     return result
 
 

@@ -196,6 +196,54 @@ class TestGetPricing:
         assert pricing.output_per_mtok == output_per_mtok
 
 
+class TestGpt56Pricing:
+    """Tests for the GPT-5.6 pricing entries added in #386."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self) -> None:
+        """Clear the per-process warning de-dupe set between tests."""
+        from conductor.engine.pricing import _FUZZY_MATCH_WARNED
+
+        _FUZZY_MATCH_WARNED.clear()
+
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+    def test_gpt_56_variants_priced_at_family_rate(self, model: str) -> None:
+        """Each GPT-5.6 id resolves via an exact key at the GPT-5.x family rate."""
+        pricing = get_pricing(model)
+        assert pricing is not None
+        assert pricing.input_per_mtok == 2.00
+        assert pricing.output_per_mtok == 8.00
+
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+    def test_gpt_56_variants_do_not_fuzzy_warn(
+        self, model: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Exact keys resolve silently — pins the "explicit ids, not a prefix
+        key" decision so a later well-meaning `gpt-5.6` prefix key cannot
+        reintroduce a fuzzy-match warning for these ids without a test
+        failure calling it out."""
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            get_pricing(model)
+        assert caplog.records == []
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "grok-4.5",
+            "gemini-3.6-flash",
+            "mai-code-1.1-flash",
+            "mai-code-1-flash-picker",
+        ],
+    )
+    def test_unconfirmed_models_remain_unpriced(self, model: str) -> None:
+        """These ids are deliberately absent pending a published rate (#386).
+
+        Load-bearing regression guard: it stops a later fuzzy key silently
+        inventing rates for them.
+        """
+        assert get_pricing(model) is None
+
+
 class TestFuzzyMatchWarnings:
     """Tests for the fuzzy-match warning behavior (#137)."""
 

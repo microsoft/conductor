@@ -325,13 +325,44 @@ def _default_effort_cell(model: ModelDiagnostic) -> Text:
     return Text(model.default_reasoning_effort)
 
 
+_PRICING_SOURCE_CELLS: dict[str, Text] = {
+    "provider": Text.from_markup("[green]provider[/green]"),
+    "table": Text.from_markup("[dim]table[/dim]"),
+    "none": Text.from_markup("[red]none[/red]"),
+}
+"""Pre-built cells for each :attr:`ModelDiagnostic.pricing_source` literal
+(issue #386). Built as module-level constants rather than interpolated at
+render time — no runtime value ever reaches the markup parser, keeping this
+inside the repo's console rules (see AGENTS.md "Console Output")."""
+
+
+def _rate_cell(value: float | None) -> Text:
+    """Format a per-Mtok rate, or ``—`` when unknown.
+
+    Deliberately never renders ``0.00`` for ``None`` — a zero would read as
+    "free", which is exactly the silent-wrong-number class of bug issue
+    #386 is about.
+    """
+    if value is None:
+        return _DASH
+    return Text(f"{value:,.2f}")
+
+
+def _pricing_source_cell(model: ModelDiagnostic) -> Text:
+    """Format the pricing-source cell (``provider`` / ``table`` / ``none`` / ``—``)."""
+    if model.pricing_source is None:
+        return _DASH
+    return _PRICING_SOURCE_CELLS.get(model.pricing_source, Text(model.pricing_source))
+
+
 def _render_models(providers: list[ProviderDiagnostic], console: Console) -> None:
     """Render a per-provider Models detail table (``--models`` only).
 
     One table per provider that returned at least one model, with columns
-    for reasoning-effort support and prompt/output/context token limits.
-    Providers with no models (``None``/empty/error) are already summarized
-    in the Providers table and are skipped here — there is nothing to detail.
+    for reasoning-effort support, prompt/output/context token limits, and
+    per-Mtok pricing plus its source (issue #386). Providers with no models
+    (``None``/empty/error) are already summarized in the Providers table and
+    are skipped here — there is nothing to detail.
     """
     for diag in providers:
         if not diag.models:
@@ -343,6 +374,9 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
         table.add_column("Prompt", justify="right")
         table.add_column("Output", justify="right")
         table.add_column("Context", justify="right")
+        table.add_column("Input $/Mtok", justify="right")
+        table.add_column("Output $/Mtok", justify="right")
+        table.add_column("Pricing")
 
         for model in diag.models:
             table.add_row(
@@ -352,6 +386,9 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
                 _format_tokens(model.max_prompt_tokens),
                 _format_tokens(model.max_output_tokens),
                 _format_tokens(model.max_context_window_tokens),
+                _rate_cell(model.input_per_mtok),
+                _rate_cell(model.output_per_mtok),
+                _pricing_source_cell(model),
             )
 
         console.print(table)

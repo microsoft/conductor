@@ -590,7 +590,117 @@ class TestDoctorFlags:
             "max_prompt_tokens": 128_000,
             "max_output_tokens": 64_000,
             "max_context_window_tokens": 192_000,
+            "input_per_mtok": None,
+            "output_per_mtok": None,
+            "pricing_source": None,
         }
+
+
+class TestDoctorModelsPricing:
+    """Tests for the pricing columns added to the Models detail table (#386)."""
+
+    def test_pricing_columns_render_in_detail_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="gpt-4o",
+                            input_per_mtok=2.50,
+                            output_per_mtok=10.00,
+                            pricing_source="table",
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "gpt-4o" in line]
+        assert model_lines, "model row not found in output"
+        assert "2.50" in model_lines[0]
+        assert "10.00" in model_lines[0]
+        assert "table" in model_lines[0]
+
+    def test_provider_source_renders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="gpt-5.6-sol",
+                            input_per_mtok=2.00,
+                            output_per_mtok=8.00,
+                            pricing_source="provider",
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "gpt-5.6-sol" in line]
+        assert model_lines, "model row not found in output"
+        assert "provider" in model_lines[0]
+
+    def test_unpriced_model_renders_dash_not_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unpriced model must render `—`, never `0.00` — a zero would
+        read as "free", the exact silent-wrong-number bug #386 is about."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[ModelDiagnostic(id="grok-4.5", pricing_source="none")],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        monkeypatch.setattr(_app_module, "output_console", Console(width=200))
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        model_lines = [line for line in result.output.splitlines() if "grok-4.5" in line]
+        assert model_lines, "model row not found in output"
+        assert "0.00" not in model_lines[0]
+        assert "none" in model_lines[0]
+
+    def test_json_includes_pricing_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    checked=True,
+                    connection_ok=True,
+                    models=[
+                        ModelDiagnostic(
+                            id="gpt-4o",
+                            input_per_mtok=2.50,
+                            output_per_mtok=10.00,
+                            pricing_source="table",
+                        )
+                    ],
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        model = data["providers"][0]["models"][0]
+        assert model["input_per_mtok"] == 2.50
+        assert model["output_per_mtok"] == 10.00
+        assert model["pricing_source"] == "table"
 
 
 # ---------------------------------------------------------------------------

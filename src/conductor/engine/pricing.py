@@ -118,6 +118,12 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.4-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
     "gpt-5-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
+    # GPT-5.6 variants priced at the existing GPT-5.x family rate (#386). Grok,
+    # Gemini-3.6, and the MAI-Code ids are deliberately absent pending a
+    # published rate — do not "complete" this set by guessing.
+    "gpt-5.6-sol": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-5.6-terra": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-5.6-luna": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     # O-series
     "o1": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
     "o1-mini": ModelPricing(input_per_mtok=3.00, output_per_mtok=12.00),

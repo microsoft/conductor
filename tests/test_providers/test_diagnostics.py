@@ -257,6 +257,7 @@ def _fake_provider(
     models: list[str] | None = None,
     models_error: Exception | None = None,
     capabilities: dict[str, Any] | None = None,
+    pricing: dict[str, Any] | Exception | None = None,
 ) -> Any:
     """Build an AsyncMock provider for check/model probes.
 
@@ -264,6 +265,11 @@ def _fake_provider(
     (or ``None``) returned by ``get_model_capabilities`` for that id. Ids not
     present in the mapping (or when ``capabilities`` is omitted) resolve to
     ``None``, matching the base-hook default.
+
+    ``pricing`` maps model id -> a ``ModelPricing``-like object (or ``None``)
+    returned by ``get_model_pricing`` for that id (issue #386); omitted ids
+    resolve to ``None``, matching the base-hook default. Pass an
+    ``Exception`` instance to make every call raise it.
     """
     provider = AsyncMock()
     if validate_error is not None:
@@ -277,6 +283,11 @@ def _fake_provider(
     provider.close.return_value = None
     caps_map = capabilities or {}
     provider.get_model_capabilities.side_effect = lambda model_id: caps_map.get(model_id)
+    if isinstance(pricing, Exception):
+        provider.get_model_pricing.side_effect = pricing
+    else:
+        pricing_map = pricing or {}
+        provider.get_model_pricing.side_effect = lambda model_id: pricing_map.get(model_id)
     return provider
 
 
@@ -492,6 +503,129 @@ class TestGatherProviderCheck:
         assert [m.id for m in diag.models] == ["gpt-5", "gpt-4"]
         by_id = {m.id: m for m in diag.models}
         assert by_id["gpt-4"].supported_reasoning_efforts is None
+
+
+class TestModelPricingDiagnostics:
+    """Tests for per-model pricing resolution in ``--models`` (issue #386)."""
+
+    async def test_provider_hook_wins_over_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The provider hook beats DEFAULT_PRICING, proven with a model id
+        that is also in the static table at a different rate."""
+        from conductor.engine.pricing import ModelPricing
+
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        # "gpt-4o" is in DEFAULT_PRICING at 2.50 / 10.00 — the hook must win.
+        provider = _fake_provider(
+            ok=True,
+            models=["gpt-4o"],
+            pricing={"gpt-4o": ModelPricing(input_per_mtok=99.0, output_per_mtok=199.0)},
+        )
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        model = diag.models[0]
+        assert model.pricing_source == "provider"
+        assert model.input_per_mtok == 99.0
+        assert model.output_per_mtok == 199.0
+
+    async def test_falls_back_to_table_when_hook_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-4o"])  # hook returns None
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        model = diag.models[0]
+        assert model.pricing_source == "table"
+        assert model.input_per_mtok == 2.50
+        assert model.output_per_mtok == 10.00
+
+    async def test_unknown_model_reports_none_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["totally-unknown-model-xyz"])
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        model = diag.models[0]
+        assert model.pricing_source == "none"
+        assert model.input_per_mtok is None
+        assert model.output_per_mtok is None
+
+    async def test_hook_failure_degrades_only_that_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A raising get_model_pricing must not fail the whole --models
+        probe — the never-raise contract."""
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(
+            ok=True,
+            models=["gpt-5", "gpt-4o"],
+            pricing=RuntimeError("pricing boom"),
+        )
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        by_id = {m.id: m for m in diag.models}
+        # Both models degrade to "pricing resolution failed" since the hook
+        # itself raises for every call — pricing_source stays None (distinct
+        # from the determined "none"), and neither model is dropped.
+        assert by_id["gpt-5"].pricing_source is None
+        assert by_id["gpt-5"].input_per_mtok is None
+        assert by_id["gpt-4o"].pricing_source is None
+        assert by_id["gpt-4o"].input_per_mtok is None
+
+    async def test_hook_failure_isolated_to_one_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failure resolving pricing for one model must not affect the
+        pricing already resolved for its neighbors in the same list."""
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-4.1", "gpt-4o", "gpt-4"])
+
+        def _pricing_for(model_id: str) -> Any:
+            if model_id == "gpt-4o":
+                raise RuntimeError("pricing boom for gpt-4o only")
+            return None  # falls through to the static table for the others
+
+        provider.get_model_pricing.side_effect = _pricing_for
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        by_id = {m.id: m for m in diag.models}
+        assert by_id["gpt-4.1"].pricing_source == "table"
+        assert by_id["gpt-4"].pricing_source == "table"
+        assert by_id["gpt-4o"].pricing_source is None
+        assert by_id["gpt-4o"].input_per_mtok is None
+
+    async def test_to_dict_carries_pricing_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True, models=["gpt-4o"])
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", list_models=True)
+        assert diag.models is not None
+        model_dict = diag.models[0].to_dict()
+        assert model_dict["input_per_mtok"] == 2.50
+        assert model_dict["output_per_mtok"] == 10.00
+        assert model_dict["pricing_source"] == "table"
 
 
 # ---------------------------------------------------------------------------

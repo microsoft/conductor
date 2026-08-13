@@ -1514,6 +1514,10 @@ and unpriced agents, the total is shown as a partial (e.g. `Total: ~$0.4200
 hides missing spend. The web dashboard shows the same `~$X (N unpriced)` marker.
 When *no* model can be priced, the summary reads `Cost data unavailable`.
 
+Run `conductor doctor --models` to see which models are priced and from
+where — the Models detail table's `Pricing` column shows `provider` / `table`
+/ `none` per model (see [`conductor doctor`](cli-reference.md#conductor-doctor)).
+
 To price an unknown model yourself, add a `cost.pricing` override:
 
 ```yaml

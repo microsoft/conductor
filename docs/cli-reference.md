@@ -725,13 +725,18 @@ support and context-window limits:
 | Reasoning efforts | `reasoning.effort` levels the model accepts (e.g. `low, medium, high, xhigh`), `none` when the model definitively supports none (e.g. a non-thinking Claude model), or `n/a` when the provider can't determine support. |
 | Default | The model's default reasoning-effort level, or `—` when unknown/not applicable. |
 | Prompt / Output / Context | Maximum prompt (input), output (completion), and total context-window tokens, or `—` when the provider doesn't expose that limit. |
+| Input $/Mtok / Output $/Mtok | Resolved per-million-token input/output rate (USD), or `—` when unpriced (never `0.00` — a zero would read as "free"). |
+| Pricing | Where the rate came from (see #386): `provider` (live rate from the provider's `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback), `none` (unpriced — the run's cost summary will show `~$X (N unpriced)`), or `—` when pricing resolution itself failed. |
 
 Coverage varies by provider — every field degrades independently to `n/a` /
 `—` rather than failing the command:
 
 - **Copilot** reports reasoning-effort levels + default, and prompt/context
   token limits, from the SDK's per-model metadata (`Output` is frequently
-  `—` — the live API does not currently populate it for most models).
+  `—` — the live API does not currently populate it for most models). It is
+  also currently the only provider that implements the `get_model_pricing`
+  hook, so `Pricing` shows `provider` for models the SDK prices live; other
+  providers legitimately show `table` or `none`.
 - **Claude** derives reasoning-effort support from a static heuristic
   (Claude 3.7+ / 4.x models support all five levels; older models support
   none) and reports only `Prompt` (via the Anthropic API's
@@ -752,7 +757,10 @@ id strings):
   "default_reasoning_effort": "medium",
   "max_prompt_tokens": 128000,
   "max_output_tokens": 64000,
-  "max_context_window_tokens": 192000
+  "max_context_window_tokens": 192000,
+  "input_per_mtok": 2.00,
+  "output_per_mtok": 8.00,
+  "pricing_source": "table"
 }
 ```
 

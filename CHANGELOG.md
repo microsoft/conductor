@@ -70,8 +70,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `claude-haiku-4.5` at the published Anthropic rates. Both spellings are
   kept: the dashed keys are what price the date-suffixed Anthropic ids
   (`claude-haiku-4-5-20251001`).
+- **`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are no longer unpriced**
+  (#386). Added to `DEFAULT_PRICING` as exact keys at the existing GPT-5.x
+  family rate ($2.00 in / $8.00 out per million tokens) — exact keys rather
+  than a `gpt-5.6` prefix key so the three resolve silently instead of
+  through `get_pricing`'s fuzzy-match warning path. `grok-4.5`,
+  `gemini-3.6-flash`, `mai-code-1.1-flash`, and `mai-code-1-flash-picker`
+  remain **deliberately** unpriced in the static table pending a published
+  rate; an invented rate would print as a confident cost, which is worse
+  than the honest `(N unpriced)` marker. With a Copilot SDK `>=1.0.9`
+  (#418), the live provider-pricing hook now prices all of these anyway —
+  the static-table gap only matters when that hook is unavailable.
 
-## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
+### Added
+
+- **`conductor doctor --models` now shows per-model pricing** (#386). The
+  Models detail table gained `Input $/Mtok`, `Output $/Mtok`, and `Pricing`
+  columns — the last distinguishing `provider` (live
+  `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback),
+  and `none` (genuinely unpriced) so "why is my run unpriced" is answerable
+  with one read-only, network-free command (the probe reuses the same
+  `list_models()` call `--models` already makes). `--json` gains matching
+  `input_per_mtok` / `output_per_mtok` / `pricing_source` fields on each
+  model object.
+
+
 
 ### Added
 
