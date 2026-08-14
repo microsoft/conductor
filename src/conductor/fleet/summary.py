@@ -909,7 +909,6 @@ def _scan_agent_details(
 def derive_run_summary(
     record: RunRecord,
     *,
-    now: float | None = None,
     tail_bytes: int = _DEFAULT_TAIL_BYTES,
 ) -> RunSummary:
     """Derive a :class:`RunSummary` for ``record`` from its event log's tail.
@@ -924,8 +923,6 @@ def derive_run_summary(
 
     Args:
         record: The run record to summarize.
-        now: Reference time for elapsed calculations (defaults to
-            ``time.time()``); exposed for deterministic testing.
         tail_bytes: Passed through to :func:`read_event_log_tail`.
 
     Returns:
@@ -933,19 +930,21 @@ def derive_run_summary(
         event visible within the tail window.
     """
     events: list[dict[str, Any]] = []
-    head_events: list[dict[str, Any]] = []
+    log_path: Path | None = None
     if record.event_log_path:
         log_path = Path(record.event_log_path)
         events = read_event_log_tail(log_path, tail_bytes=tail_bytes)
-        # `workflow_started` is the log's first event, so on a run long
-        # enough to outgrow the tail window it is always outside it -- the
-        # topology (and with it the preview's step list) disappeared exactly
-        # when a run got interesting enough to want it.
-        head_events = read_event_log_head(log_path)
 
     scan = _scan_events(events)
-    if head_events and (scan.topology is None or scan.workflow_name is None):
-        head_scan = _scan_events(head_events)
+    # `workflow_started` is the log's first event, so on a run long enough to
+    # outgrow the tail window it is always outside it -- the topology (and
+    # with it the preview's step list) disappeared exactly when a run got
+    # interesting enough to want it. Read lazily: for any log under the tail
+    # window -- the common case, and every young run -- the tail already
+    # contained `workflow_started`, and this runs once per row on the Runs
+    # screen's ~2s poll, on the UI thread.
+    if log_path is not None and (scan.topology is None or scan.workflow_name is None):
+        head_scan = _scan_events(read_event_log_head(log_path))
         scan.topology = scan.topology or head_scan.topology
         scan.workflow_name = scan.workflow_name or head_scan.workflow_name
         scan.cwd = scan.cwd or head_scan.cwd

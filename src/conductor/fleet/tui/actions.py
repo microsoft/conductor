@@ -249,7 +249,12 @@ class ConfirmKillModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static(self._message, id="confirm-message"),
+            # `Text`, not a plain str: `Static` defaults to markup=True, so a
+            # workflow named `plan[wip].yaml` would be silently rendered as
+            # `plan.yaml` -- in the dialog whose whole job is naming what is
+            # about to be killed. The hint below is conductor's own literal,
+            # so it stays markup.
+            Static(Text(self._message), id="confirm-message"),
             Static("[bold]\\[y][/bold] Confirm   [bold]\\[n/esc][/bold] Cancel", id="confirm-hint"),
             id="confirm-dialog",
         )

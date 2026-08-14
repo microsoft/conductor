@@ -51,10 +51,10 @@ output_console = make_console()
 
 @fleet_app.callback()
 def fleet_main(ctx: typer.Context) -> None:
-    """Manage the fleet of running Conductor workflows.
+    r"""Manage the fleet of running Conductor workflows.
 
     With no subcommand, this launches the interactive TUI. Requires the
-    `tui` extra (`pip install 'conductor-cli[tui]'`); without it, prints an
+    `tui` extra (`pip install 'conductor-cli\[tui]'`); without it, prints an
     install hint and exits rather than launching.
 
     \b
@@ -150,12 +150,12 @@ def prune(
         ),
     ] = False,
 ) -> None:
-    """Prune old event logs under $TMPDIR/conductor/.
+    r"""Prune old event logs under $TMPDIR/conductor/.
 
     This is the explicit manual entry point for event-log retention (E5 —
     see docs/projects/fleet-manager/fleet-manager.design.md's *Second-order
     cleanup*), and runs regardless of whether the opportunistic startup
-    sweep is enabled via [fleet.retention].enabled in
+    sweep is enabled via \[fleet.retention].enabled in
     ~/.conductor/config.toml. Never deletes checkpoints or a live run's
     event log. Pruning an event log makes that run unavailable to
     `conductor replay`.
@@ -181,14 +181,30 @@ def prune(
 
     result = prune_event_logs(keep_last=resolved_keep_last, dry_run=dry_run)
 
-    if not result.deleted:
+    # A failed sweep must not render as "nothing to do". `prune_event_logs`
+    # never raises (the opportunistic startup sweep depends on that), so the
+    # explicit CLI reader is the layer that has to tell the two apart --
+    # otherwise `conductor fleet prune || alert` never fires while the disk
+    # fills, and the symlink-tamper refusal is reported as an empty sweep.
+    if result.error is not None:
+        console.print(
+            styled(
+                "[bold red]Error:[/bold red] the event-log sweep did not complete; "
+                "some files may not have been deleted: {}",
+                result.error,
+            )
+        )
+        raise typer.Exit(code=1)
+
+    if not result.deleted and not result.failed:
         output_console.print(Text.from_markup("[dim]Nothing to prune.[/dim]"))
         return
 
-    verb = "Would delete" if dry_run else "Deleted"
-    output_console.print(styled("{} {} file(s):", verb, len(result.deleted)))
-    for f in result.deleted:
-        output_console.print(styled("  [dim]{}[/dim]", f))
+    if result.deleted:
+        verb = "Would delete" if dry_run else "Deleted"
+        output_console.print(styled("{} {} file(s):", verb, len(result.deleted)))
+        for f in result.deleted:
+            output_console.print(styled("  [dim]{}[/dim]", f))
 
     if result.skipped_live:
         output_console.print(
@@ -197,3 +213,15 @@ def prune(
                 len(result.skipped_live),
             )
         )
+
+    # Reported last so it is the final thing on screen, and exits non-zero:
+    # a systematic cause (a read-only or root-owned log directory) refuses
+    # the same files on every run, and listing only the successes above
+    # would present that as a working sweep.
+    if result.failed:
+        console.print(
+            styled("[bold red]Failed to delete {} file(s):[/bold red]", len(result.failed))
+        )
+        for path, reason in result.failed:
+            console.print(styled("  {} — {}", path, reason))
+        raise typer.Exit(code=1)

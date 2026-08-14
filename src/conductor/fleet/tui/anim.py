@@ -37,10 +37,6 @@ FRAME_INTERVAL = 0.1
 #: flicker between glyphs of different visual weight.
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-#: A slower, heavier spinner for a single large focal point (the run-detail
-#: header) where the fine braille dots read as noise at close range.
-PULSE_FRAMES = "◐◓◑◒"
-
 #: Styles cycled to make a glyph "breathe". Deliberately an even-length
 #: palindrome so the brightness ramps up and back down smoothly instead of
 #: snapping from brightest to dimmest between the last frame and the first.

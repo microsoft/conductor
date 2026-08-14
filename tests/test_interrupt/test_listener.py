@@ -499,6 +499,33 @@ class TestSigtermHandlerFix:
         assert mock_signal.call_args_list[-1].args == (signal.SIGTERM, signal.SIG_DFL)
         mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
 
+    def test_inherited_sig_ign_is_respected_not_overridden(
+        self, listener: KeyboardListener
+    ) -> None:
+        """An inherited SIG_IGN means "this process does not die on SIGTERM".
+
+        It is an ``IntEnum`` member like SIG_DFL, so the not-callable branch
+        would otherwise take the re-raise path and terminate a process a
+        supervisor or container init shim explicitly configured not to.
+        """
+        with (
+            patch(
+                "conductor.interrupt.listener.signal.getsignal",
+                return_value=signal.Handlers.SIG_IGN,
+            ),
+            patch("conductor.interrupt.listener.signal.signal") as mock_signal,
+            patch("conductor.interrupt.listener.os.kill") as mock_kill,
+            patch.object(listener, "_restore_terminal") as mock_restore,
+        ):
+            listener._register_cleanup_handlers()
+            registered_handler = mock_signal.call_args_list[-1].args[1]
+            registered_handler(signal.SIGTERM, None)
+
+        # The terminal is still restored -- only the termination is skipped.
+        mock_restore.assert_called_once()
+        mock_kill.assert_not_called()
+        assert mock_signal.call_args_list[-1].args[1] is not signal.SIG_DFL
+
     def test_delegates_to_previous_handler_when_callable(self, listener: KeyboardListener) -> None:
         """A real, callable previous handler (e.g. installed by another
         library) must still be invoked -- this behavior is unchanged."""

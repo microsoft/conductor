@@ -465,6 +465,7 @@ class TestSharedImplementation:
         fake_outcome = Mock()
         fake_outcome.declined = False
         fake_outcome.stopped = [record]
+        fake_outcome.failed = []
 
         with patch.object(
             tui_actions, "stop_records", return_value=fake_outcome
@@ -835,3 +836,48 @@ class TestGateModalScrolling:
             await pilot.press("ctrl+shift+down")
             await pilot.pause()
             assert scroller.scroll_offset.y > 1
+
+    async def test_a_refused_kill_is_reported_not_counted_as_zero(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """A kill the shared implementation refused must reach the user.
+
+        `stop_records` writes its per-record diagnostics -- including the
+        identity-mismatch refusal, which is a safety stop the user has to
+        act on -- to the silent console the TUI hands it, and that buffer is
+        discarded. So `StopOutcome.failed` is the only channel left. Before
+        this, the screen announced "Killed 0 run(s)." at *informational*
+        severity and the reason was unreachable.
+        """
+        record = _write_record(tmp_path, "run-a", pid=os.getpid(), mode="bg")
+
+        fake_outcome = Mock()
+        fake_outcome.declined = False
+        fake_outcome.stopped = []
+        fake_outcome.failed = [(record, "survived")]
+
+        notifications: list[tuple[str, str]] = []
+
+        with patch.object(tui_actions, "stop_records", return_value=fake_outcome):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                screen = app.screen
+                original_notify = screen.notify
+
+                def _capture(message: str, **kwargs: object) -> None:
+                    notifications.append((message, str(kwargs.get("severity", "information"))))
+                    original_notify(message, **kwargs)  # type: ignore[arg-type]
+
+                with patch.object(screen, "notify", _capture):
+                    await pilot.press("k")
+                    await pilot.pause()
+                    await pilot.press("y")
+                    await pilot.pause()
+
+        assert notifications, "the kill produced no notification at all"
+        assert not any("Killed 0 run(s)" in message for message, _ in notifications)
+        failures = [m for m, sev in notifications if sev == "error"]
+        assert failures, f"no error notification; got {notifications}"
+        assert "survived" in failures[0]
+        assert "run-a" in failures[0]

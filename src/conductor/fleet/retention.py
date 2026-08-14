@@ -89,6 +89,21 @@ class PruneResult:
     """Event logs that were past ``keep_last`` by age but were retained
     anyway because a live run record still references them."""
 
+    failed: list[tuple[Path, str]] = field(default_factory=list)
+    """``(path, reason)`` for each file this sweep tried and failed to
+    delete. Populated only for a real ``OSError`` — a file that was already
+    gone is not a failure, since "absent" is the outcome the caller wanted.
+    A caller that renders only ``deleted`` reports a success it did not
+    achieve: a read-only or root-owned log directory fails *every* deletion,
+    forever, and looks identical to having nothing to prune."""
+
+    error: str | None = None
+    """Non-None when the sweep aborted before completing, leaving every file
+    in place. :func:`prune_event_logs` still never raises — the opportunistic
+    startup sweep depends on that — so this is how a caller that is an
+    *explicit* user request tells "the sweep failed" apart from "there was
+    nothing to do"."""
+
 
 def _companion_paths(event_log: Path) -> list[Path]:
     """Return the ``.bg.stderr.log`` / ``.bg.stdout.log`` companions of ``event_log``.
@@ -152,22 +167,25 @@ def _safe_mtime(path: Path) -> float:
         return float("-inf")
 
 
-def _safe_unlink(path: Path) -> bool:
+def _safe_unlink(path: Path) -> tuple[bool, str | None]:
     """Best-effort delete of ``path``, never raising.
 
     Returns:
-        True if this call's ``unlink()`` actually removed the file. False
-        if it was already absent or an ``OSError`` (permission denied,
-        read-only filesystem, etc.) prevented removal.
+        ``(removed, failure_reason)``. ``removed`` is True only when this
+        call's ``unlink()`` actually removed the file. ``failure_reason`` is
+        non-None only when an ``OSError`` prevented removal; a file that was
+        already absent is neither removed nor a failure, because "gone" is
+        the outcome the caller asked for. The two are distinct so the caller
+        can report a refused deletion instead of silently omitting it.
     """
     try:
         path.unlink()
     except FileNotFoundError:
-        return False
-    except OSError:
+        return False, None
+    except OSError as exc:
         logger.warning("Could not delete event log file: %s", path, exc_info=True)
-        return False
-    return True
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, None
 
 
 def prune_event_logs(*, keep_last: int, dry_run: bool = False) -> PruneResult:
@@ -196,14 +214,15 @@ def prune_event_logs(*, keep_last: int, dry_run: bool = False) -> PruneResult:
 
     Returns:
         A :class:`PruneResult` describing what was (or would be) deleted,
-        and which normally-prunable logs were skipped because a live run
-        still references them.
+        which normally-prunable logs were skipped because a live run still
+        references them, which deletions were refused, and — via
+        :attr:`PruneResult.error` — whether the sweep aborted wholesale.
     """
     try:
         return _prune_event_logs_impl(keep_last=keep_last, dry_run=dry_run)
-    except Exception:
+    except Exception as exc:
         logger.warning("Event-log retention sweep failed; leaving files in place", exc_info=True)
-        return PruneResult()
+        return PruneResult(error=f"{type(exc).__name__}: {exc}")
 
 
 def _prune_event_logs_impl(*, keep_last: int, dry_run: bool) -> PruneResult:
@@ -234,6 +253,7 @@ def _prune_event_logs_impl(*, keep_last: int, dry_run: bool) -> PruneResult:
 
     deleted: list[Path] = []
     skipped_live: list[Path] = []
+    failed: list[tuple[Path, str]] = []
 
     for event_log in prune_candidates:
         if event_log in live_paths:
@@ -246,13 +266,14 @@ def _prune_event_logs_impl(*, keep_last: int, dry_run: bool) -> PruneResult:
             deleted.extend(companions)
             continue
 
-        if _safe_unlink(event_log):
-            deleted.append(event_log)
-        for companion in companions:
-            if _safe_unlink(companion):
-                deleted.append(companion)
+        for target in (event_log, *companions):
+            removed, reason = _safe_unlink(target)
+            if removed:
+                deleted.append(target)
+            elif reason is not None:
+                failed.append((target, reason))
 
-    return PruneResult(deleted=deleted, skipped_live=skipped_live)
+    return PruneResult(deleted=deleted, skipped_live=skipped_live, failed=failed)
 
 
 def maybe_prune_event_logs() -> PruneResult | None:
@@ -290,4 +311,13 @@ def maybe_prune_event_logs() -> PruneResult | None:
     if not settings.fleet.retention.enabled:
         return None
 
-    return prune_event_logs(keep_last=settings.fleet.retention.keep_last)
+    # Inside the try, not after it: `prune_event_logs` builds its error
+    # string with `str(exc)`, which is not itself guaranteed safe, and this
+    # function's contract is a single never-raises surface for the whole
+    # opt-in feature -- a machine-wide settings file must never break
+    # `conductor run` (D3).
+    try:
+        return prune_event_logs(keep_last=settings.fleet.retention.keep_last)
+    except Exception:
+        logger.warning("Event-log retention sweep failed unexpectedly", exc_info=True)
+        return None

@@ -256,6 +256,14 @@ class KeyboardListener:
                 # terminates the way an unhandled SIGTERM normally would.
                 if callable(self._previous_sigterm):
                     self._previous_sigterm(signum, frame)
+                elif self._previous_sigterm is signal.SIG_IGN:
+                    # An inherited SIG_IGN is a deliberate "this process
+                    # does not die on SIGTERM", set by a supervisor or
+                    # container init shim. It is an IntEnum member like
+                    # SIG_DFL, so without this branch it would take the
+                    # re-raise path below and terminate a process that was
+                    # explicitly configured not to.
+                    return
                 else:
                     signal.signal(signal.SIGTERM, signal.SIG_DFL)
                     os.kill(os.getpid(), signal.SIGTERM)

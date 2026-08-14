@@ -236,7 +236,7 @@ class ProvidersScreen(Screen):
             diag = self._providers[name]
             arrow = "▼" if name in self._expanded else "▶"
             table.add_row(
-                f"{arrow} {diag.name}",
+                Text(f"{arrow} {diag.name}"),
                 _installed_cell(diag),
                 _tier_cell(diag.tier),
                 _credentials_cell(diag),

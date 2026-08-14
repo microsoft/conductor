@@ -42,18 +42,14 @@ class FleetApp(App):
     /* ------------------------------------------------------------------
        App-level design system.
 
-       Five of the six screens previously carried no CSS at all, so Textual
-       laid them out with raw defaults: tables flush against column 0, no
-       spacing between sections, and every cell the same visual weight as
-       its neighbours. These rules are deliberately app-level rather than
-       per-screen -- the defect was that styling was per-screen (and so
-       mostly absent), not that any one screen was styled wrongly.
+       Styling lives here, not per-screen, so every table, heading and
+       notice reads the same on every screen. A screen that needs a local
+       rule is the exception; adding one is a decision, not a default.
        ------------------------------------------------------------------ */
 
-    /* No `background:` here on purpose. Setting `$surface` painted every
-       screen in the theme's *elevated* colour (nord: #3B4252) rather than
-       its base background (#2E3440), which is what made the whole app look
-       hazy -- a flat mid-grey with dim text on top of it. Screens default
+    /* No `background:` here on purpose. Setting `$surface` paints a screen
+       in the theme's *elevated* colour rather than its base background,
+       which reads as a flat mid-grey haze under dim text. Screens default
        to `$background`; the surface colour is for things that sit on top. */
 
     /* Tables carry the app's data, so they get the padding the raw default

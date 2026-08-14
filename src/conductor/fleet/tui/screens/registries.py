@@ -372,7 +372,7 @@ class WorkflowInputsScreen(Screen):
             table.add_row(
                 Text(name),
                 Text(input_def.type),
-                required,
+                Text(required),
                 Text(default),
                 Text(input_def.description or "-"),
                 key=name,

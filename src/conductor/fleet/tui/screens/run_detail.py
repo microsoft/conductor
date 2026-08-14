@@ -279,15 +279,20 @@ class RunDetailScreen(Screen):
         """Add one agent's row: status, elapsed, tokens, cost -- the
         currently-running agent's row is visually highlighted (E9-T2)."""
         is_current = agent.status == "running"
-        name_cell = f"▶ {agent.name}" if is_current else f"  {agent.name}"
+        # `Text`, not an f-string: `DataTable` runs `Text.from_markup` on any
+        # `str` cell unconditionally, and `agent.name`/`agent.type` are
+        # workflow-authored -- an agent named `plan[wip]` would render as
+        # `plan`. The `[bold]` below is conductor's own, so it is applied as
+        # a style rather than as markup.
+        name_cell = Text(f"▶ {agent.name}" if is_current else f"  {agent.name}")
         if is_current:
-            name_cell = f"[bold]{name_cell}[/bold]"
+            name_cell.stylize("bold")
         table.add_row(
             name_cell,
-            agent.type,
+            Text(agent.type),
             _agent_status_cell(agent.status),
-            _format_duration(agent.elapsed_seconds()),
-            _format_agent_tokens(agent.tokens),
-            _format_agent_cost(agent.cost_usd),
+            Text(_format_duration(agent.elapsed_seconds())),
+            Text(_format_agent_tokens(agent.tokens)),
+            Text(_format_agent_cost(agent.cost_usd)),
             key=key,
         )

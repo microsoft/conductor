@@ -185,9 +185,12 @@ class HistoryScreen(Screen):
         table.add_row(
             Text(entry.workflow_name),
             status_label(entry.outcome),
-            _format_duration(entry.duration_seconds),
-            _format_tokens(entry.total_tokens),
-            _format_cost(entry),
+            # `Text`, not `str`: `DataTable` markup-parses every `str` cell.
+            # These format helpers cannot emit a bracket today, but the sink
+            # is the same one that silently truncated agent names.
+            Text(_format_duration(entry.duration_seconds)),
+            Text(_format_tokens(entry.total_tokens)),
+            Text(_format_cost(entry)),
             key=key,
         )
 

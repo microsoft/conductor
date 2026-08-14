@@ -132,3 +132,57 @@ class TestFleetPruneCommand:
         assert result.exit_code == 0
         # keep_last=0 means "prune nothing" (mirrors the checkpoint guard).
         assert old_log.exists()
+
+
+class TestFailuresAreReported:
+    """A destructive command must not report a success it did not achieve.
+
+    ``prune_event_logs`` never raises -- the opportunistic startup sweep
+    depends on that -- so the explicit CLI reader is the only layer that can
+    tell "the sweep failed" apart from "there was nothing to do". Reporting
+    the two identically means ``conductor fleet prune || alert`` never fires
+    while the disk fills, and the symlink-tamper refusal (whose whole reason
+    for existing is to shout) is rendered as an empty sweep.
+    """
+
+    def test_a_wholesale_sweep_failure_is_not_reported_as_nothing_to_prune(
+        self, temp_root: Path, settings_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _make_event_log(temp_root, "conductor-old.events.jsonl", age_seconds=1000)
+
+        def _boom() -> None:
+            raise RuntimeError("could indicate tampering")
+
+        monkeypatch.setattr("conductor.fleet.retention.event_log_root", _boom)
+
+        result = runner.invoke(app, ["fleet", "prune", "--keep-last", "1"])
+
+        assert result.exit_code == 1
+        assert "Nothing to prune" not in result.output
+        assert "tampering" in result.output
+
+    def test_a_refused_deletion_is_reported_and_exits_non_zero(
+        self, temp_root: Path, settings_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read-only or root-owned log directory refuses the same files on
+        every run, so listing only the successes presents a broken sweep as a
+        working one."""
+        _make_event_log(temp_root, "conductor-new.events.jsonl", age_seconds=1)
+        doomed = _make_event_log(temp_root, "conductor-old.events.jsonl", age_seconds=1000)
+
+        real_unlink = Path.unlink
+
+        def _refuse(self: Path, *args: object, **kwargs: object) -> None:
+            if self == doomed:
+                raise PermissionError(13, "Permission denied")
+            real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "unlink", _refuse)
+
+        result = runner.invoke(app, ["fleet", "prune", "--keep-last", "1"])
+
+        assert result.exit_code == 1
+        assert "Nothing to prune" not in result.output
+        assert "Failed to delete" in result.output
+        assert "Permission denied" in result.output
+        assert doomed.exists()

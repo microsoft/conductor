@@ -29,7 +29,7 @@ Manager alongside the run-record mechanism below — it never had the old
 PID-file limitation to begin with.)
 
 Every `conductor run` (and `resume`) invocation now writes a small JSON
-**run record** to `~/.conductor/runs/<run_id>.json`, keyed by run ID rather
+**run record** to `~/.conductor/runs/<run_id>.json` (or `$CONDUCTOR_HOME/runs/`), keyed by run ID rather
 than port (a foreground run has no port), describing its mode (`fg` /
 `fg-web` / `bg`), PID, workflow path, and — when it has a dashboard — port.
 `conductor stop`, `conductor fleet list`, and the TUI all read from this
@@ -84,6 +84,11 @@ stack rather than each managing its own navigation state.
   messages, no tool output, no graph rendering — see
   [Division of labor](#division-of-labor-tui-vs-dashboard) for why that's
   the dashboard's job.
+- **Step detail** (`enter` on a Run detail row) — what a single step
+  actually did: its input, its output, and its activity stream (messages,
+  reasoning, tool calls and their results). Loaded once on open and
+  reloaded only on `r`, never on a timer — a drill-down that refreshed
+  underneath the reader would move the text they were mid-way through.
 - **Providers** (`p`) — a collapsed summary per provider (installed, tier,
   credential presence); expand a row to run an explicit, on-demand
   connection check and see its models with reasoning-effort and
@@ -104,9 +109,8 @@ stack rather than each managing its own navigation state.
   and fill in a form generated from the workflow's declared `input:`
   block (required fields marked, defaults pre-filled, descriptions shown).
   Submitting shells out to `conductor run --web-bg` via the same
-  `launch_background()` the CLI itself uses — see
-  [D2](#gates-display-vs-resolve) below for why detached process spawning
-  is never re-implemented here. Once the launch succeeds, this screen pops
+  `launch_background()` the CLI itself uses, so a launched run outlives
+  the TUI rather than dying with it. Once the launch succeeds, this screen pops
   back to Runs, where the new run appears on the next poll tick; the TUI
   never tracks a launched run's lifecycle beyond that (**viewer, not
   supervisor**).
@@ -138,7 +142,9 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `n` | New run |
 | `h` | History |
 | `q` | Quit |
-| `escape` | Back (on any drill-down screen) |
+
+On Run detail, `enter` opens the highlighted step; that screen binds `r`
+to reload and `tab` to switch panes.
 
 Inside the Registries drill-down, `n` runs the highlighted (or currently
 displayed) workflow rather than starting from an empty form. A launch

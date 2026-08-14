@@ -1,11 +1,11 @@
 """Shared visual vocabulary for the Fleet Manager TUI.
 
-Before this module every screen invented its own status rendering: ``runs.py``
-had ``_STATUS_BADGES`` (glyph only), ``history.py`` had ``_OUTCOME_LABELS``
-(glyph + word), and ``run_detail.py`` had ``_STATUS_LABELS`` (a third,
-overlapping set). None of them carried colour, so "failed" and "unknown"
-landed on screen with identical visual weight and a reader had to actually
-parse the glyph to tell a healthy fleet from a broken one.
+The single status-rendering vocabulary for every screen: one badge, word and
+colour per status value, so the same run reads identically wherever it is
+shown. Screens must not define their own glyph maps -- a per-screen map is
+how "failed" and "unknown" end up landing with identical visual weight,
+leaving a reader to parse the glyph to tell a healthy fleet from a broken
+one.
 
 Everything here is a *presentation* concern only. The status values
 themselves are derived in :mod:`conductor.fleet.summary` and

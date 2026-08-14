@@ -817,7 +817,7 @@ class TestWorkflowInputsDrilldown:
 
             verbose_row = rows["verbose"]
             assert str(verbose_row[1]) == "boolean"
-            assert verbose_row[2] == ""
+            assert str(verbose_row[2]) == ""
             assert str(verbose_row[3]) == "False"
 
     async def test_workflow_with_no_inputs_shows_normal_message(self, fleet_env: Path) -> None:

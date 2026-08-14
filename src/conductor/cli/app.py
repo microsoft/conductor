@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -1423,7 +1423,13 @@ def _remove_stopped_record(record: RunRecord) -> None:
     would leave every pre-upgrade file with a recorded id undeletable, and
     ``stop`` would report success while the entry stayed on disk forever.
     Instead, the port-keyed removal is attempted whenever the record-keyed
-    one removed nothing.
+    one removed nothing. That fallback is identity-checked on the record's
+    ``pid``: a port-only match would delete whatever file currently holds the
+    port, which after the original run exits can be a *different, live* run
+    that has since bound it (issue #344). Since ``remove_run_record`` also
+    returns False on the normal cooperative path (the child removed its own
+    record on exit), this fallback fires routinely rather than only for
+    pre-upgrade files, so it has to be safe rather than merely rare.
 
     Args:
         record: The :class:`RunRecord` that was just confirmed stopped.
@@ -1435,9 +1441,9 @@ def _remove_stopped_record(record: RunRecord) -> None:
         removed = remove_run_record(record.run_id)
 
     if not removed and record.port is not None:
-        from conductor.cli.pid import remove_pid_file
+        from conductor.cli.pid import remove_pid_file_for_pid
 
-        remove_pid_file(record.port)
+        remove_pid_file_for_pid(record.port, record.pid)
 
 
 def _run_has_checkpoints(record: RunRecord) -> bool:
@@ -1584,7 +1590,9 @@ def _confirm_foreground_stop(foreground: list[RunRecord], con: Console) -> bool:
     return Confirm.ask("Continue?", console=con, default=False)
 
 
-def _confirm_stop_targets(targets: list[RunRecord], yes: bool, con: Console) -> bool:
+def _confirm_stop_targets(
+    targets: list[RunRecord], yes: bool, con: Console, *, non_interactive: bool = False
+) -> bool:
     """Gate the D1 confirmation, including the ``--yes`` bypass and non-TTY refusal.
 
     Legacy ``.pid`` records and ``mode="bg"`` records never trigger a
@@ -1605,6 +1613,12 @@ def _confirm_stop_targets(targets: list[RunRecord], yes: bool, con: Console) -> 
         targets: The full set of run records ``stop`` is about to act on.
         yes: Whether ``--yes``/``-y`` was passed.
         con: Rich Console for output/prompting.
+        non_interactive: Force the non-TTY branch regardless of what
+            ``stdin`` reports. Set for ``--json``, which cannot prompt --
+            being unable to ask is the same condition the non-TTY branch
+            treats as grounds to *refuse*, so skipping the gate entirely
+            would let ``stop --all --json`` kill a developer's foreground
+            run with no prompt, no ``--yes`` and no refusal.
 
     Returns:
         True if the caller should proceed to stop every target. False if
@@ -1613,15 +1627,15 @@ def _confirm_stop_targets(targets: list[RunRecord], yes: bool, con: Console) -> 
 
     Raises:
         typer.Exit: With code 1 when a foreground target requires
-            confirmation but stdin is not a terminal and ``--yes`` was
-            not passed.
+            confirmation but confirmation is impossible (``stdin`` is not a
+            terminal, or ``non_interactive``) and ``--yes`` was not passed.
     """
     foreground = _foreground_targets(targets)
     if not foreground:
         return True
     if yes:
         return True
-    if not _stdin_is_interactive():
+    if non_interactive or not _stdin_is_interactive():
         con.print(
             Text.from_markup(
                 "[bold red]Error:[/bold red] stopping a foreground workflow run requires "
@@ -1651,10 +1665,17 @@ class StopOutcome:
         stopped: Records confirmed stopped (:func:`_stop_process` polled
             them dead, or found them already gone) and whose run record
             was removed.
+        failed: ``(record, outcome)`` for every target *not* confirmed
+            stopped -- ``"survived"``, ``"unconfirmed"``, or a refused
+            identity mismatch. Carried explicitly because a caller that
+            renders only :attr:`stopped` reports a success it did not
+            achieve; that matters most for the TUI, whose console is a
+            discarded buffer, so this is the only channel its user has.
     """
 
     declined: bool
     stopped: list[RunRecord]
+    failed: list[tuple[RunRecord, str]] = field(default_factory=list)
 
 
 def stop_records(
@@ -1697,13 +1718,14 @@ def stop_records(
             stopping anything.
 
     Returns:
-        A :class:`StopOutcome` describing whether the caller declined and
-        which records were actually confirmed stopped.
+        A :class:`StopOutcome` describing whether the caller declined,
+        which records were actually confirmed stopped, and which were not.
     """
     if confirm is not None and not confirm(targets):
         return StopOutcome(declined=True, stopped=[])
 
     stopped: list[RunRecord] = []
+    failed: list[tuple[RunRecord, str]] = []
     for record in targets:
         # ``_stop_process`` reports an outcome rather than a bool: only the
         # two outcomes that mean "this process is definitively gone" may
@@ -1713,7 +1735,9 @@ def stop_records(
         if result["outcome"] in ("stopped", "already-exited"):
             _remove_stopped_record(record)
             stopped.append(record)
-    return StopOutcome(declined=False, stopped=stopped)
+        else:
+            failed.append((record, str(result["outcome"])))
+    return StopOutcome(declined=False, stopped=stopped, failed=failed)
 
 
 @app.command(rich_help_panel="Run & Recover")
@@ -1739,7 +1763,7 @@ def stop(
         bool,
         typer.Option(
             "--all",
-            help="Stop all background conductor workflows.",
+            help="Stop all running conductor workflows, foreground and background.",
         ),
     ] = False,
     allow_self: Annotated[
@@ -1757,7 +1781,7 @@ def stop(
                 "Force-terminate even when the run's identity cannot be confirmed. "
                 "Dangerous: the recorded PID may have been recycled onto another process. "
                 "Does not override a confirmed mismatch, which blocks every rung. "
-                "Also clears the PID file of a run whose liveness cannot be probed at "
+                "Also clears the run record of a run whose liveness cannot be probed at "
                 "all -- if that process is still alive it becomes untracked and must be "
                 "stopped by hand."
             ),
@@ -1781,13 +1805,14 @@ def stop(
 ) -> None:
     """Stop running workflow processes.
 
-    With no arguments, lists running background workflows. If exactly one
-    is found, stops it automatically. If multiple are found, prints the
-    list and asks you to specify --port.
+    With no arguments, lists every running workflow -- foreground and
+    background alike. If exactly one is found, stops it automatically. If
+    multiple are found, prints the list and asks you to select one with
+    --run-id (or --port, which can only name a run that has a dashboard).
 
     Each workflow is stopped by escalating until it is confirmed gone: a
     graceful cancel via the dashboard (which lets the run checkpoint), then a
-    platform signal, then forceful termination. A PID file is only removed
+    platform signal, then forceful termination. A run record is only removed
     once its process is confirmed dead, so a workflow that survives stays
     discoverable instead of becoming an untracked orphan.
 
@@ -1971,8 +1996,10 @@ def stop(
     # even in --json mode.
     # Stopping a foreground run is newly possible (and more disruptive: there
     # is no dashboard to resume from), so it is gated behind a confirmation
-    # unless --yes or --json. JSON mode is non-interactive by construction.
-    if not json_output and not _confirm_stop_targets(targets, yes, console):
+    # unless --yes. --json cannot prompt, so it takes the same refusal branch
+    # a non-TTY does rather than skipping the gate: "cannot ask" is the
+    # condition D1 exists to refuse on, not a licence to proceed.
+    if not _confirm_stop_targets(targets, yes, console, non_interactive=json_output):
         console.print(Text.from_markup("[dim]Aborted: no workflows were stopped.[/dim]"))
         return
 
@@ -1984,8 +2011,9 @@ def stop(
 
     for entry, result in zip(targets, results, strict=True):
         if result["outcome"] in ("stopped", "already-exited"):
-            # Identity-checked: only remove the file if it still describes the
-            # process we just stopped, never merely "the file for this port".
+            # Identity-checked: only remove the record if it still describes
+            # the process we just stopped, never merely "whatever holds this
+            # port" -- see _remove_stopped_record.
             _remove_stopped_record(entry)
         elif force and result["outcome"] == "unconfirmed" and result["rung"] == "terminate":
             # The #166 escape hatch. Reaching here means the liveness probe
@@ -2147,6 +2175,14 @@ def _confirm_identity(entry: RunRecord, con: Console) -> Identity:
     import httpx
 
     port = entry.port
+    if port is None:
+        # A `mode="fg"` record has no dashboard, so there is nothing to ask.
+        # Probing anyway builds `http://127.0.0.1:None/api/info`, which httpx
+        # rejects into the blanket handler below -- reaching the right answer
+        # by accident, via a debug log, after a wasted request.
+        logger.debug("No dashboard port on run %s; identity cannot be confirmed", entry.run_id)
+        return Identity.UNCONFIRMED
+
     try:
         resp = httpx.get(f"http://127.0.0.1:{port}/api/info", timeout=_IDENTITY_TIMEOUT)
         resp.raise_for_status()

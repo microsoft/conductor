@@ -35,3 +35,31 @@ def test_event_log_root_is_isolated(tmp_path: Path) -> None:
     root = event_log_root()
     assert root.is_relative_to(tmp_path)
     assert root != Path("/tmp/conductor")
+
+
+def test_run_record_dirs_are_isolated_from_the_real_home(tmp_path: Path) -> None:
+    """Both run-record directories must resolve away from the real ``~``.
+
+    ``read_run_records()`` is a *pruning* reader -- it deletes any record it
+    judges corrupt, identity-mismatched, or dead-PID -- so anything reaching
+    it (``conductor stop``, ``fleet list``, the TUI poll, and the retention
+    sweep via ``_live_event_log_paths``) destroys the developer's *live* run
+    records unless both are redirected.
+
+    Both are checked because they resolve differently by design:
+    ``run_records_dir()`` honors ``CONDUCTOR_HOME`` while ``pid_dir()``
+    deliberately does not, so isolating one still leaves the other pointed
+    at the real home.
+    """
+    from conductor.cli.pid import pid_dir
+    from conductor.fleet.records import run_records_dir
+
+    real_runs = Path.home() / ".conductor" / "runs"
+
+    records_dir = run_records_dir()
+    assert records_dir.is_relative_to(tmp_path)
+    assert records_dir != real_runs
+
+    legacy_dir = pid_dir()
+    assert legacy_dir.is_relative_to(tmp_path)
+    assert legacy_dir != real_runs

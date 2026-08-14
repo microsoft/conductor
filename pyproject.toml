@@ -67,11 +67,11 @@ aca = [
     "azure-core[aio]>=1.29.0",
 ]
 tui = [
-    # Pinned to the floor actually developed and tested against (latest on
-    # PyPI is 8.2.8) rather than a much looser floor -- App.run_test()/Pilot
-    # behavior that every TUI pilot test (Fleet Manager E7-E14) depends on
-    # has changed across that range.
-    "textual>=6.0",
+    # Floor is 8.x, not a looser bound: `BlockFooter` (fleet/tui/widgets.py)
+    # is written against 8.x `Footer` group rendering, and the
+    # `App.run_test()` / `Pilot` behavior every TUI pilot test depends on
+    # changed before it.
+    "textual>=8.0",
 ]
 
 [project.urls]
@@ -112,7 +112,7 @@ dev = [
     "ty>=0.0.1a0",
     # So Fleet Manager TUI pilot tests (App.run_test()) run in CI/dev without
     # requiring an end user to install the `tui` extra just to run the suite.
-    "textual>=6.0",
+    "textual>=8.0",
 ]
 
 [tool.ruff]

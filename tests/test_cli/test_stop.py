@@ -1055,3 +1055,147 @@ class TestStopSelfExclusion:
         # The self entry's port must not leak into the "running" listing.
         assert "8080" not in result.output.split("Excluded")[0]
         stop_spy.assert_not_called()
+
+
+class TestLegacyPidRemovalIsIdentityChecked:
+    """The legacy ``.pid`` fallback must match on PID, not port alone.
+
+    ``_remove_stopped_record`` falls back to a port-keyed removal whenever
+    the run-record removal removed nothing -- which is the *normal* path,
+    since a cooperating child removes its own record on exit. So the
+    fallback fires routinely rather than only for pre-upgrade files, and a
+    port-only match would delete whatever file currently holds the port.
+    Between the caller's snapshot and this call the stopped run's port can
+    already have been rebound by a different, live run (issue #344), and
+    deleting *its* file leaves a live workflow burning tokens with nothing
+    tracking it.
+    """
+
+    def test_a_different_live_runs_pid_file_survives(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """Exercised directly rather than through the CLI: driving it via
+        ``stop`` cannot isolate this, because ``read_run_records()`` prunes a
+        dead-PID ``.pid`` file before ``stop`` ever reaches the removal, and
+        making the usurper live enough to survive that would also make it a
+        second target of the same ``--port`` selector.
+        """
+        from conductor.cli.app import _remove_stopped_record
+        from conductor.fleet.records import RunRecord
+
+        # A different run has since bound port 8080 and written its own file.
+        usurper = _write_pid(pid_tmpdir, _OTHER_PID, 8080, "/tmp/other.yaml", run_id="otherrun")
+
+        stopped = RunRecord(
+            run_id="stopme",
+            pid=_LIVE_PID,
+            workflow_path="/tmp/wf.yaml",
+            workflow_name="wf",
+            started_at="2026-03-03T00:00:00",
+            event_log_path="/tmp/conductor/stopme.events.jsonl",
+            port=8080,
+            mode="bg",
+            checkpoint_dir=None,
+        )
+
+        _remove_stopped_record(stopped)
+
+        assert usurper.exists(), "a live run's PID file was deleted by a port-only match"
+
+    def test_the_matching_legacy_pid_file_is_still_removed(
+        self, pid_tmpdir: Path, tmp_path: Path
+    ) -> None:
+        """The fallback must still work for the case it exists to serve."""
+        pid = os.getpid()
+        legacy = _write_pid(pid_tmpdir, pid, 8082, "/tmp/wf.yaml", run_id="legacyrun")
+
+        with _stops_cleanly():
+            result = runner.invoke(app, ["stop", "--port", "8082"])
+
+        assert result.exit_code == 0
+        assert not legacy.exists()
+
+
+class TestJsonModeStillHonorsTheForegroundGate:
+    """``--json`` must take D1's refusal branch, not skip the gate.
+
+    JSON mode cannot prompt -- but "cannot ask" is precisely the condition
+    the non-TTY branch treats as grounds to *refuse*, whose own docstring
+    says defaulting to yes "would reinstate the exact hazard D1 closes".
+    Skipping the gate instead let ``conductor stop --all --json`` kill a
+    developer's foreground run with no prompt, no ``--yes``, and no refusal.
+    """
+
+    def test_json_without_yes_refuses_to_stop_a_foreground_run(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("j1000001", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill") as mock_kill,
+        ):
+            result = runner.invoke(app, ["stop", "--all", "--json"])
+
+        assert result.exit_code == 1
+        mock_kill.assert_not_called()
+
+    def test_json_with_yes_proceeds(self, pid_tmpdir: Path) -> None:
+        pid = os.getpid()
+        _write_run_record("j1000002", pid, None, "/tmp/wf.yaml", mode="fg")
+
+        with _stops_cleanly():
+            result = runner.invoke(app, ["stop", "--all", "--json", "--yes"])
+
+        assert result.exit_code == 0
+
+    def test_json_over_a_background_only_fleet_is_unaffected(self, pid_tmpdir: Path) -> None:
+        """D1 never gated a bg run, and --json must not start."""
+        pid = os.getpid()
+        _write_run_record("j1000003", pid, 8090, "/tmp/wf.yaml", mode="bg")
+
+        with _stops_cleanly():
+            result = runner.invoke(app, ["stop", "--all", "--json"])
+
+        assert result.exit_code == 0
+
+
+class TestUnknownForegroundModeStillConfirms:
+    """A newer Conductor's foreground mode must not disarm the D1 gate.
+
+    An unrecognised ``mode`` is normalised rather than treated as corrupt
+    (a corrupt record is deleted without a liveness check, which would
+    orphan a live run). But the normalisation target matters: folding an
+    unknown ``fg-*`` into ``bg`` keeps the record *and* silently removes
+    the confirmation prompt guarding it, so ``stop --all`` would kill a
+    foreground run with no prompt at all.
+    """
+
+    def test_an_unknown_fg_variant_is_still_gated(self, pid_tmpdir: Path) -> None:
+        from conductor.fleet.records import run_records_dir
+
+        pid = os.getpid()
+        (run_records_dir() / "future01.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "future01",
+                    "pid": pid,
+                    "workflow_path": "/tmp/wf.yaml",
+                    "workflow_name": "wf",
+                    "started_at": "2026-03-03T00:00:00",
+                    "event_log_path": "/tmp/conductor/future01.events.jsonl",
+                    "port": None,
+                    "mode": "fg-tui",
+                    "checkpoint_dir": None,
+                }
+            )
+        )
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.app.os.kill") as mock_kill,
+        ):
+            # Non-interactive and no --yes: the gate must refuse.
+            result = runner.invoke(app, ["stop", "--all"])
+
+        assert result.exit_code == 1
+        mock_kill.assert_not_called()

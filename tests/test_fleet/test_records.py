@@ -826,17 +826,30 @@ class TestPlatformSpecificPidBounds:
             RunRecord.from_dict({"pid": 2**32})
 
 
-class TestFromDictInvalidModeRejected:
-    """An explicit ``mode`` outside the known set must be rejected rather
-    than silently accepted, since it drives D1's stop-confirmation gating."""
+class TestFromDictModeCoercion:
+    """``mode`` drives D1's stop-confirmation gating, so a *malformed* value
+    must be rejected — but an *unrecognised* one must not be, because a
+    rejection routes into the corrupt-and-delete path that never consults
+    liveness."""
 
-    def test_rejects_unknown_mode_string(self) -> None:
-        with pytest.raises(ValueError, match="invalid mode"):
-            RunRecord.from_dict({"pid": 123, "mode": "not-a-real-mode"})
+    def test_unknown_mode_normalises_to_bg(self) -> None:
+        record = RunRecord.from_dict({"pid": 123, "mode": "not-a-real-mode"})
+        assert record.mode == "bg"
+
+    def test_an_unknown_foreground_variant_fails_closed_to_fg(self) -> None:
+        """``mode`` also arms D1's stop confirmation, so an unknown ``fg-*``
+        must not fold into ``bg`` -- that would keep the record intact and
+        silently drop the prompt guarding it."""
+        record = RunRecord.from_dict({"pid": 123, "mode": "fg-tui"})
+        assert record.mode == "fg"
 
     def test_rejects_non_string_mode(self) -> None:
         with pytest.raises(ValueError, match="invalid mode"):
             RunRecord.from_dict({"pid": 123, "mode": 1})
+
+    def test_rejects_explicit_null_mode(self) -> None:
+        with pytest.raises(ValueError, match="invalid mode"):
+            RunRecord.from_dict({"pid": 123, "mode": None})
 
     def test_accepts_each_valid_mode(self) -> None:
         for mode in ("fg", "fg-web", "bg"):
@@ -847,9 +860,31 @@ class TestFromDictInvalidModeRejected:
         record = RunRecord.from_dict({"pid": 123})
         assert record.mode == "bg"
 
-    def test_invalid_mode_in_a_record_file_is_pruned_not_raised(self, fleet_env: Path) -> None:
+    def test_a_live_run_written_by_a_newer_conductor_survives(self, fleet_env: Path) -> None:
+        """A mode this version has never heard of must not delete the record.
+
+        ``_read_and_prune`` deletes a corrupt record *without* checking
+        liveness, so treating an unrecognised mode as corruption would make
+        an older Conductor silently orphan a live newer run from ``stop``,
+        ``status`` and the fleet -- the exact bug the run record exists to
+        fix. The record is kept, surfaced, and gated as ``bg`` (the value
+        that never triggers a spurious foreground confirmation).
+        """
+        path = run_records_dir() / "newmode.json"
+        path.write_text(
+            json.dumps({"pid": os.getpid(), "run_id": "newmode", "mode": "fg-tui"}),
+        )
+
+        records = read_run_records()
+
+        assert [r.run_id for r in records] == ["newmode"]
+        # Normalised, not deleted -- and to `fg`, so D1 still confirms.
+        assert records[0].mode == "fg"
+        assert path.exists()
+
+    def test_a_genuinely_malformed_record_is_still_pruned(self, fleet_env: Path) -> None:
         bad_path = run_records_dir() / "badmode.json"
-        bad_path.write_text(json.dumps({"pid": 123, "run_id": "badmode", "mode": "evil"}))
+        bad_path.write_text(json.dumps({"pid": 123, "run_id": "badmode", "mode": 17}))
 
         records = read_run_records()
 

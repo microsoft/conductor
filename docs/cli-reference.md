@@ -249,7 +249,7 @@ conductor status [OPTIONS]
 
 `conductor stop` with no arguments also lists running workflows — but it *stops* one when exactly one is running, so the natural "what's running?" reflex is destructive precisely when there is a single run to lose. `conductor status` never terminates anything.
 
-It is also read-only on disk: unlike `stop`, it never removes a PID file, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
+It is also read-only on disk: unlike `stop`, it never removes a run record, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
 
 The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone. The table renders `Started` to minute precision in UTC, and the dashboard URL wraps onto a second line rather than being cropped on a narrow terminal. `--json` reports the exact recorded `started_at` value regardless.
 
@@ -380,17 +380,15 @@ run started before upgrading stays stoppable.
 > `--web-bg` child, which is spawned in its own detached process group) in
 > another console.
 
-`stop` reads those files and escalates through a ladder, confirming each rung before moving to the next:
+The escalation ladder, confirming each rung before moving to the next:
 
 1. **Ask the dashboard to cancel** (`POST /api/kill`) — the graceful rung, which lets the run write a checkpoint so you can `conductor resume` later.
 2. **Send a platform signal** — `SIGTERM` on POSIX, `CTRL_BREAK_EVENT` on Windows.
 3. **Force-terminate** — `SIGKILL` / `TerminateProcess`.
 
-A PID file is removed **only once its process is confirmed gone**. A workflow that survives every rung keeps its file and stays discoverable, rather than becoming an untracked orphan still holding its port.
-
 ### Identity and `--force`
 
-Between a PID file being written and `stop` reading it, the OS may have recycled that PID onto an unrelated process. Every PID-directed rung is therefore gated on the dashboard confirming its own PID first. Three outcomes:
+Between a run record being written and `stop` reading it, the OS may have recycled that PID onto an unrelated process. Every PID-directed rung is therefore gated on the dashboard confirming its own PID first. Three outcomes:
 
 | Identity | Meaning | Behavior |
 |----------|---------|----------|
@@ -432,12 +430,15 @@ as fair game just like any other run.
 The caller's own run is identified by three signals, tried in order (first
 match wins):
 
-1. **`CONDUCTOR_RUN_ID`** env var matching the PID file's `run_id`
-   (case-insensitively, since a manually-exported env var could differ in
-   case from the minted lowercase id). Set on every `--web-bg` child (and
-   inherited by its descendants, including a spawned `conductor stop`).
+1. **`CONDUCTOR_RUN_ID` / `CONDUCTOR_SELF_RUN_ID`** env var matching the
+   record's `run_id` (case-insensitively, since a manually-exported env var
+   could differ in case from the minted lowercase id). The first is set on
+   every `--web-bg` child; the second is exported by *every* run into its own
+   environment, so a foreground run — which has no port for signal 2 and no
+   `/proc` for signal 3 on Windows or macOS — can still recognise itself.
+   Both are inherited by descendants, including a spawned `conductor stop`.
 2. **`CONDUCTOR_WEB_BG=1` + `CONDUCTOR_WEB_PORT`** matching the entry's port —
-   a compatibility signal used only for PID files written before `run_id`
+   a compatibility signal used only for records written before `run_id`
    existed (empty `run_id`).
 3. **Process ancestry** — a `/proc/<pid>/status` `PPid:` walk plus a session-id
    check, so any descendant of the background process (however it was
@@ -575,7 +576,7 @@ referenced by a live (or currently-resuming) run. A retained or live run's
 alongside its event log.
 
 > **Warning:** pruning an event log makes that run's history unavailable to
-> [`conductor replay`](#conductor-run) — `replay` reads the JSONL event log
+> `conductor replay` — `replay` reads the JSONL event log
 > directly, so once it's deleted there is nothing left to replay.
 
 With no `--keep-last`, the configured value from
@@ -1024,6 +1025,8 @@ are hidden from `--help` and are slated for removal in a future release.
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
 | `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) and by `conductor guide` (checked by `POST /api/guidance`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_HOME` | Overrides `~/.conductor/` as the location of run records, the registry config, and `config.toml` |
+| `CONDUCTOR_FLEET_NO_ANIM` | Set to any non-empty value to disable Fleet Manager TUI animation (spinners, sparkline motion, splash). Useful over slow SSH links, in recorded terminals, and where movement is distracting |
 
 ## Exit Codes
 

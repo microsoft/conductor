@@ -8,7 +8,7 @@ that same week — ``conductor status`` (#389) and ``conductor plugin list``
 (#398) — were written against the unfixed pattern in files the fix never
 touched.
 
-So the convention is enforced by reading the source. Eight rules, each closing
+So the convention is enforced by reading the source. Ten rules, each closing
 a hole the previous one leaves open:
 
 A. Every ``Console`` is built by ``make_console`` (or explicitly passes
@@ -36,6 +36,18 @@ G. ``typer`` ``help=``/``epilog=`` text escapes its brackets. Typer renders
    ``conductor run --help`` entirely.
 H. ``rich.markup.escape`` is never used. It is not byte-exact, so it cannot
    round-trip a value that already contains a backslash before a bracket.
+I. Textual's own content sinks -- ``Static``/``Label``, ``App.notify``, and
+   every ``str`` cell of a ``DataTable`` -- are handed a ``Text`` or
+   ``markup=False`` when the value is dynamic. Textual parses these itself
+   with ``markup=True`` by default, so neither rule A nor rule D reaches
+   them. This is the hole the Fleet Manager TUI landed in: the
+   kill-confirmation dialog parsed the workflow names it was listing for
+   deletion, and the run-detail table went on parsing agent names after
+   that was fixed.
+J. A Typer command's *docstring* escapes its brackets. Typer falls back to
+   the docstring when no ``help=`` is given, so rule G's kwarg check misses
+   it entirely -- ``conductor fleet prune --help`` lost the whole
+   ``[fleet.retention]`` config section name that way.
 
 A failure names file and line, and the fix is always one of: wrap in
 ``styled(...)``, wrap in ``Text.from_markup(...)`` when there is nothing to
@@ -50,6 +62,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -84,6 +97,24 @@ SAFE_WRAPPERS = _SAFE_BARE_CALLS | _SAFE_TEXT_METHODS
 # missing from ``conductor run --help``.
 TYPER_TEXT_KWARGS = {"help", "epilog", "rich_help_panel", "short_help"}
 TYPER_CALLEES = {"Option", "Argument", "Typer", "command", "callback"}
+
+# Textual renders its own content through rich, with ``markup=True`` by
+# default -- exactly the inversion ``make_console`` exists to undo, in a
+# framework ``make_console`` cannot reach. ``Static``/``Label`` parse their
+# first positional argument; ``App.notify`` parses its message. This is the
+# hole that let ~4,500 lines of TUI land unflagged: the kill-confirmation
+# dialog markup-parsed the workflow names it was naming for deletion.
+TEXTUAL_CONTENT_CLASSES = {"Static", "Label"}
+TEXTUAL_NOTIFY = "notify"
+# `DataTable` runs `Text.from_markup()` on any `str` cell unconditionally,
+# consulting no console or widget setting (`textual/widgets/_data_table.py`).
+# Rule D covers these callees for *literal* markup only, so a dynamic cell
+# was reachable by nothing -- which is how a run-detail row went on
+# markup-parsing workflow-authored agent names after B1 was fixed.
+TEXTUAL_CELL_SINKS = {"add_row", "add_column"}
+# The content parameter is positional-*or*-keyword in both signatures, so a
+# rule that only inspects `args[0]` is bypassed by writing it as a kwarg.
+TEXTUAL_CONTENT_KWARGS = {"content", "message", "renderable"}
 
 
 def _python_files() -> list[Path]:
@@ -177,9 +208,47 @@ def _safe_text_names(scope: ast.AST) -> set[str]:
             if _annotation_is_text(arg.annotation):
                 safe.add(arg.arg)
 
+    # A helper declared ``-> Text`` produces one, so a call to it is as safe
+    # as ``styled(...)``. Resolved from the annotation rather than listed by
+    # name, so a helper that later stops returning ``Text`` stops being safe.
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _annotation_is_text(
+            node.returns
+        ):
+            safe.add(node.name)
+
+    # A name bound *once* to a plain string literal is conductor's own text,
+    # so any markup in it is intended -- the same reason a literal passed
+    # directly is already accepted. Bound *more* than once it is not: the
+    # ordinary `label = "unknown"` / `if x: label = x.name` shape would
+    # otherwise clear a runtime value for the whole scope, since this
+    # resolver is flow-insensitive and never un-clears a name.
+    assigned_counts: Counter[str] = Counter()
+    for node in _scope_nodes(scope):
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assigned_counts[target.id] += 1
+
+    for node in _scope_nodes(scope):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and assigned_counts[target.id] == 1:
+                safe.add(target.id)
+
     def _value_is_safe(value: ast.AST) -> bool:
         if _is_safe_wrapper(value):
             return True
+        # ``Text(...) + Text.from_markup(...)`` is still a ``Text``.
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+            return _value_is_safe(value.left) and _value_is_safe(value.right)
         if isinstance(value, ast.IfExp):
             return _value_is_safe(value.body) and _value_is_safe(value.orelse)
         if isinstance(value, ast.Name):
@@ -214,6 +283,23 @@ def _is_dynamic(node: ast.AST, safe_names: frozenset[str] = frozenset()) -> bool
         return False
     if isinstance(node, ast.Name) and node.id in safe_names:
         return False
+    # Bare-``Name`` calls, plus a ``self.`` receiver. Matching an arbitrary
+    # attribute call would defeat ``_SAFE_BARE_CALLS``' own reasoning:
+    # ``_callee`` returns the trailing name, so a module defining ``def
+    # join(...) -> Text`` would clear every ``", ".join(runtime_values)`` in
+    # it. ``self.<name>`` has no such ambiguity -- the receiver is the class
+    # the method was resolved from.
+    if isinstance(node, ast.Call):
+        fn = node.func
+        if isinstance(fn, ast.Name) and fn.id in safe_names:
+            return False
+        if (
+            isinstance(fn, ast.Attribute)
+            and isinstance(fn.value, ast.Name)
+            and fn.value.id == "self"
+            and fn.attr in safe_names
+        ):
+            return False
     if isinstance(node, ast.IfExp):
         return _is_dynamic(node.body, safe_names) or _is_dynamic(node.orelse, safe_names)
     return isinstance(node, ast.Name | ast.Attribute | ast.Call | ast.Subscript | ast.BinOp)
@@ -520,6 +606,119 @@ def _violates_h(node: ast.AST) -> list[str]:
     return []
 
 
+def _has_markup_false(node: ast.Call) -> bool:
+    """Does this call explicitly opt out of markup parsing?"""
+    return any(
+        kw.arg == "markup" and isinstance(kw.value, ast.Constant) and kw.value.value is False
+        for kw in node.keywords
+    )
+
+
+def _text_returning_names(tree: ast.Module) -> set[str]:
+    """Names of functions in ``tree`` declared to return a ``Text``."""
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and _annotation_is_text(node.returns)
+    }
+
+
+def _text_returning_helpers() -> frozenset[str]:
+    """Every function in ``src/conductor`` declared to return a ``Text``.
+
+    Resolved project-wide because the helpers that build a cell
+    (``status_label``, ``mode_label``, ``empty_cell``, ``_format_duration``)
+    are defined in ``theme.py`` and *imported* by the screens that use them,
+    so a per-scope walk cannot see them. Keyed by bare name, which is the
+    same approximation ``_SAFE_BARE_CALLS`` makes -- a name collision with a
+    ``-> str`` helper elsewhere would clear it wrongly, which is the accepted
+    cost of not maintaining a hand-written allowlist. The set is derived from
+    annotations, so a helper that stops returning ``Text`` stops being safe.
+    """
+    names: set[str] = set()
+    for path in _python_files():
+        names |= _text_returning_names(ast.parse(path.read_text(encoding="utf-8")))
+    return frozenset(names)
+
+
+def _imports_textual_datatable(tree: ast.Module) -> bool:
+    """Does this module import Textual's ``DataTable``?
+
+    Rule I's cell check applies only to that widget, which parses every
+    ``str`` cell. Rich's ``Table`` takes its markup setting from the console,
+    and every conductor console is built ``markup=False`` by rule A -- so
+    keying on "imports textual" would flag ``cli/fleet.py``'s Rich table,
+    which imports ``textual`` only for its availability flag.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").startswith("textual")
+            and any(alias.name == "DataTable" for alias in node.names)
+        ):
+            return True
+    return False
+
+
+def _violates_i(node: ast.AST, safe: frozenset[str], *, textual_tables: bool = False) -> list[str]:
+    """Textual content sinks parse markup themselves, so they need a ``Text``.
+
+    ``Static``/``Label`` parse their first positional argument, ``App.notify``
+    parses its message, and ``DataTable.add_row``/``add_column`` parse *every*
+    ``str`` cell -- all with ``markup=True`` by default. A literal is fine --
+    it is conductor's own, and the tags are intended. A *dynamic* value is
+    not: a workflow named ``plan[wip].yaml`` is silently rendered as
+    ``plan.yaml``.
+    """
+    if not isinstance(node, ast.Call):
+        return []
+    name = _callee(node)
+    is_cell_sink = textual_tables and name in TEXTUAL_CELL_SINKS
+    if name not in TEXTUAL_CONTENT_CLASSES and name != TEXTUAL_NOTIFY and not is_cell_sink:
+        return []
+    if _has_markup_false(node):
+        return []
+
+    # Every cell of a row is rendered; only the first argument of the others.
+    checked: list[ast.AST] = list(node.args) if is_cell_sink else node.args[:1]
+    checked += [kw.value for kw in node.keywords if kw.arg in TEXTUAL_CONTENT_KWARGS]
+    return [f"{name}(...)" for arg in checked if _is_dynamic(arg, safe)]
+
+
+def _decorator_name(node: ast.AST) -> str | None:
+    """The trailing name of a decorator, whether or not it is called.
+
+    ``@app.command`` and ``@app.command(...)`` are the same registration and
+    must both be recognised, so this unwraps the ``ast.Call`` shape first.
+    """
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _violates_j(node: ast.AST) -> list[str]:
+    """A Typer command's docstring is help text, and is markup-parsed.
+
+    Typer uses the docstring when ``help=`` is absent, so rule G -- which
+    only inspects kwargs -- never sees it.
+    """
+    if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        return []
+    if not any(_decorator_name(d) in {"command", "callback"} for d in node.decorator_list):
+        return []
+    doc = ast.get_docstring(node, clean=False)
+    if doc is None:
+        return []
+    if not MARKUP_RE.search(doc.replace("\\[", "")):
+        return []
+    return ["typer command docstring"]
+
+
 def _report(violations: list[str], remedy: str) -> str:
     listing = "\n".join(f"  {v}" for v in violations)
     return f"{len(violations)} markup-unsafe call site(s):\n{listing}\n\n{remedy}"
@@ -760,6 +959,61 @@ class TestRuleHEscapeIsNotUsed:
         )
 
 
+class TestRuleITextualSinksReceiveText:
+    """Textual parses its own content, and ``make_console`` cannot reach it.
+
+    ``Static``/``Label`` parse their first positional argument and
+    ``App.notify`` parses its message, both defaulting to ``markup=True``.
+    That default is the one rule A inverts for every conductor console, so a
+    TUI is the one place in the codebase where the old, unsafe default is
+    still live. It cost the kill-confirmation dialog the workflow names it
+    existed to display: ``plan[wip].yaml`` renders as ``plan.yaml`` in the
+    prompt asking whether to kill it.
+    """
+
+    def test_textual_content_sinks_are_not_given_runtime_values(self) -> None:
+        helpers = _text_returning_helpers()
+        violations: list[str] = []
+        for path in _python_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            safe_scopes = _scope_names(tree, _safe_text_names)
+            textual_tables = _imports_textual_datatable(tree)
+            for node in ast.walk(tree):
+                safe = _names_for(safe_scopes, node) | helpers
+                violations += [
+                    f"{_rel(path)}:{node.lineno}: {v}"
+                    for v in _violates_i(node, safe, textual_tables=textual_tables)
+                ]
+        assert not violations, _report(
+            violations,
+            "Textual defaults to markup=True. Wrap the value in Text(...) / "
+            "styled(...), or pass markup=False.",
+        )
+
+
+class TestRuleJTyperDocstringsAreEscaped:
+    """A command's docstring *is* its help text when ``help=`` is absent.
+
+    Rule G only reads kwargs, so a docstring slips past it into exactly the
+    same parser. ``conductor fleet prune --help`` lost the entire
+    ``[fleet.retention]`` section name this way -- the one thing the sentence
+    existed to name -- while the ``--keep-last`` help a few lines above,
+    which uses ``help=``, escaped correctly and was caught by rule G.
+    """
+
+    def test_typer_command_docstrings_have_no_unescaped_markup(self) -> None:
+        violations: list[str] = []
+        for path in _python_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                violations += [f"{_rel(path)}:{node.lineno}: {v}" for v in _violates_j(node)]
+        assert not violations, _report(
+            violations,
+            "typer renders a command docstring as help through rich, so "
+            "escape brackets as \\[ ... ].",
+        )
+
+
 class TestTheGuardsActuallyDetectViolations:
     """Negative controls.
 
@@ -779,6 +1033,10 @@ class TestTheGuardsActuallyDetectViolations:
         docstrings = _docstring_ids(tree)
         safe_scopes = _scope_names(tree, _safe_text_names)
         maybe_scopes = _scope_names(tree, _maybe_text_names)
+        # Mirrors the source scan, which unions the project-wide `-> Text`
+        # helper names in. Without this a control would run a *different*
+        # resolution from the rule it claims to control.
+        helpers = _text_returning_names(tree)
         found: list[str] = []
         for node in ast.walk(tree):
             if rule == "A":
@@ -801,6 +1059,14 @@ class TestTheGuardsActuallyDetectViolations:
                 found += _violates_a_subclass(node)
             elif rule == "H":
                 found += _violates_h(node)
+            elif rule == "I":
+                found += _violates_i(node, _names_for(safe_scopes, node) | helpers)
+            elif rule == "I-table":
+                found += _violates_i(
+                    node, _names_for(safe_scopes, node) | helpers, textual_tables=True
+                )
+            elif rule == "J":
+                found += _violates_j(node)
             else:  # pragma: no cover - guard against a typo in a new control
                 raise AssertionError(f"unknown rule {rule!r}")
         return found
@@ -987,6 +1253,135 @@ class TestTheGuardsActuallyDetectViolations:
     )
     def test_rule_h_accepts_safe_sites(self, snippet: str) -> None:
         assert not self._violations_in(snippet, "H")
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            "Static(self._message, id='x')",
+            "Static(f'Killed {name}')",
+            "Label(record.workflow_name)",
+            "self.notify(f'Gate failed: {outcome.message}')",
+            "self.notify(reason, severity='error')",
+        ],
+    )
+    def test_rule_i_flags_a_runtime_value_at_a_textual_sink(self, snippet: str) -> None:
+        assert self._violations_in(snippet, "I")
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            "Static(Text(self._message), id='x')",
+            'Static("[bold]\\\\[y][/bold] Confirm", id="hint")',
+            "Static(id='resolve-message')",
+            "self.notify(f'Killed {n} run(s).', markup=False)",
+            'self.notify("Kill cancelled.", severity="warning")',
+            'Static(styled("[red]{}[/red]", str(e)))',
+        ],
+    )
+    def test_rule_i_accepts_safe_sites(self, snippet: str) -> None:
+        assert not self._violations_in(snippet, "I")
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            '@app.command()\ndef p() -> None:\n    """Enabled via [fleet.retention].enabled."""\n',
+            '@app.callback()\ndef main() -> None:\n    """Takes [@registry] refs."""\n',
+            '@fleet_app.command\ndef listing() -> None:\n    """Reads [fleet.retention]."""\n',
+        ],
+    )
+    def test_rule_j_flags_markup_in_a_command_docstring(self, snippet: str) -> None:
+        assert self._violations_in(snippet, "J")
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            '@app.command()\ndef p() -> None:\n    """Via \\\\[fleet.retention].enabled."""\n',
+            '@app.command()\ndef prune() -> None:\n    """Prune old event logs."""\n',
+            '@app.command()\ndef prune() -> None:\n    """Keeps [0-9] files."""\n',
+            'def helper() -> None:\n    """Not a command, so [fleet.retention] is inert."""\n',
+            "@app.command()\ndef prune() -> None:\n    pass\n",
+        ],
+    )
+    def test_rule_j_accepts_safe_sites(self, snippet: str) -> None:
+        assert not self._violations_in(snippet, "J")
+
+    # -- Controls for the *clearing* logic in `_safe_text_names`. ------------
+    # These pin the side that produces false negatives. A rule that clears too
+    # much reports "all clear" exactly like a rule that matches nothing, and
+    # this resolver is flow-insensitive: it never un-clears a name, so every
+    # widening has to be bounded at the point it is added.
+
+    def test_a_rebound_constant_name_is_not_treated_as_safe(self) -> None:
+        """`label = "unknown"` / `if x: label = x.name` is the ordinary way to
+        write a defaulted label. Clearing it on the strength of the literal
+        would wave the runtime value through every sink."""
+        src = 'def f(record):\n    label = "unknown"\n    label = record.name\n    Static(label)\n'
+        assert self._violations_in(src, "I")
+
+    def test_a_rebound_constant_name_is_not_cleared_for_from_markup(self) -> None:
+        """The same hole against rule C, which always parses."""
+        src = 'def f(x):\n    tpl = "[b]hi[/b]"\n    tpl = x.raw\n    Text.from_markup(tpl)\n'
+        assert self._violations_in(src, "C")
+
+    def test_a_singly_bound_constant_name_is_safe(self) -> None:
+        """The case the widening exists for: a module-level message constant."""
+        src = 'MESSAGE = "[bold]No runs yet.[/bold]"\ndef f():\n    Static(MESSAGE)\n'
+        assert not self._violations_in(src, "I")
+
+    def test_an_augmented_constant_name_is_not_safe(self) -> None:
+        src = 'def f(record):\n    s = "a"\n    s += record.name\n    Static(s)\n'
+        assert self._violations_in(src, "I")
+
+    def test_a_binop_with_a_runtime_operand_is_not_safe(self) -> None:
+        src = 'def f(record):\n    t = Text("a") + record.name\n    Static(t)\n'
+        assert self._violations_in(src, "I")
+
+    def test_a_text_returning_helper_does_not_clear_a_same_named_method(self) -> None:
+        """`_callee` returns the trailing name, so an arbitrary attribute call
+        must not be cleared by a module-level helper of the same name --
+        otherwise `def join(...) -> Text` clears every `", ".join(values)`.
+
+        Driven through rule I, which is the rule that actually unions the
+        `-> Text` helper names in; running it through a rule that does not
+        would pass without exercising the mechanism at all.
+        """
+        src = (
+            "def join(parts) -> Text:\n    return Text()\n\n"
+            'def f(names):\n    Static(", ".join(names))\n'
+        )
+        assert self._violations_in(src, "I")
+
+    def test_a_text_returning_helper_clears_its_own_bare_call(self) -> None:
+        """The case that widening exists for, so the control above cannot
+        pass merely because nothing is ever cleared."""
+        src = (
+            "def label(x) -> Text:\n    return Text()\n\n"
+            "def f(record):\n    Static(label(record.name))\n"
+        )
+        assert not self._violations_in(src, "I")
+
+    def test_a_self_method_returning_text_is_cleared(self) -> None:
+        src = (
+            "class S:\n"
+            "    def _cell(self, k) -> Text:\n        return Text()\n"
+            "    def f(self, k):\n        Static(self._cell(k))\n"
+        )
+        assert not self._violations_in(src, "I")
+
+    def test_rule_i_flags_a_dynamic_datatable_cell(self) -> None:
+        """`DataTable` markup-parses *every* `str` cell, not just the first."""
+        src = "def f(table, agent):\n    table.add_row(Text('ok'), agent.name)\n"
+        assert self._violations_in(src, "I-table")
+
+    def test_rule_i_ignores_table_cells_outside_a_textual_module(self) -> None:
+        """A Rich `Table` takes its markup setting from the console, which
+        rule A already locks to markup=False."""
+        src = "def f(table, agent):\n    table.add_row(Text('ok'), agent.name)\n"
+        assert not self._violations_in(src, "I")
+
+    def test_rule_i_flags_the_keyword_form(self) -> None:
+        src = "def f(record):\n    Static(content=record.workflow_name)\n"
+        assert self._violations_in(src, "I")
 
     def test_rule_f_does_not_leak_names_across_functions(self) -> None:
         """A ``Text`` name in one function must not clear another's local.

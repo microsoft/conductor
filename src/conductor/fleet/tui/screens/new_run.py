@@ -442,16 +442,13 @@ class NewRunScreen(Screen):
         ``asyncio.to_thread`` rather than run inline, and only ever
         triggered by this explicit action.
 
-        The Launch button is already disabled synchronously by
-        ``on_button_pressed`` before this worker starts (a guard against a
-        second click starting a duplicate, potentially billable run); it is
-        re-enabled here only on failure -- on success the screen pops away
-        entirely, so there is nothing left to re-enable.
+        Re-entrancy is guarded by ``self._launching`` rather than a
+        widget's ``disabled`` state: a second ``ctrl+s`` while a launch is
+        in flight would start a duplicate, billable run. The flag is
+        cleared only on failure -- on success the screen pops away
+        entirely, so there is nothing left to reset.
         """
         if self._launching:
-            # A second ctrl+s while a launch is in flight would start a
-            # duplicate (billable) run. This guard used to live on the
-            # button's `disabled` state; with no button it belongs here.
             return
 
         resolved = self._resolved

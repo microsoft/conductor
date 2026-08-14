@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from conductor.config.instructions import DiscoveredInstruction
     from conductor.config.schema import ProviderSettings, WorkflowConfig
     from conductor.events import WorkflowEvent
+    from conductor.fleet.records import RunMode
 
 
 logger = logging.getLogger(__name__)
@@ -1744,7 +1745,7 @@ def _print_loaded_instructions(detailed: list[DiscoveredInstruction]) -> None:
         )
 
 
-def _derive_run_mode(*, web: bool, web_bg: bool) -> str:
+def _derive_run_mode(*, web: bool, web_bg: bool) -> RunMode:
     """Derive the fleet run-record ``mode`` field from web/web-bg flags.
 
     Mirrors the ``bg_mode`` expression used elsewhere in this module to
@@ -1799,8 +1800,17 @@ def _write_run_record_for_current_process(
     Never raises: a failure to write this diagnostic/discovery record must
     not abort the workflow it describes.
     """
+    from conductor.cli.self_run import SELF_RUN_ID_ENV
     from conductor.engine.checkpoint import CheckpointManager
     from conductor.fleet.records import RunRecord, write_run_record
+
+    # Export the id so descendants inherit it. This is what makes `stop`'s
+    # self-exclusion signal 1 work for a *foreground* run: signal 2 is
+    # bg-only by definition and signal 3 walks `/proc`, so without this a fg
+    # run has no self-detection at all off Linux, and an agent step running
+    # `conductor stop --all` terminates its own workflow (issue #399). Set
+    # before the write so it holds even if the write fails.
+    os.environ[SELF_RUN_ID_ENV] = event_log_subscriber.run_id
 
     try:
         write_run_record(
@@ -1816,8 +1826,36 @@ def _write_run_record_for_current_process(
                 checkpoint_dir=str(CheckpointManager.get_checkpoints_dir()),
             )
         )
-    except Exception:
+    except Exception as exc:
         logger.warning("Failed to write fleet run record", exc_info=True)
+        # Conductor installs no logging handlers, so the line above reaches
+        # `logging.lastResort` as unattributed stderr. Without the record
+        # this run is invisible to `stop`/`status`/`fleet list`, i.e.
+        # silently back to the bug the run record exists to fix, so say so
+        # where the user will see it. (Under --web-bg the child's stderr is
+        # itself a temp log; that case is covered instead by the launch
+        # health gate in `bg_runner._finalize_background_launch`, which
+        # fails the launch when no record appears.)
+        #
+        # Guarded with BaseException, not Exception: rich turns a broken
+        # pipe into `SystemExit` (`Console._on_broken_pipe`), which would
+        # sail past every `except Exception` between here and the top of
+        # `conductor run` and kill the workflow this diagnostic describes --
+        # breaking this function's "never raises" contract. A full disk
+        # triggers both halves at once: the record write fails *and* the
+        # stderr write fails.
+        try:
+            make_console(stderr=True).print(
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] could not write this run's fleet "
+                    "record ({}). It will not appear in `conductor status` / `fleet list` "
+                    "and cannot be stopped with `conductor stop`; use Ctrl-C or `kill {}`.",
+                    exc,
+                    os.getpid(),
+                )
+            )
+        except BaseException:  # noqa: BLE001 - a diagnostic must not kill the run
+            logger.debug("Could not print the run-record warning", exc_info=True)
 
 
 def _remove_run_record_for_current_process_safe() -> None:

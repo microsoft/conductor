@@ -62,17 +62,6 @@ EMPTY_STAGE = r"""
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 """
 
-EMPTY_STAGE_WIDTH = max(len(line) for line in EMPTY_STAGE.splitlines())
-
-#: Shown on the History screen when nothing has been retained yet.
-EMPTY_ARCHIVE = r"""
-     ┌───┐ ┌───┐ ┌───┐
-     │   │ │   │ │   │
-     │   │ │   │ │   │      the archive is empty
-     └───┘ └───┘ └───┘
-    ═══════════════════
-"""
-
 
 def wordmark(width: int) -> Text:
     """Return the widest wordmark that fits in ``width`` cells.

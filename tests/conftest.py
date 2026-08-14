@@ -104,6 +104,41 @@ def _isolate_event_log_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_run_records_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect both run-record directories away from the developer's real home.
+
+    The sibling guard above closes the ``$TMPDIR/conductor/`` leak; this one
+    closes the ``~/.conductor/runs/`` half, which is the more destructive of
+    the two. ``conductor.fleet.records.read_run_records()`` is a *pruning*
+    reader: it deletes any record it judges corrupt, identity-mismatched, or
+    owned by a dead PID. Anything that reaches it -- ``conductor stop``,
+    ``fleet list``, the TUI poll, and ``retention.prune_event_logs()`` via
+    ``_live_event_log_paths()`` -- therefore deletes the developer's *live*
+    run records unless both directories are redirected.
+
+    Both are needed because they resolve differently on purpose:
+    ``records.run_records_dir()`` honors ``CONDUCTOR_HOME``, while
+    ``cli.pid.pid_dir()`` deliberately does not (legacy ``.pid`` files must
+    stay readable at their original, unredirected location). Redirecting only
+    one leaves the other pointing at the real home, which is what
+    ``tests/test_fleet/test_retention.py`` did.
+
+    ``CONDUCTOR_HOME`` is set rather than patching ``run_records_dir``
+    itself, so a test that sets the variable for its own purposes still
+    wins -- patching the function would make that variable inert.
+    """
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor-home"))
+
+    legacy_pid_dir = tmp_path / "legacy-pid-dir"
+
+    def _isolated_pid_dir() -> Path:
+        legacy_pid_dir.mkdir(parents=True, exist_ok=True)
+        return legacy_pid_dir
+
+    monkeypatch.setattr("conductor.cli.pid.pid_dir", _isolated_pid_dir)
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     """Return the path to the test fixtures directory."""

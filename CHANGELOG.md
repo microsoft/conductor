@@ -183,6 +183,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`conductor stop` against a foreground run is no longer a silent no-op.**
+  With the interactive keyboard listener active, the `SIGTERM` handler
+  delegated to the previous disposition only when it was *callable* — and in
+  an unmodified process `signal.getsignal(SIGTERM)` returns `SIG_DFL`, an
+  `IntEnum` member that is not callable, so the signal fell through and was
+  swallowed entirely: the process survived and kept running. The handler now
+  restores the default disposition and re-raises against itself. An inherited
+  `SIG_IGN` is honoured rather than converted into a termination.
+- **A `questions` node no longer leaves the run parked at an already-answered
+  gate.** A questions node reuses `gate_presented` but never emitted the
+  matching `gate_resolved`, so every consumer of the event stream — the web
+  dashboard as well as the Fleet Manager — held a gate that never closed for
+  the remainder of the run.
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused
   `AgentOutput.input_tokens` — a *billing* total summed across every API call
@@ -396,6 +409,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pane; the view is not refit in either case. The same compensation steadies
   the graph when a running workflow's topology grows — a `for_each` fanning
   out or a subworkflow's DAG arriving.
+- **`workflow_started` now records the run's resolved `inputs`.** Two runs of
+  the same workflow are otherwise indistinguishable in a listing. The values
+  are written to the run's JSONL event log, which is also read by `conductor
+  replay` and the dashboard.
 - **Fleet Manager: `conductor stop`, `conductor fleet list`, and a new
   interactive `conductor fleet` TUI now discover every run, not just
   `--web-bg` ones.** Previously only `--web-bg` wrote a discoverable

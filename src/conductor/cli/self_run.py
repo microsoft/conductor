@@ -9,13 +9,16 @@ targeting by default.
 
 Three independent signals are tried, in order (first match wins per entry):
 
-1. **``CONDUCTOR_RUN_ID`` env var** matches the PID file's ``run_id``
-   (case-insensitively, since a manually-exported env var could differ in
-   case from the minted lowercase id). ``cli/bg_runner.py::_build_bg_env``
-   sets this on the detached background child, so every descendant of it —
-   including an agent's ``bash`` tool and the ``conductor stop`` it spawns —
-   inherits it, and ``_finalize_background_launch`` writes the same id into
-   the PID file's ``run_id`` key (added in issue #411).
+1. **``CONDUCTOR_RUN_ID`` / ``CONDUCTOR_SELF_RUN_ID`` env var** matches the
+   record's ``run_id`` (case-insensitively, since a manually-exported env
+   var could differ in case from the minted lowercase id).
+   ``cli/bg_runner.py::_build_bg_env`` sets the former on the detached
+   background child, and ``cli/run.py`` exports the latter from *every* run
+   into its own environment — so every descendant, including an agent's
+   ``bash`` tool and the ``conductor stop`` it spawns, inherits one of them.
+   The two are separate names because ``engine/event_log.py`` reads
+   ``CONDUCTOR_RUN_ID`` as "adopt this run id", which a nested
+   ``conductor run`` must not do.
 2. **``CONDUCTOR_WEB_BG=1`` + ``CONDUCTOR_WEB_PORT``** matching the entry's
    ``port``, used *only* when the entry records no ``run_id`` (i.e. ``""``).
    This is the compatibility path for PID files written before #411. Limiting
@@ -39,7 +42,10 @@ a deliberate limitation rather than an implementation gap — a
 ``CreateToolhelp32Snapshot``-based ancestry walk would be unexercised by
 conductor's ubuntu-only CI, so it is documented here instead: an agent on
 Windows whose tool runner strips ``CONDUCTOR_*`` env vars before spawning
-its shell is still exposed to this issue.
+its shell is still exposed to this issue. Signal 1 is what keeps that
+exposure narrow: a *foreground* run has no port for signal 2 and no
+``/proc`` for signal 3, so before ``CONDUCTOR_SELF_RUN_ID`` was exported it
+had no working signal at all off Linux.
 """
 
 from __future__ import annotations
@@ -60,6 +66,17 @@ logger = logging.getLogger(__name__)
 RUN_ID_ENV = "CONDUCTOR_RUN_ID"
 WEB_BG_ENV = "CONDUCTOR_WEB_BG"
 WEB_PORT_ENV = "CONDUCTOR_WEB_PORT"
+
+# Exported by ``cli/run.py::_write_run_record_for_current_process`` into the
+# *running workflow's own* environment, so every descendant it spawns -- an
+# agent's shell, a ``type: script`` step -- inherits it.
+#
+# Deliberately a separate name from ``RUN_ID_ENV`` rather than reusing it:
+# ``engine/event_log.py`` treats ``CONDUCTOR_RUN_ID`` as "adopt this run id",
+# so exporting that one would make a nested ``conductor run`` reuse its
+# parent's id and write to the same ``.events.jsonl`` path. This variable is
+# read only here.
+SELF_RUN_ID_ENV = "CONDUCTOR_SELF_RUN_ID"
 
 # Bounds the ``/proc`` ancestry walk so a malformed or cyclic ``PPid`` chain
 # cannot loop indefinitely.
@@ -194,7 +211,7 @@ def partition_own_run(records: list[RunRecord]) -> OwnRunPartition:
         input order, and a ``reasons`` map (keyed by PID) for diagnostics.
     """
     my_pids = own_run_pids()
-    my_run_id = os.environ.get(RUN_ID_ENV, "")
+    my_run_id = os.environ.get(RUN_ID_ENV, "") or os.environ.get(SELF_RUN_ID_ENV, "")
     web_bg = os.environ.get(WEB_BG_ENV) == "1"
     my_web_port = os.environ.get(WEB_PORT_ENV, "")
 

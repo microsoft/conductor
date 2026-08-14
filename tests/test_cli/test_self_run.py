@@ -350,3 +350,60 @@ class TestDescribeOwnRun:
         """
         entry = _entry(111, 8080, workflow="")
         assert describe_own_run(entry) == "unknown (port 8080)"
+
+
+class TestForegroundSelfExclusionOffLinux:
+    """A foreground run must be able to recognise itself without ``/proc``.
+
+    A fg run has no port (so signal 2 cannot fire) and, off Linux, no
+    ``/proc`` ancestry walk (so signal 3 cannot either). ``cli/run.py``
+    therefore exports ``CONDUCTOR_SELF_RUN_ID`` from every run into its own
+    environment, so a descendant -- an agent's shell, and the ``conductor
+    stop --all`` it spawns -- inherits it and signal 1 works everywhere.
+    Without it, that command terminates its own workflow (issue #399).
+    """
+
+    def test_self_run_id_identifies_a_portless_foreground_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(RUN_ID_ENV, raising=False)
+        monkeypatch.delenv(WEB_BG_ENV, raising=False)
+        monkeypatch.delenv(WEB_PORT_ENV, raising=False)
+        monkeypatch.setenv("CONDUCTOR_SELF_RUN_ID", "fgrun01")
+        # No ancestry signal available -- the Windows/macOS situation.
+        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
+
+        entries = [_entry(111, None, run_id="fgrun01")]
+        partition = partition_own_run(entries)
+
+        assert partition.own == entries
+        assert partition.others == []
+        assert partition.reasons[111] == "run id"
+
+    def test_a_different_runs_record_is_still_targetable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(RUN_ID_ENV, raising=False)
+        monkeypatch.setenv("CONDUCTOR_SELF_RUN_ID", "fgrun01")
+        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
+
+        entries = [_entry(222, None, run_id="someoneelse")]
+        partition = partition_own_run(entries)
+
+        assert partition.own == []
+        assert partition.others == entries
+
+    def test_bg_run_id_env_still_wins_when_both_are_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CONDUCTOR_RUN_ID`` is the bg child's own id; a stale inherited
+        ``CONDUCTOR_SELF_RUN_ID`` from an outer run must not displace it."""
+        monkeypatch.setenv(RUN_ID_ENV, "bgchild")
+        monkeypatch.setenv("CONDUCTOR_SELF_RUN_ID", "outerrun")
+        monkeypatch.setattr("conductor.cli.self_run.own_run_pids", lambda: frozenset())
+
+        entries = [_entry(111, 8080, run_id="bgchild"), _entry(222, 8081, run_id="outerrun")]
+        partition = partition_own_run(entries)
+
+        assert [e.pid for e in partition.own] == [111]
+        assert [e.pid for e in partition.others] == [222]

@@ -43,7 +43,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast, get_args
 
 from conductor.cli import pid as cli_pid
 
@@ -51,7 +51,12 @@ logger = logging.getLogger(__name__)
 
 _RUN_RECORDS_DIR_NAME = "runs"
 
-_VALID_MODES = frozenset({"fg", "fg-web", "bg"})
+RunMode = Literal["fg", "fg-web", "bg"]
+"""How a run was launched: plain foreground, foreground with a dashboard, or
+detached background. Written verbatim into a run record's ``mode`` field, so
+the writer is checked against the same closed set the reader accepts."""
+
+_VALID_MODES: frozenset[str] = frozenset(get_args(RunMode))
 
 # Path-safe run-id pattern. Real run_ids are ``secrets.token_hex(4)`` (see
 # ``engine/event_log.py``) — 8 lowercase hex characters — but this pattern is
@@ -232,7 +237,7 @@ def _coerce_optional_int(value: Any, field: str) -> int | None:
     return value
 
 
-def _coerce_mode(data: dict[str, Any]) -> str:
+def _coerce_mode(data: dict[str, Any]) -> RunMode:
     """Coerce the ``mode`` field, defaulting a genuinely *missing* key to ``"bg"``.
 
     Legacy records (which never had a ``mode`` key at all) are always
@@ -244,16 +249,41 @@ def _coerce_mode(data: dict[str, Any]) -> str:
     than silently defaulting to ``"bg"`` the same way a truly missing key
     does.
 
+    An *unrecognised* string is a different case and normalises rather than
+    raising. A newer Conductor may write a mode this version has never heard
+    of, and a raise here reaches ``_load_record_file`` as ``corrupt``, which
+    ``_read_and_prune`` deletes **without consulting liveness** — so a
+    version skew would silently delete a live run's record and orphan that
+    process from ``stop``, ``status`` and the fleet. This mirrors
+    :func:`conductor.engine.checkpoint.CheckpointManager.load_checkpoint`,
+    which is likewise total on an unknown ``trigger``.
+
+    The normalisation is prefix-based rather than a flat default to ``"bg"``,
+    because ``mode`` is also what arms D1's stop confirmation
+    (``cli/app.py::_foreground_targets`` matches ``fg``/``fg-web``). Folding
+    an unknown ``"fg-…"`` into ``"bg"`` would keep the record intact and
+    silently remove the prompt guarding it, so an unknown foreground variant
+    fails *closed* into ``"fg"`` (confirm before killing) and anything else
+    into ``"bg"``.
+
     Raises:
-        ValueError: If ``mode`` is present but not one of ``"fg"``,
-            ``"fg-web"``, or ``"bg"``.
+        ValueError: If ``mode`` is present but not a string (including an
+            explicit ``null``).
     """
     if "mode" not in data:
         return "bg"
     value = data["mode"]
-    if not isinstance(value, str) or value not in _VALID_MODES:
+    if not isinstance(value, str):
         raise ValueError(f"invalid mode: {value!r}")
-    return value
+    if value not in _VALID_MODES:
+        normalised: RunMode = "fg" if value.startswith("fg") else "bg"
+        logger.warning(
+            "Unrecognised run-record mode %r (from a newer Conductor?); treating as %r",
+            value,
+            normalised,
+        )
+        return normalised
+    return cast(RunMode, value)
 
 
 @dataclass(frozen=True)
@@ -287,7 +317,7 @@ class RunRecord:
     started_at: str
     event_log_path: str
     port: int | None
-    mode: str
+    mode: RunMode
     checkpoint_dir: str | None
 
     def to_dict(self) -> dict[str, Any]:

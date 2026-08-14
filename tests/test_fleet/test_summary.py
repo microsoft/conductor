@@ -322,10 +322,12 @@ class TestCurrentStep:
         _write_jsonl(path, [_event("agent_started", {"agent_name": "researcher"}, ts=start_ts)])
         record = _make_record(tmp_path, event_log_path=str(path))
 
-        summary = derive_run_summary(record, now=start_ts + 42.0)
+        summary = derive_run_summary(record)
 
         assert summary.current_step == "researcher"
         assert summary.current_step_type == "agent"
+        # Elapsed is computed lazily by the accessor, which takes its own
+        # `now` -- `derive_run_summary` has no time input to pin.
         assert summary.elapsed_on_step_seconds(now=start_ts + 42.0) == 42.0
 
     def test_agent_completed_closes_the_step(self, tmp_path: Path) -> None:

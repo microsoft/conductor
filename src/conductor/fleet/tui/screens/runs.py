@@ -31,7 +31,6 @@ from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Header, Static
 
-from conductor.console import styled
 from conductor.fleet.records import RunRecord, read_run_records
 from conductor.fleet.summary import (
     GateInfo,
@@ -383,7 +382,6 @@ def _gate_section(gate: GateInfo, resolvable: bool, width: int, max_prompt_lines
 
 def _preview_text(
     summary: RunSummary,
-    record: RunRecord,
     *,
     width: int = 100,
     height: int = 12,
@@ -391,17 +389,16 @@ def _preview_text(
 ) -> Text:
     """Render the selected run's detail for the preview pane.
 
-    The Runs table is deliberately one line per run, so everything that
-    does not fit a column -- the mode, the PID, the log path, an open
-    gate's prompt and options -- had nowhere to appear short of drilling
-    in. This pane puts it in the space the table was leaving empty, which
-    is what lets the home screen answer "what is this run doing" without a
-    screen change.
+    The Runs table is deliberately one line per run, so an open gate's
+    prompt and options, and the shape of the workflow, had nowhere to
+    appear short of drilling in. This pane puts them in the space the
+    table was leaving empty, which is what lets the home screen answer
+    "what is this run doing" without a screen change.
     """
     # Deliberately *not* a restatement of the row above: every column the
-    # table already carries (step, elapsed, tokens, cost, mode -- and now PID
-    # and port) is left out. What remains is the two things a one-line row
-    # cannot hold: an open gate's full prompt, and the shape of the workflow.
+    # table already carries (step, elapsed, tokens, cost, mode, PID and port)
+    # is left out. What remains is the two things a one-line row cannot hold:
+    # an open gate's full prompt, and the shape of the workflow.
     out = Text()
 
     # Built first so its height is known: the progress view is bounded
@@ -463,25 +460,6 @@ def _notification_message(summary: RunSummary) -> str:
             return f"{summary.workflow_name}: waiting at gate ({gate.agent_name})"
         return f"{summary.workflow_name}: waiting at gate"
     return f"{summary.workflow_name}: run failed"
-
-
-def _gate_detail_text(summary: RunSummary) -> Text:
-    """Render the gate-detail panel's text for a run with an open gate
-    (E13-T1): its prompt and the available option labels/values -- the
-    payload E6-T6 already carries on ``RunSummary.gate``, surfaced here
-    rather than only implied by the row's ``current_step``/badge.
-
-    ``gate.agent_name``/``gate.prompt``/``gate.options`` are workflow-
-    controlled data, not authored Rich markup -- escaped so a value
-    containing e.g. ``[/red]`` renders as literal text instead of raising
-    MarkupError.
-    """
-    gate = summary.gate
-    assert gate is not None
-    parts = [styled("[bold]Gate:[/bold] {}", gate.agent_name), Text(gate.prompt)]
-    if gate.options:
-        parts.append(Text("Options: " + ", ".join(gate.options)))
-    return Text("\n").join(parts)
 
 
 class RunsScreen(Screen):
@@ -944,7 +922,6 @@ class RunsScreen(Screen):
         panel.update(
             _preview_text(
                 summary,
-                record,
                 width=max(20, pane.size.width - _PREVIEW_PADDING),
                 height=max(4, pane.size.height - _PREVIEW_VERTICAL_PADDING),
                 frame=self._frame,
@@ -1061,7 +1038,7 @@ class RunsScreen(Screen):
             return
         reason = dashboard_disabled_reason(record)
         if reason is not None:
-            self.notify(f"Dashboard unavailable: {reason}", severity="warning")
+            self.notify(f"Dashboard unavailable: {reason}", severity="warning", markup=False)
             return
         url = dashboard_url(record)
         if open_dashboard(record):
@@ -1101,12 +1078,34 @@ class RunsScreen(Screen):
     async def _kill_and_refresh(self, targets: list[RunRecord]) -> None:
         """Confirm and kill ``targets`` via the shared implementation, then
         immediately refresh the table so a killed run disappears without
-        waiting out the next ~2s poll tick."""
+        waiting out the next ~2s poll tick.
+
+        Reports failures explicitly. ``stop_records`` writes its per-record
+        diagnostics to the silent console this screen hands it, so they are
+        discarded -- if a kill is refused (an identity mismatch, which is a
+        safety stop the user needs to act on) or the process survives, this
+        notification is the only place the user can learn it. Announcing
+        only ``stopped`` would report a success that did not happen, which
+        is the same defect the dashboard action above avoids.
+        """
         outcome = await kill_runs(self.app, targets)
         if outcome.declined:
             self.notify("Kill cancelled.", severity="warning")
             return
-        self.notify(f"Killed {len(outcome.stopped)} run(s).")
+        if outcome.stopped:
+            self.notify(f"Killed {len(outcome.stopped)} run(s).", markup=False)
+        if outcome.failed:
+            detail = ", ".join(
+                f"{record.workflow_name or record.pid} ({why})" for record, why in outcome.failed
+            )
+            self.notify(
+                f"Could not kill {len(outcome.failed)} run(s): {detail}",
+                severity="error",
+                timeout=15,
+                markup=False,
+            )
+        elif not outcome.stopped:
+            self.notify("Nothing was killed.", severity="warning", markup=False)
         self.refresh_runs()
 
     # -----------------------------------------------------------------
@@ -1145,7 +1144,7 @@ class RunsScreen(Screen):
 
         reason = gate_resolve_disabled_reason(record)
         if reason is not None:
-            self.notify(f"Cannot resolve gate here: {reason}", severity="warning")
+            self.notify(f"Cannot resolve gate here: {reason}", severity="warning", markup=False)
             return
 
         self._resolving_gate = True
@@ -1157,10 +1156,14 @@ class RunsScreen(Screen):
                     self.notify("Gate resolution cancelled.", severity="warning")
                     return
                 if not outcome.success:
-                    self.notify(f"Gate resolution failed: {outcome.message}", severity="error")
+                    self.notify(
+                        f"Gate resolution failed: {outcome.message}",
+                        severity="error",
+                        markup=False,
+                    )
                     return
 
-                self.notify(outcome.message)
+                self.notify(outcome.message, markup=False)
 
                 # A `questions` node asks one question per gate, so answering
                 # one immediately opens the next. Dismissing back to the table

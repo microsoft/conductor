@@ -299,7 +299,12 @@ class TestRobustness:
     ) -> None:
         """prune_event_logs() is documented never to raise; force an
         unexpected exception deep in the implementation and confirm it is
-        swallowed and reported as an empty PruneResult."""
+        swallowed, reported via ``error``, and deletes nothing.
+
+        ``error`` is what stops the CLI rendering a failed sweep as
+        "Nothing to prune." with exit 0 -- an empty result alone is
+        indistinguishable from having had nothing to do.
+        """
         _make_event_log(temp_root, "conductor-a.events.jsonl")
 
         def _boom() -> None:
@@ -308,7 +313,11 @@ class TestRobustness:
         monkeypatch.setattr("conductor.fleet.retention.event_log_root", _boom)
 
         result = prune_event_logs(keep_last=1)
-        assert result == PruneResult()
+        assert result.deleted == []
+        assert result.skipped_live == []
+        assert result.failed == []
+        assert result.error is not None
+        assert "boom" in result.error
 
 
 # ---------------------------------------------------------------------------
