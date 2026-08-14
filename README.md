@@ -118,6 +118,66 @@ conductor run workflow.yaml
 pip install git+https://github.com/microsoft/conductor.git@v1.0.0
 ```
 
+### Installing behind a proxy or private package index
+
+Conductor's dependencies are resolved from the public Python package index
+(`pypi.org` / `files.pythonhosted.org`). Some networks — corporate or otherwise
+managed devices in particular — block direct access to public package
+registries and require every package to come from an internal mirror or proxy.
+
+Conductor ships **no default mirror** and never redirects your packages on its
+own. Point your package manager at whichever index your organization provides
+and the normal install commands work unchanged.
+
+**uv** (used by the install scripts, `uv tool install`, and `conductor update`):
+
+```bash
+# macOS / Linux
+export UV_DEFAULT_INDEX="https://<your-index-host>/simple/"
+curl -sSfL https://aka.ms/conductor/install.sh | sh
+```
+
+```powershell
+# Windows -- for this shell only
+$env:UV_DEFAULT_INDEX = "https://<your-index-host>/simple/"
+irm https://aka.ms/conductor/install.ps1 | iex
+
+# Windows -- persist for future shells (then open a new terminal)
+setx UV_DEFAULT_INDEX "https://<your-index-host>/simple/"
+```
+
+Persist the setting in your shell profile (or with `setx`) so later upgrades
+and `conductor update --apply` inherit it. uv also reads a config file if you
+prefer that to an environment variable — `~/.config/uv/uv.toml` on macOS/Linux,
+`%APPDATA%\uv\uv.toml` on Windows:
+
+```toml
+[[index]]
+url = "https://<your-index-host>/simple/"
+default = true
+```
+
+**pipx / pip** (only if you install via the `pipx` or `pip` sections above):
+
+```bash
+pip config set global.index-url https://<your-index-host>/simple/
+```
+
+> **uv does not read pip's configuration.** Setting `pip config set
+> global.index-url` alone has no effect on the install scripts, `uv tool
+> install`, or `conductor update` — those need `UV_DEFAULT_INDEX` (or
+> `uv.toml`). Configure both if you use both toolchains.
+
+If the index requires credentials, uv accepts them inline in the URL or via
+[`UV_INDEX_<NAME>_USERNAME` / `UV_INDEX_<NAME>_PASSWORD`](https://docs.astral.sh/uv/configuration/indexes/#providing-credentials).
+
+When an install fails because the index is unreachable, the install scripts say
+so explicitly and skip their retry backoff — retrying cannot fix a blocked
+index. If you see a generic timeout or `403` instead, check whether your
+organization requires a proxy (`HTTPS_PROXY` / `NO_PROXY`) as well as an index
+URL. Do not work around the block by disabling security tooling; ask your IT or
+platform team for the approved index endpoint.
+
 ### Use the Conductor skill in Claude Code or Copilot CLI
 
 This repo doubles as a single-plugin marketplace that ships the `conductor`

@@ -65,18 +65,23 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
 _SHIM_SOURCE = Path(__file__).parent / "_uv_shim.py"
 
 
-def _install_uv_shim(sandbox: Sandbox) -> dict[str, str]:
-    """Install a ``uv`` shim that fakes a lock-error on the first install.
+def _install_uv_shim(sandbox: Sandbox, mode: str = "lock-once") -> dict[str, str]:
+    """Install a ``uv`` shim that fakes a canned failure.
+
+    ``mode`` selects the failure the shim injects — ``lock-once`` (a
+    Windows file-lock error on the first install only) or
+    ``network-always`` (a blocked-package-index error on every install).
+    See ``_uv_shim.py``'s docstring.
 
     Returns an ``extra_env`` mapping that callers should merge into the
-    ``install.ps1`` invocation's environment. The mapping prepends the
-    shim's directory to ``PATH`` (so PowerShell's bare-``uv`` resolution
-    finds ``uv.bat`` first), captures the real ``uv`` path for the shim
-    to defer to, and points the shim at a per-sandbox state file.
+    install script's environment. The mapping prepends the shim's
+    directory to ``PATH`` (so bare-``uv`` resolution finds the shim
+    first), captures the real ``uv`` path for the shim to defer to, and
+    points the shim at a per-sandbox state file.
 
     The shim itself lives in ``_uv_shim.py`` next to this file; see that
-    module's docstring for behavior. The shim intercepts only the first
-    ``uv tool install --force`` call and forwards every other ``uv``
+    module's docstring for behavior. The shim intercepts only
+    ``uv tool install --force`` calls and forwards every other ``uv``
     invocation to the real binary.
 
     Why this approach (Option B from issue #174): no synthetic Win32 file
@@ -86,8 +91,8 @@ def _install_uv_shim(sandbox: Sandbox) -> dict[str, str]:
     rename; with it, Rust ≥ 1.66's POSIX-semantics unlinks bypass the
     lock entirely. See PR #177 for the full investigation. The shim
     trades fidelity-to-real-Windows-locks for a deterministic test of
-    install.ps1's control flow — which is the actually load-bearing
-    invariant the test should protect.
+    the install scripts' control flow — which is the actually
+    load-bearing invariant the test should protect.
     """
     real_uv = shutil.which("uv")
     if not real_uv:
@@ -98,18 +103,27 @@ def _install_uv_shim(sandbox: Sandbox) -> dict[str, str]:
     shim_py = shim_dir / "_uv_shim.py"
     shutil.copy(_SHIM_SOURCE, shim_py)
 
-    # uv.bat: PowerShell's bare-command resolution finds .bat via PATHEXT.
     # Use the test runner's sys.executable (absolute path) so the shim
-    # works regardless of what's on PATH inside install.ps1's env.
-    (shim_dir / "uv.bat").write_text(
-        f'@echo off\r\n"{sys.executable}" "{shim_py}" %*\r\n',
-        encoding="utf-8",
-    )
+    # works regardless of what's on PATH inside the install script's env.
+    if IS_WINDOWS:
+        # uv.bat: PowerShell's bare-command resolution finds .bat via PATHEXT.
+        (shim_dir / "uv.bat").write_text(
+            f'@echo off\r\n"{sys.executable}" "{shim_py}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        shim_exe = shim_dir / "uv"
+        shim_exe.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{shim_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        shim_exe.chmod(0o755)
 
     return {
         "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
         "CONDUCTOR_TEST_REAL_UV": real_uv,
         "CONDUCTOR_TEST_SHIM_STATE": str(shim_dir / "state"),
+        "CONDUCTOR_TEST_SHIM_MODE": mode,
     }
 
 
@@ -281,6 +295,63 @@ def test_upgrade_with_running_process_uses_rename_fallback(
     assert "Moved existing install to" in result.combined, (
         "Move-ConductorToolDirAside did not log the renamed-aside path; "
         f"the rename either failed or the success log was removed:\n{result.combined}"
+    )
+
+
+def test_blocked_package_index_reports_guidance_and_skips_retries(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """A blocked package index must be diagnosed, not retried into the ground.
+
+    Networks that block the public Python index (managed corporate devices
+    in particular) make ``uv tool install`` fail with a fetch/403/DNS-shaped
+    error. uv has already exhausted *its own* retries by then, so the
+    install scripts' 2s/5s/10s backoff cannot help — it only delays the one
+    message that does. Before this was classified, the user saw three silent
+    retries and then generic file-lock advice (including a suggestion to add
+    a Windows Defender exclusion), which is both useless and actively
+    misleading for a network policy block.
+
+    Drives the shim in ``network-always`` mode and asserts the scripts:
+
+    1. Stop after a single ``uv tool install --force`` attempt.
+    2. Name the actual problem (the package index was unreachable).
+    3. Point at ``UV_DEFAULT_INDEX``, which is the setting that fixes it —
+       and specifically *not* at pip's config, which uv never reads.
+
+    Assertion 1 is the load-bearing one: without it this test still passes
+    if the classifier is deleted, since the script fails either way.
+    """
+    shim_env = _install_uv_shim(sandbox, mode="network-always")
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+
+    state = Path(shim_env["CONDUCTOR_TEST_SHIM_STATE"])
+    attempts = int(state.read_text()) if state.exists() else 0
+    assert attempts == 1, (
+        f"expected the install script to stop after 1 attempt on a blocked "
+        f"index, but uv was invoked {attempts} times. The network-block "
+        f"classifier (is_network_block_error / Test-NetworkBlockError) either "
+        f"regressed or no longer matches uv's error text.\n{result.combined}"
+    )
+
+    combined = result.combined
+    assert "package index could not be reached" in combined, (
+        f"install script did not name the blocked index as the cause:\n{combined}"
+    )
+    assert "UV_DEFAULT_INDEX" in combined, (
+        f"install script did not point at the setting that fixes this:\n{combined}"
+    )
+    assert "does not read pip" in combined, (
+        "guidance must say uv ignores pip's config -- otherwise users follow "
+        f"`pip config set global.index-url` and it silently does nothing:\n{combined}"
+    )
+    # Defender-exclusion advice is for file-lock failures. Suggesting it for a
+    # policy-enforced network block tells the user to poke at security tooling
+    # over a problem it did not cause.
+    assert "Add-MpPreference" not in combined, (
+        f"Defender-exclusion advice leaked into the blocked-index path:\n{combined}"
     )
 
 

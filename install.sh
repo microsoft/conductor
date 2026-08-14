@@ -8,6 +8,17 @@
 #   3. Downloads and verifies the constraints file (SHA-256)
 #   4. Installs Conductor via uv tool install with pinned dependencies
 #
+# Private / mirrored package index:
+#   uv resolves Conductor's dependencies from https://pypi.org/simple by
+#   default. On networks that block the public index, export UV_DEFAULT_INDEX
+#   (uv's own setting — this script does not need a Conductor-specific flag)
+#   before running the installer:
+#
+#       export UV_DEFAULT_INDEX="https://<your-index-host>/simple/"
+#
+#   uv does NOT read pip's configuration, so `pip config set global.index-url`
+#   alone has no effect here.
+#
 # Test hooks (used by tests/integration/test_install_scripts.py):
 #   --source <path-or-url>    OR   $CONDUCTOR_INSTALL_SOURCE
 #       Install from this source (wheel path, directory, or git+ URL) instead
@@ -39,6 +50,10 @@ SOURCE="${CONDUCTOR_INSTALL_SOURCE:-}"
 AUTO_STOP="${CONDUCTOR_INSTALL_AUTO_STOP:-0}"
 FORCE_FLAG="${CONDUCTOR_INSTALL_FORCE:-0}"
 SKIP_PATH_UPDATE="${CONDUCTOR_INSTALL_SKIP_PATH_UPDATE:-0}"
+
+# Set by uv_install_with_retry: `network` or `other`. Declared here so the
+# script stays safe under `set -u` if the install is never attempted.
+INSTALL_FAILURE_KIND="other"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -124,8 +139,34 @@ find_running_conductor() {
     '
 }
 
+# Report the package index uv will resolve against, if the environment
+# overrides the default. uv reads UV_DEFAULT_INDEX (current) and UV_INDEX_URL
+# (deprecated but still honored); it does NOT read pip's configuration.
+# Printing it makes "did my override actually apply?" answerable from the
+# install log alone.
+report_index_override() {
+    if [ -n "${UV_DEFAULT_INDEX:-}" ]; then
+        info "Package index (UV_DEFAULT_INDEX): ${UV_DEFAULT_INDEX}"
+    elif [ -n "${UV_INDEX_URL:-}" ]; then
+        info "Package index (UV_INDEX_URL): ${UV_INDEX_URL}"
+    fi
+}
+
+# True when uv's output looks like the package index was unreachable rather
+# than a transient local failure: a blocked/filtered network, an intercepting
+# proxy, or a TLS-inspecting middlebox. Deliberately generic — Conductor ships
+# no default mirror and makes no assumption about whose network this is.
+is_network_block_error() {
+    file="$1"
+    [ -f "$file" ] || return 1
+    LC_ALL=C tr '[:upper:]' '[:lower:]' < "$file" | grep -qE \
+        'pypi\.org|files\.pythonhosted\.org|failed to fetch|error sending request|request failed after|403 forbidden|407 proxy authentication required|dns error|invalid peer certificate|self-signed certificate|certificate verify failed|connection refused|connection reset|operation timed out|proxyerror|tls connect error'
+}
+
 # Run `uv tool install` with retry+backoff. Echoes combined stdout+stderr to
-# the LOG_FILE and returns the final exit code.
+# the LOG_FILE and returns the final exit code. Sets INSTALL_FAILURE_KIND to
+# `network` or `other` so the caller can print guidance that matches the
+# actual failure (sh functions can only return an exit status).
 uv_install_with_retry() {
     install_source="$1"
     constraints="$2"  # may be empty
@@ -134,6 +175,7 @@ uv_install_with_retry() {
     delays="2 5 10"
     attempt=1
     ec=0
+    INSTALL_FAILURE_KIND="other"
     : > "$log_file"
     set +e
     if [ -n "$constraints" ]; then
@@ -144,6 +186,14 @@ uv_install_with_retry() {
     ec=$?
     set -e
     [ "$ec" -eq 0 ] && return 0
+
+    # A blocked index does not heal on a retry — uv has already exhausted its
+    # own retries by this point. Backing off three more times just delays the
+    # only message that helps, so stop here and let the caller explain.
+    if is_network_block_error "$log_file"; then
+        INSTALL_FAILURE_KIND="network"
+        return "$ec"
+    fi
 
     for d in $delays; do
         attempt=$((attempt + 1))
@@ -160,7 +210,32 @@ uv_install_with_retry() {
         set -e
         [ "$ec" -eq 0 ] && return 0
     done
+    if is_network_block_error "$log_file"; then
+        INSTALL_FAILURE_KIND="network"
+    fi
     return "$ec"
+}
+
+# Guidance for a failure that looks like a blocked/unreachable package index.
+print_index_guidance() {
+    printf '\n  \033[1mThe Python package index could not be reached.\033[0m\n\n' >&2
+    printf '  This usually means the network blocks direct access to the public Python\n' >&2
+    printf '  package index (pypi.org / files.pythonhosted.org). Managed or corporate\n' >&2
+    printf '  devices often require all packages to come from an internal mirror.\n\n' >&2
+    printf '  If your organization provides a PyPI mirror or proxy, point uv at it and\n' >&2
+    printf '  re-run this installer:\n\n' >&2
+    printf '      export UV_DEFAULT_INDEX="https://<your-index-host>/simple/"\n' >&2
+    printf '      curl -sSfL https://aka.ms/conductor/install.sh | sh\n\n' >&2
+    printf '  Add the same export to your shell profile so future installs and\n' >&2
+    printf "  'conductor update --apply' inherit it.\n\n" >&2
+    printf '  Notes:\n' >&2
+    printf "    * uv does not read pip's configuration. Setting\n" >&2
+    printf '      "pip config set global.index-url ..." alone has no effect here.\n' >&2
+    printf '    * Ask your IT or platform team for the index URL. Conductor ships no\n' >&2
+    printf '      default mirror and never redirects your packages on its own.\n' >&2
+    printf '    * If the index needs credentials, uv supports them in the URL or via\n' >&2
+    printf '      UV_INDEX_<NAME>_USERNAME / UV_INDEX_<NAME>_PASSWORD.\n\n' >&2
+    printf '  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index\n\n' >&2
 }
 
 # Run `conductor --version` from the freshly installed location and return the
@@ -308,11 +383,16 @@ main() {
 
     # --- Install with retries ---
     info "Installing Conductor ${display_version}…"
+    report_index_override
     log_file="${tmpdir}/uv-install.log"
     if ! uv_install_with_retry "$install_source" "$constraints_file" "$log_file"; then
         printf '\n  ── uv tool install output ──\n' >&2
         sed 's/^/  /' "$log_file" >&2
         printf '\n' >&2
+        if [ "${INSTALL_FAILURE_KIND:-other}" = "network" ]; then
+            print_index_guidance
+            error "uv tool install failed: could not reach the package index"
+        fi
         error "uv tool install failed after retries"
     fi
     success "Conductor ${display_version} installed"

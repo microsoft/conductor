@@ -31,6 +31,7 @@ before issue #175.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -152,3 +153,102 @@ def test_install_sh_uses_lf_line_endings() -> None:
         "install.sh contains CRLF line endings; must be LF-only or POSIX "
         "shells will see literal carriage returns and break the shebang."
     )
+
+
+# ---------------------------------------------------------------------------
+# Private / mirrored package index support
+# ---------------------------------------------------------------------------
+#
+# Both install scripts resolve dependencies through uv, which reads
+# UV_DEFAULT_INDEX. On networks that block the public Python index the
+# install fails, and the only actionable remedy is that variable -- so the
+# scripts must (a) surface it, and (b) never hardcode a specific vendor's
+# mirror, since Conductor is public OSS installed on many different
+# networks.
+
+README = REPO_ROOT / "README.md"
+
+# The anchor both scripts link to from their failure guidance.
+README_INDEX_ANCHOR = "installing-behind-a-proxy-or-private-package-index"
+
+# Any index URL appearing in the scripts must be one of these: the public
+# index (named as the thing being blocked) or the documented placeholder.
+# Checking the shape rather than denylisting known vendors keeps this test
+# from having to name anyone's internal infrastructure -- and catches a
+# mirror this list's author never heard of.
+ALLOWED_INDEX_URL_MARKERS = ("pypi.org", "<your-index-host>")
+
+# Matches an index-looking URL: an https host followed by a path segment
+# that PEP 503 Simple-API endpoints universally end in.
+INDEX_URL_RE = re.compile(r"https://[^\s\"'`)\]]*?/simple/?", re.IGNORECASE)
+
+
+def test_install_scripts_classify_a_blocked_package_index() -> None:
+    """Both scripts must classify an unreachable index as its own failure mode.
+
+    Without this, a policy-blocked index burns the full retry backoff and
+    then reports generic file-lock advice (including a Windows Defender
+    exclusion), which is misleading for a network block.
+    """
+    assert "is_network_block_error" in INSTALL_SH.read_text(encoding="utf-8")
+    assert "Test-NetworkBlockError" in INSTALL_PS1.read_text(encoding="utf-8")
+
+
+def test_install_scripts_name_the_uv_index_variable() -> None:
+    """Both scripts must point users at ``UV_DEFAULT_INDEX``.
+
+    This is the only setting that fixes a blocked index for these scripts.
+    ``pip config set global.index-url`` does *not* work -- uv never reads
+    pip's configuration -- so the scripts must say so rather than leave
+    users following advice that silently does nothing.
+    """
+    for path in (INSTALL_SH, INSTALL_PS1):
+        text = path.read_text(encoding="utf-8")
+        assert "UV_DEFAULT_INDEX" in text, f"{path.name} never mentions UV_DEFAULT_INDEX"
+        assert "does not read pip" in text.lower(), (
+            f"{path.name} must warn that uv ignores pip's configuration"
+        )
+
+
+def test_install_scripts_do_not_hardcode_a_private_index() -> None:
+    """Neither script may ship a specific organization's package mirror.
+
+    Conductor is public OSS. A mirror baked in here would silently redirect
+    every other user's dependency resolution through one organization's
+    proxy. Private-index support is *configuration* the user supplies via
+    ``UV_DEFAULT_INDEX``; every index URL in the scripts must therefore be
+    either the public index (named as the thing being blocked) or the
+    documented ``<your-index-host>`` placeholder.
+
+    This checks the shape of any index URL rather than denylisting known
+    vendors, so it catches a mirror this test's author never heard of --
+    and, just as importantly, doesn't require naming anyone's internal
+    infrastructure inside a public repository.
+    """
+    for path in (INSTALL_SH, INSTALL_PS1):
+        text = path.read_text(encoding="utf-8")
+        for url in INDEX_URL_RE.findall(text):
+            assert any(marker in url for marker in ALLOWED_INDEX_URL_MARKERS), (
+                f"{path.name} contains a hardcoded package index URL: {url!r}. "
+                f"Conductor must not ship a default mirror -- users supply "
+                f"their own via UV_DEFAULT_INDEX. Use the "
+                f"'<your-index-host>' placeholder in documentation instead."
+            )
+
+
+def test_install_scripts_link_to_a_real_readme_section() -> None:
+    """The failure guidance's docs link must resolve to a real README anchor.
+
+    The scripts print this URL at the exact moment a user is blocked, so a
+    dangling anchor sends them to a page that doesn't explain anything.
+    """
+    readme = README.read_text(encoding="utf-8")
+    assert "### Installing behind a proxy or private package index" in readme, (
+        "README is missing the section the install scripts link to; "
+        f"expected a heading generating the anchor '#{README_INDEX_ANCHOR}'."
+    )
+    for path in (INSTALL_SH, INSTALL_PS1):
+        text = path.read_text(encoding="utf-8")
+        assert README_INDEX_ANCHOR in text, (
+            f"{path.name} does not link to the README's private-index section"
+        )

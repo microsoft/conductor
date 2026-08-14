@@ -7,6 +7,17 @@
 #   3. Downloads and verifies the constraints file (SHA-256)
 #   4. Installs Conductor via uv tool install with pinned dependencies
 #
+# Private / mirrored package index:
+#   uv resolves Conductor's dependencies from https://pypi.org/simple by
+#   default. On networks that block the public index, set UV_DEFAULT_INDEX
+#   (uv's own setting -- this script does not need a Conductor-specific flag)
+#   before running the installer:
+#
+#       $env:UV_DEFAULT_INDEX = "https://<your-index-host>/simple/"
+#
+#   uv does NOT read pip's configuration, so `pip config set global.index-url`
+#   alone has no effect here.
+#
 # Robustness features for upgrade-over-existing-install:
 #   - Detects other running conductor processes; with -AutoStop kills them and
 #     continues, otherwise prompts (or aborts if no TTY)
@@ -168,6 +179,84 @@ function Test-LockError {
         if ($lower.Contains($needle)) { return $true }
     }
     return $false
+}
+
+function Test-NetworkBlockError {
+    # True when uv's output looks like the package index was unreachable
+    # rather than a transient local failure: a blocked/filtered network, an
+    # intercepting proxy, or a TLS-inspecting middlebox. Deliberately generic
+    # -- Conductor ships no default mirror and makes no assumption about
+    # whose network this is.
+    param([string]$Output)
+    if (-not $Output) { return $false }
+    $lower = $Output.ToLower()
+    $needles = @(
+        'pypi.org',
+        'files.pythonhosted.org',
+        'failed to fetch',
+        'error sending request',
+        'request failed after',
+        '403 forbidden',
+        '407 proxy authentication required',
+        'dns error',
+        'invalid peer certificate',
+        'self-signed certificate',
+        'certificate verify failed',
+        'connection refused',
+        'connection reset',
+        'operation timed out',
+        'proxyerror',
+        'tls connect error'
+    )
+    foreach ($needle in $needles) {
+        if ($lower.Contains($needle)) { return $true }
+    }
+    return $false
+}
+
+function Write-IndexOverrideInfo {
+    # Report the package index uv will resolve against, if the environment
+    # overrides the default. uv reads UV_DEFAULT_INDEX (current) and
+    # UV_INDEX_URL (deprecated but still honored); it does NOT read pip's
+    # configuration. Printing it makes "did my override actually apply?"
+    # answerable from the install log alone.
+    if ($env:UV_DEFAULT_INDEX) {
+        Write-Info "Package index (UV_DEFAULT_INDEX): $($env:UV_DEFAULT_INDEX)"
+    } elseif ($env:UV_INDEX_URL) {
+        Write-Info "Package index (UV_INDEX_URL): $($env:UV_INDEX_URL)"
+    }
+}
+
+function Write-IndexGuidance {
+    # Guidance for a failure that looks like a blocked/unreachable index.
+    Write-Host ""
+    Write-Host "  The Python package index could not be reached." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  This usually means the network blocks direct access to the public Python"
+    Write-Host "  package index (pypi.org / files.pythonhosted.org). Managed or corporate"
+    Write-Host "  devices often require all packages to come from an internal mirror."
+    Write-Host ""
+    Write-Host "  If your organization provides a PyPI mirror or proxy, point uv at it and"
+    Write-Host "  re-run this installer:"
+    Write-Host ""
+    Write-Host '      $env:UV_DEFAULT_INDEX = "https://<your-index-host>/simple/"' -ForegroundColor Cyan
+    Write-Host '      irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  To persist it for future shells (including 'conductor update --apply'),"
+    Write-Host "  set it once and open a new terminal:"
+    Write-Host ""
+    Write-Host '      setx UV_DEFAULT_INDEX "https://<your-index-host>/simple/"' -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Notes:"
+    Write-Host "    * uv does not read pip's configuration. Setting"
+    Write-Host '      "pip config set global.index-url ..." alone has no effect here.'
+    Write-Host "    * Ask your IT or platform team for the index URL. Conductor ships no"
+    Write-Host "      default mirror and never redirects your packages on its own."
+    Write-Host "    * If the index needs credentials, uv supports them in the URL or via"
+    Write-Host "      UV_INDEX_<NAME>_USERNAME / UV_INDEX_<NAME>_PASSWORD."
+    Write-Host ""
+    Write-Host "  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index"
+    Write-Host ""
 }
 
 function Move-ConductorToolDirAside {
@@ -374,6 +463,8 @@ try {
     # --- Install with retries + rename-fallback ---
     $delays = @(2, 5, 10)
     Write-Info "Installing Conductor $displayVersion..."
+    Write-IndexOverrideInfo
+    $networkBlocked = $false
     for ($attempt = 1; $attempt -le ($delays.Count + 1); $attempt++) {
         if ($attempt -gt 1) {
             $sleep = $delays[[Math]::Min($attempt - 2, $delays.Count - 1)]
@@ -390,9 +481,11 @@ try {
             break
         }
 
+        $combinedOutput = $lastStderr + $lastStdout
+
         # If we hit a directory-lock error and we haven't already renamed
         # aside, try the rename-fallback before the next retry.
-        if (-not $renamedAside -and (Test-LockError -Output ($lastStderr + $lastStdout))) {
+        if (-not $renamedAside -and (Test-LockError -Output $combinedOutput)) {
             Write-Warn "Install blocked by a file lock; renaming the existing tool dir aside and retrying..."
             $renamedAside = Move-ConductorToolDirAside
             if ($renamedAside) {
@@ -403,6 +496,15 @@ try {
                     Remove-StaleOldFiles -ScriptsDir (Join-Path $existingTool2 'Scripts')
                 }
             }
+            continue
+        }
+
+        # A blocked index does not heal on a retry -- uv has already exhausted
+        # its own retries by this point. Backing off three more times just
+        # delays the only message that helps, so stop and explain instead.
+        if (Test-NetworkBlockError -Output $combinedOutput) {
+            $networkBlocked = $true
+            break
         }
     }
 
@@ -415,6 +517,12 @@ try {
         } else {
             Write-Host "  (no output captured)" -ForegroundColor DarkGray
         }
+
+        if ($networkBlocked) {
+            Write-IndexGuidance
+            Write-Err "uv tool install failed: could not reach the package index"
+        }
+
         Write-Host ""
         Write-Info "Install failed."
         Write-Info "If the error mentions 'Access is denied' or 'failed to remove directory':"
