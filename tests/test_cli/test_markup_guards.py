@@ -64,6 +64,7 @@ import ast
 import re
 from collections import Counter
 from collections.abc import Callable, Iterator
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -117,8 +118,20 @@ TEXTUAL_CELL_SINKS = {"add_row", "add_column"}
 TEXTUAL_CONTENT_KWARGS = {"content", "message", "renderable"}
 
 
-def _python_files() -> list[Path]:
-    return sorted(p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts)
+@lru_cache(maxsize=1)
+def _python_files() -> tuple[Path, ...]:
+    return tuple(sorted(p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts))
+
+
+@lru_cache(maxsize=1)
+def _parsed_sources() -> tuple[tuple[Path, ast.Module], ...]:
+    """Every source file with its parsed AST, parsed once for the whole module.
+
+    Ten rules scan the tree, and several resolve names across it, so a
+    parse-per-test meant re-parsing ~116 files fifteen times over. The trees
+    are only read, never mutated, so one parse serves every rule.
+    """
+    return tuple((path, ast.parse(path.read_text(encoding="utf-8"))) for path in _python_files())
 
 
 def _is_factory(path: Path) -> bool:
@@ -624,6 +637,7 @@ def _text_returning_names(tree: ast.Module) -> set[str]:
     }
 
 
+@lru_cache(maxsize=1)
 def _text_returning_helpers() -> frozenset[str]:
     """Every function in ``src/conductor`` declared to return a ``Text``.
 
@@ -637,8 +651,8 @@ def _text_returning_helpers() -> frozenset[str]:
     annotations, so a helper that stops returning ``Text`` stops being safe.
     """
     names: set[str] = set()
-    for path in _python_files():
-        names |= _text_returning_names(ast.parse(path.read_text(encoding="utf-8")))
+    for _path, tree in _parsed_sources():
+        names |= _text_returning_names(tree)
     return frozenset(names)
 
 
@@ -775,8 +789,7 @@ class TestRuleBBypassSinksReceiveText:
 
     def test_panel_titles_are_not_interpolated_strings(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             scopes = _scope_names(tree, _safe_text_names)
             for node in ast.walk(tree):
                 violations += [
@@ -791,8 +804,7 @@ class TestRuleBBypassSinksReceiveText:
 
     def test_prompts_are_not_interpolated_strings(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             scopes = _scope_names(tree, _safe_text_names)
             for node in ast.walk(tree):
                 violations += [
@@ -837,8 +849,7 @@ class TestRuleDNoUnwrappedMarkupAtASink:
 
     def test_no_markup_string_literal_reaches_a_sink(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             docstrings = _docstring_ids(tree)
             for node in ast.walk(tree):
                 violations += [
@@ -870,8 +881,7 @@ class TestRuleENoTextThroughBuiltinPrint:
 
     def test_builtin_print_is_not_given_a_text(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             for node in ast.walk(tree):
                 violations += [f"{_rel(path)}:{node.lineno}: {v}" for v in _violates_e(node)]
         assert not violations, _report(
@@ -926,8 +936,7 @@ class TestRuleGTyperHelpIsEscaped:
 
     def test_typer_help_has_no_unescaped_markup(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             for node in ast.walk(tree):
                 violations += [f"{_rel(path)}:{node.lineno}: {v}" for v in _violates_g(node)]
         assert not violations, _report(
@@ -948,8 +957,7 @@ class TestRuleHEscapeIsNotUsed:
 
     def test_rich_markup_escape_is_never_used(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             for node in ast.walk(tree):
                 violations += [f"{_rel(path)}:{node.lineno}: {v}" for v in _violates_h(node)]
         assert not violations, _report(
@@ -974,8 +982,7 @@ class TestRuleITextualSinksReceiveText:
     def test_textual_content_sinks_are_not_given_runtime_values(self) -> None:
         helpers = _text_returning_helpers()
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             safe_scopes = _scope_names(tree, _safe_text_names)
             textual_tables = _imports_textual_datatable(tree)
             for node in ast.walk(tree):
@@ -1003,8 +1010,7 @@ class TestRuleJTyperDocstringsAreEscaped:
 
     def test_typer_command_docstrings_have_no_unescaped_markup(self) -> None:
         violations: list[str] = []
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path, tree in _parsed_sources():
             for node in ast.walk(tree):
                 violations += [f"{_rel(path)}:{node.lineno}: {v}" for v in _violates_j(node)]
         assert not violations, _report(
@@ -1479,8 +1485,7 @@ class TestTheGuardsCoverRealSource:
     def test_sinks_are_actually_present_in_the_source(self) -> None:
         """If nothing matches the sink names, rule D can never fail."""
         seen = 0
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for _path, tree in _parsed_sources():
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
@@ -1492,8 +1497,7 @@ class TestTheGuardsCoverRealSource:
     def test_panel_titles_are_actually_present(self) -> None:
         """Likewise for rule B, whose match set is much smaller."""
         seen = 0
-        for path in _python_files():
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for _path, tree in _parsed_sources():
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and _callee(node) == "Panel":
                     seen += sum(1 for kw in node.keywords if kw.arg in {"title", "subtitle"})

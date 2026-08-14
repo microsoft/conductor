@@ -154,7 +154,13 @@ jobs:
           fi
 
       - name: Run tests with coverage
-        timeout-minutes: 10
+        # 20, not 10: the Fleet Manager added ~600 tests, most of them Textual
+        # `App.run_test()` pilots, which took the Windows step from ~5m to
+        # ~10m and tripped the old limit at 9m56s with every test passing.
+        # Windows runs the suite at roughly twice the Linux wall time, so this
+        # is ~2x headroom there and ~3x on Linux — still short enough to catch
+        # a genuine hang rather than burning a full job timeout on one.
+        timeout-minutes: 20
         run: uv run pytest --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not performance"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
