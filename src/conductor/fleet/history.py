@@ -120,7 +120,7 @@ class HistoryEntry:
     guessed from anything else."""
 
     total_tokens: int
-    """Sum of ``tokens`` across every completed agent seen in the tail --
+    """Sum of ``tokens`` across every completed agent seen in the log --
     mirrors ``RunSummary.total_tokens``'s own accounting exactly (D5:
     completed-agent tokens only)."""
 
@@ -273,10 +273,10 @@ class _CorruptEventLogError(Exception):
     empty file" (E14 review round 2), so :func:`build_history_entries`'s
     per-file guard can skip the former (E14-T4) while still returning a
     normal ``"unknown"`` entry for the latter (a legitimately empty log
-    is not corruption). Because it is raised on generator exhaustion, it
-    reaches callers through whatever loop is draining the stream -- in
-    practice, the ``for evt in events:`` loop inside
-    :func:`_scan_history_events`."""
+    is not corruption). For a corrupt log the generator never suspends at
+    a ``yield`` (no event ever parses), so this is raised on the very
+    first ``next()`` -- there is no drain-dependent timing to it, in
+    practice or otherwise."""
 
 
 def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
@@ -292,24 +292,27 @@ def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
     presenting a genuinely completed run as ``"unknown"`` with an
     incomplete total (E14 review round 1). This function is a generator:
     neither the raw bytes nor the parsed events are ever fully
-    materialised, so peak memory is one raw line plus one parsed event
-    dict, regardless of log size -- the parsed dict is the larger of the
-    two, typically several times the line's byte size, but it too is
-    discarded as soon as the caller has consumed it. Contrast
+    materialised into a list, so memory is proportional to the largest
+    single line, not to the log's size (retained state beyond that one
+    line/dict is just two booleans). Contrast
     ``conductor.fleet.summary.read_event_log_full``, which caps its read
     at 8 MiB and therefore trades coverage for a bounded (but nonzero)
-    memory footprint; streaming gives History unbounded coverage *and*
-    O(1) memory, so it needs no equivalent cap -- the two readers'
-    differing bounds are a deliberate consequence of their differing
-    consumers (a live-run detail view vs. a done-run, read-once history),
-    not an oversight.
+    memory footprint; streaming gives History unbounded coverage and
+    bounds memory against event *count*, so it needs no equivalent
+    count-based cap -- but a single oversized line is still read and
+    parsed whole (``for raw_line in f`` reads up to the next newline), so
+    this is not an unconditional memory bound. The two readers' differing
+    bounds are a deliberate consequence of their differing consumers (a
+    live-run detail view vs. a done-run, read-once history), not an
+    oversight.
 
     The generator holds the file handle open (inside its ``with``) until
-    it is exhausted or the caller stops consuming it and it is garbage
-    collected / explicitly closed. The sole consumer,
-    :func:`_build_entry`, drains it synchronously to completion via
-    :func:`_scan_history_events`, so the file closes deterministically as
-    part of normal control flow.
+    it is exhausted, closed, or garbage collected -- that ``with`` block,
+    not any particular caller, owns the handle's lifetime. The sole
+    consumer in production, :func:`_build_entry`, drains it to completion
+    via :func:`_scan_history_events`; tests may consume it directly and
+    abandon it early, which is exactly why the handle's release does not
+    depend on caller behavior.
 
     Because this is a generator, none of its side effects happen when
     ``_read_full_log(path)`` is called -- they happen while the returned
@@ -326,18 +329,21 @@ def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
 
     A malformed individual line (bad JSON, a truncated write caught
     mid-flush) is tolerated the same way the bounded readers already do
-    -- skipped rather than aborting the whole read. But a **non-empty**
-    file (at least one non-blank line) that yields **zero** parseable
-    events is corrupt, not "legitimately empty" -- E14-T4 requires a
-    corrupt log to be skipped, not shown as an ordinary ``"unknown"``
-    entry (E14 review round 2). Raises :class:`_CorruptEventLogError` in
-    that case, once the stream is exhausted; a genuinely empty file (no
-    non-blank lines at all) still yields nothing and raises nothing,
-    which :func:`_build_entry` legitimately turns into an ``"unknown"``
-    entry.
+    -- skipped rather than aborting the whole read, with a single
+    aggregate warning logged if any lines were skipped (partial
+    corruption still produces an entry, but not silently). But a
+    **non-empty** file (at least one non-blank line) that yields **zero**
+    parseable events is corrupt, not "legitimately empty" -- E14-T4
+    requires a corrupt log to be skipped, not shown as an ordinary
+    ``"unknown"`` entry (E14 review round 2). Raises
+    :class:`_CorruptEventLogError` in that case, once the stream is
+    exhausted; a genuinely empty file (no non-blank lines at all) still
+    yields nothing and raises nothing, which :func:`_build_entry`
+    legitimately turns into an ``"unknown"`` entry.
     """
     saw_nonblank_line = False
     yielded_any = False
+    skipped_lines = 0
     with open(path, "rb") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -346,13 +352,20 @@ def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
             saw_nonblank_line = True
             try:
                 obj = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                skipped_lines += 1
                 continue
             if isinstance(obj, dict):
                 yielded_any = True
                 yield obj
     if saw_nonblank_line and not yielded_any:
         raise _CorruptEventLogError(f"{path}: non-empty log with no parseable events")
+    if skipped_lines:
+        logger.warning(
+            "%s: skipped %d unparseable line(s); this run's totals may be incomplete",
+            path,
+            skipped_lines,
+        )
 
 
 def _build_entry(path: Path) -> HistoryEntry:
@@ -471,7 +484,12 @@ def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]
     for path in candidates:
         try:
             entries.append(_build_entry(path))
+        except (OSError, _CorruptEventLogError):
+            logger.warning("Skipping unreadable/corrupt event log %s", path, exc_info=True)
+            continue
         except Exception:
-            logger.warning("Failed to build history entry for %s; skipping", path, exc_info=True)
+            logger.error(
+                "Unexpected failure building history entry for %s; skipping", path, exc_info=True
+            )
             continue
     return entries
