@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `fleet/retention.py`'s filename parsers, and `fleet/records.py`'s own
   timestamp parser, now derive their run-id-matching regexes from the same
   shared pattern.
+- **Fleet Manager History no longer accumulates an entire retained event log
+  into memory to build one entry** (#436). `_read_full_log` now streams
+  parsed events one at a time instead of materializing them into a list
+  before scanning, so building a History entry from a large
+  `*.events.jsonl` file no longer holds the whole parsed log in memory at
+  once.
 
 ## [0.1.30](https://github.com/microsoft/conductor/compare/v0.1.29...v0.1.30) - 2026-08-14
 

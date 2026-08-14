@@ -18,6 +18,8 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import json
 import tempfile
 import time
@@ -27,7 +29,14 @@ from unittest.mock import patch
 
 import pytest
 
-from conductor.fleet.history import HistoryEntry, build_history_entries
+import conductor.fleet.history as history_module
+from conductor.fleet.history import (
+    HistoryEntry,
+    _CorruptEventLogError,
+    _read_full_log,
+    _scan_history_events,
+    build_history_entries,
+)
 from conductor.fleet.retention import event_log_root
 
 # ---------------------------------------------------------------------------
@@ -140,6 +149,23 @@ class TestOutcomeClassification:
         entries = build_history_entries()
 
         assert entries == []
+
+    def test_one_parseable_line_among_garbage_is_not_corrupt(self, temp_root: Path) -> None:
+        """A mix of unparseable and parseable lines is tolerated -- only
+        an *entirely* unparseable, non-empty log counts as corrupt
+        (`saw_nonblank_line and not yielded_any`). The one good line must
+        still produce a normal entry, not a skipped/corrupt one."""
+        path = temp_root / "conductor-mixed-20260101-120000-cafef00d.events.jsonl"
+        path.write_bytes(
+            b"not json at all\n"
+            + _event("workflow_started", {"name": "my-workflow"}, ts=1000.0).encode()
+            + b"\nmore garbage\n"
+        )
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].outcome == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +387,6 @@ class TestCorruptLogSkipped:
         # Monkeypatch the module-level per-file builder to raise only for
         # the "bad-one" path, proving that specific failure is contained
         # and does not prevent the other (good) file from being returned.
-        import conductor.fleet.history as history_module
-
         original_build_entry = history_module._build_entry
 
         def _flaky_build_entry(path: Path):
@@ -663,3 +687,155 @@ class TestHistoryEntryShape:
 
         assert isinstance(entries[0], HistoryEntry)
         assert entries[0].path == path
+
+
+# ---------------------------------------------------------------------------
+# `_read_full_log` streams rather than materializes (issue #436)
+# ---------------------------------------------------------------------------
+
+
+class TestFullLogStreamsWithoutMaterializing:
+    """Regression coverage for issue #436: `_read_full_log` must be a
+    generator that yields one parsed event at a time, and
+    `_scan_history_events` must accept any one-shot iterable, so memory
+    for a history scan does not scale with the number of events in the
+    log (a single oversized line is still read and parsed whole -- see
+    `_read_full_log`'s docstring)."""
+
+    def test_read_full_log_does_not_return_a_list(self, temp_root: Path) -> None:
+        """The structural guard: this is the assertion that fails if
+        someone reintroduces list accumulation, which no behavioural test
+        (all of which pass equally well against the buggy list-based
+        implementation) can catch. The path is never opened here (the
+        generator is constructed but not advanced), so it need not exist
+        -- consistent with the "open() is deferred to first next()"
+        contract documented on `_read_full_log`."""
+        assert inspect.isgeneratorfunction(_read_full_log)
+
+        result = _read_full_log(temp_root / "unused.events.jsonl")
+        assert inspect.isgenerator(result)
+
+    def test_read_full_log_parses_lazily(self, temp_root: Path) -> None:
+        """Direct, deterministic proof that memory no longer scales with
+        log length: taking a single `next()` off the generator parses
+        exactly one line, not the whole file."""
+        path = _write_log(
+            temp_root,
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("agent_completed", {"agent_name": "a", "tokens": 1}, ts=1001.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+
+        with (
+            patch.object(history_module.json, "loads", wraps=json.loads) as loads,
+            contextlib.closing(_read_full_log(path)) as gen,
+        ):
+            assert inspect.isgenerator(gen)
+            first = next(gen)
+
+            assert loads.call_count == 1
+            assert first["type"] == "workflow_started"
+
+    def test_corrupt_log_raises_on_first_next(self, temp_root: Path) -> None:
+        """A non-empty, all-unparseable log raises `_CorruptEventLogError`
+        on the very first `next()` -- since no line ever parses, the
+        generator never suspends at a `yield` and runs straight through
+        to the raise. Pins the `saw_nonblank_line`/`yielded_any`
+        replacement at the unit level, and the stronger (not merely
+        eventual) guarantee that detection does not depend on the
+        caller draining the stream."""
+        path = temp_root / "conductor-corrupt-20260101-120000-cafef00d.events.jsonl"
+        path.write_bytes(b"not json at all\nmore garbage\n")
+
+        with pytest.raises(_CorruptEventLogError):
+            next(_read_full_log(path))
+
+    def test_empty_log_yields_nothing_and_does_not_raise(self, temp_root: Path) -> None:
+        """The counterpart distinction: a genuinely empty file (no
+        non-blank lines at all) yields nothing and raises nothing."""
+        path = _write_log(temp_root, lines=[])
+
+        assert list(_read_full_log(path)) == []
+
+    def test_scan_accepts_a_one_shot_iterator(self) -> None:
+        """Pins the widened `_scan_history_events` signature: a future
+        edit that indexes `events` or calls `len()` on it fails here
+        rather than silently at runtime against a live generator. Also
+        counts yields to pin single-pass consumption -- a second,
+        silently-empty re-iteration over an exhausted generator would
+        otherwise satisfy every other assertion below unnoticed."""
+
+        consumed = 0
+
+        def _events() -> Any:
+            nonlocal consumed
+            for evt in (
+                {"type": "workflow_started", "timestamp": 1000.0, "data": {}},
+                {
+                    "type": "agent_completed",
+                    "timestamp": 1001.0,
+                    "data": {"agent_name": "a", "tokens": 100, "cost_usd": 0.01},
+                },
+                {
+                    "type": "agent_completed",
+                    "timestamp": 1002.0,
+                    "data": {"agent_name": "b", "tokens": 50, "cost_usd": None},
+                },
+                {"type": "workflow_completed", "timestamp": 1005.0, "data": {"elapsed": 5.0}},
+            ):
+                consumed += 1
+                yield evt
+
+        scan = _scan_history_events(_events())
+
+        assert consumed == 4
+        assert scan.outcome == "completed"
+        assert scan.started_at == 1000.0
+        assert scan.ended_at == 1005.0
+        assert scan.reported_elapsed == 5.0
+        assert scan.total_tokens == 150
+        assert scan.total_cost_usd == 0.01
+        assert scan.unpriced_agent_count == 1
+
+    def test_build_entry_streams_without_materializing(self, temp_root: Path) -> None:
+        """Pins the guarantee at the actual production call site
+        (history.py:_build_entry), not just at the two functions in
+        isolation -- a future edit such as
+        `_scan_history_events(list(_read_full_log(path)))` would pass
+        every other test in this module while fully reintroducing the
+        memory bug this issue fixes."""
+        path = _write_log(
+            temp_root,
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+
+        saw_generator = False
+        real_scan = history_module._scan_history_events
+
+        def _spy(events: Any) -> Any:
+            nonlocal saw_generator
+            saw_generator = inspect.isgenerator(events)
+            return real_scan(events)
+
+        with patch.object(history_module, "_scan_history_events", side_effect=_spy):
+            history_module._build_entry(path)
+
+        assert saw_generator, "_build_entry materialized the event stream before scanning"
+
+    def test_open_failure_surfaces_on_first_next_not_at_call_time(self, temp_root: Path) -> None:
+        """`_read_full_log` is a generator, so `open()` and any `OSError`
+        it raises are deferred to the first `next()`, not raised at call
+        time -- a future caller writing
+        `try: gen = _read_full_log(p) except OSError:` would otherwise
+        silently never catch anything."""
+        missing_path = temp_root / "conductor-missing-20260101-120000-cafef00d.events.jsonl"
+
+        gen = _read_full_log(missing_path)
+
+        with pytest.raises(OSError):
+            next(gen)
