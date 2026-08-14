@@ -64,6 +64,12 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
 
 _SHIM_SOURCE = Path(__file__).parent / "_uv_shim.py"
 
+# A phrase that appears only in the scripts' blocked-index guidance -- not in
+# the git-host guidance, and not in any generic failure message. Asserting on
+# the guidance body rather than the one-line terminator is what distinguishes
+# "the user was told how to fix this" from "the run failed".
+INDEX_GUIDANCE_MARKER = "public Python package index"
+
 
 def _install_uv_shim(sandbox: Sandbox, mode: str = "lock-once") -> dict[str, str]:
     """Install a ``uv`` shim that fakes a canned failure.
@@ -124,7 +130,18 @@ def _install_uv_shim(sandbox: Sandbox, mode: str = "lock-once") -> dict[str, str
         "CONDUCTOR_TEST_REAL_UV": real_uv,
         "CONDUCTOR_TEST_SHIM_STATE": str(shim_dir / "state"),
         "CONDUCTOR_TEST_SHIM_MODE": mode,
+        # Clear any index override the developer's own shell exports. The
+        # scripts echo it, which would satisfy a "UV_DEFAULT_INDEX appears in
+        # the output" assertion from the echo line rather than the guidance.
+        "UV_DEFAULT_INDEX": "",
+        "UV_INDEX_URL": "",
     }
+
+
+def _shim_attempts(shim_env: dict[str, str]) -> int:
+    """Number of ``uv tool install --force`` calls the shim intercepted."""
+    state = Path(shim_env["CONDUCTOR_TEST_SHIM_STATE"])
+    return int(state.read_text()) if state.exists() else 0
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -319,25 +336,29 @@ def test_blocked_package_index_reports_guidance_and_skips_retries(
     3. Point at ``UV_DEFAULT_INDEX``, which is the setting that fixes it —
        and specifically *not* at pip's config, which uv never reads.
 
-    Assertion 1 is the load-bearing one: without it this test still passes
-    if the classifier is deleted, since the script fails either way.
+    Assertion 1 is the one that protects the *skip-the-retries* behavior
+    specifically. Deleting the classifier outright would fail assertions
+    2-4 as well, since the guidance would never print — but the classifier
+    is also consulted after the retry loop, so removing only the early exit
+    would leave 2-4 passing after four attempts and 17 seconds. Assertion 1
+    is the only one that notices.
     """
     shim_env = _install_uv_shim(sandbox, mode="network-always")
     result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
 
     assert result.returncode != 0, f"install should have failed:\n{result.combined}"
 
-    state = Path(shim_env["CONDUCTOR_TEST_SHIM_STATE"])
-    attempts = int(state.read_text()) if state.exists() else 0
+    attempts = _shim_attempts(shim_env)
     assert attempts == 1, (
         f"expected the install script to stop after 1 attempt on a blocked "
-        f"index, but uv was invoked {attempts} times. The network-block "
-        f"classifier (is_network_block_error / Test-NetworkBlockError) either "
-        f"regressed or no longer matches uv's error text.\n{result.combined}"
+        f"index, but uv was invoked {attempts} times. The early exit on a "
+        f"definitive index block (is_definitive_index_block / "
+        f"Test-DefinitiveIndexBlock) either regressed or no longer matches "
+        f"uv's error text.\n{result.combined}"
     )
 
     combined = result.combined
-    assert "package index could not be reached" in combined, (
+    assert INDEX_GUIDANCE_MARKER in combined, (
         f"install script did not name the blocked index as the cause:\n{combined}"
     )
     assert "UV_DEFAULT_INDEX" in combined, (
@@ -349,9 +370,167 @@ def test_blocked_package_index_reports_guidance_and_skips_retries(
     )
     # Defender-exclusion advice is for file-lock failures. Suggesting it for a
     # policy-enforced network block tells the user to poke at security tooling
-    # over a problem it did not cause.
+    # over a problem it did not cause. `Add-MpPreference` only exists in
+    # install.ps1, so the POSIX leg needs its own witness: install.sh's
+    # generic terminator, which is what prints when the classifier misses.
     assert "Add-MpPreference" not in combined, (
         f"Defender-exclusion advice leaked into the blocked-index path:\n{combined}"
+    )
+    assert "failed after retries" not in combined, (
+        f"blocked index fell through to the generic failure message:\n{combined}"
+    )
+
+
+def test_ordinary_failure_still_retries_and_shows_no_index_guidance(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """The negative direction: a plain build failure must be left alone.
+
+    This is the guard against the classifier over-firing. A user whose
+    build dies on a missing system header must still get the full retry
+    schedule (a genuinely transient local failure may heal) and must *not*
+    be told to configure ``UV_DEFAULT_INDEX`` — advice that cannot possibly
+    help and that sends them chasing a network problem they do not have.
+
+    Without this test the classifier can widen indefinitely and nothing
+    notices; the blocked-index test above passes either way.
+    """
+    shim_env = _install_uv_shim(sandbox, mode="other-always")
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+
+    attempts = _shim_attempts(shim_env)
+    assert attempts == 4, (
+        f"an ordinary build failure must use the full retry schedule, but uv "
+        f"was invoked {attempts} times. The classifier is over-firing.\n{result.combined}"
+    )
+
+    combined = result.combined
+    assert INDEX_GUIDANCE_MARKER not in combined, (
+        f"index guidance printed for a failure that is not an index problem:\n{combined}"
+    )
+    assert "UV_DEFAULT_INDEX" not in combined, (
+        f"a build failure must not send the user to configure an index:\n{combined}"
+    )
+
+
+def test_transient_blip_does_not_cut_the_retry_schedule_short(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """A connection blip must not be mistaken for a blocked index.
+
+    ``connection reset`` is a network fault but not evidence that uv gave
+    up — unlike ``request failed after``/``403``, a retry really can fix
+    it. Treating every network-shaped string as definitive traded a working
+    install for a faster wrong answer: one blip mid-run would abort the
+    remaining attempts *and* report the run as a blocked index, even when
+    the persistent failure was an ordinary build error.
+
+    The shim emits a blip on attempt 2 only, with a build failure either
+    side, so the run must go the distance and be reported as what it
+    finally failed on.
+    """
+    shim_env = _install_uv_shim(sandbox, mode="transient-then-other")
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+
+    attempts = _shim_attempts(shim_env)
+    assert attempts == 4, (
+        f"a transient blip must not abort the retry schedule, but uv was "
+        f"invoked only {attempts} times.\n{result.combined}"
+    )
+    assert INDEX_GUIDANCE_MARKER not in result.combined, (
+        f"a blip on one attempt relabeled the whole run as a blocked index:\n{result.combined}"
+    )
+
+
+def test_blocked_index_on_a_later_attempt_still_short_circuits(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """The early exit must be evaluated on every attempt, not just the first.
+
+    An install can fail for an unrelated reason once and hit the blocked
+    index on the retry. Classifying only the first attempt left the POSIX
+    script burning the full 17s backoff while Windows stopped at two — the
+    same input producing different behavior on the two platforms.
+    """
+    shim_env = _install_uv_shim(sandbox, mode="network-after-first")
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+
+    attempts = _shim_attempts(shim_env)
+    assert attempts == 2, (
+        f"expected the script to stop on the attempt that hit the block "
+        f"(2), but uv was invoked {attempts} times.\n{result.combined}"
+    )
+    assert INDEX_GUIDANCE_MARKER in result.combined, (
+        f"a block arriving on attempt 2 was not diagnosed:\n{result.combined}"
+    )
+
+
+def test_lock_fallback_does_not_starve_the_index_classifier(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """Output matching *both* classifiers must still reach the index branch.
+
+    A TLS-inspecting proxy can produce a fetch failure and a permission
+    error in the same output — plausible on exactly the managed devices
+    this feature targets. ``install.ps1`` runs its lock fallback first and
+    then ``continue``s, and the fallback's guard used to be the *result* of
+    the rename. ``Move-ConductorToolDirAside`` returns ``$null`` when there
+    is no existing tool dir (a fresh install), so the guard never flipped,
+    the branch fired on all four attempts, and the index classifier was
+    never reached — restoring the exact pre-feature behavior, Defender
+    advice included.
+
+    Deliberately run against a *fresh* sandbox (no ``seed_install``), since
+    that is the case that regressed. Needs no ``skipif``: install.sh has no
+    lock branch, so it classifies on attempt 1 and stops even sooner.
+    """
+    shim_env = _install_uv_shim(sandbox, mode="lock-and-network-always")
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+
+    attempts = _shim_attempts(shim_env)
+    assert attempts <= 2, (
+        f"the lock fallback starved the index classifier: uv was invoked "
+        f"{attempts} times instead of stopping once the block was seen."
+        f"\n{result.combined}"
+    )
+    assert INDEX_GUIDANCE_MARKER in result.combined, (
+        f"an error matching both classifiers was never diagnosed as an index "
+        f"block:\n{result.combined}"
+    )
+
+
+def test_unreachable_git_host_is_not_reported_as_a_blocked_index(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """A blocked github.com must not be diagnosed as a blocked package index.
+
+    The installer fetches Conductor itself from ``git+https://github.com/...``,
+    and uv words a failed git fetch with the same "failed to fetch" phrase it
+    uses for the index. Matching that phrase alone told a user whose network
+    blocks github.com that their *package index* was the problem — so they
+    would set a perfectly correct ``UV_DEFAULT_INDEX``, fail identically, and
+    conclude the index URL was wrong. github.com is on the primary path for
+    every real install, so this is not an edge case.
+    """
+    shim_env = _install_uv_shim(sandbox, mode="git-host-always")
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+
+    combined = result.combined
+    assert INDEX_GUIDANCE_MARKER not in combined, (
+        f"a git-remote failure was misdiagnosed as a blocked package index:\n{combined}"
+    )
+    assert "github.com" in combined, (
+        f"guidance did not name the host that was actually unreachable:\n{combined}"
     )
 
 

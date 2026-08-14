@@ -13,14 +13,36 @@ Behavior is selected by ``CONDUCTOR_TEST_SHIM_MODE``:
     succeeds.
 
 ``network-always``
-    On *every* ``uv tool install --force ...`` call, write a canned
-    blocked-package-index error to stderr and exit non-zero. Used to
+    On *every* call, write a canned blocked-package-index error. Used to
     prove the install scripts classify the failure and stop retrying,
     instead of burning the full backoff schedule on a failure that
     cannot heal.
 
-Every other call (``tool dir``, ``tool update-shell``, the retried
-install, etc.) is forwarded to the real ``uv`` unchanged.
+``network-after-first``
+    An ordinary failure first, then the blocked-index error. Proves the
+    early exit is evaluated on every attempt rather than only the first.
+
+``lock-and-network-always``
+    Output matching *both* the lock and index classifiers, on every
+    call. Proves the lock fallback cannot starve the index classifier —
+    the fallback runs once and the next attempt is still classified.
+
+``other-always``
+    An ordinary build failure with no network signature. The negative
+    direction: the full retry schedule must still run and no index
+    guidance may be printed.
+
+``transient-then-other``
+    A connection-level blip on attempt 2, an ordinary build failure
+    otherwise. A blip must not cut the retry schedule short, and the run
+    must be reported as whatever it *finally* failed on.
+
+``git-host-always``
+    A git-remote failure. uv words this the same way it words an index
+    fetch failure, so this proves the two are told apart.
+
+Every other call (``tool dir``, ``tool update-shell``, ...) is forwarded
+to the real ``uv`` unchanged in every mode.
 
 Stateful via the file referenced by ``CONDUCTOR_TEST_SHIM_STATE``, which
 holds the number of intercepted ``tool install --force`` attempts; the
@@ -63,19 +85,72 @@ NETWORK_ERROR = (
     "(https://pypi.org/simple/httpx/)\n"
 )
 
+# An ordinary failure with no network signature at all. The negative
+# control: the scripts must retry this on the full schedule and must not
+# print index guidance for it.
+OTHER_ERROR = (
+    "error: Failed to build `pyaudio==0.2.14`\n"
+    "  Caused by: src/pyaudio/device_api.c:9:10: fatal error: "
+    "portaudio.h: No such file or directory\n"
+)
+
+# A connection-level blip. Retrying really can fix this, so it must not
+# cut the retry schedule short even though it does name a network fault.
+TRANSIENT_ERROR = (
+    "error: Failed to download `httpx==0.28.1`\n  Caused by: connection reset by peer\n"
+)
+
+# uv's wording for an unreachable *git* remote. Note it says "failed to
+# fetch" exactly as an index failure does -- which is why the scripts
+# need a dedicated git check rather than relying on that needle.
+GIT_HOST_ERROR = (
+    "error: Git operation failed\n"
+    "  Caused by: failed to fetch into: /home/u/.cache/uv/git-v0/db/4a951fc9\n"
+    "  Caused by: failed to fetch branch or tag `v0.1.30`\n"
+)
+
+_MODES = {
+    "lock-once",
+    "network-always",
+    "network-after-first",
+    "lock-and-network-always",
+    "other-always",
+    "transient-then-other",
+    "git-host-always",
+}
+
 args = sys.argv[1:]
 is_install_force = args[:2] == ["tool", "install"] and "--force" in args[2:]
+
+if mode not in _MODES:
+    # Falling through to the real uv would run a genuine network install and
+    # surface as a confusing "install should have failed" much later.
+    sys.stderr.write(f"_uv_shim: unknown CONDUCTOR_TEST_SHIM_MODE {mode!r}\n")
+    sys.exit(64)
 
 if is_install_force:
     attempt = int(state.read_text()) if state.exists() else 0
     attempt += 1
     state.write_text(str(attempt))
+
+    canned: str | None = None
     if mode == "network-always":
-        sys.stderr.write(NETWORK_ERROR)
-        sys.stderr.flush()
-        sys.exit(2)
-    if mode == "lock-once" and attempt == 1:
-        sys.stderr.write(LOCK_ERROR)
+        canned = NETWORK_ERROR
+    elif mode == "other-always":
+        canned = OTHER_ERROR
+    elif mode == "git-host-always":
+        canned = GIT_HOST_ERROR
+    elif mode == "lock-and-network-always":
+        canned = LOCK_ERROR + NETWORK_ERROR
+    elif mode == "network-after-first":
+        canned = OTHER_ERROR if attempt == 1 else NETWORK_ERROR
+    elif mode == "transient-then-other":
+        canned = TRANSIENT_ERROR if attempt == 2 else OTHER_ERROR
+    elif mode == "lock-once" and attempt == 1:
+        canned = LOCK_ERROR
+
+    if canned is not None:
+        sys.stderr.write(canned)
         sys.stderr.flush()
         sys.exit(2)
 

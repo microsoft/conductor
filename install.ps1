@@ -13,7 +13,7 @@
 #   (uv's own setting -- this script does not need a Conductor-specific flag)
 #   before running the installer:
 #
-#       $env:UV_DEFAULT_INDEX = "https://<your-index-host>/simple/"
+#       $env:UV_DEFAULT_INDEX = "internal=https://<your-index-host>/simple/"
 #
 #   uv does NOT read pip's configuration, so `pip config set global.index-url`
 #   alone has no effect here.
@@ -181,30 +181,34 @@ function Test-LockError {
     return $false
 }
 
-function Test-NetworkBlockError {
-    # True when uv's output looks like the package index was unreachable
-    # rather than a transient local failure: a blocked/filtered network, an
-    # intercepting proxy, or a TLS-inspecting middlebox. Deliberately generic
-    # -- Conductor ships no default mirror and makes no assumption about
-    # whose network this is.
+function Test-GitHostFailure {
+    # True when uv could not reach the *git remote* it fetches Conductor
+    # itself from. Checked before the index classifier because uv reports a
+    # failed git fetch with the same "failed to fetch" wording it uses for the
+    # index, and the remedies are completely different: no index setting fixes
+    # a blocked github.com.
     param([string]$Output)
     if (-not $Output) { return $false }
-    $lower = $Output.ToLower()
+    return $Output.ToLowerInvariant().Contains('git operation failed')
+}
+
+function Test-DefinitiveIndexBlock {
+    # Tier 1: uv states it gave up, or the condition is a policy, DNS, or TLS
+    # fact that a 2-second backoff cannot change. Safe to stop retrying.
+    param([string]$Output)
+    if (-not $Output) { return $false }
+    if (Test-GitHostFailure -Output $Output) { return $false }
+    $lower = $Output.ToLowerInvariant()
     $needles = @(
-        'pypi.org',
-        'files.pythonhosted.org',
         'failed to fetch',
-        'error sending request',
         'request failed after',
+        '401 unauthorized',
         '403 forbidden',
         '407 proxy authentication required',
         'dns error',
         'invalid peer certificate',
         'self-signed certificate',
         'certificate verify failed',
-        'connection refused',
-        'connection reset',
-        'operation timed out',
         'proxyerror',
         'tls connect error'
     )
@@ -214,6 +218,47 @@ function Test-NetworkBlockError {
     return $false
 }
 
+function Test-NetworkBlockError {
+    # True when uv's output looks like the package index was unreachable
+    # rather than a transient local failure: a blocked/filtered network, an
+    # intercepting proxy, or a TLS-inspecting middlebox. Deliberately generic
+    # -- Conductor ships no default mirror and makes no assumption about
+    # whose network this is.
+    #
+    # Every needle names a *failure*, never merely a host. Matching on
+    # 'pypi.org' alone reported an integrity failure ("hash mismatch for
+    # https://files.pythonhosted.org/...") as an unreachable index, which is
+    # the worst available answer for a supply-chain signal.
+    #
+    # Tier 2 adds connection-level failures that a retry may genuinely fix (a
+    # VPN blip, a reset mid-download). Those still produce index guidance if
+    # they are what the run *finally* failed on, but they never cut the retry
+    # schedule short -- only Test-DefinitiveIndexBlock does that.
+    param([string]$Output)
+    if (-not $Output) { return $false }
+    if (Test-GitHostFailure -Output $Output) { return $false }
+    if (Test-DefinitiveIndexBlock -Output $Output) { return $true }
+    $lower = $Output.ToLowerInvariant()
+    $needles = @(
+        'error sending request',
+        'connection refused',
+        'connection reset',
+        'operation timed out'
+    )
+    foreach ($needle in $needles) {
+        if ($lower.Contains($needle)) { return $true }
+    }
+    return $false
+}
+
+function Get-RedactedUrl {
+    # Strip userinfo from a URL. An index URL is a documented place to put
+    # credentials, and the line that prints it reaches the terminal and every
+    # CI log that captures the installer.
+    param([string]$Url)
+    return ($Url -replace '://[^/@]*@', '://***@')
+}
+
 function Write-IndexOverrideInfo {
     # Report the package index uv will resolve against, if the environment
     # overrides the default. uv reads UV_DEFAULT_INDEX (current) and
@@ -221,39 +266,68 @@ function Write-IndexOverrideInfo {
     # configuration. Printing it makes "did my override actually apply?"
     # answerable from the install log alone.
     if ($env:UV_DEFAULT_INDEX) {
-        Write-Info "Package index (UV_DEFAULT_INDEX): $($env:UV_DEFAULT_INDEX)"
+        Write-Info "Package index (UV_DEFAULT_INDEX): $(Get-RedactedUrl $env:UV_DEFAULT_INDEX)"
     } elseif ($env:UV_INDEX_URL) {
-        Write-Info "Package index (UV_INDEX_URL): $($env:UV_INDEX_URL)"
+        Write-Info "Package index (UV_INDEX_URL): $(Get-RedactedUrl $env:UV_INDEX_URL)"
     }
 }
 
 function Write-IndexGuidance {
     # Guidance for a failure that looks like a blocked/unreachable index.
     Write-Host ""
-    Write-Host "  The Python package index could not be reached." -ForegroundColor Yellow
+    Write-Host "  A package index this installer needs could not be reached." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  This usually means the network blocks direct access to the public Python"
-    Write-Host "  package index (pypi.org / files.pythonhosted.org). Managed or corporate"
-    Write-Host "  devices often require all packages to come from an internal mirror."
+    Write-Host "  The most common cause is a network that blocks direct access to the"
+    Write-Host "  public Python package index (pypi.org / files.pythonhosted.org)."
+    Write-Host "  Managed or corporate devices often require all packages to come from"
+    Write-Host "  an internal mirror."
     Write-Host ""
-    Write-Host "  If your organization provides a PyPI mirror or proxy, point uv at it and"
-    Write-Host "  re-run this installer:"
-    Write-Host ""
-    Write-Host '      $env:UV_DEFAULT_INDEX = "https://<your-index-host>/simple/"' -ForegroundColor Cyan
-    Write-Host '      irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  To persist it for future shells (including 'conductor update --apply'),"
-    Write-Host "  set it once and open a new terminal:"
-    Write-Host ""
-    Write-Host '      setx UV_DEFAULT_INDEX "https://<your-index-host>/simple/"' -ForegroundColor Cyan
-    Write-Host ""
+    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL) {
+        Write-Host "  An index override is already set (shown above), so uv did not use the"
+        Write-Host "  public index. Check that the URL is correct and reachable from this"
+        Write-Host "  machine, and that any credentials it needs are supplied."
+        Write-Host ""
+    } else {
+        Write-Host "  If your organization provides a PyPI mirror or proxy, point uv at it"
+        Write-Host "  and re-run this installer:"
+        Write-Host ""
+        Write-Host '      $env:UV_DEFAULT_INDEX = "internal=https://<your-index-host>/simple/"' -ForegroundColor Cyan
+        Write-Host '      irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  To persist it for future shells (including 'conductor update --apply'),"
+        Write-Host "  set it once and open a new terminal:"
+        Write-Host ""
+        Write-Host '      setx UV_DEFAULT_INDEX "internal=https://<your-index-host>/simple/"' -ForegroundColor Cyan
+        Write-Host ""
+    }
     Write-Host "  Notes:"
     Write-Host "    * uv does not read pip's configuration. Setting"
     Write-Host '      "pip config set global.index-url ..." alone has no effect here.'
     Write-Host "    * Ask your IT or platform team for the index URL. Conductor ships no"
     Write-Host "      default mirror and never redirects your packages on its own."
-    Write-Host "    * If the index needs credentials, uv supports them in the URL or via"
-    Write-Host "      UV_INDEX_<NAME>_USERNAME / UV_INDEX_<NAME>_PASSWORD."
+    Write-Host "    * For credentials, name the index (the 'internal=' prefix above) and"
+    Write-Host "      set UV_INDEX_INTERNAL_USERNAME / UV_INDEX_INTERNAL_PASSWORD, or"
+    Write-Host "      embed them in the URL."
+    Write-Host "    * If the error mentions a certificate, the network is inspecting TLS."
+    Write-Host "      Trust your organization CA via SSL_CERT_FILE, or set UV_NATIVE_TLS=1."
+    Write-Host "    * If the error mentions a proxy (407), set HTTPS_PROXY / NO_PROXY."
+    Write-Host ""
+    Write-Host "  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index"
+    Write-Host ""
+}
+
+function Write-GitHostGuidance {
+    # Guidance for a failure fetching Conductor's own git repository. Kept
+    # separate from the index guidance because no index setting can fix it.
+    Write-Host ""
+    Write-Host "  Conductor's source repository could not be reached." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  This installer fetches Conductor itself from github.com. The error"
+    Write-Host "  above is a git failure, not a package-index failure, so setting"
+    Write-Host "  UV_DEFAULT_INDEX will not help."
+    Write-Host ""
+    Write-Host "  Check that this machine can reach github.com -- including any proxy"
+    Write-Host "  (HTTPS_PROXY / NO_PROXY) or TLS inspection your network requires."
     Write-Host ""
     Write-Host "  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index"
     Write-Host ""
@@ -465,6 +539,8 @@ try {
     Write-Info "Installing Conductor $displayVersion..."
     Write-IndexOverrideInfo
     $networkBlocked = $false
+    $gitHostFailure = $false
+    $lockFallbackTried = $false
     for ($attempt = 1; $attempt -le ($delays.Count + 1); $attempt++) {
         if ($attempt -gt 1) {
             $sleep = $delays[[Math]::Min($attempt - 2, $delays.Count - 1)]
@@ -481,11 +557,16 @@ try {
             break
         }
 
-        $combinedOutput = $lastStderr + $lastStdout
+        $attemptOutput = $lastStderr + $lastStdout
 
-        # If we hit a directory-lock error and we haven't already renamed
-        # aside, try the rename-fallback before the next retry.
-        if (-not $renamedAside -and (Test-LockError -Output $combinedOutput)) {
+        # If we hit a directory-lock error and we haven't already tried the
+        # fallback, rename the tool dir aside before the next retry. The guard
+        # tracks the *attempt*, not its result: Move-ConductorToolDirAside
+        # returns $null when there is no existing tool dir (a fresh install),
+        # so guarding on $renamedAside would keep this branch firing every
+        # iteration and starve the classifier below.
+        if (-not $lockFallbackTried -and (Test-LockError -Output $attemptOutput)) {
+            $lockFallbackTried = $true
             Write-Warn "Install blocked by a file lock; renaming the existing tool dir aside and retrying..."
             $renamedAside = Move-ConductorToolDirAside
             if ($renamedAside) {
@@ -495,17 +576,29 @@ try {
                 if ($existingTool2) {
                     Remove-StaleOldFiles -ScriptsDir (Join-Path $existingTool2 'Scripts')
                 }
+            } else {
+                Write-Warn "No existing tool dir to rename; the lock is elsewhere. Retrying anyway."
             }
             continue
         }
 
-        # A blocked index does not heal on a retry -- uv has already exhausted
-        # its own retries by this point. Backing off three more times just
-        # delays the only message that helps, so stop and explain instead.
-        if (Test-NetworkBlockError -Output $combinedOutput) {
+        # A definitively blocked index does not heal on a retry -- uv has
+        # already exhausted its own retries by this point. Backing off three
+        # more times just delays the only message that helps, so stop and
+        # explain instead. Connection-level failures are deliberately
+        # excluded: a VPN blip really can heal, and cutting the schedule
+        # short for one would trade a working install for a faster wrong
+        # answer. A git failure is excluded too, since uv does not retry git
+        # fetches internally, so a retry there is genuinely useful.
+        if (Test-DefinitiveIndexBlock -Output $attemptOutput) {
             $networkBlocked = $true
             break
         }
+        # Not conclusive yet -- remember what this attempt looked like so the
+        # post-loop classification can explain whatever the run finally
+        # failed on.
+        $networkBlocked = Test-NetworkBlockError -Output $attemptOutput
+        $gitHostFailure = Test-GitHostFailure -Output $attemptOutput
     }
 
     if (-not $installed) {
@@ -518,9 +611,22 @@ try {
             Write-Host "  (no output captured)" -ForegroundColor DarkGray
         }
 
+        # Printed before any early exit below, so a user whose install was
+        # renamed aside is always told where it went.
+        if ($renamedAside) {
+            Write-Host ""
+            Write-Info "The previous install was moved to: $renamedAside"
+            Write-Info "You can delete it manually once nothing has it open."
+        }
+
         if ($networkBlocked) {
             Write-IndexGuidance
             Write-Err "uv tool install failed: could not reach the package index"
+        }
+
+        if ($gitHostFailure) {
+            Write-GitHostGuidance
+            Write-Err "uv tool install failed: could not reach github.com"
         }
 
         Write-Host ""
@@ -529,10 +635,6 @@ try {
         Write-Info "  * Stop any running Conductor processes (try Task Manager or 'Get-Process conductor')"
         Write-Info "  * Windows Defender may be scanning the install directory. Try an exclusion:"
         Write-Info "      Add-MpPreference -ExclusionPath `"`$env:LOCALAPPDATA\uv`""
-        if ($renamedAside) {
-            Write-Info "  * The previous install was moved to: $renamedAside"
-            Write-Info "    You can delete it manually once nothing has it open."
-        }
         Write-Host ""
         Write-Err "uv tool install failed"
     }

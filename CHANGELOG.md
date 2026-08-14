@@ -13,22 +13,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into a generic failure.** On networks that block direct access to the public
   Python package index — increasingly common on managed corporate devices —
   `uv tool install` fails with a fetch/403/DNS-shaped error. uv has already
-  exhausted its own retries by that point, so `install.sh` / `install.ps1`
-  spent their 2s/5s/10s backoff on a failure that cannot heal and then printed
-  file-lock advice (including a Windows Defender exclusion suggestion) that is
-  both useless and misleading for a network-policy block. Both scripts now
-  classify the failure (`is_network_block_error` / `Test-NetworkBlockError`),
-  stop after the first attempt, and explain the actual remedy: point uv at
-  your organization's index with `UV_DEFAULT_INDEX`. They also echo the active
-  index at install time so "did my override apply?" is answerable from the
-  install log, and the Defender advice is now scoped to lock failures only.
+  exhausted its own retries by that point, so both scripts spent their
+  2s/5s/10s backoff on a failure that cannot heal, and `install.ps1` then
+  printed file-lock advice (including a Windows Defender exclusion suggestion)
+  that is both useless and misleading for a network-policy block. Both scripts
+  now classify the failure, stop after the attempt that hit it, and explain the
+  actual remedy: point uv at your organization's index with `UV_DEFAULT_INDEX`.
+  They also echo the active index at install time — with any credentials in the
+  URL redacted — so "did my override apply?" is answerable from the install log.
+  On the blocked-index path `install.ps1` no longer reaches its Defender advice.
+- **Two neighbouring failures are told apart rather than blamed on the index.**
+  uv words an unreachable *git remote* exactly as it words an unreachable index,
+  and the installer fetches Conductor itself from `git+https://github.com/...` —
+  so a blocked `github.com` was being reported as a blocked package index,
+  sending users to configure something that could not help. It now gets its own
+  message. Separately, connection-level blips (`connection reset` and friends)
+  still get the full retry schedule, since unlike a policy block they can
+  genuinely heal; only a definitive block short-circuits the retries.
 - **README: "Installing behind a proxy or private package index"** — how to
   install through a mirrored/proxied index with uv (`UV_DEFAULT_INDEX`,
-  `uv.toml`, credentials) and with pip/pipx, including the trap that **uv does
-  not read pip's configuration**, so `pip config set global.index-url` alone
-  has no effect on the install scripts, `uv tool install`, or `conductor
-  update`. Conductor ships no default mirror and never redirects package
-  resolution on its own; the index is always user-supplied configuration.
+  `uv.toml`, named-index credentials, TLS inspection, proxies) and with
+  pip/pipx, including the trap that **uv does not read pip's configuration**,
+  so `pip config set global.index-url` alone has no effect on the install
+  scripts, `uv tool install`, or `conductor update`. Conductor ships no default
+  mirror and never redirects package resolution on its own; the index is always
+  user-supplied configuration.
 
 ## [0.1.30](https://github.com/microsoft/conductor/compare/v0.1.29...v0.1.30) - 2026-08-14
 

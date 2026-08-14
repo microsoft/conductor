@@ -133,18 +133,22 @@ and the normal install commands work unchanged.
 
 ```bash
 # macOS / Linux
-export UV_DEFAULT_INDEX="https://<your-index-host>/simple/"
+export UV_DEFAULT_INDEX="internal=https://<your-index-host>/simple/"
 curl -sSfL https://aka.ms/conductor/install.sh | sh
 ```
 
 ```powershell
 # Windows -- for this shell only
-$env:UV_DEFAULT_INDEX = "https://<your-index-host>/simple/"
+$env:UV_DEFAULT_INDEX = "internal=https://<your-index-host>/simple/"
 irm https://aka.ms/conductor/install.ps1 | iex
 
 # Windows -- persist for future shells (then open a new terminal)
-setx UV_DEFAULT_INDEX "https://<your-index-host>/simple/"
+setx UV_DEFAULT_INDEX "internal=https://<your-index-host>/simple/"
 ```
+
+The `internal=` prefix names the index. The name is optional for a plain
+public mirror, but it is what credential environment variables key off — so
+naming it up front saves reconfiguring later.
 
 Persist the setting in your shell profile (or with `setx`) so later upgrades
 and `conductor update --apply` inherit it. uv also reads a config file if you
@@ -153,6 +157,7 @@ prefer that to an environment variable — `~/.config/uv/uv.toml` on macOS/Linux
 
 ```toml
 [[index]]
+name = "internal"
 url = "https://<your-index-host>/simple/"
 default = true
 ```
@@ -169,14 +174,27 @@ pip config set global.index-url https://<your-index-host>/simple/
 > `uv.toml`). Configure both if you use both toolchains.
 
 If the index requires credentials, uv accepts them inline in the URL or via
-[`UV_INDEX_<NAME>_USERNAME` / `UV_INDEX_<NAME>_PASSWORD`](https://docs.astral.sh/uv/configuration/indexes/#providing-credentials).
+`UV_INDEX_INTERNAL_USERNAME` / `UV_INDEX_INTERNAL_PASSWORD` — where `INTERNAL`
+is the index name from the `internal=` prefix (or the `name` key) above,
+upper-cased. See
+[uv's index documentation](https://docs.astral.sh/uv/concepts/indexes/#providing-credentials-directly).
 
 When an install fails because the index is unreachable, the install scripts say
 so explicitly and skip their retry backoff — retrying cannot fix a blocked
-index. If you see a generic timeout or `403` instead, check whether your
-organization requires a proxy (`HTTPS_PROXY` / `NO_PROXY`) as well as an index
-URL. Do not work around the block by disabling security tooling; ask your IT or
-platform team for the approved index endpoint.
+index. Two related cases are reported separately rather than being blamed on
+the index:
+
+- **A blocked `github.com`.** The installer fetches Conductor itself from git,
+  and uv words that failure the same way it words an index failure. No index
+  setting fixes it, so the scripts say so and point at github.com instead.
+- **A transient connection blip.** These still get the full retry schedule,
+  since unlike a policy block they can genuinely heal.
+
+If the error mentions a certificate, your network is inspecting TLS — trust
+your organization's root CA via `SSL_CERT_FILE`, or set `UV_NATIVE_TLS=1` to
+use the system trust store. If it mentions a proxy (`407`), set `HTTPS_PROXY` /
+`NO_PROXY` as well as the index URL. Do not work around the block by disabling
+security tooling; ask your IT or platform team for the approved index endpoint.
 
 ### Use the Conductor skill in Claude Code or Copilot CLI
 

@@ -14,7 +14,7 @@
 #   (uv's own setting — this script does not need a Conductor-specific flag)
 #   before running the installer:
 #
-#       export UV_DEFAULT_INDEX="https://<your-index-host>/simple/"
+#       export UV_DEFAULT_INDEX="internal=https://<your-index-host>/simple/"
 #
 #   uv does NOT read pip's configuration, so `pip config set global.index-url`
 #   alone has no effect here.
@@ -143,98 +143,190 @@ find_running_conductor() {
 # overrides the default. uv reads UV_DEFAULT_INDEX (current) and UV_INDEX_URL
 # (deprecated but still honored); it does NOT read pip's configuration.
 # Printing it makes "did my override actually apply?" answerable from the
-# install log alone.
+# install log alone. Any userinfo is stripped first: an index URL is a
+# documented place to put credentials, and this line reaches the terminal
+# and every CI log that captures the installer.
+redact_url_credentials() {
+    printf '%s' "$1" | sed 's#://[^/@]*@#://***@#'
+}
+
 report_index_override() {
     if [ -n "${UV_DEFAULT_INDEX:-}" ]; then
-        info "Package index (UV_DEFAULT_INDEX): ${UV_DEFAULT_INDEX}"
+        info "Package index (UV_DEFAULT_INDEX): $(redact_url_credentials "$UV_DEFAULT_INDEX")"
     elif [ -n "${UV_INDEX_URL:-}" ]; then
-        info "Package index (UV_INDEX_URL): ${UV_INDEX_URL}"
+        info "Package index (UV_INDEX_URL): $(redact_url_credentials "$UV_INDEX_URL")"
     fi
+}
+
+# True when uv could not reach the *git remote* it fetches Conductor itself
+# from. Checked before the index classifier because uv reports a failed git
+# fetch with the same "failed to fetch" wording it uses for the index, and
+# the remedies are completely different: no index setting fixes a blocked
+# github.com. Must be called in a conditional (it returns non-zero as a
+# normal answer).
+is_git_host_failure() {
+    [ -f "$1" ] || return 1
+    LC_ALL=C tr '[:upper:]' '[:lower:]' < "$1" | LC_ALL=C grep -qF 'git operation failed'
 }
 
 # True when uv's output looks like the package index was unreachable rather
 # than a transient local failure: a blocked/filtered network, an intercepting
 # proxy, or a TLS-inspecting middlebox. Deliberately generic — Conductor ships
 # no default mirror and makes no assumption about whose network this is.
-is_network_block_error() {
-    file="$1"
-    [ -f "$file" ] || return 1
-    LC_ALL=C tr '[:upper:]' '[:lower:]' < "$file" | grep -qE \
-        'pypi\.org|files\.pythonhosted\.org|failed to fetch|error sending request|request failed after|403 forbidden|407 proxy authentication required|dns error|invalid peer certificate|self-signed certificate|certificate verify failed|connection refused|connection reset|operation timed out|proxyerror|tls connect error'
+#
+# Every needle names a *failure*, never merely a host. Matching on `pypi.org`
+# alone reported an integrity failure ("hash mismatch for
+# https://files.pythonhosted.org/...") as an unreachable index, which is the
+# worst available answer for a supply-chain signal.
+#
+# Split into two tiers, because "skip the retries" and "explain the failure"
+# need different evidence:
+#
+#   definitive — uv states it gave up, or the condition is a policy, DNS, or
+#                TLS fact that a 2-second backoff cannot change. Safe to stop
+#                retrying immediately.
+#   transient  — connection-level failures that a retry may genuinely fix (a
+#                VPN blip, a reset mid-download). These still produce index
+#                guidance if they are what the run *finally* failed on, but
+#                they never cut the retry schedule short.
+#
+# Must be called in a conditional (they return non-zero as a normal answer).
+is_definitive_index_block() {
+    [ -f "$1" ] || return 1
+    is_git_host_failure "$1" && return 1
+    LC_ALL=C tr '[:upper:]' '[:lower:]' < "$1" | LC_ALL=C grep -qF \
+        -e 'failed to fetch' \
+        -e 'request failed after' \
+        -e '401 unauthorized' \
+        -e '403 forbidden' \
+        -e '407 proxy authentication required' \
+        -e 'dns error' \
+        -e 'invalid peer certificate' \
+        -e 'self-signed certificate' \
+        -e 'certificate verify failed' \
+        -e 'proxyerror' \
+        -e 'tls connect error'
 }
 
-# Run `uv tool install` with retry+backoff. Echoes combined stdout+stderr to
-# the LOG_FILE and returns the final exit code. Sets INSTALL_FAILURE_KIND to
-# `network` or `other` so the caller can print guidance that matches the
-# actual failure (sh functions can only return an exit status).
+is_network_block_error() {
+    [ -f "$1" ] || return 1
+    is_git_host_failure "$1" && return 1
+    is_definitive_index_block "$1" && return 0
+    LC_ALL=C tr '[:upper:]' '[:lower:]' < "$1" | LC_ALL=C grep -qF \
+        -e 'error sending request' \
+        -e 'connection refused' \
+        -e 'connection reset' \
+        -e 'operation timed out'
+}
+
+# Run `uv tool install` with retry+backoff. Appends combined stdout+stderr of
+# every attempt to LOG_FILE and returns the final exit code. Sets
+# INSTALL_FAILURE_KIND to `network`, `git`, or `other` so the caller can print
+# guidance that matches the actual failure (sh functions can only return an
+# exit status).
+#
+# Classification reads only the *most recent* attempt, never the accumulated
+# log: one transient blip anywhere in a run would otherwise relabel whatever
+# the run finally failed on.
 uv_install_with_retry() {
     install_source="$1"
     constraints="$2"  # may be empty
     log_file="$3"
+    attempt_log="${log_file}.attempt"
 
-    delays="2 5 10"
-    attempt=1
     ec=0
+    attempt=0
     INSTALL_FAILURE_KIND="other"
     : > "$log_file"
-    set +e
-    if [ -n "$constraints" ]; then
-        uv tool install --force "$install_source" -c "$constraints" >>"$log_file" 2>&1
-    else
-        uv tool install --force "$install_source" >>"$log_file" 2>&1
-    fi
-    ec=$?
-    set -e
-    [ "$ec" -eq 0 ] && return 0
 
-    # A blocked index does not heal on a retry — uv has already exhausted its
-    # own retries by this point. Backing off three more times just delays the
-    # only message that helps, so stop here and let the caller explain.
-    if is_network_block_error "$log_file"; then
-        INSTALL_FAILURE_KIND="network"
-        return "$ec"
-    fi
-
-    for d in $delays; do
+    # A leading 0 makes the first attempt share the loop body without sleeping.
+    for d in 0 2 5 10; do
         attempt=$((attempt + 1))
-        info "Retrying install (attempt ${attempt}) after ${d}s…"
-        sleep "$d"
-        printf '\n--- attempt %s ---\n' "$attempt" >>"$log_file"
+        if [ "$d" != "0" ]; then
+            info "Retrying install (attempt ${attempt}) after ${d}s…"
+            sleep "$d"
+            printf '\n--- attempt %s ---\n' "$attempt" >>"$log_file"
+        fi
+
         set +e
         if [ -n "$constraints" ]; then
-            uv tool install --force "$install_source" -c "$constraints" >>"$log_file" 2>&1
+            uv tool install --force "$install_source" -c "$constraints" >"$attempt_log" 2>&1
         else
-            uv tool install --force "$install_source" >>"$log_file" 2>&1
+            uv tool install --force "$install_source" >"$attempt_log" 2>&1
         fi
         ec=$?
         set -e
+        cat "$attempt_log" >>"$log_file" 2>/dev/null || true
+
         [ "$ec" -eq 0 ] && return 0
+
+        # A definitively blocked index does not heal on a retry — uv has
+        # already exhausted its own retries by this point. Backing off three
+        # more times just delays the only message that helps, so stop here and
+        # let the caller explain. Connection-level failures are deliberately
+        # excluded: a VPN blip really can heal, and cutting the schedule short
+        # for one would trade a working install for a faster wrong answer. A
+        # git failure is excluded too, since uv does not retry git fetches
+        # internally, so a retry there is genuinely useful.
+        if is_definitive_index_block "$attempt_log"; then
+            INSTALL_FAILURE_KIND="network"
+            return "$ec"
+        fi
     done
-    if is_network_block_error "$log_file"; then
+
+    # The retries are spent. Classify whatever the run *finally* failed on.
+    if is_network_block_error "$attempt_log"; then
         INSTALL_FAILURE_KIND="network"
+    elif is_git_host_failure "$attempt_log"; then
+        INSTALL_FAILURE_KIND="git"
     fi
     return "$ec"
 }
 
 # Guidance for a failure that looks like a blocked/unreachable package index.
 print_index_guidance() {
-    printf '\n  \033[1mThe Python package index could not be reached.\033[0m\n\n' >&2
-    printf '  This usually means the network blocks direct access to the public Python\n' >&2
-    printf '  package index (pypi.org / files.pythonhosted.org). Managed or corporate\n' >&2
-    printf '  devices often require all packages to come from an internal mirror.\n\n' >&2
-    printf '  If your organization provides a PyPI mirror or proxy, point uv at it and\n' >&2
-    printf '  re-run this installer:\n\n' >&2
-    printf '      export UV_DEFAULT_INDEX="https://<your-index-host>/simple/"\n' >&2
-    printf '      curl -sSfL https://aka.ms/conductor/install.sh | sh\n\n' >&2
-    printf '  Add the same export to your shell profile so future installs and\n' >&2
-    printf "  'conductor update --apply' inherit it.\n\n" >&2
+    printf '\n  \033[1mA package index this installer needs could not be reached.\033[0m\n\n' >&2
+    printf '  The most common cause is a network that blocks direct access to the\n' >&2
+    printf '  public Python package index (pypi.org / files.pythonhosted.org).\n' >&2
+    printf '  Managed or corporate devices often require all packages to come from\n' >&2
+    printf '  an internal mirror.\n\n' >&2
+    if [ -n "${UV_DEFAULT_INDEX:-}${UV_INDEX_URL:-}" ]; then
+        printf '  An index override is already set (shown above), so uv did not use the\n' >&2
+        printf '  public index. Check that the URL is correct and reachable from this\n' >&2
+        printf '  machine, and that any credentials it needs are supplied.\n\n' >&2
+    else
+        printf '  If your organization provides a PyPI mirror or proxy, point uv at it\n' >&2
+        printf '  and re-run this installer:\n\n' >&2
+        printf '      export UV_DEFAULT_INDEX="internal=https://<your-index-host>/simple/"\n' >&2
+        printf '      curl -sSfL https://aka.ms/conductor/install.sh | sh\n\n' >&2
+        printf '  Add the same export to your shell profile so future installs and\n' >&2
+        printf "  'conductor update --apply' inherit it.\n\n" >&2
+    fi
     printf '  Notes:\n' >&2
     printf "    * uv does not read pip's configuration. Setting\n" >&2
     printf '      "pip config set global.index-url ..." alone has no effect here.\n' >&2
     printf '    * Ask your IT or platform team for the index URL. Conductor ships no\n' >&2
     printf '      default mirror and never redirects your packages on its own.\n' >&2
-    printf '    * If the index needs credentials, uv supports them in the URL or via\n' >&2
-    printf '      UV_INDEX_<NAME>_USERNAME / UV_INDEX_<NAME>_PASSWORD.\n\n' >&2
+    printf '    * For credentials, name the index (the "internal=" prefix above) and\n' >&2
+    printf '      set UV_INDEX_INTERNAL_USERNAME / UV_INDEX_INTERNAL_PASSWORD, or\n' >&2
+    printf '      embed them in the URL.\n' >&2
+    printf '    * If the error mentions a certificate, the network is inspecting TLS.\n' >&2
+    printf '      Trust your organization CA via SSL_CERT_FILE, or set UV_NATIVE_TLS=1.\n' >&2
+    printf '    * If the error mentions a proxy (407), set HTTPS_PROXY / NO_PROXY.\n\n' >&2
+    printf '  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index\n\n' >&2
+}
+
+# Guidance for a failure fetching Conductor's own git repository. Kept
+# separate from the index guidance because no index setting can fix it, and
+# saying "your package index is blocked" would send the user to configure
+# something that is not the problem.
+print_git_host_guidance() {
+    printf '\n  \033[1mConductor'"'"'s source repository could not be reached.\033[0m\n\n' >&2
+    printf '  This installer fetches Conductor itself from github.com. The error\n' >&2
+    printf '  above is a git failure, not a package-index failure, so setting\n' >&2
+    printf '  UV_DEFAULT_INDEX will not help.\n\n' >&2
+    printf '  Check that this machine can reach github.com — including any proxy\n' >&2
+    printf '  (HTTPS_PROXY / NO_PROXY) or TLS inspection your network requires.\n\n' >&2
     printf '  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index\n\n' >&2
 }
 
@@ -387,13 +479,25 @@ main() {
     log_file="${tmpdir}/uv-install.log"
     if ! uv_install_with_retry "$install_source" "$constraints_file" "$log_file"; then
         printf '\n  ── uv tool install output ──\n' >&2
-        sed 's/^/  /' "$log_file" >&2
-        printf '\n' >&2
-        if [ "${INSTALL_FAILURE_KIND:-other}" = "network" ]; then
-            print_index_guidance
-            error "uv tool install failed: could not reach the package index"
+        if [ -s "$log_file" ]; then
+            sed 's/^/  /' "$log_file" >&2
+        else
+            printf '  (no output captured)\n' >&2
         fi
-        error "uv tool install failed after retries"
+        printf '\n' >&2
+        case "${INSTALL_FAILURE_KIND:-other}" in
+            network)
+                print_index_guidance
+                error "uv tool install failed: could not reach the package index"
+                ;;
+            git)
+                print_git_host_guidance
+                error "uv tool install failed: could not reach github.com"
+                ;;
+            *)
+                error "uv tool install failed after retries"
+                ;;
+        esac
     fi
     success "Conductor ${display_version} installed"
 
