@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.30...HEAD)
 
+### Fixed
+
+- **`--web-bg`/`resume --web-bg`: a failed run-record write no longer kills
+  a healthy background workflow** (#435). The launch gate's run-record poll
+  (Fleet Manager D2) used to terminate the child and fail the launch if it
+  couldn't confirm the run record within 15 seconds, even when the child was
+  alive and its dashboard was still reachable — treating a bookkeeping
+  failure as a workflow failure. It now downgrades to a warning
+  (`BackgroundLaunch.run_record_written=False`, surfaced via a new note
+  pointing at the captured stderr log, and via a TUI notification from the
+  Fleet Manager's New Run screen) and lets the launch proceed; only a child
+  that is actually dead, or whose dashboard has gone unreachable, still fails
+  the launch.
+- **The `run_id` format is now defined once**, in a new leaf module
+  `conductor.run_id` (#435). Previously `fleet/records.py` enforced a broad
+  path-safe pattern while `engine/event_log.py` independently enforced a
+  narrower hex-only pattern and lowercased its input; a resumed
+  `--web-bg` run whose checkpoint `run_id` contained uppercase characters
+  could be silently folded to a different value by the event log, causing
+  the parent's launch-gate poll to look for a key the child never wrote and
+  kill the resumed run 15 seconds after a successful start. `fleet/history.py`
+  and `fleet/retention.py`'s filename parsers, and `fleet/records.py`'s own
+  timestamp parser, now derive their run-id-matching regexes from the same
+  shared pattern.
+
 ## [0.1.30](https://github.com/microsoft/conductor/compare/v0.1.29...v0.1.30) - 2026-08-14
 
 ### Added

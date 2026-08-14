@@ -49,7 +49,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import socket
 import subprocess
 import sys
@@ -60,6 +59,8 @@ from enum import Enum
 from io import IOBase
 from pathlib import Path
 from typing import Any
+
+from conductor.run_id import is_valid_run_id, new_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +83,10 @@ _CREATE_BREAKAWAY_FROM_JOB: int = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB
 _ERROR_ACCESS_DENIED = 5
 
 # NOTE: run-id format validation here defers to
-# ``conductor.fleet.records.is_valid_run_id`` (imported lazily inside the
-# functions that need it, to avoid a hard import cycle at module load time)
-# rather than a hand-rolled hex-only regex. A resumed child reuses a
-# checkpoint's ``run_id`` verbatim -- ``EventLogSubscriber``'s
+# ``conductor.run_id.is_valid_run_id`` -- the single shared contract also
+# used by ``fleet.records`` and ``EventLogSubscriber`` -- rather than a
+# hand-rolled hex-only regex. A resumed child reuses a checkpoint's
+# ``run_id`` verbatim -- ``EventLogSubscriber``'s
 # ``existing_path``/``existing_run_id`` branch performs no format check of
 # its own -- and the only thing that actually gates whether that id can be
 # used is whether the child's own ``write_run_record`` call accepts it as a
@@ -93,7 +94,9 @@ _ERROR_ACCESS_DENIED = 5
 # to keep one) can reject a checkpoint ``run_id`` the child would happily
 # reuse, causing the parent to poll for a freshly generated id the resumed
 # child never writes its run record under (see ``_peek_resume_run_id``'s
-# docstring).
+# docstring). ``conductor.run_id`` is a stdlib-only leaf module, so
+# importing it here at module load time (unlike ``conductor.fleet.records``,
+# which would drag in ``conductor.cli`` and close an import cycle) is safe.
 
 
 def _detachment_kwargs() -> dict[str, Any]:
@@ -216,10 +219,11 @@ class BackgroundLaunch:
         stdout_log: Path to the file capturing the child's stdout.
         run_id: The run id that ties this bg launch to its ``.events.jsonl``
             peer via ``CONDUCTOR_RUN_ID``. Normally exactly 8 lowercase hex
-            characters (a fresh ``secrets.token_hex(4)``), but a resumed
-            launch may force-carry a checkpoint's original run id instead
-            (see ``_peek_resume_run_id``), which is validated against the
-            same path-safe contract the fleet run-record store itself uses.
+            characters (a fresh ``conductor.run_id.new_run_id()``), but a
+            resumed launch may force-carry a checkpoint's original run id
+            instead (see ``_peek_resume_run_id``), which is validated
+            against the same path-safe contract the fleet run-record store
+            itself uses.
         workflow_started: Whether the launcher observed the workflow actually
             start (via ``GET /api/info`` reporting a ``workflow_started``
             event — see ``_wait_for_workflow_start``) before its wait
@@ -249,10 +253,24 @@ class BackgroundLaunch:
             reintroduce a narrower form of the same false-success bug this
             PR fixes. Check this field *before* ``workflow_started``: the
             latter is only meaningful when this one is ``True``.
+        run_record_written: Whether the child's fleet run record was
+            actually observed by the launch gate (see
+            ``_finalize_background_launch``). ``True`` in the overwhelming
+            common case. ``False`` means the run is executing normally —
+            the dashboard came up and stayed reachable — but the discovery
+            record itself could not be confirmed within the poll window,
+            so this run will **not** appear in ``conductor status`` /
+            ``fleet list`` / the ``fleet`` TUI and cannot be stopped with
+            ``conductor stop`` (issue #435: a bookkeeping failure must not
+            be treated as a launch failure and kill an otherwise-healthy
+            workflow). Callers should surface this with a warning pointing
+            at the captured stderr log, where the child's own
+            ``_write_run_record_for_current_process`` failure handler
+            names the underlying cause.
 
     Invariants (enforced in ``__post_init__``):
         * ``run_id`` is a valid fleet run id -- see
-          ``conductor.fleet.records.is_valid_run_id``, the same contract
+          ``conductor.run_id.is_valid_run_id``, the same contract
           the child's own ``write_run_record`` call enforces.
         * ``url`` is a localhost URL (``http://127.0.0.1:<port>``).
         * ``run_id`` appears in both ``stderr_log.name`` and
@@ -267,10 +285,9 @@ class BackgroundLaunch:
     run_id: str
     workflow_started: bool = True
     still_running: bool = True
+    run_record_written: bool = True
 
     def __post_init__(self) -> None:
-        from conductor.fleet.records import is_valid_run_id
-
         if not is_valid_run_id(self.run_id):
             raise ValueError(
                 f"BackgroundLaunch.run_id must be a valid run id, got: {self.run_id!r}"
@@ -404,7 +421,7 @@ def _open_bg_log_files(
             cannot be opened. The caller is expected to surface this as a
             ``RuntimeError`` with context.
     """
-    run_id = forced_run_id or secrets.token_hex(4)
+    run_id = forced_run_id or new_run_id()
     ts = time.strftime("%Y%m%d-%H%M%S")
     base = _sanitize_name(workflow_ref.stem) if workflow_ref.stem else "workflow"
     log_dir = Path(tempfile.gettempdir()) / "conductor"
@@ -651,20 +668,50 @@ def _remove_dead_child_record(run_id: str, child_pid: int) -> None:
         logger.debug("Could not remove run record for run_id=%s", run_id, exc_info=True)
 
 
+@dataclass(frozen=True, slots=True)
+class _GateOutcome:
+    """Result of :func:`_finalize_background_launch`'s readiness gate.
+
+    Replaces a bare ``bool`` (which only ever meant ``workflow_started``)
+    so the run-record poll's own, independent signal --
+    ``run_record_written`` -- survives the call rather than being folded
+    away, following the ``WebPauseOutcome`` / ``StartProbe`` precedent of
+    naming an outcome instead of widening a single boolean.
+    """
+
+    workflow_started: bool
+    """See ``BackgroundLaunch.workflow_started`` -- same meaning."""
+
+    run_record_written: bool
+    """See ``BackgroundLaunch.run_record_written`` -- same meaning. ``True``
+    on every path except the one where the run-record poll deadline passed
+    while the child was confirmed alive and still serving its port
+    (issue #435)."""
+
+
 def _finalize_background_launch(
     proc: subprocess.Popen[Any],
     web_port: int,
     run_id: str,
     stderr_log: Path,
-) -> bool:
+) -> _GateOutcome:
     """Wait for the dashboard, wait for the child's run record, then confirm it started.
 
-    On any failure (server didn't start, child died early, the child never
-    wrote its run record within the timeout), the still-running child is
-    terminated to avoid orphaned processes holding the dashboard port
-    without a discoverable record. The stderr log path (with a bounded tail
-    of its contents) is included in the ``RuntimeError`` so callers can
-    point users at the captured crash output.
+    On a fatal failure (server didn't start, child died early, the port is
+    taken by a foreign process), the still-running child is terminated to
+    avoid orphaned processes holding the dashboard port. The stderr log path
+    (with a bounded tail of its contents) is included in the
+    ``RuntimeError`` so callers can point users at the captured crash
+    output.
+
+    The run-record poll (stage one-and-a-half, below) is a *readiness
+    signal*, not a kill switch (issue #435): if its own deadline passes
+    while the child is confirmed alive and still serving its port, that
+    means the child's discovery bookkeeping failed, not that the workflow
+    itself is unhealthy -- terminating a working run over a failed
+    diagnostic write would be strictly worse than leaving it running
+    undiscoverable. Only a child that is actually dead, or that has gone
+    unreachable, fails the launch at this stage.
 
     Per D2 (the child owns the write in every mode — see
     ``docs/projects/fleet-manager/fleet-manager.design.md``), the detached
@@ -699,10 +746,11 @@ def _finalize_background_launch(
     rather than letting the exception escape uncontained and orphan the
     background process.
 
-    Because the child writes its record as it starts executing, the record
-    poll is a *stronger* readiness signal than the PID write it replaces --
-    but it is still not proof the engine reached ``workflow_started``, so
-    the stage-two ``/api/info`` probe (issue #410) is retained below.
+    Because the child writes its record as it starts executing, seeing a
+    matching record is a *stronger* readiness signal than the PID write it
+    replaces -- but it is still not proof the engine reached
+    ``workflow_started``, so the stage-two ``/api/info`` probe (issue #410)
+    is retained below.
 
     Args:
         proc: The detached child process.
@@ -713,18 +761,21 @@ def _finalize_background_launch(
             in failure messages so users know where to look.
 
     Returns:
-        ``True`` if the workflow was observed to start (or the stage-two
-        probe is disabled, or the child exited cleanly within the wait
-        window). ``False`` if the stage-two wait deadline passed with the
-        child still alive and not yet reporting a start — not a failure,
-        just "still initializing".
+        A :class:`_GateOutcome`. ``workflow_started`` is ``True`` if the
+        workflow was observed to start (or the stage-two probe is
+        disabled, or the child exited cleanly within the wait window),
+        ``False`` if the stage-two wait deadline passed with the child
+        still alive and not yet reporting a start (not a failure, just
+        "still initializing"). ``run_record_written`` is ``False`` only
+        when the run-record poll's own deadline passed while the child was
+        confirmed alive and reachable (issue #435).
 
     Raises:
         RuntimeError: If the child died early (with a non-zero exit code),
-            the dashboard didn't start within the timeout, the child never
-            wrote a matching run record within the timeout, reading the run
-            record itself failed, the child died before the workflow started
-            (non-zero exit), or a foreign process already holds the port.
+            the dashboard didn't start within the timeout, reading the run
+            record itself failed, the child died before the workflow
+            started (non-zero exit), or a foreign process already holds
+            the port.
     """
     if not _wait_for_server(web_port, timeout=15.0, proc=proc):
         retcode = proc.poll()
@@ -733,7 +784,7 @@ def _finalize_background_launch(
                 # A sub-second run that finished before the socket became
                 # reachable is not a failure, and there's no live process to
                 # track — no PID file to write.
-                return True
+                return _GateOutcome(workflow_started=True, run_record_written=True)
             raise RuntimeError(
                 f"Background process exited immediately with code {retcode}. "
                 f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
@@ -750,6 +801,7 @@ def _finalize_background_launch(
     # the child has reached the point of registering itself.
     from conductor.fleet.records import read_run_record
 
+    run_record_written = True
     deadline = time.monotonic() + 15.0
     while True:
         retcode = proc.poll()
@@ -757,7 +809,7 @@ def _finalize_background_launch(
             if retcode == 0:
                 # Completed inside the window; the child removed its own
                 # record on exit, so there is nothing to wait for.
-                return True
+                return _GateOutcome(workflow_started=True, run_record_written=True)
             raise RuntimeError(
                 f"Background process exited immediately with code {retcode}. "
                 f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
@@ -780,6 +832,27 @@ def _finalize_background_launch(
         ):
             break
         if time.monotonic() >= deadline:
+            # The deadline passed. This is a *bookkeeping* failure, not
+            # necessarily a workflow failure (issue #435) -- if the child
+            # is still alive and its dashboard is still reachable, the
+            # workflow itself is healthy and only the discovery record
+            # write failed. Downgrade to a warning and let the launch
+            # proceed rather than killing a working run. Only when the
+            # child is dead or its port has gone unreachable is this
+            # still fatal.
+            if proc.poll() is None and _wait_for_server(web_port, timeout=1.0, proc=proc):
+                logger.warning(
+                    "Background process (run_id=%s) did not report a run record within "
+                    "15 seconds, but is still running and its dashboard is still "
+                    "reachable. It will not appear in `conductor status` / `fleet list` "
+                    "and cannot be stopped with `conductor stop`. See child stderr log: "
+                    "%s%s",
+                    run_id,
+                    stderr_log,
+                    _tail_log(stderr_log),
+                )
+                run_record_written = False
+                break
             _terminate_child(proc)
             raise RuntimeError(
                 f"Background process did not report a run record within 15 seconds "
@@ -790,12 +863,12 @@ def _finalize_background_launch(
 
     start_timeout = _resolve_start_timeout()
     if start_timeout == 0:
-        return True
+        return _GateOutcome(workflow_started=True, run_record_written=run_record_written)
 
     probe = _wait_for_workflow_start(web_port, proc, timeout=start_timeout)
 
     if probe is StartProbe.STARTED:
-        return True
+        return _GateOutcome(workflow_started=True, run_record_written=run_record_written)
 
     if probe is StartProbe.TIMED_OUT:
         logger.info(
@@ -805,14 +878,14 @@ def _finalize_background_launch(
             start_timeout,
             _START_TIMEOUT_ENV,
         )
-        return False
+        return _GateOutcome(workflow_started=False, run_record_written=run_record_written)
 
     if probe is StartProbe.CHILD_EXITED:
         retcode = proc.poll()
         if retcode == 0:
             # Completed inside the window; the child already removed its
             # own run record.
-            return True
+            return _GateOutcome(workflow_started=True, run_record_written=run_record_written)
         _remove_dead_child_record(run_id, proc.pid)
         raise RuntimeError(
             "Background process exited before the workflow started "
@@ -921,21 +994,22 @@ def _spawn_bg_child(
                 f"Failed to start background process: {exc}. See child stderr log: {stderr_path}"
             ) from exc
 
-        workflow_started = _finalize_background_launch(proc, web_port, run_id, stderr_path)
+        gate_outcome = _finalize_background_launch(proc, web_port, run_id, stderr_path)
     finally:
         # The child has its own duplicated OS handles by now (or never got
         # them, if Popen raised) — either way the parent's Python file
         # objects can be released without affecting the child.
         _close_quietly(stderr_handle, stdout_handle)
 
-    # ``_finalize_background_launch`` returns bare ``True`` (or ``False`` for
-    # ``StartProbe.TIMED_OUT``) from several paths that don't check the
-    # child's exit code, because at the moment they returned the child was
-    # confirmed either alive or cleanly exited (0) — see the function's own
-    # docstring. ``proc`` is still in hand here, so re-poll it directly
-    # rather than widening that function's return type: this is what lets
-    # ``BackgroundLaunch.still_running`` distinguish "genuinely running" from
-    # "already exited" without callers printing a live dashboard URL for an
+    # ``_finalize_background_launch`` returns a ``workflow_started`` of
+    # ``True`` (or ``False`` for ``StartProbe.TIMED_OUT``) from several
+    # paths that don't check the child's exit code, because at the moment
+    # they returned the child was confirmed either alive or cleanly exited
+    # (0) — see the function's own docstring. ``proc`` is still in hand
+    # here, so re-poll it directly rather than widening that function's
+    # return type further: this is what lets ``BackgroundLaunch
+    # .still_running`` distinguish "genuinely running" from "already
+    # exited" without callers printing a live dashboard URL for an
     # already-exited process (#410).
     retcode = proc.poll()
     still_running = retcode is None
@@ -961,8 +1035,9 @@ def _spawn_bg_child(
         stderr_log=stderr_path,
         stdout_log=stdout_path,
         run_id=run_id,
-        workflow_started=workflow_started,
+        workflow_started=gate_outcome.workflow_started,
         still_running=still_running,
+        run_record_written=gate_outcome.run_record_written,
     )
 
 
@@ -1079,6 +1154,17 @@ def _peek_resume_run_id(workflow_path: Path | None, checkpoint_path: Path | None
     terminate a perfectly healthy resumed run whenever the original log
     file survived.
 
+    This function and ``EventLogSubscriber``'s ``existing_run_id`` branch
+    both defer to the single shared rule in :mod:`conductor.run_id`
+    (issue #435) -- before that, this module kept its own broad
+    (path-safe) copy while ``EventLogSubscriber``'s *other* branch (the
+    ``CONDUCTOR_RUN_ID`` env-var fallback taken when the peeked log has
+    vanished between this peek and child start) enforced a narrower
+    hex-only rule and lowercased the result, so a checkpoint id this
+    function accepted here could still be rejected (and folded to a
+    different value) by the child, silently polling for a key the child
+    never wrote. With one shared rule, that divergence cannot recur.
+
     Best-effort: any failure to locate or parse the checkpoint returns
     ``None`` (falling back to a freshly generated id, the pre-existing
     behavior) rather than raising — the child's own checkpoint resolution
@@ -1093,13 +1179,12 @@ def _peek_resume_run_id(workflow_path: Path | None, checkpoint_path: Path | None
 
     Returns:
         The checkpoint's ``run_id`` if the child will reuse it (and it is
-        a valid fleet run id -- see
-        ``conductor.fleet.records.is_valid_run_id``, the same contract the
-        child's own ``write_run_record`` call enforces -- and hence also
-        satisfies ``BackgroundLaunch``'s invariant), else ``None``.
+        a valid fleet run id -- see :func:`conductor.run_id.is_valid_run_id`,
+        the same contract the child's own ``write_run_record`` call
+        enforces -- and hence also satisfies ``BackgroundLaunch``'s
+        invariant), else ``None``.
     """
     from conductor.engine.checkpoint import CheckpointManager
-    from conductor.fleet.records import is_valid_run_id
 
     try:
         if checkpoint_path is not None:

@@ -475,11 +475,22 @@ class NewRunScreen(Screen):
             return
 
         # Success: hand off to the Runs screen, whose own poll timer will
-        # pick up the new (already-discoverable, per D2) run record --
-        # this screen never tracks the launched run itself (viewer, not
-        # supervisor). Unwinds to Runs rather than popping one level: this
-        # screen can also be reached from two levels inside the Registries
-        # drill-down, where a single pop would land back on a workflow's
-        # inputs with the just-started run nowhere in sight.
+        # pick up the new run record -- this screen never tracks the
+        # launched run itself (viewer, not supervisor). Unwinds to Runs
+        # rather than popping one level: this screen can also be reached
+        # from two levels inside the Registries drill-down, where a single
+        # pop would land back on a workflow's inputs with the just-started
+        # run nowhere in sight.
         cast("FleetApp", self.app).return_to_runs()
         self.app.notify(f"Launched: {launch.url}", markup=False)
+        if not launch.run_record_written:
+            # The run is executing normally, but its discovery bookkeeping
+            # failed (issue #435) -- it will not appear on the Runs screen
+            # this notification just switched to, so say so rather than
+            # leaving the user wondering why a "successful" launch vanished.
+            self.app.notify(
+                "This run could not register itself for discovery and will not "
+                "appear in the list. Check its stderr log for the cause.",
+                severity="warning",
+                markup=False,
+            )

@@ -29,6 +29,15 @@ Design points this module implements:
   as ``RunRecord``s with ``mode="bg"`` (so D1's stop-confirmation gate never
   prompts for them) and best-effort field mapping rather than dropping or
   crashing on the unfamiliar shape.
+- **The ``run_id`` contract itself lives in :mod:`conductor.run_id`**, not
+  here — that leaf module is shared with
+  :class:`conductor.engine.event_log.EventLogSubscriber` (which must not
+  import this module, since it would drag in ``conductor.cli``) and with
+  the filename parsers in ``fleet/history.py`` / ``fleet/retention.py``.
+  ``is_valid_run_id`` is re-exported from here (rather than only available
+  from ``conductor.run_id``) purely for backward compatibility with
+  ``cli.bg_runner`` and the existing test suite, which import it from this
+  module.
 """
 
 from __future__ import annotations
@@ -47,6 +56,8 @@ from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
 from conductor.cli import pid as cli_pid
+from conductor.run_id import RUN_ID_PATTERN_SOURCE
+from conductor.run_id import is_valid_run_id as is_valid_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -66,53 +77,29 @@ _VALID_MODES: frozenset[str] = frozenset(get_args(RunMode))
 _REPLACE_RETRIES = 10
 _REPLACE_RETRY_DELAY_SECONDS = 0.02
 
-# Path-safe run-id pattern. Real run_ids are ``secrets.token_hex(4)`` (see
-# ``engine/event_log.py``) — 8 lowercase hex characters — but this pattern is
-# intentionally broader (alphanumeric, ``-``, ``_``) so it doesn't need to
-# track that format precisely. ``run_id`` is interpolated directly into a
-# filename (``<run_id>.json``), so it must be validated before being used in
-# a path: critically, ``.`` is excluded from the safe set, which rules out
-# both ``..`` traversal and a value like ``"foo/../../etc"``; ``/`` and
-# ``\`` are excluded outright, which rules out absolute paths and separators.
-_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+# The path-safe run-id contract itself now lives in ``conductor.run_id`` (the
+# leaf module ``engine/event_log.py`` also depends on, without pulling in
+# this module and hence ``conductor.cli``) -- see that module's docstring
+# for why a single source is what makes a mismatch here unwritable rather
+# than merely fixed once. ``is_valid_run_id`` is re-exported (rather than
+# only available from ``conductor.run_id``) so ``cli.bg_runner``'s
+# ``_peek_resume_run_id`` / ``BackgroundLaunch.__post_init__`` and the
+# existing test suite can keep importing it from here.
 
 # The ``YYYYMMDD-HHMMSS`` stamp `EventLogSubscriber` puts in a log's name,
 # anchored to the ``-<run_id>.events.jsonl`` tail so a workflow name that
-# happens to contain digits cannot be mistaken for it.
-_LOG_STEM_TIMESTAMP_RE = re.compile(r"-(\d{8}-\d{6})-[^-]+\.events\.jsonl$")
+# happens to contain digits cannot be mistaken for it. Built from the shared
+# ``RUN_ID_PATTERN_SOURCE`` (rather than a hand-rolled ``[^-]+``) so a
+# hyphenated run id -- which the old ``[^-]+`` could not match at all --
+# still anchors correctly: the strict ``\d{8}-\d{6}`` timestamp segment is
+# what actually pins the split point, so the run-id segment can backtrack
+# across embedded hyphens safely.
+_LOG_STEM_TIMESTAMP_RE = re.compile(rf"-(\d{{8}}-\d{{6}})-{RUN_ID_PATTERN_SOURCE}\.events\.jsonl$")
 
 # How far a candidate log's start time may sit from the record's before it
 # stops being considered the same run. The child writes its log moments
 # after the parent stamps the record, so this only has to absorb startup.
 _LOG_MATCH_TOLERANCE_SECONDS = 120.0
-
-
-def is_valid_run_id(run_id: str) -> bool:
-    """Return True if ``run_id`` is safe to use as a run-record filename component.
-
-    This is the single, authoritative "effective run-id" contract: the
-    broadest format any run_id — freshly generated, or reused verbatim from
-    a checkpoint by a resumed run (``EventLogSubscriber``'s
-    ``existing_path``/``existing_run_id`` branch performs no format check of
-    its own) — must satisfy for :func:`write_run_record` /
-    :func:`read_run_record` to actually accept it.
-
-    Exported (rather than kept as the private ``_RUN_ID_PATTERN`` regex) so
-    ``cli.bg_runner._peek_resume_run_id`` can predict, using this exact same
-    rule, whether the resumed child will successfully write a run record
-    under a checkpoint's ``run_id`` — instead of maintaining its own,
-    narrower hex-only copy that could (and did) reject a checkpoint
-    ``run_id`` the child itself would happily reuse, causing the parent to
-    poll for the wrong key and kill a healthy resumed run.
-
-    Args:
-        run_id: The run identifier to check.
-
-    Returns:
-        True if ``run_id`` matches the path-safe pattern used to key run
-        record files.
-    """
-    return bool(_RUN_ID_PATTERN.fullmatch(run_id))
 
 
 def _max_pid() -> int:
@@ -1044,7 +1031,7 @@ def read_run_record(run_id: str) -> RunRecord | None:
         Does not check liveness — a caller that just wrote the record for
         its own process wouldn't want a liveness race to hide it.
     """
-    if not _RUN_ID_PATTERN.fullmatch(run_id):
+    if not is_valid_run_id(run_id):
         return None
     filepath = run_records_dir() / f"{run_id}.json"
     record, _corrupt, _stat = _load_record_file(filepath)
@@ -1074,7 +1061,7 @@ def remove_run_record(run_id: str) -> bool:
         are avoided by treating ``_safe_unlink``'s own return value as the
         single source of truth for whether removal occurred.
     """
-    if not _RUN_ID_PATTERN.fullmatch(run_id):
+    if not is_valid_run_id(run_id):
         return False
     filepath = run_records_dir() / f"{run_id}.json"
     removed = _safe_unlink(filepath)

@@ -273,6 +273,18 @@ class TestFilenameParsing:
         assert len(entries) == 1
         assert entries[0].run_id is None
 
+    def test_hyphenated_run_id_recovered_correctly(self, temp_root: Path) -> None:
+        """A run id containing ``-``/``_`` (issue #435's broadened
+        ``conductor.run_id`` contract) still round-trips through the
+        filename parser -- without anchoring on the fixed-format timestamp,
+        a hyphenated run id could otherwise be split apart and lost."""
+        _write_log(temp_root, name="my-workflow", run_id="nightly-run_7", lines=[])
+
+        entries = build_history_entries()
+
+        assert entries[0].workflow_name == "my-workflow"
+        assert entries[0].run_id == "nightly-run_7"
+
 
 # ---------------------------------------------------------------------------
 # Bounded by retention (E14-T2's acceptance criterion)

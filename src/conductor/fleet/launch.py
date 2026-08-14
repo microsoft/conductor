@@ -220,8 +220,11 @@ def launch_workflow(
     never spawns a ``conductor`` subprocess itself -- so the one already
     cross-platform-hardened detached-spawn implementation (and its D2
     run-record poll gate) is reused rather than duplicated. A successful
-    return therefore guarantees the run is already discoverable via
-    ``read_run_records()`` before this function returns.
+    return means the workflow is running, but not always already
+    discoverable: check the returned ``BackgroundLaunch.run_record_written``
+    -- ``False`` means the run-record poll's own bookkeeping failed (issue
+    #435), so the run will not (yet) show up via ``read_run_records()``
+    even though it is executing normally.
 
     Args:
         workflow_path: Local path to the workflow YAML (from
@@ -233,15 +236,16 @@ def launch_workflow(
         metadata: Optional CLI metadata key=value pairs.
 
     Returns:
-        The ``BackgroundLaunch`` describing the now-discoverable run.
+        The ``BackgroundLaunch`` describing the launch. See above for the
+        ``run_record_written`` caveat.
 
     Raises:
         LaunchError: On a required-field/coercion failure, or when
             ``launch_background()`` itself fails (child died early,
-            dashboard never came up, or -- the D2 gate -- the child never
-            wrote a matching run record within the timeout). The original
-            exception's message is preserved verbatim so the TUI can show
-            it, but never the raw traceback.
+            dashboard never came up, or -- the D2 gate -- the child died or
+            went unreachable before writing a matching run record). The
+            original exception's message is preserved verbatim so the TUI
+            can show it, but never the raw traceback.
     """
     inputs = build_launch_inputs(raw_values, input_defs)
 

@@ -1349,6 +1349,28 @@ class TestLegacyEventLogRecovery:
         )
         assert record.event_log_path == str(wanted)
 
+    def test_hyphenated_run_id_disambiguates_correctly(self, log_dir: Path) -> None:
+        """A run id containing ``-``/``_`` (issue #435's broadened
+        ``conductor.run_id`` contract) still round-trips through the
+        timestamp-anchored ``_LOG_STEM_TIMESTAMP_RE`` -- without that
+        anchor, a hyphenated run id could be split apart by the naive
+        hyphen-based parse this regex used to use."""
+        wanted = log_dir / "conductor-ship-20260812-183544-nightly-run_7.events.jsonl"
+        wanted.write_text("")
+        for stem in ("test-20260812-190115", "multi-20260812-190037"):
+            (log_dir / f"conductor-{stem}-nightly-run_7.events.jsonl").write_text("")
+
+        record = RunRecord.from_dict(
+            {
+                "pid": 1,
+                "port": 8080,
+                "workflow": "/tmp/wf.yaml",
+                "run_id": "nightly-run_7",
+                "started_at": datetime(2026, 8, 12, 18, 35, 44).astimezone().isoformat(),
+            }
+        )
+        assert record.event_log_path == str(wanted)
+
     def test_started_at_far_from_every_candidate_is_not_adopted(self, log_dir: Path) -> None:
         """Outside the tolerance window nothing is claimed: a same-id log from
         an unrelated run must not be adopted just for being closest."""

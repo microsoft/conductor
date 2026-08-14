@@ -753,7 +753,12 @@ class TestLaunchBackgroundResumeFailures:
         mock_read.assert_not_called()
 
     def test_terminates_child_when_run_record_never_appears(self, tmp_path: Path) -> None:
-        """If the child never writes its run record, the running child is killed (no orphan)."""
+        """When the child never writes its run record *and* its dashboard has
+        gone unreachable at the deadline re-probe, the running child is
+        killed (no orphan). See ``test_bg_runner.py``'s
+        ``TestRunRecordPollGate`` for the counterpart where the child stays
+        reachable and the launch is downgraded to a warning instead
+        (issue #435)."""
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -765,7 +770,10 @@ class TestLaunchBackgroundResumeFailures:
 
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
-            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            # Second element is the deadline branch's 1s reachability
+            # re-probe, which fails here -- keeping this test on the fatal
+            # path.
+            patch("conductor.cli.bg_runner._wait_for_server", side_effect=[True, False]),
             patch("conductor.fleet.records.read_run_record", return_value=None),
             patch.object(bg_runner.time, "sleep"),
             patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
@@ -1159,6 +1167,87 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         # The launch gate polls for the child's record by run id, so the
         # adopted id is what it must have asked for.
         mock_write.assert_called_with("DEADBEEF")
+
+    def test_hyphenated_checkpoint_run_id_is_adopted_verbatim(self, tmp_path: Path) -> None:
+        """A checkpoint's hyphenated ``run_id`` is adopted verbatim too.
+
+        The shared ``conductor.run_id`` contract (issue #435) allows
+        ``-``/``_`` in addition to alphanumerics, so a checkpoint carrying
+        one (e.g. a hand-authored or externally-generated run id) must be
+        adopted the same way a plain hex one is.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "nightly-run_7")
+
+        proc = MagicMock()
+        proc.pid = 6010
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9219),
+            ) as mock_write,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9219
+            )
+
+        assert launch.run_id == "nightly-run_7"
+        mock_write.assert_called_with("nightly-run_7")
+
+    def test_parent_poll_key_matches_child_env_fallback_when_log_vanishes(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The two rules agree even on the branch that used to diverge (issue #435).
+
+        ``_peek_resume_run_id`` (parent side) adopts the checkpoint's
+        ``run_id`` whenever its event log exists *at peek time*. But the
+        actual child may find that log gone by the time it constructs its
+        own ``EventLogSubscriber`` (e.g. a retention sweep raced it) --
+        in which case the child falls through to the ``CONDUCTOR_RUN_ID``
+        env-var branch instead of the ``existing_run_id`` branch. Before
+        issue #435, that branch enforced a narrower hex-only rule and
+        lowercased the result, so an uppercase or hyphenated checkpoint
+        ``run_id`` the parent adopted here could be silently folded into a
+        *different* value by the child -- making the parent's launch-gate
+        poll (``_finalize_background_launch``) wait on a key the child
+        never writes. With one shared rule, the two agree unconditionally.
+        """
+        from conductor.cli import bg_runner
+        from conductor.engine.event_log import EventLogSubscriber
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "DEADBEEF-42")
+        checkpoint = json.loads(cp_path.read_text())
+        event_log_path = Path(checkpoint["event_log_path"])
+
+        # Parent peeks while the log still exists -- adopts the checkpoint's
+        # run_id verbatim.
+        forced_run_id = bg_runner._peek_resume_run_id(None, cp_path)
+        assert forced_run_id == "DEADBEEF-42"
+
+        # The log vanishes before the child actually constructs its
+        # EventLogSubscriber (e.g. a retention sweep raced it) -- the child
+        # takes the env-var fallback branch instead of `existing_run_id`.
+        event_log_path.unlink()
+
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", forced_run_id)
+        sub = EventLogSubscriber(
+            "test-workflow", existing_path=event_log_path, existing_run_id=forced_run_id
+        )
+        try:
+            # The id the child actually writes its run record/log under
+            # must equal the id the parent is polling for.
+            assert sub.run_id == forced_run_id
+        finally:
+            sub.close()
 
     def test_non_string_checkpoint_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
         """A checkpoint whose ``run_id`` field is a non-string JSON value doesn't crash.

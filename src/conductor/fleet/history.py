@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from conductor.fleet.retention import event_log_root
+from conductor.run_id import RUN_ID_PATTERN_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +58,16 @@ _EVENT_LOG_GLOB = "conductor-*.events.jsonl"
 # `<name>` itself may contain hyphens (a common workflow-file-stem
 # convention, e.g. "simple-qa-bot"), so it cannot be split on hyphens
 # positionally -- instead the fixed-format timestamp
-# (`time.strftime("%Y%m%d-%H%M%S")`, always 8 digits-dash-6 digits) and
-# hex run-id segments anchor the parse from the *right* end of the
-# filename, leaving whatever remains (including any hyphens) as the name.
+# (`time.strftime("%Y%m%d-%H%M%S")`, always 8 digits-dash-6 digits) anchors
+# the parse from the *right* end of the filename, leaving whatever remains
+# before it (including any hyphens) as the name. The run-id segment is
+# built from the shared `conductor.run_id.RUN_ID_PATTERN_SOURCE` (not a
+# hand-rolled hex-only charset) so a run id containing `-`/`_` still
+# round-trips -- without this, such a run silently loses its `run_id` on
+# the History screen (`_parse_filename` would fall back to `run_id=None`).
 _FILENAME_PATTERN = re.compile(
-    r"^conductor-(?P<name>.+)-(?P<ts>\d{8}-\d{6})-(?P<run_id>[0-9a-fA-F]{1,32})\.events\.jsonl$"
+    rf"^conductor-(?P<name>.+)-(?P<ts>\d{{8}}-\d{{6}})-(?P<run_id>{RUN_ID_PATTERN_SOURCE})"
+    r"\.events\.jsonl$"
 )
 
 # Mirrors `conductor.settings.FleetRetentionSettings.keep_last`'s own

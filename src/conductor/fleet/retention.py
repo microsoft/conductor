@@ -40,12 +40,20 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from conductor.run_id import RUN_ID_PATTERN_SOURCE
+
 logger = logging.getLogger(__name__)
 
 _EVENT_LOG_GLOB = "conductor-*.events.jsonl"
 _BG_STDERR_SUFFIX = ".bg.stderr.log"
 _BG_STDOUT_SUFFIX = ".bg.stdout.log"
-_RUN_ID_FROM_EVENT_LOG = re.compile(r"-([0-9a-fA-F]{1,32})\.events\.jsonl$")
+# Anchored on the fixed-format `YYYYMMDD-HHMMSS` timestamp segment
+# (`EventLogSubscriber`'s `time.strftime("%Y%m%d-%H%M%S")`) immediately
+# before the run-id, not just "whatever follows the last hyphen" -- the
+# shared `RUN_ID_PATTERN_SOURCE` charset now includes `-`/`_`, so without
+# this anchor a hyphenated run id could backtrack across the timestamp (or
+# even the workflow name) instead of stopping at its own boundary.
+_RUN_ID_FROM_EVENT_LOG = re.compile(rf"-\d{{8}}-\d{{6}}-({RUN_ID_PATTERN_SOURCE})\.events\.jsonl$")
 
 
 def event_log_root() -> Path:

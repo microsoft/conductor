@@ -249,6 +249,31 @@ class TestExclusions:
         assert newest.exists()
         assert set(result.deleted) == {old_log, stderr_log, stdout_log}
 
+    def test_bg_companions_pruned_with_hyphenated_run_id(self, temp_root: Path) -> None:
+        """A run id containing ``-``/``_`` (issue #435's broadened
+        ``conductor.run_id`` contract) still matches its companions --
+        without the timestamp anchor in ``_RUN_ID_FROM_EVENT_LOG``, a
+        hyphenated run id could backtrack across the timestamp segment and
+        fail to match its own companion files."""
+        old_log = _make_event_log(
+            temp_root,
+            "conductor-bgrun-20260101-000000-nightly-run_7.events.jsonl",
+            age_seconds=1000,
+        )
+        stderr_log = temp_root / "conductor-bgrun-20260101-000000-nightly-run_7.bg.stderr.log"
+        stdout_log = temp_root / "conductor-bgrun-20260101-000000-nightly-run_7.bg.stdout.log"
+        stderr_log.write_text("")
+        stdout_log.write_text("")
+        newest = _make_event_log(temp_root, "conductor-newest.events.jsonl", age_seconds=0)
+
+        result = prune_event_logs(keep_last=1)
+
+        assert not old_log.exists()
+        assert not stderr_log.exists()
+        assert not stdout_log.exists()
+        assert newest.exists()
+        assert set(result.deleted) == {old_log, stderr_log, stdout_log}
+
     def test_bg_companions_of_retained_log_survive(self, temp_root: Path) -> None:
         """A retained (not-yet-pruned) events log's companions are simply
         never inspected/deleted -- they were never candidates."""

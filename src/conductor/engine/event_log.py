@@ -14,6 +14,12 @@ Example::
     # ... run workflow ...
     subscriber.close()
     print(f"Logs at: {subscriber.path}")
+
+The ``run_id`` format this subscriber accepts/mints is not defined here --
+it defers entirely to :mod:`conductor.run_id`, the single shared contract
+also used by the fleet run-record store and its filename parsers. See
+that module's docstring for why the contract lives there rather than
+here.
 """
 
 from __future__ import annotations
@@ -21,23 +27,20 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
-import secrets
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 from conductor.events import WorkflowEvent
+from conductor.run_id import is_valid_run_id, new_run_id
 
 logger = logging.getLogger(__name__)
 
 # ``CONDUCTOR_RUN_ID`` is set by ``conductor.cli.bg_runner`` when launching a
-# ``--web-bg`` child. We validate it as a short hex string before using it in
-# a filename, both to keep the filename path-safe and to reject accidental
-# injection via the env var. 32 hex characters is the upper bound — enough
-# for any reasonable run-id format including a SHA1 prefix.
-_RUN_ID_PATTERN = re.compile(r"[0-9a-fA-F]{1,32}")
+# ``--web-bg`` child. We validate it against the shared fleet run-id contract
+# (``conductor.run_id``) before using it in a filename, both to keep the
+# filename path-safe and to reject accidental injection via the env var.
 
 
 def _make_json_safe(obj: Any) -> Any:
@@ -94,8 +97,9 @@ class EventLogSubscriber:
 
         When neither ``existing_path`` nor ``existing_run_id`` is
         provided, the run id is taken from the ``CONDUCTOR_RUN_ID``
-        environment variable when it is set to a short hex string —
-        used by :mod:`conductor.cli.bg_runner` to propagate the
+        environment variable when it is set to a value matching the
+        shared fleet run-id contract (:mod:`conductor.run_id`) — used
+        by :mod:`conductor.cli.bg_runner` to propagate the
         parent-chosen run id to the detached child so all artefacts
         of a single bg run share the same id in their filenames (see
         issue #116). Otherwise a fresh random id is generated.
@@ -127,9 +131,15 @@ class EventLogSubscriber:
         # and this child's ``.events.jsonl`` file share a run id in their
         # filenames and cross-correlate. Fall back to a fresh random id
         # otherwise. See issue #116.
+        #
+        # Adopted verbatim (no case-folding): the ``existing_run_id`` branch
+        # above already adopts its id as-is, and the two branches must agree
+        # or a parent (``bg_runner``) that predicts which branch a resumed
+        # child will take (``_peek_resume_run_id``) could poll for a key
+        # this branch would silently fold into a different one (issue #435).
         env_run_id = os.environ.get("CONDUCTOR_RUN_ID", "")
-        if env_run_id and _RUN_ID_PATTERN.fullmatch(env_run_id):
-            self._run_id = env_run_id.lower()
+        if env_run_id and is_valid_run_id(env_run_id):
+            self._run_id = env_run_id
         else:
             if env_run_id:
                 # Malformed env value — log so a typo in a wrapper script
@@ -138,7 +148,7 @@ class EventLogSubscriber:
                     "Ignoring malformed CONDUCTOR_RUN_ID=%r; using random id",
                     env_run_id,
                 )
-            self._run_id = secrets.token_hex(4)
+            self._run_id = new_run_id()
         ts = time.strftime("%Y%m%d-%H%M%S")
         self._path = (
             Path(tempfile.gettempdir())
@@ -150,7 +160,13 @@ class EventLogSubscriber:
 
     @property
     def run_id(self) -> str:
-        """Unique run identifier (8-char hex)."""
+        """Unique run identifier.
+
+        Normally an 8-character lowercase hex string (see
+        :func:`conductor.run_id.new_run_id`), but a resumed run may carry
+        forward a checkpoint's original id verbatim -- see
+        :mod:`conductor.run_id` for the full accepted shape.
+        """
         return self._run_id
 
     @property
