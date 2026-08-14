@@ -70,7 +70,23 @@ draws between the row-scoped and fleet-scoped key blocks (and the same one
 Textual itself uses to fence off the docked command-palette key)."""
 
 
-def _rendered_footer(app: FleetApp) -> str:
+def _footer_line(app: FleetApp) -> str:
+    """The compositor row carrying the footer bindings, or ``""``.
+
+    Searches for the row rather than assuming the footer is the last strip.
+    It is on Linux, but not reliably on Windows, where the trailing strip
+    can be blank -- which made every footer assertion read an empty line and
+    fail for a reason unrelated to the grouping these tests are about.
+    """
+    strips = list(app.screen._compositor.render_strips())
+    for strip in reversed(strips):
+        line = "".join(segment.text for segment in strip)
+        if "New" in line:
+            return line
+    return ""
+
+
+async def _rendered_footer(pilot: Any, app: FleetApp) -> str:
     """Return the footer as actually painted, for assertions about what a
     user can see.
 
@@ -79,18 +95,16 @@ def _rendered_footer(app: FleetApp) -> str:
     widget alone yields nothing, and the marker class on a ``FooterKey``
     says only that styling was *requested*, not that it landed.
 
-    Searches for the row carrying a binding rather than assuming the footer
-    is the compositor's last strip. It is on Linux, but the trailing strip
-    is blank on Windows, which made every footer assertion read an empty
-    line and fail for a reason that had nothing to do with the grouping
-    these tests are about.
+    Waits for the footer to actually paint instead of reading after a single
+    ``pause()``. One pause is enough on Linux; on Windows the first frame can
+    land before the footer is composited, so the assertion read a blank line.
     """
-    strips = list(app.screen._compositor.render_strips())
-    lines = ["".join(segment.text for segment in strip) for strip in strips]
-    for line in reversed(lines):
-        if "New" in line:
+    for _ in range(20):
+        line = _footer_line(app)
+        if line:
             return line
-    return lines[-1] if lines else ""
+        await pilot.pause()
+    return _footer_line(app)
 
 
 def _write_record(
@@ -894,7 +908,7 @@ class TestGateBindingVisibility:
         app = FleetApp()
         async with app.run_test(size=(140, 30)) as pilot:
             await pilot.pause()
-            line = _rendered_footer(app)
+            line = await _rendered_footer(pilot, app)
 
         assert "Kill  " in line and "n New" in line
         between = line[line.index("k Kill") : line.index("n New")]
@@ -907,7 +921,7 @@ class TestGateBindingVisibility:
         app = FleetApp()
         async with app.run_test(size=(140, 30)) as pilot:
             await pilot.pause()
-            line = _rendered_footer(app)
+            line = await _rendered_footer(pilot, app)
 
         assert line.lstrip().startswith("n New"), line
         assert _BLOCK_RULE not in line[: line.index("n New")], line
