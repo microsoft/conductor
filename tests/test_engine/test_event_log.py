@@ -81,6 +81,11 @@ class TestEventLogSubscriber:
 
     def test_filenames_unique_for_simultaneous_starts(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TMPDIR", str(tmp_path))
+        # A pinned CONDUCTOR_RUN_ID (e.g. from running this suite inside a
+        # --web-bg conductor session) would make every subscriber below
+        # adopt the same id and hence the same filename, defeating the
+        # very uniqueness this test checks.
+        monkeypatch.delenv("CONDUCTOR_RUN_ID", raising=False)
         subs = [EventLogSubscriber("same-workflow") for _ in range(3)]
         paths = [s.path for s in subs]
         # All paths must be distinct even when created in rapid succession

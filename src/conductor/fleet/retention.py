@@ -136,9 +136,15 @@ def _companion_paths(event_log: Path) -> list[Path]:
         f"conductor-*-{run_id}{_BG_STDERR_SUFFIX}",
         f"conductor-*-{run_id}{_BG_STDOUT_SUFFIX}",
     ]
+    # The glob's `*` is unanchored, so it also matches a companion whose
+    # *own* run id merely ends in this one (e.g. run_id="abc" matching a
+    # file actually keyed by "x-abc") -- filter to the timestamp-anchored
+    # boundary so a hyphen-adjacent run id can't be mistaken for this run's
+    # companion log.
+    boundary = re.compile(rf"^conductor-.+-\d{{8}}-\d{{6}}-{re.escape(run_id)}(?:\.bg\.\w+\.log)$")
     companions: list[Path] = []
     for pattern in patterns:
-        companions.extend(p for p in parent.glob(pattern) if p.is_file())
+        companions.extend(p for p in parent.glob(pattern) if p.is_file() and boundary.match(p.name))
     return companions
 
 

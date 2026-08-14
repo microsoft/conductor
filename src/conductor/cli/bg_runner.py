@@ -23,23 +23,31 @@ that ``--log-file`` writes to disk. Leaving verbosity at the default and
 capturing the stream to a file keeps both the log files and any
 ``--log-file`` trace populated for detached children (see issue #196).
 
-**Two-stage readiness contract** (issue #410): a bg launch is considered
-"finalized" only after two separate probes, not one. Stage one
-(:func:`_wait_for_server`) is a plain TCP connect — it proves a process
-is listening on the port, nothing more. Stage two
-(:func:`_wait_for_workflow_start`) polls ``GET /api/info`` until the
-payload carries a ``started_at`` key, which only appears once the
-child's engine has actually emitted ``workflow_started`` — proving the
-workflow itself began rather than just the dashboard's HTTP server. Both
-stages check ``proc.poll()`` on every iteration so a child that exits
-early (e.g. a ``ConfigurationError`` from a bad workflow) is reported in
-about a second instead of after the full timeout. The stage-two wait
-defaults to 30s and is tunable via ``CONDUCTOR_WEB_BG_START_TIMEOUT``
-(``0`` disables it, restoring pre-#410 behavior); passing that deadline
-with the child still alive is not treated as a failure — the URL is
-still printed and the PID file is still left in place, since the
-workflow may simply be slow to start (plugin fetch, MCP server startup,
-provider connection).
+**Three-stage readiness contract** (issues #410, #435): a bg launch is
+considered "finalized" only after three separate probes, not one. Stage
+one (:func:`_wait_for_server`) is a plain TCP connect — it proves a
+process is listening on the port, nothing more. Stage one-and-a-half
+polls the child's own fleet run record (:mod:`conductor.fleet.records`)
+until it appears matching this launch's pid/mode/port -- if that poll's
+own deadline passes while the child stays alive and its dashboard stays
+reachable, this is downgraded to a warning (``run_record_written=False``
+on the returned :class:`BackgroundLaunch`) rather than treated as a
+launch failure, since a bookkeeping failure must not kill an otherwise
+healthy workflow. Stage two (:func:`_wait_for_workflow_start`) polls
+``GET /api/info`` until the payload carries a ``started_at`` key, which
+only appears once the child's engine has actually emitted
+``workflow_started`` — proving the workflow itself began rather than
+just the dashboard's HTTP server. All three stages check ``proc.poll()``
+on every iteration so a child that exits early (e.g. a
+``ConfigurationError`` from a bad workflow) is reported in about a
+second instead of after the full timeout. The stage-two wait defaults to
+30s and is tunable via ``CONDUCTOR_WEB_BG_START_TIMEOUT`` (``0`` disables
+it, restoring pre-#410 behavior); passing that deadline with the child
+still alive is not treated as a failure — the URL is still printed,
+since the workflow may simply be slow to start (plugin fetch, MCP server
+startup, provider connection). There is no parent-side PID file: the
+child writes its own fleet run record (Fleet Manager D2), which is what
+stage one-and-a-half polls for.
 """
 
 from __future__ import annotations
@@ -773,9 +781,11 @@ def _finalize_background_launch(
     Raises:
         RuntimeError: If the child died early (with a non-zero exit code),
             the dashboard didn't start within the timeout, reading the run
-            record itself failed, the child died before the workflow
-            started (non-zero exit), or a foreign process already holds
-            the port.
+            record itself failed, the run-record poll deadline passed
+            while the child was dead or its dashboard had become
+            unreachable (the alive-and-reachable case is downgraded --
+            see Returns), the child died before the workflow started
+            (non-zero exit), or a foreign process already holds the port.
     """
     if not _wait_for_server(web_port, timeout=15.0, proc=proc):
         retcode = proc.poll()
@@ -841,15 +851,26 @@ def _finalize_background_launch(
             # child is dead or its port has gone unreachable is this
             # still fatal.
             if proc.poll() is None and _wait_for_server(web_port, timeout=1.0, proc=proc):
+                # One more read before declaring the record missing: the
+                # child may have written it in the instant between the
+                # deadline check above and this re-probe, and re-reading
+                # here is essentially free next to the 15s already spent
+                # waiting.
+                record = read_run_record(run_id)
+                if (
+                    record is not None
+                    and record.pid == proc.pid
+                    and record.mode == "bg"
+                    and record.port == web_port
+                ):
+                    break
                 logger.warning(
                     "Background process (run_id=%s) did not report a run record within "
                     "15 seconds, but is still running and its dashboard is still "
                     "reachable. It will not appear in `conductor status` / `fleet list` "
-                    "and cannot be stopped with `conductor stop`. See child stderr log: "
-                    "%s%s",
+                    "and cannot be stopped with `conductor stop`. See child stderr log: %s",
                     run_id,
                     stderr_log,
-                    _tail_log(stderr_log),
                 )
                 run_record_written = False
                 break

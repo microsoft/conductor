@@ -1371,6 +1371,30 @@ class TestLegacyEventLogRecovery:
         )
         assert record.event_log_path == str(wanted)
 
+    def test_workflow_name_containing_a_timestamp_segment_does_not_confuse_the_anchor(
+        self, log_dir: Path
+    ) -> None:
+        """A workflow name that itself looks like ``YYYYMMDD-HHMMSS`` (e.g.
+        ``report-20250101-120000.yaml``) must not make the timestamp
+        extraction anchor on that segment instead of the real one that
+        immediately precedes the run id -- a ``re.search`` over a charset
+        that can span hyphens would find the *first* timestamp-shaped
+        segment (the one baked into the workflow name) rather than the
+        *last* one (the actual start-time stamp)."""
+        wanted = log_dir / "conductor-report-20250101-120000-20250714-093000-deadbeef.events.jsonl"
+        wanted.write_text("")
+
+        record = RunRecord.from_dict(
+            {
+                "pid": 1,
+                "port": 8080,
+                "workflow": "/tmp/report-20250101-120000.yaml",
+                "run_id": "deadbeef",
+                "started_at": datetime(2025, 7, 14, 9, 30, 0).astimezone().isoformat(),
+            }
+        )
+        assert record.event_log_path == str(wanted)
+
     def test_started_at_far_from_every_candidate_is_not_adopted(self, log_dir: Path) -> None:
         """Outside the tolerance window nothing is claimed: a same-id log from
         an unrelated run must not be adopted just for being closest."""

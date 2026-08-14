@@ -1765,6 +1765,79 @@ class TestFinalizeBackgroundLaunchStageTwo:
         """A run record the gate will accept as this launch's own."""
         return MagicMock(pid=proc.pid, mode="bg", port=port)
 
+    @pytest.mark.parametrize(
+        ("probe", "expected_workflow_started"),
+        [
+            (bg_runner.StartProbe.STARTED, True),
+            (bg_runner.StartProbe.TIMED_OUT, False),
+            (bg_runner.StartProbe.CHILD_EXITED, True),
+        ],
+    )
+    def test_run_record_written_is_false_through_stage_two_when_record_never_appears(
+        self,
+        tmp_path: Path,
+        probe: bg_runner.StartProbe,
+        expected_workflow_started: bool,
+    ) -> None:
+        """Issue #435's downgrade must survive into every stage-two outcome,
+        not just the ``start_timeout == 0`` early return -- mutating the
+        ``StartProbe.STARTED`` arm to hard-code ``run_record_written=True``
+        must fail this test (and its sibling below)."""
+        proc = self._make_proc()
+        if probe is bg_runner.StartProbe.CHILD_EXITED:
+            # Alive through the record-poll deadline (including its
+            # leniency re-check), exited cleanly by the time stage two
+            # reports CHILD_EXITED.
+            _poll = iter([None, None, None])
+            proc.poll.side_effect = lambda: next(_poll, 0)
+
+        with (
+            # First call is the initial 15s dashboard-reachability wait;
+            # the second is the deadline branch's 1s re-probe -- both must
+            # succeed to reach the non-fatal, degraded path.
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, True]),
+            patch("conductor.fleet.records.read_run_record", return_value=None),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(bg_runner, "_remove_dead_child_record") as mock_remove,
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=30.0),
+            patch.object(bg_runner, "_wait_for_workflow_start", return_value=probe),
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc, 9430, "deadbeef", tmp_path / "err.log"
+            )
+
+        assert result.run_record_written is False
+        assert result.workflow_started is expected_workflow_started
+        mock_terminate.assert_not_called()
+        mock_remove.assert_not_called()
+
+    def test_run_record_written_is_true_through_stage_two_when_record_matches(
+        self, tmp_path: Path
+    ) -> None:
+        """The matched-record counterpart to the test above -- guards against
+        the flag simply being hard-coded ``False``."""
+        proc = self._make_proc()
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=self._record_for(proc, 9431),
+            ),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=30.0),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.STARTED
+            ),
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc, 9431, "deadbeef", tmp_path / "err.log"
+            )
+
+        assert result.run_record_written is True
+        assert result.workflow_started is True
+
     def test_record_polled_before_stage_two_wait(self, tmp_path: Path) -> None:
         """The child's record must be confirmed before stage two begins."""
         proc = self._make_proc()

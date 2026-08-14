@@ -87,14 +87,20 @@ _REPLACE_RETRY_DELAY_SECONDS = 0.02
 # existing test suite can keep importing it from here.
 
 # The ``YYYYMMDD-HHMMSS`` stamp `EventLogSubscriber` puts in a log's name,
-# anchored to the ``-<run_id>.events.jsonl`` tail so a workflow name that
-# happens to contain digits cannot be mistaken for it. Built from the shared
+# anchored to the ``-<run_id>.events.jsonl`` tail. Built from the shared
 # ``RUN_ID_PATTERN_SOURCE`` (rather than a hand-rolled ``[^-]+``) so a
 # hyphenated run id -- which the old ``[^-]+`` could not match at all --
-# still anchors correctly: the strict ``\d{8}-\d{6}`` timestamp segment is
-# what actually pins the split point, so the run-id segment can backtrack
-# across embedded hyphens safely.
-_LOG_STEM_TIMESTAMP_RE = re.compile(rf"-(\d{{8}}-\d{{6}})-{RUN_ID_PATTERN_SOURCE}\.events\.jsonl$")
+# still round-trips. Because that charset can itself span hyphens, a plain
+# ``re.search`` would anchor on the *first* ``\d{8}-\d{6}``-shaped segment
+# it finds, which is the wrong one whenever the workflow name also contains
+# a timestamp-shaped segment (e.g. ``report-20250101-120000``). A greedy
+# ``.*`` prefix plus ``.match()`` (mirroring ``fleet/history.py``'s
+# ``_FILENAME_PATTERN``) forces the timestamp group to be the *last*
+# match, i.e. the one immediately before the run-id and the
+# ``.events.jsonl`` suffix.
+_LOG_STEM_TIMESTAMP_RE = re.compile(
+    rf"^.*-(\d{{8}}-\d{{6}})-{RUN_ID_PATTERN_SOURCE}\.events\.jsonl$"
+)
 
 # How far a candidate log's start time may sit from the record's before it
 # stops being considered the same run. The child writes its log moments
@@ -807,7 +813,7 @@ def _log_stem_timestamp(path: Path) -> datetime | None:
         The parsed local start time, or ``None`` if the name does not carry
         one in the expected position.
     """
-    m = _LOG_STEM_TIMESTAMP_RE.search(path.name)
+    m = _LOG_STEM_TIMESTAMP_RE.match(path.name)
     if m is None:
         return None
     try:

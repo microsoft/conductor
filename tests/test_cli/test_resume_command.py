@@ -412,6 +412,31 @@ class TestResumeCommand:
         assert "has not reported starting" in combined
         assert "CONDUCTOR_WEB_BG_START_TIMEOUT" in combined
 
+    def test_resume_web_bg_no_run_record_prints_note(self, tmp_path: Path) -> None:
+        """Issue #435: resume --web-bg must surface the same "could not register
+        itself for discovery" note as a fresh ``run --web-bg`` — see
+        ``app.py``'s duplicated verbose bg-launch block, which is exactly the
+        kind of copy-paste omission the parity rule in AGENTS.md exists to
+        catch."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9096",
+                stderr_log=tmp_path / "stub-baddecaf.bg.stderr.log",
+                stdout_log=tmp_path / "stub-baddecaf.bg.stdout.log",
+                run_id="baddecaf",
+                run_record_written=False,
+            )
+            result = runner.invoke(app, ["resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "could not register itself for discovery" in combined
+        assert "conductor stop" in combined
+
     def test_resume_web_bg_still_running_false_prints_completed_notice(
         self, tmp_path: Path
     ) -> None:

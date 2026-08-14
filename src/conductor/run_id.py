@@ -25,12 +25,31 @@ from __future__ import annotations
 import re
 import secrets
 
-RUN_ID_PATTERN_SOURCE = r"[A-Za-z0-9_-]{1,200}"
+RUN_ID_PATTERN_SOURCE = r"[A-Za-z0-9_-]{1,64}"
 """The one run-id shape, as a *source string* so filename regexes that need
 to anchor a ``run_id`` inside a larger pattern (e.g. ``fleet/history.py``'s
-filename parser) can interpolate it directly instead of restating it."""
+filename parser) can interpolate it directly instead of restating it.
 
-RUN_ID_RE = re.compile(rf"\A{RUN_ID_PATTERN_SOURCE}\Z")
+The upper bound (64) is generous -- no run id this codebase mints exceeds 8
+characters -- but is deliberately far short of the 200 an earlier revision
+allowed: this pattern is interpolated into derived filenames
+(``conductor-<name>-<ts>-<run_id>.events.jsonl``, the ``--web-bg`` capture
+logs) whose *total* length must stay well under a filesystem's per-component
+limit (typically 255 bytes), not just this run id's own byte budget. A value
+this long from a hand-set ``CONDUCTOR_RUN_ID`` used to raise ``OSError:
+File name too long`` out of ``EventLogSubscriber`` instead of being rejected
+and falling back to a fresh random id.
+
+Bare and greedy: this source string is *not* anchored, so interpolating it
+into a ``re.search``/``re.match`` without a strong anchor on its own right
+boundary lets it backtrack across embedded hyphens and over-capture a
+neighboring segment (e.g. a workflow name that itself contains a
+``YYYYMMDD-HHMMSS``-shaped segment). Anchor from the correct end (see
+``fleet/history.py``'s ``_FILENAME_PATTERN``) rather than assuming a plain
+``search`` finds the intended segment.
+"""
+
+_RUN_ID_RE = re.compile(RUN_ID_PATTERN_SOURCE)
 
 # A run_id is interpolated directly into a filename (``<run_id>.json``,
 # ``conductor-<name>-<ts>-<run_id>.events.jsonl``), so it must be validated
@@ -58,7 +77,7 @@ def is_valid_run_id(run_id: str) -> bool:
         True if ``run_id`` matches the path-safe pattern used to key run
         record files and event log filenames.
     """
-    return bool(RUN_ID_RE.fullmatch(run_id))
+    return bool(_RUN_ID_RE.fullmatch(run_id))
 
 
 def new_run_id() -> str:
