@@ -42,6 +42,16 @@ open questions the design left for this epic:
   cover ``model_construct()`` or ``model_copy(update=...)``, both of which
   bypass validators by design; neither is used to build this model anywhere
   in this codebase.
+
+  Issue #396: the runner (``aca_runner/auth.py::check_inner_provider_settings``)
+  additionally rejects any key outside
+  ``aca_runner/auth.py::ALLOWED_INNER_PROVIDER_SETTINGS_KEYS`` — exactly the
+  four keys named above — closing off a caller sending e.g. ``runtime_url``
+  (repoint the inner Copilot session at an arbitrary external runtime) or
+  ``headers`` (inject arbitrary HTTP headers) directly at the runner. This
+  is a separate control from ``_INNER_PROVIDER_SECRET_KEYS`` below: that
+  list is about which values get redacted, not which keys are permitted at
+  all — ``base_url`` is permitted but not secret.
 - ``AcaExecuteRequest.tool_output`` / ``AcaResultData.cache_read_tokens`` /
   ``AcaResultData.cache_write_tokens`` — review fix: these were captured
   host-side (``ToolOutputConfig`` on the provider; Claude-style prompt-cache
@@ -67,6 +77,12 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+# The one definition of the transport-token header name (issue #396),
+# imported by both the runner (`aca_runner/server.py`, via
+# `aca_runner/auth.py`) and the host provider (`providers/aca.py`) so the two
+# sides of the transport-token gate can never drift apart.
+RUNNER_TOKEN_HEADER = "X-Conductor-Runner-Token"
 
 # `inner_provider_settings` keys that carry a credential (as opposed to
 # `base_url`, which is not secret). Kept in one place so the redaction
@@ -168,7 +184,12 @@ class AcaExecuteRequest(BaseModel):
     ``SecretStr`` immediately after validation. (Field validators only run
     on validated construction; ``model_construct()``/``model_copy(update=...)``
     bypass them and are not used to build this model anywhere in this
-    codebase.)"""
+    codebase.)
+
+    Issue #396: the runner rejects any key outside the four named above
+    (``aca_runner/auth.py::ALLOWED_INNER_PROVIDER_SETTINGS_KEYS``) with a
+    400, and optionally checks ``base_url`` against
+    ``ACA_RUNNER_ALLOWED_BASE_URLS``. See that module's docstring."""
 
     @field_validator("inner_provider_settings", mode="after")
     @classmethod

@@ -10,7 +10,7 @@ from conductor.config.schema import PluginSourceDef
 from conductor.plugins.errors import PluginFetchError, PluginSourceError
 from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
 
-from .conftest import make_git_repo, make_marketplace, make_plugin
+from .conftest import make_git_repo, make_marketplace, make_plugin, rmtree
 
 
 def _entry(source: str, **kwargs) -> PluginSourceDef:
@@ -144,8 +144,6 @@ class TestStaleForwarding:
     """
 
     def test_stale_survives_the_composition_layer(self, tmp_path: Path, plugin_cache_home: Path):
-        import shutil
-
         from conductor.plugins.fetch import clear_resolution_memo
 
         repo = tmp_path / "repo"
@@ -154,7 +152,7 @@ class TestStaleForwarding:
         entry = _entry(f"file://{repo}#v1.0.0")
         resolve_plugin_sources({"acme": entry})
 
-        shutil.rmtree(repo)
+        rmtree(repo)
         clear_resolution_memo()
         warnings: list[str] = []
         resolved = resolve_plugin_sources({"acme": entry}, on_warning=warnings.append)

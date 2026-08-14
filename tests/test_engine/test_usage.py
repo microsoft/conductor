@@ -222,7 +222,14 @@ class TestUsageTracker:
         assert usage.cache_write_tokens == 50
         assert usage.elapsed_seconds == 2.5
         assert usage.cost_usd is not None
-        assert usage.cost_usd > 0
+        # Pin the exact figure: a `> 0` assertion passes identically whether or
+        # not the cached buckets are subtracted out of the input bucket, so it
+        # cannot protect the seam it covers.
+        # uncached input 1000 - 100 - 50 = 850 @ $3/M   = 0.00255
+        # output              500        @ $15/M        = 0.0075
+        # cache read          100        @ $0.30/M      = 0.00003
+        # cache write          50        @ $3.75/M      = 0.0001875
+        assert usage.cost_usd == pytest.approx(0.0102675, rel=1e-6)
 
     def test_usage_tracker_record_null_tokens(self) -> None:
         """Test recording when token fields are None."""

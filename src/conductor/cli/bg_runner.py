@@ -22,12 +22,31 @@ set ``verbose_mode=False``, which gates provider-side SDK event logging
 that ``--log-file`` writes to disk. Leaving verbosity at the default and
 capturing the stream to a file keeps both the log files and any
 ``--log-file`` trace populated for detached children (see issue #196).
+
+**Two-stage readiness contract** (issue #410): a bg launch is considered
+"finalized" only after two separate probes, not one. Stage one
+(:func:`_wait_for_server`) is a plain TCP connect — it proves a process
+is listening on the port, nothing more. Stage two
+(:func:`_wait_for_workflow_start`) polls ``GET /api/info`` until the
+payload carries a ``started_at`` key, which only appears once the
+child's engine has actually emitted ``workflow_started`` — proving the
+workflow itself began rather than just the dashboard's HTTP server. Both
+stages check ``proc.poll()`` on every iteration so a child that exits
+early (e.g. a ``ConfigurationError`` from a bad workflow) is reported in
+about a second instead of after the full timeout. The stage-two wait
+defaults to 30s and is tunable via ``CONDUCTOR_WEB_BG_START_TIMEOUT``
+(``0`` disables it, restoring pre-#410 behavior); passing that deadline
+with the child still alive is not treated as a failure — the URL is
+still printed and the PID file is still left in place, since the
+workflow may simply be slow to start (plugin fetch, MCP server startup,
+provider connection).
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -37,9 +56,18 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from enum import Enum
 from io import IOBase
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Default wall-clock budget for the stage-two "did the workflow actually
+# start" probe (issue #410), and the env var that overrides it. See the
+# module docstring's "Two-stage readiness contract" section.
+_START_TIMEOUT_DEFAULT = 30.0
+_START_TIMEOUT_ENV = "CONDUCTOR_WEB_BG_START_TIMEOUT"
 
 # Windows process creation flags. Exposed via ``getattr`` with documented
 # fallbacks so this module can be imported on POSIX (where these attributes do
@@ -192,6 +220,35 @@ class BackgroundLaunch:
             launch may force-carry a checkpoint's original run id instead
             (see ``_peek_resume_run_id``), which is validated against the
             same path-safe contract the fleet run-record store itself uses.
+        workflow_started: Whether the launcher observed the workflow actually
+            start (via ``GET /api/info`` reporting a ``workflow_started``
+            event — see ``_wait_for_workflow_start``) before its wait
+            deadline. ``True`` means only that the launcher did **not**
+            observe a failure to start — it is the default because the
+            stage-two probe can be disabled entirely via
+            ``CONDUCTOR_WEB_BG_START_TIMEOUT=0``, in which case nothing
+            contradicts it. ``False`` means the deadline passed with the
+            child still alive but not yet reporting a start; callers should
+            surface this as a "still initializing" note rather than a
+            failure — see issue #410. Only meaningful once ``still_running``
+            has already been checked (see below) — check ``still_running``
+            first.
+        still_running: Whether the child process was still alive when the
+            launcher finished waiting. ``True`` in the common case (the
+            workflow is a genuine long-running background run). ``False``
+            when the child completed (exit code 0) inside the launcher's
+            wait window — either before the port opened or during the
+            stage-two workflow-start probe. This is deliberately a separate
+            field from ``workflow_started``: a clean sub-second run makes
+            ``workflow_started`` stay ``True`` while ``still_running``
+            becomes ``False`` — the two fields deliberately diverge in
+            exactly this case, rather than both reading ``True``, because
+            callers must not report a URL/"running in background" for a
+            process that has already exited (issue #410) — printing that
+            message unconditionally on ``workflow_started`` alone would
+            reintroduce a narrower form of the same false-success bug this
+            PR fixes. Check this field *before* ``workflow_started``: the
+            latter is only meaningful when this one is ``True``.
 
     Invariants (enforced in ``__post_init__``):
         * ``run_id`` is a valid fleet run id -- see
@@ -208,6 +265,8 @@ class BackgroundLaunch:
     stderr_log: Path
     stdout_log: Path
     run_id: str
+    workflow_started: bool = True
+    still_running: bool = True
 
     def __post_init__(self) -> None:
         from conductor.fleet.records import is_valid_run_id
@@ -241,18 +300,29 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_server(port: int, timeout: float = 15.0) -> bool:
+def _wait_for_server(
+    port: int, timeout: float = 15.0, *, proc: subprocess.Popen[Any] | None = None
+) -> bool:
     """Wait until the web server is accepting connections on *port*.
 
     Args:
         port: The TCP port to check.
         timeout: Maximum seconds to wait.
+        proc: When given, checked with ``proc.poll()`` on every iteration so
+            a dead child is detected in well under *timeout* instead of
+            waiting out the full socket-connect deadline. Keyword-only so
+            the many existing ``patch(..., "_wait_for_server")`` call sites
+            (which invoke this positionally as ``(port, timeout)``) are
+            unaffected by the added parameter.
 
     Returns:
-        True if the server became reachable within *timeout*, False otherwise.
+        True if the server became reachable within *timeout*, False if the
+        timeout elapsed or (when *proc* is given) the child exited first.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return True
@@ -379,20 +449,222 @@ def _close_quietly(*handles: IOBase) -> None:
             )
 
 
+class StartProbe(str, Enum):
+    """Result of :func:`_wait_for_workflow_start`'s stage-two readiness probe.
+
+    Mirrors the ``Liveness`` / ``Identity`` enum pattern in ``cli/pid.py`` and
+    ``cli/app.py`` — a bool would collapse genuinely different outcomes that
+    callers must react to differently.
+
+    Attributes:
+        STARTED: ``/api/info`` reported a ``started_at`` key — the child's
+            engine has emitted ``workflow_started``.
+        CHILD_EXITED: ``proc.poll()`` returned non-``None`` before the
+            workflow was observed to start. The caller must still check the
+            return code: a clean ``0`` exit (a sub-second workflow that
+            finished within the wait window) is not a failure.
+        PORT_CONFLICT: ``/api/info`` reported an ``int`` ``pid`` that does
+            not match ``proc.pid`` — the port is answered by a foreign
+            process, not our child.
+        TIMED_OUT: The wait deadline passed with the child alive and no
+            ``workflow_started`` observed yet.
+    """
+
+    STARTED = "started"
+    CHILD_EXITED = "child_exited"
+    PORT_CONFLICT = "port_conflict"
+    TIMED_OUT = "timed_out"
+
+
+def _resolve_start_timeout() -> float:
+    """Resolve the stage-two start-wait deadline from the environment.
+
+    Returns:
+        ``CONDUCTOR_WEB_BG_START_TIMEOUT`` parsed as a float when it is a
+        valid non-negative number (``0`` disables the probe entirely, which
+        restores pre-#410 behavior). An unset, unparseable, or negative value
+        falls back to :data:`_START_TIMEOUT_DEFAULT`, logging a warning for
+        the latter two cases so a typo'd env var doesn't silently do nothing.
+    """
+    raw = os.environ.get(_START_TIMEOUT_ENV)
+    if raw is None:
+        return _START_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a valid number; using the default %.0fs.",
+            _START_TIMEOUT_ENV,
+            raw,
+            _START_TIMEOUT_DEFAULT,
+        )
+        return _START_TIMEOUT_DEFAULT
+    if value < 0:
+        logger.warning(
+            "%s=%r must not be negative; using the default %.0fs.",
+            _START_TIMEOUT_ENV,
+            raw,
+            _START_TIMEOUT_DEFAULT,
+        )
+        return _START_TIMEOUT_DEFAULT
+    return value
+
+
+def _probe_workflow_info(port: int) -> dict[str, Any] | None:
+    """Fetch ``GET /api/info`` from the dashboard on *port*, once.
+
+    This is the same identity endpoint ``conductor stop`` polls (see
+    ``cli/app.py::_confirm_identity``), so this adds no new endpoint and no
+    new dependency — ``httpx`` is already a hard dependency, imported lazily
+    inside functions elsewhere in this codebase.
+
+    Args:
+        port: The TCP port the dashboard should be listening on.
+
+    Returns:
+        The parsed JSON body when the request succeeds, returns a 2xx status,
+        and decodes to a dict. ``None`` on a connection/timeout/HTTP-status
+        failure or a non-dict body (logged at debug — a single failed probe
+        is expected while the child is still starting up and not actionable
+        on its own). An exception outside that expected set (a bug in this
+        function, or a body large enough to raise on decode) is logged at
+        *warning* instead of being folded into the same "not ready yet"
+        bucket — a genuinely broken probe must not be indistinguishable from
+        normal startup latency for the caller's full wait window.
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{port}/api/info", timeout=1.0)
+        resp.raise_for_status()
+        info = resp.json()
+    except httpx.HTTPError as exc:
+        # Connection refused/reset, timeout, or a non-2xx status (including a
+        # foreign, non-Conductor process answering the port) — all expected
+        # "not ready yet" outcomes for a dashboard that hasn't bound the port
+        # or started serving yet.
+        logger.debug("Workflow-start probe on port %s failed: %s", port, exc)
+        return None
+    except ValueError as exc:
+        # ``.json()`` raises a ``JSONDecodeError`` (a ``ValueError`` subclass)
+        # on a non-JSON body — plausible from the same foreign-process case
+        # above. Still just "not ready yet" from this caller's perspective.
+        logger.debug("Workflow-start probe on port %s returned unparseable JSON: %s", port, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - see docstring: log loudly, don't hide a real bug
+        logger.warning(
+            "Workflow-start probe on port %s failed with an unexpected %s: %s",
+            port,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def _wait_for_workflow_start(
+    port: int, proc: subprocess.Popen[Any], *, timeout: float
+) -> StartProbe:
+    """Poll ``/api/info`` until the workflow reports having started.
+
+    Args:
+        port: The TCP port the dashboard is listening on.
+        proc: The detached child process, checked with ``proc.poll()`` on
+            every iteration so a dead child is detected immediately rather
+            than after the full timeout.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        :class:`StartProbe` describing why the wait ended.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return StartProbe.CHILD_EXITED
+
+        info = _probe_workflow_info(port)
+        if info is not None:
+            reported_pid = info.get("pid")
+            if isinstance(reported_pid, int) and reported_pid != proc.pid:
+                return StartProbe.PORT_CONFLICT
+            # Key presence, not truthiness: ``started_at`` is
+            # ``event.get("timestamp", 0)`` server-side and could
+            # legitimately be ``0``. That key only exists on the
+            # ``workflow_started`` branch of the endpoint.
+            if "started_at" in info:
+                return StartProbe.STARTED
+
+        time.sleep(0.3)
+    return StartProbe.TIMED_OUT
+
+
+def _tail_log(path: Path, max_lines: int = 20, max_chars: int = 2000) -> str:
+    """Return a bounded tail of a captured bg log file for error messages.
+
+    Never raises — a diagnostics helper must not be the thing that breaks
+    the launch. Returns ``""`` when the file is missing or unreadable.
+
+    Args:
+        path: Path to the captured stderr/stdout log file.
+        max_lines: Maximum number of trailing lines to include.
+        max_chars: Maximum total characters to include (applied after the
+            line limit, in case a single line is enormous).
+
+    Returns:
+        A header plus the tail of the file's contents, or ``""`` on failure.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = text.splitlines()[-max_lines:]
+    tail = "\n".join(lines)
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    if not tail:
+        return ""
+    return f"\n--- last {len(lines)} line(s) of {path} ---\n{tail}"
+
+
+def _remove_dead_child_record(run_id: str, child_pid: int) -> None:
+    """Remove the child's run record after the launcher gave up on it.
+
+    The counterpart to the old parent-side ``remove_pid_file_at`` cleanup:
+    the child writes the record (D2), so when the launcher terminates it or
+    finds it dead, the record it wrote would otherwise be left behind
+    advertising a process that is gone.
+
+    Identity-checked on ``pid`` for the same reason ``remove_pid_file_at``
+    re-read its file (issue #344): a resumed launch can carry a checkpoint's
+    original ``run_id``, so the record under this key may belong to a
+    different, live process. Never raises -- this is cleanup on a path that
+    is already reporting a failure, and masking that failure with a
+    secondary one would hide the reason the launch was abandoned.
+    """
+    try:
+        from conductor.fleet.records import read_run_record, remove_run_record
+
+        record = read_run_record(run_id)
+        if record is not None and record.pid == child_pid:
+            remove_run_record(run_id)
+    except Exception:  # noqa: BLE001 - cleanup must not mask the launch failure
+        logger.debug("Could not remove run record for run_id=%s", run_id, exc_info=True)
+
+
 def _finalize_background_launch(
     proc: subprocess.Popen[Any],
     web_port: int,
     run_id: str,
     stderr_log: Path,
-) -> None:
-    """Wait for the dashboard to come up, then wait for the child's run record.
+) -> bool:
+    """Wait for the dashboard, wait for the child's run record, then confirm it started.
 
     On any failure (server didn't start, child died early, the child never
     wrote its run record within the timeout), the still-running child is
     terminated to avoid orphaned processes holding the dashboard port
-    without a discoverable record. The stderr log path is included in the
-    ``RuntimeError`` so callers can point users at the captured crash
-    output.
+    without a discoverable record. The stderr log path (with a bounded tail
+    of its contents) is included in the ``RuntimeError`` so callers can
+    point users at the captured crash output.
 
     Per D2 (the child owns the write in every mode — see
     ``docs/projects/fleet-manager/fleet-manager.design.md``), the detached
@@ -400,7 +672,11 @@ def _finalize_background_launch(
     ``run_id``) once it starts executing. This function is the parent-side
     gate: it polls :func:`conductor.fleet.records.read_run_record` rather
     than writing a PID/record file itself, so there is exactly one writer
-    (and hence exactly one record) per background run.
+    (and hence exactly one record) per background run. This replaces the
+    parent-side ``write_pid_file`` the two-stage contract originally wrote
+    here; the run record supersedes the PID file and is written by the
+    child, so re-introducing a parent-side write would create a second
+    writer for one run.
 
     The polled record must match this launch on three fields before the
     gate accepts it as readiness -- a record merely found under the right
@@ -423,6 +699,11 @@ def _finalize_background_launch(
     rather than letting the exception escape uncontained and orphan the
     background process.
 
+    Because the child writes its record as it starts executing, the record
+    poll is a *stronger* readiness signal than the PID write it replaces --
+    but it is still not proof the engine reached ``workflow_started``, so
+    the stage-two ``/api/info`` probe (issue #410) is retained below.
+
     Args:
         proc: The detached child process.
         web_port: The TCP port the child should be listening on.
@@ -431,34 +712,55 @@ def _finalize_background_launch(
         stderr_log: Path to the file capturing the child's stderr. Included
             in failure messages so users know where to look.
 
+    Returns:
+        ``True`` if the workflow was observed to start (or the stage-two
+        probe is disabled, or the child exited cleanly within the wait
+        window). ``False`` if the stage-two wait deadline passed with the
+        child still alive and not yet reporting a start — not a failure,
+        just "still initializing".
+
     Raises:
-        RuntimeError: If the child died early, the dashboard didn't start
-            within the timeout, the child never wrote a matching run record
-            within the timeout, or reading the run record itself failed.
+        RuntimeError: If the child died early (with a non-zero exit code),
+            the dashboard didn't start within the timeout, the child never
+            wrote a matching run record within the timeout, reading the run
+            record itself failed, the child died before the workflow started
+            (non-zero exit), or a foreign process already holds the port.
     """
-    if not _wait_for_server(web_port, timeout=15.0):
+    if not _wait_for_server(web_port, timeout=15.0, proc=proc):
         retcode = proc.poll()
         if retcode is not None:
+            if retcode == 0:
+                # A sub-second run that finished before the socket became
+                # reachable is not a failure, and there's no live process to
+                # track — no PID file to write.
+                return True
             raise RuntimeError(
                 f"Background process exited immediately with code {retcode}. "
-                f"See child stderr log: {stderr_log}"
+                f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
             )
         _terminate_child(proc)
         raise RuntimeError(
             f"Dashboard did not start within 15 seconds on port {web_port}. "
             f"The background process was terminated. "
-            f"See child stderr log: {stderr_log}"
+            f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
         )
 
+    # The child's own run record, not a parent-side PID write (D2): one
+    # writer per run. This is stage one-and-a-half -- the port is open and
+    # the child has reached the point of registering itself.
     from conductor.fleet.records import read_run_record
 
     deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
+    while True:
         retcode = proc.poll()
         if retcode is not None:
+            if retcode == 0:
+                # Completed inside the window; the child removed its own
+                # record on exit, so there is nothing to wait for.
+                return True
             raise RuntimeError(
                 f"Background process exited immediately with code {retcode}. "
-                f"See child stderr log: {stderr_log}"
+                f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
             )
         try:
             record = read_run_record(run_id)
@@ -467,7 +769,8 @@ def _finalize_background_launch(
             raise RuntimeError(
                 f"Failed to read background process's run record "
                 f"(run_id={run_id}): {exc}. The background process was "
-                f"terminated. See child stderr log: {stderr_log}"
+                f"terminated. See child stderr log: "
+                f"{stderr_log}{_tail_log(stderr_log)}"
             ) from exc
         if (
             record is not None
@@ -475,14 +778,56 @@ def _finalize_background_launch(
             and record.mode == "bg"
             and record.port == web_port
         ):
-            return
+            break
+        if time.monotonic() >= deadline:
+            _terminate_child(proc)
+            raise RuntimeError(
+                f"Background process did not report a run record within 15 seconds "
+                f"(run_id={run_id}). The background process was terminated. "
+                f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
+            )
         time.sleep(0.2)
 
+    start_timeout = _resolve_start_timeout()
+    if start_timeout == 0:
+        return True
+
+    probe = _wait_for_workflow_start(web_port, proc, timeout=start_timeout)
+
+    if probe is StartProbe.STARTED:
+        return True
+
+    if probe is StartProbe.TIMED_OUT:
+        logger.info(
+            "Workflow on port %s has not reported starting after %.0fs; "
+            "leaving it running. Set %s to tune this wait.",
+            web_port,
+            start_timeout,
+            _START_TIMEOUT_ENV,
+        )
+        return False
+
+    if probe is StartProbe.CHILD_EXITED:
+        retcode = proc.poll()
+        if retcode == 0:
+            # Completed inside the window; the child already removed its
+            # own run record.
+            return True
+        _remove_dead_child_record(run_id, proc.pid)
+        raise RuntimeError(
+            "Background process exited before the workflow started "
+            f"(code {retcode}). See child stderr log: "
+            f"{stderr_log}{_tail_log(stderr_log)}"
+        )
+
+    # probe is StartProbe.PORT_CONFLICT
     _terminate_child(proc)
+    _remove_dead_child_record(run_id, proc.pid)
+    info = _probe_workflow_info(web_port)
+    foreign_pid = info.get("pid") if info else "unknown"
     raise RuntimeError(
-        f"Background process did not report a run record within 15 seconds "
-        f"(run_id={run_id}). The background process was terminated. "
-        f"See child stderr log: {stderr_log}"
+        f"Port {web_port} is already in use by another process (PID {foreign_pid}). "
+        "Choose a different port with --web-port."
     )
 
 
@@ -546,7 +891,10 @@ def _spawn_bg_child(
 
     Raises:
         RuntimeError: If the log files cannot be created, the child fails to
-            start, or the dashboard doesn't become reachable.
+            start, the dashboard doesn't become reachable, or the child is
+            found to have exited with a non-zero code in the narrow window
+            between ``_finalize_background_launch`` reporting success and
+            this function's own final liveness check.
     """
     try:
         run_id, stderr_path, stdout_path, stderr_handle, stdout_handle = _open_bg_log_files(
@@ -573,18 +921,48 @@ def _spawn_bg_child(
                 f"Failed to start background process: {exc}. See child stderr log: {stderr_path}"
             ) from exc
 
-        _finalize_background_launch(proc, web_port, run_id, stderr_path)
+        workflow_started = _finalize_background_launch(proc, web_port, run_id, stderr_path)
     finally:
         # The child has its own duplicated OS handles by now (or never got
         # them, if Popen raised) — either way the parent's Python file
         # objects can be released without affecting the child.
         _close_quietly(stderr_handle, stdout_handle)
 
+    # ``_finalize_background_launch`` returns bare ``True`` (or ``False`` for
+    # ``StartProbe.TIMED_OUT``) from several paths that don't check the
+    # child's exit code, because at the moment they returned the child was
+    # confirmed either alive or cleanly exited (0) — see the function's own
+    # docstring. ``proc`` is still in hand here, so re-poll it directly
+    # rather than widening that function's return type: this is what lets
+    # ``BackgroundLaunch.still_running`` distinguish "genuinely running" from
+    # "already exited" without callers printing a live dashboard URL for an
+    # already-exited process (#410).
+    retcode = proc.poll()
+    still_running = retcode is None
+    if not still_running and retcode != 0:
+        # The child crashed in the narrow window between
+        # _finalize_background_launch's last liveness check (STARTED,
+        # TIMED_OUT, and the CONDUCTOR_WEB_BG_START_TIMEOUT=0 escape hatch
+        # all return without re-checking the exit code, since the child was
+        # confirmed alive or the check was skipped entirely moments before)
+        # and this re-poll. Reporting this as a clean "Workflow completed"
+        # success would be exactly the false-success bug class issue #410
+        # exists to close, so raise instead of returning a BackgroundLaunch
+        # — the same treatment _finalize_background_launch already gives a
+        # non-zero exit it catches directly (StartProbe.CHILD_EXITED above).
+        raise RuntimeError(
+            f"Background process exited unexpectedly (code {retcode}) while "
+            f"the launcher was finishing up. See child stderr log: "
+            f"{stderr_path}{_tail_log(stderr_path)}"
+        )
+
     return BackgroundLaunch(
         url=f"http://127.0.0.1:{web_port}",
         stderr_log=stderr_path,
         stdout_log=stdout_path,
         run_id=run_id,
+        workflow_started=workflow_started,
+        still_running=still_running,
     )
 
 

@@ -5,7 +5,133 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.29...HEAD)
+
+## [0.1.29](https://github.com/microsoft/conductor/compare/v0.1.28...v0.1.29) - 2026-08-13
+
+### Security
+
+- **Hardened the web dashboard's HTTP/WebSocket surface** (#397). Every
+  mutating route (`POST /api/stop`, `/api/kill`, `/api/resume`,
+  `/api/gate-respond`, `/api/guidance`) and the `/ws` handshake now require a
+  per-run token by default — previously the only protection was the
+  optional `CONDUCTOR_GATE_TOKEN` env var, and requests were unauthenticated
+  when it was unset. The token is minted automatically per run and
+  discoverable by `conductor gate respond` / `guide` / `stop` via a new
+  `0600` file (POSIX; on Windows the mode bits are not honoured and the
+  file relies on the user-profile ACL instead — see #425) at
+  `~/.conductor/runs/dashboard-<port>.token`;
+  `CONDUCTOR_GATE_TOKEN` still overrides it when set. A new pure-ASGI
+  `OriginHostGuard` middleware also validates the `Host` and (when present)
+  `Origin` headers on every HTTP and WebSocket request, closing the
+  DNS-rebinding and CSRF-from-another-open-page angles; `CONDUCTOR_WEB_ALLOW_ORIGINS`
+  (comma-separated origins) extends the allowlist for local dev servers.
+  **Breaking for external API callers:** every mutating route now also
+  requires `Content-Type: application/json` (415 otherwise), including the
+  previously bodyless control POSTs, and a request whose `Host`/`Origin`
+  doesn't match the bound dashboard is rejected with 403 regardless of
+  token. Read-only routes (`/api/state`, `/api/info`, `/api/logs`,
+  `/api/gate-status`, `/api/files/*`, and the replay dashboard) remain
+  unauthenticated, protected by Origin/Host only.
+- **Hardened the ACA agent runner's transport surface** (#396). The
+  experimental `aca` provider's in-container runner previously relied
+  entirely on the Azure session-gateway network boundary; it now adds four
+  independent layers, none individually load-bearing. The runner binds
+  `127.0.0.1` by default (the shipped container image sets
+  `ACA_RUNNER_HOST=0.0.0.0` explicitly, so a deployed pool is unaffected —
+  only a runner started by hand changes behaviour). An opt-in transport
+  token, `ACA_RUNNER_AUTH_TOKEN`, makes `/execute` require a matching
+  `X-Conductor-Runner-Token` header — checked before the inner Copilot
+  provider is constructed — and `401` otherwise; the host sends the header
+  automatically when the same value is set on its side. `GET /health` stays
+  unauthenticated (the image's own `HEALTHCHECK` sends no header) but now
+  reports `auth_required` and `auth_token_present`, letting the host warn
+  when a gateway is silently stripping the header or when only one side has
+  a token configured. The runner also rejects any `inner_provider_settings`
+  key outside `base_url` / `api_key` / `bearer_token` / `github_token`,
+  closing off `runtime_url` and `headers` injection, and
+  `ACA_RUNNER_ALLOWED_BASE_URLS` optionally restricts which BYOK `base_url`
+  values are accepted. See `docs/providers/aca.md#security`.
+
+### Fixed
+
+- **A pathological gate or dialog prompt no longer stalls the event loop**
+  (#395). `linkify_markdown` — which runs on human-gate prompts, dialog
+  turns, and rendered agent prompts — degraded to quadratic time on inputs
+  containing long unterminated runs of backticks/tildes or `[` characters,
+  so agent-generated text could freeze every concurrent agent sharing the
+  loop. The fenced-code opener no longer backtracks character-by-character,
+  and existing-markdown-link detection is now a linear single-pass scanner
+  (fuzz-verified equivalent to the regex it replaces). A defensive 256K
+  character cap skips linkification entirely on anything larger — whitespace
+  is still normalized — so a future pathological shape degrades gracefully
+  rather than hanging.
+
+- **Token cost is no longer massively overstated for cached, tool-calling
+  agents.** `AgentOutput.input_tokens` is the *whole* prompt and already
+  contains `cache_read_tokens` / `cache_write_tokens`, but `calculate_cost`
+  billed all four buckets additively — charging every cached token at the
+  full input rate *and again* at the cache rate (11x on `claude-sonnet-5`).
+  Because a long agentic loop re-reads almost its entire prompt from cache on
+  every turn, the error compounded across turns: a real run reporting
+  **$51.08** actually cost about **$8**. A cached bucket is now subtracted
+  from the input bucket before the input rate is applied, so each physical
+  token is priced exactly once — the same treatment `genai-prices` uses,
+  including its rule that a bucket is only subtracted when a rate exists to
+  charge it at (a `0.0` cache rate in the table means "no published rate",
+  not "free"). Cost figures on the dashboard, the CLI summary,
+  `agent_completed` events and the JSONL event log all drop accordingly; no
+  workflow config changes. The Claude Agent SDK provider, whose
+  Anthropic-shaped usage dict reports cached tokens *outside* `input_tokens`,
+  now folds them in and reports both cache buckets, so cached tokens there
+  are billed at the cache rate instead of not being billed at all — note this
+  also makes that provider's reported `input_tokens` / `tokens_used` counts
+  cache-inclusive, matching Copilot, so token totals rise even as cost falls.
+
+  **If you set `limits.budget_usd`:** existing values were calibrated against
+  the inflated figures and now permit correspondingly more real spend. Review
+  them, particularly under `budget_mode: enforce`.
+
+- **`claude-opus-5` and the dotted Claude 4.5 names are no longer unpriced.**
+  `DEFAULT_PRICING` had no `claude-opus-5` entry, and `get_pricing`'s
+  versioned-suffix fallback only extends a key with a `-` delimiter — so the
+  SDK-advertised `claude-haiku-4.5` never matched the dashed
+  `claude-haiku-4-5` entry either. Those models fell back to `None` and were
+  reported as unpriced whenever the provider's live pricing hook was
+  unavailable (an older Copilot SDK, or a non-Copilot provider). Added
+  `claude-opus-5`, `claude-opus-4.5`, `claude-sonnet-4.5` and
+  `claude-haiku-4.5` at the published Anthropic rates. Both spellings are
+  kept: the dashed keys are what price the date-suffixed Anthropic ids
+  (`claude-haiku-4-5-20251001`).
+- **`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are no longer unpriced**
+  (#386). Added to `DEFAULT_PRICING` as exact keys at the existing GPT-5.x
+  family rate ($2.00 in / $8.00 out per million tokens) — exact keys rather
+  than a `gpt-5.6` prefix key so the three resolve silently instead of
+  through `get_pricing`'s fuzzy-match warning path. `grok-4.5`,
+  `gemini-3.6-flash`, `mai-code-1.1-flash`, and `mai-code-1-flash-picker`
+  remain **deliberately** unpriced in the static table pending a published
+  rate; an invented rate would print as a confident cost, which is worse
+  than the honest `(N unpriced)` marker. The live provider-pricing hook
+  prices any model whose SDK metadata carries `billing.token_prices`
+  (verified for `claude-opus-5` in #418, on Copilot SDK `>=1.0.9` —
+  already the hard floor pinned in `pyproject.toml`) — the static-table
+  gap only matters when that hook is unavailable or the model's metadata
+  lacks a rate.
+
+### Added
+
+- **`conductor doctor --models` now shows per-model pricing** (#386). The
+  Models detail table gained `Input $/Mtok`, `Output $/Mtok`, and `Pricing`
+  columns — the last distinguishing `provider` (live
+  `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback),
+  and `none` (genuinely unpriced) so "why is my run unpriced" is answerable
+  with one read-only command (pricing resolution adds no new network
+  round-trip — the Copilot SDK memoizes `list_models()` for the process).
+  `--json` gains matching
+  `input_per_mtok` / `output_per_mtok` / `pricing_source` fields on each
+  model object.
+
+## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
 
 ### Added
 
@@ -183,6 +309,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--web-bg` no longer reports success and prints a URL for workflows that
+  never actually started** (#410). The launcher's readiness check used to
+  trust a bare TCP connect: the moment *anything* accepted a connection on
+  the dashboard port, it wrote the PID file, printed the URL, and exited 0
+  — even for a workflow that failed `load_config` moments later. Two
+  changes close this: (1) `WebDashboard.start()` (which binds the port) now
+  runs *after* `load_config` succeeds in `run_workflow_async`, so a
+  `ConfigurationError` from a broken workflow never binds a port in the
+  first place; (2) `_finalize_background_launch` now confirms the workflow
+  actually started, not just that a socket answered. `_wait_for_server`
+  checks the child's exit status on every iteration of its connect loop, so
+  a dead child is detected in well under a second instead of after the full
+  15s timeout; a stage-two probe then polls `GET /api/info` (the same
+  identity endpoint `conductor stop` already uses) for up to 30s
+  (`CONDUCTOR_WEB_BG_START_TIMEOUT`, `0` disables it) until it reports a
+  `workflow_started` event, exiting 1 with the exit code and a tail of the
+  captured stderr log if the child dies first, or naming the conflicting
+  PID if the port turns out to be held by an unrelated process. The PID
+  file is written as soon as the port opens — before this second wait —
+  so a slow-starting run stays visible to `conductor status`/`stop`
+  throughout; if the child then dies, the entry is removed. Passing the
+  30s deadline with the child still alive is not treated as a failure — the
+  URL is still printed, alongside a note that the workflow hasn't reported
+  starting yet.
+
+- **Live provider pricing works again** (#386). Every Copilot model was being
+  costed from the static `DEFAULT_PRICING` table instead of the live rates the
+  SDK reports, and models absent from that table reported no cost at all.
+  `CopilotProvider.get_model_pricing` reads `billing.token_prices`, and
+  `github-copilot-sdk` 1.0.1 — the version the lock pinned — parsed the
+  `models.list` response with a hand-written `client.ModelBilling` that declared
+  only `multiplier` and discarded the `tokenPrices` wire field. The field never
+  left the API and is still modelled in the SDK's generated types; only the
+  client dataclass dropped it. The hook therefore returned `None` for every
+  model, so the resolution chain #265 built (workflow override → provider hook →
+  static table → unpriced) ran permanently on its fallback. No per-token rates
+  were invented for the missing models; with the hook alive they price from the
+  SDK.
+
+  The field was restored in SDK 1.0.7; the floor moves to `>=1.0.9`, the version
+  tested here. Moving the floor rather than only the lock is the point — the old
+  `>=1.0.0` was satisfied by 1.0.1, so an existing environment kept dead pricing
+  while reporting a healthy dependency. 1.0.9 also splits the cached-token rate
+  into separate read and write prices and deprecates the single `cache_price`
+  the hook read, which would have silently priced cache reads at $0.00, and it
+  ships a pure-Python wheel that fetches the CLI binary on first use instead of
+  bundling it per platform.
+
+  `_default_permission_handler` no longer forwards `approve_all`'s result
+  blindly. That helper stopped being unconditional: it abstains with
+  `PermissionNoResult` when the runtime marks a request `managed_approval_required`,
+  and raises when managed settings are enabled. Conductor is the only connected
+  client, so an abstention is never answered — the CLI blocks on a pending
+  permission request until idle recovery gives up minutes later and reports a
+  timeout that blames the network. Both cases now decline explicitly and say
+  why. Declining rather than approving is deliberate: managed approval is a
+  policy control, and overriding it would turn a hang into a bypass.
+
+  The existing hook tests built their models from `SimpleNamespace`, so they
+  asserted what Conductor does with a billing object rather than whether the SDK
+  still supplies one, and stayed green throughout. Tests now build the model
+  through the SDK's own `ModelInfo.from_dict`, so the next SDK release that
+  stops carrying the field fails the build instead of quietly reverting every
+  run to static pricing, and the permission handler has behavioural coverage for
+  the first time.
+- **Plugin checkouts from a `file://` source no longer land outside the plugin
+  cache on Windows.** The cache key is derived from the URL's path segments, but
+  the splitter only knew `/`, so a native Windows path arrived as a single
+  segment with its backslashes intact — and the key kept them, putting the
+  checkout at a drive-absolute location rather than under the cache root, which
+  is the same escape the `..` check exists to prevent. Two further problems sat
+  behind it: a drive colon made an owner of `C:_src` read as a drive (or, in the
+  middle of a name, as an NTFS alternate data stream), and flattening a deep
+  path into one segment produced a directory name long enough that `git` refused
+  to create `.git` inside it. Separators are now folded, the characters that
+  change a path's meaning on Windows are substituted, and an over-long segment
+  is replaced by a digest of itself — on every platform, so one workflow file
+  resolves to the same cache layout wherever it runs.
+- **Two sources resolving to the same commit no longer fail the whole fetch on
+  Windows.** Publishing a completed checkout tolerates losing the race to a
+  concurrent fetch, but recognised only the POSIX errnos for "destination
+  already exists"; Windows reports that as `ERROR_ACCESS_DENIED`, so the
+  tolerance never applied and the second source raised. Safe to accept because
+  the readiness sentinel is written after publishing: a winner that died
+  mid-clone leaves no sentinel, so the tree is re-fetched rather than read
+  half-written.
+- **A local path is recognised the same way on every platform** — `_is_local_path`
+  asked `pathlib.Path`, which is the *running* platform's flavour, so a POSIX
+  absolute path such as `/srv/plugins` was refused as an unrecognised source on
+  Windows. Both conventions are now consulted.
+- **Registry names are validated before they can corrupt the config** — a name
+  containing a quote, a space, `=` or `#` was accepted, written into
+  `registries.toml` as an unescaped table key, and then failed to parse. Since
+  `registry add`, `remove` and `get` all load the config first, the user could
+  not remove the entry that broke it and every unrelated registry went down
+  with it. Names are now restricted to letters, digits, `.`, `_` and `-`, which
+  also keeps them legal as cache directory names on Windows, and the table key
+  is quoted so a dotted name stays one registry instead of becoming a nested
+  table.
+- **`conductor doctor` no longer reports a missing Claude CLI on Windows** —
+  the CLI probe dropped five `~`-anchored fallback locations on Windows,
+  including `~/.claude/local/claude` where Claude Code's own installer puts it,
+  so `validate_connection()` returned False for a CLI the SDK would find and
+  run. Only `/usr/local/bin/claude` is now skipped there: it is rooted but
+  driveless, so it resolves against the current drive, which any unprivileged
+  local user can write to.
+- **Registry TOML values are escaped** — a registry whose source or type
+  contained a quote or a backslash produced a file that could not be re-read.
 - **`conductor stop` against a foreground run is no longer a silent no-op.**
   With the interactive keyboard listener active, the `SIGTERM` handler
   delegated to the previous disposition only when it was *callable* — and in
@@ -348,6 +582,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand with a 19-character naive `started_at`, well short of production's
   32-character value — it now goes through the real `write_pid_file`, so the
   widths under test match the widths production writes.
+- **JSON result output no longer crashes on a legacy Windows stdout** (#342).
+  On a `cp1252` console, `conductor run` exited non-zero with
+  `UnicodeEncodeError` *after* the workflow had already succeeded, having
+  written a truncated document callers could not parse. `json.dumps` emits
+  ASCII by default, but rich's `print_json` re-parses and re-serialises with
+  `ensure_ascii=False` immediately before the write, restoring the character it
+  had escaped. Every JSON sink now passes `ensure_ascii=True`. Results carry
+  `\uXXXX` escapes on all platforms as a result, which is valid JSON and decodes
+  identically. `conductor doctor`'s default *table* output is unaffected by this
+  change and still fails on such a console (#401).
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
@@ -359,6 +603,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three of the five sinks; two of those were reachable on a bare `conductor run`
   with no flags. Opening tags such as `[bold]` were the quieter half of the same
   bug: rich consumed them without raising and the text simply disappeared.
+- **Non-ASCII workflow inputs are shown literally in verbose output**
+  ([#391](https://github.com/microsoft/conductor/pull/391)). The verbose
+  "Workflow Inputs" panel serialised inputs with `json.dumps`' default
+  `ensure_ascii=True`, so a Cyrillic, CJK or emoji input was displayed as
+  `\uXXXX` escapes rather than the text the user typed. Every other JSON
+  display path in the repo already passed `ensure_ascii=False` (#356); this
+  was the last one that did not. Machine-readable JSON *results* are
+  unaffected and still ASCII-escaped, which is what keeps them safe on a
+  legacy Windows console (#342).
 - **Structured `runtime.provider` for `name: claude` no longer drops a
   YAML-declared `api_key`** — the schema accepted `api_key` (alongside
   `base_url` and `auth_token`) but the provider factory silently discarded it,

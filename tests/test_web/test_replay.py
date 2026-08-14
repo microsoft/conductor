@@ -16,9 +16,9 @@ import json
 from pathlib import Path
 
 import pytest
-from starlette.testclient import TestClient
 
 from conductor.web.replay import ReplayDashboard, _load_events
+from tests.test_web.conftest import make_replay_client
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -139,14 +139,14 @@ class TestReplayDashboardApi:
         becomes wrong — this forces the decision to be deliberate.
         """
         dashboard = self._make_dashboard(tmp_path)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             assert client.post(route).status_code in (404, 405)
 
     def test_get_state_returns_all_events(self, tmp_path: Path) -> None:
         """GET /api/state returns all loaded events."""
         events = _make_events(5)
         dashboard = self._make_dashboard(tmp_path, events)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             resp = client.get("/api/state")
             assert resp.status_code == 200
             data = resp.json()
@@ -157,7 +157,7 @@ class TestReplayDashboardApi:
         """GET /api/replay/info returns correct metadata."""
         events = _make_events(4)
         dashboard = self._make_dashboard(tmp_path, events)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             resp = client.get("/api/replay/info")
             assert resp.status_code == 200
             info = resp.json()
@@ -173,7 +173,7 @@ class TestReplayDashboardApi:
             {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a1"}},
         ]
         dashboard = self._make_dashboard(tmp_path, events)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             resp = client.get("/api/replay/info")
             info = resp.json()
             assert info["workflowName"] is None
@@ -182,7 +182,7 @@ class TestReplayDashboardApi:
     def test_download_logs(self, tmp_path: Path) -> None:
         """GET /api/logs returns events with Content-Disposition header."""
         dashboard = self._make_dashboard(tmp_path)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             resp = client.get("/api/logs")
             assert resp.status_code == 200
             assert "attachment" in resp.headers.get("content-disposition", "")
@@ -191,7 +191,7 @@ class TestReplayDashboardApi:
     def test_index_returns_html(self, tmp_path: Path) -> None:
         """GET / returns the frontend HTML."""
         dashboard = self._make_dashboard(tmp_path)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             resp = client.get("/")
             assert resp.status_code == 200
             assert "text/html" in resp.headers.get("content-type", "")
@@ -208,7 +208,7 @@ class TestReplayDashboardApi:
         events = _make_events(3)
         path = _write_jsonl(tmp_path / "log.jsonl", events)
         dashboard = ReplayDashboard(path)
-        with TestClient(dashboard.app) as client:
+        with make_replay_client(dashboard) as client:
             resp = client.get("/api/state")
             assert resp.status_code == 200
             assert len(resp.json()) == 3

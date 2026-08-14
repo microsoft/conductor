@@ -28,6 +28,7 @@ export function ReconnectWarningBanner() {
   const bgStderrLog = useWorkflowStore((s) => s.bgStderrLog);
   const bgStdoutLog = useWorkflowStore((s) => s.bgStdoutLog);
   const systemLogFile = useWorkflowStore((s) => s.systemLogFile);
+  const wsAuthFailed = useWorkflowStore((s) => s.wsAuthFailed);
 
   if (!stuck) return null;
 
@@ -40,6 +41,18 @@ export function ReconnectWarningBanner() {
     }
     return 'Check the terminal where `conductor run` was launched, or re-run with --log-file to capture one.';
   })();
+
+  // A rejected WebSocket handshake (issue #397 -- bad/missing token, or a
+  // Host/Origin mismatch on /ws) closes with the same code a crashed
+  // process would, so the two are indistinguishable from `onclose` alone.
+  // `wsAuthFailed` is a best-effort heuristic (a same-attempt `/api/state`
+  // success followed by a handshake that never reaches `onopen`), so the
+  // wording below covers both possibilities rather than asserting one.
+  const detailMessage = wsAuthFailed
+    ? 'The dashboard may have been rejected by its own authentication check (an invalid or expired token, or a Host/Origin mismatch) -- try reloading the page. If that doesn\u2019t help, the Conductor process may have crashed.'
+    : 'Reconnecting for ' +
+      formatElapsed(elapsedMs / 1000) +
+      ' with no success. The Conductor process may have crashed.';
 
   return (
     <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 animate-[banner-in_200ms_ease-out]">
@@ -55,10 +68,7 @@ export function ReconnectWarningBanner() {
           <span className="text-xs font-medium text-amber-300">
             Connection lost — workflow may have stopped responding
           </span>
-          <span className="text-[11px] text-amber-400/80 truncate">
-            Reconnecting for {formatElapsed(elapsedMs / 1000)} with no success. The Conductor
-            process may have crashed.
-          </span>
+          <span className="text-[11px] text-amber-400/80 truncate">{detailMessage}</span>
           <span className="text-[10px] text-amber-400/60 truncate" title={bgStderrLog ?? systemLogFile ?? undefined}>
             {logHint}
           </span>

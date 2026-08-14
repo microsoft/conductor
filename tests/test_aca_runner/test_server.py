@@ -104,6 +104,17 @@ def _reset_fake_provider_instances() -> Any:
     _FakeCopilotProvider.instances = []
 
 
+@pytest.fixture(autouse=True)
+def _clear_runner_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure a developer's ambient env cannot flip a test's result (issue #396).
+
+    Mirrors `TestAcaCredentialPrecedence._clear_credential_env`'s discipline
+    in `tests/test_providers/test_aca.py`.
+    """
+    monkeypatch.delenv("ACA_RUNNER_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ACA_RUNNER_ALLOWED_BASE_URLS", raising=False)
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr("conductor.aca_runner.server.CopilotProvider", _FakeCopilotProvider)
@@ -112,6 +123,21 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Any:
     app = create_app()
     with TestClient(app) as test_client:
         yield test_client
+
+
+def _build_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Construct a fresh `TestClient` after the caller has set env vars.
+
+    Unlike the `client` fixture above, this is a plain helper (not itself a
+    fixture) so a test can `monkeypatch.setenv(...)` *before* calling it —
+    `create_app()` resolves the token/allowlist once at startup (issue
+    #396), so env vars set after the app already exists would have no
+    effect.
+    """
+    monkeypatch.setattr("conductor.aca_runner.server.CopilotProvider", _FakeCopilotProvider)
+    from conductor.aca_runner.server import create_app
+
+    return TestClient(create_app())
 
 
 def _execute_body(**overrides: Any) -> dict[str, Any]:
@@ -590,3 +616,236 @@ class TestInnerProviderCacheKeyHashing:
         )
         assert len(_FakeCopilotProvider.instances) == 2
         assert _FakeCopilotProvider.instances[0].close.await_count == 1
+
+
+class TestRunnerAuthGate:
+    """Opt-in transport-token gate on `/execute` (issue #396)."""
+
+    def test_execute_succeeds_with_no_header_when_token_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with _build_client(monkeypatch) as client:
+            response = client.post("/execute", json=_execute_body())
+            assert response.status_code == 200
+            _parse_ndjson(response.text)
+
+    def test_execute_returns_401_with_no_header_when_token_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            response = client.post("/execute", json=_execute_body())
+            assert response.status_code == 401
+            body = response.json()
+            assert "message" in body.get("error", body)
+            assert _FakeCopilotProvider.instances == []
+
+    def test_execute_returns_401_with_wrong_header_when_token_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(),
+                headers={"X-Conductor-Runner-Token": "wrong-token"},
+            )
+            assert response.status_code == 401
+            assert _FakeCopilotProvider.instances == []
+
+    def test_execute_succeeds_with_correct_header_when_token_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(),
+                headers={"X-Conductor-Runner-Token": "secret-runner-token"},
+            )
+            assert response.status_code == 200
+            _parse_ndjson(response.text)
+            assert len(_FakeCopilotProvider.instances) == 1
+
+    def test_health_returns_200_regardless_of_auth_gate_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            # No header.
+            assert client.get("/health").status_code == 200
+            # Wrong header.
+            assert (
+                client.get(
+                    "/health", headers={"X-Conductor-Runner-Token": "wrong-token"}
+                ).status_code
+                == 200
+            )
+            # Correct header.
+            assert (
+                client.get(
+                    "/health", headers={"X-Conductor-Runner-Token": "secret-runner-token"}
+                ).status_code
+                == 200
+            )
+
+    def test_rejected_request_never_constructs_the_inner_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate is a real gate, not just a response filter (review requirement)."""
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            client.post("/execute", json=_execute_body())
+            client.post(
+                "/execute",
+                json=_execute_body(),
+                headers={"X-Conductor-Runner-Token": "wrong-token"},
+            )
+        assert _FakeCopilotProvider.instances == []
+
+    def test_malformed_body_from_unauthenticated_caller_returns_422_not_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pinned contract (review finding B2): FastAPI validates the
+        `AcaExecuteRequest` body *before* the handler's token check ever
+        runs, so a malformed body with no token header returns FastAPI's own
+        422 rather than the gate's 401 — the gate protects execution, not
+        the parser. See `execute_endpoint`'s docstring."""
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            response = client.post("/execute", json={"bogus": 1})
+            assert response.status_code == 422
+            assert _FakeCopilotProvider.instances == []
+
+
+class TestHealthReportsAuthPosture:
+    """`GET /health`'s `auth_required` / `auth_token_present` fields (issue #396)."""
+
+    def test_auth_required_false_when_token_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _build_client(monkeypatch) as client:
+            body = client.get("/health").json()
+            assert body["auth_required"] is False
+
+    def test_auth_required_true_when_token_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            body = client.get("/health").json()
+            assert body["auth_required"] is True
+
+    def test_auth_token_present_false_when_no_header_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            body = client.get("/health").json()
+            assert body["auth_token_present"] is False
+
+    def test_auth_token_present_true_for_a_wrong_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`auth_token_present` reports presence only — never validity — so
+        it cannot be used as a brute-force oracle (review requirement)."""
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            body = client.get(
+                "/health", headers={"X-Conductor-Runner-Token": "definitely-wrong"}
+            ).json()
+            assert body["auth_token_present"] is True
+
+    def test_auth_token_present_true_for_the_correct_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "secret-runner-token")
+        with _build_client(monkeypatch) as client:
+            body = client.get(
+                "/health", headers={"X-Conductor-Runner-Token": "secret-runner-token"}
+            ).json()
+            assert body["auth_token_present"] is True
+
+
+class TestInnerProviderSettingsAllowlist:
+    """Runner-side `inner_provider_settings` key/base_url allowlist (issue #396)."""
+
+    def test_runtime_url_key_is_rejected_with_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(inner_provider_settings={"runtime_url": "http://evil"}),
+            )
+            assert response.status_code == 400
+            assert _FakeCopilotProvider.instances == []
+
+    def test_headers_key_is_rejected_with_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(inner_provider_settings={"headers": {"X-Injected": "value"}}),
+            )
+            assert response.status_code == 400
+            assert _FakeCopilotProvider.instances == []
+
+    def test_all_four_allowed_keys_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(
+                    inner_provider_settings={
+                        "base_url": "http://localhost:11434/v1",
+                        "api_key": "k",
+                        "bearer_token": "t",
+                        "github_token": "g",
+                    }
+                ),
+            )
+            assert response.status_code == 200
+            _parse_ndjson(response.text)
+
+    def test_allowlist_rejects_off_list_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACA_RUNNER_ALLOWED_BASE_URLS", "http://localhost:11434/v1")
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(inner_provider_settings={"base_url": "http://evil.example.com"}),
+            )
+            assert response.status_code == 400
+            assert _FakeCopilotProvider.instances == []
+
+    def test_allowlist_admits_on_list_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACA_RUNNER_ALLOWED_BASE_URLS", "http://localhost:11434/v1")
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(
+                    inner_provider_settings={"base_url": "http://localhost:11434/v1"}
+                ),
+            )
+            assert response.status_code == 200
+            _parse_ndjson(response.text)
+
+    def test_unset_allowlist_admits_any_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(
+                    inner_provider_settings={"base_url": "http://anything.example.com"}
+                ),
+            )
+            assert response.status_code == 200
+            _parse_ndjson(response.text)
+
+    def test_non_string_base_url_returns_400_not_500_with_allowlist_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a non-string `base_url` must not crash with an
+        unhandled `AttributeError` -> 500 (review finding B1) — it must
+        return a clean, non-retryable 400 like every other malformed
+        `inner_provider_settings` value."""
+        monkeypatch.setenv("ACA_RUNNER_ALLOWED_BASE_URLS", "http://localhost:11434/v1")
+        with _build_client(monkeypatch) as client:
+            response = client.post(
+                "/execute",
+                json=_execute_body(inner_provider_settings={"base_url": 123}),
+            )
+            assert response.status_code == 400
+            assert "message" in response.json().get("error", {})
+            assert _FakeCopilotProvider.instances == []

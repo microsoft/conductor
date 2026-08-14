@@ -20,7 +20,7 @@ from pydantic import SecretStr
 
 from conductor.config.schema import AgentDef, ProviderSettings, SandboxConfig, ToolOutputConfig
 from conductor.exceptions import ProviderError
-from conductor.providers.aca_protocol import AcaExecuteRequest
+from conductor.providers.aca_protocol import RUNNER_TOKEN_HEADER, AcaExecuteRequest
 from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
 from conductor.providers.factory import create_provider
 
@@ -305,6 +305,15 @@ def _default_aca_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
     real precedence logic.
     """
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-default-github-token")
+
+
+@pytest.fixture(autouse=True)
+def _clear_runner_auth_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure a developer's ambient `ACA_RUNNER_AUTH_TOKEN` cannot flip a
+    test's result (issue #396) — same discipline as
+    `TestAcaCredentialPrecedence._clear_credential_env`.
+    """
+    monkeypatch.delenv("ACA_RUNNER_AUTH_TOKEN", raising=False)
 
 
 def _make_provider(**settings_kwargs: object):
@@ -1761,3 +1770,306 @@ class TestAcaDialogTurns:
             assert exc.is_retryable is False
         else:
             pytest.fail("expected ProviderError")
+
+
+class TestAcaRunnerTokenHeaderForwarding:
+    """The `X-Conductor-Runner-Token` header (issue #396) on runner-forwarded
+    calls (`/execute`, `/interrupt`, `/health`) — and its deliberate absence
+    from the ACA management-plane `_stop_session` `DELETE /session` call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_header_when_token_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "host-runner-token")
+        frames = [{"type": "result", "data": {"content": {}, "partial": False}}]
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, content=_ndjson_body(frames))
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert len(captured) == 1
+        assert captured[0].headers[RUNNER_TOKEN_HEADER] == "host-runner-token"
+
+    @pytest.mark.asyncio
+    async def test_execute_omits_header_when_token_not_configured(self) -> None:
+        frames = [{"type": "result", "data": {"content": {}, "partial": False}}]
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, content=_ndjson_body(frames))
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(agent=_agent(), context={}, rendered_prompt="x")
+
+        assert len(captured) == 1
+        assert RUNNER_TOKEN_HEADER not in captured[0].headers
+
+    @pytest.mark.asyncio
+    async def test_interrupt_sends_header_when_token_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "host-runner-token")
+        interrupt_signal = asyncio.Event()
+        interrupt_signal.set()
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/interrupt":
+                return httpx.Response(200, json={"status": "ok"})
+            raise AssertionError(f"unexpected path {request.url.path}")
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        fake_response = _FakeInterruptResponse(
+            [json.dumps({"type": "result", "data": {"content": {}, "partial": True}})]
+        )
+        provider._stream_execute = lambda *a, **kw: _FakeStreamContext(fake_response)  # type: ignore[method-assign]
+
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(
+                agent=_agent(), context={}, rendered_prompt="x", interrupt_signal=interrupt_signal
+            )
+
+        interrupt_requests = [r for r in captured if r.url.path == "/interrupt"]
+        assert len(interrupt_requests) == 1
+        assert interrupt_requests[0].headers[RUNNER_TOKEN_HEADER] == "host-runner-token"
+
+    @pytest.mark.asyncio
+    async def test_interrupt_omits_header_when_token_not_configured(self) -> None:
+        interrupt_signal = asyncio.Event()
+        interrupt_signal.set()
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/interrupt":
+                return httpx.Response(200, json={"status": "ok"})
+            raise AssertionError(f"unexpected path {request.url.path}")
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        fake_response = _FakeInterruptResponse(
+            [json.dumps({"type": "result", "data": {"content": {}, "partial": True}})]
+        )
+        provider._stream_execute = lambda *a, **kw: _FakeStreamContext(fake_response)  # type: ignore[method-assign]
+
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(
+                agent=_agent(), context={}, rendered_prompt="x", interrupt_signal=interrupt_signal
+            )
+
+        interrupt_requests = [r for r in captured if r.url.path == "/interrupt"]
+        assert len(interrupt_requests) == 1
+        assert RUNNER_TOKEN_HEADER not in interrupt_requests[0].headers
+
+    @pytest.mark.asyncio
+    async def test_health_sends_header_when_token_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "host-runner-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers[RUNNER_TOKEN_HEADER] == "host-runner-token"
+            return httpx.Response(200, json={"status": "ok"})
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            assert await provider.validate_connection() is True
+
+    @pytest.mark.asyncio
+    async def test_health_omits_header_when_token_not_configured(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert RUNNER_TOKEN_HEADER not in request.headers
+            return httpx.Response(200, json={"status": "ok"})
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            assert await provider.validate_connection() is True
+
+    @pytest.mark.asyncio
+    async def test_stop_session_never_sends_runner_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test (issue #396): `_stop_session`'s `DELETE /session`
+        is an ACA management-plane operation that never reaches the runner —
+        adding the runner token header there would leak the runner
+        credential to the Azure control plane instead.
+        """
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "host-runner-token")
+        interrupt_signal = asyncio.Event()
+        interrupt_signal.set()
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/interrupt":
+                return httpx.Response(500, json={"error": {"message": "boom"}})
+            if request.url.path == "/session":
+                return httpx.Response(200, json={"status": "stopped"})
+            raise AssertionError(f"unexpected path {request.url.path}")
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        fake_response = _FakeInterruptResponse(
+            [json.dumps({"type": "agent_message", "data": {}}) for _ in range(5)]
+        )
+        provider._stream_execute = lambda *a, **kw: _FakeStreamContext(fake_response)  # type: ignore[method-assign]
+
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(
+                agent=_agent(), context={}, rendered_prompt="x", interrupt_signal=interrupt_signal
+            )
+
+        session_requests = [r for r in captured if r.url.path == "/session"]
+        assert len(session_requests) == 1
+        assert RUNNER_TOKEN_HEADER not in session_requests[0].headers
+        # And the header *was* sent on the sibling /interrupt call — proving
+        # its absence here is deliberate, not a broken test.
+        interrupt_requests = [r for r in captured if r.url.path == "/interrupt"]
+        assert interrupt_requests[0].headers[RUNNER_TOKEN_HEADER] == "host-runner-token"
+
+
+class TestAcaAuthSkewWarnings:
+    """`validate_connection()`'s `_warn_on_auth_skew` (issue #396)."""
+
+    @pytest.mark.asyncio
+    async def test_warns_when_runner_requires_token_but_none_arrived(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "ready": True,
+                    "auth_required": True,
+                    "auth_token_present": False,
+                },
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            await provider.validate_connection()
+
+        assert any("stripping" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_warns_when_host_has_token_but_runner_does_not_require_one(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "host-runner-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "ready": True,
+                    "auth_required": False,
+                    "auth_token_present": True,
+                },
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            await provider.validate_connection()
+
+        assert any("being ignored" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_silent_when_postures_agree_both_off(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ready": True, "auth_required": False, "auth_token_present": False},
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            await provider.validate_connection()
+
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_silent_when_postures_agree_both_on(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "host-runner-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ready": True, "auth_required": True, "auth_token_present": True},
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            await provider.validate_connection()
+
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_silent_when_runner_omits_fields_entirely(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An old runner image predating these fields must not spuriously warn."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ready": True})
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            await provider.validate_connection()
+
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_silent_when_health_body_is_not_a_dict(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=["not", "a", "dict"])
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            assert await provider.validate_connection() is True
+
+        assert caplog.records == []

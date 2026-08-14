@@ -22,10 +22,10 @@ class AgentUsage:
     Attributes:
         agent_name: Name of the agent that was executed.
         model: Model used for execution (may be None if unknown).
-        input_tokens: Number of input tokens used.
+        input_tokens: Total prompt tokens, inclusive of the cache counts below.
         output_tokens: Number of output tokens generated.
-        cache_read_tokens: Tokens read from cache (Claude).
-        cache_write_tokens: Tokens written to cache (Claude).
+        cache_read_tokens: Tokens read from cache; a subset of ``input_tokens``.
+        cache_write_tokens: Tokens written to cache; a subset of ``input_tokens``.
         cost_usd: Estimated cost in USD (None if pricing unavailable).
         elapsed_seconds: Execution time in seconds.
     """

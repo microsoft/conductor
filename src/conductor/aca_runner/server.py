@@ -33,12 +33,19 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import SecretStr
 from pydantic import ValidationError as PydanticValidationError
 
 from conductor import __version__ as _conductor_version
+from conductor.aca_runner.auth import (
+    RUNNER_TOKEN_HEADER,
+    check_inner_provider_settings,
+    resolve_allowed_base_urls,
+    resolve_runner_token,
+    token_gate,
+)
 from conductor.config.schema import (
     AgentDef,
     OutputField,
@@ -148,14 +155,17 @@ def _check_stdio_binaries(mcp_servers: dict[str, Any] | None) -> None:
         )
 
 
-def _validate_execute_request(request: AcaExecuteRequest) -> AgentDef:
+def _validate_execute_request(
+    request: AcaExecuteRequest, *, allowed_base_urls: tuple[str, ...] | None
+) -> AgentDef:
     """Pre-flight checks run before the streaming response is opened.
 
     Anything detectable synchronously (unsupported inner provider, a missing
-    stdio binary, an invalid agent payload) is surfaced as a non-2xx JSON
-    response — mirroring ``AcaRuntimeProvider._error_from_response`` on the
-    host side — rather than as a mid-stream ``error`` frame, since none of
-    these failures depend on actually starting the inner SDK call.
+    stdio binary, an invalid agent payload, an out-of-allowlist
+    `inner_provider_settings` key or `base_url` — issue #396) is surfaced as
+    a non-2xx JSON response — mirroring ``AcaRuntimeProvider._error_from_response``
+    on the host side — rather than as a mid-stream ``error`` frame, since
+    none of these failures depend on actually starting the inner SDK call.
 
     Returns the reconstructed `AgentDef` (review fix) so the caller can reuse
     it in `_stream_execute` instead of re-running (and re-risking a
@@ -170,6 +180,9 @@ def _validate_execute_request(request: AcaExecuteRequest) -> AgentDef:
             is_retryable=False,
         )
     _check_stdio_binaries(request.mcp_servers)
+    check_inner_provider_settings(
+        request.inner_provider_settings, allowed_base_urls=allowed_base_urls
+    )
     return _build_agent(request.agent)
 
 
@@ -320,7 +333,7 @@ class _InnerProviderCache:
 
 
 async def _stream_execute(
-    provider: CopilotProvider, agent: AgentDef, request: AcaExecuteRequest
+    provider: CopilotProvider, agent: AgentDef, payload: AcaExecuteRequest
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
 
@@ -345,9 +358,9 @@ async def _stream_execute(
         try:
             output = await provider.execute(
                 agent,
-                request.context,
-                request.rendered_prompt,
-                request.tools,
+                payload.context,
+                payload.rendered_prompt,
+                payload.tools,
                 event_callback=emit,
             )
         except Exception as exc:  # broad: forwarded as an error frame, never swallowed
@@ -378,8 +391,15 @@ def create_app() -> FastAPI:
 
     A factory (rather than a module-level singleton) so tests can construct
     a fresh app per test with `CopilotProvider` monkeypatched beforehand.
+
+    The transport-token gate and `base_url` allowlist (issue #396) are
+    resolved **once at startup**, closing over them for the lifetime of the
+    app — tests that need a different value set/clear the env var via
+    `monkeypatch` before calling `create_app()`.
     """
     provider_cache = _InnerProviderCache()
+    runner_token = resolve_runner_token()
+    allowed_base_urls = resolve_allowed_base_urls()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
@@ -397,23 +417,55 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health(
+        http_request: Request,
         identifier: str | None = None,
         api_version: str | None = Query(default=None, alias="api-version"),
     ) -> dict[str, Any]:
-        """Readiness + version probe (E4-T1) for `validate_connection` skew checks."""
+        """Readiness + version probe (E4-T1) for `validate_connection` skew checks.
+
+        Deliberately unauthenticated (issue #396): the image's own
+        `HEALTHCHECK` (`curl -fsS http://localhost:$ACA_RUNNER_PORT/health`)
+        sends no header, so gating this endpoint would break it. Reports
+        `auth_required` (whether the transport-token gate is configured) and
+        `auth_token_present` (whether *a* token header arrived on **this**
+        request — never whether it matched) so `validate_connection()` can
+        warn when the two postures disagree (e.g. a gateway silently
+        stripping the header). `identifier` is gateway routing metadata
+        only — ACA routes by it, auto-allocating a session if none exists —
+        and is never treated as a caller-authentication signal; the
+        transport-token gate on `/execute` is the actual runner-side
+        control.
+        """
         return {
             "ready": True,
             "conductor_version": _conductor_version,
             "runner_version": RUNNER_VERSION,
+            "auth_required": runner_token is not None,
+            "auth_token_present": http_request.headers.get(RUNNER_TOKEN_HEADER) is not None,
         }
 
     @app.post("/execute")
     async def execute_endpoint(
-        request: AcaExecuteRequest,
+        payload: AcaExecuteRequest,
+        http_request: Request,
         identifier: str | None = None,
         api_version: str | None = Query(default=None, alias="api-version"),
     ) -> Response:
         """Run one agent turn, streaming NDJSON event frames (E4-T2/T3/T4).
+
+        Gated by the optional transport-token check (issue #396) before any
+        application-level work: the header is checked first thing in the
+        handler, so a missing/incorrect `X-Conductor-Runner-Token` header
+        (when `ACA_RUNNER_AUTH_TOKEN` is configured) returns a plain 401 in
+        the same `{"error": {"message": ...}}` envelope
+        `AcaRuntimeProvider._error_from_response` already parses, and never
+        runs `_validate_execute_request` or constructs the inner Copilot
+        provider. Note FastAPI validates the `AcaExecuteRequest` body
+        parameter *before* this handler runs, so a malformed body from an
+        unauthenticated caller still returns FastAPI's own 422 rather than a
+        401 — the gate protects execution, not the parser. `identifier`
+        remains gateway routing metadata only, exactly as on `/health` —
+        never inspected as an authentication signal.
 
         Review fix: agent reconstruction (`_build_agent`, via
         `_validate_execute_request`) and the provider-cache lookup both run
@@ -423,18 +475,25 @@ def create_app() -> FastAPI:
         line and headers are not sent until this block returns successfully,
         so nothing here can corrupt an already-started NDJSON stream.
         """
+        presented = http_request.headers.get(RUNNER_TOKEN_HEADER)
+        if not token_gate(presented, runner_token):
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": "aca runner: missing or invalid runner auth token"}},
+            )
+
         try:
-            agent = _validate_execute_request(request)
+            agent = _validate_execute_request(payload, allowed_base_urls=allowed_base_urls)
             provider = await provider_cache.get(
-                mcp_servers=request.mcp_servers,
-                inner_provider_settings=request.inner_provider_settings,
-                tool_output=request.tool_output,
+                mcp_servers=payload.mcp_servers,
+                inner_provider_settings=payload.inner_provider_settings,
+                tool_output=payload.tool_output,
             )
         except (ProviderError, PydanticValidationError) as exc:
             return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
 
         return StreamingResponse(
-            _stream_execute(provider, agent, request), media_type="application/x-ndjson"
+            _stream_execute(provider, agent, payload), media_type="application/x-ndjson"
         )
 
     return app

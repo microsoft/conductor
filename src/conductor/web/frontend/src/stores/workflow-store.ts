@@ -57,6 +57,7 @@ import type {
   GuidanceAppliedData,
 } from '@/types/events';
 import { mergeGuidance, type GuidanceEntry } from '@/lib/guidance';
+import { authHeaders } from '@/lib/auth';
 
 export interface ActivityEntry {
   type: string;
@@ -354,6 +355,25 @@ interface WorkflowState {
    * for too long after the underlying process silently died (issue #330).
    */
   wsDisconnectedSince: number | null;
+  /**
+   * Set when the WebSocket handshake appears to have been rejected by the
+   * server's auth guard (issue #397) rather than a generic network drop:
+   * `/api/state` succeeded (so the server is reachable) but the
+   * subsequent `/ws` connection closed without ever reaching `onopen`.
+   * A rejected handshake is otherwise indistinguishable from a dead
+   * process — both surface as `onclose` code 1006 — so without this the
+   * dashboard looks "healthy" while every gate approval, dialog reply, and
+   * guidance submission silently goes nowhere.
+   */
+  wsAuthFailed: boolean;
+  /**
+   * Set when a user action tried to send over the WebSocket
+   * (`sendGateResponse`/`sendDialogMessage`/`sendDialogDecline`/
+   * `sendIterationLimitResponse`) while it wasn't connected, so the UI can
+   * surface "your response was not sent" instead of silently discarding
+   * the click (issue #397).
+   */
+  wsSendFailed: boolean;
   /** `system.log_file` (the always-on `*.events.jsonl` structured event log, unrelated to `--log-file`) from the root `workflow_started` event, when non-empty (issue #330). */
   systemLogFile: string | null;
   /** `system.bg_stderr_log` from the root `workflow_started` event, only present for `--web-bg` runs (issue #330). */
@@ -404,6 +424,8 @@ interface WorkflowState {
   replayState: (events: WorkflowEvent[]) => void;
   selectNode: (name: string | null) => void;
   setWsStatus: (status: WsStatus) => void;
+  setWsAuthFailed: (failed: boolean) => void;
+  setWsSendFailed: (failed: boolean) => void;
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => void;
   clearEdgeHighlight: (from: string, to: string) => void;
 
@@ -811,6 +833,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   selectedNode: null,
   wsStatus: 'connecting',
   wsDisconnectedSince: null,
+  wsAuthFailed: false,
+  wsSendFailed: false,
   systemLogFile: null,
   bgStderrLog: null,
   bgStdoutLog: null,
@@ -850,6 +874,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         // question opened — every prompt in a questions node shares one name.
         prompt_id: promptId ?? null,
       });
+      set({ wsSendFailed: false });
+    } else {
+      console.error('sendGateResponse: WebSocket not connected, response was not sent');
+      set({ wsSendFailed: true });
     }
   },
 
@@ -874,6 +902,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       // `dialog_awaiting_response` accordingly. Keeps state transitions in one
       // place and avoids a race where the agent reply arrives before the
       // optimistic set commits.
+      set({ wsSendFailed: false });
+    } else {
+      console.error('sendDialogMessage: WebSocket not connected, message was not sent');
+      set({ wsSendFailed: true });
     }
   },
 
@@ -885,12 +917,22 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agent_name: agentName,
         dialog_id: dialogId,
       });
+      set({ wsSendFailed: false });
+    } else {
+      console.error('sendDialogDecline: WebSocket not connected, decline was not sent');
+      set({ wsSendFailed: true });
     }
   },
 
   sendIterationLimitResponse: (target, gateId, additionalIterations) => {
     const send = useWorkflowStore.getState()._wsSend;
-    if (!send) return;
+    if (!send) {
+      console.error(
+        'sendIterationLimitResponse: WebSocket not connected, response was not sent',
+      );
+      set({ wsSendFailed: true });
+      return;
+    }
     // Clamp to non-negative integer. 0 means "stop", N>0 means "continue with N more".
     const additional = Math.max(0, Math.floor(Number(additionalIterations) || 0));
     // ``target`` is a discriminated union — exactly one branch is set, so a
@@ -906,13 +948,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       ...targetFields,
       additional_iterations: additional,
     });
+    set({ wsSendFailed: false });
   },
 
   sendGuidance: async (text) => {
     try {
       const res = await fetch('/api/guidance', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ text }),
       });
       const body = (await res.json().catch(() => ({}))) as {
@@ -1153,17 +1196,31 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       // Track when the connection last dropped from a healthy state so a
       // "stuck reconnecting" banner (#330) can measure elapsed time across
       // the connecting/reconnecting backoff churn, rather than resetting
-      // every retry cycle. Only start the clock on a *fresh* disconnect
-      // (previous status was 'connected'); once set, preserve it through
-      // subsequent non-connected statuses; clear it once reconnected.
+      // every retry cycle. Starts the clock on a *fresh* disconnect
+      // (previous status was 'connected') OR on the very first failed
+      // connection attempt (wsDisconnectedSince still null from the
+      // initial 'connecting' state) -- without the latter, a WebSocket
+      // that never connects at all (e.g. rejected at the auth guard, issue
+      // #397) never starts the clock, so the banner never fires even
+      // though the dashboard looks identically "stuck" to the user. Once
+      // set, preserve it through subsequent non-connected statuses; clear
+      // it once reconnected.
       let wsDisconnectedSince = prev.wsDisconnectedSince;
       if (status === 'connected') {
         wsDisconnectedSince = null;
-      } else if (prev.wsStatus === 'connected') {
+      } else if (prev.wsStatus === 'connected' || wsDisconnectedSince === null) {
         wsDisconnectedSince = Date.now();
       }
       return { wsStatus: status, wsDisconnectedSince };
     });
+  },
+
+  setWsAuthFailed: (failed: boolean) => {
+    set({ wsAuthFailed: failed });
+  },
+
+  setWsSendFailed: (failed: boolean) => {
+    set({ wsSendFailed: failed });
   },
 
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => {

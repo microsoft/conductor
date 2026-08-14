@@ -172,6 +172,37 @@ def verbose_log(message: str | Text, style: str = "dim") -> None:
         _file_console.print(renderable)
 
 
+def _is_scoped_bg_child(web_bg: bool, web_port: int) -> bool:
+    """Whether this invocation is genuinely the ``--web-bg`` child the launcher tracks.
+
+    ``web_bg=True`` (the CLI flag on *this* invocation) is authoritative on
+    its own. Otherwise, ``CONDUCTOR_WEB_BG=1`` alone is not — it is set on
+    the bg child's environment by ``bg_runner._build_bg_env`` and, being a
+    normal env var, is inherited by *every* descendant of that child, not
+    just the one process the launcher is watching. A workflow that shells
+    out (a ``type: script`` step, an agent's shell tool) and happens to
+    invoke a fresh, non-bg ``conductor run --web`` would otherwise inherit
+    ``CONDUCTOR_WEB_BG=1`` and be misidentified as the tracked bg child too
+    (see ``cli/self_run.py``'s docstring, which documents and relies on this
+    same inheritance for a different feature — issue #399).
+
+    Cross-checking ``CONDUCTOR_WEB_PORT`` (also set by ``_build_bg_env``,
+    to the exact port ``--web-port`` binds on the tracked child) against
+    this invocation's own *web_port* mirrors ``self_run.py``'s signal 2:
+    only the literal child ``_spawn_bg_child`` launched has both env vars
+    agreeing with its own port.
+    """
+    if web_bg:
+        return True
+    if os.environ.get("CONDUCTOR_WEB_BG") != "1":
+        return False
+    try:
+        inherited_port = int(os.environ.get("CONDUCTOR_WEB_PORT", ""))
+    except ValueError:
+        return False
+    return inherited_port == web_port
+
+
 def _describe_provider(provider: ProviderSettings) -> str:
     """Render a redacted single-line description of provider settings.
 
@@ -1949,24 +1980,6 @@ async def run_workflow_async(
             workflow_root=Path(workflow_path).resolve().parent,
         )
 
-        try:
-            await dashboard.start()
-            from conductor.cli.app import is_verbose
-
-            if is_verbose():
-                _verbose_console.print(
-                    styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
-                )
-        except Exception as e:
-            _verbose_console.print(
-                styled(
-                    "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
-                    "start: {}. Continuing without dashboard.",
-                    e,
-                )
-            )
-            dashboard = None
-
     try:
         # Log workflow loading
         verbose_log(f"Loading workflow: {workflow_path}")
@@ -1984,6 +1997,53 @@ async def run_workflow_async(
         verbose_log(f"Workflow: {config.workflow.name}")
         verbose_log(f"Entry point: {config.workflow.entry_point}")
         verbose_log(f"Agents: {len(config.agents)}")
+
+        # Start the dashboard only after config validation succeeds — never
+        # before. Binding the port before ``load_config`` meant a workflow
+        # that fails to even parse still left a live socket that
+        # ``--web-bg``'s launcher (and a concurrent ``conductor status``)
+        # would read as "started" (issue #410). Deliberately placed here
+        # rather than after ``_build_mcp_servers`` / plugin prefetch below:
+        # those can take tens of seconds (git clone), and the launcher's own
+        # port-reachability probe must not have to wait them out.
+        if dashboard is not None:
+            try:
+                await dashboard.start()
+                from conductor.cli.app import is_verbose
+
+                if is_verbose():
+                    _verbose_console.print(
+                        styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
+                    )
+            except Exception as e:
+                # Never leave ``dashboard`` pointing at one whose ``start()``
+                # failed — set this *before* the bg_mode branch below so the
+                # unconditional ``finally: dashboard.stop()`` further down
+                # can't await a serve task that never came up. Awaiting it
+                # would re-raise the same underlying failure (or worse, a
+                # bare ``SystemExit`` from uvicorn's own bind-failure path,
+                # which isn't even an ``Exception`` and would escape the
+                # CLI's error handler) and silently replace the informative
+                # RuntimeError below with that raw exception instead.
+                dashboard = None
+                if _is_scoped_bg_child(web_bg, web_port):
+                    # In a ``--web-bg`` child, silently continuing without a
+                    # dashboard would leave the port never reachable, which
+                    # the launcher's own probe (``bg_runner._wait_for_server``)
+                    # interprets as either a false success (fast workflow) or
+                    # a reason to kill an otherwise-healthy long-running
+                    # workflow (issue #410) — neither of which reports the
+                    # real cause. Propagate instead so the child exits
+                    # non-zero and the launcher's existing "process exited"
+                    # path surfaces this actual error via the stderr log.
+                    raise RuntimeError(f"Dashboard failed to start: {e}") from e
+                _verbose_console.print(
+                    styled(
+                        "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
+                        "start: {}. Continuing without dashboard.",
+                        e,
+                    )
+                )
 
         # Start JSONL event log subscriber (always-on structured diagnostics)
         from conductor.engine.event_log import EventLogSubscriber
@@ -2810,6 +2870,28 @@ async def resume_workflow_async(
                             styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
                         )
                 except Exception as e:
+                    # Drop the dashboard everywhere it's been wired up
+                    # *before* deciding whether to raise or warn — the
+                    # engine + DialogHandler captured it at construction
+                    # time and would otherwise block waiting on a never-
+                    # running WebSocket for human gates / dialogs. This
+                    # also ensures the unconditional
+                    # ``finally: dashboard.stop()`` further down can't await
+                    # a serve task that never came up, which would re-raise
+                    # the same underlying failure (or a bare ``SystemExit``
+                    # from uvicorn's bind-failure path) and silently replace
+                    # the informative RuntimeError below with that instead.
+                    engine.clear_web_dashboard()
+                    dashboard = None
+                    if _is_scoped_bg_child(web_bg, web_port):
+                        # Same reasoning as run_workflow_async: silently
+                        # continuing without a dashboard in a ``--web-bg``
+                        # child leaves the port never reachable, which the
+                        # launcher's probe reads as either a false success
+                        # or a reason to kill an otherwise-healthy resumed
+                        # workflow (issue #410). Propagate so the child
+                        # exits non-zero with the real cause.
+                        raise RuntimeError(f"Dashboard failed to start: {e}") from e
                     _verbose_console.print(
                         styled(
                             "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
@@ -2817,12 +2899,6 @@ async def resume_workflow_async(
                             e,
                         )
                     )
-                    # Drop the dashboard everywhere it's been wired up.
-                    # The engine + DialogHandler captured it at construction
-                    # time and would otherwise block waiting on a never-
-                    # running WebSocket for human gates / dialogs.
-                    engine.clear_web_dashboard()
-                    dashboard = None
 
             # Re-write the Fleet Manager run record (E2) now that the
             # dashboard's actual resolved port (dashboard.start() — or its

@@ -296,23 +296,31 @@ describe('workflow-store processEvent — subworkflowContexts reactivity (#307)'
  * failing to reconnect should eventually warn the user rather than leaving
  * `workflowStatus` looking `'running'` forever. The store tracks
  * `wsDisconnectedSince` as the timestamp of the *first* drop from
- * `'connected'`, preserved through the connecting/reconnecting backoff
- * churn (since `wsStatus` itself oscillates and can't be timed directly),
- * and cleared once reconnected.
+ * `'connected'` OR the very first failed connection attempt (issue #397:
+ * a handshake rejected by the auth guard never reaches `'connected'` at
+ * all, so timing only drops-from-connected would never fire the banner
+ * for it), preserved through the connecting/reconnecting backoff churn
+ * (since `wsStatus` itself oscillates and can't be timed directly), and
+ * cleared once reconnected.
  */
 describe('workflow-store setWsStatus — wsDisconnectedSince tracking (#330)', () => {
-  it('stays null through the initial connecting state before any connection has ever succeeded', () => {
+  it('starts the clock on the very first connecting state, even before any connection has ever succeeded', () => {
     const { setWsStatus } = useWorkflowStore.getState();
     setWsStatus('connecting');
-    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+    expect(useWorkflowStore.getState().wsDisconnectedSince).not.toBeNull();
   });
 
-  it('stays null across connecting -> disconnected -> reconnecting when the socket has never once reached connected (e.g. the page loaded while the backend was already down)', () => {
+  it('preserves the same timestamp across connecting -> disconnected -> reconnecting when the socket has never once reached connected (e.g. the page loaded while the backend was already down, or the handshake was auth-rejected)', () => {
     const { setWsStatus } = useWorkflowStore.getState();
     setWsStatus('connecting');
+    const firstAttempt = useWorkflowStore.getState().wsDisconnectedSince;
+    expect(firstAttempt).not.toBeNull();
+
     setWsStatus('disconnected');
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstAttempt);
+
     setWsStatus('reconnecting');
-    expect(useWorkflowStore.getState().wsDisconnectedSince).toBeNull();
+    expect(useWorkflowStore.getState().wsDisconnectedSince).toBe(firstAttempt);
   });
 
   it('sets a timestamp on a fresh drop from connected, preserves it through connecting/reconnecting churn, and clears it on reconnect', () => {
@@ -1055,5 +1063,59 @@ describe('workflow-store — context_pct clears when context_window_used is unme
     }));
 
     expect(useWorkflowStore.getState().nodes.r1?.context_pct).toBeUndefined();
+  });
+});
+
+/**
+ * Regression coverage for issue #397: a gate response, dialog message,
+ * dialog decline, or iteration-limit response sent while the WebSocket is
+ * not connected must set `wsSendFailed` (previously silently dropped with
+ * no feedback at all) and must clear it again once a send actually
+ * succeeds.
+ */
+describe('workflow-store — send actions surface a failure when not connected (#397)', () => {
+  beforeEach(() => {
+    useWorkflowStore.setState({ _wsSend: null, wsSendFailed: false });
+  });
+
+  it('sendGateResponse sets wsSendFailed when there is no send function', () => {
+    const { sendGateResponse } = useWorkflowStore.getState();
+    sendGateResponse('reviewer', 'approve');
+    expect(useWorkflowStore.getState().wsSendFailed).toBe(true);
+  });
+
+  it('sendGateResponse clears wsSendFailed on a successful send', () => {
+    useWorkflowStore.setState({ wsSendFailed: true, _wsSend: () => {} });
+    const { sendGateResponse } = useWorkflowStore.getState();
+    sendGateResponse('reviewer', 'approve');
+    expect(useWorkflowStore.getState().wsSendFailed).toBe(false);
+  });
+
+  it('sendDialogMessage sets wsSendFailed when there is no send function', () => {
+    const { sendDialogMessage } = useWorkflowStore.getState();
+    sendDialogMessage('writer', 'dlg-1', 'hello');
+    expect(useWorkflowStore.getState().wsSendFailed).toBe(true);
+  });
+
+  it('sendDialogDecline sets wsSendFailed when there is no send function', () => {
+    const { sendDialogDecline } = useWorkflowStore.getState();
+    sendDialogDecline('writer', 'dlg-1');
+    expect(useWorkflowStore.getState().wsSendFailed).toBe(true);
+  });
+
+  it('sendIterationLimitResponse sets wsSendFailed when there is no send function', () => {
+    const { sendIterationLimitResponse } = useWorkflowStore.getState();
+    sendIterationLimitResponse({ agent_name: 'writer' }, 'gate-1', 2);
+    expect(useWorkflowStore.getState().wsSendFailed).toBe(true);
+  });
+});
+
+describe('workflow-store — wsAuthFailed (#397)', () => {
+  it('setWsAuthFailed sets and clears the flag', () => {
+    const { setWsAuthFailed } = useWorkflowStore.getState();
+    setWsAuthFailed(true);
+    expect(useWorkflowStore.getState().wsAuthFailed).toBe(true);
+    setWsAuthFailed(false);
+    expect(useWorkflowStore.getState().wsAuthFailed).toBe(false);
   });
 });

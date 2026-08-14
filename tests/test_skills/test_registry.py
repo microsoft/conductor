@@ -27,6 +27,17 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _abs(*parts: str) -> Path:
+    """Build an absolute path that is absolute on Windows too.
+
+    ``Path("/plug")`` is absolute on POSIX but not on Windows, where a path needs a
+    drive to satisfy ``is_absolute()``. Anchoring to the current drive root keeps these
+    fixtures absolute on both platforms while preserving the basename the invariants
+    check against.
+    """
+    return Path(Path.cwd().anchor, *parts)
+
+
 class TestListBuiltinSkills:
     def test_includes_conductor(self) -> None:
         names = list_builtin_skills()
@@ -256,7 +267,7 @@ class TestSkillPluginInvariants:
             resolve_skill_plugin(skill)
 
     def test_valid_instance_builds_qualified_name(self) -> None:
-        plugin = SkillPlugin(skill_name="s", plugin_name="p", plugin_root=Path("/plug"))
+        plugin = SkillPlugin(skill_name="s", plugin_name="p", plugin_root=_abs("plug"))
         assert plugin.qualified_name == "p:s"
 
 
@@ -274,7 +285,7 @@ class TestResolvedSkillInvariants:
             ResolvedSkill(name="acme", directory=Path("skills/acme"), source="./acme")
 
     def test_valid_construction_is_unaffected(self) -> None:
-        item = ResolvedSkill(name="acme", directory=Path("/skills/acme"), source="./acme")
+        item = ResolvedSkill(name="acme", directory=_abs("skills", "acme"), source="./acme")
         assert item.name == "acme"
 
 

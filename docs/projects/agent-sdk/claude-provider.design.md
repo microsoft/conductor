@@ -103,6 +103,13 @@ This solution enables users to:
 - **FR4.4**: Preserve retry configuration compatibility with existing CopilotProvider patterns
 
 #### FR5: Token Usage Tracking
+
+> **Superseded.** FR5.2/FR5.3 below describe the *raw Anthropic Messages API*
+> shape. The Claude Agent SDK's usage dict reports cached tokens **outside**
+> its `input_tokens`, so the shipped provider folds both cache buckets *into*
+> `AgentOutput.input_tokens`. See `AgentOutput.input_tokens` and the
+> "Cache-inclusive token accounting" bullet in `AGENTS.md`.
+
 - **FR5.1**: Extract from response.usage: `input_tokens`, `output_tokens`
 - **FR5.2**: Include cache metrics when available:
   - `cache_creation_input_tokens`: Tokens written to cache

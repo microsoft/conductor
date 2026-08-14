@@ -40,7 +40,15 @@ _CROSS = Text.from_markup("[red]✗[/red]")
 _DASH = Text.from_markup("[dim]—[/dim]")
 _OPTIONAL_MARK = "○"
 """Neutral glyph for an absent *optional* credential — deliberately not the
-red ``✗`` used for a genuinely missing required credential (issue #319)."""
+red ``✗`` used for a genuinely missing required credential (issue #319).
+
+.. note::
+   ``✓``, ``✗`` and ``○`` are not encodable in cp1252, so the default *table*
+   output of ``conductor doctor`` still fails on such a console — see #401.
+   This module's ``--json`` path is safe (``ensure_ascii=True``); the table path
+   is deliberately out of scope here because every glyph consumer would need the
+   console threaded through it. The em-dash is encodable in cp1252.
+"""
 
 
 def run_doctor(
@@ -98,7 +106,7 @@ def run_doctor(
     report = _gather_report(sections=sections, provider=provider, check=check, models=models)
 
     if as_json:
-        console.print_json(data=report.to_dict())
+        console.print_json(data=report.to_dict(), ensure_ascii=True)
         return _compute_exit_code(report.providers, check=check, provider=provider)
 
     if report.env is not None:
@@ -317,13 +325,55 @@ def _default_effort_cell(model: ModelDiagnostic) -> Text:
     return Text(model.default_reasoning_effort)
 
 
+_PRICING_SOURCE_CELLS: dict[str, Text] = {
+    "provider": Text.from_markup("[green]provider[/green]"),
+    "table": Text.from_markup("[dim]table[/dim]"),
+    "none": Text.from_markup("[red]none[/red]"),
+    "error": Text.from_markup("[yellow]error[/yellow]"),
+}
+"""Pre-built cells for each :attr:`ModelDiagnostic.pricing_source` literal
+(issue #386), plus the synthetic ``"error"`` key used for ``None`` (pricing
+resolution itself failed). Built as module-level constants to avoid
+re-parsing the same markup literal on every table row (matching the
+``_CHECK``/``_CROSS``/``_DASH`` constants above) — each markup argument is
+still a literal template, not an interpolated value, keeping this inside the
+repo's console rules (see AGENTS.md "Console Output")."""
+
+
+def _rate_cell(value: float | None) -> Text:
+    """Format a per-Mtok rate, or ``—`` when unknown.
+
+    Deliberately never renders ``0.00`` for ``None`` — a zero would read as
+    "free", which is exactly the silent-wrong-number class of bug issue
+    #386 is about.
+    """
+    if value is None:
+        return _DASH
+    return Text(f"{value:,.2f}")
+
+
+def _pricing_source_cell(model: ModelDiagnostic) -> Text:
+    """Format the pricing-source cell (``provider`` / ``table`` / ``none`` / ``error``).
+
+    ``None`` means resolution itself failed (distinct from the determined
+    ``"none"``) and renders as a visible ``error`` rather than the same
+    ``—`` glyph used elsewhere for "provider doesn't expose this" — that
+    glyph would make a systemic pricing-hook break indistinguishable from a
+    boring provider.
+    """
+    if model.pricing_source is None:
+        return _PRICING_SOURCE_CELLS["error"]
+    return _PRICING_SOURCE_CELLS.get(model.pricing_source, Text(model.pricing_source))
+
+
 def _render_models(providers: list[ProviderDiagnostic], console: Console) -> None:
     """Render a per-provider Models detail table (``--models`` only).
 
     One table per provider that returned at least one model, with columns
-    for reasoning-effort support and prompt/output/context token limits.
-    Providers with no models (``None``/empty/error) are already summarized
-    in the Providers table and are skipped here — there is nothing to detail.
+    for reasoning-effort support, prompt/output/context token limits, and
+    per-Mtok pricing plus its source (issue #386). Providers with no models
+    (``None``/empty/error) are already summarized in the Providers table and
+    are skipped here — there is nothing to detail.
     """
     for diag in providers:
         if not diag.models:
@@ -335,6 +385,9 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
         table.add_column("Prompt", justify="right")
         table.add_column("Output", justify="right")
         table.add_column("Context", justify="right")
+        table.add_column("Input $/Mtok", justify="right")
+        table.add_column("Output $/Mtok", justify="right")
+        table.add_column("Pricing")
 
         for model in diag.models:
             table.add_row(
@@ -344,6 +397,9 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
                 _format_tokens(model.max_prompt_tokens),
                 _format_tokens(model.max_output_tokens),
                 _format_tokens(model.max_context_window_tokens),
+                _rate_cell(model.input_per_mtok),
+                _rate_cell(model.output_per_mtok),
+                _pricing_source_cell(model),
             )
 
         console.print(table)

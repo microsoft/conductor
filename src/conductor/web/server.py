@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json
 import logging
 import os
@@ -30,12 +29,20 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from conductor.engine.guidance import validate_guidance_text
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.executor.linkify import LINKABLE_EXTENSIONS
+from conductor.web.auth import (
+    OriginHostGuard,
+    constant_time_match,
+    mint_token,
+    remove_token_file,
+    resolve_expected_token,
+    write_token_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +160,12 @@ class WebDashboard:
         # submission resumed a paused agent or is merely queued.
         self._agent_paused = False
 
+        # Per-run auth token (issue #397). Minted unconditionally so the
+        # protected configuration is the default; CONDUCTOR_GATE_TOKEN
+        # overrides it when set (see resolve_expected_token). Written to a
+        # discoverable file once the port is known (see start()).
+        self._token = mint_token()
+
         # Server internals
         self._server: Any = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -196,23 +209,48 @@ class WebDashboard:
             lifespan=lifespan,
         )
 
+        # Origin/Host validation + token auth (issue #397). A pure-ASGI
+        # middleware so WebSocket scopes are covered too — Starlette's
+        # BaseHTTPMiddleware (and @app.middleware("http")) never sees them.
+        # get_bound / get_expected_token are lazy callables: the port is
+        # unknown until start() binds the socket, and the token can be
+        # overridden by CONDUCTOR_GATE_TOKEN at any time.
+        app.add_middleware(
+            OriginHostGuard,  # ty: ignore[invalid-argument-type]
+            get_bound=lambda: (dashboard._host, dashboard.port),
+            get_expected_token=lambda: resolve_expected_token(dashboard._token),
+            protected_paths=frozenset(
+                {
+                    "/api/stop",
+                    "/api/kill",
+                    "/api/resume",
+                    "/api/gate-respond",
+                    "/api/guidance",
+                }
+            ),
+            websocket_paths=frozenset({"/ws"}),
+        )
+
         @app.get("/")
-        async def index() -> FileResponse:
+        async def index() -> HTMLResponse:
             # Serve index.html with `no-cache` so browsers always revalidate
-            # it with the server before reusing a cached copy (this is a
-            # plain FileResponse, not StaticFiles, so it doesn't honor
-            # conditional requests -> every load is a fresh 200, not a cheap
-            # 304). index.html references version-hashed /assets/* bundles;
-            # without this, a browser can keep serving a stale index.html
-            # after a `conductor update`, pinning the dashboard to the
-            # previous build's bundle. The hashed asset files under /assets
-            # are unaffected by this header and get no explicit Cache-Control
-            # here; that's safe because a content change always produces a
-            # new filename, so a browser holding onto a stale hash is
-            # harmless.
-            return FileResponse(
-                _STATIC_DIR / "index.html",
-                media_type="text/html",
+            # it with the server before reusing a cached copy (this used to
+            # be a plain FileResponse; it is now read and templated so the
+            # per-run token can be injected -> every load is a fresh 200,
+            # not a cheap 304). index.html references version-hashed
+            # /assets/* bundles; without the no-cache header, a browser can
+            # keep serving a stale index.html after a `conductor update`,
+            # pinning the dashboard to the previous build's bundle. The
+            # hashed asset files under /assets are unaffected by this header
+            # and get no explicit Cache-Control here; that's safe because a
+            # content change always produces a new filename, so a browser
+            # holding onto a stale hash is harmless.
+            html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            token = resolve_expected_token(dashboard._token)
+            injection = f"<script>window.__CONDUCTOR_TOKEN__={json.dumps(token)};</script>"
+            html = html.replace("</head>", f"{injection}</head>", 1)
+            return HTMLResponse(
+                content=html,
                 headers={"Cache-Control": "no-cache"},
             )
 
@@ -520,14 +558,11 @@ class WebDashboard:
                     try:
                         msg = json.loads(raw)
                         if isinstance(msg, dict) and msg.get("type") == "gate_response":
-                            # Apply the same auth + waiting-state checks as the
-                            # HTTP endpoint so the WebSocket path cannot bypass
-                            # CONDUCTOR_GATE_TOKEN or resolve a non-waiting gate.
-                            if not self._gate_token_ok(ws.headers.get("authorization")):
-                                logger.warning(
-                                    "Rejecting WS gate_response: invalid or missing token"
-                                )
-                            elif (
+                            # The WebSocket handshake already authenticated
+                            # this connection (OriginHostGuard checks the
+                            # token before accept()), so only the
+                            # waiting-state check is needed here.
+                            if (
                                 target_error := self._validate_gate_target(
                                     str(msg.get("agent_name", "")),
                                     msg.get("prompt_id"),
@@ -1023,24 +1058,25 @@ class WebDashboard:
         return len(self._connections) > 0
 
     def _gate_token_ok(self, auth_header: str | None) -> bool:
-        """Return True if the gate token requirement is satisfied.
+        """Return True if the presented token matches the resolved gate token.
 
-        When ``CONDUCTOR_GATE_TOKEN`` is unset, gate responses are always
-        allowed. Otherwise the header must be ``Authorization: Bearer
-        <token>`` matching the env var, compared in constant time so the
-        token cannot be recovered via timing.
+        The header must be ``Authorization: Bearer <token>`` matching the
+        resolved token (``CONDUCTOR_GATE_TOKEN`` if set, else the per-run
+        minted token -- see ``conductor.web.auth.resolve_expected_token``),
+        compared in constant time so the token cannot be recovered via
+        timing. Note the ``OriginHostGuard`` middleware already enforces
+        this on ``/api/gate-respond`` and ``/api/guidance`` before the
+        request reaches these handlers; this check is defense in depth.
 
         Args:
             auth_header: The raw ``Authorization`` header value, or None.
 
         Returns:
-            True if the token check passes (or no token is configured).
+            True if the token check passes.
         """
-        expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
-        if not expected_token:
-            return True
+        expected_token = resolve_expected_token(self._token)
         scheme, _, presented = (auth_header or "").partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(presented, expected_token)
+        return scheme.lower() == "bearer" and constant_time_match(presented, expected_token)
 
     def _validate_gate_target(self, agent_name: str, prompt_id: str | None = None) -> str | None:
         """Validate that a gate response targets the currently-waiting prompt.
@@ -1393,6 +1429,19 @@ class WebDashboard:
         if self._actual_port is None:
             self._actual_port = self._port
 
+        # Write the token file now that the actual port is known (issue
+        # #397). Deliberately here rather than __init__: with port=0 the
+        # bound port is only known after the socket binds, and this method
+        # runs for both --web and --web-bg (cli/run.py calls start()/stop()
+        # on both the run and resume paths, and the --web-bg child goes
+        # through the same code). Written as *resolved* token
+        # (CONDUCTOR_GATE_TOKEN if set, else the minted one) — the guard
+        # validates against resolve_expected_token(self._token), not the
+        # raw minted value, so writing the minted value here would make the
+        # file useless (and CLI auto-discovery would always 403) whenever
+        # the env var override is set.
+        write_token_file(self._actual_port, resolve_expected_token(self._token))
+
     async def stop(self) -> None:
         """Shut down the server gracefully.
 
@@ -1420,6 +1469,21 @@ class WebDashboard:
         except RuntimeError:
             pass  # No running loop (e.g. during interpreter shutdown)
 
+        # Remove the token file (issue #397) — best-effort, and identity-
+        # checked against the token *this* run wrote: the socket was just
+        # released above, so a concurrent run can already have bound the
+        # same port and overwritten the file by the time we get here.
+        # Deleting it unconditionally would delete that newer run's token
+        # file out from under it, exactly the port-reuse hazard
+        # cli/pid.py::remove_pid_file_at already guards against. Placed
+        # before the WebSocket drain (rather than after) so it isn't
+        # delayed by however long that unbounded per-connection loop takes.
+        if self._actual_port is not None:
+            try:
+                remove_token_file(self._actual_port, resolve_expected_token(self._token))
+            except OSError as exc:
+                logger.warning("Failed to remove dashboard token file: %s", exc)
+
         # Close remaining WebSocket connections
         for ws in list(self._connections):
             with contextlib.suppress(Exception):
@@ -1438,6 +1502,11 @@ class WebDashboard:
         """Return the dashboard URL (e.g., ``http://127.0.0.1:8080``)."""
         port = self._actual_port if self._actual_port is not None else self._port
         return f"http://{self._host}:{port}"
+
+    @property
+    def token(self) -> str:
+        """The token requests must present (env override else the minted per-run token)."""
+        return resolve_expected_token(self._token)
 
     @property
     def app(self) -> FastAPI:

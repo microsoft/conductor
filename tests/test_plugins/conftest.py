@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -20,6 +23,26 @@ from conductor.providers.capabilities import ProviderCapabilities
 SKILL_FRONTMATTER = "---\nname: {name}\ndescription: A test skill.\n---\n\nBody.\n"
 
 AGENT_DEFINITION = "---\nname: {name}\ndescription: {description}\n{extra}---\n\n{prompt}\n"
+
+
+def rmtree(path: Path) -> None:
+    """``shutil.rmtree`` that also works on a git repository on Windows.
+
+    Git marks everything under ``.git/objects`` read-only, and Windows
+    refuses to unlink a read-only file, so a plain ``rmtree`` of a checkout
+    raises ``PermissionError`` (WinError 5) there while succeeding on POSIX,
+    where permission to unlink comes from the *directory*.
+
+    Tests that delete a repo to prove a fetch never touches the remote again
+    need the delete itself to work everywhere, so clear the bit and retry
+    rather than skipping those tests off Linux.
+    """
+
+    def _clear_readonly(func, target, _exc):  # type: ignore[no-untyped-def]
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onexc=_clear_readonly)
 
 
 def write_skill(directory: Path, name: str | None = None) -> Path:

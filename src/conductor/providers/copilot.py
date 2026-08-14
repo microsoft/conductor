@@ -42,6 +42,8 @@ from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
+    from copilot.session import PermissionInvocation
+
     from conductor.config.schema import AgentDef, OutputField, ProviderSettings
     from conductor.engine.pricing import ModelPricing
 
@@ -92,13 +94,19 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 # Try to import the Copilot SDK
 try:
     from copilot import CopilotClient
-    from copilot.session import PermissionHandler
+    from copilot.session import (
+        PermissionDecisionUserNotAvailable,
+        PermissionHandler,
+        PermissionNoResult,
+    )
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
+    PermissionNoResult = None  # type: ignore[misc, assignment]
+    PermissionDecisionUserNotAvailable = None  # type: ignore[misc, assignment]
 
 # RuntimeConnection was added to the SDK after CopilotClient; import it
 # separately so an older-but-present SDK still enables the default nested-spawn
@@ -396,18 +404,68 @@ class CopilotProvider(AgentProvider):
     @staticmethod
     def _default_permission_handler(
         request: Any,
-        invocation: dict[str, str],
+        invocation: PermissionInvocation,
     ) -> Any:
-        """Default permission handler that approves all requests.
+        """Approve tool permission requests, or decline them explicitly.
 
-        The SDK requires a permission handler on session creation.
-        In orchestration mode, we approve all tool permissions since the
-        workflow author controls which tools are available to each agent.
+        The SDK requires a permission handler on session creation. In
+        orchestration mode the workflow author controls which tools each agent
+        gets, so an ordinary request is approved.
 
-        Returns a PermissionRequestResult from the SDK.
+        ``approve_all`` does not always approve. It abstains with
+        ``PermissionNoResult`` when the request carries
+        ``managed_approval_required``, a flag the runtime sets rather than
+        anything Conductor configures. That sentinel exists so a second
+        connected client can answer instead, and Conductor is the only client:
+        returning it leaves the request unanswered, the CLI blocked, and the
+        run dying minutes later against an idle timeout that blames the
+        network. Decline explicitly instead — never approve, because managed
+        approval is a deliberate policy control and overriding it here would
+        turn a hang into a bypass.
+
+        ``approve_all`` also raises when ``invocation["managed_settings_enabled"]``
+        is set. That flag comes from the ``enable_managed_settings`` opt-in on
+        ``create_session``, which Conductor never passes; the guard is here
+        because the SDK swallows exceptions raised by this callback and
+        answers ``PermissionDecisionUserNotAvailable`` on its own logger, so
+        an unguarded raise would surface as every tool being denied for no
+        stated reason.
+
+        Args:
+            request: The SDK's permission request for a single tool call.
+            invocation: The SDK's ``PermissionInvocation`` for this session.
+
+        Returns:
+            A ``PermissionRequestResult`` from the SDK. Always a concrete
+            decision, never an abstention.
         """
+        try:
+            result = PermissionHandler.approve_all(request, invocation)
+        except RuntimeError:
+            logger.error(
+                "Copilot rejected blanket tool approval for session %s because "
+                "managed settings are enabled. Conductor runs unattended and "
+                "cannot answer a managed permission prompt, so tool calls will "
+                "be declined. Run this workflow through an interactive Copilot "
+                "client instead.",
+                invocation.get("session_id", "<unknown>"),
+            )
+            return PermissionDecisionUserNotAvailable()
+
+        if isinstance(result, PermissionNoResult):
+            logger.error(
+                "Copilot requires managed approval for tool %r in session %s. "
+                "Conductor runs unattended and has no one to ask, so the call "
+                "is being declined rather than left pending. Run this workflow "
+                "through an interactive Copilot client, or ask an administrator "
+                "to relax the managed-approval policy for this tool.",
+                getattr(request, "tool_name", None) or "<unknown>",
+                invocation.get("session_id", "<unknown>"),
+            )
+            return PermissionDecisionUserNotAvailable()
+
         logger.debug("auto-approved permission request: %s", request)
-        return PermissionHandler.approve_all(request, invocation)
+        return result
 
     def _large_output_config(self) -> dict[str, Any]:
         """Build the SDK ``large_output`` config for session creation.
@@ -2787,7 +2845,15 @@ class CopilotProvider(AgentProvider):
         batch_size = getattr(token_prices, "batch_size", None)
         input_price = getattr(token_prices, "input_price", None)
         output_price = getattr(token_prices, "output_price", None)
-        cache_price = getattr(token_prices, "cache_price", None)
+        # ``cache_price`` is the original single cached-token rate. Copilot SDK
+        # >=1.0.9 deprecates it in favour of separate read and write rates, so
+        # prefer those and keep the old field as the fallback — a model that
+        # ships only the new fields would otherwise price cache reads at $0.00,
+        # which is the same silent-wrong-number failure as #386 one field over.
+        cache_read_price = getattr(token_prices, "cache_read_price", None)
+        if not _is_finite_nonneg(cache_read_price):
+            cache_read_price = getattr(token_prices, "cache_price", None)
+        cache_write_price = getattr(token_prices, "cache_write_price", None)
         # Require a positive batch size and finite, non-negative input/output
         # prices. Missing or malformed values (None / negative / NaN / inf) mean
         # we can't produce a trustworthy cost, so fall back to the static table
@@ -2810,10 +2876,12 @@ class CopilotProvider(AgentProvider):
         return ModelPricing(
             input_per_mtok=_per_mtok(input_price),
             output_per_mtok=_per_mtok(output_price),
-            # The SDK exposes a single cached-token price (a read rate); Copilot
-            # models have no separate cache-write price.
-            cache_read_per_mtok=_per_mtok(cache_price) if _is_finite_nonneg(cache_price) else 0.0,
-            cache_write_per_mtok=0.0,
+            cache_read_per_mtok=(
+                _per_mtok(cache_read_price) if _is_finite_nonneg(cache_read_price) else 0.0
+            ),
+            cache_write_per_mtok=(
+                _per_mtok(cache_write_price) if _is_finite_nonneg(cache_write_price) else 0.0
+            ),
         )
 
     async def list_models(self) -> list[str] | None:

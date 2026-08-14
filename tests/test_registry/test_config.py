@@ -134,6 +134,50 @@ class TestSaveConfig:
         assert loaded.registries["dev"].type == RegistryType.path
         assert loaded.registries["dev"].source == "/dev/workflows"
 
+    def test_roundtrip_survives_backslashes_in_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Windows path must survive the TOML round-trip.
+
+        ``_format_toml`` writes values into TOML *basic* strings, which process
+        backslash escapes. ``C:\\Users\\...`` therefore reaches the parser as ``\\U``,
+        a Unicode escape, and TOML rejects it with "Invalid hex value" — so the
+        config could be written but never read back. Not Windows-only: any source
+        containing a backslash corrupts the file on every platform.
+        """
+        _setup_config_home(tmp_path, monkeypatch)
+
+        windows_source = r"C:\Users\alice\AppData\Local\workflows"
+        save_config(
+            RegistriesConfig(
+                registries={"local": RegistryEntry(type=RegistryType.path, source=windows_source)}
+            )
+        )
+
+        loaded = load_config()
+        assert loaded.registries["local"].source == windows_source
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            r"C:\Users\alice",  # \U -> "invalid hex value"
+            r"C:\temp\new",  # \t and \n -> silent corruption, not an error
+            r"D:\x41\backup",  # \x -> hex escape
+            'has"a"quote',  # closes the basic string early
+            "trailing\\",  # escapes the closing quote
+        ],
+    )
+    def test_roundtrip_survives_toml_metacharacters(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+    ) -> None:
+        _setup_config_home(tmp_path, monkeypatch)
+
+        save_config(
+            RegistriesConfig(registries={"r": RegistryEntry(type=RegistryType.path, source=source)})
+        )
+
+        assert load_config().registries["r"].source == source
+
     def test_save_creates_parent_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -300,3 +344,48 @@ class TestRegistriesConfigValidation:
     def test_none_default_always_valid(self) -> None:
         config = RegistriesConfig(default=None, registries={})
         assert config.default is None
+
+
+class TestRegistryNameCharset:
+    """The name is a TOML table key and a cache directory name.
+
+    Escaping the *values* left the key unescaped and the charset unchecked, so
+    ``conductor registry add 'has"quote'`` reported success and wrote a file that
+    then failed to parse. Because ``add_registry``, ``remove_registry`` and
+    ``get_registry`` all load the config first, the user could not remove the
+    entry that broke it, and every unrelated registry went down with it.
+    """
+
+    @pytest.mark.parametrize("name", ['has"quote', "with space", "a=b", "a#b"])
+    def test_toml_metacharacters_are_rejected(self, name: str) -> None:
+        from conductor.registry.config import _validate_registry_name
+
+        with pytest.raises(RegistryError):
+            _validate_registry_name(name)
+
+    @pytest.mark.parametrize("name", ["team-a", "team_a", "TeamA1", "my.team"])
+    def test_ordinary_names_are_accepted(self, name: str) -> None:
+        from conductor.registry.config import _validate_registry_name
+
+        _validate_registry_name(name)
+
+    def test_a_dotted_name_round_trips_as_one_key(self) -> None:
+        """Unquoted, ``[registries.my.team]`` declares a *nested table*.
+
+        The entry then silently vanishes on load rather than failing loudly,
+        which is why quoting the key is needed as well as the charset check.
+        """
+        import tomllib
+
+        from conductor.registry.config import (
+            RegistriesConfig,
+            RegistryEntry,
+            _format_toml,
+        )
+
+        cfg = RegistriesConfig(
+            default="my.team",
+            registries={"my.team": RegistryEntry(type="github", source="o/r")},
+        )
+        parsed = tomllib.loads(_format_toml(cfg))
+        assert list(parsed["registries"]) == ["my.team"]

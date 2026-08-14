@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib
 import io
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -314,7 +315,23 @@ class TestFetchedPluginMetadataRenders:
     marketplace, skill and subagent names read out of a cloned repository.
     """
 
-    @pytest.mark.parametrize("marker", [CRASHING, DELETED])
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            pytest.param(
+                CRASHING,
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32",
+                    reason="'/' is a path separator on Windows, so 'plug[/etc/x]' becomes "
+                    "three nested directories rather than one named component. Rich's "
+                    "crashing form is a closing tag and needs the slash, so this marker "
+                    "cannot exist inside a Windows path at all. The escaping it checks is "
+                    "covered there by the 10 non-path CRASHING cases in this module.",
+                ),
+            ),
+            DELETED,
+        ],
+    )
     def test_plugin_path_survives_the_report(self, tmp_path: Path, marker: str) -> None:
         """The plugin *root* is rendered, and a path can contain brackets.
 
@@ -342,7 +359,12 @@ class TestFetchedPluginMetadataRenders:
             '  entry_point: "start"\n'
             "  runtime:\n"
             "    provider: copilot\n"
-            f'    plugins: ["{root}"]\n'
+            # json.dumps rather than an f-string: a YAML double-quoted scalar
+            # processes backslash escapes, so a Windows tmp_path interpolated
+            # raw makes "C:\\Users" read as the Unicode escape \\U and the
+            # fixture fails to parse. YAML is a superset of JSON, so JSON
+            # string escaping produces a valid scalar on every platform.
+            f"    plugins: [{json.dumps(str(root))}]\n"
             "agents:\n"
             '  - name: "start"\n'
             '    prompt: "hi"\n'

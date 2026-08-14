@@ -38,6 +38,7 @@ import { EgressNode } from './EgressNode';
 import { AnimatedEdge } from './AnimatedEdge';
 import { WorkflowErrorBanner, WorkflowSuccessBanner } from '@/components/layout/ErrorBanner';
 import { ReconnectWarningBanner } from '@/components/layout/ReconnectWarningBanner';
+import { SendFailedBanner } from '@/components/layout/SendFailedBanner';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import type { NodeStatus } from '@/lib/constants';
 import { Loader2, Maximize, Zap, ChevronsUpDown, ChevronsDownUp } from 'lucide-react';
@@ -461,6 +462,7 @@ function WorkflowGraphInner() {
       <WorkflowErrorBanner />
       <WorkflowSuccessBanner />
       <ReconnectWarningBanner />
+      <SendFailedBanner />
       {showEmptyState && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center pointer-events-none">
           <div className="relative mb-3">

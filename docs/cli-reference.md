@@ -137,6 +137,49 @@ The `--web-bg` flag is a convenience shortcut: it forks a background process run
 
 `--web` and `--web-bg` are mutually exclusive.
 
+**Security:** the dashboard is origin/host-restricted and token-protected by
+default (issue #397). Requests must present a `Host` header naming the bound
+machine (loopback aliases or the configured bind host); a present `Origin`
+header must match too, though most non-browser clients (curl, `httpx`,
+`conductor gate respond`) send none and are unaffected. Mutating routes
+(`/api/stop`, `/api/kill`, `/api/resume`, `/api/gate-respond`,
+`/api/guidance`) and the `/ws` WebSocket handshake additionally require a
+bearer token — see [Authentication](#conductor-gate-respond) under
+`conductor gate respond` for the token precedence order and discovery. Set
+`CONDUCTOR_WEB_ALLOW_ORIGINS` (comma-separated full origins) to admit an
+extra development origin, e.g. Vite's `http://localhost:5173`, without
+disabling the check for anything else.
+
+**Readiness contract** (issue #410) — the launcher confirms the workflow
+actually started before it prints a URL and exits 0, rather than trusting a
+bare TCP connection. This happens in two stages:
+
+1. **Port reachability** — the launcher waits (up to 15s) for the child's
+   dashboard port to accept connections, checking the child's exit status on
+   every iteration. If the child dies before the port opens, the launcher
+   exits 1 immediately (typically well under a second) with the exit code
+   and a bounded tail of the child's captured stderr log — e.g. a
+   `ConfigurationError` from a workflow that fails to even parse. A clean
+   (exit code 0) sub-second run is not treated as a failure.
+2. **Workflow start** — once the port is reachable and the PID file is
+   written, the launcher polls `GET /api/info` (the same identity endpoint
+   `conductor stop` uses) for up to 30s, waiting for it to report the
+   workflow has actually started (not just that the dashboard's HTTP server
+   is up). If the child dies during this wait, the launcher removes the PID
+   file it just wrote and exits 1 with the exit code and stderr tail. If a
+   *different* process already holds the requested port, the launcher
+   terminates the child, removes the PID file, and exits 1 naming the
+   conflicting PID and suggesting `--web-port`.
+
+If the 30s workflow-start wait elapses with the child still alive and
+listening, that is **not** treated as a failure: the URL is still printed
+and the CLI still exits 0, since the workflow may simply be slow to start
+(plugin fetch, MCP server startup, provider connection). In that case a
+note is printed alongside the URL suggesting the dashboard or stderr log be
+checked. Tune the wait (or disable it entirely) via
+`CONDUCTOR_WEB_BG_START_TIMEOUT` (seconds; default `30`; `0` disables the
+stage-two probe, restoring the pre-#410 behavior of trusting the port alone).
+
 **`--web-bg` and `human_gate`** — background runs support human gates through
 the dashboard. When the workflow reaches a `human_gate`, the detached process
 waits for a response from the web dashboard (the gate modal) or the
@@ -618,7 +661,24 @@ conductor gate respond [OPTIONS]
 
 ### Authentication
 
-If the running workflow was launched with a gate token configured, requests without a matching token are rejected with HTTP 403. Supply the token via `--token` or set the `CONDUCTOR_GATE_TOKEN` environment variable (the flag takes precedence when both are present).
+Every request requires a valid token (issue #397): a per-run token is minted
+automatically for every dashboard, so the protected configuration is the
+default rather than something you must opt into. Requests without a
+matching token are rejected with HTTP 403. The token is resolved in this
+order:
+
+1. `--token SECRET`
+2. the `CONDUCTOR_GATE_TOKEN` environment variable
+3. the per-run token file at `~/.conductor/runs/dashboard-<port>.token`
+   (written with mode `0600` on POSIX by the dashboard on startup, removed
+   on shutdown; on Windows the mode bits are not honoured, so the file's
+   protection comes from the inherited ACL of its parent directory
+   (`%USERPROFILE%\.conductor\runs` by default) rather than per-owner
+   permission bits), auto-discovered by port so most invocations need
+   neither flag nor env var
+
+The first source found wins; a later source in the list is never consulted
+once an earlier one supplies a value.
 
 ### Auto-Discovery
 
@@ -687,9 +747,8 @@ with code 1.
 
 ### Authentication
 
-Uses the same `CONDUCTOR_GATE_TOKEN` mechanism as `conductor gate respond` —
-if the running workflow was launched with a gate token configured, requests
-without a matching token are rejected with HTTP 403.
+Same token precedence and auto-discovery as `conductor gate respond`: `--token` >
+`CONDUCTOR_GATE_TOKEN` > the per-run token file in `~/.conductor/runs/`.
 
 ### Examples
 
@@ -837,13 +896,18 @@ support and context-window limits:
 | Reasoning efforts | `reasoning.effort` levels the model accepts (e.g. `low, medium, high, xhigh`), `none` when the model definitively supports none (e.g. a non-thinking Claude model), or `n/a` when the provider can't determine support. |
 | Default | The model's default reasoning-effort level, or `—` when unknown/not applicable. |
 | Prompt / Output / Context | Maximum prompt (input), output (completion), and total context-window tokens, or `—` when the provider doesn't expose that limit. |
+| Input $/Mtok / Output $/Mtok | Resolved per-million-token input/output rate (USD), or `—` when unpriced; a displayed `0.00` means a genuinely free rate reported by the provider, never "unknown". |
+| Pricing | Where the rate came from (see #386): `provider` (live rate from the provider's `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback), `none` (unpriced — the run's cost summary will show `~$X (N unpriced)`), or `error` when pricing resolution itself failed. |
 
 Coverage varies by provider — every field degrades independently to `n/a` /
 `—` rather than failing the command:
 
 - **Copilot** reports reasoning-effort levels + default, and prompt/context
   token limits, from the SDK's per-model metadata (`Output` is frequently
-  `—` — the live API does not currently populate it for most models).
+  `—` — the live API does not currently populate it for most models). It is
+  also currently the only provider that implements the `get_model_pricing`
+  hook, so `Pricing` shows `provider` for models the SDK prices live; other
+  providers legitimately show `table` or `none`.
 - **Claude** derives reasoning-effort support from a static heuristic
   (Claude 3.7+ / 4.x models support all five levels; older models support
   none) and reports only `Prompt` (via the Anthropic API's
@@ -864,7 +928,10 @@ id strings):
   "default_reasoning_effort": "medium",
   "max_prompt_tokens": 128000,
   "max_output_tokens": 64000,
-  "max_context_window_tokens": 192000
+  "max_context_window_tokens": 192000,
+  "input_per_mtok": 2.00,
+  "output_per_mtok": 8.00,
+  "pricing_source": "table"
 }
 ```
 
@@ -1024,7 +1091,8 @@ are hidden from `--help` and are slated for removal in a future release.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) and by `conductor guide` (checked by `POST /api/guidance`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_GATE_TOKEN` | Overrides the dashboard's per-run minted auth token. Checked by `POST /api/stop`, `/api/kill`, `/api/resume`, `/api/gate-respond`, and `/api/guidance`, and by the `/ws` WebSocket handshake; also read by `conductor gate respond` and `conductor guide` |
+| `CONDUCTOR_WEB_ALLOW_ORIGINS` | Comma-separated list of additional origins (`scheme://host:port`) the dashboard's `OriginHostGuard` accepts, on top of the loopback aliases and configured bind host. Dev-server escape hatch (e.g. Vite's `http://localhost:5173`); nothing else is disabled by setting it |
 | `CONDUCTOR_HOME` | Overrides `~/.conductor/` as the location of run records, the registry config, and `config.toml` |
 | `CONDUCTOR_FLEET_NO_ANIM` | Set to any non-empty value to disable Fleet Manager TUI animation (spinners, sparkline motion, splash). Useful over slow SSH links, in recorded terminals, and where movement is distracting |
 
