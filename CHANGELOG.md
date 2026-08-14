@@ -31,6 +31,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `fleet/retention.py`'s filename parsers, and `fleet/records.py`'s own
   timestamp parser, now derive their run-id-matching regexes from the same
   shared pattern.
+- **Install hints for optional extras now print a command that works, and
+  upgrades stop uninstalling the extras you have** (#441). Every hint pointing
+  at an optional extra hardcoded `pip install 'conductor-cli[<extra>]'`, which
+  cannot work on the documented install path: `install.sh`/`install.ps1` create
+  a `uv tool` venv, which is not pip-managed, and `conductor-cli` is not
+  published to PyPI so pip has nothing to resolve against there. `conductor
+  fleet` without the `tui` extra, and the `aca` / `claude-agent-sdk` provider
+  errors, now resolve the command from the *detected* install context — `uv
+  tool install --force '<spec>'` for an install-script install, `uv sync
+  --inexact --extra <extra>` for a source checkout, and `pip install` as the
+  fallback, carrying the git URL you installed from when there is one so a
+  `pip`/`pipx`-from-git install resolves too. The suggested command reuses the
+  install source recorded for your install (so a fork or a local build is not
+  redirected upstream) and carries the extras you already have, because `uv
+  tool install --force` replaces the tool's entire requirement set and `uv
+  sync` is exact by default. A receipt that cannot be read is reported rather
+  than treated as "no extras" — in the hint, and in both install scripts,
+  which warn and carry on rather than either dropping the extras silently or
+  refusing to run.
+  For the same reason, `install.sh` and `install.ps1` now read the existing
+  install's `uv-receipt.toml` and rebuild the source as
+  `conductor-cli[<extras>] @ <source>`, so `conductor update` (which drives
+  them) no longer silently uninstalls `[tui]` or `[aca]` on upgrade — it also
+  names the extras it found before you commit. New `--extras <a,b>` /
+  `CONDUCTOR_INSTALL_EXTRAS` adds an extra during an install or upgrade
+  (rejecting one this package does not declare, which uv would otherwise
+  accept with a warning and a zero exit status), and `--no-preserve-extras` /
+  `CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS` drops back to a bare install.
+
 - **Fleet Manager History no longer accumulates an entire retained event log
   into memory to build one entry** (#436). `_read_full_log` now streams
   parsed events one at a time instead of materializing them into a list

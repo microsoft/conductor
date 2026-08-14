@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from conductor.exceptions import ProviderError
+from conductor.install_hint import install_command
 from conductor.providers._schema import (
     SchemaDepthError,
     build_json_schema_field,
@@ -596,7 +597,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
                 "Claude Agent SDK not installed",
-                suggestion="Install with: uv add 'claude-agent-sdk>=0.2.82'",
+                suggestion=f"Install with: {install_command('claude-agent-sdk')}",
             )
 
         self._default_model = model or _DEFAULT_MODEL

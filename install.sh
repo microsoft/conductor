@@ -24,6 +24,16 @@
 #       install into a throwaway UV_TOOL_BIN_DIR that must never leak into the
 #       real environment (note: `uv tool update-shell` intentionally modifies
 #       the shell and so ignores UV_NO_MODIFY_PATH).
+#   --extras <a,b>            OR   $CONDUCTOR_INSTALL_EXTRAS
+#       Comma-separated optional extras to install (tui, aca,
+#       claude-agent-sdk). These are *added to* the extras already recorded
+#       in the existing install's uv receipt, which are preserved
+#       automatically -- `uv tool install --force` rewrites the tool's whole
+#       requirement set, so an upgrade that named no extras used to silently
+#       uninstall `[tui]`/`[aca]` (issue #441).
+#   --no-preserve-extras      OR   $CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS=1
+#       Do not carry the existing install's extras forward. Use this to drop
+#       back to a bare install.
 
 set -eu
 
@@ -39,6 +49,8 @@ SOURCE="${CONDUCTOR_INSTALL_SOURCE:-}"
 AUTO_STOP="${CONDUCTOR_INSTALL_AUTO_STOP:-0}"
 FORCE_FLAG="${CONDUCTOR_INSTALL_FORCE:-0}"
 SKIP_PATH_UPDATE="${CONDUCTOR_INSTALL_SKIP_PATH_UPDATE:-0}"
+EXTRAS="${CONDUCTOR_INSTALL_EXTRAS:-}"
+NO_PRESERVE_EXTRAS="${CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,6 +59,9 @@ while [ $# -gt 0 ]; do
         --auto-stop)        AUTO_STOP=1; shift ;;
         --force)            FORCE_FLAG=1; shift ;;
         --skip-path-update) SKIP_PATH_UPDATE=1; shift ;;
+        --extras)           EXTRAS="$2"; shift 2 ;;
+        --extras=*)         EXTRAS="${1#--extras=}"; shift ;;
+        --no-preserve-extras) NO_PRESERVE_EXTRAS=1; shift ;;
         *) shift ;;
     esac
 done
@@ -163,10 +178,15 @@ uv_install_with_retry() {
     return "$ec"
 }
 
+# The directory uv keeps tool venvs in, or empty when uv cannot say.
+uv_tools_dir() {
+    uv tool dir 2>/dev/null | head -n1 || true
+}
+
 # Run `conductor --version` from the freshly installed location and return the
 # version string (or empty on failure).
 verify_install() {
-    tools_dir=$(uv tool dir 2>/dev/null | head -n1 || true)
+    tools_dir=$(uv_tools_dir)
     if [ -n "$tools_dir" ]; then
         # uv tool venvs put the entrypoint at <tool_dir>/<pkg>/bin/<exe> on POSIX
         for candidate in "$tools_dir/conductor-cli/bin/conductor" "$tools_dir/conductor/bin/conductor"; do
@@ -178,6 +198,114 @@ verify_install() {
     fi
     if need_cmd conductor; then
         conductor --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1
+    fi
+}
+
+# Path to the existing install's uv tool receipt, or empty if there isn't one.
+# Probes both directory names verify_install knows about, so the two functions
+# agree about where the tool lives.
+receipt_path() {
+    tools_dir=$(uv_tools_dir)
+    [ -n "$tools_dir" ] || return 0
+    for name in conductor-cli conductor; do
+        if [ -f "${tools_dir}/${name}/uv-receipt.toml" ]; then
+            printf '%s' "${tools_dir}/${name}/uv-receipt.toml"
+            return 0
+        fi
+    done
+}
+
+# Read the extras recorded in the existing install's uv tool receipt.
+#
+# `uv tool install --force` replaces the tool's entire requirement set, so an
+# upgrade that names no extras silently uninstalls `[tui]`/`[aca]` (issue
+# #441). The receipt is the only authoritative record of what the current
+# install carries; the CLI's `conductor.install_hint` reads the same file to
+# build its install hints, so the two must agree.
+#
+# Flattens newlines (uv may wrap the requirements array), splits the array
+# into one requirement object per line, keeps this distribution's entry --
+# matched on the whole `name = "conductor-cli"` field, not as a substring, so
+# a `conductor-cli-plugin` requirement is not mistaken for it -- and extracts
+# its extras. Field order inside the object and additional `uv tool install
+# --with` requirements are both tolerated.
+# Returns 0 with the extras (possibly empty) when the receipt was understood,
+# and non-zero when one exists but could not be read. That distinction is the
+# whole point: an unreadable receipt is NOT a bare install, and treating it as
+# one rebuilds the tool without the extras it records -- silently causing the
+# very data loss this change exists to prevent. `conductor.install_hint`'s
+# `read_receipt` draws the same line with `ReceiptContents.readable`.
+#
+# `-i` on the name match because the Python reader normalises per PEP 503; a
+# case-sensitive match here would find nothing for a receipt recording
+# `Conductor-CLI` and drop the extras.
+receipt_extras() {
+    receipt=$(receipt_path)
+    [ -n "$receipt" ] || return 0
+    [ -r "$receipt" ] || return 1
+    flat=$(tr '\n' ' ' < "$receipt") || return 1
+    entry=$(printf '%s' "$flat" | tr '}' '\n' \
+        | grep -Ei 'name[[:space:]]*=[[:space:]]*"conductor[-_.]cli"' \
+        | head -n1) || return 1
+    [ -n "$entry" ] || return 1
+    printf '%s' "$entry" \
+        | sed -n 's/.*extras[[:space:]]*=[[:space:]]*\[\([^]]*\)\].*/\1/p' \
+        | tr -d "\"' " \
+        || true
+}
+
+# Merge comma-separated extras lists, dropping blanks/duplicates and sorting
+# so the generated spec is stable between runs (and comparable as a string).
+#
+# Lower-cases before deduplicating to match `install.ps1`'s Merge-Extras,
+# whose Sort-Object -Unique is case-insensitive. Without this the two
+# installers disagree, and `--extras TUI` against a recorded `tui` would make
+# the up-to-date comparison below never converge.
+merge_extras() {
+    printf '%s,%s' "$1" "$2" \
+        | tr ',' '\n' \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' \
+        | sort -u \
+        | tr '\n' ',' \
+        | sed 's/,$//' \
+        || true
+}
+
+# Refuse an extra this package does not declare. uv treats an unknown extra as
+# a *warning* and still exits 0, so without this a typo installs nothing and
+# reports success -- the same "confident command that does not work" this
+# whole change exists to remove.
+#
+# Split with parameter expansion rather than a `... | while` pipeline: the
+# loop body would run in a subshell there, so `error`'s `exit 1` would kill
+# only the subshell and the install would carry on with the bad extra.
+validate_extras() {
+    _rest="$1"
+    while [ -n "$_rest" ]; do
+        _name="${_rest%%,*}"
+        case "$_rest" in
+            *,*) _rest="${_rest#*,}" ;;
+            *)   _rest="" ;;
+        esac
+        [ -n "$_name" ] || continue
+        _name=$(printf '%s' "$_name" | tr '[:upper:]' '[:lower:]')
+        case "$_name" in
+            tui|aca|claude-agent-sdk) ;;
+            *) error "unknown extra '${_name}' (available: tui, aca, claude-agent-sdk)" ;;
+        esac
+    done
+}
+
+# Wrap an install source in a PEP 508 direct reference carrying the extras.
+# uv accepts a git+ URL, a local directory, or a wheel path on the right-hand
+# side of the `@`.
+apply_extras() {
+    if [ -n "$2" ]; then
+        printf 'conductor-cli[%s] @ %s' "$2" "$1"
+    else
+        printf '%s' "$1"
     fi
 }
 
@@ -227,12 +355,48 @@ main() {
         display_version="$tag_name"
     fi
 
+    # --- Extras: carry the existing install's extras forward, plus any requested ---
+    #
+    # `receipt_now` is what is installed; `existing_extras` is what we choose
+    # to carry. They differ under --no-preserve-extras, and the up-to-date
+    # check below has to compare against the former -- comparing against the
+    # latter made the opt-out a no-op, since the flag zeroes it and both sides
+    # then match.
+    validate_extras "$EXTRAS"
+    receipt_readable=1
+    raw_extras=$(receipt_extras) || receipt_readable=0
+    receipt_now=$(merge_extras "$raw_extras" "")
+    if [ "$receipt_readable" = "0" ]; then
+        # Warn and keep going rather than aborting: a broken receipt is
+        # exactly the state a reinstall is meant to repair, so refusing would
+        # take away the remedy. But say plainly that extras cannot be carried,
+        # because the alternative -- proceeding silently -- is how [tui]/[aca]
+        # disappear without anyone noticing.
+        warn "Could not read the existing install's uv receipt; extras cannot be preserved."
+        warn "Re-run with --extras <a,b> to reinstate any you had."
+    fi
+    existing_extras=""
+    [ "$NO_PRESERVE_EXTRAS" = "1" ] || existing_extras="$receipt_now"
+    resolved_extras=$(merge_extras "$existing_extras" "$EXTRAS")
+    if [ -n "$resolved_extras" ]; then
+        info "Including extras: ${resolved_extras}"
+        install_source=$(apply_extras "$install_source" "$resolved_extras")
+    elif [ -n "$receipt_now" ]; then
+        info "Dropping extras: ${receipt_now}"
+    fi
+
     # --- Existing-install check (only for the GitHub-release path) ---
     if [ -z "$SOURCE" ] && need_cmd conductor; then
         current_version=$(conductor --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1 || true)
         if [ -n "$current_version" ]; then
             latest_version=$(printf '%s' "$tag_name" | sed 's/^v//')
-            if [ "$current_version" = "$latest_version" ]; then
+            # An already-current version is only a no-op when the extras on
+            # disk already match what this run would install: `--extras tui`
+            # (or --no-preserve-extras) still has work to do, and reporting
+            # "up to date" would silently skip it.
+            if [ "$current_version" = "$latest_version" ] \
+                && [ "$resolved_extras" = "$receipt_now" ] \
+                && [ "$receipt_readable" = "1" ]; then
                 success "Conductor v${current_version} is already installed and up to date."
                 printf '\n  Run \033[1mconductor --help\033[0m to get started.\n\n'
                 return 0
@@ -314,6 +478,14 @@ main() {
         sed 's/^/  /' "$log_file" >&2
         printf '\n' >&2
         error "uv tool install failed after retries"
+    fi
+    # uv reports an extra it does not recognise as a warning and still exits
+    # 0, and the log is only shown on failure -- so without this the run ends
+    # in a green checkmark having installed nothing the user asked for.
+    if grep -q 'does not have an extra named' "$log_file" 2>/dev/null; then
+        grep 'does not have an extra named' "$log_file" | while IFS= read -r line; do
+            warn "$line"
+        done
     fi
     success "Conductor ${display_version} installed"
 

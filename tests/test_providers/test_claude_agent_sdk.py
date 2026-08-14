@@ -76,6 +76,19 @@ class TestClaudeAgentSdkProviderInitialization:
         with pytest.raises(ProviderError, match="Claude Agent SDK not installed"):
             ClaudeAgentSdkProvider()
 
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", False)
+    @patch("conductor.providers.claude_agent_sdk.install_command", return_value="RESOLVED-COMMAND")
+    def test_the_install_suggestion_is_resolved_not_hardcoded(self, resolver) -> None:
+        """Issue #441: this used to say `uv add 'claude-agent-sdk>=0.2.82'`,
+        which fails outside a uv project and cannot install into the uv tool
+        venv the install script creates. `claude-agent-sdk` is one of this
+        package's declared extras, so the resolver applies."""
+        with pytest.raises(ProviderError) as exc_info:
+            ClaudeAgentSdkProvider()
+
+        assert exc_info.value.suggestion == "Install with: RESOLVED-COMMAND"
+        resolver.assert_called_once_with("claude-agent-sdk")
+
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)

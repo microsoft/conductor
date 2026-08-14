@@ -76,6 +76,17 @@ conductor update --apply
 
 `--apply` launches the install script automatically — on Windows it opens in a new console window so you can watch progress; on macOS/Linux it replaces the current process. Either way, the running `conductor` exits before the installer touches the venv, so file locks release cleanly.
 
+**Optional extras survive the upgrade.** `uv tool install --force` replaces the tool's entire requirement set, so an upgrade that named no extras used to silently uninstall `[tui]` or `[aca]`. Both install scripts now read the existing install's uv receipt and carry those extras forward, and `conductor update` tells you which ones it found. To add one during an upgrade, or to drop back to a bare install:
+
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --extras tui
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --no-preserve-extras
+```
+
+```powershell
+$env:CONDUCTOR_INSTALL_EXTRAS = 'tui'; irm https://aka.ms/conductor/install.ps1 | iex
+```
+
 The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
 
 Conductor periodically checks GitHub for newer releases (cached for 24 hours under `~/.conductor/update-check.json`) and prints a one-line hint when one is available. To silence the hint permanently — for example when you manage upgrades through a package manager or company-mirrored install — set `CONDUCTOR_NO_UPDATE_CHECK=1` in your shell environment. The check is also skipped automatically for non-TTY invocations, `--silent` mode, the `update` subcommand, and `--help` / `--version`.
@@ -217,9 +228,16 @@ conductor stop
 The dashboard shows you one run in depth. The **Fleet Manager** shows you *every* run at once — and it's where you go when something needs you. Launch it with `conductor fleet`:
 
 ```bash
-pip install 'conductor-cli[tui]'   # one-time: the TUI ships as an optional extra
+# One-time: the TUI ships as an optional extra.
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --extras tui
 conductor fleet
 ```
+
+> The install command depends on how you installed Conductor. Running `conductor fleet`
+> without the extra prints the one that works on your machine — pinned to the version
+> you are running and carrying any extras you already have, because `uv tool install
+> --force` replaces the tool's whole requirement set. `conductor update` carries them
+> forward for the same reason.
 
 ![Fleet Manager](docs/img/fleet-manager.png)
 

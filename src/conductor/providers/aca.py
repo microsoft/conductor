@@ -5,11 +5,17 @@ shim implementing :class:`~conductor.providers.base.AgentProvider` that
 delegates agent execution to an in-sandbox ``conductor-agent-runner``
 process running inside an Azure Container Apps dynamic-sessions pool.
 
-The library is an optional dependency — install with:
-    pip install 'conductor-cli[aca]'
-(pins ``azure-identity`` plus ``azure-core[aio]`` — the latter supplies the
-``aiohttp``-based async transport the async ``DefaultAzureCredential`` in
-this module requires; ``azure-identity`` alone does not include one.)
+The library is an optional dependency. ``conductor run`` and ``conductor
+doctor`` print the install command for the detected install context (see
+:mod:`conductor.install_hint`); a hardcoded ``pip install`` string cannot
+work on the documented install path, where a uv tool venv is not
+pip-managed and ``conductor-cli`` is not on PyPI (issue #441). Note the
+provider is constructed lazily, so this surfaces when the first agent on
+it runs — not at ``conductor validate``.
+The extra pins ``azure-identity`` plus ``azure-core[aio]`` — the latter
+supplies the ``aiohttp``-based async transport the async
+``DefaultAzureCredential`` in this module requires; ``azure-identity``
+alone does not include one.
 
 The transport shim (epic E3, issue #284) derives a session ``identifier``
 from ``identifier_scope`` (DD5), acquires a cached AAD bearer token, issues a
@@ -39,6 +45,7 @@ import httpx
 from pydantic import SecretStr
 
 from conductor.exceptions import ProviderError
+from conductor.install_hint import install_command
 from conductor.providers.aca_protocol import (
     RUNNER_TOKEN_HEADER,
     AcaAgentPayload,
@@ -193,8 +200,9 @@ class AcaRuntimeProvider(AgentProvider):
     in-sandbox runner's NDJSON event stream verbatim to ``event_callback``,
     parsing the terminal ``result`` frame into :class:`AgentOutput`.
 
-    Requires the ``azure-identity`` package:
-        pip install 'conductor-cli[aca]'
+    Requires the ``azure-identity`` package, shipped by the ``aca`` extra.
+    See :mod:`conductor.install_hint` for how the install command is
+    resolved.
 
     Example:
         >>> provider = AcaRuntimeProvider(provider_settings=settings)
@@ -297,7 +305,7 @@ class AcaRuntimeProvider(AgentProvider):
         if not AZURE_IDENTITY_AVAILABLE:
             raise ProviderError(
                 "aca provider requires the azure-identity package",
-                suggestion="Install with: uv add 'conductor-cli[aca]'",
+                suggestion=f"Install with: {install_command('aca')}",
             )
 
         self._provider_settings = provider_settings

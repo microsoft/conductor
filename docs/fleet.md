@@ -47,19 +47,47 @@ below is a separate, optional layer on top of it.
 `conductor fleet list` and `conductor fleet prune` (documented in the
 [CLI reference](cli-reference.md)) need nothing beyond a normal Conductor
 install. The interactive TUI (`conductor fleet`, invoked with no
-subcommand) additionally requires the `tui` extra:
+subcommand) additionally requires the `tui` extra.
 
-```bash
-pip install 'conductor-cli[tui]'
-```
+The command depends on how Conductor itself was installed, so
+`conductor fleet` prints the right one for your machine rather than
+guessing:
 
-Without it, `conductor fleet` prints an install hint and exits non-zero
+| How you installed | Command |
+| --- | --- |
+| The install script (`curl -sSfL https://aka.ms/conductor/install.sh \| sh`) | `uv tool install --force 'conductor-cli[tui] @ git+https://github.com/microsoft/conductor.git@v<version>'` |
+| A source checkout (`uv sync`) | `uv sync --extra tui` |
+| Anything else — a wheel, `pip`/`pipx` from git, a system package | `pip install 'conductor-cli[tui]'` (with the git URL appended when there is one) |
+
+`conductor-cli` is **not** published to PyPI, so the `pip` form resolves
+only where pip can already see an installed `conductor-cli` — never inside a
+uv tool venv, which is what the install script creates. That is why the hint
+is resolved rather than hardcoded (issue #441); for a `pip`/`pipx`-from-git
+install it also appends the git URL you installed from, so the command
+actually resolves.
+
+Without the extra, `conductor fleet` prints that command and exits non-zero
 rather than raising an `ImportError` traceback:
 
 ```bash
 $ conductor fleet
 Error: the interactive fleet manager requires the 'tui' extra.
-Install with: pip install 'conductor-cli[tui]'
+Install with: uv tool install --force 'conductor-cli[tui] @ git+https://github.com/microsoft/conductor.git@v<version>'
+```
+
+The suggested command pins the version already running and carries any
+extras you already have, because `uv tool install --force` replaces the
+tool's whole requirement set — installing `[tui]` on a machine that had
+`[aca]` would otherwise remove it.
+
+For the same reason, `conductor update` (and the install scripts it drives)
+preserve the extras recorded in the existing install, so an upgrade never
+silently uninstalls the TUI. To install an extra as part of an upgrade, or
+to drop back to a bare install:
+
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --extras tui
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --no-preserve-extras
 ```
 
 `conductor fleet list` and `conductor fleet prune` are unaffected either

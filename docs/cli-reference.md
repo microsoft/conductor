@@ -541,20 +541,33 @@ bindings, and status vocabulary.
 conductor fleet
 ```
 
-The TUI requires the `tui` extra:
+The TUI requires the `tui` extra. The install command depends on how
+Conductor itself was installed, so the bare invocation prints the one that
+works on your machine rather than guessing:
 
-```bash
-pip install 'conductor-cli[tui]'
-```
+| How you installed | Command |
+| --- | --- |
+| The install script | `uv tool install --force 'conductor-cli[tui] @ git+https://github.com/microsoft/conductor.git@v<version>'` |
+| A source checkout (`uv sync`) | `uv sync --extra tui` |
+| Anything else — a wheel, `pip`/`pipx` from git, a system package | `pip install 'conductor-cli[tui]'` (with the git URL appended when there is one) |
 
-Without it, the bare invocation prints an install hint and exits non-zero
-rather than raising an `ImportError` traceback:
+`conductor-cli` is not on PyPI, so the `pip` form resolves only where pip
+can already see an installed `conductor-cli` — never inside the uv tool venv
+the install script creates. Without the extra, the bare invocation prints the
+resolved command and exits non-zero rather than raising an `ImportError`
+traceback:
 
 ```bash
 $ conductor fleet
 Error: the interactive fleet manager requires the 'tui' extra.
-Install with: pip install 'conductor-cli[tui]'
+Install with: uv tool install --force 'conductor-cli[tui] @ git+https://github.com/microsoft/conductor.git@v<version>'
 ```
+
+The suggested command pins the running version and includes any extras
+already installed, since `uv tool install --force` replaces the tool's
+entire requirement set. `conductor update` and the install scripts preserve
+them for the same reason — see
+[Updating](../README.md#updating).
 
 `conductor fleet list` and `conductor fleet prune` (below) need nothing
 beyond a normal Conductor install — only the bare, no-subcommand
