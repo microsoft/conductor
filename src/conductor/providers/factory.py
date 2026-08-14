@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError
+from conductor.install_hint import install_command
 from conductor.providers.aca import AZURE_IDENTITY_AVAILABLE, AcaRuntimeProvider
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
@@ -178,7 +179,7 @@ async def create_provider(
             if not CLAUDE_AGENT_SDK_AVAILABLE:
                 raise ProviderError(
                     "Claude Agent SDK provider requires claude-agent-sdk package",
-                    suggestion="Install with: uv add 'claude-agent-sdk>=0.2.82'",
+                    suggestion=f"Install with: {install_command('claude-agent-sdk')}",
                 )
             # claude-agent-sdk delegates the agentic loop to the underlying
             # `claude` CLI, which exposes no hooks for sampling temperature or
@@ -208,7 +209,7 @@ async def create_provider(
             if not AZURE_IDENTITY_AVAILABLE:
                 raise ProviderError(
                     "aca provider requires the azure-identity package",
-                    suggestion="Install with: uv add 'conductor-cli[aca]'",
+                    suggestion=f"Install with: {install_command('aca')}",
                 )
             if provider_settings is None or provider_settings.name != "aca":
                 raise ProviderError(

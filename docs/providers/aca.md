@@ -41,13 +41,30 @@ the source design:
 
 ### 1. Install the azure-identity extra
 
-```bash
-# Using uv (recommended)
-uv add 'conductor-cli[aca]'
+The command depends on how Conductor itself was installed. `conductor run`
+and `conductor doctor` print the right one when the extra is missing, so you
+can also just run your workflow and copy what it says. (`conductor validate`
+does not — the provider is constructed lazily, so the guard only fires once
+an `aca`-backed agent actually runs.)
 
-# Using pip
+```bash
+# Installed via the install script (uv tool install)
+uv tool install --force 'conductor-cli[aca] @ git+https://github.com/microsoft/conductor.git@v<version>'
+
+# A source checkout
+uv sync --extra aca
+
+# A wheel from a GitHub Release or a private index
 pip install 'conductor-cli[aca]'
 ```
+
+`conductor-cli` is not published to PyPI, so the `pip` form resolves only
+where pip can already see an installed `conductor-cli` — never inside a uv
+tool venv (issue #441). The `uv tool install` form must name every
+extra you want to keep — `--force` replaces the tool's entire requirement
+set, so `[aca]` alone would remove an already-installed `[tui]`. Conductor's
+own hint builds that list for you, and `conductor update` preserves it
+across upgrades.
 
 This pins `azure-identity` plus `azure-core[aio]` (which pulls in `aiohttp`),
 used to acquire a `dynamicsessions.io` bearer token via the async
@@ -780,8 +797,11 @@ except the two that are pure narrowing (binding loopback, the
 
 ### `aca provider requires the azure-identity package`
 
-Install the extra: `pip install 'conductor-cli[aca]'` (or `uv add
-'conductor-cli[aca]'`).
+Install the `aca` extra. The error's own `suggestion` carries the exact
+command for how this Conductor was installed — see
+[Install the azure-identity extra](#1-install-the-azure-identity-extra) for
+the three forms and why a hardcoded `pip install 'conductor-cli[aca]'`
+does not work on the documented install path.
 
 ### `'pool_endpoint' is required when name='aca'`
 

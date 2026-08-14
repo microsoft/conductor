@@ -1864,9 +1864,15 @@ def _write_run_record_for_current_process(
         # this run is invisible to `stop`/`status`/`fleet list`, i.e.
         # silently back to the bug the run record exists to fix, so say so
         # where the user will see it. (Under --web-bg the child's stderr is
-        # itself a temp log; that case is covered instead by the launch
-        # health gate in `bg_runner._finalize_background_launch`, which
-        # fails the launch when no record appears.)
+        # itself a temp log the parent captures -- this exact warning line
+        # is what the parent's `bg_runner._finalize_background_launch`
+        # points at via `_tail_log` when its own run-record poll times out.
+        # That gate no longer fails the launch over a missing record --
+        # issue #435 downgraded it to a warning, surfaced via
+        # `cli/app.py::_print_web_bg_no_run_record_notice` -- because the
+        # child may be executing perfectly normally; this line is what
+        # actually carries the underlying cause into the captured bg
+        # stderr log for the user to find.)
         #
         # Guarded with BaseException, not Exception: rich turns a broken
         # pipe into `SystemExit` (`Console._on_broken_pipe`), which would

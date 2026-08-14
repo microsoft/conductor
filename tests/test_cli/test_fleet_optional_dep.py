@@ -4,6 +4,10 @@ Covers E7-T7: bare ``conductor fleet`` with ``textual`` unavailable prints
 an actionable install hint and exits non-zero without a traceback;
 ``conductor fleet list`` (core, no optional dependency) still works in
 that state.
+
+Also covers issue #441: the hint is resolved from the detected install
+context rather than hardcoding ``pip install 'conductor-cli[tui]'``, which
+cannot work for anyone (``conductor-cli`` is not published to PyPI).
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
+from conductor.install_hint import InstallContext, InstallEnvironment, render_install_command
 
 runner = CliRunner()
 
@@ -20,13 +25,76 @@ runner = CliRunner()
 class TestFleetWithoutTextual:
     """Simulates a clean install with no ``[tui]`` extra."""
 
-    def test_bare_invocation_prints_install_hint(self) -> None:
-        with patch("conductor.cli.fleet.TEXTUAL_AVAILABLE", False):
+    def test_bare_invocation_prints_the_resolved_install_command(self) -> None:
+        with (
+            patch("conductor.cli.fleet.TEXTUAL_AVAILABLE", False),
+            patch("conductor.cli.fleet.install_command", return_value="INSTALL-ME-NOW"),
+        ):
             result = runner.invoke(app, ["fleet"])
 
         assert result.exit_code != 0
-        assert "conductor-cli[tui]" in result.output
-        assert "pip install" in result.output
+        assert "tui" in result.output
+        assert "INSTALL-ME-NOW" in result.output
+
+    def test_the_hint_asks_the_resolver_for_the_tui_extra(self) -> None:
+        with (
+            patch("conductor.cli.fleet.TEXTUAL_AVAILABLE", False),
+            patch("conductor.cli.fleet.install_command", return_value="x") as resolver,
+        ):
+            runner.invoke(app, ["fleet"])
+
+        resolver.assert_called_once_with("tui")
+
+    def test_a_uv_tool_install_is_never_told_to_use_pip(self) -> None:
+        """The regression issue #441 is about: `pip install
+        'conductor-cli[tui]'` cannot work on the documented install path —
+        `conductor-cli` is not on PyPI and a uv tool venv is not
+        pip-managed."""
+        env = InstallEnvironment(InstallContext.UV_TOOL, frozenset(), "v0.1.30")
+        with (
+            patch("conductor.cli.fleet.TEXTUAL_AVAILABLE", False),
+            patch(
+                "conductor.cli.fleet.install_command",
+                return_value=render_install_command("tui", env),
+            ),
+        ):
+            result = runner.invoke(app, ["fleet"])
+
+        assert "pip install" not in result.output
+        assert "uv tool install --force" in result.output
+
+    def test_brackets_in_the_resolved_command_survive_rich_markup(self) -> None:
+        """The command is a runtime value containing `[tui]`, and rich would
+        silently delete a lowercase bracketed token from a plain string. It
+        must go through `styled()`, which never hands values to the parser."""
+        with (
+            patch("conductor.cli.fleet.TEXTUAL_AVAILABLE", False),
+            patch(
+                "conductor.cli.fleet.install_command",
+                return_value="uv sync --extra tui  # [tui] [aca]",
+            ),
+        ):
+            result = runner.invoke(app, ["fleet"])
+
+        assert "[tui] [aca]" in result.output
+        assert "Traceback" not in result.output
+
+    def test_the_command_is_not_wrapped_across_lines(self) -> None:
+        """The resolved uv spec is longer than a default 80-column terminal.
+        Rich would word-wrap it, inserting a real newline that turns a
+        copy-paste into two broken commands."""
+        long_command = (
+            "uv tool install --force 'conductor-cli[aca,tui] @ "
+            "git+https://github.com/microsoft/conductor.git@v0.1.30'"
+        )
+        assert len(long_command) > 80
+        with (
+            patch("conductor.cli.fleet.TEXTUAL_AVAILABLE", False),
+            patch("conductor.cli.fleet.install_command", return_value=long_command),
+        ):
+            result = runner.invoke(app, ["fleet"])
+
+        assert any(long_command in line for line in result.output.splitlines())
 
     def test_bare_invocation_never_raises_a_traceback(self) -> None:
         """A missing optional dependency must surface as a clean CLI error,

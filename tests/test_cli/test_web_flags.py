@@ -262,6 +262,85 @@ class TestStillRunningNotice:
         assert "Workflow completed" not in combined
 
 
+class TestNoRunRecordNotice:
+    """Issue #435: a note is printed when the launch gate couldn't confirm the run record.
+
+    ``BackgroundLaunch.run_record_written=False`` means the workflow is
+    running normally, but the launch gate's own bookkeeping (the run-record
+    poll) failed to confirm it within the deadline while the child stayed
+    alive and reachable. This must be surfaced as an advisory, not silently
+    dropped -- otherwise a user has no way to learn why a "successful"
+    launch never shows up in `conductor status` / `fleet list`.
+    """
+
+    def test_run_web_bg_no_run_record_prints_note(self, workflow_file: Path) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=True,
+                still_running=True,
+                run_record_written=False,
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "could not register itself for discovery" in combined
+        assert "conductor stop" in combined
+
+    def test_run_web_bg_no_run_record_note_absent_when_written(self, workflow_file: Path) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=True,
+                still_running=True,
+                run_record_written=True,
+            )
+
+            result = runner.invoke(app, ["run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "could not register itself for discovery" not in combined
+
+    def test_run_web_bg_no_run_record_note_suppressed_by_silent(self, workflow_file: Path) -> None:
+        from pathlib import Path as _Path
+
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        with patch("conductor.cli.bg_runner.launch_background") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9999",
+                stderr_log=_Path("/tmp/conductor-test-deadbeef.bg.stderr.log"),
+                stdout_log=_Path("/tmp/conductor-test-deadbeef.bg.stdout.log"),
+                run_id="deadbeef",
+                workflow_started=True,
+                still_running=True,
+                run_record_written=False,
+            )
+
+            result = runner.invoke(app, ["--silent", "run", str(workflow_file), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "could not register itself for discovery" not in combined
+
+
 class TestLaunchBackgroundSilentFlag:
     """Regression tests for issue #196 — bg_runner must not pass --silent.
 

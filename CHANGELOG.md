@@ -38,6 +38,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scripts, `uv tool install`, or `conductor update`. Conductor ships no default
   mirror and never redirects package resolution on its own; the index is always
   user-supplied configuration.
+### Fixed
+
+- **`--web-bg`/`resume --web-bg`: a failed run-record write no longer kills
+  a healthy background workflow** (#435). The launch gate's run-record poll
+  (Fleet Manager D2) used to terminate the child and fail the launch if it
+  couldn't confirm the run record within 15 seconds, even when the child was
+  alive and its dashboard was still reachable — treating a bookkeeping
+  failure as a workflow failure. It now downgrades to a warning
+  (`BackgroundLaunch.run_record_written=False`, surfaced via a new note
+  pointing at the captured stderr log, and via a TUI notification from the
+  Fleet Manager's New Run screen) and lets the launch proceed; only a child
+  that is actually dead, or whose dashboard has gone unreachable, still fails
+  the launch.
+- **The `run_id` format is now defined once**, in a new leaf module
+  `conductor.run_id` (#435). Previously `fleet/records.py` enforced a broad
+  path-safe pattern while `engine/event_log.py` independently enforced a
+  narrower hex-only pattern and lowercased its input; a resumed
+  `--web-bg` run whose checkpoint `run_id` contained uppercase characters
+  could be silently folded to a different value by the event log, causing
+  the parent's launch-gate poll to look for a key the child never wrote and
+  kill the resumed run 15 seconds after a successful start. `fleet/history.py`
+  and `fleet/retention.py`'s filename parsers, and `fleet/records.py`'s own
+  timestamp parser, now derive their run-id-matching regexes from the same
+  shared pattern.
+- **Install hints for optional extras now print a command that works, and
+  upgrades stop uninstalling the extras you have** (#441). Every hint pointing
+  at an optional extra hardcoded `pip install 'conductor-cli[<extra>]'`, which
+  cannot work on the documented install path: `install.sh`/`install.ps1` create
+  a `uv tool` venv, which is not pip-managed, and `conductor-cli` is not
+  published to PyPI so pip has nothing to resolve against there. `conductor
+  fleet` without the `tui` extra, and the `aca` / `claude-agent-sdk` provider
+  errors, now resolve the command from the *detected* install context — `uv
+  tool install --force '<spec>'` for an install-script install, `uv sync
+  --inexact --extra <extra>` for a source checkout, and `pip install` as the
+  fallback, carrying the git URL you installed from when there is one so a
+  `pip`/`pipx`-from-git install resolves too. The suggested command reuses the
+  install source recorded for your install (so a fork or a local build is not
+  redirected upstream) and carries the extras you already have, because `uv
+  tool install --force` replaces the tool's entire requirement set and `uv
+  sync` is exact by default. A receipt that cannot be read is reported rather
+  than treated as "no extras" — in the hint, and in both install scripts,
+  which warn and carry on rather than either dropping the extras silently or
+  refusing to run.
+  For the same reason, `install.sh` and `install.ps1` now read the existing
+  install's `uv-receipt.toml` and rebuild the source as
+  `conductor-cli[<extras>] @ <source>`, so `conductor update` (which drives
+  them) no longer silently uninstalls `[tui]` or `[aca]` on upgrade — it also
+  names the extras it found before you commit. New `--extras <a,b>` /
+  `CONDUCTOR_INSTALL_EXTRAS` adds an extra during an install or upgrade
+  (rejecting one this package does not declare, which uv would otherwise
+  accept with a warning and a zero exit status), and `--no-preserve-extras` /
+  `CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS` drops back to a bare install.
+
+- **Fleet Manager History no longer accumulates an entire retained event log
+  into memory to build one entry** (#436). `_read_full_log` now streams
+  parsed events one at a time instead of materializing them into a list
+  before scanning, so building a History entry from a large
+  `*.events.jsonl` file no longer holds the whole parsed log in memory at
+  once.
 
 ## [0.1.30](https://github.com/microsoft/conductor/compare/v0.1.29...v0.1.30) - 2026-08-14
 

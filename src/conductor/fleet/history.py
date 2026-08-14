@@ -37,11 +37,13 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from conductor.fleet.retention import event_log_root
+from conductor.run_id import RUN_ID_PATTERN_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +59,16 @@ _EVENT_LOG_GLOB = "conductor-*.events.jsonl"
 # `<name>` itself may contain hyphens (a common workflow-file-stem
 # convention, e.g. "simple-qa-bot"), so it cannot be split on hyphens
 # positionally -- instead the fixed-format timestamp
-# (`time.strftime("%Y%m%d-%H%M%S")`, always 8 digits-dash-6 digits) and
-# hex run-id segments anchor the parse from the *right* end of the
-# filename, leaving whatever remains (including any hyphens) as the name.
+# (`time.strftime("%Y%m%d-%H%M%S")`, always 8 digits-dash-6 digits) anchors
+# the parse from the *right* end of the filename, leaving whatever remains
+# before it (including any hyphens) as the name. The run-id segment is
+# built from the shared `conductor.run_id.RUN_ID_PATTERN_SOURCE` (not a
+# hand-rolled hex-only charset) so a run id containing `-`/`_` still
+# round-trips -- without this, such a run silently loses its `run_id` on
+# the History screen (`_parse_filename` would fall back to `run_id=None`).
 _FILENAME_PATTERN = re.compile(
-    r"^conductor-(?P<name>.+)-(?P<ts>\d{8}-\d{6})-(?P<run_id>[0-9a-fA-F]{1,32})\.events\.jsonl$"
+    rf"^conductor-(?P<name>.+)-(?P<ts>\d{{8}}-\d{{6}})-(?P<run_id>{RUN_ID_PATTERN_SOURCE})"
+    r"\.events\.jsonl$"
 )
 
 # Mirrors `conductor.settings.FleetRetentionSettings.keep_last`'s own
@@ -119,7 +126,7 @@ class HistoryEntry:
     guessed from anything else."""
 
     total_tokens: int
-    """Sum of ``tokens`` across every completed agent seen in the tail --
+    """Sum of ``tokens`` across every completed agent seen in the log --
     mirrors ``RunSummary.total_tokens``'s own accounting exactly (D5:
     completed-agent tokens only)."""
 
@@ -182,7 +189,7 @@ class _ScanResult:
     unpriced_agent_count: int = 0
 
 
-def _scan_history_events(events: list[dict[str, Any]]) -> _ScanResult:
+def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
     """Single pass over a log's full event stream, mirroring
     ``conductor.fleet.summary._scan_events``'s terminal-event and
     token/cost accounting -- narrowed to just what History needs (no
@@ -190,7 +197,12 @@ def _scan_history_events(events: list[dict[str, Any]]) -> _ScanResult:
     no "current" step to highlight).
 
     Events are assumed oldest-first (the natural order of a JSONL log and
-    of :func:`_read_full_log`'s output).
+    of :func:`_read_full_log`'s yield order). This function makes exactly
+    one forward pass over ``events`` (a single ``for evt in events:``, no
+    indexing, no ``len()``, no re-iteration), so it accepts a one-shot
+    iterator -- this is precisely the property that lets
+    :func:`_read_full_log` stream rather than materialise a list. A
+    future edit must not break this by, say, iterating ``events`` twice.
 
     A **resumed** run appends a fresh ``workflow_started`` after an
     earlier terminal event without a dashboard attached (the engine only
@@ -261,16 +273,21 @@ def _scan_history_events(events: list[dict[str, Any]]) -> _ScanResult:
 
 
 class _CorruptEventLogError(Exception):
-    """Raised by :func:`_read_full_log` for a non-empty log with no
-    parseable events at all -- distinguishes "genuinely corrupt content"
-    from "genuinely empty file" (E14 review round 2), so
-    :func:`build_history_entries`'s per-file guard can skip the former
-    (E14-T4) while still returning a normal ``"unknown"`` entry for the
-    latter (a legitimately empty log is not corruption)."""
+    """Raised from :func:`_read_full_log`'s generator body when the
+    stream is exhausted, for a non-empty log with no parseable events at
+    all -- distinguishes "genuinely corrupt content" from "genuinely
+    empty file" (E14 review round 2), so :func:`build_history_entries`'s
+    per-file guard can skip the former (E14-T4) while still returning a
+    normal ``"unknown"`` entry for the latter (a legitimately empty log
+    is not corruption). For a corrupt log the generator never suspends at
+    a ``yield`` (no event ever parses), so this is raised on the very
+    first ``next()`` -- there is no drain-dependent timing to it, in
+    practice or otherwise."""
 
 
-def _read_full_log(path: Path) -> list[dict[str, Any]]:
-    """Stream-parse every line of a retained event log, oldest first.
+def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
+    """Stream-parse every line of a retained event log, oldest first,
+    yielding one parsed event dict at a time.
 
     Unlike ``fleet.summary``'s bounded tail/head readers -- built for a
     *live* run's cheap, repeated ~2s poll, or a bounded detail view --
@@ -279,14 +296,37 @@ def _read_full_log(path: Path) -> list[dict[str, Any]]:
     here. A byte-capped read can silently omit an early token/cost event
     or discard an oversized terminal event that falls outside the window,
     presenting a genuinely completed run as ``"unknown"`` with an
-    incomplete total (E14 review round 1). Reading the file unboundedly,
-    streamed line-by-line via file iteration (never loaded into memory as
-    a single blob) avoids that without paying for a whole-file read at
-    once.
+    incomplete total (E14 review round 1). This function is a generator:
+    neither the raw bytes nor the parsed events are ever fully
+    materialised into a list, so memory is proportional to the largest
+    single line, not to the log's size (retained state beyond that one
+    line/dict is just two booleans). Contrast
+    ``conductor.fleet.summary.read_event_log_full``, which caps its read
+    at 8 MiB and therefore trades coverage for a bounded (but nonzero)
+    memory footprint; streaming gives History unbounded coverage and
+    bounds memory against event *count*, so it needs no equivalent
+    count-based cap -- but a single oversized line is still read and
+    parsed whole (``for raw_line in f`` reads up to the next newline), so
+    this is not an unconditional memory bound. The two readers' differing
+    bounds are a deliberate consequence of their differing consumers (a
+    live-run detail view vs. a done-run, read-once history), not an
+    oversight.
 
-    Unlike ``read_event_log_tail``'s never-raise contract, a read failure
-    here (the file cannot be opened at all -- permission denied, vanished
-    mid-scan, or any other ``OSError``) is deliberately **not**
+    The generator holds the file handle open (inside its ``with``) until
+    it is exhausted, closed, or garbage collected -- that ``with`` block,
+    not any particular caller, owns the handle's lifetime. The sole
+    consumer in production, :func:`_build_entry`, drains it to completion
+    via :func:`_scan_history_events`; tests may consume it directly and
+    abandon it early, which is exactly why the handle's release does not
+    depend on caller behavior.
+
+    Because this is a generator, none of its side effects happen when
+    ``_read_full_log(path)`` is called -- they happen while the returned
+    iterator is being **consumed**. In particular, ``open()`` and any
+    ``OSError`` it raises (permission denied, the file vanishing
+    mid-scan, or any other read failure) surface on the first
+    ``next()``, not at call time. Unlike ``read_event_log_tail``'s
+    never-raise contract, such a failure is deliberately **not**
     swallowed: it propagates so :func:`build_history_entries`'s
     per-file guard can tell "genuinely no events" apart from "couldn't
     read this file at all" and skip the latter, rather than presenting a
@@ -295,17 +335,21 @@ def _read_full_log(path: Path) -> list[dict[str, Any]]:
 
     A malformed individual line (bad JSON, a truncated write caught
     mid-flush) is tolerated the same way the bounded readers already do
-    -- skipped rather than aborting the whole read. But a **non-empty**
-    file (at least one non-blank line) that yields **zero** parseable
-    events is corrupt, not "legitimately empty" -- E14-T4 requires a
-    corrupt log to be skipped, not shown as an ordinary ``"unknown"``
-    entry (E14 review round 2). Raises :class:`_CorruptEventLogError` in
-    that case; a genuinely empty file (no non-blank lines at all) still
-    returns an empty list, which :func:`_build_entry` legitimately turns
-    into an ``"unknown"`` entry.
+    -- skipped rather than aborting the whole read, with a single
+    aggregate warning logged if any lines were skipped (partial
+    corruption still produces an entry, but not silently). But a
+    **non-empty** file (at least one non-blank line) that yields **zero**
+    parseable events is corrupt, not "legitimately empty" -- E14-T4
+    requires a corrupt log to be skipped, not shown as an ordinary
+    ``"unknown"`` entry (E14 review round 2). Raises
+    :class:`_CorruptEventLogError` in that case, once the stream is
+    exhausted; a genuinely empty file (no non-blank lines at all) still
+    yields nothing and raises nothing, which :func:`_build_entry`
+    legitimately turns into an ``"unknown"`` entry.
     """
-    events: list[dict[str, Any]] = []
     saw_nonblank_line = False
+    yielded_any = False
+    skipped_lines = 0
     with open(path, "rb") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -314,13 +358,20 @@ def _read_full_log(path: Path) -> list[dict[str, Any]]:
             saw_nonblank_line = True
             try:
                 obj = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                skipped_lines += 1
                 continue
             if isinstance(obj, dict):
-                events.append(obj)
-    if saw_nonblank_line and not events:
+                yielded_any = True
+                yield obj
+    if saw_nonblank_line and not yielded_any:
         raise _CorruptEventLogError(f"{path}: non-empty log with no parseable events")
-    return events
+    if skipped_lines:
+        logger.warning(
+            "%s: skipped %d unparseable line(s); this run's totals may be incomplete",
+            path,
+            skipped_lines,
+        )
 
 
 def _build_entry(path: Path) -> HistoryEntry:
@@ -331,18 +382,19 @@ def _build_entry(path: Path) -> HistoryEntry:
     bounded read is unsuitable for a retrospective, read-once history
     entry (E14 review round 1).
 
-    Raises on a read failure (propagated from :func:`_read_full_log`,
-    including a :class:`_CorruptEventLogError` for a non-empty log with
-    no parseable events) so :func:`build_history_entries`'s per-file
-    guard can skip a genuinely unreadable/corrupt log rather than
+    Raises on a read failure -- an ``OSError`` opening the file, or a
+    :class:`_CorruptEventLogError` for a non-empty log with no parseable
+    events -- surfacing while :func:`_read_full_log`'s generator is
+    consumed here (via :func:`_scan_history_events`'s draining loop),
+    not when it is constructed. Either way, :func:`build_history_entries`'s
+    per-file guard can skip a genuinely unreadable/corrupt log rather than
     presenting it as a fabricated ``"unknown"`` entry with zero totals
     (E14-T4 / E14 review round 1 and 2). A genuinely **empty** log (no
     non-blank lines at all) still produces a normal ``"unknown"`` entry
     -- that is legitimate data, not corruption.
     """
     workflow_name, run_id = _parse_filename(path)
-    events = _read_full_log(path)
-    scan = _scan_history_events(events)
+    scan = _scan_history_events(_read_full_log(path))
 
     duration = scan.reported_elapsed
     if duration is None and scan.started_at is not None and scan.ended_at is not None:
@@ -438,7 +490,12 @@ def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]
     for path in candidates:
         try:
             entries.append(_build_entry(path))
+        except (OSError, _CorruptEventLogError):
+            logger.warning("Skipping unreadable/corrupt event log %s", path, exc_info=True)
+            continue
         except Exception:
-            logger.warning("Failed to build history entry for %s; skipping", path, exc_info=True)
+            logger.error(
+                "Unexpected failure building history entry for %s; skipping", path, exc_info=True
+            )
             continue
     return entries

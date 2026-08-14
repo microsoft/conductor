@@ -30,6 +30,7 @@ from rich.text import Text
 
 from conductor import __version__
 from conductor.console import styled
+from conductor.install_hint import installed_extras
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +38,10 @@ _CACHE_FILE_NAME = "update-check.json"
 _CACHE_TTL_SECONDS = 86_400  # 24 hours
 _API_URL = "https://api.github.com/repos/microsoft/conductor/releases/latest"
 _FETCH_TIMEOUT_SECONDS = 2
-_REPO_GIT_URL = "https://github.com/microsoft/conductor.git"
-_RELEASE_DL_URL = "https://github.com/microsoft/conductor/releases/download"
-
 # Install-script entry points. Kept as module-level constants so a future
 # redirect change is a one-line edit.
 _INSTALL_PS1_URL = "https://aka.ms/conductor/install.ps1"
 _INSTALL_SH_URL = "https://aka.ms/conductor/install.sh"
-
-# Retry settings for `uv tool install` — mirrors install.ps1
-_INSTALL_MAX_ATTEMPTS = 3
-_INSTALL_RETRY_DELAY_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +317,7 @@ def _print_hint(console: Console, remote_version: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _install_command() -> str:
+def _install_script_command() -> str:
     """Return the OS-appropriate one-line install/upgrade command.
 
     The install script is the single, canonical upgrade path. ``conductor
@@ -407,7 +401,7 @@ def _spawn_installer_and_exit(console: Console) -> None:
             console.print(
                 styled(
                     "Run this manually in a new shell:  [bold cyan]{}[/bold cyan]",
-                    _install_command(),
+                    _install_script_command(),
                 )
             )
             raise SystemExit(1) from None
@@ -437,8 +431,40 @@ def _spawn_installer_and_exit(console: Console) -> None:
         os.execvpe("sh", ["sh", "-c", sh_command], env)
     except OSError as e:
         console.print(styled("[bold red]Could not exec installer:[/bold red] {}", e))
-        console.print(styled("Run this manually:  [bold cyan]{}[/bold cyan]", _install_command()))
+        console.print(
+            styled("Run this manually:  [bold cyan]{}[/bold cyan]", _install_script_command())
+        )
         raise SystemExit(1) from None
+
+
+def _print_extras_note(console: Console) -> None:
+    """Tell the user which optional extras the upgrade will carry forward.
+
+    ``uv tool install --force`` rewrites the tool's entire requirement set,
+    so an upgrade that names no extras used to silently uninstall ``[tui]``
+    or ``[aca]``. Both install scripts now read the same uv receipt this
+    does and rebuild the spec with those extras (issue #441); saying so here
+    is what makes that visible before the user commits to the upgrade.
+
+    Prints nothing when no extras are recorded, which is the common case.
+
+    Args:
+        console: Rich console for output.
+    """
+    try:
+        extras = installed_extras()
+    except Exception:  # noqa: BLE001 - a note must never end the update command
+        logger.debug("Could not read installed extras", exc_info=True)
+        return
+    if not extras:
+        return
+    console.print(
+        styled(
+            "[dim]Your installed extras ({}) should be carried forward by the "
+            "install script.[/dim]",
+            ", ".join(sorted(extras)),
+        )
+    )
 
 
 def run_update(console: Console, force: bool = False, apply: bool = False) -> None:
@@ -486,17 +512,19 @@ def run_update(console: Console, force: bool = False, apply: bool = False) -> No
     console.print()
 
     if apply:
+        _print_extras_note(console)
         # Hand off to the installer and exit; this call does not return.
         _spawn_installer_and_exit(console)
         return  # pragma: no cover - _spawn_installer_and_exit never returns
 
-    cmd = _install_command()
+    cmd = _install_script_command()
     console.print(
         Text.from_markup("To upgrade, run this in a [bold]new shell[/bold] (not inside conductor):")
     )
     console.print()
     console.print(styled("  [bold cyan]{}[/bold cyan]", cmd))
     console.print()
+    _print_extras_note(console)
     console.print(
         Text.from_markup(
             "[dim]Or re-run with [bold]--apply[/bold] to launch the installer "

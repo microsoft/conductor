@@ -43,13 +43,25 @@
 #       a throwaway UV_TOOL_BIN_DIR that must never leak into the real
 #       environment (note: `uv tool update-shell` intentionally modifies the
 #       shell and so ignores UV_NO_MODIFY_PATH).
+#   -Extras <a,b>             OR   $env:CONDUCTOR_INSTALL_EXTRAS
+#       Comma-separated optional extras to install (tui, aca,
+#       claude-agent-sdk). These are *added to* the extras already recorded in
+#       the existing install's uv receipt, which are preserved automatically --
+#       `uv tool install --force` rewrites the tool's whole requirement set, so
+#       an upgrade that named no extras used to silently uninstall
+#       `[tui]`/`[aca]` (issue #441).
+#   -NoPreserveExtras         OR   $env:CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS = '1'
+#       Do not carry the existing install's extras forward. Use this to drop
+#       back to a bare install.
 
 [CmdletBinding()]
 param(
     [string]$Source,
     [switch]$AutoStop,
     [switch]$Force,
-    [switch]$SkipPathUpdate
+    [switch]$SkipPathUpdate,
+    [string]$Extras,
+    [switch]$NoPreserveExtras
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +75,8 @@ if (-not $Source   -and $env:CONDUCTOR_INSTALL_SOURCE)               { $Source  
 if (-not $AutoStop -and $env:CONDUCTOR_INSTALL_AUTO_STOP -eq '1')    { $AutoStop = $true }
 if (-not $Force    -and $env:CONDUCTOR_INSTALL_FORCE     -eq '1')    { $Force    = $true }
 if (-not $SkipPathUpdate -and $env:CONDUCTOR_INSTALL_SKIP_PATH_UPDATE -eq '1') { $SkipPathUpdate = $true }
+if (-not $Extras  -and $env:CONDUCTOR_INSTALL_EXTRAS)                { $Extras   = $env:CONDUCTOR_INSTALL_EXTRAS }
+if (-not $NoPreserveExtras -and $env:CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS -eq '1') { $NoPreserveExtras = $true }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,11 +107,101 @@ function Get-UvToolsDir {
 }
 
 function Get-ConductorToolDir {
+    # Probes both directory names Get-InstalledVersion knows about, so the
+    # receipt lookup and the verification step agree about where the tool
+    # lives.
     $tools = Get-UvToolsDir
     if (-not $tools) { return $null }
+    foreach ($name in @('conductor-cli', 'conductor')) {
+        $dir = Join-Path $tools $name
+        if (Test-Path -LiteralPath (Join-Path $dir 'uv-receipt.toml')) { return $dir }
+    }
     $dir = Join-Path $tools 'conductor-cli'
     if (Test-Path -LiteralPath $dir) { return $dir }
     return $null
+}
+
+function Get-ReceiptExtras {
+    # Read the extras recorded in the existing install's uv tool receipt.
+    #
+    # `uv tool install --force` replaces the tool's entire requirement set, so
+    # an upgrade that names no extras silently uninstalls [tui]/[aca] -- which
+    # is exactly what `conductor update` used to do (issue #441). The receipt
+    # is the only authoritative record of what the current install carries;
+    # the CLI's `conductor.install_hint` reads the same file for its hints.
+    #
+    # Flattens newlines (uv may wrap the requirements array), splits the array
+    # into one requirement object per chunk, and keeps this distribution's
+    # entry -- so field order and extra `uv tool install --with` requirements
+    # are both tolerated.
+    $dir = Get-ConductorToolDir
+    if (-not $dir) { return '' }
+    $receipt = Join-Path $dir 'uv-receipt.toml'
+    if (-not (Test-Path -LiteralPath $receipt)) { return '' }
+    try {
+        $text = (Get-Content -LiteralPath $receipt -Raw) -replace '\r?\n', ' '
+    } catch {
+        # A receipt that exists but cannot be read is NOT a bare install, so
+        # do not report '' -- that would rebuild the tool without the extras
+        # it records. Signal unreadability and let the caller warn; aborting
+        # here would take away the reinstall that repairs this very state.
+        return $null
+    }
+    $found = $false
+    foreach ($chunk in ($text -split '\}')) {
+        # Match the whole `name = "conductor-cli"` field rather than the bare
+        # substring, so a `conductor-cli-plugin` requirement is not mistaken
+        # for this one. `[-_.]` covers a non-canonical (PEP 503) spelling.
+        if ($chunk -match 'name\s*=\s*"conductor[-_.]cli"') {
+            $found = $true
+            if ($chunk -match 'extras\s*=\s*\[([^\]]*)\]') {
+                return ($Matches[1] -replace '["'' ]', '')
+            }
+        }
+    }
+    if (-not $found) { return $null }
+    return ''
+}
+
+function Merge-Extras {
+    # Merge comma-separated extras lists, dropping blanks/duplicates and
+    # sorting so the generated spec is stable between runs (and comparable
+    # as a string).
+    #
+    # Lower-cases before deduplicating so the result matches `install.sh`'s
+    # `merge_extras`, whose `sort -u` is case-sensitive. Without it the two
+    # installers disagree on mixed-case input.
+    param([string]$A, [string]$B)
+    $parts = @("$A", "$B") -join ','
+    $names = $parts -split ',' |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ } |
+        Sort-Object -Unique
+    return ($names -join ',')
+}
+
+function Test-ExtrasKnown {
+    # Refuse an extra this package does not declare. uv treats an unknown
+    # extra as a *warning* and still exits 0, so without this a typo installs
+    # nothing and reports success.
+    param([string]$ExtrasList)
+    if (-not $ExtrasList) { return }
+    foreach ($name in ($ExtrasList -split ',')) {
+        $trimmed = $name.Trim()
+        if (-not $trimmed) { continue }
+        if (@('tui', 'aca', 'claude-agent-sdk') -notcontains $trimmed) {
+            Write-Err "unknown extra '$trimmed' (available: tui, aca, claude-agent-sdk)"
+        }
+    }
+}
+
+function Add-ExtrasToSource {
+    # Wrap an install source in a PEP 508 direct reference carrying the
+    # extras. uv accepts a git+ URL, a local directory, or a wheel path on
+    # the right-hand side of the `@`.
+    param([string]$InstallSource, [string]$ExtrasList)
+    if (-not $ExtrasList) { return $InstallSource }
+    return "conductor-cli[$ExtrasList] @ $InstallSource"
 }
 
 function Get-RunningConductorProcesses {
@@ -143,6 +247,17 @@ function Remove-StaleOldFiles {
     }
 }
 
+function Format-ProcessArgument {
+    # Quote an argument that contains whitespace so Start-Process passes it as
+    # one argv element. See the note in Invoke-UvInstall.
+    param([string]$Value)
+    if ($Value -notmatch '\s') { return $Value }
+    # Double any trailing backslashes so they escape each other rather than
+    # the closing quote, and escape embedded quotes.
+    $escaped = $Value -replace '(\\+)$', '$1$1' -replace '"', '\"'
+    return '"' + $escaped + '"'
+}
+
 function Invoke-UvInstall {
     param(
         [string]$InstallSource,
@@ -153,8 +268,12 @@ function Invoke-UvInstall {
     $stdoutFile = Join-Path $LogDir ("uv-stdout-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0,6)))
     $stderrFile = Join-Path $LogDir ("uv-stderr-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0,6)))
 
-    $argList = @('tool', 'install', '--force', $InstallSource)
-    if ($ConstraintsFile) { $argList += @('-c', $ConstraintsFile) }
+    # Start-Process joins -ArgumentList with spaces and does NOT quote the
+    # elements, so a PEP 508 direct reference ("conductor-cli[tui] @ <src>")
+    # would reach uv as three separate arguments and the extras would be
+    # silently dropped. Same hazard for a temp path containing a space.
+    $argList = @('tool', 'install', '--force', (Format-ProcessArgument $InstallSource))
+    if ($ConstraintsFile) { $argList += @('-c', (Format-ProcessArgument $ConstraintsFile)) }
 
     $proc = Start-Process -FilePath 'uv' `
         -ArgumentList $argList `
@@ -423,6 +542,33 @@ if ($Source) {
     $displayVersion = $tagName
 }
 
+# --- Extras: carry the existing install's extras forward, plus any requested ---
+#
+# $receiptNow is what is installed; $existingExtras is what we choose to carry.
+# They differ under -NoPreserveExtras, and the up-to-date check below has to
+# compare against the former -- comparing against the latter made the opt-out
+# a no-op, since the switch zeroes it and both sides then match.
+Test-ExtrasKnown $Extras
+$rawExtras = Get-ReceiptExtras
+$receiptReadable = $null -ne $rawExtras
+$receiptNow = Merge-Extras $rawExtras ''
+if (-not $receiptReadable) {
+    # Warn and continue rather than aborting: a broken receipt is exactly the
+    # state a reinstall is meant to repair, so refusing would remove the
+    # remedy. Proceeding silently is how [tui]/[aca] disappear unnoticed.
+    Write-Warn "Could not read the existing install's uv receipt; extras cannot be preserved."
+    Write-Warn "Re-run with -Extras <a,b> to reinstate any you had."
+}
+$existingExtras = ''
+if (-not $NoPreserveExtras) { $existingExtras = $receiptNow }
+$resolvedExtras = Merge-Extras $existingExtras $Extras
+if ($resolvedExtras) {
+    Write-Info "Including extras: $resolvedExtras"
+    $installSource = Add-ExtrasToSource $installSource $resolvedExtras
+} elseif ($receiptNow) {
+    Write-Info "Dropping extras: $receiptNow"
+}
+
 # --- Check existing installation (only meaningful for the GitHub-release path) ---
 if (-not $Source) {
     $existingConductor = Get-Command conductor -ErrorAction SilentlyContinue
@@ -434,7 +580,12 @@ if (-not $Source) {
         } catch { }
         if ($currentVersion) {
             $latestVersion = $tagName -replace '^v', ''
-            if ($currentVersion -eq $latestVersion) {
+            # An already-current version is only a no-op when the extras on
+            # disk already match what this run would install: `-Extras tui`
+            # (or -NoPreserveExtras) still has work to do, and reporting "up
+            # to date" would silently skip it.
+            if ($currentVersion -eq $latestVersion -and
+                $resolvedExtras -eq $receiptNow -and $receiptReadable) {
                 Write-Ok "Conductor v$currentVersion is already installed and up to date."
                 Write-Host ""
                 Write-Host "  Run 'conductor --help' to get started."
@@ -554,6 +705,13 @@ try {
         $lastStderr   = $r.Stderr
         if ($lastExitCode -eq 0) {
             $installed = $true
+            # uv reports an extra it does not recognise as a warning and still
+            # exits 0, and this output is only shown on failure -- so without
+            # this the run ends in a green checkmark having installed nothing
+            # the user asked for.
+            foreach ($line in (($lastStdout + $lastStderr) -split "`r?`n")) {
+                if ($line -match 'does not have an extra named') { Write-Warn $line.Trim() }
+            }
             break
         }
 

@@ -9,11 +9,17 @@ TUI (Fleet Manager E7) — this is the *One deliberate deviation* the design
 calls out: the other three sub-apps (``checkpoint`` / ``registry`` /
 ``gate``) set ``no_args_is_help=True`` since they have no sensible default
 action, whereas the TUI *is* the feature here and is the hot path. The TUI
-requires the optional ``tui`` extra (``pip install 'conductor-cli[tui]'``);
-when ``textual`` isn't installed, the bare invocation prints an install
-hint and exits non-zero rather than raising an ``ImportError`` traceback —
-mirroring the established availability-flag pattern used for other optional
-SDK dependencies (see ``providers/aca.py``'s ``AZURE_IDENTITY_AVAILABLE``).
+requires the optional ``tui`` extra; when ``textual`` isn't installed, the
+bare invocation prints an install hint and exits non-zero rather than
+raising an ``ImportError`` traceback — mirroring the established
+availability-flag pattern used for other optional SDK dependencies (see
+``providers/aca.py``'s ``AZURE_IDENTITY_AVAILABLE``).
+
+That hint is resolved from the detected install context
+(:func:`conductor.install_hint.install_command`) rather than hardcoded: a
+uv tool venv is not pip-managed and ``conductor-cli`` is not on PyPI, so a
+hardcoded ``pip install`` string cannot work on the documented install
+path (issue #441).
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from rich.table import Table
 from rich.text import Text
 
 from conductor.console import make_console, styled
+from conductor.install_hint import install_command
 
 # `textual` is an optional dependency (the `tui` extra) — this module is
 # imported unconditionally at every `conductor` invocation (via
@@ -54,8 +61,8 @@ def fleet_main(ctx: typer.Context) -> None:
     r"""Manage the fleet of running Conductor workflows.
 
     With no subcommand, this launches the interactive TUI. Requires the
-    `tui` extra (`pip install 'conductor-cli\[tui]'`); without it, prints an
-    install hint and exits rather than launching.
+    `tui` extra; without it, prints the install command for how this
+    Conductor was installed and exits rather than launching.
 
     \b
     Examples:
@@ -67,9 +74,15 @@ def fleet_main(ctx: typer.Context) -> None:
             console.print(
                 Text.from_markup(
                     "[bold red]Error:[/bold red] the interactive fleet manager requires "
-                    "the 'tui' extra.\n"
-                    "Install with: [cyan]pip install 'conductor-cli\\[tui]'[/cyan]"
+                    "the 'tui' extra."
                 )
+            )
+            # soft_wrap so rich never inserts a hard newline mid-command: the
+            # whole point of this line is that it can be copied and pasted,
+            # and the resolved uv spec is longer than a default terminal.
+            console.print(
+                styled("Install with: [cyan]{}[/cyan]", install_command("tui")),
+                soft_wrap=True,
             )
             raise typer.Exit(code=1)
 

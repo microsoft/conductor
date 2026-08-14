@@ -481,12 +481,19 @@ class TestRunRecordPollGate:
 
         mock_write.assert_not_called()
 
-    def test_raises_and_terminates_child_when_run_record_never_appears(
+    def test_run_record_never_appears_but_child_stays_reachable_downgrades_to_warning(
         self, tmp_path: Path
     ) -> None:
-        """A fatal ``RuntimeError`` (naming the stderr log) when the child
-        never reports in, and the still-running child is terminated so it
-        doesn't leak an orphaned process holding the dashboard port."""
+        """Issue #435: a bookkeeping failure must not kill a healthy workflow.
+
+        When the run-record poll's own deadline passes but the child is
+        still alive and its dashboard is still reachable (a fresh 1s
+        reachability re-probe succeeds), the launch must **not** be
+        terminated or raise -- the workflow itself is fine, only the
+        discovery record write failed. The launch succeeds with
+        ``run_record_written=False`` so callers can warn without treating
+        this as a launch failure.
+        """
         wf_path = tmp_path / "wf.yaml"
         wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
 
@@ -495,7 +502,48 @@ class TestRunRecordPollGate:
 
         with (
             patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
-            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            # First call is the initial 15s dashboard-reachability wait;
+            # the second is the deadline branch's 1s re-probe. Both must
+            # succeed for this to be the non-fatal path.
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, True]),
+            patch("conductor.fleet.records.read_run_record", return_value=None),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9319,
+            )
+
+        mock_terminate.assert_not_called()
+        assert launch.run_record_written is False
+        assert launch.still_running is True
+
+    def test_raises_and_terminates_child_when_run_record_never_appears(
+        self, tmp_path: Path
+    ) -> None:
+        """A fatal ``RuntimeError`` (naming the stderr log) when the child
+        never reports in *and* its dashboard has gone unreachable (the
+        deadline branch's 1s re-probe fails), and the still-running child
+        is terminated so it doesn't leak an orphaned process holding the
+        dashboard port. This is the one case issue #435 keeps fatal --
+        see ``test_run_record_never_appears_but_child_stays_reachable_downgrades_to_warning``
+        for the non-fatal counterpart."""
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        fake_proc = MagicMock(pid=1)
+        fake_proc.poll.return_value = None  # still running throughout
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
+            # First call is the initial 15s dashboard-reachability wait
+            # (succeeds); the second is the deadline branch's 1s re-probe,
+            # which fails -- this is what keeps this path fatal.
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, False]),
             patch("conductor.fleet.records.read_run_record", return_value=None),
             patch.object(bg_runner.time, "sleep"),
             # Two calls before the loop body runs once (deadline computation,
@@ -574,7 +622,11 @@ class TestRunRecordPollGate:
 
         with (
             patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
-            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            # Second element is the deadline branch's 1s reachability
+            # re-probe, which fails here -- keeping this test on the fatal
+            # path (issue #435 only downgrades to a warning when the child
+            # is alive *and* still reachable at the deadline).
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, False]),
             # A record exists under the polled run_id, but its pid belongs
             # to some other process entirely -- must be treated the same
             # as "no record yet".
@@ -612,7 +664,11 @@ class TestRunRecordPollGate:
 
         with (
             patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
-            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            # Second element is the deadline branch's 1s reachability
+            # re-probe, which fails here -- keeping this test on the fatal
+            # path (issue #435 only downgrades to a warning when the child
+            # is alive *and* still reachable at the deadline).
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, False]),
             # Right run_id and pid, but the record is for a foreground
             # (non-bg) run -- must not satisfy the bg readiness gate.
             patch(
@@ -650,7 +706,11 @@ class TestRunRecordPollGate:
 
         with (
             patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
-            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            # Second element is the deadline branch's 1s reachability
+            # re-probe, which fails here -- keeping this test on the fatal
+            # path (issue #435 only downgrades to a warning when the child
+            # is alive *and* still reachable at the deadline).
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, False]),
             # Right run_id, pid, and mode, but the record's port doesn't
             # match the port this launch requested.
             patch(
@@ -1705,6 +1765,79 @@ class TestFinalizeBackgroundLaunchStageTwo:
         """A run record the gate will accept as this launch's own."""
         return MagicMock(pid=proc.pid, mode="bg", port=port)
 
+    @pytest.mark.parametrize(
+        ("probe", "expected_workflow_started"),
+        [
+            (bg_runner.StartProbe.STARTED, True),
+            (bg_runner.StartProbe.TIMED_OUT, False),
+            (bg_runner.StartProbe.CHILD_EXITED, True),
+        ],
+    )
+    def test_run_record_written_is_false_through_stage_two_when_record_never_appears(
+        self,
+        tmp_path: Path,
+        probe: bg_runner.StartProbe,
+        expected_workflow_started: bool,
+    ) -> None:
+        """Issue #435's downgrade must survive into every stage-two outcome,
+        not just the ``start_timeout == 0`` early return -- mutating the
+        ``StartProbe.STARTED`` arm to hard-code ``run_record_written=True``
+        must fail this test (and its sibling below)."""
+        proc = self._make_proc()
+        if probe is bg_runner.StartProbe.CHILD_EXITED:
+            # Alive through the record-poll deadline (including its
+            # leniency re-check), exited cleanly by the time stage two
+            # reports CHILD_EXITED.
+            _poll = iter([None, None, None])
+            proc.poll.side_effect = lambda: next(_poll, 0)
+
+        with (
+            # First call is the initial 15s dashboard-reachability wait;
+            # the second is the deadline branch's 1s re-probe -- both must
+            # succeed to reach the non-fatal, degraded path.
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, True]),
+            patch("conductor.fleet.records.read_run_record", return_value=None),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(bg_runner, "_remove_dead_child_record") as mock_remove,
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=30.0),
+            patch.object(bg_runner, "_wait_for_workflow_start", return_value=probe),
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc, 9430, "deadbeef", tmp_path / "err.log"
+            )
+
+        assert result.run_record_written is False
+        assert result.workflow_started is expected_workflow_started
+        mock_terminate.assert_not_called()
+        mock_remove.assert_not_called()
+
+    def test_run_record_written_is_true_through_stage_two_when_record_matches(
+        self, tmp_path: Path
+    ) -> None:
+        """The matched-record counterpart to the test above -- guards against
+        the flag simply being hard-coded ``False``."""
+        proc = self._make_proc()
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=self._record_for(proc, 9431),
+            ),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=30.0),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.STARTED
+            ),
+        ):
+            result = bg_runner._finalize_background_launch(
+                proc, 9431, "deadbeef", tmp_path / "err.log"
+            )
+
+        assert result.run_record_written is True
+        assert result.workflow_started is True
+
     def test_record_polled_before_stage_two_wait(self, tmp_path: Path) -> None:
         """The child's record must be confirmed before stage two begins."""
         proc = self._make_proc()
@@ -1727,7 +1860,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
                 proc, 9420, "deadbeef", tmp_path / "err.log"
             )
 
-        assert result is True
+        assert result.workflow_started is True
         assert order == ["read_run_record", "wait_for_workflow_start"]
 
     def test_timed_out_returns_false_and_leaves_record(self, tmp_path: Path) -> None:
@@ -1748,7 +1881,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
                 proc, 9421, "deadbeef", tmp_path / "err.log"
             )
 
-        assert result is False
+        assert result.workflow_started is False
         mock_remove.assert_not_called()
 
     def test_start_timeout_zero_skips_stage_two(self, tmp_path: Path) -> None:
@@ -1767,7 +1900,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
                 proc, 9422, "deadbeef", tmp_path / "err.log"
             )
 
-        assert result is True
+        assert result.workflow_started is True
         mock_wait.assert_not_called()
 
     def test_child_exited_zero_after_record_returns_true(self, tmp_path: Path) -> None:
@@ -1795,7 +1928,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
                 proc, 9423, "deadbeef", tmp_path / "err.log"
             )
 
-        assert result is True
+        assert result.workflow_started is True
         mock_remove.assert_not_called()
 
     def test_child_exited_nonzero_after_record_removes_it_and_raises(self, tmp_path: Path) -> None:
@@ -1891,7 +2024,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
                 proc, 9427, "deadbeef", tmp_path / "err.log"
             )
 
-        assert result is True
+        assert result.workflow_started is True
         mock_read.assert_not_called()
 
 

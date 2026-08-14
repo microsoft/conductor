@@ -338,6 +338,31 @@ def _print_web_bg_completed_notice(stderr_log: Path) -> None:
     )
 
 
+def _print_web_bg_no_run_record_notice(stderr_log: Path) -> None:
+    """Note that the workflow is running but could not register itself for discovery.
+
+    Covers ``BackgroundLaunch.run_record_written=False``: the dashboard came
+    up and stayed reachable, but the child's fleet run record could not be
+    confirmed within the launch gate's poll window (issue #435). This is a
+    bookkeeping failure, not a workflow failure — the run itself is healthy
+    and was deliberately left running rather than killed — but it does mean
+    the run is invisible to ``conductor status`` / ``conductor fleet list``
+    and cannot be stopped with ``conductor stop``. Printed only in verbose
+    mode, alongside the dashboard URL / stderr log lines above it.
+    """
+    console.print(
+        Text.from_markup(
+            "[yellow]Note:[/yellow] this workflow is running, but it could not "
+            "register itself for discovery. It will not appear in "
+            "[bold]conductor status[/bold] / [bold]conductor fleet list[/bold] and "
+            "cannot be stopped with [bold]conductor stop[/bold]. Check the child "
+            "stderr log above for the underlying cause (e.g. permissions on "
+            "$CONDUCTOR_HOME/runs, disk quota, SELinux). Stop it manually with "
+            "[bold]kill <pid>[/bold] if needed."
+        )
+    )
+
+
 def version_callback(value: bool) -> None:
     """Display version information and exit."""
     if value:
@@ -680,6 +705,8 @@ def run(
                     )
                     if not launch.workflow_started:
                         _print_web_bg_not_started_notice()
+                    if not launch.run_record_written:
+                        _print_web_bg_no_run_record_notice(launch.stderr_log)
                     if notify_gate:
                         _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
@@ -1191,6 +1218,8 @@ def resume(
                     )
                     if not launch.workflow_started:
                         _print_web_bg_not_started_notice()
+                    if not launch.run_record_written:
+                        _print_web_bg_no_run_record_notice(launch.stderr_log)
                     if notify_gate:
                         _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:

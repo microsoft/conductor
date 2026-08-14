@@ -23,11 +23,12 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from textual.widgets import DataTable, Input, Static
 
+from conductor.cli.bg_runner import BackgroundLaunch
 from conductor.fleet.launch import LaunchError
 from conductor.fleet.records import RunRecord, write_run_record
 from conductor.fleet.tui.app import FleetApp
@@ -265,7 +266,12 @@ class TestNewRunSubmission:
     ) -> None:
         def _fake_launch_workflow(workflow_path, raw_values, input_defs, **kwargs):
             record = _write_bg_record("launched01", workflow_path)
-            return Mock(url="http://127.0.0.1:8080", run_id=record.run_id)
+            return BackgroundLaunch(
+                url="http://127.0.0.1:8080",
+                stderr_log=fleet_env / "launched01.bg.stderr.log",
+                stdout_log=fleet_env / "launched01.bg.stdout.log",
+                run_id=record.run_id,
+            )
 
         monkeypatch.setattr(
             "conductor.fleet.tui.screens.new_run.launch_workflow", _fake_launch_workflow
@@ -292,6 +298,51 @@ class TestNewRunSubmission:
             table = app.screen.query_one(DataTable)
             rows = [table.get_row_at(i) for i in range(table.row_count)]
             assert any("fixture-workflow" in r[0] for r in rows)
+
+    async def test_launch_with_no_run_record_written_shows_warning_notification(
+        self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #435: a launch that succeeded but could not confirm its own
+        discovery record must warn the user it will not appear on the Runs
+        screen -- a ``Mock(...)`` here would leave ``.run_record_written``
+        an auto-created truthy attribute and this branch structurally
+        unreachable, so a real ``BackgroundLaunch`` is required."""
+        launch = BackgroundLaunch(
+            url="http://127.0.0.1:8080",
+            stderr_log=fleet_env / "unregistered.bg.stderr.log",
+            stdout_log=fleet_env / "unregistered.bg.stdout.log",
+            run_id="unregist",
+            run_record_written=False,
+        )
+        monkeypatch.setattr(
+            "conductor.fleet.tui.screens.new_run.launch_workflow",
+            Mock(return_value=launch),
+        )
+
+        notifications: list[tuple[str, str]] = []
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            original_notify = app.notify
+
+            def _capture(message, **kwargs):
+                notifications.append((message, str(kwargs.get("severity", "information"))))
+                original_notify(message, **kwargs)
+
+            with patch.object(app, "notify", _capture):
+                await _goto_new_run(pilot)
+                await _resolve(pilot, fixture_workflow)
+
+                question_input = app.screen._input_widgets["question"]
+                question_input.value = "What is Python?"
+
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.3)
+
+                assert isinstance(app.screen, RunsScreen)
+
+        warnings = [message for message, severity in notifications if severity == "warning"]
+        assert any("could not register itself for discovery" in m for m in warnings), notifications
 
     async def test_missing_required_field_shows_error_without_launching(
         self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch

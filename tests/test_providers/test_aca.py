@@ -103,7 +103,7 @@ class TestAcaExtraCleanInstall:
         `azure-core[aio]`) is present."""
         pytest.importorskip(
             "azure.identity.aio",
-            reason="aca extra not installed (pip install 'conductor-cli[aca]')",
+            reason="aca extra not installed (see docs/providers/aca.md)",
         )
         from azure.identity.aio import DefaultAzureCredential
 
@@ -136,6 +136,43 @@ class TestAcaFactory:
             await create_provider("aca", validate=False, provider_settings=settings)
         assert exc_info.value.suggestion is not None
         assert "aca" in exc_info.value.suggestion
+
+    @patch("conductor.providers.factory.CLAUDE_AGENT_SDK_AVAILABLE", False)
+    @patch("conductor.providers.factory.install_command", return_value="RESOLVED-COMMAND")
+    @pytest.mark.asyncio
+    async def test_factory_resolves_the_claude_agent_sdk_suggestion(self, resolver) -> None:
+        """The other extra reached through the factory. Both were hardcoded to
+        commands that cannot work on the documented install path (#441)."""
+        with pytest.raises(ProviderError) as exc_info:
+            await create_provider("claude-agent-sdk", validate=False)
+        assert exc_info.value.suggestion == "Install with: RESOLVED-COMMAND"
+        resolver.assert_called_once_with("claude-agent-sdk")
+
+    @patch("conductor.providers.factory.AZURE_IDENTITY_AVAILABLE", False)
+    @patch("conductor.providers.factory.install_command", return_value="RESOLVED-COMMAND")
+    @pytest.mark.asyncio
+    async def test_factory_suggestion_is_resolved_not_hardcoded(self, _resolver) -> None:
+        """Issue #441: the suggestion used to hardcode
+        ``uv add 'conductor-cli[aca]'``, which fails outside a uv project and
+        cannot install into the uv tool venv the install script creates. It
+        now comes from the detected install context."""
+        settings = ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+        with pytest.raises(ProviderError) as exc_info:
+            await create_provider("aca", validate=False, provider_settings=settings)
+        assert exc_info.value.suggestion == "Install with: RESOLVED-COMMAND"
+
+    @patch("conductor.providers.aca.AZURE_IDENTITY_AVAILABLE", False)
+    @patch("conductor.providers.aca.install_command", return_value="RESOLVED-COMMAND")
+    def test_provider_constructor_suggestion_is_resolved(self, _resolver) -> None:
+        """The provider guards availability a second time (it is constructible
+        directly, not only through the factory), so both sites have to
+        resolve the command rather than one of them drifting."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        settings = ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+        with pytest.raises(ProviderError) as exc_info:
+            AcaRuntimeProvider(provider_settings=settings)
+        assert exc_info.value.suggestion == "Install with: RESOLVED-COMMAND"
 
     @patch("conductor.providers.factory.AZURE_IDENTITY_AVAILABLE", True)
     @pytest.mark.asyncio
