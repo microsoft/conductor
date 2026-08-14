@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -182,7 +183,7 @@ class _ScanResult:
     unpriced_agent_count: int = 0
 
 
-def _scan_history_events(events: list[dict[str, Any]]) -> _ScanResult:
+def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
     """Single pass over a log's full event stream, mirroring
     ``conductor.fleet.summary._scan_events``'s terminal-event and
     token/cost accounting -- narrowed to just what History needs (no
@@ -190,7 +191,12 @@ def _scan_history_events(events: list[dict[str, Any]]) -> _ScanResult:
     no "current" step to highlight).
 
     Events are assumed oldest-first (the natural order of a JSONL log and
-    of :func:`_read_full_log`'s output).
+    of :func:`_read_full_log`'s yield order). This function makes exactly
+    one forward pass over ``events`` (a single ``for evt in events:``, no
+    indexing, no ``len()``, no re-iteration), so it accepts a one-shot
+    iterator -- this is precisely the property that lets
+    :func:`_read_full_log` stream rather than materialise a list. A
+    future edit must not break this by, say, iterating ``events`` twice.
 
     A **resumed** run appends a fresh ``workflow_started`` after an
     earlier terminal event without a dashboard attached (the engine only
@@ -261,16 +267,21 @@ def _scan_history_events(events: list[dict[str, Any]]) -> _ScanResult:
 
 
 class _CorruptEventLogError(Exception):
-    """Raised by :func:`_read_full_log` for a non-empty log with no
-    parseable events at all -- distinguishes "genuinely corrupt content"
-    from "genuinely empty file" (E14 review round 2), so
-    :func:`build_history_entries`'s per-file guard can skip the former
-    (E14-T4) while still returning a normal ``"unknown"`` entry for the
-    latter (a legitimately empty log is not corruption)."""
+    """Raised from :func:`_read_full_log`'s generator body when the
+    stream is exhausted, for a non-empty log with no parseable events at
+    all -- distinguishes "genuinely corrupt content" from "genuinely
+    empty file" (E14 review round 2), so :func:`build_history_entries`'s
+    per-file guard can skip the former (E14-T4) while still returning a
+    normal ``"unknown"`` entry for the latter (a legitimately empty log
+    is not corruption). Because it is raised on generator exhaustion, it
+    reaches callers through whatever loop is draining the stream -- in
+    practice, the ``for evt in events:`` loop inside
+    :func:`_scan_history_events`."""
 
 
-def _read_full_log(path: Path) -> list[dict[str, Any]]:
-    """Stream-parse every line of a retained event log, oldest first.
+def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
+    """Stream-parse every line of a retained event log, oldest first,
+    yielding one parsed event dict at a time.
 
     Unlike ``fleet.summary``'s bounded tail/head readers -- built for a
     *live* run's cheap, repeated ~2s poll, or a bounded detail view --
@@ -279,14 +290,34 @@ def _read_full_log(path: Path) -> list[dict[str, Any]]:
     here. A byte-capped read can silently omit an early token/cost event
     or discard an oversized terminal event that falls outside the window,
     presenting a genuinely completed run as ``"unknown"`` with an
-    incomplete total (E14 review round 1). Reading the file unboundedly,
-    streamed line-by-line via file iteration (never loaded into memory as
-    a single blob) avoids that without paying for a whole-file read at
-    once.
+    incomplete total (E14 review round 1). This function is a generator:
+    neither the raw bytes nor the parsed events are ever fully
+    materialised, so peak memory is one raw line plus one parsed event
+    dict, regardless of log size -- the parsed dict is the larger of the
+    two, typically several times the line's byte size, but it too is
+    discarded as soon as the caller has consumed it. Contrast
+    ``conductor.fleet.summary.read_event_log_full``, which caps its read
+    at 8 MiB and therefore trades coverage for a bounded (but nonzero)
+    memory footprint; streaming gives History unbounded coverage *and*
+    O(1) memory, so it needs no equivalent cap -- the two readers'
+    differing bounds are a deliberate consequence of their differing
+    consumers (a live-run detail view vs. a done-run, read-once history),
+    not an oversight.
 
-    Unlike ``read_event_log_tail``'s never-raise contract, a read failure
-    here (the file cannot be opened at all -- permission denied, vanished
-    mid-scan, or any other ``OSError``) is deliberately **not**
+    The generator holds the file handle open (inside its ``with``) until
+    it is exhausted or the caller stops consuming it and it is garbage
+    collected / explicitly closed. The sole consumer,
+    :func:`_build_entry`, drains it synchronously to completion via
+    :func:`_scan_history_events`, so the file closes deterministically as
+    part of normal control flow.
+
+    Because this is a generator, none of its side effects happen when
+    ``_read_full_log(path)`` is called -- they happen while the returned
+    iterator is being **consumed**. In particular, ``open()`` and any
+    ``OSError`` it raises (permission denied, the file vanishing
+    mid-scan, or any other read failure) surface on the first
+    ``next()``, not at call time. Unlike ``read_event_log_tail``'s
+    never-raise contract, such a failure is deliberately **not**
     swallowed: it propagates so :func:`build_history_entries`'s
     per-file guard can tell "genuinely no events" apart from "couldn't
     read this file at all" and skip the latter, rather than presenting a
@@ -300,12 +331,13 @@ def _read_full_log(path: Path) -> list[dict[str, Any]]:
     events is corrupt, not "legitimately empty" -- E14-T4 requires a
     corrupt log to be skipped, not shown as an ordinary ``"unknown"``
     entry (E14 review round 2). Raises :class:`_CorruptEventLogError` in
-    that case; a genuinely empty file (no non-blank lines at all) still
-    returns an empty list, which :func:`_build_entry` legitimately turns
-    into an ``"unknown"`` entry.
+    that case, once the stream is exhausted; a genuinely empty file (no
+    non-blank lines at all) still yields nothing and raises nothing,
+    which :func:`_build_entry` legitimately turns into an ``"unknown"``
+    entry.
     """
-    events: list[dict[str, Any]] = []
     saw_nonblank_line = False
+    yielded_any = False
     with open(path, "rb") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -317,10 +349,10 @@ def _read_full_log(path: Path) -> list[dict[str, Any]]:
             except (UnicodeDecodeError, ValueError):
                 continue
             if isinstance(obj, dict):
-                events.append(obj)
-    if saw_nonblank_line and not events:
+                yielded_any = True
+                yield obj
+    if saw_nonblank_line and not yielded_any:
         raise _CorruptEventLogError(f"{path}: non-empty log with no parseable events")
-    return events
 
 
 def _build_entry(path: Path) -> HistoryEntry:
@@ -331,18 +363,19 @@ def _build_entry(path: Path) -> HistoryEntry:
     bounded read is unsuitable for a retrospective, read-once history
     entry (E14 review round 1).
 
-    Raises on a read failure (propagated from :func:`_read_full_log`,
-    including a :class:`_CorruptEventLogError` for a non-empty log with
-    no parseable events) so :func:`build_history_entries`'s per-file
-    guard can skip a genuinely unreadable/corrupt log rather than
+    Raises on a read failure -- an ``OSError`` opening the file, or a
+    :class:`_CorruptEventLogError` for a non-empty log with no parseable
+    events -- surfacing while :func:`_read_full_log`'s generator is
+    consumed here (via :func:`_scan_history_events`'s draining loop),
+    not when it is constructed. Either way, :func:`build_history_entries`'s
+    per-file guard can skip a genuinely unreadable/corrupt log rather than
     presenting it as a fabricated ``"unknown"`` entry with zero totals
     (E14-T4 / E14 review round 1 and 2). A genuinely **empty** log (no
     non-blank lines at all) still produces a normal ``"unknown"`` entry
     -- that is legitimate data, not corruption.
     """
     workflow_name, run_id = _parse_filename(path)
-    events = _read_full_log(path)
-    scan = _scan_history_events(events)
+    scan = _scan_history_events(_read_full_log(path))
 
     duration = scan.reported_elapsed
     if duration is None and scan.started_at is not None and scan.ended_at is not None:

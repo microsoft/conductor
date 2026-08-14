@@ -18,16 +18,25 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from conductor.fleet.history import HistoryEntry, build_history_entries
+import conductor.fleet.history as history_module
+from conductor.fleet.history import (
+    HistoryEntry,
+    _CorruptEventLogError,
+    _read_full_log,
+    _scan_history_events,
+    build_history_entries,
+)
 from conductor.fleet.retention import event_log_root
 
 # ---------------------------------------------------------------------------
@@ -651,3 +660,113 @@ class TestHistoryEntryShape:
 
         assert isinstance(entries[0], HistoryEntry)
         assert entries[0].path == path
+
+
+# ---------------------------------------------------------------------------
+# `_read_full_log` streams rather than materializes (issue #436)
+# ---------------------------------------------------------------------------
+
+
+class TestFullLogStreamsWithoutMaterializing:
+    """Regression coverage for issue #436: `_read_full_log` must be a
+    generator that yields one parsed event at a time, and
+    `_scan_history_events` must accept any one-shot iterable, so peak
+    memory for a history scan is O(1) regardless of log size -- what the
+    docstring already claimed and, before this fix, did not deliver."""
+
+    def test_read_full_log_does_not_return_a_list(self, temp_root: Path) -> None:
+        """The structural guard: this is the assertion that fails if
+        someone reintroduces list accumulation, which no behavioural test
+        (all of which pass equally well against the buggy list-based
+        implementation) can catch."""
+        path = _write_log(
+            temp_root,
+            lines=[_event("workflow_started", {"name": "my-workflow"}, ts=1000.0)],
+        )
+
+        assert inspect.isgeneratorfunction(_read_full_log)
+
+        result = _read_full_log(path)
+        assert not isinstance(result, list | Sequence)
+        assert inspect.isgenerator(result)
+
+    def test_read_full_log_parses_lazily(
+        self, temp_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct, deterministic proof that memory no longer scales with
+        log length: taking a single `next()` off the generator parses
+        exactly one line, not the whole file."""
+        path = _write_log(
+            temp_root,
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("agent_completed", {"agent_name": "a", "tokens": 1}, ts=1001.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+
+        parse_count = 0
+        real_loads = json.loads
+
+        class _CountingJsonShim:
+            @staticmethod
+            def loads(*args: Any, **kwargs: Any) -> Any:
+                nonlocal parse_count
+                parse_count += 1
+                return real_loads(*args, **kwargs)
+
+        monkeypatch.setattr(history_module, "json", _CountingJsonShim)
+
+        gen = _read_full_log(path)
+        first = next(gen)
+
+        assert parse_count == 1
+        assert first["type"] == "workflow_started"
+
+        gen.close()
+
+    def test_corrupt_log_raises_only_on_exhaustion(self, temp_root: Path) -> None:
+        """A non-empty, all-unparseable log raises `_CorruptEventLogError`
+        only once the stream is fully drained -- pins the
+        `saw_nonblank_line`/`yielded_any` replacement at the unit level."""
+        path = temp_root / "conductor-corrupt-20260101-120000-cafef00d.events.jsonl"
+        path.write_bytes(b"not json at all\nmore garbage\n")
+
+        with pytest.raises(_CorruptEventLogError):
+            list(_read_full_log(path))
+
+    def test_empty_log_yields_nothing_and_does_not_raise(self, temp_root: Path) -> None:
+        """The counterpart distinction: a genuinely empty file (no
+        non-blank lines at all) yields nothing and raises nothing."""
+        path = _write_log(temp_root, lines=[])
+
+        assert list(_read_full_log(path)) == []
+
+    def test_scan_accepts_a_one_shot_iterator(self) -> None:
+        """Pins the widened `_scan_history_events` signature: a future
+        edit that indexes or re-iterates `events` fails here rather than
+        silently at runtime against a live generator."""
+
+        def _events() -> Any:
+            yield {"type": "workflow_started", "timestamp": 1000.0, "data": {}}
+            yield {
+                "type": "agent_completed",
+                "timestamp": 1001.0,
+                "data": {"agent_name": "a", "tokens": 100, "cost_usd": 0.01},
+            }
+            yield {
+                "type": "agent_completed",
+                "timestamp": 1002.0,
+                "data": {"agent_name": "b", "tokens": 50, "cost_usd": None},
+            }
+            yield {"type": "workflow_completed", "timestamp": 1005.0, "data": {"elapsed": 5.0}}
+
+        scan = _scan_history_events(_events())
+
+        assert scan.outcome == "completed"
+        assert scan.started_at == 1000.0
+        assert scan.ended_at == 1005.0
+        assert scan.reported_elapsed == 5.0
+        assert scan.total_tokens == 150
+        assert scan.total_cost_usd == 0.01
+        assert scan.unpriced_agent_count == 1
