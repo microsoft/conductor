@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -57,6 +58,13 @@ detached background. Written verbatim into a run record's ``mode`` field, so
 the writer is checked against the same closed set the reader accepts."""
 
 _VALID_MODES: frozenset[str] = frozenset(get_args(RunMode))
+
+# Bounded retry for the Windows-only `os.replace` sharing violation -- see
+# `_replace_with_retry`. Deliberately short: the contended window is a single
+# small-file read, and a genuine permission problem must still surface rather
+# than being hidden behind a long stall.
+_REPLACE_RETRIES = 10
+_REPLACE_RETRY_DELAY_SECONDS = 0.02
 
 # Path-safe run-id pattern. Real run_ids are ``secrets.token_hex(4)`` (see
 # ``engine/event_log.py``) — 8 lowercase hex characters — but this pattern is
@@ -428,13 +436,45 @@ def run_records_dir() -> Path:
     return d
 
 
+def _replace_with_retry(tmp_name: str, filepath: Path) -> None:
+    """``os.replace`` the temp file into place, retrying briefly on Windows.
+
+    POSIX ``rename`` is atomic and never fails because a reader has the
+    destination open. Windows is different: ``os.replace`` raises
+    ``PermissionError`` (``ERROR_ACCESS_DENIED``/``ERROR_SHARING_VIOLATION``)
+    when another process holds a handle to the destination — and this record
+    is read constantly, by ``conductor status``, ``fleet list``, the TUI's
+    ~2s poll, and the ``--web-bg`` launch gate. Without the retry the write
+    fails, ``cli/run.py`` swallows it, and the run silently becomes
+    undiscoverable and unstoppable: exactly the defect the run record exists
+    to prevent, reproduced only on Windows.
+
+    The window is a single ``read_text`` on a small file, so a short bounded
+    retry closes it in practice. A genuine permission problem still surfaces:
+    the final attempt is allowed to raise.
+    """
+    if sys.platform != "win32":
+        os.replace(tmp_name, filepath)
+        return
+
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp_name, filepath)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRIES - 1:
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
+
+
 def write_run_record(record: RunRecord) -> Path:
     """Atomically write ``record`` to ``<run_records_dir>/<run_id>.json``.
 
     Writes to a temp file in the same directory first, then ``os.replace``s
     it into place, so a concurrent reader never observes a partially-written
     file (readers may still race the *absence* of the file, which is fine —
-    see :func:`read_run_record`).
+    see :func:`read_run_record`). On Windows the replace is retried briefly
+    — see :func:`_replace_with_retry`.
 
     Args:
         record: The run record to persist.
@@ -453,7 +493,7 @@ def write_run_record(record: RunRecord) -> Path:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(record.to_dict(), f, indent=2)
-        os.replace(tmp_name, filepath)
+        _replace_with_retry(tmp_name, filepath)
     except BaseException:
         # Best-effort cleanup of the temp file on any failure. `os.replace`
         # either fully completed (in which case tmp_name no longer exists)

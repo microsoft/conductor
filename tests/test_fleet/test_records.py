@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from conductor.cli import pid as cli_pid
+from conductor.fleet import records
 from conductor.fleet.records import (
     RunRecord,
     is_valid_run_id,
@@ -224,6 +225,13 @@ class TestConcurrentWrites:
                         try:
                             text = path.read_text()
                         except FileNotFoundError:
+                            continue
+                        except PermissionError:
+                            # Windows denies the open while `os.replace` is
+                            # swapping the file in. Like the FileNotFoundError
+                            # above this is a race with the replace itself,
+                            # not a *torn* read -- which is what this test
+                            # exists to rule out.
                             continue
                         data = json.loads(text)
                         assert isinstance(data, dict)
@@ -1419,3 +1427,71 @@ class TestLegacyEventLogRecovery:
         )
         assert record.event_log_path == ""
         assert not (empty / "conductor").exists()
+
+
+class TestWindowsReplaceRetry:
+    """``os.replace`` is not reader-proof on Windows.
+
+    POSIX ``rename`` never fails because someone holds the destination open;
+    Windows raises ``PermissionError``. This record is read constantly (
+    ``conductor status``, ``fleet list``, the TUI poll, the ``--web-bg``
+    launch gate), and an unretried failure is swallowed by ``cli/run.py``,
+    leaving the run undiscoverable and unstoppable.
+    """
+
+    def test_write_retries_a_sharing_violation_and_succeeds(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def _flaky(src: object, dst: object) -> None:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(13, "Access is denied")
+            real_replace(src, dst)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(records.os, "replace", _flaky)
+
+        path = write_run_record(_make_record(run_id="retry001"))
+
+        assert calls["n"] == 3
+        assert read_run_record("retry001") is not None
+        assert path.exists()
+
+    def test_a_persistent_permission_error_still_surfaces(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real permission problem must not be hidden behind the retry."""
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(
+            records.os,
+            "replace",
+            lambda *_a: (_ for _ in ()).throw(PermissionError(13, "Access is denied")),
+        )
+
+        with pytest.raises(PermissionError):
+            write_run_record(_make_record(run_id="retry002"))
+
+        # The temp file must not be left behind for a failed write.
+        assert not list(run_records_dir().glob(".retry002.*.tmp"))
+
+    def test_posix_does_not_retry(self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The retry is Windows-specific; POSIX rename cannot hit this."""
+        monkeypatch.setattr(records.sys, "platform", "linux")
+        calls = {"n": 0}
+
+        def _boom(*_a: object) -> None:
+            calls["n"] += 1
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(records.os, "replace", _boom)
+
+        with pytest.raises(PermissionError):
+            write_run_record(_make_record(run_id="retry003"))
+
+        assert calls["n"] == 1

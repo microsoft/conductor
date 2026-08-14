@@ -78,9 +78,19 @@ def _rendered_footer(app: FleetApp) -> str:
     the border glyphs exist: ``Footer`` is a container, so rendering the
     widget alone yields nothing, and the marker class on a ``FooterKey``
     says only that styling was *requested*, not that it landed.
+
+    Searches for the row carrying a binding rather than assuming the footer
+    is the compositor's last strip. It is on Linux, but the trailing strip
+    is blank on Windows, which made every footer assertion read an empty
+    line and fail for a reason that had nothing to do with the grouping
+    these tests are about.
     """
     strips = list(app.screen._compositor.render_strips())
-    return "".join(segment.text for segment in strips[-1])
+    lines = ["".join(segment.text for segment in strip) for strip in strips]
+    for line in reversed(lines):
+        if "New" in line:
+            return line
+    return lines[-1] if lines else ""
 
 
 def _write_record(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -287,6 +288,15 @@ class TestKillAction:
         # the record must survive.
         assert read_run_record("run-a") is not None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "Patches `os.kill` to raise ProcessLookupError, which only the POSIX "
+            "kill path calls -- `terminate_process` dispatches to the ctypes "
+            "`TerminateProcess` implementation on Windows, so the simulated race "
+            "never occurs there."
+        ),
+    )
     async def test_kill_already_dead_pid_does_not_raise(
         self, fleet_env: Path, tmp_path: Path
     ) -> None:

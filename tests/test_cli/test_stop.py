@@ -28,6 +28,7 @@ import contextlib
 import importlib
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -434,6 +435,15 @@ class TestStopProcessGone:
         assert "already exited" in result.output
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Simulates an errno from the POSIX kill primitive. `terminate_process` "
+        "dispatches to `_terminate_process_windows` (ctypes `TerminateProcess`) "
+        "there, so the patched `os.kill` is never reached and the assertions "
+        "describe a path Windows cannot take."
+    ),
+)
 class TestStopProcessUnexpectedOSError:
     """Companion regression for issue #166.
 
