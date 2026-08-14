@@ -5,7 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.29...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.30...HEAD)
+
+## [0.1.30](https://github.com/microsoft/conductor/compare/v0.1.29...v0.1.30) - 2026-08-14
+
+### Added
+
+- **Fleet Manager: `conductor stop`, `conductor fleet list`, and a new
+  interactive `conductor fleet` TUI now discover every run, not just
+  `--web-bg` ones** (#431). Previously only `--web-bg` wrote a discoverable
+  (port-keyed `.pid`) record, so a plain `conductor run` or `conductor run
+  --web` process was invisible to `conductor stop` and had to be killed by
+  hand. Every run path now writes a `run_id`-keyed JSON record to
+  `~/.conductor/runs/<run_id>.json` describing its mode (`fg`/`fg-web`/`bg`),
+  PID, workflow path, and dashboard port (when it has one); `stop`,
+  `fleet list`, and the TUI all read from this same store. The legacy
+  port-keyed `.pid` file is still read (and cleaned up) for a still-running
+  pre-upgrade process, but is no longer written by any current code path.
+  **Behavior change:** stopping a **foreground** run (`mode` `fg`/`fg-web` —
+  anything holding a terminal) now requires interactive confirmation, since a
+  plain `SIGTERM` discards in-flight progress unless periodic checkpoints are
+  enabled for that run; a background-only fleet is unaffected. Use
+  `--yes`/`-y` to skip the prompt (e.g. scripts, CI); a non-interactive
+  `stdin` without `--yes` refuses to proceed rather than silently defaulting
+  to "yes". `stop` also gained `--run-id`, the only selector that can target a
+  foreground run with no dashboard port to match on. See
+  [`docs/cli-reference.md`](docs/cli-reference.md#conductor-stop).
+- **`conductor fleet`** (#431) — an optional interactive Textual TUI (`pip
+  install 'conductor-cli[tui]'`) for monitoring, managing, and launching
+  Conductor runs across dedicated screens: Runs (home, ~2s-polled, sorted by
+  recency), Run detail (per-agent topology and timings, not a DAG), Providers
+  (collapsed-by-default provider/model diagnostics, reusing
+  `providers/diagnostics.py`), Registries (registries → workflows → inputs),
+  New Run (form generated from a workflow's declared `input:`, launches via
+  the same `conductor run --web-bg` path the CLI uses), and History
+  (every retained run regardless of outcome, bounded by retention plus an
+  independent 200-entry display cap, delegating replay to `conductor
+  replay <log>` rather than re-implementing it). A human gate is displayed as
+  a persistent badge for every run mode; it can additionally be **resolved**
+  from the TUI (`g`) for any run with a dashboard port (`fg-web`/`bg`) via the
+  existing `conductor gate respond` HTTP path — a plain foreground run's gate
+  is display-only (its PID is shown) since its blocking prompt thread cannot
+  be reached remotely. A terminal bell / OSC 9 notification fires once per
+  transition into `at-gate` or a failure. `conductor fleet list` and
+  `conductor fleet prune` need no optional dependency; only the bare,
+  no-subcommand `conductor fleet` (which launches the TUI) requires the `tui`
+  extra. See [`docs/fleet.md`](docs/fleet.md).
+- **`~/.conductor/config.toml`** (#431) — a new machine-wide, read-only-in-v1
+  settings file (`src/conductor/settings.py`), read with stdlib `tomllib` and
+  honoring `$CONDUCTOR_HOME` the same way `registries.toml` does. Currently
+  controls `[fleet.retention]`: an opportunistic sweep (`enabled = true` by
+  default, `keep_last = 200`) that bounds the otherwise-unbounded
+  `$TMPDIR/conductor/` directory of event logs at the start of every
+  `conductor run`/`resume`. Never deletes the `checkpoints/` subdirectory or
+  an event log a live/resuming run still references. `conductor fleet prune`
+  is the explicit manual entry point (with `--keep-last`/`--dry-run`) and
+  always works regardless of the `enabled` setting. A missing file is normal
+  (every setting defaults cleanly); a malformed file only breaks an explicit
+  reader (`fleet prune` with no `--keep-last` override) — never `conductor
+  run`/`resume`, which swallow a settings load failure and just skip the
+  feature it configures. See
+  [`docs/configuration.md`](docs/configuration.md#machine-wide-settings-conductorconfigtoml).
+
+### Changed
+
+- **`workflow_started` now records the run's resolved `inputs`** (#431). Two
+  runs of the same workflow are otherwise indistinguishable in a listing. The
+  values are written to the run's JSONL event log, which is also read by
+  `conductor replay` and the dashboard.
+
+### Fixed
+
+- **`conductor stop` against a foreground run is no longer a silent no-op**
+  (#431). With the interactive keyboard listener active, the `SIGTERM` handler
+  delegated to the previous disposition only when it was *callable* — and in
+  an unmodified process `signal.getsignal(SIGTERM)` returns `SIG_DFL`, an
+  `IntEnum` member that is not callable, so the signal fell through and was
+  swallowed entirely: the process survived and kept running. The handler now
+  restores the default disposition and re-raises against itself. An inherited
+  `SIG_IGN` is honoured rather than converted into a termination.
+- **A `questions` node no longer leaves the run parked at an already-answered
+  gate** (#431). A questions node reuses `gate_presented` but never emitted the
+  matching `gate_resolved`, so every consumer of the event stream — the web
+  dashboard as well as the Fleet Manager — held a gate that never closed for
+  the remainder of the run.
 
 ## [0.1.29](https://github.com/microsoft/conductor/compare/v0.1.28...v0.1.29) - 2026-08-13
 
@@ -417,19 +500,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local user can write to.
 - **Registry TOML values are escaped** — a registry whose source or type
   contained a quote or a backslash produced a file that could not be re-read.
-- **`conductor stop` against a foreground run is no longer a silent no-op.**
-  With the interactive keyboard listener active, the `SIGTERM` handler
-  delegated to the previous disposition only when it was *callable* — and in
-  an unmodified process `signal.getsignal(SIGTERM)` returns `SIG_DFL`, an
-  `IntEnum` member that is not callable, so the signal fell through and was
-  swallowed entirely: the process survived and kept running. The handler now
-  restores the default disposition and re-raises against itself. An inherited
-  `SIG_IGN` is honoured rather than converted into a termination.
-- **A `questions` node no longer leaves the run parked at an already-answered
-  gate.** A questions node reuses `gate_presented` but never emitted the
-  matching `gate_resolved`, so every consumer of the event stream — the web
-  dashboard as well as the Fleet Manager — held a gate that never closed for
-  the remainder of the run.
 - **Dashboard context-window bar no longer reports cumulative input tokens as
   a false red at >100% of the cap** (#412). The bar reused
   `AgentOutput.input_tokens` — a *billing* total summed across every API call
@@ -662,67 +732,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pane; the view is not refit in either case. The same compensation steadies
   the graph when a running workflow's topology grows — a `for_each` fanning
   out or a subworkflow's DAG arriving.
-- **`workflow_started` now records the run's resolved `inputs`.** Two runs of
-  the same workflow are otherwise indistinguishable in a listing. The values
-  are written to the run's JSONL event log, which is also read by `conductor
-  replay` and the dashboard.
-- **Fleet Manager: `conductor stop`, `conductor fleet list`, and a new
-  interactive `conductor fleet` TUI now discover every run, not just
-  `--web-bg` ones.** Previously only `--web-bg` wrote a discoverable
-  (port-keyed `.pid`) record, so a plain `conductor run` or `conductor run
-  --web` process was invisible to `conductor stop` and had to be killed by
-  hand. Every run path now writes a `run_id`-keyed JSON record to
-  `~/.conductor/runs/<run_id>.json` describing its mode (`fg`/`fg-web`/`bg`),
-  PID, workflow path, and dashboard port (when it has one); `stop`,
-  `fleet list`, and the TUI all read from this same store. The legacy
-  port-keyed `.pid` file is still read (and cleaned up) for a still-running
-  pre-upgrade process, but is no longer written by any current code path.
-  **Behavior change:** stopping a **foreground** run (`mode` `fg`/`fg-web` —
-  anything holding a terminal) now requires interactive confirmation, since a
-  plain `SIGTERM` discards in-flight progress unless periodic checkpoints are
-  enabled for that run; a background-only fleet is unaffected. Use
-  `--yes`/`-y` to skip the prompt (e.g. scripts, CI); a non-interactive
-  `stdin` without `--yes` refuses to proceed rather than silently defaulting
-  to "yes". `stop` also gained `--run-id`, the only selector that can target a
-  foreground run with no dashboard port to match on. See
-  [`docs/cli-reference.md`](docs/cli-reference.md#conductor-stop).
-
-- **`conductor fleet`** — an optional interactive Textual TUI (`pip install
-  'conductor-cli[tui]'`) for monitoring, managing, and launching Conductor
-  runs across dedicated screens: Runs (home, ~2s-polled, sorted by recency),
-  Run detail (per-agent topology and timings, not a DAG), Providers
-  (collapsed-by-default provider/model diagnostics, reusing
-  `providers/diagnostics.py`), Registries (registries → workflows → inputs),
-  New Run (form generated from a workflow's declared `input:`, launches via
-  the same `conductor run --web-bg` path the CLI uses), and History
-  (every retained run regardless of outcome, bounded by retention plus an
-  independent 200-entry display cap, delegating replay to `conductor
-  replay <log>` rather than re-implementing it). A human gate is displayed as
-  a persistent badge for every run mode; it can additionally be **resolved**
-  from the TUI (`g`) for any run with a dashboard port (`fg-web`/`bg`) via the
-  existing `conductor gate respond` HTTP path — a plain foreground run's gate
-  is display-only (its PID is shown) since its blocking prompt thread cannot
-  be reached remotely. A terminal bell / OSC 9 notification fires once per
-  transition into `at-gate` or a failure. `conductor fleet list` and
-  `conductor fleet prune` need no optional dependency; only the bare,
-  no-subcommand `conductor fleet` (which launches the TUI) requires the `tui`
-  extra. See [`docs/fleet.md`](docs/fleet.md).
-
-- **`~/.conductor/config.toml`** — a new machine-wide, read-only-in-v1
-  settings file (`src/conductor/settings.py`), read with stdlib `tomllib` and
-  honoring `$CONDUCTOR_HOME` the same way `registries.toml` does. Currently
-  controls `[fleet.retention]`: an opportunistic sweep (`enabled = true` by
-  default, `keep_last = 200`) that bounds the otherwise-unbounded
-  `$TMPDIR/conductor/` directory of event logs at the start of every
-  `conductor run`/`resume`. Never deletes the `checkpoints/` subdirectory or
-  an event log a live/resuming run still references. `conductor fleet prune`
-  is the explicit manual entry point (with `--keep-last`/`--dry-run`) and
-  always works regardless of the `enabled` setting. A missing file is normal
-  (every setting defaults cleanly); a malformed file only breaks an explicit
-  reader (`fleet prune` with no `--keep-last` override) — never `conductor
-  run`/`resume`, which swallow a settings load failure and just skip the
-  feature it configures. See
-  [`docs/configuration.md`](docs/configuration.md#machine-wide-settings-conductorconfigtoml).
 
 ## [0.1.27](https://github.com/microsoft/conductor/compare/v0.1.26...v0.1.27) - 2026-08-04
 
