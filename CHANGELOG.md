@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.30...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.31...HEAD)
+
+## [0.1.31](https://github.com/microsoft/conductor/compare/v0.1.30...v0.1.31) - 2026-08-15
 
 ### Added
 
@@ -38,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scripts, `uv tool install`, or `conductor update`. Conductor ships no default
   mirror and never redirects package resolution on its own; the index is always
   user-supplied configuration.
+
 ### Fixed
 
 - **`--web-bg`/`resume --web-bg`: a failed run-record write no longer kills
@@ -90,7 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rejecting one this package does not declare, which uv would otherwise
   accept with a warning and a zero exit status), and `--no-preserve-extras` /
   `CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS` drops back to a bare install.
-
 - **Fleet Manager History no longer accumulates an entire retained event log
   into memory to build one entry** (#436). `_read_full_log` now streams
   parsed events one at a time instead of materializing them into a list
