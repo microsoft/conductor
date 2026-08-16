@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from textual.screen import ModalScreen
 
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.runs import RunsScreen
@@ -113,3 +114,30 @@ class TestSplash:
         async with app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(app.screen, RunsScreen)
+
+    async def test_dismissing_never_pops_a_screen_it_does_not_own(self) -> None:
+        """`_dismiss` pops whatever is on top, so it must only fire while the
+        splash *is* what's on top.
+
+        Nothing covers the splash today, so this is a guard on the guard: it
+        pins the predicate rather than a reachable path. `Screen.is_current`
+        would satisfy the check here -- it means "still being composited",
+        which stays true underneath a translucent screen -- and the splash
+        would then pop the screen covering it instead of itself.
+        """
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            splash = app.screen
+            assert isinstance(splash, SplashScreen)
+
+            cover: ModalScreen[None] = ModalScreen()
+            app.push_screen(cover)
+            await pilot.pause()
+            assert splash.is_current, "the splash is still composited under the modal"
+
+            splash._dismiss()
+            await pilot.pause()
+
+            assert app.screen is cover, "the covering screen must not be popped"
+            assert splash in app.screen_stack, "the splash must not have dismissed itself"

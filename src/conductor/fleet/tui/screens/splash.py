@@ -90,9 +90,15 @@ class SplashScreen(Screen[None]):
             tag.update("")
 
     def _dismiss(self) -> None:
-        # Guarded: the timer and a keypress race, and popping a screen that
-        # is already gone raises.
-        if self.is_current:
+        # `is_active`, not `is_current`: this pops whatever is on top, so it
+        # must only fire while *this* screen is what's on top. `is_current`
+        # means "still being composited", which stays true for a covered
+        # screen -- so a splash covered at the moment its timer fired would
+        # have popped the thing covering it. It also still guards the race
+        # this was written for (the timer and a keypress both dismiss, and
+        # popping an already-popped screen raises), since a popped screen is
+        # neither active nor current.
+        if self.is_active:
             self.app.pop_screen()
 
     def on_key(self) -> None:
