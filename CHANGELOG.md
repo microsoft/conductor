@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `--web-bg` launch gate now terminates the whole workflow process
+  tree, not just the pid it spawned, closing the orphan a trampoline
+  `sys.executable` could leave behind** (#447). Issue #444 fixed the
+  launch gate's false-positive port conflicts but left its four failure
+  paths terminating only `subprocess.Popen.pid` — under a trampoline
+  `sys.executable` (e.g. a Windows `uv tool install`, the documented
+  install path), that pid is a re-exec shim, not the process actually
+  running the workflow, so a launch-gate failure could kill the shim and
+  leave the real workflow running, undiscoverable, and still burning
+  tokens. On Windows the child is now created suspended and assigned to a
+  fresh job object *before* it can run (so it cannot re-exec out of
+  reach), with `TerminateJobObject` reaching the whole tree regardless of
+  exec depth; the job deliberately has no `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  so the tree still survives the launcher exiting, which is the entire
+  point of `--web-bg`. On POSIX, `os.killpg` now reaches the process
+  group the detached child already leads. After the tree kill, a final
+  liveness sweep independently confirms every pid the gate knew about is
+  actually dead rather than assuming it — a survivor is now named
+  explicitly in the error message (with a `conductor status` /
+  `conductor stop --port` pointer) instead of the message unconditionally
+  claiming "The background process was terminated." A run record is only
+  removed once its pid is confirmed dead by that sweep, so a surviving
+  orphan keeps the record that is `conductor stop`'s only remaining
+  handle on it.
+
 - **`--web-bg` no longer fails on every port with a false "Port already in
   use", killing a healthy run** (#444). The launch gate's two identity
   checks both compared against the *spawned* process's pid

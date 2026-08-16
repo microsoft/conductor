@@ -611,7 +611,7 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
@@ -637,7 +637,7 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
@@ -669,7 +669,7 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
@@ -700,7 +700,7 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):

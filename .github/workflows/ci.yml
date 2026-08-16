@@ -14,6 +14,8 @@
 # - frontend: Type-checks, tests (Vitest), and builds the web dashboard
 # - install-scripts: End-to-end exercise of install.ps1 / install.sh on
 #                    Windows + Ubuntu (opt-in pytest marker; ~90s)
+# - web-bg-smoke: Real `uv tool install` + `conductor run --web-bg` launcher
+#                 smoke test on Windows + Ubuntu (issue #447)
 
 name: CI
 
@@ -321,3 +323,77 @@ jobs:
       - name: Run install-script integration tests
         timeout-minutes: 10
         run: uv run pytest -m install_scripts -v
+
+  web-bg-smoke:
+    name: Web BG Smoke (${{ matrix.os }})
+    # A launcher-level smoke test, not a workflow-execution test: it drives
+    # the real `conductor run --web-bg` launch gate against a genuine `uv
+    # tool install` on both platforms, which is what actually reproduces a
+    # trampoline `sys.executable` (issue #444) and would have caught it --
+    # mocking the spawn seam, as the unit tests do, cannot. Runs on Windows
+    # (where the trampoline actually happens) and Ubuntu (parity sanity
+    # check). `examples/wait-smoke.yaml` needs no provider and caps itself
+    # at `timeout_seconds: 3`, so the run completes well inside the launch
+    # gate's own window and the assertion is on the *launcher*'s output,
+    # not on workflow correctness.
+    runs-on: ${{ matrix.os }}
+    needs: [lint]
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+      fail-fast: false
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install into an isolated tool sandbox
+        # Mirrors the install-scripts job's UV_TOOL_DIR sandbox so this
+        # never touches the runner's own environment. `uv tool install .`
+        # on Windows is exactly what makes `sys.executable` a trampoline
+        # (a wrapper `.exe` that re-execs the real interpreter) -- the
+        # documented install path this job exists to cover.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/uv-tool-dir" "$RUNNER_TEMP/uv-tool-bin-dir"
+          echo "UV_TOOL_DIR=$RUNNER_TEMP/uv-tool-dir" >> "$GITHUB_ENV"
+          echo "UV_TOOL_BIN_DIR=$RUNNER_TEMP/uv-tool-bin-dir" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/uv-tool-bin-dir" >> "$GITHUB_PATH"
+          uv tool install .
+
+      - name: Run conductor run --web-bg and assert launcher success
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          output=$(conductor run examples/wait-smoke.yaml --web-bg 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "conductor run --web-bg exited with code $status"
+            exit 1
+          fi
+          if echo "$output" | grep -qi "already in use"; then
+            echo "launch gate reported a false port conflict (issue #444/#447 regression)"
+            exit 1
+          fi
+          if echo "$output" | grep -qi "did not start within"; then
+            echo "launch gate reported the dashboard never became reachable"
+            exit 1
+          fi
+          if echo "$output" | grep -qi "did not report a run record"; then
+            echo "launch gate reported the child never wrote its run record"
+            exit 1
+          fi

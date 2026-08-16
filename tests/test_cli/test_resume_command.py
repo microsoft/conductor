@@ -533,7 +533,9 @@ class TestLaunchBackgroundResume:
 
         captured: dict[str, list[str]] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:  # type: ignore[no-untyped-def]
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: object
+        ) -> MagicMock:  # type: ignore[no-untyped-def]
             captured["cmd"] = cmd
             proc = MagicMock()
             proc.pid = 12345
@@ -541,7 +543,7 @@ class TestLaunchBackgroundResume:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -584,7 +586,9 @@ class TestLaunchBackgroundResume:
 
         captured: dict[str, list[str]] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:  # type: ignore[no-untyped-def]
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: object
+        ) -> MagicMock:  # type: ignore[no-untyped-def]
             captured["cmd"] = cmd
             proc = MagicMock()
             proc.pid = 12345
@@ -592,7 +596,7 @@ class TestLaunchBackgroundResume:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -743,16 +747,19 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None  # still running
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
-            patch("conductor.fleet.records.read_run_record") as mock_read,
+            patch("conductor.fleet.records.read_run_record", return_value=None) as mock_read,
             pytest.raises(RuntimeError, match="terminated"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
         proc.terminate.assert_called_once()
-        # The dashboard never came up, so the record-poll gate is never reached.
-        mock_read.assert_not_called()
+        # The dashboard never came up, so the record-poll *gate* itself is
+        # never reached -- but issue #447's ``_peek_confirmed_pid`` still
+        # makes one best-effort, opportunistic read to find a trustworthy
+        # termination target before killing the child.
+        mock_read.assert_called_once()
 
     def test_reports_immediate_child_exit(self, tmp_path: Path) -> None:
         """If the child died before the server came up, surface its exit code."""
@@ -766,7 +773,7 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = 7  # exited with code 7
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
             patch("conductor.fleet.records.read_run_record") as mock_read,
             pytest.raises(RuntimeError, match="exited immediately with code 7"),
@@ -794,7 +801,7 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             # Second element is the deadline branch's 1s reachability
             # re-probe, which fails here -- keeping this test on the fatal
             # path.
@@ -822,7 +829,7 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -848,7 +855,7 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -863,14 +870,16 @@ class TestLaunchBackgroundResumeFailures:
         mock_read.assert_called_once_with(launch.run_id)
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
-        """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
+        """Verify ``_spawn_detached`` is called with bg env vars + redirected stdout/stderr.
 
         The child's stdout/stderr must be redirected to log files (NOT
         ``DEVNULL``) so a silent crash leaves a forensic trail. See
-        issue #116.
+        issue #116. Detachment kwargs themselves (``start_new_session`` /
+        Windows job breakaway / ``CREATE_SUSPENDED``) are internal to
+        ``_spawn_detached`` now (issue #447) and are covered directly by
+        ``tests/test_cli/test_bg_runner.py::TestSpawnDetached`` and
+        ``TestDetachmentKwargs`` instead of being re-asserted here.
         """
-        import sys as _sys
-
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -878,16 +887,19 @@ class TestLaunchBackgroundResumeFailures:
 
         captured: dict[str, object] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: object
+        ) -> MagicMock:
             captured.update(kwargs)
             captured["cmd"] = cmd
+            captured["env"] = env
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -901,8 +913,6 @@ class TestLaunchBackgroundResumeFailures:
 
         import subprocess as _sp
 
-        # stdin stays DEVNULL (detached child has no interactive input)
-        assert captured["stdin"] is _sp.DEVNULL
         # stdout/stderr must be redirected to writable text-mode file objects
         # so Python tracebacks and faulthandler dumps from the child survive
         # the parent's exit. DEVNULL is explicitly NOT allowed here.
@@ -915,11 +925,6 @@ class TestLaunchBackgroundResumeFailures:
             assert hasattr(stream, "write"), f"{stream_name} must be a writable file-like"
             assert hasattr(stream, "name"), f"{stream_name} must expose a name attribute"
             assert ".bg." in stream.name and stream.name.endswith(".log")
-        if _sys.platform == "win32":
-            expected_flags = _sp.CREATE_NEW_PROCESS_GROUP | _sp.CREATE_BREAKAWAY_FROM_JOB
-            assert captured["creationflags"] == expected_flags
-        else:
-            assert captured["start_new_session"] is True
         env = captured["env"]
         assert isinstance(env, dict)
         assert env["CONDUCTOR_WEB_BG"] == "1"
@@ -984,7 +989,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1014,15 +1019,17 @@ class TestLaunchBackgroundResumeRunIdAdoption:
 
         captured: dict[str, Any] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
-            captured["env"] = kwargs["env"]
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
+            captured["env"] = env
             proc = MagicMock()
             proc.pid = 6002
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1054,7 +1061,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
                 "conductor.engine.checkpoint.CheckpointManager.find_latest_checkpoint",
                 return_value=cp_path,
             ),
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1081,7 +1088,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1107,7 +1114,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1134,7 +1141,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1173,7 +1180,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1211,7 +1218,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1295,7 +1302,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1330,7 +1337,7 @@ class TestLaunchBackgroundResumeRunIdAdoption:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",

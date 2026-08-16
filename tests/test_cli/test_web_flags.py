@@ -366,7 +366,9 @@ class TestLaunchBackgroundSilentFlag:
 
         captured: dict[str, list[str]] = {}
 
-        def _fake_popen(cmd: list[str], **_kwargs: object) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **_kwargs: object
+        ) -> MagicMock:
             captured["cmd"] = cmd
             proc = MagicMock()
             proc.pid = 12345
@@ -374,7 +376,7 @@ class TestLaunchBackgroundSilentFlag:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",

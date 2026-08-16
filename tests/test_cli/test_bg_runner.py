@@ -42,6 +42,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -130,6 +131,54 @@ class TestIsBreakawayDenied:
 # ---------------------------------------------------------------------------
 
 
+def _make_windows_mocks(*, create_process_side_effect: Any = None) -> tuple[MagicMock, MagicMock]:
+    """Build MagicMocks standing in for ``_winapi``/``_kernel32`` on Windows.
+
+    Sufficient to drive ``_spawn_detached_windows``/``_terminate_child``'s
+    Windows path without a real Windows host: constants, ``CreateProcess``
+    returning a ``(hp, ht, pid, tid)`` tuple, and the job-object primitives
+    all succeeding by default.
+    """
+    winapi = MagicMock()
+    winapi.STARTF_USESTDHANDLES = 0x100
+    winapi.DUPLICATE_SAME_ACCESS = 0x2
+    winapi.GetCurrentProcess.return_value = -1
+    _handle_counter = iter(range(1000, 2000))
+    winapi.DuplicateHandle.side_effect = lambda *a, **k: next(_handle_counter)
+    if create_process_side_effect is not None:
+        winapi.CreateProcess.side_effect = create_process_side_effect
+    else:
+        winapi.CreateProcess.return_value = (5001, 5002, 4321, 1)
+
+    kernel32 = MagicMock()
+    kernel32.CreateJobObjectW.return_value = 6001
+    kernel32.AssignProcessToJobObject.return_value = True
+    kernel32.SetInformationJobObject.return_value = True
+    kernel32.ResumeThread.return_value = 1
+    kernel32.TerminateJobObject.return_value = True
+    kernel32.CloseHandle.return_value = True
+    return winapi, kernel32
+
+
+@contextlib.contextmanager
+def _patched_windows_platform(winapi: MagicMock, kernel32: MagicMock) -> Any:
+    """Patch ``sys.platform``, ``_winapi``, ``_kernel32``, and ``msvcrt``.
+
+    ``msvcrt`` is patched with a trivial ``get_osfhandle`` that returns the
+    fd itself (any int is fine — ``DuplicateHandle`` is what produces the
+    "real" inheritable handle in these tests).
+    """
+    msvcrt_mock = MagicMock()
+    msvcrt_mock.get_osfhandle.side_effect = lambda fd: fd
+    with (
+        patch.object(bg_runner.sys, "platform", "win32"),
+        patch.object(bg_runner, "_winapi", winapi),
+        patch.object(bg_runner, "_kernel32", kernel32),
+        patch.object(bg_runner, "msvcrt", msvcrt_mock),
+    ):
+        yield
+
+
 class TestSpawnDetached:
     """Behavior of ``_spawn_detached`` across platforms and failure modes."""
 
@@ -156,65 +205,91 @@ class TestSpawnDetached:
         assert kwargs["stderr"] is subprocess.DEVNULL
         assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["env"] == {"X": "1"}
+        assert proc.pid in bg_runner._SPAWNED_GROUP_LEADERS
 
-    def test_windows_happy_path_includes_breakaway(self) -> None:
-        captured: dict[str, Any] = {}
+    def test_windows_happy_path_includes_breakaway_and_suspended(self) -> None:
+        winapi, kernel32 = _make_windows_mocks()
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
-            captured["cmd"] = cmd
-            captured["kwargs"] = kwargs
-            return MagicMock(pid=4321)
-
-        with (
-            patch.object(bg_runner.sys, "platform", "win32"),
-            patch.object(bg_runner.subprocess, "Popen", side_effect=_fake_popen) as mock_popen,
-        ):
+        with _patched_windows_platform(winapi, kernel32):
             proc = bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
 
         assert proc.pid == 4321
-        mock_popen.assert_called_once()
-        flags = captured["kwargs"]["creationflags"]
-        assert flags == (bg_runner._CREATE_NEW_PROCESS_GROUP | bg_runner._CREATE_BREAKAWAY_FROM_JOB)
+        winapi.CreateProcess.assert_called_once()
+        call = winapi.CreateProcess.call_args
+        creationflags = call.args[5]
+        assert creationflags & bg_runner._CREATE_NEW_PROCESS_GROUP
+        assert creationflags & bg_runner._CREATE_BREAKAWAY_FROM_JOB
+        assert creationflags & bg_runner._CREATE_SUSPENDED
+
+    def test_windows_happy_path_assigns_job_and_resumes_in_order(self) -> None:
+        winapi, kernel32 = _make_windows_mocks()
+        order: list[str] = []
+        kernel32.CreateJobObjectW.side_effect = lambda *a: (order.append("create_job"), 6001)[1]
+        kernel32.AssignProcessToJobObject.side_effect = lambda *a: (
+            order.append("assign"),
+            True,
+        )[1]
+        kernel32.ResumeThread.side_effect = lambda *a: (order.append("resume"), 1)[1]
+
+        with _patched_windows_platform(winapi, kernel32):
+            proc = bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
+
+        assert order == ["create_job", "assign", "resume"]
+        kernel32.AssignProcessToJobObject.assert_called_once_with(6001, 5001)
+        assert proc.pid == 4321
+
+    def test_windows_resume_thread_still_called_when_job_creation_fails(self) -> None:
+        winapi, kernel32 = _make_windows_mocks()
+        kernel32.CreateJobObjectW.return_value = 0  # failure sentinel
+
+        with _patched_windows_platform(winapi, kernel32):
+            bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
+
+        kernel32.ResumeThread.assert_called_once()
+        kernel32.AssignProcessToJobObject.assert_not_called()
+
+    def test_windows_resume_thread_still_called_when_assignment_fails(self) -> None:
+        winapi, kernel32 = _make_windows_mocks()
+        kernel32.AssignProcessToJobObject.return_value = False
+
+        with _patched_windows_platform(winapi, kernel32):
+            bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
+
+        kernel32.ResumeThread.assert_called_once()
 
     def test_windows_breakaway_denied_falls_back_and_warns(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """When the parent's job forbids breakaway, retry without the flag.
 
-        - First Popen call requests breakaway and raises OSError(winerror=5).
-        - Second Popen call must NOT include CREATE_BREAKAWAY_FROM_JOB.
+        - First CreateProcess call requests breakaway and raises
+          OSError(winerror=5).
+        - Second call must NOT include CREATE_BREAKAWAY_FROM_JOB (but must
+          keep CREATE_SUSPENDED, since the job-assignment sequence still
+          applies on the fallback path).
         - A user-visible warning must be written to stderr.
         """
-        success_proc = MagicMock(pid=999)
-        popen_kwargs: list[dict[str, Any]] = []
+        calls: list[Any] = []
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
-            popen_kwargs.append(kwargs)
-            if len(popen_kwargs) == 1:
+        def _create_process(*args: Any) -> tuple[int, int, int, int]:
+            calls.append(args)
+            if len(calls) == 1:
                 raise _make_breakaway_denied_error()
-            return success_proc
+            return (5001, 5002, 4321, 1)
 
-        with (
-            patch.object(bg_runner.sys, "platform", "win32"),
-            patch.object(bg_runner.subprocess, "Popen", side_effect=_fake_popen) as mock_popen,
-        ):
+        winapi, kernel32 = _make_windows_mocks(create_process_side_effect=_create_process)
+
+        with _patched_windows_platform(winapi, kernel32):
             proc = bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
 
-        assert proc is success_proc
-        assert mock_popen.call_count == 2
-
-        # First attempt requested breakaway.
-        first = popen_kwargs[0]
-        assert first["creationflags"] & bg_runner._CREATE_BREAKAWAY_FROM_JOB
-        # Second attempt is plain CREATE_NEW_PROCESS_GROUP, no breakaway.
-        second = popen_kwargs[1]
-        assert second["creationflags"] == bg_runner._CREATE_NEW_PROCESS_GROUP
-        assert not (second["creationflags"] & bg_runner._CREATE_BREAKAWAY_FROM_JOB)
-        # Stdio + env preserved across the retry.
-        assert second["stdout"] is subprocess.DEVNULL
-        assert second["stderr"] is subprocess.DEVNULL
-        assert second["stdin"] is subprocess.DEVNULL
-        assert second["env"] == {"X": "1"}
+        assert proc.pid == 4321
+        assert len(calls) == 2
+        first_flags = calls[0][5]
+        second_flags = calls[1][5]
+        assert first_flags & bg_runner._CREATE_BREAKAWAY_FROM_JOB
+        assert not (second_flags & bg_runner._CREATE_BREAKAWAY_FROM_JOB)
+        assert second_flags & bg_runner._CREATE_NEW_PROCESS_GROUP
+        assert second_flags & bg_runner._CREATE_SUSPENDED
 
         captured = capsys.readouterr()
         assert "warning" in captured.err.lower()
@@ -225,15 +300,16 @@ class TestSpawnDetached:
     def test_windows_non_breakaway_oserror_propagates(self) -> None:
         """OSErrors other than ERROR_ACCESS_DENIED must propagate without retry."""
         not_found = _make_file_not_found_error()
+        winapi, kernel32 = _make_windows_mocks(create_process_side_effect=not_found)
+
         with (
-            patch.object(bg_runner.sys, "platform", "win32"),
-            patch.object(bg_runner.subprocess, "Popen", side_effect=not_found) as mock_popen,
+            _patched_windows_platform(winapi, kernel32),
             pytest.raises(FileNotFoundError),
         ):
             bg_runner._spawn_detached(["nonexistent.exe"], {})
 
         # Exactly one attempt — no fallback retry.
-        mock_popen.assert_called_once()
+        winapi.CreateProcess.assert_called_once()
 
     def test_posix_oserror_propagates_without_retry(self) -> None:
         """POSIX never has a breakaway concept; OSErrors must propagate."""
@@ -246,6 +322,29 @@ class TestSpawnDetached:
             bg_runner._spawn_detached(["python", "-c", "pass"], {})
 
         mock_popen.assert_called_once()
+
+
+class TestSpawnDetachedWindowsTerminateTree:
+    """``_WindowsDetachedProcess.terminate_tree`` calls ``TerminateJobObject``."""
+
+    def test_terminate_tree_calls_terminate_job_object(self) -> None:
+        winapi, kernel32 = _make_windows_mocks()
+
+        with _patched_windows_platform(winapi, kernel32):
+            proc = bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
+            proc.terminate_tree()
+
+        kernel32.TerminateJobObject.assert_called_once_with(6001, 1)
+
+    def test_terminate_tree_is_noop_when_job_was_never_created(self) -> None:
+        winapi, kernel32 = _make_windows_mocks()
+        kernel32.CreateJobObjectW.return_value = 0
+
+        with _patched_windows_platform(winapi, kernel32):
+            proc = bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"})
+            proc.terminate_tree()
+
+        kernel32.TerminateJobObject.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +517,194 @@ class TestCreationFlagConstants:
 
         assert bg_runner._CREATE_NEW_PROCESS_GROUP == subprocess.CREATE_NEW_PROCESS_GROUP
         assert bg_runner._CREATE_BREAKAWAY_FROM_JOB == subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+
+# ---------------------------------------------------------------------------
+# _terminate_child (issue #447): terminating the process *tree*, not just
+# proc.pid, plus honestly reporting when termination could not be confirmed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree kill only")
+class TestTerminateChild:
+    """``_terminate_child``'s POSIX process-tree kill and confirmation sweep."""
+
+    def test_kills_real_process_tree_spawned_via_spawn_detached(self) -> None:
+        """Regression test for issue #447: a real two-level process tree,
+        spawned through the actual ``_spawn_detached`` production seam (so
+        ``_SPAWNED_GROUP_LEADERS`` is populated the same way a real launch
+        would populate it), must have BOTH levels dead afterwards -- the
+        previous behavior (``proc.terminate()`` on the outer handle alone)
+        would leave the inner descendant running.
+        """
+        script = (
+            "import subprocess, sys, time; "
+            "p = subprocess.Popen([sys.executable, '-c', "
+            "'import os,sys,time; print(os.getpid(), flush=True); time.sleep(30)'], "
+            "stdout=subprocess.PIPE, text=True); "
+            "line = p.stdout.readline(); "
+            "sys.stdout.write(line); sys.stdout.flush(); "
+            "time.sleep(30)"
+        )
+        proc = bg_runner._spawn_detached(
+            [sys.executable, "-c", script], dict(os.environ), stdout=subprocess.PIPE
+        )
+        assert isinstance(proc, subprocess.Popen)
+        inner_pid: int | None = None
+        try:
+            assert proc.stdout is not None
+            sel = selectors.DefaultSelector()
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            try:
+                if not sel.select(timeout=10.0):
+                    pytest.fail("nested interpreter did not report its pid within 10s")
+            finally:
+                sel.close()
+            line = proc.stdout.readline()
+            if not line:
+                pytest.fail("nested interpreter closed its stdout without reporting a pid")
+            inner_pid = int(line.strip())
+
+            outcome = bg_runner._terminate_child(proc)
+
+            assert outcome.confirmed is True
+            assert outcome.surviving_pids == ()
+            # The real regression check: the tree kill (os.killpg) must have
+            # reached the *inner* descendant too, not just the outer proc.
+            deadline = time.monotonic() + 5.0
+            inner_alive = True
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(inner_pid, 0)
+                except ProcessLookupError:
+                    inner_alive = False
+                    break
+                time.sleep(0.1)
+            assert not inner_alive, "inner descendant survived _terminate_child"
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    proc.wait(timeout=5.0)
+            if inner_pid is not None:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(inner_pid, signal.SIGKILL)
+
+    def test_confirmed_child_pid_is_killed_when_not_a_descendant(self) -> None:
+        """A ``confirmed_child_pid`` that is a genuinely separate process
+        (the trampoline case, where the outer ``proc`` is only a shim) must
+        be terminated too, even though it is not in the outer process's own
+        tree."""
+        proc = MagicMock()
+        proc.pid = 999999999  # not a real pid; poll() reports it as dead
+        proc.poll.return_value = 0
+
+        other = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        # Reap ``other`` as soon as it dies so a SIGKILL delivered inside
+        # ``_terminate_child``'s sweep doesn't leave a zombie that a plain
+        # ``os.kill(pid, 0)`` liveness probe would still see as "alive"
+        # (we are ``other``'s direct parent here, unlike the real
+        # trampoline case this is standing in for).
+        reaper = threading.Thread(target=other.wait, daemon=True)
+        reaper.start()
+        try:
+            outcome = bg_runner._terminate_child(proc, confirmed_child_pid=other.pid)
+
+            assert outcome.confirmed is True
+            assert other.pid not in outcome.surviving_pids
+            deadline = time.monotonic() + 5.0
+            alive = True
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(other.pid, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.1)
+            assert not alive
+        finally:
+            if other.poll() is None:
+                with contextlib.suppress(Exception):
+                    other.kill()
+                    other.wait(timeout=5.0)
+
+    def test_reports_unconfirmed_when_liveness_check_keeps_reporting_alive(self) -> None:
+        """When the final sweep cannot confirm death, the outcome must name
+        the surviving pid rather than silently claiming success."""
+        proc = MagicMock()
+        proc.pid = 4242
+        proc.poll.return_value = None
+        proc.terminate.side_effect = Exception("boom")
+
+        with (
+            patch("conductor.cli.pid.is_process_alive", return_value=True),
+            patch("conductor.cli.pid.terminate_process") as mock_terminate_process,
+        ):
+            outcome = bg_runner._terminate_child(proc)
+
+        assert outcome.confirmed is False
+        assert outcome.surviving_pids == (4242,)
+        mock_terminate_process.assert_called_once_with(4242, timeout=2.0)
+
+    def test_does_not_killpg_a_pid_this_module_never_spawned(self) -> None:
+        """The ``os.killpg`` footgun guard: a pid this module did not itself
+        register as a spawned group leader must never be passed to
+        ``os.killpg``, even if it happens to still look "alive" (e.g. a
+        stale ``MagicMock(pid=1)`` from an unrelated test)."""
+        proc = MagicMock()
+        proc.pid = 1  # deliberately NOT in _SPAWNED_GROUP_LEADERS
+        proc.poll.return_value = None
+
+        assert 1 not in bg_runner._SPAWNED_GROUP_LEADERS
+
+        with (
+            patch("os.killpg") as mock_killpg,
+            patch("conductor.cli.pid.is_process_alive", return_value=False),
+        ):
+            bg_runner._terminate_child(proc)
+
+        mock_killpg.assert_not_called()
+
+
+class TestTerminationNote:
+    """``_termination_note`` renders the confirmed/unconfirmed message halves."""
+
+    def test_confirmed_renders_terminated_message(self) -> None:
+        outcome = bg_runner._TerminationOutcome(confirmed=True, surviving_pids=())
+        note = bg_runner._termination_note(outcome, web_port=9000)
+        assert "terminated" in note.lower()
+
+    def test_unconfirmed_names_surviving_pids_and_stop_command(self) -> None:
+        outcome = bg_runner._TerminationOutcome(confirmed=False, surviving_pids=(111, 222))
+        note = bg_runner._termination_note(outcome, web_port=9001)
+        assert "111" in note
+        assert "222" in note
+        assert "conductor stop --port 9001" in note
+        assert "could not confirm termination" in note.lower()
+
+
+class TestCleanupRecordAfterTermination:
+    """``_cleanup_record_after_termination`` only removes a confirmed-dead pid's record."""
+
+    def test_removes_record_when_candidate_pid_is_dead(self) -> None:
+        outcome = bg_runner._TerminationOutcome(confirmed=True, surviving_pids=())
+        with patch.object(bg_runner, "_remove_dead_child_record") as mock_remove:
+            bg_runner._cleanup_record_after_termination("deadbeef", outcome, 111)
+        mock_remove.assert_called_once_with("deadbeef", 111)
+
+    def test_preserves_record_when_candidate_pid_survived(self) -> None:
+        outcome = bg_runner._TerminationOutcome(confirmed=False, surviving_pids=(111,))
+        with patch.object(bg_runner, "_remove_dead_child_record") as mock_remove:
+            bg_runner._cleanup_record_after_termination("deadbeef", outcome, 111)
+        mock_remove.assert_not_called()
+
+    def test_noop_when_candidate_pid_is_none(self) -> None:
+        outcome = bg_runner._TerminationOutcome(confirmed=True, surviving_pids=())
+        with patch.object(bg_runner, "_remove_dead_child_record") as mock_remove:
+            bg_runner._cleanup_record_after_termination("deadbeef", outcome, None)
+        mock_remove.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1053,7 +1340,7 @@ class TestTrampolinePidMismatchEndToEnd:
             )
 
         assert "42424" in str(exc_info.value)
-        mock_terminate.assert_called_once_with(fake_proc)
+        mock_terminate.assert_called_once_with(fake_proc, confirmed_child_pid=1)
 
 
 # ---------------------------------------------------------------------------
@@ -1345,14 +1632,16 @@ class TestLaunchBackgroundDiagnostics:
 
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 1234
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1387,7 +1676,9 @@ class TestLaunchBackgroundDiagnostics:
 
         captured: dict[str, Any] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             captured.update(kwargs)
             proc = MagicMock()
             proc.pid = 1
@@ -1395,7 +1686,7 @@ class TestLaunchBackgroundDiagnostics:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1409,7 +1700,9 @@ class TestLaunchBackgroundDiagnostics:
                 web_port=9301,
             )
 
-        assert captured["stdin"] is subprocess.DEVNULL  # no interactive input
+        assert (
+            captured.get("stdin", subprocess.DEVNULL) is subprocess.DEVNULL
+        )  # no interactive input
         for stream_name in ("stdout", "stderr"):
             stream = captured[stream_name]
             assert stream is not subprocess.DEVNULL
@@ -1429,7 +1722,9 @@ class TestLaunchBackgroundDiagnostics:
 
         captured: dict[str, Any] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             captured["stdout"] = kwargs["stdout"]
             captured["stderr"] = kwargs["stderr"]
             proc = MagicMock()
@@ -1438,7 +1733,7 @@ class TestLaunchBackgroundDiagnostics:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1463,7 +1758,9 @@ class TestLaunchBackgroundDiagnostics:
 
         captured: dict[str, Any] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             captured["stdout"] = kwargs["stdout"]
             captured["stderr"] = kwargs["stderr"]
             proc = MagicMock()
@@ -1473,7 +1770,7 @@ class TestLaunchBackgroundDiagnostics:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1504,15 +1801,17 @@ class TestLaunchBackgroundDiagnostics:
 
         captured: dict[str, Any] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
-            captured["env"] = kwargs["env"]
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
+            captured["env"] = env
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1550,14 +1849,16 @@ class TestLaunchBackgroundDiagnostics:
 
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 4321
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1584,14 +1885,16 @@ class TestLaunchBackgroundDiagnostics:
 
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = 42  # immediate exit code 42
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -1619,14 +1922,16 @@ class TestLaunchBackgroundDiagnostics:
 
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None  # still running
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
             patch("conductor.cli.bg_runner._terminate_child"),
             patch(
@@ -2442,14 +2747,15 @@ class TestFinalizeBackgroundLaunchStageTwo:
 
         mock_remove.assert_called_once_with("deadbeef", 222)
 
-    def test_port_conflict_removes_record_and_raises_naming_port(self, tmp_path: Path) -> None:
+    def test_port_conflict_removes_confirmed_pid_record_when_dead(self, tmp_path: Path) -> None:
         proc = self._make_proc(pid=111)
 
         # A record pid distinct from ``proc.pid`` (confirmed via freshness,
-        # not pid equality) so the assertion below pins that this path is
-        # deliberately still keyed on ``proc.pid`` (issue #444's
-        # orphan-preservation rationale), not the confirmed pid -- rather
-        # than passing merely because the two are equal.
+        # not pid equality) -- #447 keys cleanup on the *confirmed* pid,
+        # the one actually running the workflow under a trampoline, rather
+        # than the deliberately-preserved ``proc.pid`` used before #447
+        # (when termination reached only ``proc.pid`` and could not
+        # confirm anything about the confirmed pid at all).
         fresh_started_at = (self._launched_at() + timedelta(seconds=1)).isoformat()
         record = MagicMock(pid=222, mode="bg", port=9425, started_at=fresh_started_at)
 
@@ -2467,7 +2773,11 @@ class TestFinalizeBackgroundLaunchStageTwo:
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch("conductor.fleet.records.read_run_record", return_value=record),
             patch.object(bg_runner, "_remove_dead_child_record") as mock_remove,
-            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(
+                bg_runner,
+                "_terminate_child",
+                return_value=bg_runner._TerminationOutcome(confirmed=True, surviving_pids=()),
+            ) as mock_terminate,
             patch.object(
                 bg_runner,
                 "_wait_for_workflow_start",
@@ -2482,8 +2792,47 @@ class TestFinalizeBackgroundLaunchStageTwo:
         assert "9425" in str(exc_info.value)
         assert "999" in str(exc_info.value)
         assert "--web-port" in str(exc_info.value)
-        mock_terminate.assert_called_once_with(proc)
-        mock_remove.assert_called_once_with("deadbeef", proc.pid)
+        mock_terminate.assert_called_once_with(proc, confirmed_child_pid=222)
+        mock_remove.assert_called_once_with("deadbeef", 222)
+
+    def test_port_conflict_preserves_record_when_confirmed_pid_survives(
+        self, tmp_path: Path
+    ) -> None:
+        """A survivor keeps its run record -- ``conductor stop``'s only handle on it."""
+        proc = self._make_proc(pid=111)
+        fresh_started_at = (self._launched_at() + timedelta(seconds=1)).isoformat()
+        record = MagicMock(pid=222, mode="bg", port=9440, started_at=fresh_started_at)
+
+        def _fake_wait_for_start(
+            *args: Any, last_seen_info: dict[str, Any] | None = None, **kwargs: Any
+        ) -> bg_runner.StartProbe:
+            if last_seen_info is not None:
+                last_seen_info.update({"pid": 999})
+            return bg_runner.StartProbe.PORT_CONFLICT
+
+        with (
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.fleet.records.read_run_record", return_value=record),
+            patch.object(bg_runner, "_remove_dead_child_record") as mock_remove,
+            patch.object(
+                bg_runner,
+                "_terminate_child",
+                return_value=bg_runner._TerminationOutcome(confirmed=False, surviving_pids=(222,)),
+            ),
+            patch.object(
+                bg_runner,
+                "_wait_for_workflow_start",
+                side_effect=_fake_wait_for_start,
+            ),
+            pytest.raises(RuntimeError, match="already in use") as exc_info,
+        ):
+            bg_runner._finalize_background_launch(
+                proc, 9440, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
+            )
+
+        assert "could not confirm termination" in str(exc_info.value).lower()
+        assert "222" in str(exc_info.value)
+        mock_remove.assert_not_called()
 
     def test_stderr_tail_included_in_child_exited_error(self, tmp_path: Path) -> None:
         proc = self._make_proc()
@@ -2538,14 +2887,16 @@ class TestSpawnBgChildPropagatesWorkflowStarted:
     def test_workflow_started_false_reaches_background_launch(self, tmp_path: Path) -> None:
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -2566,14 +2917,16 @@ class TestSpawnBgChildPropagatesWorkflowStarted:
     def test_workflow_started_true_by_default(self, tmp_path: Path) -> None:
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -2605,14 +2958,16 @@ class TestSpawnBgChildPropagatesStillRunning:
     def test_still_running_true_when_child_alive(self, tmp_path: Path) -> None:
         wf_path = _write_workflow(tmp_path)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -2637,11 +2992,13 @@ class TestSpawnBgChildPropagatesStillRunning:
         fake_proc = MagicMock()
         fake_proc.pid = 1
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             return fake_proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",
@@ -2673,11 +3030,13 @@ class TestSpawnBgChildPropagatesStillRunning:
         fake_proc.pid = 1
         fake_proc.poll.return_value = 0
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             return fake_proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch.object(bg_runner, "_wait_for_server", return_value=False),
             patch("conductor.fleet.records.read_run_record") as mock_read,
             patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
@@ -2716,11 +3075,13 @@ class TestSpawnBgChildPropagatesStillRunning:
         _poll = iter([None])
         fake_proc.poll.side_effect = lambda: next(_poll, 1)
 
-        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
             return fake_proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch.object(bg_runner, "_spawn_detached", side_effect=_fake_popen),
             patch.object(bg_runner, "_wait_for_server", return_value=True),
             patch(
                 "conductor.fleet.records.read_run_record",

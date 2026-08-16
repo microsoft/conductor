@@ -67,20 +67,52 @@ since the workflow may simply be slow to start (plugin fetch, MCP server
 startup, provider connection). There is no parent-side PID file: the
 child writes its own fleet run record (Fleet Manager D2), which is what
 stage one-and-a-half polls for.
+
+**Terminating the process tree, not just ``Popen.pid`` (issue #447):**
+every failure branch of the readiness gate above eventually needs to
+clean up a still-running child, and doing that by calling ``terminate()``
+on the spawned :class:`subprocess.Popen` handle alone is unsound under a
+trampoline ``sys.executable`` (issue #444's Q1) -- the pid that ends up
+running the workflow is not always the pid this module spawned, so
+terminating only the latter can leave the former orphaned and still
+burning tokens. :func:`_terminate_child` therefore kills the whole
+*process tree* before falling back to the single-handle ladder: on
+Windows, the child is created suspended and immediately assigned to a
+fresh job object (see :func:`_spawn_detached_windows`,
+:class:`_WindowsDetachedProcess`) with ``JOB_OBJECT_LIMIT_BREAKAWAY_OK``
+set but **not** ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` (the job must
+survive the launcher exiting -- that's the entire point of
+``--web-bg``), so ``TerminateJobObject`` reaches every process the child
+spawned, however many exec layers deep; on POSIX,
+``start_new_session=True`` already makes the child a process-group
+leader, so ``os.killpg`` is the equivalent, gated by a registry
+(:data:`_SPAWNED_GROUP_LEADERS`) of pids this module actually spawned so
+it is never called against an arbitrary pid. After the tree kill and the
+single-handle ladder, a final identity-checked sweep
+(``conductor.cli.pid.is_process_alive``/``terminate_process``) confirms
+the outcome rather than assuming it, naming any pid that survives in a
+:class:`_TerminationOutcome` instead of unconditionally claiming success.
+:func:`_cleanup_record_after_termination` only removes a child's run
+record once its pid is confirmed dead by that sweep, so a surviving
+orphan keeps the run record that is ``conductor stop``'s only remaining
+handle on it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -115,6 +147,107 @@ _CREATE_BREAKAWAY_FROM_JOB: int = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB
 # called with ``CREATE_BREAKAWAY_FROM_JOB`` and the parent's job object has
 # ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` cleared (some hardened CI environments).
 _ERROR_ACCESS_DENIED = 5
+
+# ``CREATE_SUSPENDED`` — the child's primary thread never starts running
+# until ``ResumeThread`` is called. This is what lets the Windows spawn path
+# (below) assign the child to a job object *before* it can run and
+# potentially re-exec through a trampoline ``sys.executable`` out of the
+# job's reach (issue #447). ``subprocess`` has no public name for this flag.
+_CREATE_SUSPENDED = 0x00000004
+
+# ``STILL_ACTIVE`` / ``WAIT_TIMEOUT`` — duplicated from ``cli/pid.py`` rather
+# than imported (those names are private to that module and this one has no
+# other reason to import it at module scope). Values are the same Win32 SDK
+# constants documented there.
+_STILL_ACTIVE = 259
+_WAIT_TIMEOUT = 0x00000102
+
+# Job-object limit flags and info-class constant used to create a job with
+# ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` set and, deliberately,
+# ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` NOT set -- see ``_create_job_object``.
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JobObjectExtendedLimitInformation = 9
+
+if sys.platform == "win32":
+    import _winapi
+    import msvcrt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    _kernel32.ResumeThread.restype = wintypes.DWORD
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _kernel32.WaitForSingleObject.restype = wintypes.DWORD
+else:
+    # ``_winapi``/``msvcrt`` don't exist off Windows at all (not even as
+    # importable stubs), so this module can't `import` them unconditionally.
+    # Tests patch these two symbols (plus ``sys.platform``) to exercise the
+    # Windows spawn/termination path from any host -- the same convention
+    # ``cli/pid.py`` uses for ``_kernel32``.
+    _winapi = None
+    msvcrt = None
+    _kernel32 = None
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    """``JOBOBJECT_BASIC_LIMIT_INFORMATION`` -- only ``LimitFlags`` is set."""
+
+    _fields_ = (
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    )
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    """``IO_COUNTERS`` -- required padding for ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION``."""
+
+    _fields_ = (
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    )
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    """``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` -- the struct ``SetInformationJobObject`` needs."""
+
+    _fields_ = (
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    )
+
 
 # NOTE: run-id format validation here defers to
 # ``conductor.run_id.is_valid_run_id`` -- the single shared contract also
@@ -175,6 +308,331 @@ def _is_breakaway_denied(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) == _ERROR_ACCESS_DENIED
 
 
+# Pids this module has itself spawned as a POSIX process-group leader (via
+# ``start_new_session=True``). ``_terminate_child`` (below) only calls
+# ``os.killpg`` against a pid found here -- never against an arbitrary pid a
+# caller hands in -- because ``os.killpg(1, SIGKILL)`` against, say, a stale
+# ``MagicMock(pid=1)`` in a test, or a pid recycled by the OS onto an
+# unrelated process, would be a real (if rare) footgun. Membership only ever
+# grows; a pid is never removed, since a dead pid re-added later by the OS
+# recycling it is out of scope for this module (the same accepted risk as
+# every other liveness probe in this codebase).
+_SPAWNED_GROUP_LEADERS: set[int] = set()
+
+
+class _StartupInfo:
+    """Duck-typed stand-in for ``subprocess.STARTUPINFO``.
+
+    That class only exists in the standard library's ``subprocess`` module
+    on Windows (it's defined inside an ``if _mswindows:`` block), so it
+    can't be constructed here for cross-platform unit testing -- patching
+    ``_winapi``/``sys.platform`` (this module's test convention, mirroring
+    ``cli/pid.py``) doesn't help, since the class itself is simply absent
+    from ``subprocess`` on POSIX. ``_winapi.CreateProcess`` reads its
+    ``startup_info`` argument via plain attribute access
+    (``dwFlags``/``hStdInput``/``hStdOutput``/``hStdError``/``wShowWindow``/
+    ``lpAttributeList``), so any object exposing them works.
+    """
+
+    def __init__(self) -> None:
+        self.dwFlags = 0
+        self.hStdInput: int | None = None
+        self.hStdOutput: int | None = None
+        self.hStdError: int | None = None
+        self.wShowWindow = 0
+        self.lpAttributeList: dict[str, Any] = {}
+
+
+def _create_job_object() -> int | None:
+    """Create a Windows job object with ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` set.
+
+    Deliberately does NOT set ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``: the
+    whole point of ``--web-bg`` is that the tree outlives the launcher, so
+    the job must not tear the tree down when the launcher's own handle to
+    it is closed (see ``_release_child_handles``). ``BREAKAWAY_OK`` is set
+    so a nested ``--web-bg`` launched from inside this workflow still gets
+    its own breakaway, matching today's behavior, instead of tripping
+    ``_is_breakaway_denied``'s warning path against conductor's own job.
+
+    Never raises: a launcher that cannot create a job object should still
+    spawn the child (degrading to the pre-#447 best-effort termination)
+    rather than fail the whole launch over a missing durable-kill
+    guarantee.
+
+    Returns:
+        The job handle, or ``None`` on any failure.
+    """
+    if _kernel32 is None:
+        return None
+    try:
+        job = _kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        ok = _kernel32.SetInformationJobObject(
+            job,
+            _JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            _kernel32.CloseHandle(job)
+            return None
+        return job
+    except OSError:
+        logger.debug("Failed to create Windows job object for bg child", exc_info=True)
+        return None
+
+
+class _WindowsDetachedProcess:
+    """``subprocess.Popen``-shaped wrapper around a directly-created Windows child.
+
+    ``subprocess.Popen`` cannot be reused for the suspend-assign-resume
+    sequence :func:`_spawn_detached_windows` needs (issue #447, Q1):
+    CPython's Windows ``_execute_child`` closes the child's primary thread
+    handle (``_winapi.CloseHandle(ht)``) before ``Popen.__init__`` returns,
+    so there is no handle left to call ``ResumeThread`` on by the time a
+    caller could assign the process to a job object. This class exposes
+    only the ``Popen`` surface this module actually uses -- ``pid``,
+    ``poll()``, ``wait()``, ``terminate()``/``kill()`` -- plus
+    ``terminate_tree()`` (kills the whole job, not just this one process)
+    and ``close()`` (releases the retained handles once the launch gate no
+    longer needs them; see ``_release_child_handles``).
+    """
+
+    def __init__(self, *, pid: int, h_process: int, h_job: int | None) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self._h_process: int | None = h_process
+        self._h_job: int | None = h_job
+
+    def poll(self) -> int | None:
+        """Return the exit code if the process has exited, else ``None``."""
+        if self.returncode is not None:
+            return self.returncode
+        assert _kernel32 is not None and self._h_process is not None
+        exit_code = wintypes.DWORD()
+        if not _kernel32.GetExitCodeProcess(self._h_process, ctypes.byref(exit_code)):
+            return None
+        if exit_code.value == _STILL_ACTIVE:
+            return None
+        self.returncode = exit_code.value
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Block until the process exits, raising ``TimeoutExpired`` like ``Popen.wait``."""
+        if self.returncode is not None:
+            return self.returncode
+        assert _kernel32 is not None and self._h_process is not None
+        timeout_ms = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+        result = _kernel32.WaitForSingleObject(self._h_process, timeout_ms)
+        if result == _WAIT_TIMEOUT:
+            raise subprocess.TimeoutExpired(cmd="<detached child>", timeout=timeout or 0.0)
+        code = self.poll()
+        return code if code is not None else 0
+
+    def terminate(self) -> None:
+        """Terminate this single process (not the tree) -- mirrors ``Popen.terminate``."""
+        assert _kernel32 is not None and self._h_process is not None
+        with contextlib.suppress(OSError):
+            _kernel32.TerminateProcess(self._h_process, 1)
+
+    kill = terminate
+
+    def terminate_tree(self) -> None:
+        """Terminate every process in this child's job, not just this one (issue #447)."""
+        if self._h_job is None or _kernel32 is None:
+            return
+        with contextlib.suppress(OSError):
+            _kernel32.TerminateJobObject(self._h_job, 1)
+
+    def close(self) -> None:
+        """Release the retained process/job handles (see ``_release_child_handles``)."""
+        if _kernel32 is None:
+            return
+        if self._h_process is not None:
+            with contextlib.suppress(OSError):
+                _kernel32.CloseHandle(self._h_process)
+            self._h_process = None
+        if self._h_job is not None:
+            with contextlib.suppress(OSError):
+                _kernel32.CloseHandle(self._h_job)
+            self._h_job = None
+
+
+# The type this module's spawn/termination helpers accept and return: a
+# genuine ``subprocess.Popen`` on POSIX, or the ``Popen``-shaped
+# ``_WindowsDetachedProcess`` on Windows (issue #447).
+_DetachedChild = subprocess.Popen[Any] | _WindowsDetachedProcess
+
+
+def _resolve_stdio_handle(stream: Any, *, for_write: bool) -> int:
+    """Return an inheritable Windows handle for a Popen-style stdio argument.
+
+    Mirrors what ``subprocess.Popen._get_handles``/``_make_inheritable`` do
+    on Windows: resolve the stream to a raw OS handle, then duplicate it as
+    inheritable via ``DuplicateHandle`` (the duplicate is what actually
+    gets inherited; the original is left untouched here and closed by the
+    caller once ``CreateProcess`` returns).
+
+    Args:
+        stream: Either ``subprocess.DEVNULL`` or an open file-like object
+            with a ``fileno()`` method (this module never passes
+            ``subprocess.PIPE`` to a detached child).
+        for_write: Whether a freshly-opened ``os.devnull`` should be opened
+            for writing (stdout/stderr) or reading (stdin).
+
+    Returns:
+        An inheritable duplicate handle.
+    """
+    assert _winapi is not None and msvcrt is not None
+    if stream is subprocess.DEVNULL:
+        flags = os.O_WRONLY if for_write else os.O_RDONLY
+        fd = os.open(os.devnull, flags)
+        try:
+            raw_handle = msvcrt.get_osfhandle(fd)
+            return _winapi.DuplicateHandle(
+                _winapi.GetCurrentProcess(),
+                raw_handle,
+                _winapi.GetCurrentProcess(),
+                0,
+                1,
+                _winapi.DUPLICATE_SAME_ACCESS,
+            )
+        finally:
+            os.close(fd)
+    if hasattr(stream, "fileno"):
+        raw_handle = msvcrt.get_osfhandle(stream.fileno())
+        return _winapi.DuplicateHandle(
+            _winapi.GetCurrentProcess(),
+            raw_handle,
+            _winapi.GetCurrentProcess(),
+            0,
+            1,
+            _winapi.DUPLICATE_SAME_ACCESS,
+        )
+    raise TypeError(f"Unsupported stdio stream for a detached Windows child: {stream!r}")
+
+
+def _spawn_detached_windows(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    stdout: Any,
+    stderr: Any,
+    stdin: Any,
+) -> _WindowsDetachedProcess:
+    """Windows ``_spawn_detached``: suspend, job-assign, then resume (issue #447).
+
+    Replicates what ``subprocess.Popen._execute_child`` does on Windows
+    using the same stdlib building blocks (``list2cmdline``,
+    ``DuplicateHandle``, ``CreateProcess`` with a
+    ``lpAttributeList["handle_list"]`` restricting inheritance to exactly
+    the three stdio handles), with one addition: ``CREATE_SUSPENDED`` is
+    OR'd into the creation flags so the child cannot run -- and therefore
+    cannot re-exec through a trampoline ``sys.executable`` out of reach --
+    before it has been assigned to a fresh job object. The child's primary
+    thread is always resumed in a ``finally``, whether or not the job
+    could be created or the assignment succeeded: a suspended process that
+    is never resumed would be a worse bug than the orphan this fixes.
+
+    On breakaway-denied (``ERROR_ACCESS_DENIED`` from the parent's job
+    forbidding ``CREATE_BREAKAWAY_FROM_JOB``), retries without that flag
+    and prints the same warning as the POSIX-era implementation.
+
+    Args:
+        cmd: The fully-resolved command-line argv to execute.
+        env: The environment dict to pass to the child.
+        stdout: ``subprocess.DEVNULL`` or an open file-like object.
+        stderr: ``subprocess.DEVNULL`` or an open file-like object.
+        stdin: ``subprocess.DEVNULL`` or an open file-like object.
+
+    Returns:
+        A :class:`_WindowsDetachedProcess` wrapping the running child,
+        already assigned to (and resumed within) its own job object when
+        job creation succeeded.
+    """
+    assert _winapi is not None and _kernel32 is not None
+
+    handles = [
+        _resolve_stdio_handle(stdin, for_write=False),
+        _resolve_stdio_handle(stdout, for_write=True),
+        _resolve_stdio_handle(stderr, for_write=True),
+    ]
+    try:
+        si = _StartupInfo()
+        si.dwFlags |= _winapi.STARTF_USESTDHANDLES
+        si.hStdInput, si.hStdOutput, si.hStdError = handles
+        si.lpAttributeList = {"handle_list": handles}
+
+        cmd_line = subprocess.list2cmdline(cmd)
+        creationflags = _CREATE_NEW_PROCESS_GROUP | _CREATE_BREAKAWAY_FROM_JOB | _CREATE_SUSPENDED
+        try:
+            hp, ht, pid, _tid = _winapi.CreateProcess(
+                None, cmd_line, None, None, True, creationflags, env, None, si
+            )
+        except OSError as exc:
+            if not _is_breakaway_denied(exc):
+                raise
+            sys.stderr.write(
+                "warning: parent shell forbids Windows job breakaway; the "
+                "background workflow may not survive shell exit. Run "
+                "--web-bg from a non-job-managed shell (e.g. a regular "
+                "PowerShell window) for reliable persistence.\n"
+            )
+            creationflags &= ~_CREATE_BREAKAWAY_FROM_JOB
+            hp, ht, pid, _tid = _winapi.CreateProcess(
+                None, cmd_line, None, None, True, creationflags, env, None, si
+            )
+    finally:
+        for handle in handles:
+            with contextlib.suppress(OSError):
+                _winapi.CloseHandle(handle)
+
+    job = _create_job_object()
+    try:
+        if job is not None and not _kernel32.AssignProcessToJobObject(job, hp):
+            with contextlib.suppress(OSError):
+                _kernel32.CloseHandle(job)
+            job = None
+    finally:
+        # Resume no matter what happened above: a job that could not be
+        # created or assigned still means a *running* child (degrading to
+        # the pre-#447 single-process termination), whereas a child left
+        # permanently suspended would be strictly worse than the bug this
+        # fixes.
+        _kernel32.ResumeThread(ht)
+        with contextlib.suppress(OSError):
+            _kernel32.CloseHandle(ht)
+
+    return _WindowsDetachedProcess(pid=pid, h_process=hp, h_job=job)
+
+
+def _spawn_detached_posix(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    stdout: Any,
+    stderr: Any,
+    stdin: Any,
+) -> subprocess.Popen[Any]:
+    """POSIX ``_spawn_detached`` -- unchanged ``subprocess.Popen`` call.
+
+    ``start_new_session=True`` makes the child both a session leader and
+    the leader of its own process group, which is what lets
+    :func:`_terminate_child` reach the whole tree via
+    ``os.killpg(proc.pid, ...)`` (issue #447) rather than only the direct
+    child. ``proc.pid`` is recorded in :data:`_SPAWNED_GROUP_LEADERS` so
+    that call is only ever made against a pid this module spawned as a
+    group leader.
+    """
+    base: dict[str, Any] = {"stdout": stdout, "stderr": stderr, "stdin": stdin, "env": env}
+    proc = subprocess.Popen(cmd, **base, start_new_session=True)  # noqa: S603
+    _SPAWNED_GROUP_LEADERS.add(proc.pid)
+    return proc
+
+
 def _spawn_detached(
     cmd: list[str],
     env: dict[str, str],
@@ -182,22 +640,16 @@ def _spawn_detached(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
     stdin: Any = subprocess.DEVNULL,
-) -> subprocess.Popen[Any]:
+) -> _DetachedChild:
     """Launch a fully-detached child process for ``--web-bg`` mode.
 
-    Composes the supplied stdio + environment + the platform-specific
-    detachment kwargs from :func:`_detachment_kwargs`, then calls
-    ``subprocess.Popen``. The default stdio is ``DEVNULL`` for all three
-    streams; callers that need to capture the child's stderr/stdout
-    (for diagnostics — see issue #116) can pass open file handles via
-    the ``stdout`` / ``stderr`` kwargs.
-
-    On Windows, if the Popen call fails with ``ERROR_ACCESS_DENIED`` because
-    the parent's job object forbids breakaway, prints a visible warning to
-    ``sys.stderr`` and retries WITHOUT ``CREATE_BREAKAWAY_FROM_JOB``. In that
-    environment the child may still be killed when the parent's job closes;
-    the warning sets that expectation so the user does not see only the
-    "Dashboard: ..." line and assume success.
+    Dispatches to :func:`_spawn_detached_posix` (an ordinary
+    ``subprocess.Popen`` with ``start_new_session=True``) or
+    :func:`_spawn_detached_windows` (a job-object-assigned child, issue
+    #447) depending on platform. The default stdio is ``DEVNULL`` for all
+    three streams; callers that need to capture the child's stderr/stdout
+    (for diagnostics — see issue #116) can pass open file handles via the
+    ``stdout`` / ``stderr`` kwargs.
 
     Args:
         cmd: The fully-resolved command-line argv to execute.
@@ -211,35 +663,17 @@ def _spawn_detached(
         stdin: Popen ``stdin`` argument; defaults to ``DEVNULL``.
 
     Returns:
-        The running :class:`subprocess.Popen` handle for the detached child.
+        The running detached child -- a :class:`subprocess.Popen` on
+        POSIX, a :class:`_WindowsDetachedProcess` on Windows.
 
     Raises:
-        OSError: Propagated from ``Popen`` for any failure other than the
-            Windows breakaway-denied case (e.g. ``FileNotFoundError`` for a
+        OSError: Propagated for any spawn failure other than the Windows
+            breakaway-denied case (e.g. ``FileNotFoundError`` for a
             missing executable). Callers wrap this in a ``RuntimeError``.
     """
-    base: dict[str, Any] = {
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdin": stdin,
-        "env": env,
-    }
-    try:
-        return subprocess.Popen(cmd, **base, **_detachment_kwargs())  # noqa: S603
-    except OSError as exc:
-        if not _is_breakaway_denied(exc):
-            raise
-        sys.stderr.write(
-            "warning: parent shell forbids Windows job breakaway; the "
-            "background workflow may not survive shell exit. Run "
-            "--web-bg from a non-job-managed shell (e.g. a regular "
-            "PowerShell window) for reliable persistence.\n"
-        )
-        return subprocess.Popen(  # noqa: S603
-            cmd,
-            **base,
-            creationflags=_CREATE_NEW_PROCESS_GROUP,
-        )
+    if sys.platform == "win32":
+        return _spawn_detached_windows(cmd, env, stdout=stdout, stderr=stderr, stdin=stdin)
+    return _spawn_detached_posix(cmd, env, stdout=stdout, stderr=stderr, stdin=stdin)
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,7 +786,7 @@ def _find_free_port() -> int:
 
 
 def _wait_for_server(
-    port: int, timeout: float = 15.0, *, proc: subprocess.Popen[Any] | None = None
+    port: int, timeout: float = 15.0, *, proc: _DetachedChild | None = None
 ) -> bool:
     """Wait until the web server is accepting connections on *port*.
 
@@ -382,29 +816,157 @@ def _wait_for_server(
     return False
 
 
-def _terminate_child(proc: subprocess.Popen[Any]) -> None:
-    """Best-effort terminate a still-running child process.
+@dataclass(frozen=True, slots=True)
+class _TerminationOutcome:
+    """Result of :func:`_terminate_child`'s best-effort process-tree kill.
+
+    Replaces a bare ``None`` return, which let every call site assert a
+    termination it could not actually prove (issue #447) -- following the
+    ``_GateOutcome``/``StartProbe``/``WebPauseOutcome`` precedent of naming
+    an outcome instead of discarding the information a bool would lose.
+    """
+
+    confirmed: bool
+    """True only when every pid this call knew about was independently
+    confirmed dead by the final liveness sweep. False means at least one
+    survived (or its liveness could not be established) -- see
+    ``surviving_pids``."""
+
+    surviving_pids: tuple[int, ...]
+    """Pids confirmed alive, or whose liveness could not be established,
+    after every termination rung was tried. Empty when ``confirmed`` is
+    True."""
+
+
+def _terminate_child(
+    proc: _DetachedChild, *, confirmed_child_pid: int | None = None
+) -> _TerminationOutcome:
+    """Best-effort terminate a still-running child process **tree**.
 
     Used to avoid orphaned background workflows when post-launch validation
-    (server reachability, the child's run record appearing) fails. Any
-    errors raised while terminating are swallowed so the original failure
-    surfaces to the caller.
+    (server reachability, the child's run record appearing) fails. Three
+    rungs, none individually load-bearing (issue #447):
+
+    1. Tree kill: ``terminate_tree()`` (Windows job object) when *proc*
+       exposes it, else ``os.killpg(proc.pid, SIGKILL)`` on POSIX -- but
+       only when ``proc.pid`` is a pid this module itself spawned as a
+       process-group leader (see :data:`_SPAWNED_GROUP_LEADERS`), never
+       against an arbitrary pid.
+    2. The original polite/forceful ladder on *proc* itself
+       (``terminate()`` → wait 5s → ``kill()`` → wait 2s).
+    3. A final, identity-checked sweep over every pid this call knows
+       about (``proc.pid`` and, if different, *confirmed_child_pid*) via
+       ``conductor.cli.pid``'s ``is_process_alive``/``terminate_process``.
+       This is what actually *confirms* the outcome rather than assuming
+       it: a tree kill or the ladder above can each fail silently (a
+       permission error, a race, a trampoline child that escaped a job
+       the launcher couldn't create).
+
+    Rung 3 runs even when *proc* already looks dead, because under a
+    trampoline ``sys.executable`` the outer *proc* exiting says nothing
+    about whether *confirmed_child_pid* -- the pid actually running the
+    workflow -- is still alive.
+
+    Never raises: any errors from rungs 1–2 are swallowed so the
+    original failure that triggered termination surfaces to the caller.
 
     Args:
-        proc: The subprocess.Popen handle to terminate.
+        proc: The detached child handle to terminate.
+        confirmed_child_pid: The pid of the process actually running the
+            workflow, when known (e.g. from a confirmed run record) and
+            different from ``proc.pid`` (the trampoline case, issue #444).
+
+    Returns:
+        A :class:`_TerminationOutcome` describing whether every known pid
+        was confirmed dead, and naming any that survived.
     """
-    if proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    candidates = {proc.pid}
+    if confirmed_child_pid is not None:
+        candidates.add(confirmed_child_pid)
+
+    if proc.poll() is None:
+        terminate_tree = getattr(proc, "terminate_tree", None)
+        if terminate_tree is not None:
             with contextlib.suppress(Exception):
-                proc.wait(timeout=2.0)
-    except Exception:  # noqa: BLE001 - cleanup must not raise
-        pass
+                terminate_tree()
+        elif proc.pid in _SPAWNED_GROUP_LEADERS:
+            with contextlib.suppress(Exception):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            pass
+
+    from conductor.cli.pid import is_process_alive, terminate_process
+
+    surviving: list[int] = []
+    for pid in sorted(candidates):
+        if not is_process_alive(pid):
+            continue
+        with contextlib.suppress(Exception):
+            terminate_process(pid, timeout=2.0)
+        if is_process_alive(pid):
+            surviving.append(pid)
+
+    return _TerminationOutcome(confirmed=not surviving, surviving_pids=tuple(surviving))
+
+
+def _termination_note(outcome: _TerminationOutcome, *, web_port: int) -> str:
+    """Render the termination clause of a launch-gate failure message.
+
+    ``outcome.confirmed`` only means "every pid we knew about was
+    individually confirmed dead" -- prior to issue #447 every failure
+    message unconditionally claimed "The background process was
+    terminated." even when only ``proc.pid`` (not the real, possibly
+    trampolined, workflow process) had been signalled. A survivor is now
+    named explicitly, with a pointer at how to find and stop it manually.
+
+    Args:
+        outcome: The result of :func:`_terminate_child`.
+        web_port: The port this launch requested, used to build the
+            ``conductor stop`` hint.
+
+    Returns:
+        A trailing-space-terminated sentence (or two) to splice into a
+        ``RuntimeError`` message.
+    """
+    if outcome.confirmed:
+        return "The background process was terminated. "
+    pids = ", ".join(str(pid) for pid in outcome.surviving_pids)
+    return (
+        f"WARNING: could not confirm termination of PID(s) {pids}. "
+        f"Check `conductor status` or run `conductor stop --port {web_port}` "
+        "to clean it up manually. "
+    )
+
+
+def _cleanup_record_after_termination(
+    run_id: str, outcome: _TerminationOutcome, candidate_pid: int | None
+) -> None:
+    """Remove the child's run record, but only once its pid is confirmed dead.
+
+    A survivor keeps its run record: that record is `conductor stop`'s only
+    remaining handle on it (the same concern :func:`_remove_dead_child_record`
+    itself documents).
+
+    Args:
+        run_id: The run id whose record should be removed.
+        outcome: The result of :func:`_terminate_child`.
+        candidate_pid: The pid the caller believes the record should name
+            (``proc.pid`` or a confirmed identity). No-op when ``None``.
+    """
+    if candidate_pid is None:
+        return
+    if candidate_pid in outcome.surviving_pids:
+        return
+    _remove_dead_child_record(run_id, candidate_pid)
 
 
 # Filename pattern used by ``conductor.engine.event_log.EventLogSubscriber``
@@ -695,7 +1257,7 @@ def _classify_dashboard_identity(
 
 def _wait_for_workflow_start(
     port: int,
-    proc: subprocess.Popen[Any],
+    proc: _DetachedChild,
     *,
     timeout: float,
     expected_run_id: str,
@@ -863,7 +1425,7 @@ def _record_is_fresh(record: RunRecord, launched_at: datetime) -> bool:
 
 def _confirmed_pid_from_record(
     record: RunRecord | None,
-    proc: subprocess.Popen[Any],
+    proc: _DetachedChild,
     web_port: int,
     launched_at: datetime,
 ) -> int | None:
@@ -904,6 +1466,37 @@ def _confirmed_pid_from_record(
     return None
 
 
+def _peek_confirmed_pid(
+    run_id: str, proc: _DetachedChild, web_port: int, launched_at: datetime
+) -> int | None:
+    """Best-effort, out-of-band read of the child's run record.
+
+    Used by the dashboard-unreachable branch of
+    :func:`_finalize_background_launch`, which fires before the run-record
+    poll has run at all -- and is the highest-impact path for issue #447,
+    since a dead-on-arrival dashboard is exactly when a trampoline re-exec
+    is most likely to already have happened. The child may have written
+    its record even though its dashboard never came up (or came up on a
+    different pid than ``proc.pid``), so this opportunistically reuses
+    :func:`_confirmed_pid_from_record` rather than leaving that branch with
+    no trustworthy termination target at all.
+
+    Swallows everything: this is a best-effort improvement to *which* pid
+    gets terminated, not a new failure mode of its own.
+
+    Returns:
+        The confirmed pid, or ``None`` if no record could be read or
+        trusted.
+    """
+    try:
+        from conductor.fleet.records import read_run_record
+
+        record = read_run_record(run_id)
+    except Exception:  # noqa: BLE001 - best-effort only
+        return None
+    return _confirmed_pid_from_record(record, proc, web_port, launched_at)
+
+
 @dataclass(frozen=True, slots=True)
 class _GateOutcome:
     """Result of :func:`_finalize_background_launch`'s readiness gate.
@@ -926,7 +1519,7 @@ class _GateOutcome:
 
 
 def _finalize_background_launch(
-    proc: subprocess.Popen[Any],
+    proc: _DetachedChild,
     web_port: int,
     run_id: str,
     stderr_log: Path,
@@ -1047,10 +1640,12 @@ def _finalize_background_launch(
                 f"Background process exited immediately with code {retcode}. "
                 f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
             )
-        _terminate_child(proc)
+        pid = _peek_confirmed_pid(run_id, proc, web_port, launched_at)
+        outcome = _terminate_child(proc, confirmed_child_pid=pid)
+        _cleanup_record_after_termination(run_id, outcome, pid)
         raise RuntimeError(
             f"Dashboard did not start within 15 seconds on port {web_port}. "
-            f"The background process was terminated. "
+            f"{_termination_note(outcome, web_port=web_port)}"
             f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
         )
 
@@ -1080,11 +1675,11 @@ def _finalize_background_launch(
         try:
             record = read_run_record(run_id)
         except Exception as exc:
-            _terminate_child(proc)
+            outcome = _terminate_child(proc)
             raise RuntimeError(
                 f"Failed to read background process's run record "
-                f"(run_id={run_id}): {exc}. The background process was "
-                f"terminated. See child stderr log: "
+                f"(run_id={run_id}): {exc}. {_termination_note(outcome, web_port=web_port)}"
+                f"See child stderr log: "
                 f"{stderr_log}{_tail_log(stderr_log)}"
             ) from exc
         pid_from_record = _confirmed_pid_from_record(record, proc, web_port, launched_at)
@@ -1121,10 +1716,10 @@ def _finalize_background_launch(
                 )
                 run_record_written = False
                 break
-            _terminate_child(proc)
+            outcome = _terminate_child(proc)
             raise RuntimeError(
                 f"Background process did not report a run record within 15 seconds "
-                f"(run_id={run_id}). The background process was terminated. "
+                f"(run_id={run_id}). {_termination_note(outcome, web_port=web_port)}"
                 f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
             )
         time.sleep(0.2)
@@ -1162,21 +1757,23 @@ def _finalize_background_launch(
             # Completed inside the window; the child already removed its
             # own run record.
             return _GateOutcome(workflow_started=True, run_record_written=run_record_written)
-        # The outer ``proc`` is provably dead, but that only tells us the
-        # *outer* process exited -- under a trampoline, the inner process
-        # this record's ``confirmed_child_pid`` names can outlive it. Only
-        # remove the record once that pid is independently confirmed dead
-        # too, so a live orphan's record (the only handle `conductor stop`
-        # has on it) is never deleted out from under it -- the same
-        # concern the PORT_CONFLICT branch below states explicitly.
+        # The outer ``proc`` is provably dead, but under a trampoline that
+        # only tells us the *outer* process exited -- the inner process
+        # ``confirmed_child_pid`` names can outlive it, orphaned, and keep
+        # running the workflow (issue #447). ``_terminate_child`` is still
+        # worth calling here even though ``proc`` itself is already dead:
+        # its final identity-checked sweep independently targets
+        # ``confirmed_child_pid``. The record is only removed once that
+        # pid is confirmed dead too, so a live orphan's record -- the only
+        # handle `conductor stop` has on it -- is never deleted out from
+        # under it.
+        outcome = _terminate_child(proc, confirmed_child_pid=confirmed_child_pid)
         dead_pid = confirmed_child_pid if confirmed_child_pid is not None else proc.pid
-        from conductor.cli.pid import is_process_alive
-
-        if not is_process_alive(dead_pid):
-            _remove_dead_child_record(run_id, dead_pid)
+        _cleanup_record_after_termination(run_id, outcome, dead_pid)
         raise RuntimeError(
             "Background process exited before the workflow started "
-            f"(code {retcode}). See child stderr log: "
+            f"(code {retcode}). {_termination_note(outcome, web_port=web_port)}"
+            f"See child stderr log: "
             f"{stderr_log}{_tail_log(stderr_log)}"
         )
 
@@ -1184,17 +1781,19 @@ def _finalize_background_launch(
     # returns when identity was confirmed (confirmed_child_pid is not None)
     # -- see its docstring.
     foreign_pid = last_seen_info.get("pid", "unknown")
-    _terminate_child(proc)
-    # Deliberately still keyed on ``proc.pid``, not ``confirmed_child_pid``
-    # (issue #444's Q1): terminating only ``proc.pid`` can leave the real
-    # workflow process orphaned under a trampoline (a separate issue, out
-    # of scope here). Leaving this pid-checked means that orphan's record
-    # survives -- which is the *right* outcome while orphan termination is
-    # unimplemented, since that record is the only handle `conductor stop`
-    # has on the surviving orphan.
-    _remove_dead_child_record(run_id, proc.pid)
+    outcome = _terminate_child(proc, confirmed_child_pid=confirmed_child_pid)
+    # #447 made termination reach the whole process tree (a Windows job
+    # object / a POSIX process group), not just ``proc.pid``, so the
+    # identity check for cleanup now targets the *confirmed* pid -- the
+    # one actually running the workflow under a trampoline
+    # ``sys.executable`` -- rather than being deliberately kept on
+    # ``proc.pid`` as before. A pid still confirmed alive after every
+    # termination rung was tried keeps its run record: that record is
+    # `conductor stop`'s only remaining handle on it.
+    _cleanup_record_after_termination(run_id, outcome, confirmed_child_pid)
     raise RuntimeError(
         f"Port {web_port} is already in use by another process (PID {foreign_pid}). "
+        f"{_termination_note(outcome, web_port=web_port)}"
         "Choose a different port with --web-port."
     )
 
@@ -1225,6 +1824,22 @@ def _build_bg_env(
     env["CONDUCTOR_BG_STDERR_LOG"] = str(stderr_log)
     env["CONDUCTOR_BG_STDOUT_LOG"] = str(stdout_log)
     return env
+
+
+def _release_child_handles(proc: _DetachedChild) -> None:
+    """Release the Windows process/job handles the launch gate no longer needs.
+
+    A no-op for a POSIX ``subprocess.Popen`` (nothing beyond what ``Popen``
+    itself already manages). For a :class:`_WindowsDetachedProcess`, this
+    closes the retained process and job handles -- otherwise they would
+    leak for the lifetime of whatever process called :func:`launch_background`,
+    which is not always a short-lived CLI invocation: the Fleet TUI's New
+    Run screen (``fleet/launch.py``) calls it from a long-lived process.
+    """
+    close = getattr(proc, "close", None)
+    if close is not None:
+        with contextlib.suppress(Exception):
+            close()
 
 
 def _spawn_bg_child(
@@ -1302,44 +1917,52 @@ def _spawn_bg_child(
         # objects can be released without affecting the child.
         _close_quietly(stderr_handle, stdout_handle)
 
-    # ``_finalize_background_launch`` returns a ``workflow_started`` of
-    # ``True`` (or ``False`` for ``StartProbe.TIMED_OUT``) from several
-    # paths that don't check the child's exit code, because at the moment
-    # they returned the child was confirmed either alive or cleanly exited
-    # (0) — see the function's own docstring. ``proc`` is still in hand
-    # here, so re-poll it directly rather than widening that function's
-    # return type further: this is what lets ``BackgroundLaunch
-    # .still_running`` distinguish "genuinely running" from "already
-    # exited" without callers printing a live dashboard URL for an
-    # already-exited process (#410).
-    retcode = proc.poll()
-    still_running = retcode is None
-    if not still_running and retcode != 0:
-        # The child crashed in the narrow window between
-        # _finalize_background_launch's last liveness check (STARTED,
-        # TIMED_OUT, and the CONDUCTOR_WEB_BG_START_TIMEOUT=0 escape hatch
-        # all return without re-checking the exit code, since the child was
-        # confirmed alive or the check was skipped entirely moments before)
-        # and this re-poll. Reporting this as a clean "Workflow completed"
-        # success would be exactly the false-success bug class issue #410
-        # exists to close, so raise instead of returning a BackgroundLaunch
-        # — the same treatment _finalize_background_launch already gives a
-        # non-zero exit it catches directly (StartProbe.CHILD_EXITED above).
-        raise RuntimeError(
-            f"Background process exited unexpectedly (code {retcode}) while "
-            f"the launcher was finishing up. See child stderr log: "
-            f"{stderr_path}{_tail_log(stderr_path)}"
-        )
+    try:
+        # ``_finalize_background_launch`` returns a ``workflow_started`` of
+        # ``True`` (or ``False`` for ``StartProbe.TIMED_OUT``) from several
+        # paths that don't check the child's exit code, because at the moment
+        # they returned the child was confirmed either alive or cleanly exited
+        # (0) — see the function's own docstring. ``proc`` is still in hand
+        # here, so re-poll it directly rather than widening that function's
+        # return type further: this is what lets ``BackgroundLaunch
+        # .still_running`` distinguish "genuinely running" from "already
+        # exited" without callers printing a live dashboard URL for an
+        # already-exited process (#410).
+        retcode = proc.poll()
+        still_running = retcode is None
+        if not still_running and retcode != 0:
+            # The child crashed in the narrow window between
+            # _finalize_background_launch's last liveness check (STARTED,
+            # TIMED_OUT, and the CONDUCTOR_WEB_BG_START_TIMEOUT=0 escape hatch
+            # all return without re-checking the exit code, since the child was
+            # confirmed alive or the check was skipped entirely moments before)
+            # and this re-poll. Reporting this as a clean "Workflow completed"
+            # success would be exactly the false-success bug class issue #410
+            # exists to close, so raise instead of returning a BackgroundLaunch
+            # — the same treatment _finalize_background_launch already gives a
+            # non-zero exit it catches directly (StartProbe.CHILD_EXITED above).
+            raise RuntimeError(
+                f"Background process exited unexpectedly (code {retcode}) while "
+                f"the launcher was finishing up. See child stderr log: "
+                f"{stderr_path}{_tail_log(stderr_path)}"
+            )
 
-    return BackgroundLaunch(
-        url=f"http://127.0.0.1:{web_port}",
-        stderr_log=stderr_path,
-        stdout_log=stdout_path,
-        run_id=run_id,
-        workflow_started=gate_outcome.workflow_started,
-        still_running=still_running,
-        run_record_written=gate_outcome.run_record_written,
-    )
+        return BackgroundLaunch(
+            url=f"http://127.0.0.1:{web_port}",
+            stderr_log=stderr_path,
+            stdout_log=stdout_path,
+            run_id=run_id,
+            workflow_started=gate_outcome.workflow_started,
+            still_running=still_running,
+            run_record_written=gate_outcome.run_record_written,
+        )
+    finally:
+        # Release the Windows process/job handles once the gate no longer
+        # needs them (no-op on POSIX). This matters because
+        # ``launch_background`` is not always immediately followed by
+        # process exit -- ``fleet/launch.py`` calls it from a long-lived
+        # TUI process rather than a CLI invocation that exits right after.
+        _release_child_handles(proc)
 
 
 def launch_background(
