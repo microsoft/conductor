@@ -36,6 +36,7 @@ from conductor.config.schema import AgentDef, OutputField  # noqa: E402
 from conductor.exceptions import ProviderError  # noqa: E402
 from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
+    ClaudeAuthStatus,
     _remove_mcp_config,
     _resolve_skill_plugins,
     _translate_mcp_servers,
@@ -140,9 +141,11 @@ class TestValidateConnection:
         import pathlib
 
         provider = ClaudeAgentSdkProvider()
+        _ready = ClaudeAuthStatus(requested_mode="auto", resolved_mode="api_key", ready=True)
         with (
             patch.object(pathlib.Path, "exists", return_value=False),
             patch("shutil.which", return_value="/usr/local/bin/claude") as which_mock,
+            patch.object(provider, "_check_auth_readiness", return_value=_ready),
         ):
             assert await provider.validate_connection() is True
         which_mock.assert_called_with("claude")
@@ -2279,7 +2282,14 @@ class TestMcpOptionsWiring:
             captured["path"] = kwargs["options"].mcp_servers
             yield _assistant(content=[TextBlock(text="partial")])
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        _ready = ClaudeAuthStatus(requested_mode="auto", resolved_mode="api_key", ready=True)
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch(
+                "conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider._check_auth_readiness",
+                return_value=_ready,
+            ),
+        ):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
             )

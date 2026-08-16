@@ -106,7 +106,9 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     "claude-agent-sdk": _CredentialSpec(
         env_vars=("ANTHROPIC_API_KEY",),
         optional_auth_note=(
-            "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
+            "authenticates via `claude login` (subscription) or ANTHROPIC_API_KEY "
+            "(api_key mode); ANTHROPIC_API_KEY is an optional override — see auth_mode "
+            "provider setting"
         ),
     ),
     "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
@@ -837,6 +839,10 @@ async def gather_provider(
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             diag.connection_ok = False
             diag.connection_error = _format_error(e)
+        if not diag.connection_ok:
+            hint = getattr(provider, "connection_error_hint", None)
+            if isinstance(hint, str) and hint:
+                diag.connection_error = hint
 
         # Gate on a verified (not merely truthy) connection: an inconclusive
         # probe means models.list() already failed once, so calling

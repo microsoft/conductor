@@ -232,6 +232,33 @@ and compiled into this file at release time.
   configuring standard `OTEL_*` environment variables for an OTLP collector. See
   `docs/telemetry.md` and `examples/telemetry.yaml`.
   * Added native Copilot CLI spans over OTLP HTTP using W3C trace-context propagation, backed by a per-run protocol and endpoint latch that logs a warning if gRPC is used.
+- **`claude-agent-sdk` provider now selects a deterministic authentication
+  source and runs a hard-bounded readiness preflight before each agent
+  execution.** The new `runtime.provider.auth_mode` field on
+  `ProviderSettings` (`"auto"` default, `"subscription"`, `"api_key"`)
+  makes the credential path explicit instead of leaving it to ambient
+  environment inference. In `subscription` mode the provider invokes
+  `claude auth status --json` with a 5 s hard timeout; `validate_connection()`
+  returns `False` (storing a sanitized diagnostic in `_last_validation_error`)
+  on a not-logged-in or timed-out status, and `execute()` raises
+  `ProviderError(is_retryable=False)` when the preflight is not ready. In
+  `api_key` mode the subprocess is skipped entirely; presence of
+  `ANTHROPIC_API_KEY` (non-blank) is the only check. `auto` resolves to
+  `api_key` when `ANTHROPIC_API_KEY` is set and `subscription` otherwise;
+  `ANTHROPIC_AUTH_TOKEN` alone (no `ANTHROPIC_API_KEY`) causes `auto` to
+  resolve to `subscription` normally. In `subscription` mode only, a
+  conflicting `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` env var causes
+  an immediate closed failure (no subprocess call) with a clear diagnostic.
+  Subprocess cleanup is interrupt-safe: a cancelled `execute()` kills both
+  the auth task and the interrupt-waiter task without leaking a zombie
+  process or an orphaned asyncio task. `ClaudeAuthStatus` whitelists only
+  `loggedIn`/`authMethod`/`apiProvider`/`subscriptionType` from the CLI
+  JSON so the raw API key value is never stored or logged.
+- **`AgentProvider.connection_error_hint`** — new optional property hook
+  (returns `None` by default) that experimental providers can override to
+  surface a human-readable diagnosis alongside the generic `ProviderError`
+  message. `conductor doctor` and the factory's validation-failure path
+  include the hint when present.
 
 - **Per-agent `settings_dir` on `claude-agent-sdk`** (#513) — selects which
   directory's `project` settings tier supplies an agent's **skills**,
