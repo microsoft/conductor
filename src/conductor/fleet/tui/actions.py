@@ -230,10 +230,36 @@ class ConfirmKillModal(ModalScreen[bool]):
         align: center middle;
     }
     #confirm-dialog {
-        width: auto;
+        /* Fixed, not `auto`. Two reasons, and both are load-bearing:
+           `Static.DEFAULT_CSS` sets only `height: auto`, so its width falls
+           back to `1fr` -- and an `auto`-width container whose children are
+           all `1fr` resolves to 0, which is why this dialog rendered as an
+           empty bordered box (#449). And a foreground run's warning line runs
+           to ~100 characters, so an auto width would size to the longest line
+           rather than wrapping. `max-height` for the same reason
+           `GateOptionsModal` is bounded: a kill-all naming several foreground
+           runs is routinely taller than the terminal. */
+        width: 60;
+        max-width: 90%;
         height: auto;
+        max-height: 90%;
         border: thick $error;
         padding: 1 2;
+    }
+    #confirm-message-scroll {
+        /* `auto` so a one-line confirm stays a small box, `max-height: 100%`
+           so a long one scrolls inside the capped dialog instead of
+           overflowing it -- without the cap the container grows past its
+           parent and the tail is silently truncated with no scrollbar. */
+        height: auto;
+        max-height: 100%;
+        scrollbar-size-vertical: 1;
+    }
+    #confirm-hint {
+        /* Docked so the keys a user needs are the one thing that can never be
+           pushed off the bottom by a long message. */
+        dock: bottom;
+        height: 1;
     }
     """
 
@@ -249,12 +275,15 @@ class ConfirmKillModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            # `Text`, not a plain str: `Static` defaults to markup=True, so a
-            # workflow named `plan[wip].yaml` would be silently rendered as
-            # `plan.yaml` -- in the dialog whose whole job is naming what is
-            # about to be killed. The hint below is conductor's own literal,
-            # so it stays markup.
-            Static(Text(self._message), id="confirm-message"),
+            VerticalScroll(
+                # `Text`, not a plain str: `Static` defaults to markup=True,
+                # so a workflow named `plan[wip].yaml` would be silently
+                # rendered as `plan.yaml` -- in the dialog whose whole job is
+                # naming what is about to be killed. The hint below is
+                # conductor's own literal, so it stays markup.
+                Static(Text(self._message), id="confirm-message"),
+                id="confirm-message-scroll",
+            ),
             Static("[bold]\\[y][/bold] Confirm   [bold]\\[n/esc][/bold] Cancel", id="confirm-hint"),
             id="confirm-dialog",
         )
