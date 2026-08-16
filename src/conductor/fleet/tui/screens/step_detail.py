@@ -39,7 +39,7 @@ from textual.widgets import Footer, Header, Static
 from conductor.console import styled
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import StepDetail, derive_step_detail
-from conductor.fleet.tui.theme import muted, status_label
+from conductor.fleet.tui.theme import loading_text, muted, status_label
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +229,7 @@ class StepDetailScreen(Screen):
         """
         status = self.query_one("#step-status", Static)
         input_content = self.query_one("#input-content", Static)
-        status.update(muted("Loading…"))
+        status.update(loading_text())
         try:
             detail = await asyncio.to_thread(derive_step_detail, self._record, self._agent_name)
         except Exception as e:  # noqa: BLE001 - surfaced, not crashed

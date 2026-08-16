@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,12 +24,13 @@ from textual.binding import Binding
 from textual.widgets import DataTable, Footer, Static
 
 from conductor.cli import pid as cli_pid
-from conductor.fleet.records import RunRecord, write_run_record
-from conductor.fleet.summary import GateInfo
+from conductor.fleet.records import RunRecord, read_run_records, write_run_record
+from conductor.fleet.summary import GateInfo, derive_run_summary
 from conductor.fleet.tui.actions import GateOptionsModal
 from conductor.fleet.tui.anim import FRAME_INTERVAL
 from conductor.fleet.tui.app import FleetApp
-from conductor.fleet.tui.screens.runs import RunsScreen
+from conductor.fleet.tui.screens.runs import RunScan, RunsScreen, _collect_runs
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,7 +108,7 @@ async def _rendered_footer(pilot: Any, app: FleetApp) -> str:
         line = _footer_line(app)
         if line:
             return line
-        await pilot.pause()
+        await settle(pilot)
     return _footer_line(app)
 
 
@@ -177,7 +179,7 @@ class TestRunsScreenTable:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
 
             assert table.row_count == 1
@@ -194,7 +196,7 @@ class TestRunsScreenTable:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
 
             assert table.row_count == 2
@@ -217,7 +219,7 @@ class TestRunsScreenTable:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
 
             rows = [table.get_row_at(i)[0] for i in range(table.row_count)]
@@ -243,7 +245,7 @@ class TestRunsScreenTable:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
 
             row = table.get_row_at(0)
@@ -255,7 +257,7 @@ class TestRunsScreenTable:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
 
             row = table.get_row_at(0)
@@ -266,7 +268,7 @@ class TestRunsScreenEmptyState:
     async def test_empty_state_renders_when_no_records(self, fleet_env: Path) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             empty_state = app.screen.query_one("#empty-state", Static)
             table = app.screen.query_one(DataTable)
 
@@ -277,7 +279,7 @@ class TestRunsScreenEmptyState:
     async def test_empty_state_shows_launch_affordance(self, fleet_env: Path) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             empty_state = app.screen.query_one("#empty-state", Static)
 
             rendered = str(empty_state.content)
@@ -291,7 +293,7 @@ class TestRunsScreenEmptyState:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             empty_state = app.screen.query_one("#empty-state", Static)
             table = app.screen.query_one(DataTable)
 
@@ -311,7 +313,7 @@ class TestRunsScreenPolling:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
             assert table.row_count == 0
 
@@ -320,7 +322,7 @@ class TestRunsScreenPolling:
             # Wait out several poll intervals (real time -- set_interval is
             # a real asyncio timer, not something pilot.pause() advances).
             await asyncio.sleep(0.3)
-            await pilot.pause()
+            await settle(pilot)
 
             assert table.row_count == 1
             row = table.get_row_at(0)
@@ -339,16 +341,319 @@ class TestRunsScreenPolling:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
             assert table.row_count == 1
 
             remove_run_record("run-a")
 
             await asyncio.sleep(0.3)
-            await pilot.pause()
+            await settle(pilot)
 
             assert table.row_count == 0
+
+
+class TestCollectRuns:
+    """Unit tests for ``_collect_runs``, the collector half of the poll
+    refresh (issue #437) -- pure enough to test without a running app."""
+
+    def test_returns_pairs_sorted_newest_first(self, fleet_env: Path, tmp_path: Path) -> None:
+        _write_record(
+            tmp_path, "run-old", workflow_name="old", started_at="2020-01-01T00:00:00+00:00"
+        )
+        _write_record(
+            tmp_path, "run-new", workflow_name="new", started_at="2026-01-01T00:00:00+00:00"
+        )
+
+        scan = _collect_runs()
+
+        assert scan is not None
+        assert [record.run_id for record, _ in scan.collected] == ["run-new", "run-old"]
+        assert all(summary.run_id == record.run_id for record, summary in scan.collected)
+        assert scan.seen_run_ids == {"run-new", "run-old"}
+        assert scan.failed == 0
+
+    def test_returns_none_when_read_run_records_raises(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "run-a")
+
+        with patch(
+            "conductor.fleet.tui.screens.runs.read_run_records",
+            side_effect=OSError("transient failure"),
+        ):
+            assert _collect_runs() is None
+
+    def test_skips_a_record_whose_summary_derivation_raises(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "run-good", workflow_name="good")
+        _write_record(tmp_path, "run-bad", workflow_name="bad")
+
+        def _flaky_derive(record: RunRecord):
+            if record.run_id == "run-bad":
+                raise RuntimeError("boom")
+            return derive_run_summary(record)
+
+        with patch(
+            "conductor.fleet.tui.screens.runs.derive_run_summary", side_effect=_flaky_derive
+        ):
+            scan = _collect_runs()
+
+        assert scan is not None
+        assert [record.run_id for record, _ in scan.collected] == ["run-good"]
+        assert scan.failed == 1
+
+    def test_a_failed_derivation_still_reports_the_record_as_seen(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The notifier is pruned against ``seen_run_ids``, so a record that
+        failed to derive must still appear there -- otherwise it is forgotten
+        and re-fires its gate/failure notification on the next successful
+        tick (issue #446 review)."""
+        _write_record(tmp_path, "run-good", workflow_name="good")
+        _write_record(tmp_path, "run-bad", workflow_name="bad")
+
+        def _flaky_derive(record: RunRecord):
+            if record.run_id == "run-bad":
+                raise RuntimeError("boom")
+            return derive_run_summary(record)
+
+        with patch(
+            "conductor.fleet.tui.screens.runs.derive_run_summary", side_effect=_flaky_derive
+        ):
+            scan = _collect_runs()
+
+        assert scan is not None
+        assert scan.seen_run_ids == {"run-good", "run-bad"}
+
+
+class TestRunsScreenWorkerThreading:
+    """The poll refresh (and the dashboard-open action) run off the main
+    thread (issue #437), so a large fleet's I/O never blocks the event
+    loop -- verified by thread identity rather than timing, so nothing
+    here is flaky."""
+
+    async def test_collector_runs_off_the_main_thread(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        seen_main_thread: list[bool] = []
+
+        def _tracking_read():
+            seen_main_thread.append(threading.current_thread() is threading.main_thread())
+            return read_run_records()
+
+        with patch("conductor.fleet.tui.screens.runs.read_run_records", side_effect=_tracking_read):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+
+        assert seen_main_thread, "the collector was never called"
+        assert all(on_main is False for on_main in seen_main_thread)
+
+    async def test_a_tick_is_skipped_while_a_refresh_is_in_flight(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An overrunning refresh causes the next poll tick to be dropped,
+        not queued behind it (Q2) -- the collector is entered exactly once
+        while blocked, however many ticks elapse in the meantime."""
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 0.05)
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        release = threading.Event()
+        call_count = 0
+
+        def _blocking_collect():
+            nonlocal call_count
+            call_count += 1
+            release.wait(timeout=10)
+            return []
+
+        with patch("conductor.fleet.tui.screens.runs._collect_runs", side_effect=_blocking_collect):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                # Several poll intervals elapse while the collector is
+                # blocked -- none of them may start a second worker.
+                await asyncio.sleep(0.3)
+                assert call_count == 1
+
+                # Release and let the app settle -- once unblocked, later
+                # ticks are expected to run (and each completes almost
+                # instantly), so nothing further is asserted about
+                # `call_count` past this point.
+                release.set()
+                await settle(pilot)
+
+    async def test_ui_stays_responsive_while_a_refresh_is_in_flight(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """A refresh blocked in its worker thread must not block the event
+        loop -- the app can still process an unrelated keypress (pushing
+        the History screen) while it is in flight."""
+        from conductor.fleet.tui.screens.history import HistoryScreen
+
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        # Starts released so the mount-time load returns immediately --
+        # otherwise the opening `settle` sits through the full timeout,
+        # which is ~9% of this suite's wall time and tests nothing.
+        release = threading.Event()
+        release.set()
+
+        def _blocking_collect():
+            release.wait(timeout=10)
+            return RunScan(collected=[])
+
+        with patch("conductor.fleet.tui.screens.runs._collect_runs", side_effect=_blocking_collect):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                screen = app.screen
+                assert isinstance(screen, RunsScreen)
+
+                release.clear()
+                screen.refresh_runs()
+                # The refresh worker is now blocked on `release` -- the
+                # event loop must still be free to push a new screen.
+                await asyncio.wait_for(pilot.press("h"), timeout=2.0)
+                await pilot.pause()
+
+                assert isinstance(app.screen, HistoryScreen)
+
+                release.set()
+
+    async def test_loading_indicator_hides_after_first_load(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """``#runs-loading`` is visible before the first collector result
+        lands and hidden once the table (or empty state) takes over."""
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        release = threading.Event()
+
+        def _blocking_collect():
+            release.wait(timeout=10)
+            return _collect_runs()
+
+        with patch("conductor.fleet.tui.screens.runs._collect_runs", side_effect=_blocking_collect):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # Assert the whole pre-load frame: a freshly-mounted Static
+                # defaults to display=True, so checking only that would pass
+                # against a screen that never set it (issue #446 review).
+                loading = app.screen.query_one("#runs-loading", Static)
+                assert loading.display is True
+                assert "Loading" in str(loading.render())
+                assert app.screen.query_one(DataTable).display is False
+                assert app.screen.query_one("#empty-state", Static).display is False
+
+                release.set()
+                await settle(pilot)
+
+                assert loading.display is False
+                table = app.screen.query_one(DataTable)
+                assert table.display is True
+
+    async def test_dashboard_opens_off_the_main_thread(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "run-web", port=9123, mode="fg-web")
+
+        seen_main_thread: list[bool] = []
+
+        def _tracking_open(record: RunRecord) -> bool:
+            seen_main_thread.append(threading.current_thread() is threading.main_thread())
+            return True
+
+        with patch("conductor.fleet.tui.screens.runs.open_dashboard", side_effect=_tracking_open):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("w")
+                await settle(pilot)
+
+        assert seen_main_thread == [False]
+
+    async def test_second_w_press_while_opening_does_not_open_twice(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """A second ``w`` press while a dashboard open is already in flight
+        must not open a second tab (mirroring the kill/gate re-entrancy
+        guards)."""
+        _write_record(tmp_path, "run-web", port=9123, mode="fg-web")
+
+        release = threading.Event()
+        call_count = 0
+
+        def _blocking_open(record: RunRecord) -> bool:
+            nonlocal call_count
+            call_count += 1
+            release.wait(timeout=10)
+            return True
+
+        with patch("conductor.fleet.tui.screens.runs.open_dashboard", side_effect=_blocking_open):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("w")
+                # Not `settle`: the dashboard-open worker is genuinely
+                # blocked on `release`, so waiting for all workers here
+                # would deadlock.
+                await pilot.pause()
+
+                await pilot.press("w")
+                await pilot.pause()
+
+                release.set()
+                await settle(pilot)
+
+        assert call_count == 1
+
+    async def test_the_open_guard_is_released_so_w_keeps_working(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The guard is only safe because it is always released -- a stuck
+        flag makes ``w`` a silent no-op for the rest of the session, and
+        unlike the poll guard there is no timer to self-heal it (issue #446
+        review)."""
+        _write_record(tmp_path, "run-web", port=9123, mode="fg-web")
+
+        with patch("conductor.fleet.tui.screens.runs.open_dashboard", return_value=True) as opener:
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("w")
+                await settle(pilot)
+                await pilot.press("w")
+                await settle(pilot)
+
+        assert opener.call_count == 2
+
+    async def test_a_failing_open_does_not_exit_the_app(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """``open_dashboard`` catches broadly today, so this is a backstop:
+        a ``@work`` method defaults to ``exit_on_error``, so anything
+        escaping would take the TUI down over a failed browser launch."""
+        _write_record(tmp_path, "run-web", port=9123, mode="fg-web")
+
+        with patch(
+            "conductor.fleet.tui.screens.runs.open_dashboard",
+            side_effect=RuntimeError("no browser"),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("w")
+                await settle(pilot)
+
+                assert app.is_running
+                screen = app.screen
+                assert isinstance(screen, RunsScreen)
+                assert screen._opening_dashboard is False
 
 
 class TestRunsScreenDuplicateEmptyRunId:
@@ -371,7 +676,7 @@ class TestRunsScreenDuplicateEmptyRunId:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
 
             assert table.row_count == 2
@@ -381,9 +686,9 @@ class TestRunsScreenQuitBinding:
     async def test_q_quits_the_app(self, fleet_env: Path) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("q")
-            await pilot.pause()
+            await settle(pilot)
 
             assert not app.is_running
 
@@ -405,7 +710,7 @@ class TestRunsScreenCursorPreservation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
             assert table.row_count == 2
 
@@ -413,7 +718,7 @@ class TestRunsScreenCursorPreservation:
             selected_row = table.get_row_at(table.cursor_row)
 
             await asyncio.sleep(0.3)
-            await pilot.pause()
+            await settle(pilot)
 
             # Compared on the workflow cell rather than the whole row: the
             # Burn sparkline legitimately changes between polls (that is
@@ -453,10 +758,10 @@ class TestGateDetailMarkupSafety:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
-            await pilot.pause()
+            await settle(pilot)
 
             panel = app.screen.query_one("#run-preview", Static)
             assert panel.display is True
@@ -479,7 +784,7 @@ class TestRunsScreenScanFailurePreservesNotifierState:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             screen = app.screen
             assert isinstance(screen, RunsScreen)
 
@@ -496,7 +801,7 @@ class TestRunsScreenScanFailurePreservesNotifierState:
                 side_effect=OSError("transient failure"),
             ):
                 screen.refresh_runs()
-                await pilot.pause()
+                await settle(pilot)
 
             # The table/displayed state from before the failed scan is
             # left untouched -- not cleared to the empty state.
@@ -507,6 +812,260 @@ class TestRunsScreenScanFailurePreservesNotifierState:
             # observing the same status again must not look like a fresh
             # transition.
             assert screen._notifier.observe("run-gate", "at-gate") is False
+
+    async def test_a_failed_derivation_does_not_reset_that_run_s_notifier_history(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The same once-per-transition contract, through the other door
+        (issue #446 review). A *per-record* derivation failure used to drop
+        that record from the prune set, so ``TransitionNotifier.prune``
+        forgot it and the next successful tick re-fired its notification.
+
+        Deliberately a **partial** failure: one run still derives, so the
+        render reaches the normal row-building path and its prune call.
+        A total failure takes the error branch and never prunes at all.
+        """
+        _write_record(tmp_path, "run-gate", workflow_name="gatewf")
+        _write_record(tmp_path, "run-ok", workflow_name="okwf")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            screen._notifier.observe("run-gate", "at-gate")
+            assert screen._notifier.observe("run-gate", "at-gate") is False
+
+            def _flaky_derive(record: RunRecord):
+                if record.run_id == "run-gate":
+                    raise RuntimeError("boom")
+                return derive_run_summary(record)
+
+            with patch(
+                "conductor.fleet.tui.screens.runs.derive_run_summary",
+                side_effect=_flaky_derive,
+            ):
+                screen.refresh_runs()
+                await settle(pilot)
+
+            # It was still *seen* this tick, so its history survives -- the
+            # run has not silently become a brand-new transition.
+            assert screen._notifier.observe("run-gate", "at-gate") is False
+
+            # One tick where this run's summary cannot be derived at all.
+            with patch(
+                "conductor.fleet.tui.screens.runs.derive_run_summary",
+                side_effect=RuntimeError("boom"),
+            ):
+                screen.refresh_runs()
+                await settle(pilot)
+
+            # It was still *seen*, so its history survives -- the run has
+            # not silently become a brand-new transition.
+            assert screen._notifier.observe("run-gate", "at-gate") is False
+
+    async def test_a_total_derivation_failure_is_not_shown_as_an_empty_fleet(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Records exist but none can be read: that is an error, not the
+        "No runs -- press n to launch one" launch affordance. Showing the
+        empty state to an operator whose runs are still burning tokens
+        invites them to launch a duplicate (issue #446 review)."""
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            with patch(
+                "conductor.fleet.tui.screens.runs.derive_run_summary",
+                side_effect=RuntimeError("boom"),
+            ):
+                screen.refresh_runs()
+                await settle(pilot)
+
+            assert screen.query_one("#empty-state", Static).display is False
+            loading = screen.query_one("#runs-loading", Static)
+            assert loading.display is True
+            assert "Could not read" in str(loading.render())
+            # The row-scoped actions must keep working against the fleet
+            # that is demonstrably still there.
+            assert screen._displayed_records
+
+    async def test_a_persistent_scan_failure_surfaces_instead_of_loading_forever(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """If the very first scan fails, only ``_render_runs`` would ever
+        hide the loading line -- so the screen sat on a dim "Loading…" that
+        never resolved, with no error and no timeout (issue #446 review)."""
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        with patch(
+            "conductor.fleet.tui.screens.runs.read_run_records",
+            side_effect=OSError("unreadable"),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                screen = app.screen
+                assert isinstance(screen, RunsScreen)
+
+                loading = screen.query_one("#runs-loading", Static)
+                assert loading.display is True
+                rendered = str(loading.render())
+                assert "Could not read run records" in rendered
+                assert "Loading" not in rendered
+
+
+class TestRunsScreenGuardRecovery:
+    """The ``_refreshing`` guard is only safe because it is always released.
+    Without the ``finally``, one transient error stops the screen refreshing
+    for the rest of the session -- silently, and indistinguishably from a
+    calm fleet (issue #446 review)."""
+
+    async def test_a_scan_failure_does_not_wedge_the_screen(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 0.05)
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            with patch(
+                "conductor.fleet.tui.screens.runs.read_run_records",
+                side_effect=OSError("transient failure"),
+            ):
+                screen.refresh_runs()
+                await settle(pilot)
+
+            assert screen._refreshing is False
+
+            # And it genuinely recovers on a later tick.
+            await asyncio.sleep(0.3)
+            await settle(pilot)
+            assert screen.query_one(DataTable).row_count == 1
+
+    async def test_a_render_failure_does_not_wedge_the_screen_or_exit_the_app(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``@work`` defaults to ``exit_on_error``, so without the render
+        guard the first exception in ``_render_runs`` takes the whole TUI
+        down rather than logging a warning."""
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 0.05)
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            with patch.object(type(screen), "_render_runs", side_effect=RuntimeError("render bug")):
+                screen.refresh_runs()
+                await settle(pilot)
+                await asyncio.sleep(0.2)
+                await settle(pilot)
+
+            assert app.is_running
+            assert screen._refreshing is False
+
+            await asyncio.sleep(0.2)
+            await settle(pilot)
+            assert screen.query_one(DataTable).row_count == 1
+
+    async def test_two_dispatches_on_one_turn_start_only_one_worker(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the flag's placement: it is set in the synchronous
+        dispatcher, not the worker body, because a ``@work`` method's body
+        does not start until Textual schedules it."""
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 3600)
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            started = 0
+            real_worker = type(screen)._refresh_worker
+
+            def _counting(self_):
+                nonlocal started
+                started += 1
+                return real_worker(self_)
+
+            with patch.object(type(screen), "_refresh_worker", _counting):
+                screen.refresh_runs()
+                screen.refresh_runs()  # same event-loop turn, no await between
+                assert started == 1
+            await settle(pilot)
+
+    async def test_an_explicit_refresh_is_coalesced_rather_than_dropped(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A poll tick may be dropped, but ``_kill_and_refresh`` and the
+        gate-resolve ``finally`` promise the table reflects what they just
+        did -- and the in-flight scan they collide with started *before* it
+        (issue #446 review)."""
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 3600)
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            scans = 0
+            real_collect = _collect_runs
+
+            def _counting_collect():
+                nonlocal scans
+                scans += 1
+                return real_collect()
+
+            with patch(
+                "conductor.fleet.tui.screens.runs._collect_runs", side_effect=_counting_collect
+            ):
+                screen._refreshing = True  # pretend a scan is already in flight
+                screen.refresh_runs(explicit=True)
+                assert scans == 0, "the explicit request must not start a second scan"
+                assert screen._refresh_pending is True
+
+                # When the in-flight scan finishes, the pending request runs.
+                screen._refreshing = False
+                screen._refresh_pending = False
+                screen.refresh_runs(explicit=True)
+                await settle(pilot)
+                assert scans == 1
+
+    async def test_a_dropped_poll_tick_is_not_remembered(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only *explicit* requests coalesce; a redundant poll tick is still
+        dropped, which is the whole point of the guard."""
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 3600)
+        _write_record(tmp_path, "run-a", workflow_name="alpha")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            screen._refreshing = True
+            screen.refresh_runs()
+            assert screen._refresh_pending is False
+            screen._refreshing = False
 
 
 class TestGateResolveDuplicateGuard:
@@ -537,12 +1096,17 @@ class TestGateResolveDuplicateGuard:
         with patch("conductor.fleet.tui.screens.runs.resolve_gate", _fake_resolve_gate):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
-                await pilot.pause()
+                await settle(pilot)
 
                 await pilot.press("g")
+                # Not `settle`: the fake resolve sleeps 0.2s to simulate an
+                # in-flight resolution, and the point of this test is a
+                # second `g` press *during* that window -- waiting for the
+                # worker to complete here would let it finish first and
+                # defeat the very race this test is checking.
                 await pilot.pause()
                 await pilot.press("g")
                 await pilot.pause(0.3)
@@ -565,7 +1129,7 @@ class TestSummaryBar:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             bar = str(app.screen.query_one("#summary-bar", Static).render())
             assert "2 running" in bar
 
@@ -574,7 +1138,7 @@ class TestSummaryBar:
     ) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             bar = str(app.screen.query_one("#summary-bar", Static).render())
             assert "no runs" in bar
             assert "0 " not in bar
@@ -598,7 +1162,7 @@ class TestSummaryBar:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             bar = str(app.screen.query_one("#summary-bar", Static).render())
             assert "124k tok" in bar
             assert "$0.65" in bar
@@ -612,7 +1176,7 @@ class TestPreviewPane:
         launch hint."""
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app.screen.query_one("#preview-pane").display is False
 
     async def test_pid_and_port_are_columns_not_preview_text(
@@ -625,7 +1189,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             row = " ".join(str(c) for c in app.screen.query_one(DataTable).get_row_at(0))
             assert "alpha" in row
             assert str(os.getpid()) in row
@@ -654,7 +1218,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app.screen.query_one("#preview-pane").display is True
             assert "only" in str(app.screen.query_one("#run-preview", Static).render())
 
@@ -682,7 +1246,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             text = str(app.screen.query_one("#run-preview", Static).render())
             assert "first" in text
             assert "second" in text
@@ -711,7 +1275,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             text = str(app.screen.query_one("#run-preview", Static).render())
             assert "Approve the plan?" in text
             assert "approve" in text
@@ -742,7 +1306,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             text = str(app.screen.query_one("#run-preview", Static).render())
             assert "to respond" in text
 
@@ -773,7 +1337,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test(size=(100, 26)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             text = str(app.screen.query_one("#run-preview", Static).render())
             assert "more lines" in text
             # The call to action survives the clipping -- it is the point.
@@ -802,7 +1366,7 @@ class TestPreviewPane:
 
         app = FleetApp()
         async with app.run_test(size=(100, 26)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             pane = app.screen.query_one("#preview-pane")
             assert not pane.allow_vertical_scroll
 
@@ -819,7 +1383,7 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app.screen.check_action("resolve_gate", ()) is False
 
     async def test_shown_when_the_selected_run_is_at_a_gate(
@@ -838,13 +1402,13 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app.screen.check_action("resolve_gate", ()) is True
 
     async def test_hidden_with_no_runs_at_all(self, fleet_env: Path) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app.screen.check_action("resolve_gate", ()) is False
 
     async def test_fleet_scoped_bindings_are_unaffected(
@@ -857,7 +1421,7 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             for action in ("quit", "kill_all", "open_history", "open_new_run"):
                 assert app.screen.check_action(action, ()) is True
 
@@ -870,7 +1434,7 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             for action in ("open_detail", "open_dashboard", "kill"):
                 assert app.screen.check_action(action, ()) is True
 
@@ -880,7 +1444,7 @@ class TestGateBindingVisibility:
         kill, and the reclaimed width is what lets `Detail` fit."""
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             for action in ("open_detail", "open_dashboard", "kill", "resolve_gate"):
                 assert app.screen.check_action(action, ()) is False
             # Fleet-scoped keys survive an empty fleet.
@@ -915,7 +1479,7 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test(size=(140, 30)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             line = await _rendered_footer(pilot, app)
 
         assert "Kill  " in line and "n New" in line
@@ -928,7 +1492,7 @@ class TestGateBindingVisibility:
         rather than a grouping."""
         app = FleetApp()
         async with app.run_test(size=(140, 30)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             line = await _rendered_footer(pilot, app)
 
         assert line.lstrip().startswith("n New"), line
@@ -951,7 +1515,7 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             footer = app.screen.query_one(Footer)
             overflowing = [
                 (child.region.x, child.region.right, getattr(child, "description", "?"))
@@ -974,7 +1538,7 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             shown = [
                 ab.binding.description
                 for ab in app.screen.active_bindings.values()
@@ -995,10 +1559,10 @@ class TestGateBindingVisibility:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             before = len(app.screen_stack)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             assert len(app.screen_stack) == before + 1
 
 
@@ -1043,10 +1607,10 @@ class TestChainedGateResolution:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("g")
             for _ in range(40):
-                await pilot.pause()
+                await settle(pilot)
                 if len(presented) >= 2:
                     break
                 await asyncio.sleep(0.05)
@@ -1085,10 +1649,10 @@ class TestChainedGateResolution:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("g")
             for _ in range(20):
-                await pilot.pause()
+                await settle(pilot)
                 if calls:
                     break
                 await asyncio.sleep(0.05)
@@ -1248,6 +1812,12 @@ class TestRunsScreenPausesWhileNotOnTop:
             # The run reaches its gate *while* the modal is up.
             self._seed_gated_run(tmp_path)
             screen.refresh_runs()
+            # The scan itself runs in a worker thread (issue #437), so the
+            # notification lands after that hop rather than synchronously.
+            # `settle` is safe here specifically because the modal was
+            # pushed with `push_screen`, not `push_screen_wait` -- no worker
+            # is suspended waiting on a keypress.
+            await settle(pilot)
 
             assert notified == ["wf: waiting at gate (ask)"]
 
@@ -1315,3 +1885,41 @@ class TestRunsScreenPausesWhileNotOnTop:
             await asyncio.sleep(FRAME_INTERVAL * 4)
             await pilot.pause()
             assert ticks, "the timer fires again once the gate is answered"
+
+
+class TestAwaitNextGateThreading:
+    """``_await_next_gate`` re-reads the log while a gate modal is up, so a
+    synchronous derivation there is exactly the freeze issue #437 removes.
+    Both chained-gate tests monkeypatch the method away entirely, so without
+    this its thread hop is indistinguishable from unconverted code."""
+
+    async def test_the_gate_re_read_runs_off_the_main_thread(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "aaaa0021", workflow_name="wf")
+
+        seen_main_thread: list[bool] = []
+
+        def _tracking_derive(record: RunRecord):
+            seen_main_thread.append(threading.current_thread() is threading.main_thread())
+            return derive_run_summary(record)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+            record = next(iter(screen._displayed_records.values()))
+
+            with patch(
+                "conductor.fleet.tui.screens.runs.derive_run_summary",
+                side_effect=_tracking_derive,
+            ):
+                await screen._await_next_gate(
+                    record,
+                    after=GateInfo(agent_name="ask", prompt="Q1?", options=[], option_details=[]),
+                    timeout=0.6,
+                )
+
+        assert seen_main_thread, "the gate re-read never ran"
+        assert not any(seen_main_thread), "the gate re-read blocked the event loop"

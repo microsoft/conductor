@@ -18,17 +18,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from textual.widgets import DataTable, Static
 
 from conductor.fleet.records import RunRecord, write_run_record
+from conductor.fleet.summary import derive_run_summary
 from conductor.fleet.tui.app import FleetApp
-from conductor.fleet.tui.screens.run_detail import RunDetailScreen
+from conductor.fleet.tui.screens.run_detail import RunDetailScreen, _collect_detail
 from conductor.fleet.tui.screens.runs import RunsScreen
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -125,11 +129,11 @@ class TestRunDetailNavigation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RunsScreen)
 
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunDetailScreen)
             assert len(app.screen_stack) == 3  # default + RunsScreen + RunDetailScreen
@@ -141,13 +145,13 @@ class TestRunDetailNavigation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RunDetailScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
             assert len(app.screen_stack) == 2  # back to default + RunsScreen
@@ -176,13 +180,13 @@ class TestRunDetailNavigation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.screen.query_one(DataTable)
             # Runs are sorted by recency (newest first) -- "beta" (Feb) is
             # row 0, "alpha" (Jan) is row 1.
             table.move_cursor(row=1)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             detail_screen = app.screen
             assert isinstance(detail_screen, RunDetailScreen)
@@ -205,9 +209,9 @@ class TestRunDetailNavigation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             detail_screen = app.screen
             assert isinstance(detail_screen, RunDetailScreen)
@@ -246,9 +250,9 @@ class TestGateIsNotRepeatedHere:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunDetailScreen)
             painted = "".join(
@@ -284,9 +288,9 @@ class TestGateIsNotRepeatedHere:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             status = str(table.get_row_at(0)[2])
@@ -307,9 +311,9 @@ class TestRunDetailTopologyRows:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             assert table.row_count == 3
@@ -333,9 +337,9 @@ class TestRunDetailTopologyRows:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunDetailScreen)
             table = app.screen.query_one(DataTable)
@@ -356,9 +360,9 @@ class TestRunDetailTopologyRows:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             rows = [table.get_row_at(i) for i in range(table.row_count)]
@@ -395,9 +399,9 @@ class TestRunDetailTopologyRows:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             row = table.get_row_at(0)
@@ -417,9 +421,9 @@ class TestRunDetailTopologyRows:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             assert list(table.columns.values())[0].label.plain == "Agent"
@@ -455,9 +459,9 @@ class TestRunDetailGracefulDegradation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunDetailScreen)
             table = app.screen.query_one(DataTable)
@@ -473,9 +477,9 @@ class TestRunDetailGracefulDegradation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             placeholder = app.screen.query_one("#detail-placeholder", Static)
@@ -489,13 +493,13 @@ class TestRunDetailGracefulDegradation:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RunDetailScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
 
@@ -527,9 +531,9 @@ class TestRunDetailPolling:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             row = table.get_row_at(0)
@@ -552,7 +556,7 @@ class TestRunDetailPolling:
             # Wait out several poll intervals (real time -- set_interval is
             # a real asyncio timer, not something pilot.pause() advances).
             await asyncio.sleep(0.3)
-            await pilot.pause()
+            await settle(pilot)
 
             row = table.get_row_at(0)
             assert "completed" in str(row[2]).lower()
@@ -573,9 +577,9 @@ class TestRunDetailPolling:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             placeholder = app.screen.query_one("#detail-placeholder", Static)
@@ -585,7 +589,7 @@ class TestRunDetailPolling:
             _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
 
             await asyncio.sleep(0.3)
-            await pilot.pause()
+            await settle(pilot)
 
             assert table.display is True
             assert placeholder.display is False
@@ -605,15 +609,15 @@ class TestRunDetailPolling:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             detail_screen = app.screen
             assert isinstance(detail_screen, RunDetailScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RunsScreen)
 
             # If the timer were still running, this would either raise
@@ -621,5 +625,154 @@ class TestRunDetailPolling:
             # Textual -- either way, letting several intervals elapse here
             # must not crash the app.
             await asyncio.sleep(0.3)
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RunsScreen)
+
+
+class TestCollectDetail:
+    """Unit tests for ``_collect_detail``, the collector half of the poll
+    refresh (issue #437)."""
+
+    def test_derives_both_summary_and_detail(self, fleet_env: Path, tmp_path: Path) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        record = _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        summary, detail = _collect_detail(record)
+
+        assert summary is not None
+        assert detail is not None
+        assert detail.agents and detail.agents[0].name == "researcher"
+
+    def test_summary_failure_does_not_prevent_detail(self, fleet_env: Path, tmp_path: Path) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        record = _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        with patch(
+            "conductor.fleet.tui.screens.run_detail.derive_run_summary",
+            side_effect=RuntimeError("boom"),
+        ):
+            summary, detail = _collect_detail(record)
+
+        assert summary is None
+        assert detail is not None
+
+    def test_detail_failure_does_not_prevent_summary(self, fleet_env: Path, tmp_path: Path) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        record = _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        with patch(
+            "conductor.fleet.tui.screens.run_detail.derive_run_detail",
+            side_effect=RuntimeError("boom"),
+        ):
+            summary, detail = _collect_detail(record)
+
+        assert summary is not None
+        assert detail is None
+
+
+class TestRunDetailWorkerThreading:
+    """Both derivations run off the main thread in a single worker call
+    (issue #437) -- verified by thread identity, not timing."""
+
+    async def test_collector_runs_off_the_main_thread(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        seen_main_thread: list[bool] = []
+
+        def _tracking_summary(record: RunRecord):
+            seen_main_thread.append(threading.current_thread() is threading.main_thread())
+            return derive_run_summary(record)
+
+        with patch(
+            "conductor.fleet.tui.screens.run_detail.derive_run_summary",
+            side_effect=_tracking_summary,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("enter")
+                await settle(pilot)
+
+        assert seen_main_thread, "the collector was never called"
+        assert all(on_main is False for on_main in seen_main_thread)
+
+    async def test_a_tick_is_skipped_while_a_refresh_is_in_flight(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(RunDetailScreen, "POLL_INTERVAL_SECONDS", 0.05)
+
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        release = threading.Event()
+        call_count = 0
+
+        def _blocking_collect(record: RunRecord):
+            nonlocal call_count
+            call_count += 1
+            release.wait(timeout=10)
+            return None, None
+
+        with patch(
+            "conductor.fleet.tui.screens.run_detail._collect_detail",
+            side_effect=_blocking_collect,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("enter")
+
+                # Several poll intervals elapse while the collector is
+                # blocked -- none of them may start a second worker.
+                await asyncio.sleep(0.3)
+                assert call_count == 1
+
+                release.set()
+                await settle(pilot)
+
+    async def test_loading_indicator_hides_after_first_load(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        release = threading.Event()
+
+        def _blocking_collect(record: RunRecord):
+            release.wait(timeout=10)
+            return _collect_detail(record)
+
+        with patch(
+            "conductor.fleet.tui.screens.run_detail._collect_detail",
+            side_effect=_blocking_collect,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("enter")
+                await pilot.pause()
+
+                # Assert the whole pre-load frame: a freshly-mounted Static
+                # defaults to display=True, so checking only that would pass
+                # against a screen that never set it (issue #446 review).
+                loading = app.screen.query_one("#detail-loading", Static)
+                assert loading.display is True
+                assert "Loading" in str(loading.render())
+                assert app.screen.query_one(DataTable).display is False
+                assert app.screen.query_one("#detail-placeholder", Static).display is False
+
+                release.set()
+                await settle(pilot)
+
+                assert loading.display is False
+                table = app.screen.query_one(DataTable)
+                assert table.display is True

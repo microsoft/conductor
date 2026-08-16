@@ -105,7 +105,11 @@ stack rather than each managing its own navigation state.
   which run needs attention, not by which file it came from. When nothing
   is running, this screen shows the launch affordance (`n` → New Run)
   rather than an empty table — the empty state is a first-class screen,
-  not an afterthought.
+  not an afterthought. The poll's scan runs off the UI thread, and any
+  tick arriving while the previous scan is still running is skipped rather
+  than started alongside it, so the UI stays responsive even against a
+  large fleet. If the scan itself fails, the screen says so rather than
+  silently showing you a stale table or an empty-looking fleet.
 - **Run detail** (`enter` on a Runs row) — topology from `workflow_started`,
   per-agent status/elapsed/tokens/cost from the event log, with the
   currently-running agent highlighted. Deliberately **not a DAG**: no agent

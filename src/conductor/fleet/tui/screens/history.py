@@ -20,19 +20,28 @@ Loaded once on mount, like the Providers/Registries screens (E10/E11) --
 unlike the Runs/run-detail screens' live ~2s poll, a completed run's
 history does not change once written, so there is no live state here to
 keep refreshed on a timer.
+
+The read is bounded by ``min(keep_last, _MAX_HISTORY_ENTRIES)`` -- the
+200-entry display cap is independent of retention, so raising
+``keep_last`` cannot grow this screen -- and happens off the event loop,
+in a worker thread (issue #437); how much of each log is read once
+retrieved is issue #436's concern, not this one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
+from conductor.console import styled
 from conductor.fleet.history import HistoryEntry, build_history_entries
-from conductor.fleet.tui.theme import status_label
+from conductor.fleet.tui.theme import loading_text, status_label
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +128,7 @@ class HistoryScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static(loading_text(), id="history-loading", classes="notice")
         yield DataTable(id="history-table")
         yield Static(_EMPTY_STATE_TEXT, id="history-empty-state")
         yield Footer()
@@ -127,26 +137,54 @@ class HistoryScreen(Screen):
         table = self.query_one(DataTable)
         table.add_columns("Workflow", "Outcome", "Duration", "Tokens", "Cost")
         table.cursor_type = "row"
+        # Hidden until the load lands (issue #437) -- this is the screen
+        # where it matters most: up to `keep_last` (default 200) logs are
+        # read before anything else can paint.
+        table.display = False
+        self.query_one("#history-empty-state", Static).display = False
         self.load_history()
 
-    def load_history(self) -> None:
-        """(Re-)build the history list and populate the table (or show the
-        empty state).
+    @work
+    async def load_history(self) -> None:
+        """(Re-)build the history list and populate the table, off the event
+        loop (issue #437).
 
-        Best-effort: a failure building the list is logged and treated as
-        "no history" (mirroring every other screen's degrade-gracefully
-        convention) rather than crashing the screen --
-        ``build_history_entries`` itself already never raises, but this
-        is an extra backstop consistent with ``runs.py``'s own precedent.
+        One-shot: called only from ``on_mount`` (this screen has no refresh
+        binding and no poll), so unlike ``runs.py``/``run_detail.py`` it
+        needs no re-entrancy guard. Add one before wiring any reload key.
+
+        A failure building the list is **not** degraded into "no history".
+        ``build_history_entries`` is documented never to raise, so if it
+        does, rendering the empty state would make a positive claim of
+        absence -- and because this screen loads once, that claim is
+        permanent for its lifetime and the operator stops looking (issue
+        #446 review). Surfaced as an error line instead, matching
+        ``step_detail.py``/``registries.py``'s convention for this same
+        worker pattern.
         """
+        loading = self.query_one("#history-loading", Static)
         try:
-            entries = build_history_entries()
-        except Exception:
+            entries = await asyncio.to_thread(build_history_entries)
+        except Exception as e:  # noqa: BLE001 - surfaced, not crashed
             logger.warning("Failed to build run history", exc_info=True)
-            entries = []
+            loading.update(styled("[red]Could not read run history:[/red] {}", str(e)))
+            loading.display = True
+            self.notify("Could not read run history.", severity="error", markup=False)
+            return
 
+        try:
+            self._render_history(entries)
+        except Exception:  # noqa: BLE001 - a render bug must not exit the app
+            # Matches the guard on the two polled screens: a ``@work``
+            # method defaults to ``exit_on_error``, so an exception here
+            # would take the whole TUI down rather than log a warning.
+            logger.warning("Failed to render run history", exc_info=True)
+
+    def _render_history(self, entries: list[HistoryEntry]) -> None:
+        """Repopulate the table (or the empty state) from a completed load."""
         table = self.query_one(DataTable)
         empty_state = self.query_one("#history-empty-state", Static)
+        self.query_one("#history-loading", Static).display = False
         table.clear()
 
         if not entries:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,12 @@ from unittest.mock import patch
 import pytest
 from textual.widgets import DataTable, Static
 
+from conductor.fleet.history import build_history_entries
 from conductor.fleet.retention import event_log_root
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.history import HistoryScreen
 from conductor.fleet.tui.screens.runs import RunsScreen
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,9 +93,9 @@ def _write_log(
 
 async def _goto_history(pilot) -> None:
     """Navigate from the (already-mounted) Runs screen to History."""
-    await pilot.pause()
+    await settle(pilot)
     await pilot.press("h")
-    await pilot.pause()
+    await settle(pilot)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +119,7 @@ class TestHistoryNavigation:
             assert isinstance(app.screen, HistoryScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
 
@@ -302,7 +305,7 @@ class TestHistoryReplayDelegation:
             table.move_cursor(row=0)
             with patch.object(HistoryScreen, "notify") as mock_notify:
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_notify.assert_called_once()
         message = mock_notify.call_args.args[0]
@@ -335,7 +338,131 @@ class TestHistoryReplayDelegation:
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_open.assert_not_called()
         mock_dashboard.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Off-loop loading (issue #437)
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryWorkerThreading:
+    async def test_build_history_entries_runs_off_the_main_thread(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _write_log(
+            event_log_dir,
+            name="completed-wf",
+            run_id="00000001",
+            lines=[
+                _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+            ],
+        )
+
+        seen_main_thread: list[bool] = []
+
+        def _tracking_build():
+            seen_main_thread.append(threading.current_thread() is threading.main_thread())
+            return build_history_entries()
+
+        with patch(
+            "conductor.fleet.tui.screens.history.build_history_entries",
+            side_effect=_tracking_build,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_history(pilot)
+
+        assert seen_main_thread == [False]
+
+    @pytest.mark.parametrize(
+        ("write_log", "revealed_id"),
+        [(True, "#history-table"), (False, "#history-empty-state")],
+    )
+    async def test_loading_indicator_shows_then_yields_to_the_result(
+        self, fleet_env: Path, event_log_dir: Path, write_log: bool, revealed_id: str
+    ) -> None:
+        if write_log:
+            _write_log(
+                event_log_dir,
+                name="completed-wf",
+                run_id="00000001",
+                lines=[
+                    _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                    _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+                ],
+            )
+
+        release = threading.Event()
+
+        def _blocking_build():
+            release.wait(timeout=10)
+            return build_history_entries()
+
+        with patch(
+            "conductor.fleet.tui.screens.history.build_history_entries",
+            side_effect=_blocking_build,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("h")
+                await pilot.pause()
+
+                # Assert the whole pre-load frame, not just that a Static
+                # exists: a freshly-mounted Static defaults to display=True,
+                # so checking only that would pass against a screen which
+                # never touched it (issue #446 review).
+                loading = app.screen.query_one("#history-loading", Static)
+                assert loading.display is True
+                assert "Loading" in str(loading.render())
+                assert app.screen.query_one(DataTable).display is False
+                assert app.screen.query_one("#history-empty-state", Static).display is False
+
+                release.set()
+                await settle(pilot)
+
+                assert loading.display is False
+                assert app.screen.query_one(revealed_id, Static | DataTable).display is True
+
+    async def test_a_failed_build_is_not_reported_as_no_history(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """Degrading a read failure into the empty state makes a positive
+        claim of absence -- and because this screen loads once, with no
+        poll to self-heal, that claim is permanent and the operator stops
+        looking (issue #446 review)."""
+        with patch(
+            "conductor.fleet.tui.screens.history.build_history_entries",
+            side_effect=OSError("unreadable"),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("h")
+                await settle(pilot)
+
+                assert app.is_running
+                assert app.screen.query_one("#history-empty-state", Static).display is False
+                loading = app.screen.query_one("#history-loading", Static)
+                assert loading.display is True
+                assert "Could not read run history" in str(loading.render())
+
+    async def test_a_render_failure_does_not_exit_the_app(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """``@work`` defaults to ``exit_on_error``, so an unguarded render
+        exception here would take the whole TUI down -- while the identical
+        bug on the two polled screens is only a logged warning."""
+        with patch.object(HistoryScreen, "_render_history", side_effect=RuntimeError("render bug")):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("h")
+                await settle(pilot)
+
+                assert app.is_running

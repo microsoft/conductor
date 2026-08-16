@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -32,6 +33,7 @@ from conductor.fleet.records import RunRecord, read_run_record, write_run_record
 from conductor.fleet.tui import actions as tui_actions
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.runs import RunsScreen
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers (mirroring tests/test_cli/test_stop.py's established patterns)
@@ -142,12 +144,12 @@ class TestDashboardAction:
         with patch.object(tui_actions.webbrowser, "open") as mock_open:
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 screen = app.screen
                 assert isinstance(screen, RunsScreen)
                 with patch.object(RunsScreen, "notify") as mock_notify:
                     await pilot.press("w")
-                    await pilot.pause()
+                    await settle(pilot)
 
         mock_open.assert_not_called()
         mock_notify.assert_called_once()
@@ -175,9 +177,9 @@ class TestDashboardAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("w")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_open.assert_called_once_with("http://127.0.0.1:9123")
 
@@ -189,9 +191,9 @@ class TestDashboardAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("w")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_open.assert_not_called()
 
@@ -215,12 +217,15 @@ class TestKillAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("k")
+                # Not `settle`: `action_kill` is a `@work` method that
+                # suspends on `push_screen_wait` until the modal below is
+                # answered, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 # Confirm the kill via the modal (D1: TUI always confirms).
                 await pilot.press("y")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_kill.assert_called_once()
         called_pid = mock_kill.call_args.args[0]
@@ -243,11 +248,13 @@ class TestKillAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("k")
+                # Not `settle`: the kill worker suspends on the confirmation
+                # modal below, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 await pilot.press("y")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_kill.assert_called_once()
         assert mock_kill.call_args.args[0] == pid
@@ -278,11 +285,13 @@ class TestKillAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("k")
+                # Not `settle`: the kill worker suspends on the confirmation
+                # modal below, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 await pilot.press("y")
-                await pilot.pause()
+                await settle(pilot)
 
         # The process never actually died, even after SIGKILL escalation --
         # the record must survive.
@@ -320,11 +329,13 @@ class TestKillAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("k")
+                # Not `settle`: the kill worker suspends on the confirmation
+                # modal below, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 await pilot.press("y")
-                await pilot.pause()
+                await settle(pilot)
 
         # Reaching here without an unhandled exception is the assertion;
         # additionally confirm the record was cleaned up (already-gone
@@ -343,12 +354,14 @@ class TestKillAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("k")
+                # Not `settle`: the kill worker suspends on the confirmation
+                # modal below, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 # Cancel the confirmation modal.
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_kill.assert_not_called()
         assert read_run_record("run-a") is not None
@@ -378,11 +391,14 @@ class TestKillAllAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("K")
+                # Not `settle`: `action_kill_all` is a `@work` method that
+                # suspends on `push_screen_wait` until the modal below is
+                # answered, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 await pilot.press("y")
-                await pilot.pause()
+                await settle(pilot)
 
         # Exactly one modal for the whole kill-all, not one per run.
         modal_spy.assert_called_once()
@@ -412,12 +428,15 @@ class TestKillAllAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("K")
+                # Not `settle`: the kill-all worker suspends on the
+                # confirmation modal below, so waiting for all workers here
+                # would deadlock.
                 await pilot.pause()
                 # Decline -- we only care about the confirmation message here.
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
 
         assert captured_message is not None
         assert "run-fg" in captured_message
@@ -433,11 +452,14 @@ class TestKillAllAction:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("K")
+                # Not `settle`: the kill-all worker suspends on the
+                # confirmation modal below, so waiting for all workers here
+                # would deadlock.
                 await pilot.pause()
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_kill.assert_not_called()
 
@@ -445,9 +467,9 @@ class TestKillAllAction:
         with patch("conductor.cli.app.os.kill") as mock_kill:
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("K")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_kill.assert_not_called()
 
@@ -482,15 +504,54 @@ class TestSharedImplementation:
         ) as mock_stop_records:
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("k")
+                # Not `settle`: the kill worker suspends on the confirmation
+                # modal below, so waiting for all workers here would deadlock.
                 await pilot.pause()
                 await pilot.press("y")
-                await pilot.pause()
+                await settle(pilot)
 
         mock_stop_records.assert_called_once()
         called_targets = mock_stop_records.call_args.args[0]
         assert [r.run_id for r in called_targets] == ["run-a"]
+
+    async def test_stop_records_runs_off_the_main_thread(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """``kill_runs`` awaits ``stop_records`` via ``asyncio.to_thread``
+        (issue #437) rather than calling it inline on the event loop --
+        ``stop_records``'s underlying signal-and-poll escalation ladder can
+        take seconds."""
+        pid = os.getpid()
+        _write_record(tmp_path, "run-a", pid=pid, mode="bg")
+
+        seen_main_thread: list[bool] = []
+
+        with (
+            _fast_grace_period(),
+            patch("conductor.cli.pid.is_process_alive", side_effect=_alive_then_dead()),
+            patch("conductor.cli.app.os.kill"),
+        ):
+            real_stop_records = tui_actions.stop_records
+
+            def _tracking_stop_records(*args: object, **kwargs: object):
+                seen_main_thread.append(threading.current_thread() is threading.main_thread())
+                return real_stop_records(*args, **kwargs)
+
+            with patch.object(tui_actions, "stop_records", side_effect=_tracking_stop_records):
+                app = FleetApp()
+                async with app.run_test() as pilot:
+                    await settle(pilot)
+                    await pilot.press("k")
+                    # Not `settle`: the kill worker suspends on the
+                    # confirmation modal below, so waiting for all workers
+                    # here would deadlock.
+                    await pilot.pause()
+                    await pilot.press("y")
+                    await settle(pilot)
+
+        assert seen_main_thread == [False]
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +598,9 @@ class TestGateOptionsModalMarkupSafety:
                 result_holder["result"] = await app.push_screen_wait(GateOptionsModal(gate))
 
             app.run_worker(_push_modal())
+            # Not `settle`: `_push_modal`'s worker suspends on
+            # `push_screen_wait` until `escape` dismisses it below, so
+            # waiting for all workers here would deadlock.
             await pilot.pause()
 
             from textual.widgets import Static
@@ -546,7 +610,7 @@ class TestGateOptionsModalMarkupSafety:
             assert "[/red]evil prompt[/bold]" in text
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
             assert result_holder["result"] is None
 
 
@@ -571,6 +635,9 @@ class TestGateOptionsModalDuplicateValues:
                 result_holder["result"] = await app.push_screen_wait(GateOptionsModal(gate))
 
             app.run_worker(_push_modal())
+            # Not `settle`: `_push_modal`'s worker suspends on
+            # `push_screen_wait` until `enter` selects an option below, so
+            # waiting for all workers here would deadlock.
             await pilot.pause()
 
             option_list = app.screen.query_one(OptionList)
@@ -581,7 +648,7 @@ class TestGateOptionsModalDuplicateValues:
             # internal opaque id.
             option_list.highlighted = 2
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert result_holder["result"] == "abort"
 
@@ -792,7 +859,7 @@ class TestGateModalScrolling:
         app = FleetApp()
         async with app.run_test(size=(80, 24)) as pilot:
             app.push_screen(GateOptionsModal(self._long_gate()))
-            await pilot.pause()
+            await settle(pilot)
 
             option_list = app.screen.query_one(OptionList)
             screen_height = app.screen.size.height
@@ -811,7 +878,7 @@ class TestGateModalScrolling:
         app = FleetApp()
         async with app.run_test(size=(80, 24)) as pilot:
             app.push_screen(GateOptionsModal(self._long_gate()))
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen.focused, OptionList)
 
     async def test_ctrl_down_scrolls_the_prompt(self, fleet_env: Path) -> None:
@@ -822,12 +889,12 @@ class TestGateModalScrolling:
         app = FleetApp()
         async with app.run_test(size=(80, 24)) as pilot:
             app.push_screen(GateOptionsModal(self._long_gate()))
-            await pilot.pause()
+            await settle(pilot)
 
             scroller = app.screen.query_one("#gate-prompt-scroll", VerticalScroll)
             assert scroller.scroll_offset.y == 0
             await pilot.press("ctrl+down")
-            await pilot.pause()
+            await settle(pilot)
             assert scroller.scroll_offset.y > 0, "ctrl+down must scroll the prompt"
 
     async def test_page_binding_scrolls_further_than_a_line(self, fleet_env: Path) -> None:
@@ -840,11 +907,11 @@ class TestGateModalScrolling:
         app = FleetApp()
         async with app.run_test(size=(80, 24)) as pilot:
             app.push_screen(GateOptionsModal(self._long_gate()))
-            await pilot.pause()
+            await settle(pilot)
 
             scroller = app.screen.query_one("#gate-prompt-scroll", VerticalScroll)
             await pilot.press("ctrl+shift+down")
-            await pilot.pause()
+            await settle(pilot)
             assert scroller.scroll_offset.y > 1
 
     async def test_a_refused_kill_is_reported_not_counted_as_zero(
@@ -871,7 +938,7 @@ class TestGateModalScrolling:
         with patch.object(tui_actions, "stop_records", return_value=fake_outcome):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 screen = app.screen
                 original_notify = screen.notify
 
@@ -881,9 +948,12 @@ class TestGateModalScrolling:
 
                 with patch.object(screen, "notify", _capture):
                     await pilot.press("k")
+                    # Not `settle`: the kill worker suspends on the
+                    # confirmation modal below, so waiting for all workers
+                    # here would deadlock.
                     await pilot.pause()
                     await pilot.press("y")
-                    await pilot.pause()
+                    await settle(pilot)
 
         assert notifications, "the kill produced no notification at all"
         assert not any("Killed 0 run(s)" in message for message, _ in notifications)

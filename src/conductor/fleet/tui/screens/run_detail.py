@@ -14,15 +14,23 @@ Unlike the Runs screen (which stays on the bounded tail-window read so its
 **full**-log read (:func:`conductor.fleet.summary.derive_run_detail`,
 E9-T3) so every agent's complete history is available, not just whichever
 agents happen to still be inside the tail window.
+
+Both derivations run in a single worker thread (:func:`asyncio.to_thread`),
+not on the event loop, so the ~2s poll's larger read (a full-log scan on
+top of the Runs screen's bounded tail read) never blocks keypresses or the
+footer repaint (issue #437); a tick that overruns the poll interval is
+dropped rather than queued.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.screen import Screen
 from textual.timer import Timer
@@ -30,8 +38,14 @@ from textual.widgets import DataTable, Footer, Header, Static
 
 from conductor.console import styled
 from conductor.fleet.records import RunRecord
-from conductor.fleet.summary import AgentDetail, RunSummary, derive_run_detail, derive_run_summary
-from conductor.fleet.tui.theme import muted, status_label
+from conductor.fleet.summary import (
+    AgentDetail,
+    RunDetail,
+    RunSummary,
+    derive_run_detail,
+    derive_run_summary,
+)
+from conductor.fleet.tui.theme import loading_text, muted, status_label
 
 if TYPE_CHECKING:
     # app.py imports this module, so a top-level import would cycle.
@@ -104,6 +118,34 @@ def _format_agent_cost(cost_usd: float | None) -> str:
     return f"~${cost_usd:.2f}"
 
 
+def _collect_detail(record: RunRecord) -> tuple[RunSummary | None, RunDetail | None]:
+    """Derive ``record``'s summary and detail in one call, off the event loop.
+
+    The I/O half of :meth:`RunDetailScreen.refresh_detail` (issue #437) --
+    touches no widget, so it is safe to run in a worker thread via
+    :func:`asyncio.to_thread` and directly unit-testable. Both derivations
+    are done here together (rather than as two separate ``to_thread`` hops)
+    so one poll tick costs one thread round trip.
+
+    Preserves the original per-derivation ``try/except`` + ``logger.warning``
+    -> ``None`` behaviour verbatim: a failure deriving one does not prevent
+    the other from being returned.
+    """
+    try:
+        summary = derive_run_summary(record)
+    except Exception:
+        logger.warning("Failed to derive run summary for run_id=%s", record.run_id, exc_info=True)
+        summary = None
+
+    try:
+        detail = derive_run_detail(record)
+    except Exception:
+        logger.warning("Failed to derive run detail for run_id=%s", record.run_id, exc_info=True)
+        detail = None
+
+    return summary, detail
+
+
 class RunDetailScreen(Screen):
     """Per-run detail: topology as discrete per-agent rows, current step
     highlighted. Not a DAG; no agent messages; no tool output (E9-T2)."""
@@ -124,6 +166,12 @@ class RunDetailScreen(Screen):
         # the log's declared name as soon as the detail read supplies it,
         # so the title agrees with the Runs and History screens.
         self._display_name = record.workflow_name
+        self._refreshing = False
+        """Guards against a poll tick starting a second, concurrent
+        ``_refresh_worker`` while one is already awaiting its
+        ``asyncio.to_thread`` scan (issue #437) -- an overrunning refresh
+        drops the next tick rather than queueing it, matching
+        ``RunsScreen``'s identical guard."""
 
     def _update_title(self, title: Static) -> None:
         """Render the heading from the current best-known workflow name."""
@@ -174,6 +222,7 @@ class RunDetailScreen(Screen):
         yield Header()
         yield Static(id="detail-title")
         yield Static(id="run-inputs")
+        yield Static(loading_text(), id="detail-loading", classes="notice")
         yield DataTable(id="detail-table")
         yield Static(_PLACEHOLDER_TEXT, id="detail-placeholder")
         yield Footer()
@@ -183,6 +232,13 @@ class RunDetailScreen(Screen):
         table.add_columns("Agent", "Type", "Status", "Elapsed", "Tokens", "Cost")
         table.cursor_type = "row"
         self.query_one("#run-inputs", Static).display = False
+        # Hidden until the first collector result lands (issue #437); the
+        # title is still painted immediately from the record, since it
+        # needs no I/O -- "seeded from the record, then corrected" matching
+        # `step_detail.py`'s convention.
+        table.display = False
+        self.query_one("#detail-placeholder", Static).display = False
+        self._update_title(self.query_one("#detail-title", Static))
         self.refresh_detail()
         self._poll_timer = self.set_interval(self.POLL_INTERVAL_SECONDS, self.refresh_detail)
 
@@ -196,45 +252,67 @@ class RunDetailScreen(Screen):
 
     def refresh_detail(self) -> None:
         """(Re-)derive this run's detail and repopulate the table (or show
-        the placeholder). Best-effort: a failure deriving detail is logged
-        and treated the same as "no topology available" (E9-T5) rather
-        than crashing the screen.
+        the placeholder).
+
+        A **synchronous dispatcher** (issue #437), with the same shape and
+        the same rationale as
+        :meth:`~conductor.fleet.tui.screens.runs.RunsScreen.refresh_runs`
+        -- including why :attr:`_refreshing` is set here rather than as the
+        worker's first line. Called from ``on_mount`` and ``set_interval``,
+        neither of which awaits, so it stays synchronous. This screen has
+        no explicit-refresh caller, so it needs no ``_refresh_pending``
+        counterpart.
+        """
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            self._refresh_worker()
+        except Exception:
+            # The flag is set before the worker exists, so a failure to
+            # dispatch would otherwise latch it True and silently stop this
+            # screen refreshing for the rest of the session.
+            self._refreshing = False
+            raise
+
+    @work
+    async def _refresh_worker(self) -> None:
+        """Do both derivations off the event loop, then render on it.
+
+        Best-effort: a failure deriving detail is logged and treated the
+        same as "no topology available" (E9-T5) rather than crashing the
+        screen.
+        """
+        try:
+            summary, detail = await asyncio.to_thread(_collect_detail, self._record)
+            try:
+                self._render_detail(summary, detail)
+            except Exception:  # noqa: BLE001 - a render bug must not exit the app
+                logger.warning("Failed to render run detail", exc_info=True)
+        finally:
+            self._refreshing = False
+
+    def _render_detail(self, summary: RunSummary | None, detail: RunDetail | None) -> None:
+        """Repopulate the table (or the placeholder) from a completed derivation.
+
+        The render half of :meth:`refresh_detail` (issue #437) -- runs on
+        the event loop, after the collector's ``asyncio.to_thread`` hop.
+
+        An open gate is deliberately *not* repeated here. The Runs screen's
+        preview already shows it along with the key that answers it, and
+        repeating it above this table pushed the per-agent rows -- the
+        reason to open this screen at all -- below the fold on a gated run.
         """
         title = self.query_one("#detail-title", Static)
         table = self.query_one(DataTable)
         placeholder = self.query_one("#detail-placeholder", Static)
-
-        self._update_title(title)
-
-        # `RunSummary` (a bounded tail read) rather than `RunDetail`: the
-        # inputs section below needs what the run was launched with, which
-        # only the summary carries.
-        #
-        # An open gate is deliberately *not* repeated here. The Runs screen's
-        # preview already shows it along with the key that answers it, and
-        # repeating it above this table pushed the per-agent rows -- the
-        # reason to open this screen at all -- below the fold on a gated run.
-        try:
-            summary = derive_run_summary(self._record)
-        except Exception:
-            logger.warning(
-                "Failed to derive run summary for run_id=%s", self._record.run_id, exc_info=True
-            )
-            summary = None
+        self.query_one("#detail-loading", Static).display = False
 
         self._update_inputs(summary)
 
-        try:
-            detail = derive_run_detail(self._record)
-        except Exception:
-            logger.warning(
-                "Failed to derive run detail for run_id=%s", self._record.run_id, exc_info=True
-            )
-            detail = None
-
         if detail is not None and detail.workflow_name:
             self._display_name = detail.workflow_name
-            self._update_title(title)
+        self._update_title(title)
 
         if detail is None or detail.topology is None or not detail.agents:
             # A missing/unreadable event log, or one with no (yet-visible)

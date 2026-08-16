@@ -29,6 +29,7 @@ from conductor.fleet.records import RunRecord, write_run_record
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.run_detail import RunDetailScreen
 from conductor.fleet.tui.screens.step_detail import StepDetailScreen
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -126,8 +127,7 @@ async def _open_step(pilot: Any, app: FleetApp, row: int = 0) -> StepDetailScree
     app.screen.query_one(DataTable).move_cursor(row=row)
     await pilot.press("enter")
     # The screen reads the log in a worker thread.
-    await app.workers.wait_for_complete()
-    await pilot.pause()
+    await settle(pilot)
 
     screen = app.screen
     assert isinstance(screen, StepDetailScreen)

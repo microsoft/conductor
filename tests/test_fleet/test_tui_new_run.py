@@ -34,6 +34,7 @@ from conductor.fleet.records import RunRecord, write_run_record
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.new_run import NewRunScreen
 from conductor.fleet.tui.screens.runs import RunsScreen
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,9 +95,9 @@ def fixture_workflow(tmp_path: Path) -> Path:
 
 async def _goto_new_run(pilot) -> None:
     """Navigate from the (already-mounted) Runs screen to New Run."""
-    await pilot.pause()
+    await settle(pilot)
     await pilot.press("n")
-    await pilot.pause()
+    await settle(pilot)
 
 
 async def _resolve(pilot, path: Path) -> None:
@@ -150,7 +151,7 @@ class TestNewRunNavigation:
             assert isinstance(app.screen, NewRunScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
 
@@ -293,7 +294,7 @@ class TestNewRunSubmission:
             # The Runs screen's own poll timer (or an explicit refresh)
             # picks up the newly-written record.
             app.screen.refresh_runs()
-            await pilot.pause()
+            await settle(pilot)
 
             table = app.screen.query_one(DataTable)
             rows = [table.get_row_at(i) for i in range(table.row_count)]
@@ -568,7 +569,7 @@ class TestNewRunRequiredBooleanUnset:
 
             checkbox = app.screen._input_widgets["confirm"]
             await pilot.click(checkbox)
-            await pilot.pause()
+            await settle(pilot)
 
             await pilot.press("ctrl+s")
             await pilot.pause(0.3)
@@ -615,6 +616,10 @@ class TestNewRunLaunchGuard:
             question_input.value = "What is Python?"
 
             await pilot.press("ctrl+s")
+            # Not `settle`: the launch worker is genuinely blocked on
+            # `release_launch` (a real OS thread wait, not something
+            # `wait_for_complete()` should be made to sit through), so this
+            # must observe the in-flight state rather than wait it out.
             await pilot.pause()
 
             # Flagged synchronously -- before the still in-flight launch

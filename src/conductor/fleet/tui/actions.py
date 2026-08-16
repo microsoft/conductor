@@ -28,10 +28,21 @@ alternate screen buffer; and its ``typer.Exit`` (raised on every failure
 path) is caught and translated into a :class:`GateResolveOutcome` rather
 than propagating -- so a gate-respond HTTP failure surfaces in-UI, never
 as an unhandled exception.
+
+``kill_runs`` (E8-T3) and the dashboard-open path (``runs.py``'s
+``action_open_dashboard``, issue #437) also move their blocking call off
+the event loop: :func:`stop_records`'s underlying ``_stop_process`` is a
+bounded signal-and-poll escalation ladder that can take seconds, and
+opening a dashboard under WSL shells out with a 15s timeout
+(``_wsl_open``). ``kill_runs`` awaits ``asyncio.to_thread(stop_records,
+...)`` rather than calling it inline, even though the function itself is
+already ``async`` -- being a coroutine doesn't move blocking calls off the
+loop by itself.
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -266,16 +277,22 @@ class ConfirmKillModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
-def _silent_console() -> Console:
-    """A Rich Console that discards its output.
+def _silent_console(buffer: io.StringIO) -> Console:
+    """A Rich Console that writes into ``buffer`` instead of the terminal.
 
     ``stop_records``'s underlying ``_stop_process`` prints CLI-style
     progress messages via Rich; writing those to the real terminal would
     corrupt Textual's alternate-screen rendering. The TUI surfaces its own
-    feedback via ``Screen.notify`` instead, so this output is simply
-    discarded.
+    feedback via ``Screen.notify`` instead.
+
+    The output is captured rather than thrown away because it is the *only*
+    place the actionable detail behind a refused kill lives -- ``mismatched``
+    means a different process now holds that PID, and ``unconfirmed`` has a
+    documented ``conductor stop --force`` remedy. :func:`kill_runs` logs the
+    buffer whenever a kill fails, so that detail is recoverable after the
+    fact instead of being discarded (issue #446 review).
     """
-    return make_console(file=io.StringIO(), width=200)
+    return make_console(file=buffer, width=200)
 
 
 async def kill_runs(app: App, targets: list[RunRecord]) -> StopOutcome:
@@ -291,7 +308,10 @@ async def kill_runs(app: App, targets: list[RunRecord]) -> StopOutcome:
     process is actually confirmed gone -- never on signal-send alone. Kill
     works purely by signal via the run record (E3-T9 makes ``SIGTERM``
     actually effective against a ``mode == "fg"`` run), independent of any
-    dashboard or API being reachable.
+    dashboard or API being reachable. ``stop_records`` itself blocks on a
+    signal-and-poll escalation ladder that can take seconds, so the call
+    runs via ``asyncio.to_thread`` rather than directly on the event loop
+    (issue #437).
 
     Args:
         app: The running Textual app (used to push the confirmation modal).
@@ -309,7 +329,15 @@ async def kill_runs(app: App, targets: list[RunRecord]) -> StopOutcome:
     if not confirmed:
         return StopOutcome(declined=True, stopped=[])
 
-    return stop_records(targets, _silent_console())
+    buffer = io.StringIO()
+    outcome = await asyncio.to_thread(stop_records, targets, _silent_console(buffer))
+    if outcome.failed:
+        # The screen's notification carries only the outcome token
+        # ("mismatched", "unconfirmed"); the sentences explaining it -- and
+        # the `--force` remedy for `unconfirmed` -- are in the captured
+        # console output, which would otherwise be unrecoverable.
+        logger.warning("Kill reported failures; stop_records said:\n%s", buffer.getvalue())
+    return outcome
 
 
 # ---------------------------------------------------------------------------

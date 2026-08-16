@@ -10,6 +10,16 @@ Refreshed on a ~2s poll timer (:data:`RunsScreen.POLL_INTERVAL_SECONDS`) via
 Textual's ``set_interval`` — a full rescan of the run-record directory plus
 a bounded event-log tail seek per live run (:mod:`conductor.fleet.summary`).
 Per the design's *Refresh model*, there is deliberately no file watcher.
+
+That scan runs in a worker thread (:func:`asyncio.to_thread`), not on the
+event loop, so a large fleet's I/O never blocks keypresses or the footer
+repaint (issue #437). A tick arriving while the previous scan is still
+running is dropped rather than started alongside it -- the in-flight scan
+wins and the newer tick is skipped, matching the
+``_resolving_gate``/``_opening_dashboard`` guards' "first one wins, a
+second is not started" convention. An *explicit* refresh request (after a
+kill, or after a gate is resolved) is coalesced rather than dropped: see
+:attr:`RunsScreen._refresh_pending`.
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ import contextlib
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -32,6 +43,7 @@ from textual.screen import Screen
 from textual.timer import Timer
 from textual.widgets import DataTable, Header, Static
 
+from conductor.console import styled
 from conductor.fleet.records import RunRecord, read_run_records
 from conductor.fleet.summary import (
     GateInfo,
@@ -61,6 +73,7 @@ from conductor.fleet.tui.notify import TransitionNotifier, emit_terminal_notific
 from conductor.fleet.tui.theme import (
     EMPTY,
     empty_cell,
+    loading_text,
     mode_label,
     muted,
     status_badge,
@@ -463,6 +476,77 @@ def _notification_message(summary: RunSummary) -> str:
     return f"{summary.workflow_name}: run failed"
 
 
+@dataclass(frozen=True, slots=True)
+class RunScan:
+    """One completed scan of the run-record directory.
+
+    Carries the *seen* run ids alongside the successfully-derived rows
+    because the two are not the same set, and conflating them re-fires
+    notifications: :meth:`RunsScreen._render_runs` prunes
+    :attr:`RunsScreen._notifier` against every id this scan **read**, so a
+    run whose summary happened to fail on one tick keeps its notification
+    history instead of looking brand-new on the next successful tick
+    (issue #446 review; the once-per-transition contract from E13 review
+    round 1).
+
+    :attr:`failed` exists for the same reason in the other direction: an
+    empty :attr:`collected` means "no runs" only when nothing failed, and
+    the two render very differently -- see :meth:`RunsScreen._render_runs`.
+    """
+
+    collected: list[tuple[RunRecord, RunSummary]]
+    """Rows to display: records whose summary derived, most recent first."""
+
+    seen_run_ids: set[str] = field(default_factory=set)
+    """Every non-empty ``run_id`` read this scan, derived or not."""
+
+    failed: int = 0
+    """How many records were read but could not have a summary derived."""
+
+
+def _collect_runs() -> RunScan | None:
+    """Read every run record and derive its summary, off the event loop.
+
+    The I/O half of :meth:`RunsScreen.refresh_runs` (issue #437) -- touches
+    no widget, so it is safe to run in a worker thread via
+    :func:`asyncio.to_thread` and directly unit-testable on its own.
+
+    Returns ``None`` when the directory scan itself failed (the caller's
+    "skip this tick, do not reset the notifier" path), and otherwise a
+    :class:`RunScan` whose ``seen_run_ids``/``failed`` preserve what a
+    per-record derivation failure would otherwise erase -- see
+    :class:`RunScan`. Records are returned sorted by recency
+    (most-recently-started first) -- deliberately NOT grouped by workflow
+    definition (Prefect lesson, E7-T4). ISO 8601 timestamps sort correctly
+    as plain strings.
+    """
+    try:
+        records = read_run_records()
+    except Exception:
+        logger.warning("Failed to read run records during TUI refresh", exc_info=True)
+        return None
+
+    records = sorted(records, key=lambda r: r.started_at or "", reverse=True)
+
+    collected: list[tuple[RunRecord, RunSummary]] = []
+    failed = 0
+    for record in records:
+        try:
+            summary = derive_run_summary(record)
+        except Exception:
+            logger.warning(
+                "Failed to derive run summary for run_id=%s", record.run_id, exc_info=True
+            )
+            failed += 1
+            continue
+        collected.append((record, summary))
+    return RunScan(
+        collected=collected,
+        seen_run_ids={r.run_id for r in records if r.run_id},
+        failed=failed,
+    )
+
+
 class RunsScreen(Screen):
     """Home screen: every live run, sorted by recency, polled refresh."""
 
@@ -591,6 +675,28 @@ class RunsScreen(Screen):
         screen is not on top -- see :meth:`on_screen_suspend`. ``None``
         when animations are disabled (``CONDUCTOR_FLEET_NO_ANIM``), so the
         suspend/resume hooks no-op."""
+        self._refreshing = False
+        """Guards against a poll tick (or an explicit ``refresh_runs()``
+        call) starting a second, concurrent ``_refresh_worker`` while one
+        is already awaiting its ``asyncio.to_thread`` scan (issue #437) --
+        an overrunning refresh drops the next tick rather than running two
+        scans at once, matching this screen's other re-entrancy guards."""
+        self._refresh_pending = False
+        """Set when an *explicit* refresh (after a kill, or after a gate is
+        resolved) arrived while a scan was in flight. Those two callers
+        promise the table updates immediately rather than a tick later, and
+        on the slow-fleet case issue #437 targets a scan is in flight most
+        of the time -- so an explicit request is coalesced and re-dispatched
+        from :meth:`_refresh_worker`'s ``finally`` rather than dropped like
+        a redundant poll tick (issue #446 review)."""
+        self._opening_dashboard = False
+        """Guards against a second, concurrent ``w`` press opening another
+        browser tab while a dashboard-open (also off the event loop, issue
+        #437) is still in flight."""
+        self._scan_trouble_notified = False
+        """Debounces the "could not read run records" notification to once
+        per run of consecutive failures, so a persistently unreadable
+        directory doesn't emit one toast per ~2s tick."""
 
     def action_quit(self) -> None:
         """Quit the app -- bound to ``q`` (Textual dispatches bindings to the
@@ -640,6 +746,7 @@ class RunsScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(id="summary-bar", classes="summary-bar")
+        yield Static(loading_text(), id="runs-loading", classes="notice")
         yield DataTable(id="runs-table")
         yield Static(_EMPTY_STATE_TEXT, id="empty-state", classes="empty-state")
         yield Vertical(Static(id="run-preview"), id="preview-pane")
@@ -665,6 +772,13 @@ class RunsScreen(Screen):
         )
         table.cursor_type = "row"
         table.zebra_stripes = True
+        # Hidden until the first collector result lands, so the pre-load
+        # frame shows one dim "Loading…" line instead of an empty table,
+        # the "no runs" empty state, and an empty bordered preview pane all
+        # at once (issue #437).
+        table.display = False
+        self.query_one("#empty-state", Static).display = False
+        self.query_one("#preview-pane", Vertical).display = False
         self.refresh_runs()
         self.set_interval(self.POLL_INTERVAL_SECONDS, self.refresh_runs)
         if animations_enabled():
@@ -800,42 +914,151 @@ class RunsScreen(Screen):
             max(0.0, total - previous)
         )
 
-    def refresh_runs(self) -> None:
+    def refresh_runs(self, *, explicit: bool = False) -> None:
         """Rescan run records and repopulate the table (or show the empty state).
 
-        Called once at mount and then on every poll tick. Best-effort: a
-        failure reading records or deriving one run's summary is logged and
-        that run is skipped rather than crashing the whole refresh —
-        ``read_run_records()`` is already tolerant of individual bad files,
-        but this is an extra backstop specifically so a poll loop can never
-        take the TUI down.
+        A **synchronous dispatcher** (issue #437) -- it stays this shape
+        deliberately because it is called from ``on_mount``, from
+        ``set_interval``, and from two action paths (``_kill_and_refresh``,
+        ``action_resolve_gate``'s ``finally``); only the body lives in a
+        worker. Guarded by :attr:`_refreshing` so an overrunning refresh
+        drops the next tick rather than starting a second, overlapping one
+        -- deliberately not ``@work(exclusive=True)``, which would cancel
+        the in-flight worker and start a new one ("newest wins") rather
+        than the "skip this tick" behaviour wanted here. The flag is set
+        here, synchronously, rather than as the first line of
+        ``_refresh_worker`` -- a ``@work`` method's body doesn't start
+        running the instant it is called (Textual schedules it), so setting
+        the flag inside the worker would leave a window where a poll tick
+        landing before that first scheduling turn sees ``_refreshing``
+        still ``False`` and starts a second, overlapping worker.
 
-        A transient failure reading the run-record directory itself (e.g.
-        a momentary I/O error, not an individual bad record file --
-        ``read_run_records()`` already tolerates those) is distinguished
-        from a genuinely empty scan: it skips this tick entirely, leaving
-        the previously displayed table, selection, and
+        Args:
+            explicit: ``True`` for a caller that needs the table to reflect
+                something it just did (a kill, a resolved gate) rather than
+                merely being a periodic poll. Such a request is remembered
+                and re-dispatched when the in-flight scan finishes, since
+                that scan started *before* the change and cannot show it.
+        """
+        if self._refreshing:
+            self._refresh_pending = self._refresh_pending or explicit
+            return
+        self._refreshing = True
+        try:
+            self._refresh_worker()
+        except Exception:
+            # The flag is set before the worker exists, so a failure to
+            # dispatch would otherwise latch it True and silently stop this
+            # screen refreshing for the rest of the session.
+            self._refreshing = False
+            raise
+
+    @work
+    async def _refresh_worker(self) -> None:
+        """Do the scan off the event loop, then render on it.
+
+        Best-effort: a failure reading records or deriving one run's
+        summary is logged and surfaced rather than crashing the whole
+        refresh -- ``read_run_records()`` is already tolerant of individual
+        bad files, but this is an extra backstop specifically so a poll
+        loop can never take the TUI down. See :func:`_collect_runs` for the
+        failure contract itself.
+
+        A failure reading the run-record directory *itself* skips this tick
+        entirely, leaving the previously displayed table, selection, and
         :attr:`_notifier` history untouched, rather than treating the
-        failure as "zero records" and pruning all notifier history --
-        which would make every gated/failed run look brand-new again on
-        the next successful scan and re-fire its notification, violating
-        the once-per-transition contract (E13 review round 1).
+        failure as "zero records" and pruning all notifier history -- which
+        would make every gated/failed run look brand-new again on the next
+        successful scan and re-fire its notification, violating the
+        once-per-transition contract (E13 review round 1). Skipping the
+        tick's *data* is right; skipping it *silently* is not, so the
+        failure is surfaced by :meth:`_render_scan_failure`.
         """
         try:
-            records = read_run_records()
-        except Exception:
-            logger.warning("Failed to read run records during TUI refresh", exc_info=True)
+            scan = await asyncio.to_thread(_collect_runs)
+            if scan is None:
+                self._render_scan_failure()
+                return
+            try:
+                self._render_runs(scan)
+            except Exception:  # noqa: BLE001 - a render bug must not exit the app
+                logger.warning("Failed to render runs table", exc_info=True)
+        finally:
+            self._refreshing = False
+            if self._refresh_pending:
+                self._refresh_pending = False
+                self.refresh_runs(explicit=True)
+
+    def _render_scan_failure(self) -> None:
+        """Show that the scan failed, instead of leaving the screen silent.
+
+        Two states this replaces, both of which look like a working app
+        (issue #446 review): on first load, a dim "Loading…" line that
+        never resolves, because only :meth:`_render_runs` hides it; and
+        mid-session, a table frozen at its last good contents that the
+        operator reads as current -- and may press ``k`` against a run that
+        already exited.
+        """
+        table = self.query_one(DataTable)
+        loading = self.query_one("#runs-loading", Static)
+        loading.update(
+            styled(
+                "[red]Could not read run records[/red] -- {}",
+                "showing the last successful scan" if table.display else "see the log",
+            )
+        )
+        loading.display = True
+        self._notify_scan_trouble("Could not read run records; the table may be stale.")
+
+    def _notify_scan_trouble(self, message: str) -> None:
+        """Notify once per run of consecutive scan failures.
+
+        A persistently unreadable run-record directory fails on every ~2s
+        tick; one toast per tick would bury the screen it is warning about.
+        Reset by the next successful render.
+        """
+        if self._scan_trouble_notified:
             return
+        self._scan_trouble_notified = True
+        self.notify(message, severity="error", timeout=15, markup=False)
 
-        # Flat list sorted by recency (most-recently-started first) --
-        # explicitly NOT grouped by workflow definition (Prefect lesson,
-        # E7-T4). ISO 8601 timestamps sort correctly as plain strings.
-        records = sorted(records, key=lambda r: r.started_at or "", reverse=True)
+    def _render_runs(self, scan: RunScan) -> None:
+        """Repopulate the table (or the empty state) from a completed scan.
 
+        The render half of :meth:`refresh_runs` (issue #437) -- runs on the
+        event loop, after the collector's ``asyncio.to_thread`` hop.
+
+        Distinguishes an empty fleet from a fleet none of whose summaries
+        could be derived. Both arrive with no rows, but the first is the
+        launch affordance and the second is an error: showing "no runs" to
+        an operator whose runs are all still burning tokens invites them to
+        launch a duplicate (issue #446 review).
+        """
         table = self.query_one(DataTable)
         empty_state = self.query_one("#empty-state", Static)
+        loading = self.query_one("#runs-loading", Static)
 
-        if not records:
+        if not scan.collected and scan.failed:
+            # Records exist; not one of them could be read. Deliberately
+            # leaves the notifier, the selection and `_displayed_records`
+            # alone -- emptying the latter would make `k`/`K`/`enter`
+            # silent no-ops on a fleet that is still running.
+            loading.update(
+                styled(
+                    "[red]Could not read {} of {} run(s)[/red] "
+                    "-- the fleet is still running; see the log.",
+                    str(scan.failed),
+                    str(len(scan.seen_run_ids) or scan.failed),
+                )
+            )
+            loading.display = True
+            self._notify_scan_trouble(f"Could not read {scan.failed} run(s); the table is stale.")
+            return
+
+        loading.display = False
+        self._scan_trouble_notified = False
+
+        if not scan.collected:
             # First-class empty state (E7-T5): the launch affordance, not
             # an empty table.
             table.display = False
@@ -843,7 +1066,7 @@ class RunsScreen(Screen):
             table.clear()
             self._displayed_records = {}
             self._displayed_summaries = {}
-            self._notifier.prune(set())
+            self._notifier.prune(scan.seen_run_ids)
             self._update_summary_bar([])
             # Hidden unconditionally rather than via the visibility-guarded
             # repaint below: this branch already forces a relayout, and
@@ -870,14 +1093,7 @@ class RunsScreen(Screen):
 
         displayed: dict[str, RunRecord] = {}
         summaries: dict[str, RunSummary] = {}
-        for index, record in enumerate(records):
-            try:
-                summary = derive_run_summary(record)
-            except Exception:
-                logger.warning(
-                    "Failed to derive run summary for run_id=%s", record.run_id, exc_info=True
-                )
-                continue
+        for index, (record, summary) in enumerate(scan.collected):
             # Legacy .pid-derived records may carry an empty run_id, which
             # would collide on this row key across two such records and
             # raise DuplicateKey -- fall back to a per-refresh unique key.
@@ -898,7 +1114,11 @@ class RunsScreen(Screen):
                 emit_terminal_notification(self.app, _notification_message(summary))
         self._displayed_records = displayed
         self._displayed_summaries = summaries
-        self._notifier.prune({r.run_id for r in records if r.run_id})
+        # Pruned against every run_id this scan READ, not just the rows that
+        # rendered: a record whose summary failed to derive must keep its
+        # notification history, or it looks brand-new on the next
+        # successful tick and re-fires (issue #446 review).
+        self._notifier.prune(scan.seen_run_ids)
 
         if previous_key is not None:
             with contextlib.suppress(Exception):
@@ -1012,11 +1232,21 @@ class RunsScreen(Screen):
             return
 
         pane.display = True
+        # Fall back to the screen's own size when the pane hasn't been
+        # laid out yet -- it starts hidden (`display = False`) until the
+        # first load lands (issue #437), and Textual doesn't compute a
+        # hidden widget's size until the *next* layout pass, which hasn't
+        # happened yet at the point this first render runs. Without the
+        # fallback, the very first gate preview on a fresh mount would be
+        # clipped to a near-zero width.
+        pane_size = pane.size
+        if not pane_size.width or not pane_size.height:
+            pane_size = self.size
         panel.update(
             _preview_text(
                 summary,
-                width=max(20, pane.size.width - _PREVIEW_PADDING),
-                height=max(4, pane.size.height - _PREVIEW_VERTICAL_PADDING),
+                width=max(20, pane_size.width - _PREVIEW_PADDING),
+                height=max(4, pane_size.height - _PREVIEW_VERTICAL_PADDING),
                 frame=self._frame,
             )
         )
@@ -1121,10 +1351,16 @@ class RunsScreen(Screen):
     def action_open_dashboard(self) -> None:
         """Open the selected run's dashboard in a browser -- bound to ``w``.
 
-        A portless record (``mode == "fg"``, no dashboard) disables the
-        action with a visible reason (a Textual notification) rather than
-        failing silently -- see
-        ``conductor.fleet.tui.actions.dashboard_disabled_reason``.
+        A synchronous dispatcher (matching :meth:`refresh_runs`'s shape):
+        the guard check and the disabled-reason notification stay here, on
+        the event loop, and only the actual open -- which can block for up
+        to 15s under WSL (``_wsl_open``'s ``subprocess.run(..., timeout=15)``,
+        issue #437) -- moves into :meth:`_open_dashboard_worker`. The
+        :attr:`_opening_dashboard` flag is set here, synchronously, rather
+        than as the first line of the worker -- a ``@work`` method's body
+        doesn't start running the instant it is called, so setting the
+        flag inside the worker would leave a window where a rapid second
+        ``w`` press sees it still ``False`` and opens a second tab.
         """
         record = self._selected_record()
         if record is None:
@@ -1133,8 +1369,47 @@ class RunsScreen(Screen):
         if reason is not None:
             self.notify(f"Dashboard unavailable: {reason}", severity="warning", markup=False)
             return
+        if self._opening_dashboard:
+            return
+        self._opening_dashboard = True
+        try:
+            self._open_dashboard_worker(record)
+        except Exception:
+            # The flag is set before the worker exists, so a failure to
+            # dispatch would otherwise latch it True and make ``w`` a
+            # silent no-op for the rest of the session.
+            self._opening_dashboard = False
+            raise
+
+    @work
+    async def _open_dashboard_worker(self, record: RunRecord) -> None:
+        """Open ``record``'s dashboard off the event loop.
+
+        Guarded by :attr:`_opening_dashboard` so a double ``w`` press
+        cannot open two browser tabs while the first open is still in
+        flight.
+        """
         url = dashboard_url(record)
-        if open_dashboard(record):
+        try:
+            opened = await asyncio.to_thread(open_dashboard, record)
+        except Exception:  # noqa: BLE001 - surfaced, not crashed
+            # ``open_dashboard`` catches broadly today, so this is a
+            # backstop: a ``@work`` method defaults to ``exit_on_error``,
+            # so anything escaping here would take the whole TUI down over
+            # a failed browser launch. The URL is what the user actually
+            # needs, so it is surfaced either way.
+            logger.warning("Failed to open dashboard for run_id=%s", record.run_id, exc_info=True)
+            self.notify(
+                f"Could not open a browser. Dashboard: {url}",
+                severity="error",
+                timeout=15,
+                markup=False,
+            )
+            return
+        finally:
+            self._opening_dashboard = False
+
+        if opened:
             self.notify(f"Opened dashboard: {url}", markup=False)
             return
         # Reporting success unconditionally is how a failed open (a WSL host
@@ -1199,7 +1474,7 @@ class RunsScreen(Screen):
             )
         elif not outcome.stopped:
             self.notify("Nothing was killed.", severity="warning", markup=False)
-        self.refresh_runs()
+        self.refresh_runs(explicit=True)
 
     # -----------------------------------------------------------------
     # Gate resolution (D4, E13-T2/E13-T3)
@@ -1269,7 +1544,7 @@ class RunsScreen(Screen):
                     return
         finally:
             self._resolving_gate = False
-            self.refresh_runs()
+            self.refresh_runs(explicit=True)
 
     async def _await_next_gate(
         self, record: RunRecord, *, after: GateInfo, timeout: float = 8.0
@@ -1289,7 +1564,7 @@ class RunsScreen(Screen):
         while time.monotonic() < deadline:
             await asyncio.sleep(_NEXT_GATE_POLL_SECONDS)
             try:
-                summary = derive_run_summary(record)
+                summary = await asyncio.to_thread(derive_run_summary, record)
             except Exception:
                 logger.warning("Failed to re-read run summary after a gate", exc_info=True)
                 return None

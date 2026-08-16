@@ -128,3 +128,14 @@ EMPTY = "—"
 def empty_cell() -> Text:
     """Render the standard dim placeholder for a cell with nothing to show."""
     return Text(EMPTY, style="dim")
+
+
+#: The placeholder shown while a screen's first load is in flight.
+#: Centralised for the same reason as :data:`EMPTY`: five screens were
+#: spelling this three different ways, two of them via raw markup strings.
+LOADING = "Loading…"
+
+
+def loading_text() -> Text:
+    """Render the standard dim "still loading" placeholder."""
+    return Text(LOADING, style="dim")

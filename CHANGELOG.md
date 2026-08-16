@@ -30,6 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured before the child is terminated instead of probed after, when it
   can no longer answer.
 
+- **Fleet Manager TUI no longer blocks the Textual event loop on the Runs
+  screen's ~2s poll, the run-detail screen's poll, History's initial load,
+  or opening a run's dashboard** (#437). Each screen's data load now runs in
+  a worker thread (`asyncio.to_thread`), with rendering back on the event
+  loop, so the UI stays responsive on a large fleet or a slow filesystem
+  (e.g. a WSL dashboard-open call that can take up to 15s). A tick arriving
+  while the previous scan is still running is skipped rather than started
+  alongside it, and each screen shows a brief "Loading…" line while its
+  first result is in flight. An *explicit* refresh — after a kill, or after
+  a gate is resolved — is coalesced rather than skipped, so those actions
+  still update the table without waiting out a poll interval.
+- **The Fleet Manager TUI now tells you when it cannot read a run**, instead
+  of showing something that looks like success (#437 review). A run-record
+  directory it cannot read is reported on the Runs screen rather than
+  leaving a "Loading…" line that never resolves or a table silently frozen
+  at its last good contents; a fleet whose summaries all fail to derive is
+  reported as an error rather than as the "no runs — launch one" empty
+  state, which invited launching a duplicate of a workflow that was still
+  running; and a History read failure is reported rather than rendered as
+  "No run history yet.", which claimed absence and, since that screen loads
+  once, never corrected itself. A run whose summary fails to derive on one
+  poll tick also no longer loses its notification history, which had made
+  it re-fire its gate/failure terminal notification on the next successful
+  tick.
+
 ## [0.1.31](https://github.com/microsoft/conductor/compare/v0.1.30...v0.1.31) - 2026-08-15
 
 ### Added

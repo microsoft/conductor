@@ -35,6 +35,7 @@ from conductor.fleet.tui.screens.registries import (
 )
 from conductor.fleet.tui.screens.runs import RunsScreen
 from conductor.providers.diagnostics import CredentialEnvVar, ModelDiagnostic, ProviderDiagnostic
+from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,9 +99,9 @@ class _FakeReport:
 
 async def _goto_providers(pilot) -> None:
     """Navigate from the (already-mounted) Runs screen to Providers."""
-    await pilot.pause()
+    await settle(pilot)
     await pilot.press("p")
-    await pilot.pause()
+    await settle(pilot)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ class TestProvidersNavigation:
                 assert isinstance(app.screen, ProvidersScreen)
 
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
 
                 assert isinstance(app.screen, RunsScreen)
 
@@ -243,7 +244,7 @@ class TestProvidersExpansion:
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
 
                 # An explicit per-provider check was triggered (implies
                 # network -- check=True, list_models=True).
@@ -280,12 +281,12 @@ class TestProvidersExpansion:
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.row_count == 2  # provider + 1 model row
 
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.row_count == 1  # collapsed again
 
     async def test_expanding_already_checked_provider_does_not_recheck(
@@ -308,7 +309,7 @@ class TestProvidersExpansion:
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
 
                 fake_gather_provider.assert_not_called()
 
@@ -342,7 +343,7 @@ class TestProvidersExpansion:
 
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
 
                 fake_gather_provider.assert_not_called()
 
@@ -379,6 +380,9 @@ class TestProvidersExpansion:
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("enter")
+                # Not `settle`: the check worker is genuinely blocked on
+                # `release_check` until line below, so waiting for all
+                # workers here would deadlock.
                 await pilot.pause()
 
                 # The check is now in flight (not yet resolved) -- the app
@@ -386,11 +390,11 @@ class TestProvidersExpansion:
                 # of hanging.
                 await asyncio.wait_for(check_started.wait(), timeout=2.0)
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
                 assert isinstance(app.screen, RunsScreen)
 
                 release_check.set()
-                await pilot.pause()
+                await settle(pilot)
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +456,7 @@ class TestProvidersErrors:
 
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
 
                 rows = [table.get_row_at(i) for i in range(table.row_count)]
                 assert any("failed to list models" in str(r[0]).lower() for r in rows)
@@ -490,7 +494,7 @@ class TestProvidersTerminalStates:
 
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 rows = [table.get_row_at(i) for i in range(table.row_count)]
                 assert any("connection failed" in str(r[0]).lower() for r in rows)
                 assert not any("not checked yet" in str(r[0]).lower() for r in rows)
@@ -517,7 +521,7 @@ class TestProvidersTerminalStates:
 
                 table.move_cursor(row=0)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 rows = [table.get_row_at(i) for i in range(table.row_count)]
                 assert any("n/a" in str(r[0]).lower() for r in rows)
                 assert not any("not checked yet" in str(r[0]).lower() for r in rows)
@@ -554,10 +558,10 @@ class TestProvidersCollapsedCount:
                 table = app.screen.query_one(DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("enter")  # expand -> triggers the check
-                await pilot.pause()
+                await settle(pilot)
                 table.move_cursor(row=0)
                 await pilot.press("enter")  # collapse again
-                await pilot.pause()
+                await settle(pilot)
 
                 assert table.row_count == 1
                 row = table.get_row_at(0)
@@ -638,9 +642,9 @@ def _configure_registry(registry_dir: Path, *, name: str = "my-reg") -> None:
 
 async def _goto_registries(pilot) -> None:
     """Navigate from the (already-mounted) Runs screen to Registries."""
-    await pilot.pause()
+    await settle(pilot)
     await pilot.press("r")
-    await pilot.pause()
+    await settle(pilot)
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +672,7 @@ class TestRegistriesNavigation:
             assert isinstance(app.screen, RegistriesScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
 
@@ -734,7 +738,7 @@ class TestRegistryWorkflowsDrilldown:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RegistryWorkflowsScreen)
 
@@ -753,11 +757,11 @@ class TestRegistryWorkflowsDrilldown:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RegistryWorkflowsScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RegistriesScreen)
 
@@ -773,7 +777,7 @@ class TestRegistryWorkflowsDrilldown:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RegistryWorkflowsScreen)
             wf_table = app.screen.query_one(DataTable)
@@ -797,12 +801,12 @@ class TestWorkflowInputsDrilldown:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             wf_table = app.screen.query_one(DataTable)
             wf_table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, WorkflowInputsScreen)
 
@@ -829,12 +833,12 @@ class TestWorkflowInputsDrilldown:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             wf_table = app.screen.query_one(DataTable)
             wf_table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, WorkflowInputsScreen)
             inputs_table = app.screen.query_one(DataTable)
@@ -855,24 +859,24 @@ class TestWorkflowInputsDrilldown:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             wf_table = app.screen.query_one(DataTable)
             wf_table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, WorkflowInputsScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RegistryWorkflowsScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RegistriesScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, RunsScreen)
 
 
@@ -931,7 +935,7 @@ class TestRegistriesMarkupSafety:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RegistryWorkflowsScreen)
             wf_table = app.screen.query_one(DataTable)
@@ -959,9 +963,9 @@ class TestRegistriesMarkupSafety:
         ):
             app = FleetApp()
             async with app.run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await app.push_screen(RegistryWorkflowsScreen(registry_name))
-                await pilot.pause()
+                await settle(pilot)
 
                 assert isinstance(app.screen, RegistryWorkflowsScreen)
                 wf_table = app.screen.query_one(DataTable)
@@ -1011,12 +1015,12 @@ agents:
             table = app.screen.query_one(DataTable)
             table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             wf_table = app.screen.query_one(DataTable)
             wf_table.move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, WorkflowInputsScreen)
             inputs_table = app.screen.query_one(DataTable)
@@ -1045,11 +1049,11 @@ class TestRunFromRegistryDrilldown:
             await _goto_registries(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("n")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, NewRunScreen)
             assert app.screen.query_one("#workflow-ref", Input).value == "test-workflow@my-reg"
@@ -1062,15 +1066,15 @@ class TestRunFromRegistryDrilldown:
             await _goto_registries(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, WorkflowInputsScreen)
 
             await pilot.press("n")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, NewRunScreen)
             assert app.screen.query_one("#workflow-ref", Input).value == "test-workflow@my-reg"
@@ -1085,12 +1089,12 @@ class TestRunFromRegistryDrilldown:
             await _goto_registries(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("n")
 
             for _ in range(50):
-                await pilot.pause()
+                await settle(pilot)
                 if isinstance(app.screen, NewRunScreen) and app.screen._input_widgets:
                     break
                 await asyncio.sleep(0.05)
@@ -1110,14 +1114,14 @@ class TestRunFromRegistryDrilldown:
             await _goto_registries(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("enter")
-            await pilot.pause()
+            await settle(pilot)
             app.screen.query_one(DataTable).move_cursor(row=0)
             await pilot.press("n")
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, NewRunScreen)
 
             app.return_to_runs()
-            await pilot.pause()
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
