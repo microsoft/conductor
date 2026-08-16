@@ -51,8 +51,9 @@ payload carries a ``started_at`` key, which only appears once the
 child's engine has actually emitted ``workflow_started`` — proving the
 workflow itself began rather than just the dashboard's HTTP server. It
 also classifies the dashboard's reported identity against the confirmed
-pid (falling back to ``run_id`` when no pid was confirmed, mirroring
-``cli/app.py::_confirm_identity``/``Identity``); a mismatch is only fatal
+pid (falling back to ``run_id`` only when the payload itself has no
+usable pid to compare, mirroring ``cli/app.py::_confirm_identity``/
+``Identity``); a mismatch is only fatal
 (``StartProbe.PORT_CONFLICT``) when the identity was confirmed -- an
 *unconfirmed* mismatch keeps polling rather than killing a possibly
 healthy run on unproven suspicion. All three stages check ``proc.poll()``
@@ -514,8 +515,8 @@ class StartProbe(str, Enum):
             return code: a clean ``0`` exit (a sub-second workflow that
             finished within the wait window) is not a failure.
         PORT_CONFLICT: the dashboard on the port identified itself as a
-            *different run* (by pid, or by ``run_id`` when no pid was
-            confirmed), while this launch's own identity was
+            *different run* (by pid, or by ``run_id`` when the payload had
+            no usable pid), while this launch's own identity was
             independently confirmed via the run-record poll (issue #444
             — comparing against the raw ``Popen.pid`` produced false
             conflicts under a trampoline ``sys.executable``, e.g. a
@@ -634,7 +635,9 @@ class _DashboardIdentity(str, Enum):
             match this launch's.
         UNKNOWN: No comparable identity signal was present in the
             payload at all (e.g. an older Conductor's dashboard reporting
-            neither a usable ``pid`` nor a matching-shape ``run_id``).
+            no usable ``pid`` and no ``run_id``), or the payload reports a
+            usable ``pid`` but this launch has no confirmed ``child_pid``
+            of its own to compare it against yet.
     """
 
     OURS = "ours"
@@ -649,11 +652,19 @@ def _classify_dashboard_identity(
 
     ``pid`` is the primary signal, but only when the caller has a
     *confirmed* ``child_pid`` to compare against (see
-    :func:`_run_record_matches_launch`) — comparing against the raw
+    :func:`_confirmed_pid_from_record`) — comparing against the raw
     ``subprocess.Popen.pid`` is exactly the bug issue #444 fixes, because
     that is not always the pid of the process that ends up running the
     workflow (a trampoline ``sys.executable`` re-execs). ``run_id`` is the
-    fallback signal, mirroring ``cli/app.py::_confirm_identity``.
+    fallback signal, mirroring ``cli/app.py::_confirm_identity`` -- but,
+    matching that function exactly, the fallback only applies when the
+    payload itself has no usable pid to compare. A payload reporting a
+    usable ``pid`` while *this launch's own* ``child_pid`` is unconfirmed
+    is :attr:`_DashboardIdentity.UNKNOWN`, not a ``run_id`` comparison:
+    ``run_id`` legitimately differs from this launch's expectation on a
+    resume (the child adopts the checkpoint's original run id), so
+    treating that mismatch as :attr:`_DashboardIdentity.FOREIGN` would
+    misjudge a resumed run's own healthy dashboard as someone else's.
 
     Args:
         info: The parsed ``/api/info`` JSON body.
@@ -661,15 +672,15 @@ def _classify_dashboard_identity(
             child reports ``workflow_started``.
         child_pid: The confirmed pid of the process actually running the
             workflow (from a matched run record), or ``None`` when no run
-            record has been confirmed yet — in which case a pid
-            comparison would have no trustworthy basis and is skipped in
-            favor of the ``run_id`` fallback.
+            record has been confirmed yet.
 
     Returns:
         :class:`_DashboardIdentity`.
     """
     reported_pid = info.get("pid")
-    if child_pid is not None and isinstance(reported_pid, int):
+    if isinstance(reported_pid, int):
+        if child_pid is None:
+            return _DashboardIdentity.UNKNOWN
         return _DashboardIdentity.OURS if reported_pid == child_pid else _DashboardIdentity.FOREIGN
 
     reported_run_id = str(info.get("run_id") or "")
@@ -704,7 +715,7 @@ def _wait_for_workflow_start(
             :func:`_classify_dashboard_identity` when no pid was
             confirmed.
         confirmed_child_pid: The pid confirmed by the run-record poll
-            (:func:`_run_record_matches_launch`), or ``None`` when no
+            (:func:`_confirmed_pid_from_record`), or ``None`` when no
             record was confirmed (issue #435's downgrade path, or a
             resume whose predicted run id never matched). ``None`` means
             identity is *unverified* — a positive mismatch is then never
@@ -816,7 +827,7 @@ def _record_is_fresh(record: RunRecord, launched_at: datetime) -> bool:
     Replaces exactly what a ``pid == proc.pid`` comparison was doing when
     the run-record poll's actual job is ruling out a *stale* record left
     under the same ``run_id`` key (see
-    :func:`_run_record_matches_launch`'s docstring) -- which, unlike a
+    :func:`_confirmed_pid_from_record`'s docstring) -- which, unlike a
     trampoline re-exec (issue #444), really is distinguishable by time: a
     record written after we spawned this launch's child cannot be a
     leftover from something else.
@@ -832,17 +843,15 @@ def _record_is_fresh(record: RunRecord, launched_at: datetime) -> bool:
         ``True`` only when ``record.started_at`` is a string that parses
         (via ``datetime.fromisoformat``) into a *timezone-aware* datetime
         at or after ``launched_at``. Anything unparseable, missing, naive,
-        or simply the wrong type -- including a ``MagicMock`` attribute,
-        which several existing tests pass as a stand-in record -- returns
-        ``False`` rather than raising, falling back to the pid-equality
-        arm.
+        or simply the wrong type returns ``False`` rather than raising,
+        falling back to the pid-equality arm.
     """
     started_at = getattr(record, "started_at", None)
     if not isinstance(started_at, str):
         return False
     try:
         parsed = datetime.fromisoformat(started_at)
-    except (ValueError, TypeError):
+    except ValueError:
         return False
     if parsed.tzinfo is None:
         # A naive stamp (e.g. from a legacy pre-#435 record) can't be
@@ -852,13 +861,13 @@ def _record_is_fresh(record: RunRecord, launched_at: datetime) -> bool:
     return parsed >= launched_at
 
 
-def _run_record_matches_launch(
+def _confirmed_pid_from_record(
     record: RunRecord | None,
     proc: subprocess.Popen[Any],
     web_port: int,
     launched_at: datetime,
-) -> bool:
-    """Return whether a polled run record can be trusted as this launch's own child.
+) -> int | None:
+    """Return the confirmed workflow pid if a polled run record can be trusted.
 
     ``mode`` and ``port`` must always match (see
     :func:`_finalize_background_launch`'s docstring for what each rules
@@ -880,14 +889,19 @@ def _run_record_matches_launch(
         launched_at: See :func:`_record_is_fresh`.
 
     Returns:
-        ``True`` when the record can be trusted as this launch's own
-        child's record.
+        ``record.pid`` when the record can be trusted as this launch's own
+        child's record, ``None`` otherwise. Returning the pid rather than a
+        bare ``bool`` lets both call sites assign it directly as the
+        confirmed identity without a separate, unchecked ``record.pid``
+        access.
     """
     if record is None:
-        return False
+        return None
     if record.mode != "bg" or record.port != web_port:
-        return False
-    return record.pid == proc.pid or _record_is_fresh(record, launched_at)
+        return None
+    if record.pid == proc.pid or _record_is_fresh(record, launched_at):
+        return record.pid
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -949,7 +963,7 @@ def _finalize_background_launch(
     writer for one run.
 
     The polled record must match this launch on three fields before the
-    gate accepts it as readiness (see :func:`_run_record_matches_launch`)
+    gate accepts it as readiness (see :func:`_confirmed_pid_from_record`)
     -- a record merely found under the right ``run_id`` is not proof by
     itself that *this* launch's child is up:
 
@@ -997,7 +1011,7 @@ def _finalize_background_launch(
             in failure messages so users know where to look.
         launched_at: Timestamp captured immediately before ``proc`` was
             spawned (see ``_spawn_bg_child``), used by
-            :func:`_run_record_matches_launch` to decide whether a polled
+            :func:`_confirmed_pid_from_record` to decide whether a polled
             record is fresh enough to trust despite a pid mismatch.
 
     Returns:
@@ -1073,8 +1087,9 @@ def _finalize_background_launch(
                 f"terminated. See child stderr log: "
                 f"{stderr_log}{_tail_log(stderr_log)}"
             ) from exc
-        if _run_record_matches_launch(record, proc, web_port, launched_at):
-            confirmed_child_pid = record.pid  # type: ignore[union-attr]
+        pid_from_record = _confirmed_pid_from_record(record, proc, web_port, launched_at)
+        if pid_from_record is not None:
+            confirmed_child_pid = pid_from_record
             break
         if time.monotonic() >= deadline:
             # The deadline passed. This is a *bookkeeping* failure, not
@@ -1092,8 +1107,9 @@ def _finalize_background_launch(
                 # here is essentially free next to the 15s already spent
                 # waiting.
                 record = read_run_record(run_id)
-                if _run_record_matches_launch(record, proc, web_port, launched_at):
-                    confirmed_child_pid = record.pid  # type: ignore[union-attr]
+                pid_from_record = _confirmed_pid_from_record(record, proc, web_port, launched_at)
+                if pid_from_record is not None:
+                    confirmed_child_pid = pid_from_record
                     break
                 logger.warning(
                     "Background process (run_id=%s) did not report a run record within "
@@ -1146,12 +1162,18 @@ def _finalize_background_launch(
             # Completed inside the window; the child already removed its
             # own run record.
             return _GateOutcome(workflow_started=True, run_record_written=run_record_written)
-        # The confirmed pid (the real workflow process), not ``proc.pid``,
-        # since the child is provably dead here -- a trampoline exits when
-        # its re-exec target does -- so a leftover record under either pid
-        # would advertise a gone process either way; using the confirmed
-        # one is simply more precise when it's available.
-        _remove_dead_child_record(run_id, confirmed_child_pid or proc.pid)
+        # The outer ``proc`` is provably dead, but that only tells us the
+        # *outer* process exited -- under a trampoline, the inner process
+        # this record's ``confirmed_child_pid`` names can outlive it. Only
+        # remove the record once that pid is independently confirmed dead
+        # too, so a live orphan's record (the only handle `conductor stop`
+        # has on it) is never deleted out from under it -- the same
+        # concern the PORT_CONFLICT branch below states explicitly.
+        dead_pid = confirmed_child_pid if confirmed_child_pid is not None else proc.pid
+        from conductor.cli.pid import is_process_alive
+
+        if not is_process_alive(dead_pid):
+            _remove_dead_child_record(run_id, dead_pid)
         raise RuntimeError(
             "Background process exited before the workflow started "
             f"(code {retcode}). See child stderr log: "
