@@ -21,18 +21,26 @@ Covers three issues that landed together:
   ``_finalize_background_launch``'s reworked control flow — see the
   "Issue #410" section below.
 
-Neither group of tests actually spawns a child process. ``subprocess.Popen``
-is patched in every test so nothing leaks into the test runner.
+Neither group of tests actually spawns a child process, with one
+deliberate exception: ``TestWaitForWorkflowStart
+.test_trampoline_child_pid_differs_from_proc_pid_is_not_foreign`` (issue
+#444) builds a real two-level process tree, because the bug it guards
+against — a spawned process's pid legitimately differing from the pid of
+the process that ends up running the workflow, as happens under a
+trampoline ``sys.executable`` on Windows — cannot be reproduced with a
+mocked pid pair on this (non-trampoline) test host.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -800,6 +808,152 @@ class TestRunRecordPollGate:
             )
 
         assert launch.url == "http://127.0.0.1:9315"
+
+
+class TestTrampolinePidMismatchEndToEnd:
+    """Issue #444, end-to-end via ``launch_background``.
+
+    A trampoline ``sys.executable`` (e.g. a Windows ``uv tool install``)
+    re-execs, so ``subprocess.Popen``'s pid and the real workflow process's
+    pid legitimately differ even on a perfectly healthy launch. These tests
+    exercise the full ``launch_background`` path (not just the unit-level
+    helpers) to prove the identity model actually wires together: a fresh
+    record with a mismatched pid is accepted, a stale one is not, an
+    unconfirmed identity mismatch never kills a healthy run, and a
+    confirmed identity mismatch still catches a real conflict.
+    """
+
+    def _wf(self, tmp_path: Path) -> Path:
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        return wf_path
+
+    def test_accepts_record_from_trampoline_child_via_freshness(self, tmp_path: Path) -> None:
+        """A record whose pid differs from ``Popen.pid`` but is fresh (written
+        after this launch spawned its child) is accepted as this launch's own,
+        and the *record's* pid -- not ``Popen.pid`` -- is what's carried
+        forward as the confirmed identity for stage two."""
+        fake_proc = MagicMock(pid=1)
+        fake_proc.poll.return_value = None
+
+        fresh_started_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        trampoline_record = MagicMock(pid=98765, mode="bg", port=9460, started_at=fresh_started_at)
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.fleet.records.read_run_record", return_value=trampoline_record),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=5.0),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.STARTED
+            ) as mock_wait,
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=self._wf(tmp_path),
+                inputs={},
+                web_port=9460,
+            )
+
+        mock_terminate.assert_not_called()
+        assert launch.run_record_written is True
+        assert launch.url == "http://127.0.0.1:9460"
+        _, kwargs = mock_wait.call_args
+        assert kwargs["confirmed_child_pid"] == 98765
+
+    def test_stale_record_with_mismatched_pid_is_still_rejected(self, tmp_path: Path) -> None:
+        """Freshness must not dissolve the stale-record guard it replaces: a
+        record whose ``started_at`` predates this launch is rejected exactly
+        as a plain pid mismatch always was."""
+        fake_proc = MagicMock(pid=1)
+        fake_proc.poll.return_value = None  # still running throughout
+
+        stale_started_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        stale_record = MagicMock(pid=98765, mode="bg", port=9461, started_at=stale_started_at)
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
+            # Second element is the deadline branch's 1s reachability
+            # re-probe, which fails here to keep this on the fatal path.
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, False]),
+            patch("conductor.fleet.records.read_run_record", return_value=stale_record),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            pytest.raises(RuntimeError, match="did not report a run record"),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
+        ):
+            bg_runner.launch_background(
+                workflow_path=self._wf(tmp_path),
+                inputs={},
+                web_port=9461,
+            )
+
+        mock_terminate.assert_called_once_with(fake_proc)
+
+    def test_unconfirmed_identity_mismatch_never_kills_end_to_end(self, tmp_path: Path) -> None:
+        """Q2 end-to-end: once the run-record poll has downgraded (issue #435 --
+        no confirmed identity), stage two must be invoked with
+        ``confirmed_child_pid=None``, so a genuinely mismatching payload keeps
+        waiting instead of raising and terminating a possibly healthy run."""
+        fake_proc = MagicMock(pid=1)
+        fake_proc.poll.return_value = None  # still running throughout
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
+            # Both dashboard-reachability probes succeed -- the non-fatal,
+            # degraded (#435) path.
+            patch.object(bg_runner, "_wait_for_server", side_effect=[True, True]),
+            patch("conductor.fleet.records.read_run_record", return_value=None),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=30.0),
+            patch.object(
+                bg_runner, "_wait_for_workflow_start", return_value=bg_runner.StartProbe.TIMED_OUT
+            ) as mock_wait,
+        ):
+            launch = bg_runner.launch_background(
+                workflow_path=self._wf(tmp_path),
+                inputs={},
+                web_port=9462,
+            )
+
+        mock_terminate.assert_not_called()
+        assert launch.run_record_written is False
+        assert launch.workflow_started is False
+        assert launch.still_running is True
+        _, kwargs = mock_wait.call_args
+        assert kwargs["confirmed_child_pid"] is None
+
+    def test_confirmed_identity_still_detects_a_real_conflict_end_to_end(
+        self, tmp_path: Path
+    ) -> None:
+        """A genuinely different process holding the port is still fatal once
+        this launch's own identity has been confirmed by the run-record poll
+        -- the fix narrows false positives, it doesn't remove the check."""
+        fake_proc = MagicMock(pid=1)
+        fake_proc.poll.return_value = None
+
+        matching_record = MagicMock(pid=1, mode="bg", port=9463)
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc),
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch("conductor.fleet.records.read_run_record", return_value=matching_record),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=5.0),
+            patch.object(bg_runner, "_terminate_child") as mock_terminate,
+            patch.object(bg_runner, "_probe_workflow_info", return_value={"pid": 42424}),
+            pytest.raises(RuntimeError, match="already in use") as exc_info,
+        ):
+            bg_runner.launch_background(
+                workflow_path=self._wf(tmp_path),
+                inputs={},
+                web_port=9463,
+            )
+
+        assert "42424" in str(exc_info.value)
+        mock_terminate.assert_called_once_with(fake_proc)
 
 
 # ---------------------------------------------------------------------------
@@ -1682,7 +1836,9 @@ class TestWaitForWorkflowStart:
         with patch.object(
             bg_runner, "_probe_workflow_info", return_value={"pid": 123, "started_at": 0}
         ):
-            result = bg_runner._wait_for_workflow_start(9410, proc, timeout=5.0)
+            result = bg_runner._wait_for_workflow_start(
+                9410, proc, timeout=5.0, expected_run_id="deadbeef", confirmed_child_pid=123
+            )
 
         assert result is bg_runner.StartProbe.STARTED
 
@@ -1695,7 +1851,9 @@ class TestWaitForWorkflowStart:
         with patch.object(
             bg_runner, "_probe_workflow_info", return_value={"pid": 123, "started_at": 0}
         ):
-            result = bg_runner._wait_for_workflow_start(9411, proc, timeout=5.0)
+            result = bg_runner._wait_for_workflow_start(
+                9411, proc, timeout=5.0, expected_run_id="deadbeef", confirmed_child_pid=123
+            )
 
         assert result is bg_runner.StartProbe.STARTED
 
@@ -1705,18 +1863,23 @@ class TestWaitForWorkflowStart:
         proc.pid = 123
 
         with patch.object(bg_runner, "_probe_workflow_info") as mock_probe:
-            result = bg_runner._wait_for_workflow_start(9412, proc, timeout=5.0)
+            result = bg_runner._wait_for_workflow_start(
+                9412, proc, timeout=5.0, expected_run_id="deadbeef", confirmed_child_pid=123
+            )
 
         assert result is bg_runner.StartProbe.CHILD_EXITED
         mock_probe.assert_not_called()
 
-    def test_port_conflict_when_reported_pid_differs(self) -> None:
+    def test_port_conflict_when_identity_confirmed_and_pid_differs(self) -> None:
+        """A conflict is only fatal when this launch confirmed its own identity (issue #444)."""
         proc = MagicMock()
         proc.poll.return_value = None
         proc.pid = 123
 
         with patch.object(bg_runner, "_probe_workflow_info", return_value={"pid": 999}):
-            result = bg_runner._wait_for_workflow_start(9413, proc, timeout=5.0)
+            result = bg_runner._wait_for_workflow_start(
+                9413, proc, timeout=5.0, expected_run_id="deadbeef", confirmed_child_pid=123
+            )
 
         assert result is bg_runner.StartProbe.PORT_CONFLICT
 
@@ -1726,7 +1889,9 @@ class TestWaitForWorkflowStart:
         proc.pid = 123
 
         with patch.object(bg_runner, "_probe_workflow_info", return_value=None):
-            result = bg_runner._wait_for_workflow_start(9414, proc, timeout=0.5)
+            result = bg_runner._wait_for_workflow_start(
+                9414, proc, timeout=0.5, expected_run_id="deadbeef", confirmed_child_pid=123
+            )
 
         assert result is bg_runner.StartProbe.TIMED_OUT
 
@@ -1739,9 +1904,108 @@ class TestWaitForWorkflowStart:
         responses = [None, None, {"pid": 123, "started_at": 1.0}]
 
         with patch.object(bg_runner, "_probe_workflow_info", side_effect=responses):
-            result = bg_runner._wait_for_workflow_start(9415, proc, timeout=5.0)
+            result = bg_runner._wait_for_workflow_start(
+                9415, proc, timeout=5.0, expected_run_id="deadbeef", confirmed_child_pid=123
+            )
 
         assert result is bg_runner.StartProbe.STARTED
+
+    def test_trampoline_child_pid_differs_from_proc_pid_is_not_foreign(self) -> None:
+        """The issue #444 regression: a real two-level process tree where the
+        spawned ``Popen`` pid and the confirmed child pid legitimately
+        differ, mirroring a trampoline ``sys.executable`` (a Windows
+        ``uv tool install``, the documented install path) that re-execs
+        into a different process. Anchoring this to real OS-spawned
+        processes (rather than two arbitrary integers) is what makes it a
+        regression test for the actual bug rather than for a fabricated
+        pair of numbers.
+        """
+        outer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', "
+                "'import os,sys,time; print(os.getpid(), flush=True); time.sleep(30)'], "
+                "stdout=subprocess.PIPE, text=True); "
+                "line = p.stdout.readline(); "
+                "sys.stdout.write(line); sys.stdout.flush(); "
+                "time.sleep(30)",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert outer.stdout is not None
+            line = outer.stdout.readline()
+            inner_pid = int(line.strip())
+            if inner_pid == outer.pid:
+                pytest.skip("inner and outer pids coincided; cannot exercise the mismatch")
+
+            with patch.object(
+                bg_runner,
+                "_probe_workflow_info",
+                return_value={"pid": inner_pid, "started_at": 0},
+            ):
+                result = bg_runner._wait_for_workflow_start(
+                    9450,
+                    outer,
+                    timeout=5.0,
+                    expected_run_id="deadbeef",
+                    confirmed_child_pid=inner_pid,
+                )
+
+            assert result is bg_runner.StartProbe.STARTED
+        finally:
+            outer.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                outer.wait(timeout=5.0)
+            if outer.poll() is None:
+                outer.kill()
+                outer.wait(timeout=5.0)
+
+    def test_unconfirmed_identity_mismatch_never_kills(self) -> None:
+        """Q2: a mismatch with no confirmed identity keeps waiting instead of
+        being reported as a port conflict -- there is no trustworthy basis
+        for concluding the port is genuinely held by someone else."""
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+
+        with patch.object(
+            bg_runner, "_probe_workflow_info", return_value={"run_id": "someone-elses-run"}
+        ):
+            result = bg_runner._wait_for_workflow_start(
+                9451,
+                proc,
+                timeout=0.5,
+                expected_run_id="deadbeef",
+                confirmed_child_pid=None,
+            )
+
+        assert result is bg_runner.StartProbe.TIMED_OUT
+
+    def test_last_seen_info_is_populated_on_port_conflict(self) -> None:
+        """The caller-supplied ``last_seen_info`` carries the foreign payload
+        back so the caller can name the real PID without a second, racy
+        probe after the child has already been terminated."""
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = 123
+        last_seen_info: dict[str, Any] = {}
+
+        with patch.object(bg_runner, "_probe_workflow_info", return_value={"pid": 999}):
+            result = bg_runner._wait_for_workflow_start(
+                9452,
+                proc,
+                timeout=5.0,
+                expected_run_id="deadbeef",
+                confirmed_child_pid=123,
+                last_seen_info=last_seen_info,
+            )
+
+        assert result is bg_runner.StartProbe.PORT_CONFLICT
+        assert last_seen_info == {"pid": 999}
 
 
 class TestFinalizeBackgroundLaunchStageTwo:
@@ -1764,6 +2028,10 @@ class TestFinalizeBackgroundLaunchStageTwo:
     def _record_for(self, proc: MagicMock, port: int) -> MagicMock:
         """A run record the gate will accept as this launch's own."""
         return MagicMock(pid=proc.pid, mode="bg", port=port)
+
+    def _launched_at(self) -> datetime:
+        """A fixed spawn timestamp for tests that don't exercise freshness directly."""
+        return datetime(2026, 1, 1, tzinfo=UTC)
 
     @pytest.mark.parametrize(
         ("probe", "expected_workflow_started"),
@@ -1805,7 +2073,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             patch.object(bg_runner, "_wait_for_workflow_start", return_value=probe),
         ):
             result = bg_runner._finalize_background_launch(
-                proc, 9430, "deadbeef", tmp_path / "err.log"
+                proc, 9430, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.run_record_written is False
@@ -1832,7 +2100,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             ),
         ):
             result = bg_runner._finalize_background_launch(
-                proc, 9431, "deadbeef", tmp_path / "err.log"
+                proc, 9431, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.run_record_written is True
@@ -1857,7 +2125,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             patch.object(bg_runner, "_wait_for_workflow_start", side_effect=_fake_wait_for_start),
         ):
             result = bg_runner._finalize_background_launch(
-                proc, 9420, "deadbeef", tmp_path / "err.log"
+                proc, 9420, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.workflow_started is True
@@ -1878,7 +2146,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             ),
         ):
             result = bg_runner._finalize_background_launch(
-                proc, 9421, "deadbeef", tmp_path / "err.log"
+                proc, 9421, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.workflow_started is False
@@ -1897,7 +2165,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             patch.object(bg_runner, "_wait_for_workflow_start") as mock_wait,
         ):
             result = bg_runner._finalize_background_launch(
-                proc, 9422, "deadbeef", tmp_path / "err.log"
+                proc, 9422, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.workflow_started is True
@@ -1925,7 +2193,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             _poll = iter([None])
             proc.poll.side_effect = lambda: next(_poll, 0)
             result = bg_runner._finalize_background_launch(
-                proc, 9423, "deadbeef", tmp_path / "err.log"
+                proc, 9423, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.workflow_started is True
@@ -1952,12 +2220,24 @@ class TestFinalizeBackgroundLaunchStageTwo:
             _poll = iter([None, None, 3, 3, 3])
             proc.poll.side_effect = lambda: next(_poll, 3)
             with pytest.raises(RuntimeError, match="exited before the workflow started"):
-                bg_runner._finalize_background_launch(proc, 9424, "deadbeef", stderr_log)
+                bg_runner._finalize_background_launch(
+                    proc, 9424, "deadbeef", stderr_log, launched_at=self._launched_at()
+                )
 
         mock_remove.assert_called_once_with("deadbeef", proc.pid)
 
     def test_port_conflict_removes_record_and_raises_naming_port(self, tmp_path: Path) -> None:
         proc = self._make_proc(pid=111)
+
+        def _fake_wait_for_start(
+            *args: Any, last_seen_info: dict[str, Any] | None = None, **kwargs: Any
+        ) -> bg_runner.StartProbe:
+            # Mirrors what the real function does before returning
+            # PORT_CONFLICT: populate the caller's ``last_seen_info`` with
+            # the foreign payload so the caller can name the real PID.
+            if last_seen_info is not None:
+                last_seen_info.update({"pid": 999})
+            return bg_runner.StartProbe.PORT_CONFLICT
 
         with (
             patch.object(bg_runner, "_wait_for_server", return_value=True),
@@ -1970,12 +2250,13 @@ class TestFinalizeBackgroundLaunchStageTwo:
             patch.object(
                 bg_runner,
                 "_wait_for_workflow_start",
-                return_value=bg_runner.StartProbe.PORT_CONFLICT,
+                side_effect=_fake_wait_for_start,
             ),
-            patch.object(bg_runner, "_probe_workflow_info", return_value={"pid": 999}),
             pytest.raises(RuntimeError, match="already in use") as exc_info,
         ):
-            bg_runner._finalize_background_launch(proc, 9425, "deadbeef", tmp_path / "err.log")
+            bg_runner._finalize_background_launch(
+                proc, 9425, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
+            )
 
         assert "9425" in str(exc_info.value)
         assert "999" in str(exc_info.value)
@@ -2004,7 +2285,9 @@ class TestFinalizeBackgroundLaunchStageTwo:
             _poll = iter([None, None, 1, 1, 1])
             proc.poll.side_effect = lambda: next(_poll, 1)
             with pytest.raises(RuntimeError) as exc_info:
-                bg_runner._finalize_background_launch(proc, 9426, "deadbeef", stderr_log)
+                bg_runner._finalize_background_launch(
+                    proc, 9426, "deadbeef", stderr_log, launched_at=self._launched_at()
+                )
 
         assert "ConfigurationError: bad yaml" in str(exc_info.value)
 
@@ -2021,7 +2304,7 @@ class TestFinalizeBackgroundLaunchStageTwo:
             patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
         ):
             result = bg_runner._finalize_background_launch(
-                proc, 9427, "deadbeef", tmp_path / "err.log"
+                proc, 9427, "deadbeef", tmp_path / "err.log", launched_at=self._launched_at()
             )
 
         assert result.workflow_started is True

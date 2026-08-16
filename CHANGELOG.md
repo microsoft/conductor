@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.31...HEAD)
 
+### Fixed
+
+- **`--web-bg` no longer fails on every port with a false "Port already in
+  use", killing a healthy run** (#444). The launch gate's two identity
+  checks both compared against the *spawned* process's pid
+  (`subprocess.Popen.pid`), which is not always the pid of the process that
+  ends up running the workflow: on a trampoline `sys.executable` (e.g. a
+  `uv tool install` on Windows, the documented install path) the spawned
+  process re-execs into a different one. That made the run-record poll
+  (stage one-and-a-half) never see its own child's record — surfacing as
+  "did not report a run record within 15 seconds, but is still running" —
+  and then made stage two's `/api/info` probe report every port as held by
+  a foreign process, terminating the healthy child. The run-record poll now
+  also accepts a record whose `pid` differs from `Popen.pid` when the
+  record is *fresh* (written at or after this launch spawned its child),
+  and carries the record's real `pid` forward as the confirmed identity for
+  stage two. A `PORT_CONFLICT` is now only raised when that identity was
+  confirmed; an unconfirmed mismatch degrades to the existing non-fatal
+  "still initializing" note instead of ever being fatal. The `PID unknown`
+  wording seen alongside the conflict is fixed too — the foreign pid is now
+  captured before the child is terminated instead of probed after, when it
+  can no longer answer.
+
 ## [0.1.31](https://github.com/microsoft/conductor/compare/v0.1.30...v0.1.31) - 2026-08-15
 
 ### Added

@@ -150,9 +150,9 @@ bearer token — see [Authentication](#conductor-gate-respond) under
 extra development origin, e.g. Vite's `http://localhost:5173`, without
 disabling the check for anything else.
 
-**Readiness contract** (issue #410) — the launcher confirms the workflow
-actually started before it prints a URL and exits 0, rather than trusting a
-bare TCP connection. This happens in two stages:
+**Readiness contract** (issues #410, #435, #444) — the launcher confirms the
+workflow actually started before it prints a URL and exits 0, rather than
+trusting a bare TCP connection. This happens in three stages:
 
 1. **Port reachability** — the launcher waits (up to 15s) for the child's
    dashboard port to accept connections, checking the child's exit status on
@@ -161,15 +161,29 @@ bare TCP connection. This happens in two stages:
    and a bounded tail of the child's captured stderr log — e.g. a
    `ConfigurationError` from a workflow that fails to even parse. A clean
    (exit code 0) sub-second run is not treated as a failure.
-2. **Workflow start** — once the port is reachable and the PID file is
-   written, the launcher polls `GET /api/info` (the same identity endpoint
-   `conductor stop` uses) for up to 30s, waiting for it to report the
-   workflow has actually started (not just that the dashboard's HTTP server
-   is up). If the child dies during this wait, the launcher removes the PID
-   file it just wrote and exits 1 with the exit code and stderr tail. If a
-   *different* process already holds the requested port, the launcher
-   terminates the child, removes the PID file, and exits 1 naming the
-   conflicting PID and suggesting `--web-port`.
+2. **Run-record confirmation** — the child writes its own fleet run record
+   once it starts executing (there is no parent-side PID file); the launcher
+   polls for it and accepts it once its `mode`/`port` match this launch and
+   either its `pid` matches the spawned process or the record is fresh
+   (written after this launch started) — the latter arm matters on a
+   trampoline `sys.executable` (e.g. a `uv tool install` on Windows), where
+   the spawned process and the one that actually runs the workflow have
+   different pids. If the record never appears within 15s but the child is
+   still alive and its dashboard still reachable, this degrades to a warning
+   rather than a failure (issue #435) — only a dead or unreachable child is
+   fatal here.
+3. **Workflow start** — once the run record is confirmed, the launcher polls
+   `GET /api/info` (the same identity endpoint `conductor stop` uses) for up
+   to 30s, waiting for it to report the workflow has actually started (not
+   just that the dashboard's HTTP server is up). If the child dies during
+   this wait, the launcher removes the child's run record and exits 1 with
+   the exit code and stderr tail. If a *different* process already holds
+   the requested port, the launcher terminates the child and exits 1 naming
+   the conflicting PID and suggesting `--web-port` — but only when this
+   launch's own identity was itself confirmed in stage 2; otherwise a
+   mismatch is not treated as proof of a conflict and the wait simply
+   continues, since there'd be no trustworthy basis for concluding the port
+   is genuinely held by someone else.
 
 If the 30s workflow-start wait elapses with the child still alive and
 listening, that is **not** treated as a failure: the URL is still printed
@@ -178,7 +192,7 @@ and the CLI still exits 0, since the workflow may simply be slow to start
 note is printed alongside the URL suggesting the dashboard or stderr log be
 checked. Tune the wait (or disable it entirely) via
 `CONDUCTOR_WEB_BG_START_TIMEOUT` (seconds; default `30`; `0` disables the
-stage-two probe, restoring the pre-#410 behavior of trusting the port alone).
+stage-three probe, restoring the pre-#410 behavior of trusting the port alone).
 
 **`--web-bg` and `human_gate`** — background runs support human gates through
 the dashboard. When the workflow reaches a `human_gate`, the detached process
