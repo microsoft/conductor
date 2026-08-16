@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.31...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.32...HEAD)
+
+## [0.1.32](https://github.com/microsoft/conductor/compare/v0.1.31...v0.1.32) - 2026-08-16
 
 ### Fixed
 
@@ -54,6 +56,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wording seen alongside the conflict is fixed too — the foreign pid is now
   captured before the child is terminated instead of probed after, when it
   can no longer answer.
+
+- **The Fleet Manager TUI no longer appears to freeze while a modal is
+  open** (#448). Opening the gate options modal (`g`) left the Runs screen
+  animating underneath it — a covered screen is still composited, so its
+  ~10fps repaints kept re-blending the modal sitting on top. Measured on
+  one 160x45 terminal at an open gate, that was roughly 2.5x the escape
+  sequences and ~40% more CPU than the same screen with no modal up. On a
+  terminal that cannot absorb that stream — over SSH, in a multiplexer, on
+  a slow emulator — keystrokes queued behind the redraw and the modal
+  appeared frozen. The animation is now suppressed while a screen is
+  covered and its timer paused, which also stops the Runs screen animating
+  under the splash, run-detail, history, providers, registries, and new-run
+  screens. The ~2s data poll is deliberately left running, so gate-entry
+  and run-failure notifications still fire while a modal is up. The
+  empty-fleet state also no longer pairs "no runs" with a preview pane
+  still offering `g` for a run that had gone.
+
+- **The Fleet Manager TUI's kill confirmation prompt is no longer an empty
+  red box** (#449). `#confirm-dialog` had `width: auto` while both of its
+  children fell back to Textual's base `1fr`, and an auto-width container
+  whose children are all `1fr` resolves to zero — so the dialog collapsed
+  to 0x0 and painted nothing but its border, leaving `k` looking like a
+  broken no-op with no way to see what was about to be killed. The dialog
+  now has a fixed width (capped at 90% of the terminal so it still fits a
+  narrow one), its message scrolls instead of overflowing or being silently
+  truncated, and the confirm/cancel hint is docked to the bottom so a long
+  message cannot push it off screen.
 
 - **Fleet Manager TUI no longer blocks the Textual event loop on the Runs
   screen's ~2s poll, the run-detail screen's poll, History's initial load,
