@@ -750,6 +750,10 @@ class TestLaunchBackgroundResumeFailures:
             patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
             patch("conductor.fleet.records.read_run_record", return_value=None) as mock_read,
+            # Prevent the launch gate's liveness sweep from mistaking pid
+            # 4242 for a still-alive process and sending it a real SIGKILL
+            # -- see tests/conftest.py's install_scripts hazard note.
+            patch("conductor.cli.pid.is_process_alive", return_value=False),
             pytest.raises(RuntimeError, match="terminated"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
@@ -809,6 +813,10 @@ class TestLaunchBackgroundResumeFailures:
             patch("conductor.fleet.records.read_run_record", return_value=None),
             patch.object(bg_runner.time, "sleep"),
             patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            # Prevent the launch gate's liveness sweep from mistaking pid
+            # 4244 for a still-alive process and sending it a real SIGKILL
+            # -- see tests/conftest.py's install_scripts hazard note.
+            patch("conductor.cli.pid.is_process_alive", return_value=False),
             pytest.raises(RuntimeError, match="did not report a run record"),
             patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):

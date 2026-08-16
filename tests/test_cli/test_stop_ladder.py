@@ -950,11 +950,16 @@ class TestWritePidFileRecordsIdentity:
         from conductor.cli import bg_runner
 
         finalize_src = inspect.getsource(bg_runner._finalize_background_launch)
-        assert "read_run_record(run_id)" in finalize_src, (
+        assert "_read_record_or_fail(run_id" in finalize_src, (
             "bg_runner must poll for the child's run record by run_id, or "
             "conductor stop can never confirm a run's identity (issue #344). "
             "The parent no longer writes a PID file (Fleet Manager D2) -- the "
             "child writes its own record and this poll is the launch gate."
+        )
+        read_record_src = inspect.getsource(bg_runner._read_record_or_fail)
+        assert "read_run_record(run_id)" in read_record_src, (
+            "_read_record_or_fail must poll conductor.fleet.records.read_run_record "
+            "by run_id (issue #344/#447)."
         )
         spawn_src = inspect.getsource(bg_runner._spawn_bg_child)
         assert "run_id=run_id" in spawn_src, (

@@ -367,8 +367,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/uv-tool-dir" "$RUNNER_TEMP/uv-tool-bin-dir"
-          echo "UV_TOOL_DIR=$RUNNER_TEMP/uv-tool-dir" >> "$GITHUB_ENV"
-          echo "UV_TOOL_BIN_DIR=$RUNNER_TEMP/uv-tool-bin-dir" >> "$GITHUB_ENV"
+          export UV_TOOL_DIR="$RUNNER_TEMP/uv-tool-dir"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv-tool-bin-dir"
+          echo "UV_TOOL_DIR=$UV_TOOL_DIR" >> "$GITHUB_ENV"
+          echo "UV_TOOL_BIN_DIR=$UV_TOOL_BIN_DIR" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/uv-tool-bin-dir" >> "$GITHUB_PATH"
           uv tool install .
 

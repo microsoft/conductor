@@ -848,12 +848,18 @@ def _terminate_child(
     rungs, none individually load-bearing (issue #447):
 
     1. Tree kill: ``terminate_tree()`` (Windows job object) when *proc*
-       exposes it, else ``os.killpg(proc.pid, SIGKILL)`` on POSIX -- but
-       only when ``proc.pid`` is a pid this module itself spawned as a
-       process-group leader (see :data:`_SPAWNED_GROUP_LEADERS`), never
-       against an arbitrary pid.
+       is a :class:`_WindowsDetachedProcess`, else ``os.killpg(proc.pid,
+       SIGKILL)`` on POSIX -- but only when ``proc.pid`` is a pid this
+       module itself spawned as a process-group leader (see
+       :data:`_SPAWNED_GROUP_LEADERS`), never against an arbitrary pid.
+       Runs unconditionally, regardless of ``proc.poll()``: a Windows job
+       object and a POSIX process group both outlive their initial
+       process, and this is precisely the ``StartProbe.CHILD_EXITED`` case
+       issue #447 exists for -- the outer trampoline shim has already
+       exited while the re-exec'd workflow it started lives on.
     2. The original polite/forceful ladder on *proc* itself
-       (``terminate()`` → wait 5s → ``kill()`` → wait 2s).
+       (``terminate()`` → wait 5s → ``kill()`` → wait 2s), skipped when
+       ``proc.poll()`` already shows *proc* dead.
     3. A final, identity-checked sweep over every pid this call knows
        about (``proc.pid`` and, if different, *confirmed_child_pid*) via
        ``conductor.cli.pid``'s ``is_process_alive``/``terminate_process``.
@@ -884,15 +890,20 @@ def _terminate_child(
     if confirmed_child_pid is not None:
         candidates.add(confirmed_child_pid)
 
-    if proc.poll() is None:
-        terminate_tree = getattr(proc, "terminate_tree", None)
-        if terminate_tree is not None:
-            with contextlib.suppress(Exception):
-                terminate_tree()
-        elif proc.pid in _SPAWNED_GROUP_LEADERS:
-            with contextlib.suppress(Exception):
-                os.killpg(proc.pid, signal.SIGKILL)
+    # Rung 1 runs regardless of proc.poll(): a Windows job object and a
+    # POSIX process group both outlive their initial process, and this is
+    # precisely the StartProbe.CHILD_EXITED case issue #447 exists for --
+    # the outer trampoline shim has already exited while the re-exec'd
+    # workflow it started lives on. killpg on a dead leader raises
+    # ProcessLookupError, already suppressed below.
+    if isinstance(proc, _WindowsDetachedProcess):
+        with contextlib.suppress(Exception):
+            proc.terminate_tree()
+    elif proc.pid in _SPAWNED_GROUP_LEADERS:
+        with contextlib.suppress(Exception):
+            os.killpg(proc.pid, signal.SIGKILL)
 
+    if proc.poll() is None:
         try:
             proc.terminate()
             try:
@@ -967,6 +978,30 @@ def _cleanup_record_after_termination(
     if candidate_pid in outcome.surviving_pids:
         return
     _remove_dead_child_record(run_id, candidate_pid)
+
+
+def _read_record_or_fail(
+    run_id: str, proc: _DetachedChild, *, web_port: int, stderr_log: Path
+) -> RunRecord | None:
+    """Read the child's run record, terminating and raising on failure.
+
+    A failure here (a truncated or concurrently-rewritten record file, an
+    ``OSError``) must not escape uncontained: without this, the child would
+    never be terminated and would orphan itself, contradicting
+    :func:`_finalize_background_launch`'s own contract.
+    """
+    from conductor.fleet.records import read_run_record
+
+    try:
+        return read_run_record(run_id)
+    except Exception as exc:
+        outcome = _terminate_child(proc)
+        raise RuntimeError(
+            f"Failed to read background process's run record "
+            f"(run_id={run_id}): {exc}. {_termination_note(outcome, web_port=web_port)}"
+            f"See child stderr log: "
+            f"{stderr_log}{_tail_log(stderr_log)}"
+        ) from exc
 
 
 # Filename pattern used by ``conductor.engine.event_log.EventLogSubscriber``
@@ -1652,8 +1687,6 @@ def _finalize_background_launch(
     # The child's own run record, not a parent-side PID write (D2): one
     # writer per run. This is stage one-and-a-half -- the port is open and
     # the child has reached the point of registering itself.
-    from conductor.fleet.records import read_run_record
-
     run_record_written = True
     # The pid confirmed by a matching run record -- the trusted identity
     # passed to stage two (see docstring). Stays ``None`` down the issue
@@ -1672,16 +1705,7 @@ def _finalize_background_launch(
                 f"Background process exited immediately with code {retcode}. "
                 f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
             )
-        try:
-            record = read_run_record(run_id)
-        except Exception as exc:
-            outcome = _terminate_child(proc)
-            raise RuntimeError(
-                f"Failed to read background process's run record "
-                f"(run_id={run_id}): {exc}. {_termination_note(outcome, web_port=web_port)}"
-                f"See child stderr log: "
-                f"{stderr_log}{_tail_log(stderr_log)}"
-            ) from exc
+        record = _read_record_or_fail(run_id, proc, web_port=web_port, stderr_log=stderr_log)
         pid_from_record = _confirmed_pid_from_record(record, proc, web_port, launched_at)
         if pid_from_record is not None:
             confirmed_child_pid = pid_from_record
@@ -1701,7 +1725,9 @@ def _finalize_background_launch(
                 # deadline check above and this re-probe, and re-reading
                 # here is essentially free next to the 15s already spent
                 # waiting.
-                record = read_run_record(run_id)
+                record = _read_record_or_fail(
+                    run_id, proc, web_port=web_port, stderr_log=stderr_log
+                )
                 pid_from_record = _confirmed_pid_from_record(record, proc, web_port, launched_at)
                 if pid_from_record is not None:
                     confirmed_child_pid = pid_from_record
@@ -1910,7 +1936,13 @@ def _spawn_bg_child(
                 f"Failed to start background process: {exc}. See child stderr log: {stderr_path}"
             ) from exc
 
-        gate_outcome = _finalize_background_launch(proc, web_port, run_id, stderr_path, launched_at)
+        try:
+            gate_outcome = _finalize_background_launch(
+                proc, web_port, run_id, stderr_path, launched_at
+            )
+        except BaseException:
+            _release_child_handles(proc)
+            raise
     finally:
         # The child has its own duplicated OS handles by now (or never got
         # them, if Popen raised) — either way the parent's Python file

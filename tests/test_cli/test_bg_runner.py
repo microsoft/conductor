@@ -653,7 +653,12 @@ class TestTerminateChild:
         register as a spawned group leader must never be passed to
         ``os.killpg``, even if it happens to still look "alive" (e.g. a
         stale ``MagicMock(pid=1)`` from an unrelated test)."""
-        proc = MagicMock()
+        # spec=subprocess.Popen so the mock has no `terminate_tree` attribute
+        # and the rung-1 isinstance check on `_WindowsDetachedProcess` takes
+        # the POSIX `elif` branch -- a bare MagicMock() autocreates
+        # `terminate_tree` on attribute access, which used to route this
+        # test through the Windows arm and leave the killpg guard untested.
+        proc = MagicMock(spec=subprocess.Popen)
         proc.pid = 1  # deliberately NOT in _SPAWNED_GROUP_LEADERS
         proc.poll.return_value = None
 
