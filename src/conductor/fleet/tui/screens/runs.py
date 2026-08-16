@@ -29,6 +29,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import Screen
+from textual.timer import Timer
 from textual.widgets import DataTable, Header, Static
 
 from conductor.fleet.records import RunRecord, read_run_records
@@ -585,6 +586,11 @@ class RunsScreen(Screen):
         (E13 review round 1) -- ``action_resolve_gate`` is a non-exclusive
         ``@work`` method, so without this a rapid double-press could open
         two option modals / post two responses for the same gate."""
+        self._anim_timer: Timer | None = None
+        """The ~10fps animation timer, held so it can be paused while this
+        screen is not on top -- see :meth:`on_screen_suspend`. ``None``
+        when animations are disabled (``CONDUCTOR_FLEET_NO_ANIM``), so the
+        suspend/resume hooks no-op."""
 
     def action_quit(self) -> None:
         """Quit the app -- bound to ``q`` (Textual dispatches bindings to the
@@ -667,7 +673,66 @@ class RunsScreen(Screen):
             # animation wants ~10fps and rescanning the run-record
             # directory that often would be gratuitous I/O for the sake of
             # a spinner.
-            self.set_interval(FRAME_INTERVAL, self._tick)
+            self._anim_timer = self.set_interval(FRAME_INTERVAL, self._tick)
+
+    def on_screen_suspend(self) -> None:
+        """Pause the animation while another screen is on top.
+
+        A pushed screen does not stop this one's timers, and a screen that
+        is no longer on top is still *composited*: the compositor keeps
+        painting whatever shows through the screen above it, and for a
+        translucent ``ModalScreen`` -- the gate options dialog (``g``) and
+        the kill confirmation (``k``/``K``) -- that is the whole visible
+        area. So every animated repaint down here re-blends the screen
+        above it, at ~10fps, for a screen nobody is reading.
+
+        The user-visible cost is throughput, not frames: on one 160x45
+        terminal sitting at an open gate this was roughly 2.5x the escape
+        sequences and ~40% more CPU with the modal up than without it.
+        Absolute figures are machine- and emulator-specific and nothing
+        pins them, but the direction is structural -- and on a terminal
+        that cannot absorb the stream (over SSH, in a multiplexer, on a
+        slow emulator) keystrokes queue behind the redraw and the modal
+        appears frozen.
+
+        Note :attr:`~textual.screen.Screen.is_current` does **not** express
+        "on top" and cannot be used to gate this: it means *still being
+        composited*, which is exactly the state being paused here. Textual
+        relies on that meaning -- ``Screen._on_timer_update`` gates the
+        whole update cycle on it, which is why a covered screen keeps
+        repainting at all. Opacity is irrelevant: ``App._background_screens``
+        appends the screen below the top *before* testing the background
+        alpha, so ``is_current`` is ``True`` under an opaque screen too.
+        :attr:`~textual.screen.Screen.is_active` is the top-of-stack test,
+        and is what the guards in :meth:`_tick` and
+        :meth:`_update_gate_detail` use.
+        """
+        if self._anim_timer is not None:
+            self._anim_timer.pause()
+
+    def on_screen_resume(self) -> None:
+        """Restart the animation and repaint whatever went stale.
+
+        Resuming is deliberately done *before* the repaint: a raise out of
+        :meth:`_update_gate_detail` (``query_one`` can fail if the pane is
+        gone mid-teardown) would otherwise strand the timer paused, which
+        is a worse freeze than the one this fixes.
+
+        The repaint relies on ``App.pop_screen`` popping the stack *before*
+        posting ``ScreenResume``, since :meth:`_update_gate_detail` no-ops
+        unless this screen is already back on top. If that order ever
+        inverted, the pane would silently keep showing what it had under
+        the modal until the next ~2s poll.
+
+        This also fires once at startup, before anything has been
+        suspended -- and, because the splash is pushed over this screen
+        immediately, it can arrive while this screen is already covered.
+        That is why :meth:`_tick`'s guard is load-bearing rather than
+        decorative.
+        """
+        if self._anim_timer is not None:
+            self._anim_timer.resume()
+        self._update_gate_detail()
 
     def _tick(self) -> None:
         """Advance the animation clock and repaint only what moves.
@@ -677,6 +742,17 @@ class RunsScreen(Screen):
         each live row in place and re-renders the preview, which owns the
         one other moving thing (the score's live step).
         """
+        # This guard, not `on_screen_suspend`'s pause, is what actually
+        # stops frames landing on a covered screen. `App.push_screen`
+        # appends to the screen stack synchronously but *posts*
+        # `ScreenSuspend` as a message, and this callback is invoked
+        # straight from the timer's own asyncio task rather than queued
+        # behind that message -- so frames keep arriving until the pump
+        # drains, which is longest precisely when the pump is backed up,
+        # the failure this fix is about. The pause is hygiene on top: it
+        # stops a 10fps task waking for a screen nobody is reading.
+        if not self.is_active:
+            return
         self._frame += 1
         table = self.query_one(DataTable)
         if not table.display:
@@ -769,6 +845,11 @@ class RunsScreen(Screen):
             self._displayed_summaries = {}
             self._notifier.prune(set())
             self._update_summary_bar([])
+            # Hidden unconditionally rather than via the visibility-guarded
+            # repaint below: this branch already forces a relayout, and
+            # leaving the pane up would pair the "no runs" empty state with
+            # a preview still offering `g` for a run that is gone.
+            self.query_one("#preview-pane", Vertical).display = False
             self._update_gate_detail()
             return
 
@@ -903,7 +984,19 @@ class RunsScreen(Screen):
         selected run's gate) and on every cursor move
         (:meth:`on_data_table_row_highlighted`), since the selected row can
         change independently of a poll tick.
+
+        A no-op while another screen is on top -- repainting for a reader
+        who is looking at a modal costs a re-blend of that modal for
+        nothing (see :meth:`on_screen_suspend`). Note this defers the
+        footer's :meth:`_refresh_row_bindings` too, not just the pane, so
+        a gate closing under a modal can leave ``g`` advertised in the
+        footer showing through it. Both are recomputed from scratch on
+        every call, so the ~2s poll heals any staleness even if
+        :meth:`on_screen_resume` never fires; resume is the latency
+        optimisation on top of that.
         """
+        if not self.is_active:
+            return
         pane = self.query_one("#preview-pane", Vertical)
         panel = self.query_one("#run-preview", Static)
 

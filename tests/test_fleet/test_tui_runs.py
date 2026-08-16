@@ -24,6 +24,9 @@ from textual.widgets import DataTable, Footer, Static
 
 from conductor.cli import pid as cli_pid
 from conductor.fleet.records import RunRecord, write_run_record
+from conductor.fleet.summary import GateInfo
+from conductor.fleet.tui.actions import GateOptionsModal
+from conductor.fleet.tui.anim import FRAME_INTERVAL
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.runs import RunsScreen
 
@@ -105,6 +108,11 @@ async def _rendered_footer(pilot: Any, app: FleetApp) -> str:
             return line
         await pilot.pause()
     return _footer_line(app)
+
+
+def _gate_info(prompt: str = "Approve?") -> GateInfo:
+    """A minimal open gate, for pushing the options modal directly."""
+    return GateInfo(agent_name="ask", prompt=prompt, options=["yes", "no"], option_details=[])
 
 
 def _write_record(
@@ -1002,7 +1010,6 @@ class TestChainedGateResolution:
     async def test_next_question_is_presented_automatically(
         self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from conductor.fleet.summary import GateInfo
         from conductor.fleet.tui.actions import GateResolveOutcome
 
         log = tmp_path / "q.events.jsonl"
@@ -1087,3 +1094,224 @@ class TestChainedGateResolution:
                 await asyncio.sleep(0.05)
 
         assert calls == ["Q1?"]
+
+
+class TestRunsScreenPausesWhileNotOnTop:
+    """The Runs screen must stop animating while another screen covers it.
+
+    This is the gate freeze: a covered screen is still composited, so its
+    ~10fps repaints keep re-blending whatever sits on top of it until the
+    terminal cannot absorb the stream and keystrokes queue behind the
+    redraw. The mechanism, the measurements, and why
+    ``Screen.is_current`` cannot express the condition are recorded on
+    :meth:`~conductor.fleet.tui.screens.runs.RunsScreen.on_screen_suspend`
+    rather than repeated here.
+
+    Three independent mechanisms, one test each: the guard in ``_tick``
+    (which covers the window before the pause lands), the guard in
+    ``_update_gate_detail`` (which covers the ~2s poll, deliberately left
+    running), and the timer pause itself. Plus the two things that must
+    keep working while covered: the poll's notifications, and the repaint
+    on resume.
+    """
+
+    @staticmethod
+    def _seed_gated_run(tmp_path: Path) -> None:
+        """One live run sitting at an open gate -- what these tests start from."""
+        log = _write_events(
+            tmp_path / "gate.events.jsonl",
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event(
+                    "gate_presented",
+                    {"agent_name": "ask", "prompt": "Approve?", "options": ["yes", "no"]},
+                ),
+            ],
+        )
+        _write_record(tmp_path, "run-gate", workflow_name="wf", event_log_path=str(log))
+
+    async def test_tick_is_a_noop_while_a_modal_is_on_top(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """``push_screen`` appends to the stack synchronously but *posts*
+        ``ScreenSuspend``, and the timer invokes ``_tick`` from its own
+        task rather than through the message pump -- so frames keep
+        arriving until the pump drains. This guard, not the pause, is what
+        stops them."""
+        self._seed_gated_run(tmp_path)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            screen._tick()
+            assert screen._frame == 1, "the animation clock advances while on top"
+
+            app.push_screen(GateOptionsModal(_gate_info()))
+            await pilot.pause()
+
+            screen._tick()
+            screen._tick()
+            assert screen._frame == 1, "the animation clock must not advance under a modal"
+
+            app.pop_screen()
+            await pilot.pause()
+
+            screen._tick()
+            assert screen._frame == 2, "the animation clock resumes once the modal is dismissed"
+
+    async def test_preview_is_not_repainted_while_a_modal_is_on_top(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The ~2s data poll keeps running under a modal (see
+        :meth:`test_the_poll_keeps_running_under_a_modal`), so the guard
+        that stops it repainting has to live in ``_update_gate_detail``
+        itself rather than in the poll."""
+        self._seed_gated_run(tmp_path)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+            panel = screen.query_one("#run-preview", Static)
+
+            app.push_screen(GateOptionsModal(_gate_info()))
+            await pilot.pause()
+
+            with patch.object(panel, "update", wraps=panel.update) as painted:
+                screen.refresh_runs()
+                screen._update_gate_detail()
+                # Drained inside the suspended window so any message the
+                # rebuild queued (`table.clear()` emits `RowHighlighted`) is
+                # dispatched here, while the guard still rejects it, rather
+                # than landing after the pop and being mistaken for the
+                # resume repaint.
+                await pilot.pause()
+                assert painted.call_count == 0
+
+    async def test_resume_repaints_what_went_stale(self, fleet_env: Path, tmp_path: Path) -> None:
+        """``on_screen_resume``'s repaint is what makes the guard above safe.
+
+        Asserted against an **empty** fleet on purpose: with no rows there
+        is no ``DataTable.RowHighlighted`` on resume, so ``on_screen_resume``
+        is provably the only caller that can repaint. With a populated
+        table the focus-regain message repaints too, and a call-count
+        assertion passes even if this handler's repaint is deleted.
+        """
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+            panel = screen.query_one("#run-preview", Static)
+
+            app.push_screen(GateOptionsModal(_gate_info()))
+            await pilot.pause()
+
+            with patch.object(panel, "update", wraps=panel.update) as painted:
+                await pilot.pause()
+                assert painted.call_count == 0, "nothing repaints while covered"
+
+                app.pop_screen()
+                await pilot.pause()
+                assert painted.call_count >= 1, "resuming repaints whatever went stale"
+
+    async def test_the_poll_keeps_running_under_a_modal(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the *render* is suppressed while covered, never the poll.
+
+        The obvious next optimisation -- returning early from
+        ``refresh_runs`` too -- would silently stop gate-entry and
+        run-failure notifications at exactly the moment the operator is
+        sitting inside a gate modal, with every other test still green.
+        """
+        notified: list[str] = []
+        monkeypatch.setattr(
+            "conductor.fleet.tui.screens.runs.emit_terminal_notification",
+            lambda app, message: notified.append(message),
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            app.push_screen(GateOptionsModal(_gate_info()))
+            await pilot.pause()
+
+            # The run reaches its gate *while* the modal is up.
+            self._seed_gated_run(tmp_path)
+            screen.refresh_runs()
+
+            assert notified == ["wf: waiting at gate (ask)"]
+
+    async def test_the_animation_timer_is_paused_and_resumed(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The timer itself must stop, not merely its repaints.
+
+        Asserted by counting *invocations* of ``_tick`` rather than the
+        frames it produces. ``_tick``'s own guard already stops the frames,
+        so a frame-counting assertion holds whether or not the timer was
+        ever paused -- only an invocation count separates "paused" (never
+        called) from "called, returned early", which is the difference
+        between waking the event loop 10x a second for a covered screen
+        and leaving it alone.
+        """
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        self._seed_gated_run(tmp_path)
+
+        ticks: list[int] = []
+        original_tick = RunsScreen._tick
+
+        def _counting_tick(screen: RunsScreen) -> None:
+            ticks.append(1)
+            original_tick(screen)
+
+        monkeypatch.setattr(RunsScreen, "_tick", _counting_tick)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            # Animation is on, so the splash is pushed over the Runs screen.
+            await pilot.pause()
+            # The timer is created by `on_mount` and must already be paused
+            # under the splash -- the launch-time case of the same bug.
+            runs = next(s for s in app.screen_stack if isinstance(s, RunsScreen))
+            assert runs._anim_timer is not None
+            ticks.clear()
+            await asyncio.sleep(FRAME_INTERVAL * 4)
+            assert ticks == [], "the timer must not fire while the splash covers the fleet"
+
+            await pilot.press("x")
+            for _ in range(40):
+                await pilot.pause()
+                if isinstance(app.screen, RunsScreen):
+                    break
+                await asyncio.sleep(0.05)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+
+            ticks.clear()
+            await asyncio.sleep(FRAME_INTERVAL * 4)
+            await pilot.pause()
+            assert ticks, "the timer fires while the Runs screen is on top"
+
+            app.push_screen(GateOptionsModal(_gate_info()))
+            await pilot.pause()
+            ticks.clear()
+            await asyncio.sleep(FRAME_INTERVAL * 6)
+            await pilot.pause()
+            assert ticks == [], "the timer must not fire at all under the gate modal"
+
+            app.pop_screen()
+            await pilot.pause()
+            ticks.clear()
+            await asyncio.sleep(FRAME_INTERVAL * 4)
+            await pilot.pause()
+            assert ticks, "the timer fires again once the gate is answered"
