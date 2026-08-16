@@ -7,12 +7,20 @@ as workflow steps, capturing stdout/stderr and exit codes.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from conductor.error_envelope import (
+    ErrorEnvelope,
+    ErrorEnvelopeValidationError,
+    make_script_transport_error,
+)
 from conductor.exceptions import ExecutionError
 from conductor.executor.template import TemplateRenderer
 
@@ -26,6 +34,18 @@ def _verbose_log(message: str, style: str = "dim") -> None:
     from conductor.cli.run import verbose_log
 
     verbose_log(message, style)
+
+
+def _read_error_envelope(error_path: Path, agent_name: str) -> ErrorEnvelope | None:
+    """Read the optional script error channel without dropping transport failures."""
+    if not error_path.exists():
+        return None
+
+    try:
+        raw = json.loads(error_path.read_text(encoding="utf-8"))
+        return ErrorEnvelope.from_dict(raw, allow_reserved=False)
+    except (OSError, UnicodeError, json.JSONDecodeError, ErrorEnvelopeValidationError) as exc:
+        return make_script_transport_error(agent_name=agent_name, error=exc)
 
 
 if TYPE_CHECKING:
@@ -49,6 +69,7 @@ class ScriptOutput:
     stderr: str
     exit_code: int
     stdin_bytes: int | None = None
+    error: ErrorEnvelope | None = None
 
 
 class ScriptExecutor:
@@ -131,92 +152,99 @@ class ScriptExecutor:
                     ),
                 ) from exc
 
-        # Build environment (merge os.environ + agent.env)
-        # Note: ${VAR:-default} patterns in agent.env are already resolved
-        # by the config loader during YAML parsing.
-        # Always set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
-        # instead of the system default (cp1252 on Windows), preventing garbled
-        # Unicode characters in script output.
-        base_env = {**os.environ, "PYTHONUTF8": "1"}
-        env = {**base_env, **agent.env} if agent.env else base_env
+        with tempfile.TemporaryDirectory(prefix="conductor-error-") as error_dir:
+            error_path = Path(error_dir) / "error.json"
 
-        # Resolve bare command names and absolute paths against PATH so that a
-        # bare name (e.g. "python") finds the executable the shell would, and a
-        # path missing an extension resolves correctly. Resolution uses the
-        # subprocess's own ``PATH`` (``env`` may override it via ``agent.env``),
-        # so the resolved binary matches the one the child would have executed.
-        # Relative paths containing a separator are left untouched so they keep
-        # resolving against ``working_dir``. Resolution is non-destructive: when
-        # ``which`` cannot resolve the command we fall back to the rendered value
-        # and let the FileNotFoundError handler below produce a clear error.
-        has_separator = os.sep in rendered_command or (
-            os.altsep is not None and os.altsep in rendered_command
-        )
-        if os.path.isabs(rendered_command) or not has_separator:
-            rendered_command = (
-                shutil.which(rendered_command, path=env.get("PATH")) or rendered_command
+            # Build environment (merge os.environ + agent.env)
+            # Note: ${VAR:-default} patterns in agent.env are already resolved
+            # by the config loader during YAML parsing.
+            # Always set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
+            # instead of the system default (cp1252 on Windows), preventing garbled
+            # Unicode characters in script output.
+            base_env = {**os.environ, "PYTHONUTF8": "1"}
+            env = {**base_env, **agent.env} if agent.env else base_env
+            env["CONDUCTOR_ERROR_OUT"] = str(error_path)
+
+            # Resolve bare command names and absolute paths against PATH so that a
+            # bare name (e.g. "python") finds the executable the shell would, and a
+            # path missing an extension resolves correctly. Resolution uses the
+            # subprocess's own ``PATH`` (``env`` may override it via ``agent.env``),
+            # so the resolved binary matches the one the child would have executed.
+            # Relative paths containing a separator are left untouched so they keep
+            # resolving against ``working_dir``. Resolution is non-destructive: when
+            # ``which`` cannot resolve the command we fall back to the rendered value
+            # and let the FileNotFoundError handler below produce a clear error.
+            has_separator = os.sep in rendered_command or (
+                os.altsep is not None and os.altsep in rendered_command
             )
-
-        _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
-        if stdin_payload is not None:
-            _verbose_log(f"  Script stdin: {len(stdin_payload)} bytes")
-
-        # Create subprocess
-        try:
-            process = await asyncio.create_subprocess_exec(
-                rendered_command,
-                *rendered_args,
-                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=rendered_working_dir,
-                env=env,
-            )
-        except FileNotFoundError as exc:
-            hint = ""
-            if sys.platform == "win32":
-                hint = (
-                    " Hint: on Windows, include the file extension (e.g. .exe) "
-                    "or use an absolute path."
+            if os.path.isabs(rendered_command) or not has_separator:
+                rendered_command = (
+                    shutil.which(rendered_command, path=env.get("PATH")) or rendered_command
                 )
-            raise ExecutionError(
-                f"Script '{agent.name}': command not found: '{rendered_command}'"
-                f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
-                agent_name=agent.name,
-                suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
-            ) from exc
-        except OSError as e:
-            raise ExecutionError(
-                f"Script '{agent.name}' failed to start: {e}",
-                agent_name=agent.name,
-            ) from e
 
-        # Wait with optional per-script timeout
-        timeout = agent.timeout
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(input=stdin_payload), timeout=timeout
+            _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
+            if stdin_payload is not None:
+                _verbose_log(f"  Script stdin: {len(stdin_payload)} bytes")
+
+            # Create subprocess
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    rendered_command,
+                    *rendered_args,
+                    stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=rendered_working_dir,
+                    env=env,
+                )
+            except FileNotFoundError as exc:
+                hint = ""
+                if sys.platform == "win32":
+                    hint = (
+                        " Hint: on Windows, include the file extension (e.g. .exe) "
+                        "or use an absolute path."
+                    )
+                raise ExecutionError(
+                    f"Script '{agent.name}': command not found: '{rendered_command}'"
+                    f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
+                    agent_name=agent.name,
+                    suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
+                ) from exc
+            except OSError as e:
+                raise ExecutionError(
+                    f"Script '{agent.name}' failed to start: {e}",
+                    agent_name=agent.name,
+                ) from e
+
+            # Wait with optional per-script timeout
+            timeout = agent.timeout
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(input=stdin_payload), timeout=timeout
+                )
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                raise ExecutionError(
+                    f"Script '{agent.name}' timed out after {timeout}s",
+                    agent_name=agent.name,
+                ) from None
+
+            error = _read_error_envelope(error_path, agent.name)
+
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+            if stderr_text:
+                _verbose_log(f"  Script stderr: {stderr_text.strip()}")
+
+            # IMPORTANT: process.returncode is guaranteed non-None after communicate().
+            # Do NOT use `process.returncode or 0` — 0 is falsy in Python.
+            assert process.returncode is not None
+            return ScriptOutput(
+                stdout=stdout_text,
+                stderr=stderr_text,
+                exit_code=process.returncode,
+                stdin_bytes=len(stdin_payload) if stdin_payload is not None else None,
+                error=error,
             )
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            raise ExecutionError(
-                f"Script '{agent.name}' timed out after {timeout}s",
-                agent_name=agent.name,
-            ) from None
-
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-
-        if stderr_text:
-            _verbose_log(f"  Script stderr: {stderr_text.strip()}")
-
-        # IMPORTANT: process.returncode is guaranteed non-None after communicate().
-        # Do NOT use `process.returncode or 0` — 0 is falsy in Python.
-        assert process.returncode is not None
-        return ScriptOutput(
-            stdout=stdout_text,
-            stderr=stderr_text,
-            exit_code=process.returncode,
-            stdin_bytes=len(stdin_payload) if stdin_payload is not None else None,
-        )
