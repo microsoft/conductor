@@ -911,15 +911,14 @@ class TestKillConfirmationRendering:
     ``test_tui_run_detail.py``), not just the string handed to
     ``ConfirmKillModal.__init__`` -- which is what let a completely
     invisible dialog pass the rest of this suite for as long as it did.
+    Five of the seven tests below are rendering regressions in that sense;
+    the remaining two (``test_confirm_still_works_while_the_scroll_holds_focus``,
+    ``test_cancel_still_works_while_the_scroll_holds_focus``) are forward
+    guards on the newly-focusable scroll container rather than #449
+    regressions -- they pass against the pre-fix CSS too.
     """
 
-    def _painted(self, app: FleetApp) -> str:
-        return "".join(
-            "".join(segment.text for segment in strip)
-            for strip in app.screen._compositor.render_strips()
-        )
-
-    def _painted_within(self, app: FleetApp, region) -> str:
+    def _painted_within(self, app: FleetApp, region, clip_to=None) -> str:
         """Text painted strictly inside ``region`` (row-major, unjoined by
         row so a wrapped multi-line message stays readable).
 
@@ -930,7 +929,17 @@ class TestKillConfirmationRendering:
         that did. Scoping to the widget's own ``region`` closes that gap:
         on the pre-fix CSS the widget's region is 0x0, so this is always
         empty there regardless of what the table underneath shows.
+
+        A ``Static`` inside a ``VerticalScroll`` has an *unclipped* content
+        region -- it can extend past the scroll's own viewport, painting
+        rows that belong to the hint below or the screen underneath the
+        modal entirely. Pass ``clip_to`` (typically the scroll container's
+        ``region``) to intersect against that viewport when the caller's
+        message can overflow it; short messages that never overflow are
+        unaffected either way.
         """
+        if clip_to is not None:
+            region = region.intersection(clip_to)
         strips = list(app.screen._compositor.render_strips())
         lines = []
         for y in range(region.y, region.y + region.height):
@@ -957,7 +966,7 @@ class TestKillConfirmationRendering:
         _write_record(tmp_path, "run-a", pid=os.getpid(), mode="bg")
 
         app = FleetApp()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             await pilot.press("k")
             await pilot.pause()
@@ -966,14 +975,50 @@ class TestKillConfirmationRendering:
             assert message.size.width > 0
             assert message.size.height > 0
 
+            dialog = app.screen.query_one("#confirm-dialog")
+            assert dialog.region.width == 60, (
+                "the dialog must be fixed-width, not sized to its content"
+            )
+            assert dialog.region.x > 0, (
+                "a 60-wide dialog on an 80-col screen must be inset, not full-bleed"
+            )
+
             painted_message = self._painted_within(app, message.region)
             assert "run-a" in painted_message
 
-            painted = self._painted(app)
-            assert "Confirm" in painted
+            hint = app.screen.query_one("#confirm-hint")
+            assert "Confirm" in self._painted_within(app, hint.region)
 
             await pilot.press("n")
             await pilot.pause()
+
+    async def test_a_long_foreground_warning_line_wraps_not_stretches(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Pins the CSS comment's other claim: a ~100-char foreground
+        warning line must wrap inside the fixed-width dialog rather than
+        stretching it -- an `auto`-width dialog would size to the longest
+        line instead."""
+        _write_record(tmp_path, "run-fg", pid=os.getpid(), port=None, mode="fg")
+
+        with patch("conductor.cli.app.os.kill"):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                await pilot.press("K")
+                await pilot.pause()
+
+                dialog = app.screen.query_one("#confirm-dialog")
+                message = app.screen.query_one("#confirm-message")
+                painted_message = self._painted_within(app, message.region)
+                for line in painted_message.splitlines():
+                    assert len(line.rstrip()) <= message.size.width, (
+                        f"line exceeds dialog content width: {line!r}"
+                    )
+                assert dialog.region.width == 60
+
+                await pilot.press("n")
+                await pilot.pause()
 
     async def test_a_bracketed_workflow_name_survives(
         self, fleet_env: Path, tmp_path: Path
@@ -990,7 +1035,7 @@ class TestKillConfirmationRendering:
         _write_record(tmp_path, "run-a", pid=os.getpid(), workflow_name="plan[wip]", mode="bg")
 
         app = FleetApp()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             await pilot.press("k")
             await pilot.pause()
@@ -1012,14 +1057,15 @@ class TestKillConfirmationRendering:
 
         with patch("conductor.cli.app.os.kill"):
             app = FleetApp()
-            async with app.run_test() as pilot:
+            async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.pause()
                 await pilot.press("K")
                 await pilot.pause()
 
-                painted = self._painted(app)
-                assert "run-fg" in painted
-                assert "progress" in painted.lower()
+                message = app.screen.query_one("#confirm-message")
+                painted_message = self._painted_within(app, message.region)
+                assert "run-fg" in painted_message
+                assert "progress" in painted_message.lower()
 
                 await pilot.press("n")
                 await pilot.pause()
@@ -1043,13 +1089,20 @@ class TestKillConfirmationRendering:
                 await pilot.pause()
 
                 dialog = app.screen.query_one("#confirm-dialog")
+                hint = app.screen.query_one("#confirm-hint")
+                scroll = app.screen.query_one("#confirm-message-scroll")
                 screen_height = app.screen.size.height
                 assert dialog.region.y + dialog.region.height <= screen_height, (
                     "the dialog must stay within the screen -- an auto-height "
                     "dialog overflowed it and clipped the hint off the bottom"
                 )
-                painted = self._painted(app)
-                assert "Confirm" in painted
+                assert hint.region.y + hint.region.height <= app.screen.size.height
+                assert "Confirm" in self._painted_within(app, hint.region), (
+                    "the hint must be painted in its own region, not merely laid out"
+                )
+                assert not hint.region.overlaps(scroll.region), (
+                    "dock:bottom must reserve a row, not paint over the message"
+                )
 
                 await pilot.press("n")
                 await pilot.pause()
@@ -1084,13 +1137,39 @@ class TestKillConfirmationRendering:
                 await pilot.press("n")
                 await pilot.pause()
 
+    async def test_the_dialog_stays_bounded_on_a_narrow_terminal(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Pins `max-width: 90%` (src/conductor/fleet/tui/actions.py) --
+        every other test in this class runs at 80 columns, where the
+        60-wide dialog never reaches this branch. Below ~67 columns the
+        fixed `width: 60` would overflow the screen without the cap."""
+        _write_record(tmp_path, "run-a", pid=os.getpid(), mode="bg")
+
+        app = FleetApp()
+        async with app.run_test(size=(40, 12)) as pilot:
+            await pilot.pause()
+            await pilot.press("k")
+            await pilot.pause()
+
+            dialog = app.screen.query_one("#confirm-dialog")
+            hint = app.screen.query_one("#confirm-hint")
+            assert dialog.region.width <= 36
+            assert dialog.region.x >= 0
+            assert dialog.region.right <= 40
+            assert "Confirm" in self._painted_within(app, hint.region)
+
+            await pilot.press("n")
+            await pilot.pause()
+
     async def test_confirm_still_works_while_the_scroll_holds_focus(
         self, fleet_env: Path, tmp_path: Path
     ) -> None:
         """The `VerticalScroll` is the modal's only focusable widget (unlike
-        `GateOptionsModal`'s, this one is not `can_focus=False`). `y` and
-        `escape` are screen-level bindings and must still dismiss the modal
-        correctly regardless of what holds focus."""
+        `GateOptionsModal`'s, this one is not `can_focus=False`). `y` is a
+        screen-level binding and must still dismiss the modal correctly
+        regardless of what holds focus (`escape` is covered by the
+        pre-existing `test_kill_all_declines_signals_nothing`)."""
         self._many_foreground_records(tmp_path)
 
         with (

@@ -275,6 +275,11 @@ class ConfirmKillModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
+            # Unlike `GateOptionsModal`'s `VerticalScroll` (below), this one
+            # is not `can_focus=False`: there is no `OptionList` here
+            # competing for focus, so the scroll is left focusable on
+            # purpose and inherits plain arrow/page-key scrolling, while
+            # `y`/`n`/`escape` remain screen-level bindings that still fire.
             VerticalScroll(
                 # `Text`, not a plain str: `Static` defaults to markup=True,
                 # so a workflow named `plan[wip].yaml` would be silently
