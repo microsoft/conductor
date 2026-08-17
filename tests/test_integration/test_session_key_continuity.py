@@ -113,7 +113,11 @@ class _FakeQuery:
 
 @pytest.fixture
 def workflow_file(tmp_path: Path) -> Path:
-    counter = tmp_path / "counter"
+    # as_posix(): the path is interpolated into a double-quoted YAML scalar,
+    # where a Windows backslash reads as an escape ("C:\Users" -> invalid \U)
+    # and fails to parse. Forward slashes are also what the `sh` in the script
+    # step expects, so one change covers both.
+    counter = tmp_path.joinpath("counter").as_posix()
     path = tmp_path / "loopback.yaml"
     path.write_text(_WORKFLOW.format(counter=counter))
     return path
