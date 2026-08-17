@@ -1890,3 +1890,111 @@ class TestSharedSessionKeyConcurrency:
         )
         config.workflow.entry_point = "loop"
         validate_workflow_config(config)
+
+    @pytest.mark.parametrize(
+        ("working_dir", "per_item"),
+        [
+            ("/var/lib/search_index", False),
+            ("/srv/api_key", False),
+            ("/srv/{{ workflow.input.api_key }}", False),
+            ("/tmp/{{- item }}", True),
+        ],
+        ids=[
+            "index-in-a-path-segment",
+            "key-in-a-path-segment",
+            "unrelated-expression",
+            "trim-marker",
+        ],
+    )
+    def test_per_item_working_dir_is_detected_by_parsing_not_substring(
+        self, patch_caps: Any, working_dir: str, per_item: bool
+    ) -> None:
+        """The exemption must turn on the template actually reading the loop
+        variable.
+
+        A substring scan was wrong in both directions: ``_index`` and ``_key``
+        occur inside ordinary path segments, and an unrelated expression that
+        merely mentions ``api_key`` matched, so three shared directories were
+        waved through; while ``{{- item }}`` — a spacing the scan did not
+        enumerate — was rejected despite being genuinely per-item.
+        """
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir=working_dir,
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+
+        if per_item:
+            validate_workflow_config(config)
+        else:
+            with pytest.raises(ConfigurationError, match="without a per-item working_dir"):
+                validate_workflow_config(config)
+
+    def test_an_unparseable_working_dir_is_treated_as_shared(self, patch_caps: Any) -> None:
+        """A template that will not parse cannot be shown to vary per item, so
+        the safety check keeps its refusal rather than guessing."""
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir="/tmp/{{ item",
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        with pytest.raises(ConfigurationError, match="without a per-item working_dir"):
+            validate_workflow_config(config)
+
+    def test_a_loop_index_reference_exempts_the_group(self, patch_caps: Any) -> None:
+        """``_index`` and ``_key`` count as per-item, but only when read as
+        variables rather than spelled inside a directory name."""
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir="/tmp/run-{{ _index }}",
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        validate_workflow_config(config)

@@ -29,7 +29,7 @@ from claude_agent_sdk import (  # noqa: E402
 )
 
 from conductor.config.schema import AgentDef  # noqa: E402
-from conductor.exceptions import ProviderError  # noqa: E402
+from conductor.exceptions import ProviderError, ValidationError  # noqa: E402
 from conductor.providers.claude_agent_sdk import (  # noqa: E402
     _SESSION_KEY_NAMESPACE,
     ClaudeAgentSdkProvider,
@@ -246,8 +246,9 @@ class TestUnresolvableSession:
         assert "could not be found" in caplog.text
 
     async def test_sdk_without_session_lookup_does_not_resume_unverified(self) -> None:
-        """A sub-floor SDK degrades to a fresh session: handing an unverifiable
-        id to ``--resume`` would abort the CLI before the agent runs.
+        """An SDK that stopped exporting the lookup symbols degrades to a fresh
+        session: handing an unverifiable id to ``--resume`` would abort the CLI
+        before the agent runs.
         """
         rec = _Recorder(["sess-1", "sess-2"])
         with (
@@ -430,6 +431,52 @@ class TestMapHygiene:
 
         assert rec.resumes == [None]
 
+
+class TestMalformedRestoreShapes:
+    """Valid JSON of the wrong shape must be dropped, not stored.
+
+    Unpacking straight out of ``json.loads`` either raised (a two-element list
+    of lists is unhashable) or stored a key nothing can ever match — ints from
+    ``[1, 2]``, two characters from ``"ab"``, dict keys from ``{"a":1,"b":2}``
+    — and the last three then re-exported cleanly, persisting the corruption
+    into every later checkpoint.
+    """
+
+    @pytest.mark.parametrize(
+        ("payload", "label"),
+        [
+            ('[["x"], ["y"]]', "list-of-lists"),
+            ("[1, 2]", "ints"),
+            ('"ab"', "bare-string"),
+            ('{"a": 1, "b": 2}', "object"),
+            ("null", "null"),
+            ('["only-one"]', "one-element"),
+            ('["a", "b", "c"]', "three-elements"),
+            ("not-json", "unparseable"),
+        ],
+    )
+    def test_bad_shapes_are_skipped_and_not_re_exported(self, payload: str, label: str) -> None:
+        provider = ClaudeAgentSdkProvider()
+        provider.set_resume_session_ids({f"{_SESSION_KEY_NAMESPACE}{payload}": "sess-x"})
+
+        assert provider._resume_session_ids == {}, label
+        assert provider.get_session_ids() == {}, label
+
+    def test_a_good_entry_survives_bad_neighbours(self) -> None:
+        """One unreadable slice of the shared field must not cost the rest."""
+        good = _ck("investigation", "/repo")
+        provider = ClaudeAgentSdkProvider()
+        provider.set_resume_session_ids(
+            {
+                f"{_SESSION_KEY_NAMESPACE}[1, 2]": "bad",
+                good: "sess-1",
+                f'{_SESSION_KEY_NAMESPACE}{{"a": 1, "b": 2}}': "also-bad",
+                "some_copilot_agent": "copilot-sid",
+            }
+        )
+
+        assert provider.get_session_ids() == {good: "sess-1"}
+
     async def test_probe_is_skipped_when_there_is_nothing_to_resume(self) -> None:
         rec = _Recorder(["sess-1"])
         with _sdk(rec) as probe:
@@ -499,9 +546,13 @@ class TestTranscriptProbe:
         assert ClaudeAgentSdkProvider._session_transcript_exists(sid, str(repo)) is True
 
     def test_transcript_from_another_directory_is_not_claimed(self, claude_home: Any) -> None:
-        """The CLI refuses ``--resume`` across project dirs, so the probe must
-        too. ``get_session_info`` searches sibling git worktrees, which would
-        report the session present and turn the fallback into a hard abort.
+        """The probe stays inside the ``(session_key, cwd)`` scoping promised
+        to authors.
+
+        Not because the CLI would refuse — it resolves ``--resume`` through
+        sibling git worktrees and a global project scan, so it is *wider* than
+        we are. ``get_session_info`` searches the same way, which is why its
+        answer counts only when the ``cwd`` it recorded matches ours.
         """
         repo, project_dir = claude_home
         sid = str(uuid.uuid4())
@@ -513,6 +564,295 @@ class TestTranscriptProbe:
     def test_non_uuid_id_does_not_raise(self, claude_home: Any) -> None:
         repo, _ = claude_home
         assert ClaudeAgentSdkProvider._session_transcript_exists("not-a-uuid", str(repo)) is False
+
+
+class TestForkSession:
+    """``fork_session=False`` is passed explicitly, and must stay that way.
+
+    :class:`_Recorder` *simulates* the SDK default (a resumed call keeps its
+    id), so every other test in this file would stay green if the argument
+    were dropped or flipped. Forking would mint a new id and a new transcript
+    on every execution, leaving the key chasing a moving id.
+    """
+
+    async def test_fresh_and_resumed_calls_both_forbid_forking(self) -> None:
+        rec = _Recorder(["sess-1"])
+        with _sdk(rec):
+            provider = ClaudeAgentSdkProvider()
+            await _run(provider, "analyze", "investigation")
+            await _run(provider, "analyze", "investigation")
+
+        assert rec.resumes == [None, "sess-1"]
+        assert [o.fork_session for o in rec.calls] == [False, False]
+
+    async def test_unkeyed_calls_forbid_forking_too(self) -> None:
+        rec = _Recorder(["sess-1"])
+        with _sdk(rec):
+            provider = ClaudeAgentSdkProvider()
+            await _run(provider, "analyze", None)
+
+        assert rec.calls[0].fork_session is False
+
+
+class _BlockingQuery:
+    """Holds every call inside its generator until ``release`` is set."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.fail = False
+
+    def __call__(self, *, prompt: str, options: Any) -> Any:
+        del prompt
+        self.calls += 1
+        resumed = getattr(options, "resume", None)
+        session_id = resumed or f"sess-{self.calls}"
+        fail = self.fail
+
+        async def gen():
+            self.entered.set()
+            await self.release.wait()
+            if fail:
+                raise RuntimeError("boom")
+            yield _assistant("working", session_id)
+            yield _result("done", session_id)
+
+        return gen()
+
+
+class TestInFlightGuard:
+    """A second execution must not resume a session the first still holds.
+
+    ``conductor validate`` catches the statically visible shapes, but nothing
+    static can see a keyed agent inside a ``type: workflow`` step fanned out by
+    a concurrent ``for_each``: the sub-workflow inherits the parent's registry,
+    and so this very provider instance. Two ``claude`` processes would then
+    append to one transcript.
+    """
+
+    async def test_a_second_execution_on_the_same_slot_is_refused(self) -> None:
+        q = _BlockingQuery()
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            first = asyncio.create_task(_run(provider, "analyze", "investigation"))
+            await q.entered.wait()
+
+            with pytest.raises(ProviderError, match="still running"):
+                await _run(provider, "summarize", "investigation")
+
+            q.release.set()
+            await first
+
+        # The refusal happened before the SDK was touched a second time.
+        assert q.calls == 1
+
+    async def test_the_refusal_is_not_retryable(self) -> None:
+        """Retrying cannot help: the conflict is the workflow's own shape."""
+        q = _BlockingQuery()
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            first = asyncio.create_task(_run(provider, "analyze", "investigation"))
+            await q.entered.wait()
+
+            with pytest.raises(ProviderError) as exc:
+                await _run(provider, "summarize", "investigation")
+
+            q.release.set()
+            await first
+
+        assert exc.value.is_retryable is False
+
+    async def test_distinct_keys_run_concurrently(self) -> None:
+        q = _BlockingQuery()
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            q.release.set()
+            await asyncio.gather(
+                _run(provider, "analyze", "alpha"),
+                _run(provider, "review", "beta"),
+            )
+
+        assert q.calls == 2
+
+    async def test_one_key_under_two_working_dirs_runs_concurrently(self, tmp_path: Any) -> None:
+        """The slot carries the cwd, so these are provably distinct sessions —
+        the multi-worktree fan-out the scoping exists for."""
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        q = _BlockingQuery()
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            q.release.set()
+
+            async def go(cwd: str) -> Any:
+                agent = AgentDef(name="analyze", prompt="go", session_key="shared", working_dir=cwd)
+                return await provider.execute(agent=agent, context={}, rendered_prompt="go")
+
+            await asyncio.gather(go(str(dir_a)), go(str(dir_b)))
+
+        assert q.calls == 2
+
+    async def test_unkeyed_executions_never_claim_a_slot(self) -> None:
+        q = _BlockingQuery()
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            q.release.set()
+            await asyncio.gather(
+                _run(provider, "analyze", None),
+                _run(provider, "analyze", None),
+            )
+
+        assert q.calls == 2
+        assert provider._in_flight_sessions == set()
+
+    async def test_the_slot_is_released_after_a_successful_run(self) -> None:
+        rec = _Recorder(["sess-1"])
+        with _sdk(rec):
+            provider = ClaudeAgentSdkProvider()
+            await _run(provider, "analyze", "investigation")
+            assert provider._in_flight_sessions == set()
+            # The sequential loop-back must not be mistaken for concurrency.
+            await _run(provider, "analyze", "investigation")
+
+        assert rec.resumes == [None, "sess-1"]
+
+    async def test_the_slot_is_released_after_a_failed_run(self) -> None:
+        q = _BlockingQuery()
+        q.fail = True
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            q.release.set()
+            with pytest.raises(ProviderError):
+                await _run(provider, "analyze", "investigation")
+
+            assert provider._in_flight_sessions == set()
+            q.fail = False
+            await _run(provider, "analyze", "investigation")
+
+        assert q.calls == 2
+
+    async def test_the_slot_is_released_when_output_assembly_raises(self) -> None:
+        """``_build_output`` raises after the SDK iterator's own ``finally``,
+        so a claim released only there would leak the slot for the whole run.
+        """
+        rec = _Recorder(["sess-1"])
+        agent = AgentDef(
+            name="analyze",
+            prompt="go",
+            session_key="investigation",
+            output={"finding": {"type": "string"}},
+        )
+        with _sdk(rec):
+            provider = ClaudeAgentSdkProvider()
+            # "working" is not JSON, and a declared schema makes that fatal.
+            with pytest.raises(ValidationError):
+                await provider.execute(agent=agent, context={}, rendered_prompt="go")
+
+        assert provider._in_flight_sessions == set()
+
+
+class _UsageQuery:
+    """Reports per-execution usage, as the CLI does on a resumed session."""
+
+    def __init__(self, usages: list[tuple[int, int]]) -> None:
+        self._usages = list(usages)
+        self._n = 0
+        self.resumes: list[str | None] = []
+
+    def __call__(self, *, prompt: str, options: Any) -> Any:
+        del prompt
+        resumed = getattr(options, "resume", None)
+        self.resumes.append(resumed)
+        session_id = resumed or "sess-1"
+        input_tokens, output_tokens = self._usages[self._n]
+        self._n += 1
+
+        async def gen():
+            yield _assistant("working", session_id)
+            yield ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+                result="done",
+                usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+            )
+
+        return gen()
+
+
+class TestUsageOnAResumedSession:
+    """``ResultMessage.usage`` bills the execution, not the transcript.
+
+    Measured against the live CLI: a resumed session reported
+    ``input 2 / output 4 / num_turns 1`` for the turn it had just run, not a
+    running total. If that were ever cumulative, the second row of a loop-back
+    would re-bill the first and the cost summary would compound with every
+    pass — so pin it.
+    """
+
+    async def test_two_keyed_executions_bill_independently(self) -> None:
+        q = _UsageQuery([(1200, 300), (2, 4)])
+        with _sdk(q):
+            provider = ClaudeAgentSdkProvider()
+            first = await _run(provider, "analyze", "investigation")
+            second = await _run(provider, "analyze", "investigation")
+
+        assert q.resumes == [None, "sess-1"]
+        assert (first.input_tokens, first.output_tokens) == (1200, 300)
+        assert (second.input_tokens, second.output_tokens) == (2, 4)
+        assert second.tokens_used == 6
+
+
+class TestSessionLookupUnavailableWarning:
+    """A missing lookup symbol must be visible, not only logged at DEBUG.
+
+    Both symbols come from one import, so the reachable failure is upstream
+    moving ``project_key_for_directory`` out of ``_internal.session_store``.
+    Without a warning, ``_resolve_resume_session`` would return ``None`` on
+    every call and continuity would silently never work again — Conductor
+    installs no logging handlers, so its DEBUG line reaches nobody.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _missing_lookup():
+        with (
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude_agent_sdk.get_session_info", None),
+            patch("conductor.providers.claude_agent_sdk.project_key_for_directory", None),
+            patch("conductor.providers.claude_agent_sdk._SESSION_LOOKUP_WARNED", False),
+        ):
+            yield
+
+    def test_construction_warns_when_the_symbols_are_missing(self, caplog: Any) -> None:
+        with self._missing_lookup(), caplog.at_level("WARNING"):
+            ClaudeAgentSdkProvider()
+
+        assert "session_key" in caplog.text
+        assert "claude-agent-sdk>=0.2.82" in caplog.text
+
+    def test_the_warning_fires_only_once(self, caplog: Any) -> None:
+        with self._missing_lookup(), caplog.at_level("WARNING"):
+            ClaudeAgentSdkProvider()
+            ClaudeAgentSdkProvider()
+
+        assert caplog.text.count("does not export get_session_info") == 1
+
+    def test_a_healthy_sdk_stays_quiet(self, caplog: Any) -> None:
+        with (
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude_agent_sdk._SESSION_LOOKUP_WARNED", False),
+            caplog.at_level("WARNING"),
+        ):
+            ClaudeAgentSdkProvider()
+
+        assert "does not export get_session_info" not in caplog.text
 
 
 class TestMultiResume:

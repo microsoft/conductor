@@ -365,7 +365,14 @@ class AgentExecutor:
             TemplateError: If prompt rendering fails.
             ProviderError: If agent execution fails.
             ValidationError: If output doesn't match schema or tools are invalid.
+            ExecutionError: If the agent declares a capability its provider
+                does not support (``session_key``, ``skills``, ``plugins``).
         """
+        # Checked before any work: a declaration the provider cannot honour is
+        # decided by the agent and the provider alone, so there is nothing to
+        # learn from rendering a prompt or calling a model first.
+        self._reject_unsupported_session_key(agent)
+
         # Render model field if it contains template expressions
         if is_jinja_template(agent.model):
             rendered_model = self.renderer.render(agent.model, context)
@@ -1073,6 +1080,47 @@ class AgentExecutor:
             agent_name=agent.name,
             suggestion=(
                 f"{remedy}agent to a skill-aware provider. 'conductor validate' "
+                "reports this before a run starts."
+            ),
+        )
+
+    def _reject_unsupported_session_key(self, agent: AgentDef) -> None:
+        """Refuse ``session_key`` on a provider that cannot continue a session.
+
+        Mirrors the ``capabilities.session_continuity`` check in
+        :func:`conductor.config.validator.validate_workflow_config`.
+        ``conductor validate`` already rejects the combination, but
+        ``conductor run`` never invokes the static validator — so without
+        this the declaration holds in one command and is silently
+        contradicted in the other, with every execution starting the fresh
+        session the key was written to avoid. Nothing downstream notices: the
+        agent still answers, just without the context of the pass before.
+
+        A provider with no ``CAPABILITIES`` is left alone, for the reason
+        given in :meth:`_reject_unsupported_skills`.
+
+        Args:
+            agent: The agent whose ``session_key`` is being checked. Agents
+                that declare none return immediately.
+
+        Raises:
+            ExecutionError: If the provider declares
+                ``capabilities.session_continuity=False``.
+        """
+        if agent.session_key is None:
+            return
+        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        if capabilities is None or capabilities.session_continuity:
+            return
+        raise ExecutionError(
+            f"Agent '{agent.name}' declares session_key={agent.session_key!r} but "
+            f"provider '{type(self.provider).__name__}' does not support session "
+            f"continuity (capabilities.session_continuity=False), so every "
+            f"execution would start a fresh session.",
+            agent_name=agent.name,
+            suggestion=(
+                "Remove the session_key, or override the agent to a provider that "
+                "continues sessions (claude-agent-sdk). 'conductor validate' "
                 "reports this before a run starts."
             ),
         )

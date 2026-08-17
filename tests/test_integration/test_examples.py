@@ -294,3 +294,49 @@ class TestAcaCodingAgentExample:
         assert aca_meta["tier"] == "experimental"
         assert aca_meta["upstream_pin"] is not None
         assert "azure-identity" in aca_meta["upstream_pin"]
+
+
+class TestSessionKeyExample:
+    """`examples/claude-agent-sdk-session-key.yaml`: the runnable demonstration
+    of per-agent session continuity.
+
+    The sweep in `tests/test_config/test_validator.py::TestExamplesRegression`
+    validates every bundled example by glob, so this file was never *named* by
+    a test. That sweep proves the example parses; it does not pin the two
+    things the example exists to show — a loop-back that reuses its own
+    session, and a second agent that inherits it — either of which could be
+    edited away while the file still validates.
+    """
+
+    @property
+    def _workflow_file(self) -> Path:
+        examples = Path(__file__).parent.parent.parent / "examples"
+        return examples / "claude-agent-sdk-session-key.yaml"
+
+    def test_passes_full_validation(self) -> None:
+        """`conductor validate` semantics, not just `load_config`: the
+        session_key capability cross-check and the shared-key concurrency
+        check both live in the validator.
+        """
+        from conductor.config.validator import validate_workflow_config
+
+        config = load_config(self._workflow_file)
+        validate_workflow_config(config, workflow_path=self._workflow_file)
+
+        assert config.workflow.runtime.provider.name == "claude-agent-sdk"
+
+    def test_the_loop_back_and_the_hand_off_share_one_key(self) -> None:
+        config = load_config(self._workflow_file)
+        keys = {a.name: a.session_key for a in config.agents}
+
+        assert keys["investigate"] == keys["summarize"] == "investigation"
+        # A script step has no provider session; the schema rejects a key there.
+        assert keys["verify"] is None
+
+    def test_the_loop_back_route_exists(self) -> None:
+        """Without the route back to `investigate` the example still validates
+        but no longer demonstrates continuity at all."""
+        config = load_config(self._workflow_file)
+        verify = next(a for a in config.agents if a.name == "verify")
+
+        assert "investigate" in {route.to for route in verify.routes}

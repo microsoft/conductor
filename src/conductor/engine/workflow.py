@@ -2293,8 +2293,10 @@ class WorkflowEngine:
         """Serialize the current workflow state to a checkpoint file.
 
         Shared by the on-failure and periodic checkpoint paths. Collects
-        provider session IDs (for Copilot session resume) and delegates to
-        :meth:`CheckpointManager.save_checkpoint`, which never raises.
+        session IDs from every provider that records them — Copilot per agent
+        name, ``claude-agent-sdk`` per namespaced ``session_key`` — and
+        delegates to :meth:`CheckpointManager.save_checkpoint`, which never
+        raises.
 
         Args:
             error: The exception that triggered the save, or ``None`` for a
@@ -2327,14 +2329,31 @@ class WorkflowEngine:
                 # agent name and can still shadow each other — pre-existing.)
                 merged_ids: dict[str, str] = {}
                 merged_cwds: dict[str, str] = {}
-                for p in self._registry.get_active_providers().values():
-                    if hasattr(p, "get_session_ids"):
+                for pname, p in self._registry.get_active_providers().items():
+                    if not hasattr(p, "get_session_ids"):
+                        continue
+                    # Per provider, so one that raises costs only its own
+                    # sessions. A single try around the loop sent every
+                    # provider's map to the outer handler, which discards the
+                    # lot — losing Copilot's sessions to a Claude failure.
+                    try:
                         merged_ids.update(p.get_session_ids())  # type: ignore[union-attr]
                         if hasattr(p, "get_session_cwds"):
                             merged_cwds.update(p.get_session_cwds())  # type: ignore[union-attr]
-                if merged_ids:
-                    copilot_session_ids = merged_ids
-                    copilot_session_cwds = merged_cwds
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to collect session IDs from provider '%s' for "
+                            "checkpoint; its sessions will not resume (%s: %s)",
+                            pname,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        logger.debug("Session ID collection traceback", exc_info=True)
+                # Assigned unconditionally, matching the single-provider branch
+                # above; ``save_checkpoint`` normalises an empty map with
+                # ``or {}``.
+                copilot_session_ids = merged_ids
+                copilot_session_cwds = merged_cwds
         except Exception as exc:
             logger.warning(
                 "Failed to collect provider session IDs for checkpoint (%s: %s)",

@@ -1821,9 +1821,11 @@ class AgentDef(BaseModel):
     @field_validator("session_key")
     @classmethod
     def validate_session_key_is_literal(cls, v: str | None) -> str | None:
-        """Reject a Jinja2 template: ``session_key`` is never rendered, so
-        ``"item-{{ _key }}"`` would be one literal key shared by every
-        iteration rather than the per-item key the author intended.
+        """Reject a Jinja2 template in ``session_key``.
+
+        The field is never rendered, so ``"item-{{ _key }}"`` would become one
+        literal key shared by every iteration rather than the per-item key the
+        author intended.
         """
         if v is not None and ("{{" in v or "{%" in v):
             raise ValueError(

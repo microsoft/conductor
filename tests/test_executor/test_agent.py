@@ -8,12 +8,27 @@ Tests cover:
 - Error handling
 """
 
+import asyncio
+from typing import Any
+
 import pytest
 
-from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
-from conductor.exceptions import TemplateError, ValidationError
+from conductor.config.schema import (
+    AgentDef,
+    OutputField,
+    ReasoningConfig,
+    WorkflowConfig,
+    WorkflowDef,
+)
+from conductor.config.validator import validate_workflow_config
+from conductor.exceptions import (
+    ConfigurationError,
+    ExecutionError,
+    TemplateError,
+    ValidationError,
+)
 from conductor.executor.agent import AgentExecutor, resolve_agent_tools
-from conductor.providers.base import AgentOutput
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -856,3 +871,109 @@ class TestAgentExecutorOutputHandling:
         assert output.content["active"] is True
         assert output.content["items"] == [1, 2, 3]
         assert output.content["meta"] == {"key": "value"}
+
+
+class _StubProvider(AgentProvider, abstract=True):
+    """Minimal provider that declares no ``CAPABILITIES`` of its own."""
+
+    async def execute(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        rendered_prompt: str,
+        tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+    ) -> AgentOutput:
+        return AgentOutput(content={"answer": "ok"}, raw_response="")
+
+    async def validate_connection(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+class TestSessionKeyCapabilityRejection:
+    """``capabilities.session_continuity=False`` must hold at run time too.
+
+    ``conductor run`` never calls the static validator, so without this the
+    declaration was enforced in one command and quietly contradicted in the
+    other: a ``session_key`` on copilot / claude / hermes / aca simply started a
+    fresh session every execution, discarding exactly the context the key was
+    written to keep, with nothing in the output to show for it.
+    """
+
+    _KEYED = AgentDef(name="analyze", prompt="hi", session_key="investigation")
+
+    @staticmethod
+    def _copilot(calls: list[str] | None = None) -> CopilotProvider:
+        def mock_handler(agent, prompt, context):
+            if calls is not None:
+                calls.append(agent.name)
+            return {"answer": "x"}
+
+        return CopilotProvider(mock_handler=mock_handler)
+
+    @pytest.mark.asyncio
+    async def test_provider_without_continuity_is_refused(self) -> None:
+        assert CopilotProvider.CAPABILITIES.session_continuity is False
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await AgentExecutor(self._copilot()).execute(self._KEYED, {})
+
+        assert "does not support session continuity" in str(exc_info.value)
+        assert exc_info.value.agent_name == "analyze"
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_precedes_the_provider_call(self) -> None:
+        """Nothing is learned from spending a model call on a request the
+        provider was always going to answer without the session."""
+        calls: list[str] = []
+        with pytest.raises(ExecutionError):
+            await AgentExecutor(self._copilot(calls)).execute(self._KEYED, {})
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_agent_without_a_key_is_untouched(self) -> None:
+        output = await AgentExecutor(self._copilot()).execute(
+            AgentDef(name="analyze", prompt="hi"), {}
+        )
+        assert output.content == {"answer": "x"}
+
+    @pytest.mark.asyncio
+    async def test_a_provider_declaring_continuity_is_allowed(self) -> None:
+        class _Continuity(_StubProvider, abstract=True):
+            CAPABILITIES = CopilotProvider.CAPABILITIES.model_copy(
+                update={"session_continuity": True}
+            )
+
+        output = await AgentExecutor(_Continuity()).execute(self._KEYED, {})
+        assert output.content == {"answer": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_a_provider_without_capabilities_is_left_alone(self) -> None:
+        """Test fakes declare ``abstract=True`` and have no CAPABILITIES. A
+        real provider cannot reach this branch: ``__init_subclass__`` raises at
+        import time unless a concrete subclass declares one.
+        """
+        output = await AgentExecutor(_StubProvider()).execute(self._KEYED, {})
+        assert output.content == {"answer": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_the_static_and_runtime_checks_agree(self) -> None:
+        """Both paths must reject the same workflow, or a user hits one and not
+        the other — the disagreement this check exists to close.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="w", entry_point="analyze"),
+            agents=[self._KEYED],
+        )
+        with pytest.raises(ConfigurationError, match="does not support session continuity"):
+            validate_workflow_config(config)
+        with pytest.raises(ExecutionError, match="does not support session continuity"):
+            await AgentExecutor(self._copilot()).execute(self._KEYED, {})

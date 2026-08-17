@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Session continuity for the `claude-agent-sdk` provider via a per-agent
+  `session_key`** — executions tagged with the same key now continue one
+  Claude session instead of each starting cold, so an investigate → check →
+  retry loop keeps what it already read, and a later agent can inherit an
+  earlier one's conversation by declaring the same key. The key is a static,
+  unrendered label; sessions are scoped per working directory, since that is
+  how the `claude` CLI stores transcripts. The map is persisted in
+  checkpoints, so continuity survives `conductor resume`, and the new
+  `session_continuity` capability turns `session_key` against a provider that
+  cannot honor it into a `conductor validate` error rather than a silently
+  dropped setting. A session the provider cannot confirm on disk logs a
+  warning and starts fresh rather than failing the run, and `conductor
+  validate` refuses a key shared across concurrent executions. See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#session-continuity-session_key)
+  and
+  [`examples/claude-agent-sdk-session-key.yaml`](examples/claude-agent-sdk-session-key.yaml).
+- **Checkpoints now persist every active provider's session map**, rather than
+  stopping at the first provider that exposes one. A workflow mixing providers
+  previously kept only one map, silently dropping the others' sessions
+  depending on which agent happened to run first. `claude-agent-sdk`
+  namespaces its own entries, so they cannot collide with Copilot's
+  agent-name keys in the merged map.
 - **`conductor status` — see what is running without stopping it** (#384).
   `conductor stop` with no arguments lists background workflows, but stops one
   when exactly one is running, so the natural "what's running?" reflex was
@@ -320,29 +342,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AgentExecutor`, upstream of every provider, so the path was always
   reachable and the declaration was simply inaccurate. Now bounded by
   `runtime.skill_injection` like `claude`.
-
-- **Session continuity for the `claude-agent-sdk` provider via a per-agent
-  `session_key`** — executions tagged with the same key now continue one
-  Claude session instead of each starting cold, so an investigate → check →
-  retry loop keeps what it already read, and a later agent can inherit an
-  earlier one's conversation by declaring the same key. The key is a static,
-  unrendered label; sessions are scoped per working directory, since that is
-  how the `claude` CLI stores transcripts. The map is persisted in
-  checkpoints, so continuity survives `conductor resume`, and the new
-  `session_continuity` capability turns `session_key` against a provider that
-  cannot honor it into a `conductor validate` error rather than a silently
-  dropped setting. A session the provider cannot confirm on disk logs a
-  warning and starts fresh rather than failing the run, and `conductor
-  validate` refuses a key shared across concurrent executions. See
-  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#session-continuity-session_key)
-  and
-  [`examples/claude-agent-sdk-session-key.yaml`](examples/claude-agent-sdk-session-key.yaml).
-- **Checkpoints now persist every active provider's session map**, rather than
-  stopping at the first provider that exposes one. A workflow mixing providers
-  previously kept only one map, silently dropping the others' sessions
-  depending on which agent happened to run first. `claude-agent-sdk`
-  namespaces its own entries, so they cannot collide with Copilot's
-  agent-name keys in the merged map.
 - **`claude-agent-sdk` provider now honors `working_dir`** — the directory
   resolved from `agent.working_dir` / `runtime.working_dir` is forwarded to
   `ClaudeAgentOptions.cwd`, so the `claude` CLI runs there and every stdio MCP

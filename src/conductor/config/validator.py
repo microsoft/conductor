@@ -1747,6 +1747,36 @@ def _resolved_provider_name(agent: AgentDef, default: str) -> str:
     return agent.provider or default
 
 
+def _references_loop_variable(template: str, loop_var: str) -> bool:
+    """Whether ``template`` actually reads a for-each loop variable.
+
+    Parsed rather than substring-matched, because both halves of a substring
+    scan are wrong in opposite directions. ``_index`` and ``_key`` occur inside
+    ordinary path segments — ``/var/lib/search_index``, ``/srv/api_key`` — so a
+    bare scan reports per-item variation that is not there; and a literal
+    ``{{ item`` scan matches only the spacings it enumerates, missing
+    ``{{- item }}`` while still matching an unrelated expression that merely
+    mentions the name, such as ``{{ workflow.input.api_key }}``.
+
+    Args:
+        template: The raw (unrendered) string to inspect.
+        loop_var: The group's ``as:`` name, e.g. ``item``.
+
+    Returns:
+        True when the template reads ``loop_var``, ``_index`` or ``_key``.
+    """
+    if "{{" not in template and "{%" not in template:
+        return False
+    try:
+        undeclared = meta.find_undeclared_variables(_JINJA_ENV.parse(template))
+    except (jinja2.TemplateSyntaxError, jinja2.TemplateAssertionError):
+        # A template that will not parse cannot be shown to vary per item, and
+        # this feeds a safety check — so report "no", the conservative answer.
+        # The malformed template itself is reported elsewhere, at render time.
+        return False
+    return bool(undeclared & {loop_var, "_index", "_key"})
+
+
 def _validate_provider_capabilities(
     config: WorkflowConfig,
     workflow_path: Path | None = None,
@@ -2546,7 +2576,7 @@ def _validate_provider_capabilities(
     # one transcript. Sessions are scoped to (session_key, working directory),
     # so different directories are already distinct sessions and are not
     # flagged — that is what makes multi-worktree fan-out legal.
-    runtime_working_dir = config.workflow.runtime.working_dir
+    # ``runtime_working_dir`` is bound at the top of this function.
 
     def _effective_working_dir(agent: AgentDef) -> str | None:
         return agent.working_dir or runtime_working_dir
@@ -2578,8 +2608,7 @@ def _validate_provider_capabilities(
         # A per-item working_dir gives each iteration its own session, so only
         # a directory shared by every iteration is unsafe.
         working_dir = _effective_working_dir(fe.agent) or ""
-        loop_vars = (f"{{{{ {fe.as_}", f"{{{{{fe.as_}", "_index", "_key")
-        if any(var in working_dir for var in loop_vars):
+        if _references_loop_variable(working_dir, fe.as_):
             continue
         errors.append(
             f"For-each group '{fe.name}' has max_concurrent={fe.max_concurrent} "

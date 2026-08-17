@@ -12,6 +12,7 @@ no type checker can verify.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -219,3 +220,207 @@ class TestMixedProviderCheckpoint:
         claude = ClaudeAgentSdkProvider()
         claude.set_resume_session_ids({"investigate": "copilot-sid"})
         assert claude._resume_session_ids == {}
+
+    async def test_a_raising_provider_costs_only_its_own_sessions(
+        self, workflow_file: Path
+    ) -> None:
+        """One bad provider must not discard every provider's map.
+
+        A single ``try`` around the merge loop sent the first raise to the
+        outer handler, which sets ``copilot_session_ids = None`` — so a Claude
+        failure silently took Copilot's resumable sessions with it, and the
+        partially merged local was thrown away.
+        """
+        config = load_workflow(workflow_file)
+
+        broken = Mock()
+        broken.get_session_ids.side_effect = RuntimeError("provider exploded")
+
+        copilot = Mock()
+        copilot.get_session_ids.return_value = {"investigate": "copilot-sid"}
+        copilot.get_session_cwds.return_value = {"investigate": "/repo"}
+
+        registry = Mock()
+        registry.get_active_providers.return_value = {"broken": broken, "copilot": copilot}
+
+        engine = WorkflowEngine(config, registry=registry, workflow_path=workflow_file)
+        with patch("conductor.engine.checkpoint.CheckpointManager.save_checkpoint") as save:
+            save.return_value = Path("/tmp/cp.json")
+            engine._write_checkpoint(error=None, trigger="periodic")
+
+        assert save.call_args.kwargs["copilot_session_ids"] == {"investigate": "copilot-sid"}
+        assert save.call_args.kwargs["copilot_session_cwds"] == {"investigate": "/repo"}
+
+    async def test_the_failure_names_the_provider_that_raised(
+        self, workflow_file: Path, caplog: Any
+    ) -> None:
+        config = load_workflow(workflow_file)
+        broken = Mock()
+        broken.get_session_ids.side_effect = RuntimeError("provider exploded")
+        registry = Mock()
+        registry.get_active_providers.return_value = {"broken": broken}
+
+        engine = WorkflowEngine(config, registry=registry, workflow_path=workflow_file)
+        with (
+            patch("conductor.engine.checkpoint.CheckpointManager.save_checkpoint") as save,
+            caplog.at_level("WARNING"),
+        ):
+            save.return_value = Path("/tmp/cp.json")
+            engine._write_checkpoint(error=None, trigger="periodic")
+
+        assert "'broken'" in caplog.text
+        # Still saved, just without that provider's sessions.
+        assert save.call_args.kwargs["copilot_session_ids"] == {}
+
+
+_PARENT_FANOUT = """
+workflow:
+  name: parent-fanout
+  entry_point: seed
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-5
+  limits:
+    max_iterations: 20
+for_each:
+  - name: fan
+    type: for_each
+    source: seed.output.items
+    as: item
+    max_concurrent: 2
+    agent:
+      name: runner
+      type: workflow
+      workflow: ./child.yaml
+      input_mapping:
+        topic: "{{ item }}"
+    routes:
+      - to: $end
+agents:
+  - name: seed
+    type: set
+    values:
+      items: '["alpha", "beta"]'
+    routes:
+      - to: fan
+output:
+  count: "{{ fan.outputs | length }}"
+"""
+
+_CHILD_KEYED = """
+workflow:
+  name: child-keyed
+  entry_point: work
+  runtime:
+    provider: claude-agent-sdk
+    default_model: claude-sonnet-4-5
+  input:
+    topic:
+      type: string
+      required: true
+agents:
+  - name: work
+    session_key: shared
+    prompt: "work on {{ workflow.input.topic }}"
+    output:
+      answer:
+        type: string
+    routes:
+      - to: $end
+output:
+  answer: "{{ work.output.answer }}"
+"""
+
+
+class _SlowQuery:
+    """Holds each call open long enough for a sibling iteration to start."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, *, prompt: str, options: Any) -> Any:
+        del prompt
+        self.calls += 1
+        session_id = getattr(options, "resume", None) or f"sess-{self.calls}"
+
+        async def gen():
+            await asyncio.sleep(0.2)
+            yield AssistantMessage(
+                content=[TextBlock(text="working")],
+                model="claude-sonnet-4-5",
+                session_id=session_id,
+            )
+            yield ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+                structured_output={"answer": "a"},
+            )
+
+        return gen()
+
+
+class TestConcurrentSubWorkflowGuard:
+    """The hole ``conductor validate`` cannot see.
+
+    A ``type: workflow`` agent cannot itself carry a ``session_key``, so the
+    static shared-key check never fires for one — yet ``_execute_subworkflow``
+    passes the parent's registry down, so a concurrent ``for_each`` over a
+    sub-workflow whose *inner* agent is keyed ends up resuming one session from
+    two iterations at once. Only the provider's in-flight guard sees it.
+    """
+
+    @pytest.fixture
+    def fanout_workflow(self, tmp_path: Path) -> Path:
+        (tmp_path / "child.yaml").write_text(_CHILD_KEYED)
+        parent = tmp_path / "parent.yaml"
+        parent.write_text(_PARENT_FANOUT)
+        return parent
+
+    async def test_overlapping_iterations_are_refused(self, fanout_workflow: Path) -> None:
+        slow = _SlowQuery()
+        config = load_workflow(fanout_workflow)
+
+        async with ProviderRegistry(config, mcp_servers=None) as registry:
+            engine = WorkflowEngine(config, registry=registry, workflow_path=fanout_workflow)
+            with (
+                patch("conductor.providers.claude_agent_sdk.query", slow),
+                patch.object(
+                    ClaudeAgentSdkProvider,
+                    "_session_transcript_exists",
+                    staticmethod(Mock(return_value=True)),
+                ),
+                pytest.raises(Exception) as exc,
+            ):
+                await engine.run({})
+
+        assert "still running" in str(exc.value)
+        # The second iteration never reached the SDK.
+        assert slow.calls == 1
+
+    async def test_a_serial_fan_out_is_unaffected(self, fanout_workflow: Path) -> None:
+        """The guard must catch overlap, not sharing: the same workflow run one
+        iteration at a time is the supported way to reuse a session.
+        """
+        serial = fanout_workflow.read_text().replace("max_concurrent: 2", "max_concurrent: 1")
+        fanout_workflow.write_text(serial)
+
+        slow = _SlowQuery()
+        config = load_workflow(fanout_workflow)
+
+        async with ProviderRegistry(config, mcp_servers=None) as registry:
+            engine = WorkflowEngine(config, registry=registry, workflow_path=fanout_workflow)
+            with (
+                patch("conductor.providers.claude_agent_sdk.query", slow),
+                patch.object(
+                    ClaudeAgentSdkProvider,
+                    "_session_transcript_exists",
+                    staticmethod(Mock(return_value=True)),
+                ),
+            ):
+                await engine.run({})
+
+        assert slow.calls == 2

@@ -438,10 +438,10 @@ agents:
   `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where an
   agent is meant to re-evaluate from scratch.
 - **Scoped to one working directory.** The `claude` CLI stores transcripts per
-  directory, so sessions are tracked by `(session_key, working directory)`. Two
-  agents sharing a key under different `working_dir` values get two independent
-  sessions. Keep `working_dir` stable across executions meant to continue each
-  other.
+  directory, so Conductor tracks sessions by `(session_key, working
+  directory)`. Two agents sharing a key under different `working_dir` values
+  get two independent sessions. Keep `working_dir` stable across executions
+  meant to continue each other.
 - **Survives `conductor resume`.** The session map is written to the checkpoint
   and restored on resume. The engine merges every active provider's map, and
   `claude-agent-sdk` namespaces its own entries (`claude-agent-sdk:["<key>",
