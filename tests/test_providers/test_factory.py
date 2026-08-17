@@ -268,8 +268,8 @@ class TestCreateProvider:
         assert provider is not None
         assert provider.__class__.__name__ == "ClaudeProvider"
         # Verify models.list was called for validation
-        # Called twice: once in __init__ and once in validate_connection
-        assert mock_client.models.list.call_count == 2
+        # validate_connection() shares one round-trip between validation and model discovery
+        assert mock_client.models.list.call_count == 1
 
     @pytest.mark.asyncio
     async def test_create_unknown_provider_raises(self) -> None:

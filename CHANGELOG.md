@@ -42,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged, so that combination still warns. Workflows that set `max_bytes`
   explicitly are unaffected.
 
+### Fixed
+
+- **`claude` provider: `validate_connection()` no longer fails startup when an
+  Anthropic-compatible endpoint doesn't implement `models.list()`** (issue
+  #455). Azure AI Foundry's Anthropic endpoint, and some LiteLLM/Databricks AI
+  Gateway configurations, answer `/v1/models` with a 404 while `/v1/messages`
+  (what agents actually call) works fine — previously this made every workflow
+  using such an endpoint fail before running a single agent. The startup probe
+  now only fails on positive evidence of a broken setup: an unreachable host,
+  rejected credentials (401/403), or a non-HTTP error. Any other HTTP status
+  logs a warning naming the status code and continues, deferring credential
+  verification to the first agent execution — the same posture the `hermes`
+  provider already documents. See
+  [`docs/providers/claude.md`](docs/providers/claude.md#startup-connection-validation).
+
 ## [0.1.32](https://github.com/microsoft/conductor/compare/v0.1.31...v0.1.32) - 2026-08-16
 
 ### Fixed

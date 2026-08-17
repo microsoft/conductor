@@ -14,6 +14,9 @@ Error Handling Strategy:
   Examples: HTTP 500 errors, rate limits, authentication failures.
 
 This distinction ensures clear error classification and appropriate retry behavior.
+Startup connection validation is deliberately advisory for non-credential HTTP failures from
+``models.list()`` (e.g. a 404 on a gateway that doesn't implement model listing) — see
+``validate_connection()``.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ from conductor.providers.reasoning import (
 # Try to import the Anthropic SDK
 try:
     import anthropic
-    from anthropic import AnthropicError, AsyncAnthropic
+    from anthropic import AnthropicError, APIConnectionError, APIStatusError, AsyncAnthropic
 
     ANTHROPIC_SDK_AVAILABLE = True
 except ImportError:
@@ -55,6 +58,12 @@ except ImportError:
     AsyncAnthropic = None  # type: ignore[misc, assignment]
     anthropic = None  # type: ignore[assignment]
     AnthropicError = Exception  # type: ignore[misc, assignment]
+
+    class _SDKUnavailableError(Exception):
+        """Sentinel that never matches a real exception when the SDK is absent."""
+
+    APIConnectionError = _SDKUnavailableError  # type: ignore[misc, assignment]
+    APIStatusError = _SDKUnavailableError  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -363,39 +372,77 @@ class ClaudeProvider(AgentProvider):
         1. Validates API connectivity and credentials
         2. Performs async model verification (deferred from __init__)
 
+        ``models.list()`` is not implemented by every Anthropic-compatible endpoint
+        (Azure AI Foundry, some LiteLLM/Databricks gateways answer it with a 404 while
+        ``/v1/messages`` works fine), so a non-connection, non-credential HTTP failure from
+        this probe is treated as inconclusive rather than fatal: the workflow proceeds and
+        credentials are verified at the first agent execution instead. Only an unreachable
+        host, rejected credentials (401/403), or a non-HTTP error still fail startup.
+
         Returns:
-            True if connection successful, False otherwise.
+            True if connection successful (or the probe was inconclusive), False otherwise.
         """
         if self._client is None:
             return False
 
         try:
             # Test: list models to verify API key works and perform model verification
-            await self._client.models.list()
+            models_page = await self._client.models.list()
             # Log available models for debugging
-            await self._log_available_models()
+            self._report_available_models(models_page)
             return True
         except Exception as e:
-            logger.error(f"Connection validation failed: {e}")
+            return self._connection_probe_verdict(e)
+
+    def _connection_probe_verdict(self, exc: Exception) -> bool:
+        """Classify a ``models.list()`` failure as fatal or merely inconclusive.
+
+        Args:
+            exc: The exception raised by ``client.models.list()``.
+
+        Returns:
+            False when the failure indicates an unreachable host, rejected credentials, or
+            a non-HTTP error. True when the endpoint returned some other HTTP status (the
+            endpoint likely doesn't implement model listing) — startup proceeds and
+            credentials are verified at the first agent execution instead.
+        """
+        if isinstance(exc, APIConnectionError):
+            logger.error(f"Connection validation failed: {exc}")
             return False
 
-    async def _log_available_models(self) -> None:
-        """List and log available models, warn if default model is unavailable.
+        if isinstance(exc, APIStatusError):
+            status_code = exc.status_code
+        else:
+            # Fall back for a duck-typed error (e.g. a gateway-layer httpx.HTTPStatusError)
+            # that carries a status code without being an APIStatusError itself.
+            status_code = getattr(exc, "status_code", None)
+            if status_code is None:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+
+        if status_code is None:
+            logger.error(f"Connection validation failed: {exc}")
+            return False
+
+        if status_code in (401, 403):
+            logger.error(f"Connection validation failed: {exc}")
+            return False
+
+        logger.warning(
+            f"Could not verify connection via models.list() (HTTP {status_code}): {exc}. "
+            "This endpoint may not implement /v1/models. Continuing startup; credentials "
+            "will be verified on the first agent call."
+        )
+        return True
+
+    def _report_available_models(self, models_page: Any) -> None:
+        """Log available models, warn if default model is unavailable.
 
         Also seeds ``_max_input_cache`` so the first call to
         :meth:`get_max_prompt_tokens` doesn't pay for an extra round-trip.
+
+        Args:
+            models_page: The result of ``client.models.list()``.
         """
-        if self._client is None:
-            return
-
-        try:
-            # Call client.models.list() to get available models (async)
-            logger.debug("Discovering available Claude models via client.models.list()...")
-            models_page = await self._client.models.list()
-        except (TimeoutError, AnthropicError, OSError) as e:
-            logger.warning(f"Could not list available models (discovery failed): {e}")
-            return
-
         available_models = [model.id for model in models_page.data]
         logger.info(f"Available Claude models: {', '.join(available_models)}")
 
