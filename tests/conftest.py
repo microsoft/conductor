@@ -8,6 +8,7 @@ the full rationale.
 """
 
 import re
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,79 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 item.add_marker(skip)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_event_log_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect ``tempfile.gettempdir()`` to this test's own ``tmp_path`` for
+    *every* test, not just the ones that already know to isolate it.
+
+    ``conductor.fleet.retention.event_log_root()`` (and every other caller
+    of ``tempfile.gettempdir()`` -- ``engine/event_log.py``,
+    ``cli/bg_runner.py``) resolve ``$TMPDIR/conductor/`` from this same
+    function. Since Fleet Manager E5, ``run_workflow_async`` /
+    ``resume_workflow_async`` call ``maybe_prune_event_logs()`` on startup
+    with retention *enabled by default* (``keep_last = 200``) -- without
+    this guard, any test that drives those functions (directly, or via a
+    CLI command) prunes the *developer's actual* ``$TMPDIR/conductor/``,
+    permanently deleting real ``conductor replay`` material. This was
+    reproduced empirically: planting sentinel logs in the real
+    ``/tmp/conductor`` and running a single wiring test alone deleted two of
+    them.
+
+    Returns pytest's own ``tmp_path`` verbatim (not a nested subdirectory
+    of it) so that any other code in the same test which independently
+    builds a path under ``tmp_path`` and compares it against
+    ``tempfile.gettempdir()`` (e.g. ``mcp/manager.py``'s spill-dir
+    symlink policy, which checks ``spill_dir.is_relative_to(temp_root)``)
+    still sees a consistent root -- a nested subdirectory would make such
+    paths spuriously "outside" the patched temp root and change behavior
+    unrelated to this guard's purpose.
+
+    An autouse fixture here means no future test needs to remember to
+    isolate this itself. Tests that need a specific isolated root (e.g.
+    ``tests/test_fleet/test_retention.py``'s own ``temp_root`` fixture) can
+    still patch ``tempfile.gettempdir`` again themselves -- the later
+    ``monkeypatch.setattr`` simply wins, and both this fixture and theirs
+    ultimately point at a location under pytest's own ``tmp_path``, never
+    the real system temp directory.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_run_records_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect both run-record directories away from the developer's real home.
+
+    The sibling guard above closes the ``$TMPDIR/conductor/`` leak; this one
+    closes the ``~/.conductor/runs/`` half, which is the more destructive of
+    the two. ``conductor.fleet.records.read_run_records()`` is a *pruning*
+    reader: it deletes any record it judges corrupt, identity-mismatched, or
+    owned by a dead PID. Anything that reaches it -- ``conductor stop``,
+    ``fleet list``, the TUI poll, and ``retention.prune_event_logs()`` via
+    ``_live_event_log_paths()`` -- therefore deletes the developer's *live*
+    run records unless both directories are redirected.
+
+    Both are needed because they resolve differently on purpose:
+    ``records.run_records_dir()`` honors ``CONDUCTOR_HOME``, while
+    ``cli.pid.pid_dir()`` deliberately does not (legacy ``.pid`` files must
+    stay readable at their original, unredirected location). Redirecting only
+    one leaves the other pointing at the real home, which is what
+    ``tests/test_fleet/test_retention.py`` did.
+
+    ``CONDUCTOR_HOME`` is set rather than patching ``run_records_dir``
+    itself, so a test that sets the variable for its own purposes still
+    wins -- patching the function would make that variable inert.
+    """
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor-home"))
+
+    legacy_pid_dir = tmp_path / "legacy-pid-dir"
+
+    def _isolated_pid_dir() -> Path:
+        legacy_pid_dir.mkdir(parents=True, exist_ok=True)
+        return legacy_pid_dir
+
+    monkeypatch.setattr("conductor.cli.pid.pid_dir", _isolated_pid_dir)
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     """Return the path to the test fixtures directory."""
@@ -95,3 +169,33 @@ def tmp_workflow_file(tmp_path: Path, sample_workflow_yaml: str) -> Path:
     workflow_file = tmp_path / "test-workflow.yaml"
     workflow_file.write_text(sample_workflow_yaml)
     return workflow_file
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ``conductor.rundir.runs_dir()`` at ``tmp_path`` for every test.
+
+    ``conductor.rundir.runs_dir()`` backs both the PID registry
+    (``cli/pid.py``) and the dashboard token file (``web/auth.py``, issue
+    #397); several call paths (``conductor gate respond`` / ``guide`` /
+    the graceful-kill rung of ``conductor stop``, and ``WebDashboard.start``/
+    ``stop``) read or write it when no explicit ``--token``/env var is
+    supplied. Making this autouse and global — rather than the four
+    hand-copied per-file versions it replaces — closes the gap where a test
+    module that never opted in (``test_markup_injection.py``) read the
+    developer's real ``~/.conductor/runs`` and, on a machine with a live
+    dashboard, its live token.
+
+    Also asserts, on every call, that the resolved directory is never the
+    real home — a meta-guard in case a future test bypasses the monkeypatch
+    (e.g. by importing ``runs_dir`` before this fixture runs).
+    """
+    runs_dir = tmp_path / "runs_isolated_for_tests"
+    runs_dir.mkdir()
+    real_home_runs_dir = Path.home() / ".conductor" / "runs"
+
+    def _isolated() -> Path:
+        assert runs_dir != real_home_runs_dir
+        return runs_dir
+
+    monkeypatch.setattr("conductor.rundir.runs_dir", _isolated)

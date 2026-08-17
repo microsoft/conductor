@@ -205,7 +205,7 @@ agents:
 
 ## Model Selection
 
-Claude offers multiple model tiers optimized for different use cases. All current Claude models default to a 200K-token context window; the dashboard's "context remaining" bar sources this value from the Anthropic SDK at runtime, so it always reflects the actual cap your account has access to (rather than a hand-maintained number that can drift). Beta context modes such as Claude's 1M-token window are not enabled by default in conductor today.
+Claude offers multiple model tiers optimized for different use cases. All current Claude models default to a 200K-token context window; the dashboard's "context remaining" bar sources the cap from the Anthropic SDK at runtime, so it always reflects the actual limit your account has access to (rather than a hand-maintained number that can drift), and shows the prompt size of the most recent single API call — not a running total across every call in the agent's execution — against that cap. Beta context modes such as Claude's 1M-token window are not enabled by default in conductor today.
 
 ### Available Models
 

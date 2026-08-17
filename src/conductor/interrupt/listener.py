@@ -15,6 +15,7 @@ import asyncio
 import atexit
 import contextlib
 import logging
+import os
 import select
 import signal
 import sys
@@ -243,9 +244,29 @@ class KeyboardListener:
 
             def _sigterm_handler(signum: int, frame: Any) -> None:
                 self._restore_terminal()
-                # Call previous handler if it was callable
+                # Call previous handler if it was callable. In an unmodified
+                # process (the common case) `signal.getsignal(SIGTERM)` is
+                # `signal.Handlers.SIG_DFL` -- an IntEnum member, not
+                # callable -- so falling through here would silently
+                # swallow the SIGTERM: the process would survive and keep
+                # running forever (Fleet Manager E3-T9; see Open Question 1
+                # in docs/projects/fleet-manager/fleet-manager.plan.md).
+                # Restore the default disposition and re-raise the signal
+                # against ourselves instead, so the process actually
+                # terminates the way an unhandled SIGTERM normally would.
                 if callable(self._previous_sigterm):
                     self._previous_sigterm(signum, frame)
+                elif self._previous_sigterm is signal.SIG_IGN:
+                    # An inherited SIG_IGN is a deliberate "this process
+                    # does not die on SIGTERM", set by a supervisor or
+                    # container init shim. It is an IntEnum member like
+                    # SIG_DFL, so without this branch it would take the
+                    # re-raise path below and terminate a process that was
+                    # explicitly configured not to.
+                    return
+                else:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    os.kill(os.getpid(), signal.SIGTERM)
 
             signal.signal(signal.SIGTERM, _sigterm_handler)
         except (OSError, ValueError):

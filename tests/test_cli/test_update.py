@@ -597,19 +597,78 @@ class TestRunUpdate:
             run_update(c, force=True)
 
 
+@pytest.fixture()
+def newer_release(cache_dir: Path):
+    """A cache/network state where a newer release is available."""
+    with (
+        patch(
+            "conductor.cli.update.fetch_latest_version",
+            return_value=("99.0.0", "v99.0.0", "https://example/release"),
+        ),
+        patch("conductor.cli.update.__version__", "0.1.0"),
+    ):
+        yield
+
+
+class TestRunUpdateExtrasNote:
+    """Issue #441: `uv tool install --force` rewrites the tool's whole
+    requirement set, so an upgrade used to silently uninstall `[tui]`/`[aca]`.
+    Both install scripts now carry them forward; `conductor update` says so
+    before the user commits to the upgrade."""
+
+    def test_names_the_extras_that_will_be_preserved(self, newer_release) -> None:
+        c, buf = _make_console()
+        with patch("conductor.cli.update.installed_extras", return_value=frozenset({"tui", "aca"})):
+            run_update(c)
+        output = buf.getvalue()
+        assert "carried forward" in output.lower()
+        assert "aca, tui" in output
+
+    def test_says_nothing_when_no_extras_are_installed(self, newer_release) -> None:
+        """The common case: a bare install must not be told about a
+        preservation mechanism that has nothing to preserve."""
+        c, buf = _make_console()
+        with patch("conductor.cli.update.installed_extras", return_value=frozenset()):
+            run_update(c)
+        assert "carried forward" not in buf.getvalue().lower()
+
+    def test_the_note_also_appears_before_an_automatic_apply(self, newer_release) -> None:
+        """`--apply` hands off to the installer and never returns, so the note
+        has to be printed *before* the spawn or it is never seen.
+
+        The mock raises SystemExit because that is the real contract: with a
+        plain returning mock this test passes even when the note is printed
+        after the handoff, which is precisely the regression it guards."""
+        c, buf = _make_console()
+        with (
+            patch("conductor.cli.update.installed_extras", return_value=frozenset({"tui"})),
+            patch(
+                "conductor.cli.update._spawn_installer_and_exit",
+                side_effect=SystemExit(0),
+            ) as spawn,
+            pytest.raises(SystemExit),
+        ):
+            run_update(c, apply=True)
+        assert "tui" in buf.getvalue()
+        spawn.assert_called_once()
+
+    def test_a_failed_receipt_read_does_not_break_the_update(self, newer_release) -> None:
+        """`installed_extras` never raises by contract, but `conductor update`
+        must not be resting on that alone — it is the command a user reaches
+        for when something is already wrong. Simulate a real failure rather
+        than an empty result, which would just repeat the test above."""
+        c, buf = _make_console()
+        with patch(
+            "conductor.cli.update.installed_extras", side_effect=OSError("receipt unreadable")
+        ):
+            run_update(c)
+        output = buf.getvalue()
+        assert "99.0.0" in output
+        assert "carried forward" not in output.lower()
+
+
 class TestRunUpdateApply:
     """Tests for ``run_update(apply=True)`` — spawn-and-exit behavior."""
-
-    @pytest.fixture()
-    def newer_release(self, cache_dir: Path):
-        with (
-            patch(
-                "conductor.cli.update.fetch_latest_version",
-                return_value=("99.0.0", "v99.0.0", "https://example/release"),
-            ),
-            patch("conductor.cli.update.__version__", "0.1.0"),
-        ):
-            yield
 
     def test_apply_does_not_print_paste_command(self, newer_release) -> None:
         """With --apply we should hand off to the installer, not print a manual command."""

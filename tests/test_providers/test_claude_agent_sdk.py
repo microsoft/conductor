@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import json
 import logging
@@ -75,6 +76,19 @@ class TestClaudeAgentSdkProviderInitialization:
         with pytest.raises(ProviderError, match="Claude Agent SDK not installed"):
             ClaudeAgentSdkProvider()
 
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", False)
+    @patch("conductor.providers.claude_agent_sdk.install_command", return_value="RESOLVED-COMMAND")
+    def test_the_install_suggestion_is_resolved_not_hardcoded(self, resolver) -> None:
+        """Issue #441: this used to say `uv add 'claude-agent-sdk>=0.2.82'`,
+        which fails outside a uv project and cannot install into the uv tool
+        venv the install script creates. `claude-agent-sdk` is one of this
+        package's declared extras, so the resolver applies."""
+        with pytest.raises(ProviderError) as exc_info:
+            ClaudeAgentSdkProvider()
+
+        assert exc_info.value.suggestion == "Install with: RESOLVED-COMMAND"
+        resolver.assert_called_once_with("claude-agent-sdk")
+
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -100,7 +114,11 @@ class TestValidateConnection:
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_validate_connection_returns_true_when_bundled_cli_present(self) -> None:
-        """The SDK ships a bundled CLI under _bundled/claude — detection should succeed."""
+        """The SDK ships a bundled CLI under ``_bundled/`` — detection should succeed.
+
+        The binary is named per-platform (``claude.exe`` on Windows, ``claude``
+        elsewhere), matching the SDK's own ``_find_bundled_cli``.
+        """
         provider = ClaudeAgentSdkProvider()
         # The installed claude-agent-sdk extra includes the bundled binary,
         # so this should return True in any env where the test runs.
@@ -1009,6 +1027,327 @@ class TestTokenAccounting:
         assert output.input_tokens == 200
         assert output.output_tokens == 100
 
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_result_message_reports_cache_inclusive_totals(self) -> None:
+        """A ResultMessage carrying cache keys sets all three prompt figures.
+
+        This is the branch that determines billing in every normal completed
+        run — ``ResultMessage.usage`` replaces the per-message running sum —
+        so it is where the cache buckets have to survive. Reverting it to the
+        pre-fix form (ignoring the cache keys) leaves cached tokens billed at
+        nothing at all.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 60,
+                    "output_tokens": 40,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 25,
+                },
+            )
+            # Cumulative session total, Anthropic-shaped: cached prompt tokens
+            # sit OUTSIDE input_tokens and must be folded in.
+            yield _result(
+                result="done",
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 900,
+                    "cache_creation_input_tokens": 50,
+                },
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # 100 fresh + 900 read + 50 written = the whole prompt.
+        assert output.input_tokens == 1050
+        assert output.cache_read_tokens == 900
+        assert output.cache_write_tokens == 50
+        assert output.output_tokens == 50
+        # The contract AgentOutput.input_tokens declares.
+        assert output.cache_read_tokens + output.cache_write_tokens <= output.input_tokens
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_result_message_without_input_tokens_keeps_running_totals(self) -> None:
+        """A partial usage dict must not mix accumulated and reported figures.
+
+        ``ResultMessage.usage`` is a bare dict with no guaranteed keys. Adding
+        its cache counts onto a running sum that already contains them
+        re-creates the double-count this provider was fixed for; taking a
+        fresh input total while keeping stale cache counters drives
+        ``input_tokens`` below the buckets it is supposed to contain.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 5000,
+                    "cache_creation_input_tokens": 200,
+                },
+            )
+            # No input_tokens: not a trustworthy prompt figure.
+            yield _result(result="done", usage={"output_tokens": 50})
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # The per-message running sum survives intact — 5300, not 10500.
+        assert output.input_tokens == 5300
+        assert output.cache_read_tokens == 5000
+        assert output.cache_write_tokens == 200
+        assert output.cache_read_tokens + output.cache_write_tokens <= output.input_tokens
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_cache_buckets_accumulate_across_turns(self) -> None:
+        """Cache counts sum over turns rather than tracking only the last one.
+
+        A single-turn fixture cannot tell ``+=`` from ``=``, and the
+        degradation is silent: under-reported buckets inflate the derived
+        uncached input, so cost drifts back up.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 500,
+                    "cache_creation_input_tokens": 20,
+                },
+            )
+            yield _assistant(
+                content=[TextBlock(text="t2")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 30,
+                },
+            )
+            # No ResultMessage: the running sum is the answer.
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.cache_read_tokens == 900
+        assert output.cache_write_tokens == 50
+        assert output.input_tokens == 1150
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_partial_output_carries_cache_buckets(self) -> None:
+        """An interrupted run is still billed, so its cache buckets must survive."""
+        interrupt = asyncio.Event()
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="part1")],
+                usage={
+                    "input_tokens": 60,
+                    "output_tokens": 30,
+                    "cache_read_input_tokens": 500,
+                    "cache_creation_input_tokens": 50,
+                },
+            )
+            interrupt.set()
+            yield _assistant(
+                content=[TextBlock(text="never processed")],
+                usage={"input_tokens": 999, "output_tokens": 999},
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                interrupt_signal=interrupt,
+            )
+
+        assert output.partial is True
+        assert output.input_tokens == 610
+        assert output.cache_read_tokens == 500
+        assert output.cache_write_tokens == 50
+
+
+class TestContextWindowLastCallInputTokens:
+    """Issue #412: last_call_input_tokens is the last call's prompt size, not
+    a cumulative total, and must add in cache tokens the Anthropic-shaped
+    usage dict reports separately from input_tokens."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_last_assistant_message_wins(self) -> None:
+        """The last AssistantMessage's usage determines the figure, not the sum."""
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={"input_tokens": 1000, "output_tokens": 500},
+            )
+            yield _assistant(
+                content=[TextBlock(text="t2")],
+                usage={"input_tokens": 1500, "output_tokens": 750},
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.last_call_input_tokens == 1500
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_cache_tokens_are_added_into_the_figure(self) -> None:
+        """Anthropic-shaped usage reports cache tokens separately; the bare
+        input_tokens would understate the prompt on a cached conversation."""
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 25,
+                },
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.last_call_input_tokens == 100 + 400 + 25
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_billing_totals_are_cache_inclusive_and_priced_once(self) -> None:
+        """``input_tokens`` follows the cross-provider "cache-inclusive" contract
+        and the cache buckets are surfaced, so ``calculate_cost`` can price each
+        physical token exactly once.
+
+        The Anthropic-shaped usage dict reports cached tokens outside its own
+        ``input_tokens``; leaving them out entirely meant cached tokens were
+        billed at nothing, while adding them without also reporting the buckets
+        would bill them at the full input rate.
+        """
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 25,
+                },
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert output.input_tokens == 100 + 400 + 25
+        assert output.cache_read_tokens == 400
+        assert output.cache_write_tokens == 25
+
+        from conductor.engine.pricing import ModelPricing, calculate_cost
+
+        pricing = ModelPricing(
+            input_per_mtok=3.0,
+            output_per_mtok=15.0,
+            cache_read_per_mtok=0.3,
+            cache_write_per_mtok=3.75,
+        )
+        cost = calculate_cost(
+            model="stub",
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens or 0,
+            cache_read_tokens=output.cache_read_tokens or 0,
+            cache_write_tokens=output.cache_write_tokens or 0,
+            pricing=pricing,
+        )
+        expected = (
+            100 / 1_000_000 * 3.0
+            + 50 / 1_000_000 * 15.0
+            + 400 / 1_000_000 * 0.3
+            + 25 / 1_000_000 * 3.75
+        )
+        assert cost == pytest.approx(expected, rel=1e-9)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+    async def test_cumulative_result_message_does_not_overwrite_it(self) -> None:
+        """ResultMessage.usage is a cumulative session total and must not
+        replace the per-call figure the way it legitimately replaces the
+        billing totals."""
+
+        async def fake_query(**kwargs):
+            yield _assistant(
+                content=[TextBlock(text="t1")],
+                usage={"input_tokens": 1000, "output_tokens": 500},
+            )
+            yield _assistant(
+                content=[TextBlock(text="t2")],
+                usage={"input_tokens": 1500, "output_tokens": 750},
+            )
+            # Cumulative session total across both calls above.
+            yield _result(
+                result="done",
+                usage={"input_tokens": 2500, "output_tokens": 1250},
+            )
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            output = await provider.execute(
+                agent=AgentDef(name="test", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # Billing totals follow the cumulative ResultMessage figure...
+        assert output.input_tokens == 2500
+        # ...but the context figure stays pinned to the last single call.
+        assert output.last_call_input_tokens == 1500
+
 
 class TestErrorClassification:
     """Differentiated error suggestions per failure mode (#241 / A5).
@@ -1820,7 +2159,10 @@ class TestMcpConfigFile:
             _remove_mcp_config(path)
 
         # 0600: resolved env values and Authorization headers live in here.
-        assert mode == 0o600
+        # Windows has no POSIX mode bits — S_IMODE reports 0o666 whatever was requested —
+        # so the exact-mode guarantee is asserted on POSIX only.
+        if os.name != "nt":
+            assert mode == 0o600
         # The CLI rejects a bare mapping: "mcpServers: Invalid input:
         # expected record, received undefined".
         assert payload == {"mcpServers": servers}
@@ -2513,3 +2855,57 @@ class TestSkillsWiring:
         with pytest.raises(ProviderError, match="Two different plugins") as exc:
             _resolve_skill_plugins([str(a / "skills" / "s"), str(b / "skills" / "s")])
         assert exc.value.is_retryable is False
+
+
+class TestValidateConnectionProbeSetPerPlatform:
+    """The Windows branch had no test behind it.
+
+    On Linux ``is_windows`` is always False, and on the Windows runner the
+    bundled ``claude.exe`` ships in the wheel and short-circuits at the bundled
+    probe -- so the fallback block never ran on any CI leg. The whole branch
+    could be deleted and all three stayed green.
+
+    Asserting the probe *set* per platform is what catches a mismatch with the
+    SDK, because it forces the expectation to be written down as a literal.
+    """
+
+    def _probed(self, *, windows: bool) -> list[str]:
+        """Return the fallback paths ``validate_connection`` stats."""
+        seen: list[str] = []
+
+        def _spy(self: Path) -> bool:
+            seen.append(self.as_posix())
+            return False
+
+        with (
+            patch(
+                "conductor.providers.claude_agent_sdk.sys.platform",
+                "win32" if windows else "linux",
+            ),
+            patch("shutil.which", return_value=None),
+            patch.object(Path, "exists", _spy),
+        ):
+            provider = ClaudeAgentSdkProvider()
+            with contextlib.suppress(Exception):
+                asyncio.run(provider.validate_connection())
+        return seen
+
+    def test_posix_probes_the_driveless_path(self) -> None:
+        assert any(p == "/usr/local/bin/claude" for p in self._probed(windows=False))
+
+    def test_windows_skips_only_the_driveless_path(self) -> None:
+        """A rooted, driveless path resolves against the current drive.
+
+        ``/usr/local/bin/claude`` becomes ``C:\\usr\\local\\bin\\claude``, which
+        any unprivileged local user can create. The other five are
+        ``Path.home()``-anchored and carry no such risk -- dropping them reported
+        "no CLI" for a Windows user whose CLI sits at ``~/.claude/local/claude``,
+        where Claude Code's own local installer puts it, and which the pinned SDK
+        (0.2.87) probes and would happily run.
+        """
+        probed = self._probed(windows=True)
+        assert not any(p == "/usr/local/bin/claude" for p in probed)
+        assert any(p.endswith(".claude/local/claude") for p in probed), (
+            "a Windows user's local install must still be found"
+        )
+        assert any(p.endswith(".npm-global/bin/claude") for p in probed)

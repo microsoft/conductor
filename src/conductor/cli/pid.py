@@ -1,17 +1,30 @@
-"""PID file utilities for tracking background workflow processes.
+"""Reader utilities for legacy port-keyed PID files.
 
-When ``conductor run --web-bg`` launches a detached child process, a PID file is
-written to ``~/.conductor/runs/`` so that ``conductor stop`` can discover and
-terminate it later.  The child process removes its own PID file on exit.
+Read-only. Conductor writes ``run_id``-keyed JSON run records
+(:mod:`conductor.fleet.records`) for every run, foreground and background
+alike. These readers exist so a background process started by a
+pre-Fleet-Manager build — which left a ``.pid`` file behind — stays
+discoverable and stoppable until it exits.
 
-PID files are JSON with the schema::
+This module also owns :func:`is_process_alive`, the repository's single
+listing-liveness probe; :mod:`conductor.fleet.records` reuses it rather than
+reimplementing the platform-specific process checks.
+
+Legacy PID files are JSON with the schema::
 
     {
         "pid": 12345,
         "port": 8080,
         "workflow": "my-workflow.yaml",
-        "started_at": "2026-03-03T12:00:00"
+        "started_at": "2026-03-03T12:00:00",
+        "run_id": "a1b2c3d4",
+        "stderr_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stderr.log",
+        "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log"
     }
+
+``run_id`` may be present as an empty string, and
+``stderr_log``/``stdout_log`` may be absent entirely, depending on which
+build wrote the file — both shapes are read back as ``None``.
 """
 
 from __future__ import annotations
@@ -21,13 +34,34 @@ import json
 import logging
 import os
 import sys
+import time
 from ctypes import wintypes
-from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
+
+from conductor import rundir
 
 logger = logging.getLogger(__name__)
 
-_PID_DIR_NAME = "runs"
+
+class Liveness(str, Enum):
+    """Tri-state result of a process-liveness probe.
+
+    ``_is_process_alive`` collapses three genuinely different states into a
+    bool, which is safe for *listing* (where "assume alive" protects a live
+    run's PID file) but not for *terminating*: a caller that is about to
+    escalate to ``TerminateProcess`` must be able to tell "the process is
+    confirmed running" from "the probe failed and we have no idea".
+
+    Attributes:
+        ALIVE: The process is confirmed to exist.
+        DEAD: The process is confirmed gone.
+        UNKNOWN: The probe failed. Callers must not treat this as either.
+    """
+
+    ALIVE = "alive"
+    DEAD = "dead"
+    UNKNOWN = "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -67,6 +101,20 @@ _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
 _ERROR_INVALID_PARAMETER = 87
 
+# Access rights and wait results used by the forceful-termination path.
+# ``PROCESS_TERMINATE`` is required by ``TerminateProcess``; ``SYNCHRONIZE``
+# lets us wait on the *same* handle afterwards rather than re-probing by PID.
+# That distinction matters: a retained handle cannot be recycled, so waiting on
+# it proves *this* process died rather than "some process with that PID is now
+# gone" (see issue #344).
+_PROCESS_TERMINATE = 0x0001
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+# Exit code reported for a process we terminated. Arbitrary but non-zero, and
+# distinct from ``_STILL_ACTIVE`` so a subsequent probe reads it as dead.
+_TERMINATION_EXIT_CODE = 1
+
 if sys.platform == "win32":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -75,6 +123,10 @@ if sys.platform == "win32":
     _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
+    _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _kernel32.WaitForSingleObject.restype = wintypes.DWORD
 else:
     # On non-Windows the kernel32 wrapper is unused in production but tests
     # patch this symbol to exercise the Windows code path on every platform.
@@ -87,46 +139,14 @@ def pid_dir() -> Path:
     Returns:
         Path to ``~/.conductor/runs/``.
     """
-    d = Path.home() / ".conductor" / _PID_DIR_NAME
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return rundir.runs_dir()
 
 
-def write_pid_file(
-    pid: int,
-    port: int,
-    workflow_path: str | Path,
-    run_id: str = "",
-    log_file: str = "",
-) -> Path:
-    """Write a PID file for a background workflow process.
-
-    Args:
-        pid: Process ID of the background child.
-        port: TCP port the web dashboard is listening on.
-        workflow_path: Path to the workflow YAML file.
-        run_id: Unique run identifier (from event log subscriber).
-        log_file: Path to the JSONL event log file.
-
-    Returns:
-        Path to the created PID file.
-    """
-    workflow_name = Path(workflow_path).stem
-    filename = f"{workflow_name}-{port}.pid"
-    filepath = pid_dir() / filename
-
-    data = {
-        "pid": pid,
-        "port": port,
-        "workflow": str(workflow_path),
-        "started_at": datetime.now(UTC).isoformat(),
-        "run_id": run_id,
-        "log_file": log_file,
-    }
-
-    filepath.write_text(json.dumps(data, indent=2))
-    logger.debug("Wrote PID file: %s", filepath)
-    return filepath
+# A --web-bg launch is gated on the child's own run record
+# (cli/bg_runner.py::_finalize_background_launch), so this module writes
+# nothing: a parent-side PID write would make two writers for one run. The
+# readers below are what keep a still-running pre-upgrade background process
+# discoverable.
 
 
 def scan_pid_files() -> list[dict]:
@@ -185,7 +205,8 @@ def read_pid_files() -> list[dict]:
 
     Returns:
         List of dicts with keys ``pid``, ``port``, ``workflow``,
-        ``started_at``, and ``file`` (the PID file path).
+        ``started_at``, ``run_id``, ``stderr_log``, ``stdout_log``, and
+        ``file`` (the PID file path).
     """
     d = pid_dir()
     results: list[dict] = []
@@ -193,13 +214,18 @@ def read_pid_files() -> list[dict]:
     for f in d.glob("*.pid"):
         try:
             data = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            # Corrupted or unreadable — remove silently
+        except (json.JSONDecodeError, OSError) as exc:
+            # Deleting a file we could not read is a destructive act taken on
+            # incomplete information, so it says so. The write side is atomic
+            # now, which removes the common cause, but a genuinely corrupt file
+            # still costs someone a background run they will want to explain.
+            logger.warning("Removing unreadable PID file %s: %s", f, exc)
             f.unlink(missing_ok=True)
             continue
 
         pid = data.get("pid")
         if pid is None:
+            logger.warning("Removing PID file with no 'pid' field: %s", f)
             f.unlink(missing_ok=True)
             continue
 
@@ -217,6 +243,15 @@ def read_pid_files() -> list[dict]:
 def remove_pid_file(port: int) -> bool:
     """Remove the PID file for a given port.
 
+    .. deprecated::
+        Matching on port alone is racy: between the caller's snapshot and this
+        call, the original run can exit and a *new* run can bind the same port
+        and write its own PID file — which this would then delete, orphaning a
+        live workflow (issue #344). ``conductor stop`` uses
+        :func:`remove_pid_file_for_pid` instead, which matches on port *and*
+        PID and delegates the unlink to :func:`remove_pid_file_at`. This
+        remains for compatibility with any external caller.
+
     Args:
         port: The web dashboard port to match.
 
@@ -233,6 +268,77 @@ def remove_pid_file(port: int) -> bool:
             f.unlink(missing_ok=True)
             logger.debug("Removed PID file: %s", f)
             return True
+    return False
+
+
+def remove_pid_file_at(path: str | Path, expected_pid: int) -> bool:
+    """Remove a specific PID file, but only if it still describes ``expected_pid``.
+
+    Identity is re-read immediately before unlinking rather than trusted from
+    the caller's snapshot. Without that re-read, a run that exits mid-``stop``
+    can be replaced by a new run reusing the same port and filename, and the
+    unlink would silently deregister the *new* run — leaving a live, untracked
+    workflow burning tokens with no way to find it (issue #344).
+
+    Args:
+        path: Path to the PID file, as recorded in :func:`read_pid_files`.
+        expected_pid: The PID the caller believes the file describes.
+
+    Returns:
+        True if the file was removed, False if it was absent, unreadable, or
+        now describes a different process.
+    """
+    f = Path(path)
+    try:
+        data = json.loads(f.read_text())
+    except FileNotFoundError:
+        # Already cleaned up — most likely the child removed its own file on
+        # exit, which is the normal cooperative path.
+        return False
+    except (json.JSONDecodeError, OSError):
+        logger.debug("PID file %s unreadable during removal; leaving in place", f)
+        return False
+
+    if data.get("pid") != expected_pid:
+        logger.warning(
+            "Refusing to remove PID file %s: expected PID %s but file now describes %s. "
+            "A different run has taken over this slot.",
+            f,
+            expected_pid,
+            data.get("pid"),
+        )
+        return False
+
+    f.unlink(missing_ok=True)
+    logger.debug("Removed PID file: %s", f)
+    return True
+
+
+def remove_pid_file_for_pid(port: int, expected_pid: int) -> bool:
+    """Remove the legacy PID file for ``port``, but only if it describes ``expected_pid``.
+
+    The identity-checked counterpart to :func:`remove_pid_file`, for callers
+    that hold a full run record rather than a bare port. Port alone is not an
+    identity: between the caller's snapshot and this call the original run can
+    exit and a new run can bind the freed port, so a port-only match deletes
+    the *new* run's file and orphans a live workflow (issue #344). The unlink
+    itself is delegated to :func:`remove_pid_file_at`, which re-reads and
+    refuses loudly on a mismatch.
+
+    Args:
+        port: The web dashboard port to match.
+        expected_pid: The PID the caller believes owns that port.
+
+    Returns:
+        True if a matching PID file was found and removed, False otherwise.
+    """
+    for f in pid_dir().glob("*.pid"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("port") == port and data.get("pid") == expected_pid:
+            return remove_pid_file_at(f, expected_pid)
     return False
 
 
@@ -260,17 +366,17 @@ def remove_pid_file_for_current_process() -> bool:
     return False
 
 
-def _is_process_alive(pid: int) -> bool:
+def is_process_alive(pid: int) -> bool:
     """Check whether a process with the given PID is still running.
 
-    Dispatches to a platform-specific implementation. On POSIX systems this
-    uses ``os.kill(pid, 0)`` to probe existence without sending a signal. On
-    Windows it uses ``OpenProcess`` + ``GetExitCodeProcess`` because
-    ``os.kill(pid, 0)`` is **not** a no-op probe on Windows — any signal value
-    other than ``CTRL_C_EVENT`` / ``CTRL_BREAK_EVENT`` calls
-    ``TerminateProcess`` and may also raise ``OSError`` subclasses that the
-    POSIX-style branches don't anticipate (e.g. ``WinError 11`` /
-    ``ERROR_BAD_FORMAT``).
+    This is the *listing* probe: it answers "should this PID file be kept?"
+    and deliberately errs towards True. Callers that are about to terminate
+    something must use :func:`process_liveness` instead, which distinguishes
+    "confirmed alive" from "probe failed" (see issue #344).
+
+    This is the codebase's single *listing* liveness probe (Fleet Manager
+    design's *The fix*); ``conductor.fleet.records`` reuses it rather than
+    reimplementing platform-specific process checks.
 
     Args:
         pid: The process ID to check.
@@ -286,36 +392,189 @@ def _is_process_alive(pid: int) -> bool:
     return _is_process_alive_posix(pid)
 
 
-def _is_process_alive_posix(pid: int) -> bool:
-    """POSIX implementation of :func:`_is_process_alive` using ``os.kill``.
+# Kept as an alias, not a second implementation: `read_pid_files` and
+# `scan_pid_files` below call the private name, and `tests/test_cli/test_pid.py`
+# patches it. Note the two names are separate module attributes -- patching one
+# does not affect a caller that resolves the other, and `conductor.fleet.records`
+# resolves the public one.
+_is_process_alive = is_process_alive
 
-    Catches generic :class:`OSError` and returns True so a transient OS
-    failure doesn't crash ``conductor stop`` or silently drop a live
-    workflow's PID file (regression for issue #166).
+
+def process_liveness(pid: int) -> Liveness:
+    """Probe a process and report :class:`Liveness` without collapsing states.
+
+    Dispatches to a platform-specific implementation. On POSIX systems this
+    uses ``os.kill(pid, 0)`` to probe existence without sending a signal. On
+    Windows it uses ``OpenProcess`` + ``GetExitCodeProcess`` because
+    ``os.kill(pid, 0)`` is **not** a no-op probe on Windows — any signal value
+    other than ``CTRL_C_EVENT`` / ``CTRL_BREAK_EVENT`` calls
+    ``TerminateProcess`` and may also raise ``OSError`` subclasses that the
+    POSIX-style branches don't anticipate (e.g. ``WinError 11`` /
+    ``ERROR_BAD_FORMAT``).
+
+    Args:
+        pid: The process ID to check.
+
+    Returns:
+        :attr:`Liveness.ALIVE`, :attr:`Liveness.DEAD`, or
+        :attr:`Liveness.UNKNOWN` when the probe itself failed.
+    """
+    if sys.platform == "win32":
+        return _liveness_windows(pid)
+    return _liveness_posix(pid)
+
+
+def wait_for_exit(pid: int, timeout: float, interval: float = 0.1) -> Liveness:
+    """Poll ``pid`` until it is confirmed dead or ``timeout`` elapses.
+
+    Used between rungs of the stop ladder so that a graceful signal is given a
+    bounded chance to work before escalating. A single re-probe is not enough:
+    a workflow that has to flush a checkpoint takes a moment to exit, and
+    declaring it "survived" too early escalates unnecessarily.
+
+    Args:
+        pid: The process ID to wait on.
+        timeout: Maximum seconds to wait.
+        interval: Seconds between probes.
+
+    Returns:
+        :attr:`Liveness.DEAD` as soon as the process is confirmed gone,
+        otherwise the last observed liveness when the timeout expired.
+    """
+    deadline = time.monotonic() + timeout
+    state = process_liveness(pid)
+    while state is not Liveness.DEAD and time.monotonic() < deadline:
+        time.sleep(interval)
+        state = process_liveness(pid)
+    return state
+
+
+def terminate_process(pid: int, timeout: float = 2.0) -> Liveness:
+    """Forcefully terminate ``pid`` and confirm the outcome.
+
+    This is the last rung of the stop ladder and the only one that cannot be
+    ignored by the target. Callers **must** confirm process identity before
+    invoking it — a PID read from a stale file may since have been recycled
+    onto an unrelated process (see issue #344).
+
+    Args:
+        pid: The process ID to terminate.
+        timeout: Seconds to wait for the process to actually disappear.
+
+    Returns:
+        :attr:`Liveness.DEAD` if the process is confirmed gone,
+        :attr:`Liveness.ALIVE` if it survived, or :attr:`Liveness.UNKNOWN` if
+        the outcome could not be established.
+    """
+    if sys.platform == "win32":
+        return _terminate_process_windows(pid, timeout)
+    return _terminate_process_posix(pid, timeout)
+
+
+def _terminate_process_posix(pid: int, timeout: float) -> Liveness:
+    """POSIX implementation of :func:`terminate_process` using ``SIGKILL``."""
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return Liveness.DEAD
+    except PermissionError:
+        logger.warning("SIGKILL to PID %s denied; cannot terminate", pid)
+        return process_liveness(pid)
+    except OSError:
+        logger.warning("Unexpected OSError sending SIGKILL to PID %s", pid, exc_info=True)
+        return process_liveness(pid)
+    return wait_for_exit(pid, timeout)
+
+
+def _terminate_process_windows(pid: int, timeout: float) -> Liveness:
+    """Windows implementation of :func:`terminate_process`.
+
+    Opens the process once with ``PROCESS_TERMINATE | SYNCHRONIZE`` and both
+    terminates and waits on that **same handle**. Waiting on the retained
+    handle is what makes the confirmation trustworthy: an open handle pins the
+    PID, so the kernel cannot recycle it onto a different process midway
+    through and fool a re-probe into reporting success.
+    """
+    assert _kernel32 is not None, "_terminate_process_windows requires _kernel32 to be initialised"
+    handle = _kernel32.OpenProcess(_PROCESS_TERMINATE | _SYNCHRONIZE, False, pid)
+    if not handle:
+        err = ctypes.get_last_error()
+        if err == _ERROR_INVALID_PARAMETER:
+            # No such process — already gone.
+            return Liveness.DEAD
+        logger.warning(
+            "OpenProcess(PID=%s) for termination failed with WinError %s (%s)",
+            pid,
+            err,
+            ctypes.FormatError(err),
+        )
+        # Fall back to a plain probe: we could not terminate, but we can still
+        # report whether it is running.
+        return _liveness_windows(pid)
+
+    try:
+        if not _kernel32.TerminateProcess(handle, _TERMINATION_EXIT_CODE):
+            err = ctypes.get_last_error()
+            logger.warning(
+                "TerminateProcess(PID=%s) failed with WinError %s (%s)",
+                pid,
+                err,
+                ctypes.FormatError(err),
+            )
+            return _liveness_windows(pid)
+        timeout_ms = max(0, int(timeout * 1000))
+        result = _kernel32.WaitForSingleObject(handle, timeout_ms)
+        if result == _WAIT_OBJECT_0:
+            return Liveness.DEAD
+        if result == _WAIT_TIMEOUT:
+            return Liveness.ALIVE
+        logger.warning("WaitForSingleObject(PID=%s) returned unexpected 0x%x", pid, result)
+        return Liveness.UNKNOWN
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _is_process_alive_posix(pid: int) -> bool:
+    """Bool view of :func:`_liveness_posix` (see :func:`_is_process_alive`)."""
+    return _liveness_posix(pid) is not Liveness.DEAD
+
+
+def _is_process_alive_windows(pid: int) -> bool:
+    """Bool view of :func:`_liveness_windows` (see :func:`_is_process_alive`)."""
+    return _liveness_windows(pid) is not Liveness.DEAD
+
+
+def _liveness_posix(pid: int) -> Liveness:
+    """POSIX implementation of :func:`process_liveness` using ``os.kill``.
+
+    Catches generic :class:`OSError` and reports :attr:`Liveness.UNKNOWN` so a
+    transient OS failure doesn't crash ``conductor stop`` or silently drop a
+    live workflow's PID file (regression for issue #166).
     """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return Liveness.DEAD
     except PermissionError:
         # Process exists but we can't signal it — still alive.
-        return True
+        return Liveness.ALIVE
     except OSError:
-        # Unknown error from the OS — err on the side of "still alive".  We
-        # log at warning so the user can see why a phantom workflow is
-        # appearing in ``conductor stop`` listings.
+        # Unknown error from the OS.  We log at warning so the user can see
+        # why a phantom workflow is appearing in ``conductor stop`` listings.
         logger.warning(
-            "Unexpected OSError checking PID %s; assuming alive. "
+            "Unexpected OSError checking PID %s; liveness unknown. "
             "The PID file in ~/.conductor/runs/ may need manual removal.",
             pid,
             exc_info=True,
         )
-        return True
-    return True
+        return Liveness.UNKNOWN
+    return Liveness.ALIVE
 
 
-def _is_process_alive_windows(pid: int) -> bool:
-    """Windows implementation of :func:`_is_process_alive` using ctypes.
+def _liveness_windows(pid: int) -> Liveness:
+    """Windows implementation of :func:`process_liveness` using ctypes.
 
     Calls ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...)`` and then
     ``GetExitCodeProcess`` rather than ``os.kill(pid, 0)``, which on Windows
@@ -334,7 +593,7 @@ def _is_process_alive_windows(pid: int) -> bool:
     # "win32"`` (so ``_kernel32`` is set); in tests the symbol is patched to a
     # MagicMock.  The assert narrows the type for ty / mypy and provides a
     # clear failure mode if the function is ever called incorrectly.
-    assert _kernel32 is not None, "_is_process_alive_windows requires _kernel32 to be initialised"
+    assert _kernel32 is not None, "_liveness_windows requires _kernel32 to be initialised"
     handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         err = ctypes.get_last_error()
@@ -343,34 +602,34 @@ def _is_process_alive_windows(pid: int) -> bool:
             # alive.  This is an expected condition (e.g. cross-session or
             # higher-integrity targets) so a debug log is sufficient.
             logger.debug("OpenProcess(PID=%s) denied (ERROR_ACCESS_DENIED); assuming alive", pid)
-            return True
+            return Liveness.ALIVE
         if err == _ERROR_INVALID_PARAMETER:
             # No process with that PID exists.
-            return False
-        # Any other failure is unexpected.  Don't crash; assume still alive
-        # but warn so the user can diagnose phantom workflows.
+            return Liveness.DEAD
+        # Any other failure is unexpected.  Don't crash; report unknown and
+        # warn so the user can diagnose phantom workflows.
         logger.warning(
-            "OpenProcess(PID=%s) failed with WinError %s (%s); assuming alive. "
+            "OpenProcess(PID=%s) failed with WinError %s (%s); liveness unknown. "
             "The PID file in ~/.conductor/runs/ may need manual removal.",
             pid,
             err,
             ctypes.FormatError(err),
         )
-        return True
+        return Liveness.UNKNOWN
 
     try:
         exit_code = wintypes.DWORD()
         if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-            # Couldn't read the exit code — assume alive rather than crash.
+            # Couldn't read the exit code — report unknown rather than crash.
             err = ctypes.get_last_error()
             logger.warning(
-                "GetExitCodeProcess(PID=%s) failed with WinError %s (%s); assuming alive. "
+                "GetExitCodeProcess(PID=%s) failed with WinError %s (%s); liveness unknown. "
                 "The PID file in ~/.conductor/runs/ may need manual removal.",
                 pid,
                 err,
                 ctypes.FormatError(err),
             )
-            return True
-        return exit_code.value == _STILL_ACTIVE
+            return Liveness.UNKNOWN
+        return Liveness.ALIVE if exit_code.value == _STILL_ACTIVE else Liveness.DEAD
     finally:
         _kernel32.CloseHandle(handle)

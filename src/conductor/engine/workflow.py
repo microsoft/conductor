@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
+from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
@@ -96,6 +97,32 @@ class RunContext:
     log_file: str = ""
     dashboard_port: int | None = None
     bg_mode: bool = False
+
+
+@dataclass(frozen=True)
+class WebPauseOutcome:
+    """Result of :meth:`WorkflowEngine._handle_web_pause`.
+
+    Replaces a bare ``bool`` so a guidance submission consumed while paused
+    (a fourth wait arm alongside resume/kill/disconnect) can be reported back
+    to the caller alongside "was this handled" — the caller then either
+    applies a Copilot follow-up in place or falls through to a full re-run,
+    rather than always re-executing from scratch.
+    """
+
+    handled: bool
+    """True if the pause was resolved here (Resume clicked, guidance
+    submitted, or all clients disconnected). False means this method did not
+    resolve the pause, for one of two reasons the caller must distinguish:
+    a dashboard is attached but has no connected clients (the caller should
+    auto-resume rather than block), or no dashboard is attached at all (the
+    caller should fall through to the CLI interactive handler,
+    ``_handle_partial_output``). See ``_handle_web_pause``'s own docstring
+    for how the caller tells these two ``False`` cases apart."""
+
+    guidance: list[str] = field(default_factory=list)
+    """Guidance text(s) submitted while paused, in submission order. Empty
+    when the pause was resolved by a plain Resume click or disconnect."""
 
 
 @dataclass
@@ -333,6 +360,7 @@ class WorkflowEngine:
         _dashboard_context_path: list[str] | None = None,
         instructions_preamble: str | None = None,
         plugin_marketplaces: Mapping[str, Marketplace] | None = None,
+        _guidance_channel: GuidanceChannel | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -380,6 +408,11 @@ class WorkflowEngine:
                 mid-run would stall an agent on a network round trip, and
                 a failure there would surface as an agent error rather
                 than a configuration one. Inherited by sub-workflows.
+            _guidance_channel: Shared mid-run guidance channel (issue #400).
+                When None, a fresh :class:`GuidanceChannel` is created. Child
+                engines inherit the parent's channel so a paused sub-workflow
+                agent can be corrected too. Callers should not set this
+                directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -428,10 +461,27 @@ class WorkflowEngine:
         # at debug level — otherwise table-priced models still show a normal
         # cost and the broken live pricing is invisible (see #265).
         self._pricing_hook_failed_warned = False
+        # The companion case: a hook that never raises but returns ``None`` for
+        # everything, which is indistinguishable from "these models are simply
+        # unpriced" unless it is tracked. Live today on Copilot: the SDK's
+        # hand-written ``client.ModelBilling`` parses only ``multiplier`` and
+        # discards the ``tokenPrices`` wire field, so the hook resolves ``None``
+        # for every model. Verified against the pinned 1.0.1; 1.0.9 parses the
+        # field, so a version bump may be the real fix. See #386.
+        self._pricing_hook_none_models: set[str] = set()
+        self._pricing_hook_priced_any = False
+        self._pricing_hook_silent_warned = False
 
         # One-time latch so the "budget set but no pricing" degraded warning
         # is emitted at most once per workflow run (see _check_budget).
         self._budget_unpriced_warned = False
+
+        # One-time latch so an impossible used > max context-window pair
+        # (see _context_window_fields) is surfaced once per run instead of
+        # only at debug level — this would otherwise silently disable the
+        # dashboard's context-window bar with no operator-facing signal
+        # (issue #412).
+        self._context_window_anomaly_warned = False
 
         # Multi-provider support: registry takes precedence
         self._registry = registry
@@ -549,6 +599,11 @@ class WorkflowEngine:
         # outgoing events so the frontend can resolve the owning context
         # without inferring parentage from activeContextPath.
         self._dashboard_context_path: list[str] = list(_dashboard_context_path or [])
+
+        # Mid-run guidance channel (issue #400). Shared with child engines so
+        # a sub-workflow agent paused mid-call can receive guidance submitted
+        # via the dashboard or ``conductor guide`` too.
+        self._guidance: GuidanceChannel = _guidance_channel or GuidanceChannel()
 
     @property
     def _workflow_dir(self) -> Path | None:
@@ -1089,6 +1144,12 @@ class WorkflowEngine:
             ],
             **self._yaml_source_field(),
             "metadata": self.config.workflow.metadata,
+            # The values this run was launched with. Recorded so a reader
+            # coming to the log later can tell *which* run this was -- two
+            # runs of the same workflow are otherwise indistinguishable
+            # apart from their ids. No new exposure: the rendered prompts
+            # already in this log interpolate these same values.
+            "inputs": dict(self.context.workflow_inputs),
             "system": self._system_metadata,
             "run_id": self._run_id,
             "log_file": self._log_file,
@@ -1117,6 +1178,70 @@ class WorkflowEngine:
         """
         self._web_dashboard = None
         self._dialog_handler.web_dashboard = None
+
+    def submit_guidance(self, text: str) -> int:
+        """Queue mid-run guidance text (issue #400).
+
+        The sink handed to :meth:`WebDashboard.set_guidance_sink` — called
+        from ``POST /api/guidance``. ``resume --guidance`` does not go
+        through this method: it calls :meth:`add_user_guidance` directly for
+        each flag, applying immediately rather than queuing (see that
+        method's docstring). Does not itself apply the guidance to
+        ``self.context``: it only wakes whichever consumer is waiting
+        (``_drain_pending_guidance`` at the next loop-top boundary, or the
+        guidance wait-arm inside a live :meth:`_handle_web_pause`).
+
+        Args:
+            text: The guidance text to queue.
+
+        Returns:
+            The number of guidance entries now pending (including this one).
+        """
+        return self._guidance.submit(text)
+
+    def add_user_guidance(self, text: str, *, source: str) -> None:
+        """Apply guidance to the run's context and emit ``guidance_applied``.
+
+        The single entry point for every guidance source — the TTY Esc/
+        Ctrl+G interrupt flow, a dashboard/``conductor guide`` submission
+        drained at the next step boundary or while an agent is paused, and
+        ``resume --guidance`` — so the dashboard and JSONL log see guidance
+        applied through the interrupt path too, not just the new channel.
+
+        Args:
+            text: The guidance text to add to ``self.context.user_guidance``.
+            source: Where the guidance came from (``"interrupt"``,
+                ``"dashboard"``, or ``"cli"``), carried on the emitted event
+                for observability.
+        """
+        self.context.add_guidance(text)
+        self._emit(
+            "guidance_applied",
+            {
+                "text": text,
+                "source": source,
+                "agent_name": self._current_agent_name,
+            },
+        )
+
+    def _drain_pending_guidance(self) -> None:
+        """Apply any guidance queued via :meth:`submit_guidance` (root only).
+
+        Called at the top of ``_execute_loop``'s ``while True``, right after
+        ``_maybe_save_periodic_checkpoint`` — the one choke point every step
+        type passes through, so guidance reaches the next agent, parallel
+        group, for-each group, script, set, or wait step alike.
+
+        Root-only (mirrors ``_periodic_checkpoints_active``): draining at
+        every sub-workflow depth would let concurrent for-each sub-workflows
+        race for the same queued sentence. A sub-workflow paused mid-agent
+        still receives guidance via the shared channel's wait-arm in
+        ``_handle_web_pause``, which is active at every depth.
+        """
+        if self._subworkflow_depth != 0:
+            return
+        for text in self._guidance.drain():
+            self.add_user_guidance(text, source="dashboard")
 
     def _make_event_callback(self, agent_name: str) -> Any:
         """Create an event callback for an agent that forwards to the emitter.
@@ -1744,6 +1869,7 @@ class WorkflowEngine:
             ],
             instructions_preamble=child_preamble,
             plugin_marketplaces=child_marketplaces,
+            _guidance_channel=self._guidance,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -1830,6 +1956,7 @@ class WorkflowEngine:
             "keyboard_listener": self._keyboard_listener,
             "web_dashboard": self._web_dashboard,
             "_subworkflow_depth": self._subworkflow_depth + 1,
+            "_guidance_channel": self._guidance,
         }
         # Thread the dashboard context path into the child engine when the
         # field exists on this engine (added by the breadcrumb-navigation PR).
@@ -2059,6 +2186,76 @@ class WorkflowEngine:
                 return None
         return self._single_provider
 
+    def _note_pricing_hook_result(self, model: str, pricing: ModelPricing | None) -> None:
+        """Record what the provider pricing hook returned for ``model``.
+
+        Pure bookkeeping — deliberately no verdict here. Whether the hook is
+        systemically silent is only answerable once the run has finished asking
+        it: a hook that declines A and B and then prices C is working fine, and
+        deciding on the second ``None`` would already have warned. Because
+        :meth:`_ensure_pricing_resolved` locks per model rather than globally,
+        arrival order varies under parallel and ``for_each`` groups, so an early
+        verdict is also nondeterministic — the same workflow warns on one run
+        and stays quiet on the next.
+
+        The conclusion is drawn once in :meth:`_warn_if_pricing_hook_silent`.
+
+        Args:
+            model: The model whose pricing was just resolved.
+            pricing: The hook's result — ``None`` when it declined to price.
+        """
+        if pricing is not None:
+            self._pricing_hook_priced_any = True
+            return
+
+        self._pricing_hook_none_models.add(model)
+
+    def _warn_if_pricing_hook_silent(self) -> None:
+        """Conclude, once per run, whether live pricing was ever available.
+
+        A hook returning ``None`` for a single model is ordinary — that model
+        simply is not priced, and the static table covers it. A hook that
+        returned ``None`` for *every* model it was asked about, having priced
+        nothing, is a different condition: the mechanism is not working, and
+        every cost in the run came from the static fallback table.
+
+        No minimum-model floor. Running to completion having priced nothing is
+        the evidence; a single-model workflow is the common case (most shipped
+        examples resolve exactly one model, and #386's own reproduction is a
+        single-model run), so a floor of two would exempt precisely the runs
+        most likely to hit this.
+        """
+        if (
+            self._pricing_hook_silent_warned
+            or self._pricing_hook_priced_any
+            or not self._pricing_hook_none_models
+        ):
+            return
+
+        self._pricing_hook_silent_warned = True
+        models = ", ".join(sorted(self._pricing_hook_none_models))
+        count = len(self._pricing_hook_none_models)
+        logger.warning(
+            "Provider pricing hook returned no pricing for any of the %d models "
+            "resolved so far (%s). Costs for models in the static pricing table "
+            "are estimates from that table; models missing from it are reported "
+            "as unpriced. Set `cost.pricing` in the workflow to supply rates.",
+            count,
+            models,
+        )
+        # Conductor installs no logging handlers, so the line above reaches
+        # ``logging.lastResort`` as unattributed stderr — absent from the JSONL
+        # log and the dashboard, and under ``--web-bg`` written to a temp file
+        # nobody was told to read. Emit it as an event too, the same shape
+        # ``checkpoint_save_failed`` uses.
+        self._emit(
+            "pricing_hook_silent",
+            {
+                "models": sorted(self._pricing_hook_none_models),
+                "model_count": count,
+            },
+        )
+
     async def _ensure_pricing_resolved(self, agent: AgentDef, model: str | None) -> None:
         """Resolve provider-supplied pricing for ``model`` and cache it.
 
@@ -2129,6 +2326,22 @@ class WorkflowEngine:
                         )
                 else:
                     self.usage_tracker.set_provider_pricing(model, pricing)
+                    # Only track providers that actually implement the hook.
+                    # ``AgentProvider.get_model_pricing`` returns ``None`` by
+                    # design and ``providers/base.py`` documents that as the
+                    # correct behaviour for a provider whose SDK exposes no
+                    # pricing; only Copilot overrides it. Without this check,
+                    # four of the five providers get told their SDK broke for
+                    # doing exactly what the base class prescribes.
+                    #
+                    # Imported here rather than at module scope: the
+                    # top-level import is ``TYPE_CHECKING``-only.
+                    from conductor.providers.base import (
+                        AgentProvider as _AgentProviderBase,
+                    )
+
+                    if type(provider).get_model_pricing is not _AgentProviderBase.get_model_pricing:
+                        self._note_pricing_hook_result(model, pricing)
             # Mark resolved only now — after the attempt completes — even on a
             # provider-None / failure / None result, so it isn't retried on every
             # record and the model stays unpriced via the static-table fallback.
@@ -2176,6 +2389,65 @@ class WorkflowEngine:
                 return value
         return None
 
+    async def _context_window_fields(
+        self, agent: AgentDef, output: AgentOutput
+    ) -> dict[str, int | None]:
+        """Return the ``context_window_used`` / ``context_window_max`` event pair.
+
+        ``context_window_used`` is sourced from
+        ``output.last_call_input_tokens`` — the prompt size of the most
+        recent single API call — rather than ``output.input_tokens``, which
+        is a billing total summed across every call in the execution.
+        Reusing the billing figure as a context measurement is what caused
+        issue #412: a multi-turn agent's cumulative token count can exceed
+        the model's context window, producing a false "over 100%" red bar.
+
+        When both values are known and ``used > maximum``, a single API call
+        physically cannot exceed the cap it was made against, so either the
+        usage figure or the looked-up cap (e.g. a mismatched ``long_context``
+        session tier) is untrustworthy — both are dropped to ``None`` rather
+        than shown misleadingly. Every occurrence is logged at debug level;
+        the first occurrence in a run is also logged at warning level (see
+        ``AGENTS.md``'s "not logged at debug where nothing would reach the
+        user" rule) since this indicates a real provider/config bug — a
+        stale or mismatched context-window cap, or an incorrect
+        provider-reported token count — that would otherwise silently
+        disable the dashboard's context-window bar with no operator-facing
+        signal.
+
+        Returns:
+            A dict with ``context_window_used`` and ``context_window_max``,
+            ready to splice into an event payload.
+        """
+        used = output.last_call_input_tokens
+        maximum = await self._get_context_window_for_agent(agent, output)
+        if used is not None and maximum is not None and used > maximum:
+            logger.debug(
+                "Dropping impossible context-window pair for agent %s: "
+                "used=%d exceeds max=%d for model %s",
+                agent.name,
+                used,
+                maximum,
+                output.model,
+            )
+            if not self._context_window_anomaly_warned:
+                self._context_window_anomaly_warned = True
+                logger.warning(
+                    "Agent %s reported a single API call using %d prompt tokens, "
+                    "exceeding model %s's context-window cap of %d. This indicates "
+                    "a stale/incorrect context-window cap for this model or a "
+                    "provider-reported token count error; the dashboard's "
+                    "context-window bar is hidden for affected agents until this "
+                    "is investigated. Further occurrences are logged at debug "
+                    "level.",
+                    agent.name,
+                    used,
+                    output.model,
+                    maximum,
+                )
+            return {"context_window_used": None, "context_window_max": None}
+        return {"context_window_used": used, "context_window_max": maximum}
+
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
 
@@ -2211,7 +2483,15 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
-        result = await self._execute_loop(current_agent_name)
+        try:
+            result = await self._execute_loop(current_agent_name)
+        finally:
+            # The pricing verdict belongs to the run ending, not to anyone
+            # asking for a summary. Drawing it here covers the run that dies
+            # part way -- the case where "these numbers came from the static
+            # table" matters most, and the one a summary-time call can never
+            # reach, because the CLI re-raises before it asks.
+            self._warn_if_pricing_hook_silent()
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -2248,7 +2528,12 @@ class WorkflowEngine:
         # Execute on_start hook (signals resume)
         self._execute_hook("on_start")
 
-        result = await self._execute_loop(current_agent_name)
+        try:
+            result = await self._execute_loop(current_agent_name)
+        finally:
+            # Same reasoning as :meth:`run` -- a resumed run that dies part way
+            # is still a run that priced nothing.
+            self._warn_if_pricing_hook_silent()
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -2832,6 +3117,27 @@ class WorkflowEngine:
             finally:
                 await self._resume_listener()
 
+            # Close the gate the emit above opened. A questions node reuses
+            # `gate_presented` (see the comment on that emit) but used to
+            # stop there, so every consumer of the event stream was left
+            # holding a gate that never closed -- a `human_gate` a few
+            # hundred lines below always paired the two. Any reader that
+            # tracks "is this run waiting on a human" by these events (the
+            # Fleet Manager's run summary, the dashboard) showed the run as
+            # parked at a question it had already answered, for the rest of
+            # the run.
+            self._emit(
+                "gate_resolved",
+                {
+                    "agent_name": agent.name,
+                    "selected_option": response.value,
+                    "route": "",
+                    "additional_input": response.additional_input,
+                    "prompt_id": gate_prompt.prompt_id,
+                    "step_type": "questions",
+                },
+            )
+
             if response.value == questions_mod.NAV_FINISH:
                 return questions_mod.OUTCOME_COMPLETED
 
@@ -3327,7 +3633,7 @@ class WorkflowEngine:
         match result.action:
             case InterruptAction.CONTINUE:
                 if result.guidance:
-                    self.context.add_guidance(result.guidance)
+                    self.add_user_guidance(result.guidance, source="interrupt")
                 return current_agent_name
             case InterruptAction.SKIP:
                 return result.skip_target or current_agent_name
@@ -3336,27 +3642,35 @@ class WorkflowEngine:
             case InterruptAction.CANCEL:
                 return current_agent_name
 
-    async def _handle_web_pause(self, agent_name: str, partial_output: AgentOutput) -> bool:
+    async def _handle_web_pause(
+        self, agent_name: str, partial_output: AgentOutput
+    ) -> WebPauseOutcome:
         """Handle a mid-agent interrupt when the web dashboard is connected.
 
         Emits an ``agent_paused`` event and waits for the user to click
-        Resume or Kill in the dashboard.  If all browser clients disconnect
-        while waiting, auto-resumes to avoid hanging the workflow.
+        Resume or Kill in the dashboard, or to submit guidance (issue #400).
+        If all browser clients disconnect while waiting, auto-resumes to
+        avoid hanging the workflow.
 
         Args:
             agent_name: The name of the interrupted agent.
             partial_output: The partial output from the interrupted agent.
 
         Returns:
-            True if the agent should be re-executed (Resume chosen or
-            all clients disconnected), False if no web dashboard is
-            connected (caller should invoke ``_handle_partial_output``).
+            A :class:`WebPauseOutcome`. ``handled=True`` means the pause was
+            resolved here (Resume clicked, guidance submitted, or all clients
+            disconnected) — ``guidance`` carries any submitted text(s), empty
+            for a plain Resume/disconnect. ``handled=False`` covers two
+            distinct cases the caller branches on separately: a dashboard is
+            attached but has no connected clients (auto-resume — there is no
+            one to wait on), or no dashboard is attached at all (fall
+            through to the CLI interactive handler, ``_handle_partial_output``).
 
         Raises:
             InterruptError: If the user chose Kill (``POST /api/kill``).
         """
         if self._web_dashboard is None or not self._web_dashboard.has_connections():
-            return False
+            return WebPauseOutcome(False, [])
 
         try:
             # ``ensure_ascii=False`` so the preview shows real non-ASCII
@@ -3387,7 +3701,13 @@ class WorkflowEngine:
         resume_task = asyncio.create_task(resume_event.wait())
         kill_task = asyncio.create_task(kill_event.wait())
         disconnect_task = asyncio.create_task(disconnect_event.wait())
-        tasks = {resume_task, kill_task, disconnect_task}
+        # Guidance is a fourth wait arm (issue #400). Deliberately NOT cleared
+        # first: if guidance was already queued (submitted while the agent
+        # was still executing, before this pause began) the event is already
+        # set, so this task resolves immediately — the queued text is applied
+        # without requiring a second submission.
+        guidance_task = asyncio.create_task(self._guidance.event.wait())
+        tasks = {resume_task, kill_task, disconnect_task, guidance_task}
 
         # In subworkflows, also watch the interrupt_event so that a second
         # Stop click while paused will stop the workflow without requiring
@@ -3427,7 +3747,13 @@ class WorkflowEngine:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
-        except Exception:
+        except BaseException:
+            # BaseException (not Exception): asyncio.CancelledError derives
+            # from BaseException specifically so broad except blocks don't
+            # accidentally absorb cancellation — if this coroutine itself
+            # gets cancelled while awaiting asyncio.wait (e.g. a Kill on a
+            # nested sub-workflow branch), we still need to clean up the
+            # sibling wait-arm tasks rather than leaving them for the GC.
             for t in tasks:
                 if not t.done():
                     t.cancel()
@@ -3444,6 +3770,31 @@ class WorkflowEngine:
                 self._interrupt_event.clear()
             raise InterruptError(agent_name=agent_name)
 
+        if guidance_task in done:
+            texts = self._guidance.drain()
+            # Concurrent for-each branches share one GuidanceChannel and all
+            # wake on the same broadcast asyncio.Event, but drain() is
+            # destructive — only the first caller to reach this line gets
+            # the queued text; a sibling branch woken by the same submission
+            # can find texts == [] here. Only report guidance as applied
+            # (and re-execute with it) when this call actually drained
+            # something; otherwise fall through to the plain-resume path
+            # below so we don't emit a misleading with_guidance=True for a
+            # branch that received no new information (issue #400 review).
+            if texts:
+                for text in texts:
+                    # guidance_applied fires before agent_resumed so an
+                    # observer sees the correction land before the agent
+                    # starts running.
+                    self.add_user_guidance(text, source="dashboard")
+                # Clear resume_event too: if a Resume click raced in alongside
+                # the guidance submission, leaving it set would falsely skip
+                # the next legitimate pause cycle.
+                resume_event.clear()
+                self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": True})
+                logger.info("Agent '%s' resumed with guidance — re-executing", agent_name)
+                return WebPauseOutcome(True, texts)
+
         if disconnect_task in done:
             logger.info(
                 "All dashboard clients disconnected while '%s' was paused — auto-resuming",
@@ -3454,9 +3805,47 @@ class WorkflowEngine:
         # double-click or prior API call doesn't skip the next legitimate pause.
         resume_event.clear()
 
-        self._emit("agent_resumed", {"agent_name": agent_name})
+        self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": False})
         logger.info("Agent '%s' resumed — re-executing", agent_name)
-        return True
+        return WebPauseOutcome(True, [])
+
+    async def _send_guidance_followup(
+        self,
+        agent: AgentDef,
+        executor: AgentExecutor,
+        guidance_text: str,
+    ) -> AgentOutput | None:
+        """Send guidance as a follow-up to an interrupted Copilot session.
+
+        Lifted out of ``_handle_partial_output`` so both the CLI interactive
+        interrupt path and the dashboard/``conductor guide`` pause path share
+        one copy. Only Copilot supports resuming a paused session with a
+        follow-up message; other providers return ``None`` so the caller
+        falls back to a full re-execution with guidance appended to the
+        prompt.
+
+        Args:
+            agent: The agent whose session may be resumable.
+            executor: The executor (and provider) the agent ran under.
+            guidance_text: The guidance text to send as a follow-up.
+
+        Returns:
+            The follow-up ``AgentOutput`` if the provider had an interrupted
+            session to resume, else ``None``.
+        """
+        from conductor.providers.copilot import CopilotProvider
+
+        provider = executor.provider
+        if isinstance(provider, CopilotProvider):
+            session = provider.get_interrupted_session()
+            if session is not None:
+                return await provider.send_followup(
+                    session,
+                    guidance_text,
+                    agent_name=agent.name,
+                    agent_model=agent.model,
+                )
+        return None
 
     async def _handle_partial_output(
         self,
@@ -3484,8 +3873,6 @@ class WorkflowEngine:
         Returns:
             The final (non-partial) AgentOutput after handling the interrupt.
         """
-        from conductor.providers.copilot import CopilotProvider
-
         # Build preview from partial output
         try:
             # ``ensure_ascii=False`` so the preview shows real non-ASCII
@@ -3515,19 +3902,12 @@ class WorkflowEngine:
             return partial_output
 
         # Add guidance to context
-        self.context.add_guidance(interrupt_result.guidance)
+        self.add_user_guidance(interrupt_result.guidance, source="interrupt")
 
         # Try Copilot follow-up if provider supports it
-        provider = executor.provider
-        if isinstance(provider, CopilotProvider):
-            session = provider.get_interrupted_session()
-            if session is not None:
-                return await provider.send_followup(
-                    session,
-                    interrupt_result.guidance,
-                    agent_name=agent.name,
-                    agent_model=agent.model,
-                )
+        followup = await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
+        if followup is not None:
+            return followup
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
@@ -3878,6 +4258,11 @@ class WorkflowEngine:
                     # to context and current_agent_name is the step about to
                     # run, so a resume re-runs exactly this step. See issue #244.
                     self._maybe_save_periodic_checkpoint()
+
+                    # Apply any guidance queued via the dashboard/`conductor
+                    # guide` since the last boundary (issue #400). Root-only —
+                    # see `_drain_pending_guidance`.
+                    self._drain_pending_guidance()
 
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)
@@ -4761,17 +5146,35 @@ class WorkflowEngine:
 
                         # Handle mid-agent interrupt (partial output)
                         if output.partial:
-                            if await self._handle_web_pause(agent.name, output):
-                                # Web mode: agent paused then resumed → re-execute.
-                                # Clear interrupt_event to prevent the re-executed agent
-                                # from seeing the stale signal and returning partial again.
+                            pause_outcome = await self._handle_web_pause(agent.name, output)
+                            if pause_outcome.handled:
+                                # Web mode: agent paused then resumed. Clear
+                                # interrupt_event to prevent a re-executed agent
+                                # from seeing the stale signal and returning
+                                # partial again.
                                 if self._interrupt_event is not None:
                                     self._interrupt_event.clear()
-                                continue
-                            # In web mode with no connections, auto-resume rather than
-                            # falling through to the CLI interactive handler (which would
-                            # block on stdin with no tty in --web-bg mode).
-                            if self._web_dashboard is not None:
+                                followup = None
+                                if pause_outcome.guidance:
+                                    combined_guidance = "\n".join(pause_outcome.guidance)
+                                    followup = await self._send_guidance_followup(
+                                        resolved_agent, executor, combined_guidance
+                                    )
+                                if followup is None:
+                                    # Plain Resume, or guidance with no
+                                    # resumable session — fall through to the
+                                    # loop-top re-execution, which picks up any
+                                    # applied guidance via guidance_section.
+                                    continue
+                                # Copilot follow-up resumed the same session in
+                                # place — fall through to dialog/validator/
+                                # usage/routing below with no re-run.
+                                output = followup
+                                _agent_elapsed = _time.time() - _agent_start
+                            elif self._web_dashboard is not None:
+                                # In web mode with no connections, auto-resume rather than
+                                # falling through to the CLI interactive handler (which would
+                                # block on stdin with no tty in --web-bg mode).
                                 logger.info(
                                     "No dashboard connections for '%s' — auto-resuming",
                                     agent.name,
@@ -4779,15 +5182,16 @@ class WorkflowEngine:
                                 if self._interrupt_event is not None:
                                     self._interrupt_event.clear()
                                 continue
-                            output = await self._handle_partial_output(
-                                resolved_agent,
-                                output,
-                                agent_context,
-                                guidance_section,
-                                executor,
-                                _agent_start,
-                            )
-                            _agent_elapsed = _time.time() - _agent_start
+                            else:
+                                output = await self._handle_partial_output(
+                                    resolved_agent,
+                                    output,
+                                    agent_context,
+                                    guidance_section,
+                                    executor,
+                                    _agent_start,
+                                )
+                                _agent_elapsed = _time.time() - _agent_start
 
                         # Dialog mode: evaluate whether agent should enter dialog
                         if agent.dialog and not output.partial:
@@ -4836,10 +5240,7 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
-                                "context_window_used": output.input_tokens,
-                                "context_window_max": await self._get_context_window_for_agent(
-                                    resolved_agent, output
-                                ),
+                                **await self._context_window_fields(resolved_agent, output),
                             },
                         )
 
@@ -5869,11 +6270,13 @@ class WorkflowEngine:
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(resolved_agent)
                 event_callback = self._make_event_callback(agent.name)
+                guidance_section = self.context.get_guidance_prompt_section()
                 output = await self._execute_with_agent_timeout(
                     resolved_agent,
                     executor.execute(
                         resolved_agent,
                         agent_context,
+                        guidance_section=guidance_section,
                         event_callback=event_callback,
                     ),
                 )
@@ -5887,7 +6290,7 @@ class WorkflowEngine:
                         _agent_elapsed,
                         agent_context,
                         executor,
-                        None,
+                        guidance_section,
                         event_callback,
                     )
                     _agent_elapsed = _time.time() - _agent_start
@@ -5909,10 +6312,7 @@ class WorkflowEngine:
                         "model": output.model,
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
-                        "context_window_used": output.input_tokens,
-                        "context_window_max": await self._get_context_window_for_agent(
-                            resolved_agent, output
-                        ),
+                        **await self._context_window_fields(resolved_agent, output),
                     },
                 )
 
@@ -6369,11 +6769,13 @@ class WorkflowEngine:
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
+                guidance_section = self.context.get_guidance_prompt_section()
                 output = await self._execute_with_agent_timeout(
                     qualified_agent,
                     executor.execute(
                         qualified_agent,
                         agent_context,
+                        guidance_section=guidance_section,
                         event_callback=event_callback,
                     ),
                 )
@@ -6387,7 +6789,7 @@ class WorkflowEngine:
                         _item_elapsed,
                         agent_context,
                         executor,
-                        None,
+                        guidance_section,
                         event_callback,
                         usage_label=f"{for_each_group.name}[{key}]",
                     )
@@ -6825,12 +7227,22 @@ class WorkflowEngine:
             summary["parallel_agents_count"] = parallel_agents_count
 
         # Add usage/cost information
+        # Normally already drawn by :meth:`run` / :meth:`resume` when the run
+        # ended; the call is idempotent. It stays here for callers that drive
+        # the engine without those entry points, so the flag below is never
+        # reported as ``False`` merely because nothing concluded the run.
+        self._warn_if_pricing_hook_silent()
         usage = self.usage_tracker.get_summary()
         summary["usage"] = {
             "total_input_tokens": usage.total_input_tokens,
             "total_output_tokens": usage.total_output_tokens,
             "total_tokens": usage.total_tokens,
             "total_cost_usd": usage.total_cost_usd,
+            # A model priced from the static table has a ``cost_usd`` and so
+            # never appears in ``unpriced_models``. Without this flag the
+            # summary prints a confident number sourced from a possibly stale
+            # table while the explanation goes only to stderr.
+            "live_pricing_degraded": self._pricing_hook_silent_warned,
             "unpriced_agent_count": len(usage.unpriced_agents),
             "unpriced_models": usage.unpriced_models,
             "agents": [

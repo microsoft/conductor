@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import select
+import signal
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -455,3 +460,170 @@ class TestConstants:
     def test_disambiguate_timeout_value(self) -> None:
         """Verify Esc disambiguation timeout is 50ms."""
         assert _ESC_DISAMBIGUATE_TIMEOUT == 0.05
+
+
+class TestSigtermHandlerFix:
+    """Regression tests for Fleet Manager E3-T9 (the ``SIGTERM``-swallowing bug).
+
+    Prior to this fix, ``_sigterm_handler`` restored the terminal and
+    returned without re-raising whenever the previous handler was not
+    callable -- the normal case, since ``signal.getsignal(SIGTERM)`` is
+    ``signal.Handlers.SIG_DFL`` (an ``IntEnum`` member) in an unmodified
+    process. That silently swallowed the ``SIGTERM``: the process survived
+    and kept running forever, so ``conductor stop`` could never actually
+    terminate a ``mode == "fg"`` run. See the correction in Open Question 1
+    of ``docs/projects/fleet-manager/fleet-manager.plan.md``.
+    """
+
+    def test_reraises_default_disposition_when_previous_not_callable(
+        self, listener: KeyboardListener
+    ) -> None:
+        """SIG_DFL (not callable) must restore the default disposition and
+        re-signal the process rather than silently returning."""
+        with (
+            patch(
+                "conductor.interrupt.listener.signal.getsignal",
+                return_value=signal.Handlers.SIG_DFL,
+            ),
+            patch("conductor.interrupt.listener.signal.signal") as mock_signal,
+            patch("conductor.interrupt.listener.os.kill") as mock_kill,
+            patch.object(listener, "_restore_terminal") as mock_restore,
+        ):
+            listener._register_cleanup_handlers()
+            # The handler actually registered via signal.signal(SIGTERM, ...).
+            registered_handler = mock_signal.call_args_list[-1].args[1]
+            registered_handler(signal.SIGTERM, None)
+
+        mock_restore.assert_called_once()
+        # Restores the default disposition, then re-raises against itself.
+        assert mock_signal.call_args_list[-1].args == (signal.SIGTERM, signal.SIG_DFL)
+        mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+    def test_inherited_sig_ign_is_respected_not_overridden(
+        self, listener: KeyboardListener
+    ) -> None:
+        """An inherited SIG_IGN means "this process does not die on SIGTERM".
+
+        It is an ``IntEnum`` member like SIG_DFL, so the not-callable branch
+        would otherwise take the re-raise path and terminate a process a
+        supervisor or container init shim explicitly configured not to.
+        """
+        with (
+            patch(
+                "conductor.interrupt.listener.signal.getsignal",
+                return_value=signal.Handlers.SIG_IGN,
+            ),
+            patch("conductor.interrupt.listener.signal.signal") as mock_signal,
+            patch("conductor.interrupt.listener.os.kill") as mock_kill,
+            patch.object(listener, "_restore_terminal") as mock_restore,
+        ):
+            listener._register_cleanup_handlers()
+            registered_handler = mock_signal.call_args_list[-1].args[1]
+            registered_handler(signal.SIGTERM, None)
+
+        # The terminal is still restored -- only the termination is skipped.
+        mock_restore.assert_called_once()
+        mock_kill.assert_not_called()
+        assert mock_signal.call_args_list[-1].args[1] is not signal.SIG_DFL
+
+    def test_delegates_to_previous_handler_when_callable(self, listener: KeyboardListener) -> None:
+        """A real, callable previous handler (e.g. installed by another
+        library) must still be invoked -- this behavior is unchanged."""
+        previous_handler = MagicMock()
+        with (
+            patch(
+                "conductor.interrupt.listener.signal.getsignal",
+                return_value=previous_handler,
+            ),
+            patch("conductor.interrupt.listener.signal.signal") as mock_signal,
+            patch("conductor.interrupt.listener.os.kill") as mock_kill,
+            patch.object(listener, "_restore_terminal") as mock_restore,
+        ):
+            listener._register_cleanup_handlers()
+            registered_handler = mock_signal.call_args_list[-1].args[1]
+            registered_handler(signal.SIGTERM, "frame")
+
+        mock_restore.assert_called_once()
+        previous_handler.assert_called_once_with(signal.SIGTERM, "frame")
+        mock_kill.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM/PTY semantics are POSIX-only")
+class TestSigtermActuallyTerminatesForegroundRun:
+    """Empirical, PTY-backed regression test for Fleet Manager E3-T9 / E3-T11.
+
+    ``KeyboardListener.start()`` only installs the ``SIGTERM`` handler when
+    ``sys.stdin.isatty()`` is true, which is exactly the condition
+    ``cli/run.py`` uses to decide whether to install a real listener
+    (``mode == "fg"``). A mocked stdin can't reproduce the real swallowing
+    bug because the handler only misbehaves once actually installed and
+    signaled against a real process -- so this spawns a genuine child
+    process attached to a pseudo-terminal (mirroring the reviewer's
+    empirical repro described in Open Question 1) and verifies it actually
+    exits when sent ``SIGTERM``, rather than hanging forever.
+    """
+
+    _CHILD_SCRIPT = (
+        "import asyncio\n"
+        "from conductor.interrupt.listener import KeyboardListener\n"
+        "async def main():\n"
+        "    event = asyncio.Event()\n"
+        "    listener = KeyboardListener(interrupt_event=event)\n"
+        "    await listener.start()\n"
+        "    print('READY', flush=True)\n"
+        "    await asyncio.Event().wait()\n"
+        "asyncio.run(main())\n"
+    )
+
+    @staticmethod
+    def _wait_for_ready(master_fd: int, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        buf = b""
+        while b"READY" not in buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"child process never signaled readiness (got: {buf!r})")
+            ready, _, _ = select.select([master_fd], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+
+    @staticmethod
+    def _wait_for_exit(pid: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            done_pid, _status = os.waitpid(pid, os.WNOHANG)
+            if done_pid == pid:
+                return True
+            time.sleep(0.05)
+        # Timed out -- force-kill so the test doesn't leak a zombie/orphan
+        # process regardless of the assertion outcome below.
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+        return False
+
+    def test_process_exits_on_sigterm(self) -> None:
+        import pty
+
+        pid, master_fd = pty.fork()
+        if pid == 0:  # pragma: no cover -- runs in the forked child
+            os.execvp(sys.executable, [sys.executable, "-c", self._CHILD_SCRIPT])
+            os._exit(127)
+
+        try:
+            self._wait_for_ready(master_fd)
+            os.kill(pid, signal.SIGTERM)
+            exited = self._wait_for_exit(pid, timeout=10.0)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+        assert exited, "child process ignored SIGTERM and did not exit (E3-T9 regression)"

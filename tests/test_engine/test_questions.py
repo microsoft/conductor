@@ -945,3 +945,87 @@ class TestQuestionsRoutingAndCost:
         assert all(ids)
         assert len(set(ids)) == len(ids)
         assert all(p.name == "ask" for p in seen)
+
+
+class TestQuestionsGateEvents:
+    """A questions node reuses ``gate_presented``; it must also close it.
+
+    Any consumer that tracks "is this run waiting on a human" from the event
+    stream (the Fleet Manager's run summary, the dashboard) otherwise holds
+    a gate that never closes, and shows the run parked at a question it
+    already answered for the rest of the run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_presented_gate_is_resolved(self) -> None:
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            questions=[QuestionDef(text="First?"), QuestionDef(text="Second?")],
+            routes=[RouteDef(to="after")],
+        )
+        engine = _engine(_config(agent))
+        resolve, seen = _scripted(
+            [
+                GateResponse(value="__free_text__", label="w", additional_input={"answer": "A"}),
+                GateResponse(value="__free_text__", label="w", additional_input={"answer": "B"}),
+                GateResponse(value="__finish__", label="finish"),
+            ]
+        )
+
+        events: list[tuple[str, dict]] = []
+        original_emit = WorkflowEngine._emit
+
+        def _record_emit(self, event_type, data=None, **kwargs):
+            events.append((event_type, data or {}))
+            return original_emit(self, event_type, data, **kwargs)
+
+        with (
+            patch.object(WorkflowEngine, "_resolve_human_prompt", resolve),
+            patch.object(WorkflowEngine, "_emit", _record_emit),
+        ):
+            await engine.run({})
+
+        presented = [d for t, d in events if t == "gate_presented"]
+        resolved = [d for t, d in events if t == "gate_resolved"]
+        assert len(presented) == len(seen)
+        assert len(resolved) == len(presented), (
+            "every gate_presented from a questions node must be paired with a "
+            "gate_resolved, or a run reads as parked at a gate forever"
+        )
+        assert all(d.get("agent_name") == "ask" for d in resolved)
+
+    @pytest.mark.asyncio
+    async def test_resolution_carries_the_selected_value(self) -> None:
+        """The closing event names what was chosen, matching human_gate's."""
+        agent = AgentDef(
+            name="ask",
+            type="questions",
+            questions=[QuestionDef(text="Only?")],
+            routes=[RouteDef(to="after")],
+        )
+        engine = _engine(_config(agent))
+        resolve, _seen = _scripted(
+            [
+                GateResponse(value="__free_text__", label="w", additional_input={"answer": "A"}),
+                GateResponse(value="__finish__", label="finish"),
+            ]
+        )
+
+        events: list[tuple[str, dict]] = []
+        original_emit = WorkflowEngine._emit
+
+        def _record_emit(self, event_type, data=None, **kwargs):
+            events.append((event_type, data or {}))
+            return original_emit(self, event_type, data, **kwargs)
+
+        with (
+            patch.object(WorkflowEngine, "_resolve_human_prompt", resolve),
+            patch.object(WorkflowEngine, "_emit", _record_emit),
+        ):
+            await engine.run({})
+
+        resolved = [d for t, d in events if t == "gate_resolved"]
+        assert [d["selected_option"] for d in resolved] == ["__free_text__", "__finish__"]
+        assert resolved[0]["additional_input"] == {"answer": "A"}
+        assert all(d.get("step_type") == "questions" for d in resolved)

@@ -23,6 +23,7 @@ from starlette.testclient import TestClient
 
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.web.server import _STATIC_DIR, WebDashboard
+from tests.test_web.conftest import make_client, ws_connect
 
 
 def _make_dashboard(
@@ -39,13 +40,51 @@ def _make_event(event_type: str, **data: object) -> WorkflowEvent:
     return WorkflowEvent(type=event_type, timestamp=time.time(), data=dict(data))
 
 
+class TestGetApiInfoIdentity:
+    """``/api/info`` is what ``conductor stop`` uses to confirm identity (#344).
+
+    The dashboard runs in the same process as the workflow, so its own PID is
+    direct proof that a recorded PID really is the process listening on a port
+    and has not been recycled onto something unrelated.
+    """
+
+    def test_pid_reported_before_any_workflow_started_event(self) -> None:
+        """Identity must not depend on the workflow having started.
+
+        A run killed during startup has an empty event history. If identity
+        were only derivable from ``workflow_started``, it could never be
+        confirmed, and ``conductor stop`` would refuse to force-terminate
+        exactly when it is most needed. It also must not depend on ``run_id``,
+        which legitimately differs from the launcher's id on resume.
+        """
+        import os
+
+        _, dashboard = _make_dashboard()
+        with make_client(dashboard) as client:
+            resp = client.get("/api/info")
+            assert resp.status_code == 200
+            assert resp.json()["pid"] == os.getpid()
+
+    def test_pid_still_reported_alongside_workflow_fields(self) -> None:
+        emitter, dashboard = _make_dashboard()
+        import os
+
+        with make_client(dashboard) as client:
+            emitter.emit(_make_event("workflow_started", run_id="abcd1234", name="wf"))
+            info = client.get("/api/info").json()
+
+        assert info["pid"] == os.getpid()
+        assert info["run_id"] == "abcd1234"
+        assert info["workflow_name"] == "wf"
+
+
 class TestGetApiState:
     """Tests for GET /api/state endpoint."""
 
     def test_empty_state_initially(self) -> None:
         """GET /api/state returns empty list before any events."""
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/state")
             assert resp.status_code == 200
             assert resp.json() == []
@@ -59,7 +98,7 @@ class TestGetApiState:
         emitter.emit(_make_event("agent_started", agent_name="a1"))
         emitter.emit(_make_event("agent_completed", agent_name="a1", elapsed=1.5))
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/state")
             assert resp.status_code == 200
             events = resp.json()
@@ -75,7 +114,7 @@ class TestGetApiState:
         emitter, dashboard = _make_dashboard()
         emitter.emit(_make_event("agent_started", agent_name="a1"))
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/state")
             event = resp.json()[0]
             assert "type" in event
@@ -91,7 +130,7 @@ class TestGetIndex:
     def test_serves_html(self) -> None:
         """GET / returns HTML content."""
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/")
             assert resp.status_code == 200
             assert "text/html" in resp.headers["content-type"]
@@ -105,7 +144,7 @@ class TestGetIndex:
         the previous build's bundle (the failure mode this guards against).
         """
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/")
             assert resp.status_code == 200
             assert resp.headers.get("cache-control") == "no-cache"
@@ -117,7 +156,7 @@ class TestGetIndex:
         Cache-Control policy that would also defeat asset caching.
         """
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/favicon.svg")
             assert resp.status_code == 200
             assert resp.headers.get("cache-control") != "no-cache"
@@ -130,7 +169,7 @@ class TestGetIndex:
         no-cache header added to the index route.
         """
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             index_html = (_STATIC_DIR / "index.html").read_text()
             asset_path = re.findall(r'/assets/[^"\']+', index_html)[0]
             resp = client.get(asset_path)
@@ -144,7 +183,7 @@ class TestWebSocket:
     def test_connect_and_receive_event(self) -> None:
         """WebSocket client receives broadcast events."""
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+        with make_client(dashboard) as client, ws_connect(client, dashboard) as ws:
             # Emit event while connected — _on_event runs synchronously
             # and enqueues to the asyncio.Queue; the broadcaster task
             # (started via lifespan) reads and sends to WebSocket.
@@ -158,7 +197,7 @@ class TestWebSocket:
     def test_multiple_events_in_order(self) -> None:
         """Multiple events arrive in emission order."""
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+        with make_client(dashboard) as client, ws_connect(client, dashboard) as ws:
             emitter.emit(_make_event("agent_started", agent_name="a1"))
             emitter.emit(_make_event("agent_completed", agent_name="a1"))
 
@@ -181,7 +220,7 @@ class TestLateJoiner:
         emitter.emit(_make_event("agent_completed", agent_name="a1", elapsed=2.0))
 
         # Late joiner fetches state
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/state")
             events = resp.json()
             assert len(events) == 3
@@ -413,7 +452,7 @@ class TestBroadcastErrorIsolation:
     def test_good_client_unaffected_by_bad_client(self) -> None:
         """Good WebSocket still receives events when another client fails."""
         emitter, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+        with make_client(dashboard) as client, ws_connect(client, dashboard) as ws:
             # Add a bad mock connection alongside the real one
             bad_ws = MagicMock()
             bad_ws.send_json = AsyncMock(side_effect=RuntimeError("fail"))
@@ -530,7 +569,7 @@ class TestApiStop:
         assert not dashboard.stop_requested
         assert not dashboard._pending_stop
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post("/api/stop")
             assert resp.status_code == 200
             assert resp.json() == {"status": "stopping", "queued": True}
@@ -547,7 +586,7 @@ class TestApiStop:
         interrupt = asyncio.Event()
         dashboard.set_interrupt_event(interrupt)
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post("/api/stop")
             assert resp.status_code == 200
             assert resp.json() == {"status": "stopping"}
@@ -560,7 +599,7 @@ class TestApiStop:
         the interrupt event, taking the graceful interrupt path."""
         emitter, dashboard = _make_dashboard(bg=True)
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             client.post("/api/stop")  # arrives before set_interrupt_event
 
         assert dashboard._pending_stop
@@ -611,7 +650,7 @@ class TestApiResume:
         emitter, dashboard = _make_dashboard()
         assert not dashboard.resume_event.is_set()
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post("/api/resume")
             assert resp.status_code == 200
             assert resp.json() == {"status": "resuming"}
@@ -629,7 +668,7 @@ class TestApiKill:
         assert not dashboard.kill_event.is_set()
         assert not dashboard._bg_event.is_set()
 
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.post("/api/kill")
             assert resp.status_code == 200
             assert resp.json() == {"status": "killing"}
@@ -1081,7 +1120,7 @@ class TestWaitForIterationLimitResponse:
         consumes, not the gate-response or dialog queues.
         """
         _, dashboard = _make_dashboard()
-        with TestClient(dashboard.app) as client, client.websocket_connect("/ws") as ws:
+        with make_client(dashboard) as client, ws_connect(client, dashboard) as ws:
             ws.send_json(
                 {
                     "type": "iteration_limit_response",
@@ -1134,7 +1173,7 @@ class TestFileApi:
 
     def _client(self, workflow_dir: Path) -> TestClient:
         _, dashboard = _make_dashboard(workflow_root=workflow_dir)
-        return TestClient(dashboard.app)
+        return make_client(dashboard)
 
     def test_read_markdown_file(self, workflow_dir: Path) -> None:
         """Happy path: read a .md file."""
@@ -1219,7 +1258,7 @@ class TestFileApi:
     def test_no_workflow_root_returns_404(self) -> None:
         """When workflow_root is None, endpoint returns 404."""
         _, dashboard = _make_dashboard(workflow_root=None)
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/files/plan.md")
             assert resp.status_code == 404
             assert "No workflow root" in resp.json()["error"]
@@ -1256,7 +1295,7 @@ class TestReplayEventsFromJsonl:
         count = dashboard.replay_events_from_jsonl(log)
 
         assert count == 2
-        with TestClient(dashboard.app) as client:
+        with make_client(dashboard) as client:
             resp = client.get("/api/state")
             assert resp.status_code == 200
             body = resp.json()
@@ -1327,6 +1366,7 @@ class TestReplayEventsFromJsonl:
             "iteration_limit_resolved",
             "dialog_started",
             "dialog_completed",
+            "guidance_received",
         ],
     )
     @pytest.mark.parametrize("sub_path", [None, ["sub"], ["sub", "deeper"]])
@@ -1424,6 +1464,42 @@ class TestReplayEventsFromJsonl:
 
         assert count == 1
         assert [ev["type"] for ev in dashboard._event_history] == ["dialog_message"]
+
+    def test_preserves_guidance_applied_when_guidance_received_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """``guidance_received`` is skipped, but ``guidance_applied`` is kept.
+
+        ``guidance_received`` is only the opening half of a pair whose closer
+        is ``guidance_applied`` — a submission still pending when the
+        original run died would otherwise replay as a phantom "pending" entry
+        forever. ``guidance_applied`` is deliberately preserved:
+        ``WorkflowContext.from_dict`` restores ``user_guidance``, so that
+        guidance really is still in effect on the resumed run and must stay
+        listed (issue #400).
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "guidance_received",
+                    "timestamp": 1.0,
+                    "data": {"text": "Be concise", "pending": 1},
+                },
+                {
+                    "type": "guidance_applied",
+                    "timestamp": 1.1,
+                    "data": {"text": "Be concise", "source": "dashboard", "agent_name": "a"},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["guidance_applied"]
 
     def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
         """Subworkflow-level workflow_started/completed (identified by a non-empty

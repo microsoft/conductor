@@ -42,6 +42,8 @@ from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
+    from copilot.session import PermissionInvocation
+
     from conductor.config.schema import AgentDef, OutputField, ProviderSettings
     from conductor.engine.pricing import ModelPricing
 
@@ -92,13 +94,19 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
 # Try to import the Copilot SDK
 try:
     from copilot import CopilotClient
-    from copilot.session import PermissionHandler
+    from copilot.session import (
+        PermissionDecisionUserNotAvailable,
+        PermissionHandler,
+        PermissionNoResult,
+    )
 
     COPILOT_SDK_AVAILABLE = True
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
+    PermissionNoResult = None  # type: ignore[misc, assignment]
+    PermissionDecisionUserNotAvailable = None  # type: ignore[misc, assignment]
 
 # RuntimeConnection was added to the SDK after CopilotClient; import it
 # separately so an older-but-present SDK still enables the default nested-spawn
@@ -172,6 +180,8 @@ class SDKResponse:
         output_tokens: Number of output tokens generated (from assistant.usage event).
         cache_read_tokens: Tokens read from cache (if available).
         cache_write_tokens: Tokens written to cache (if available).
+        last_call_input_tokens: Prompt tokens of the most recent assistant.usage
+            event, distinct from input_tokens which sums every call for billing.
         partial: Whether this response is partial (from a mid-agent interrupt).
         resolved_model: Model name the SDK reported in the assistant.usage event's
             model field. None when that event is absent (error or interrupt paths)
@@ -183,6 +193,7 @@ class SDKResponse:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    last_call_input_tokens: int | None = None
     partial: bool = False
     resolved_model: str | None = None
 
@@ -393,18 +404,68 @@ class CopilotProvider(AgentProvider):
     @staticmethod
     def _default_permission_handler(
         request: Any,
-        invocation: dict[str, str],
+        invocation: PermissionInvocation,
     ) -> Any:
-        """Default permission handler that approves all requests.
+        """Approve tool permission requests, or decline them explicitly.
 
-        The SDK requires a permission handler on session creation.
-        In orchestration mode, we approve all tool permissions since the
-        workflow author controls which tools are available to each agent.
+        The SDK requires a permission handler on session creation. In
+        orchestration mode the workflow author controls which tools each agent
+        gets, so an ordinary request is approved.
 
-        Returns a PermissionRequestResult from the SDK.
+        ``approve_all`` does not always approve. It abstains with
+        ``PermissionNoResult`` when the request carries
+        ``managed_approval_required``, a flag the runtime sets rather than
+        anything Conductor configures. That sentinel exists so a second
+        connected client can answer instead, and Conductor is the only client:
+        returning it leaves the request unanswered, the CLI blocked, and the
+        run dying minutes later against an idle timeout that blames the
+        network. Decline explicitly instead — never approve, because managed
+        approval is a deliberate policy control and overriding it here would
+        turn a hang into a bypass.
+
+        ``approve_all`` also raises when ``invocation["managed_settings_enabled"]``
+        is set. That flag comes from the ``enable_managed_settings`` opt-in on
+        ``create_session``, which Conductor never passes; the guard is here
+        because the SDK swallows exceptions raised by this callback and
+        answers ``PermissionDecisionUserNotAvailable`` on its own logger, so
+        an unguarded raise would surface as every tool being denied for no
+        stated reason.
+
+        Args:
+            request: The SDK's permission request for a single tool call.
+            invocation: The SDK's ``PermissionInvocation`` for this session.
+
+        Returns:
+            A ``PermissionRequestResult`` from the SDK. Always a concrete
+            decision, never an abstention.
         """
+        try:
+            result = PermissionHandler.approve_all(request, invocation)
+        except RuntimeError:
+            logger.error(
+                "Copilot rejected blanket tool approval for session %s because "
+                "managed settings are enabled. Conductor runs unattended and "
+                "cannot answer a managed permission prompt, so tool calls will "
+                "be declined. Run this workflow through an interactive Copilot "
+                "client instead.",
+                invocation.get("session_id", "<unknown>"),
+            )
+            return PermissionDecisionUserNotAvailable()
+
+        if isinstance(result, PermissionNoResult):
+            logger.error(
+                "Copilot requires managed approval for tool %r in session %s. "
+                "Conductor runs unattended and has no one to ask, so the call "
+                "is being declined rather than left pending. Run this workflow "
+                "through an interactive Copilot client, or ask an administrator "
+                "to relax the managed-approval policy for this tool.",
+                getattr(request, "tool_name", None) or "<unknown>",
+                invocation.get("session_id", "<unknown>"),
+            )
+            return PermissionDecisionUserNotAvailable()
+
         logger.debug("auto-approved permission request: %s", request)
-        return PermissionHandler.approve_all(request, invocation)
+        return result
 
     def _large_output_config(self) -> dict[str, Any]:
         """Build the SDK ``large_output`` config for session creation.
@@ -837,6 +898,9 @@ class CopilotProvider(AgentProvider):
                 output_tokens = sdk_response.output_tokens if sdk_response else None
                 cache_read = sdk_response.cache_read_tokens if sdk_response else None
                 cache_write = sdk_response.cache_write_tokens if sdk_response else None
+                last_call_input_tokens = (
+                    sdk_response.last_call_input_tokens if sdk_response else None
+                )
                 tokens_used = None
                 if input_tokens is not None and output_tokens is not None:
                     tokens_used = input_tokens + output_tokens
@@ -852,6 +916,7 @@ class CopilotProvider(AgentProvider):
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
+                    last_call_input_tokens=last_call_input_tokens,
                     model=(
                         sdk_response.resolved_model
                         if sdk_response and agent.model in (None, "auto")
@@ -1273,6 +1338,7 @@ class CopilotProvider(AgentProvider):
                         output_tokens=sdk_response.output_tokens,
                         cache_read_tokens=sdk_response.cache_read_tokens,
                         cache_write_tokens=sdk_response.cache_write_tokens,
+                        last_call_input_tokens=sdk_response.last_call_input_tokens,
                         partial=True,
                         resolved_model=sdk_response.resolved_model,
                     )
@@ -1283,6 +1349,10 @@ class CopilotProvider(AgentProvider):
                 total_output_tokens = sdk_response.output_tokens
                 cache_read_tokens = sdk_response.cache_read_tokens
                 cache_write_tokens = sdk_response.cache_write_tokens
+                # The most recent single call's prompt size (context-window
+                # measurement, issue #412), replaced (not accumulated) by
+                # each recovery call below.
+                last_call = sdk_response.last_call_input_tokens
                 current_resolved_model = sdk_response.resolved_model
 
                 # If no output schema (or output_mode is raw), we're done
@@ -1293,6 +1363,7 @@ class CopilotProvider(AgentProvider):
                         output_tokens=total_output_tokens,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
+                        last_call_input_tokens=last_call,
                         resolved_model=current_resolved_model,
                     )
                     return {"result": response_content}, final_usage
@@ -1312,6 +1383,7 @@ class CopilotProvider(AgentProvider):
                             output_tokens=total_output_tokens,
                             cache_read_tokens=cache_read_tokens,
                             cache_write_tokens=cache_write_tokens,
+                            last_call_input_tokens=last_call,
                             resolved_model=current_resolved_model,
                         )
                         return parsed_content, final_usage
@@ -1351,7 +1423,8 @@ class CopilotProvider(AgentProvider):
                         )
                         response_content = recovery_response.content
 
-                        # Accumulate usage from recovery calls
+                        # Accumulate usage from recovery calls (all four
+                        # billing counters follow one rule).
                         if recovery_response.input_tokens is not None:
                             total_input_tokens = (
                                 total_input_tokens or 0
@@ -1360,6 +1433,19 @@ class CopilotProvider(AgentProvider):
                             total_output_tokens = (
                                 total_output_tokens or 0
                             ) + recovery_response.output_tokens
+                        if recovery_response.cache_read_tokens is not None:
+                            cache_read_tokens = (
+                                cache_read_tokens or 0
+                            ) + recovery_response.cache_read_tokens
+                        if recovery_response.cache_write_tokens is not None:
+                            cache_write_tokens = (
+                                cache_write_tokens or 0
+                            ) + recovery_response.cache_write_tokens
+                        # The recovery call is now the most recent call, so
+                        # its prompt size replaces (not accumulates) the
+                        # context-window figure.
+                        if recovery_response.last_call_input_tokens is not None:
+                            last_call = recovery_response.last_call_input_tokens
                         # Keep the latest resolved model (recovery uses the same session/model)
                         if recovery_response.resolved_model:
                             current_resolved_model = recovery_response.resolved_model
@@ -1446,7 +1532,10 @@ class CopilotProvider(AgentProvider):
                 tagged with their plain name.
 
         Returns:
-            SDKResponse with content and usage data. If interrupted,
+            SDKResponse with content and usage data. Usage is summed across
+            every ``assistant.usage`` event seen for the turn's API calls
+            (issue #412); ``last_call_input_tokens`` is the final call's
+            prompt size, a point-in-time context measurement. If interrupted,
             ``SDKResponse.partial`` will be True.
 
         Raises:
@@ -1460,8 +1549,18 @@ class CopilotProvider(AgentProvider):
         # Using a list so the nested callback can mutate it
         last_activity_ref: list[Any] = [None, None, time.monotonic()]
 
-        # Mutable container for usage data: [input_tokens, output_tokens, cache_read, cache_write]
+        # Mutable container for accumulated usage data (billing totals):
+        # [input_tokens, output_tokens, cache_read, cache_write]
         usage_ref: list[int | None] = [None, None, None, None]
+
+        # Mutable container for the most recent single call's prompt size
+        # (context-window measurement, issue #412), distinct from the
+        # accumulated usage_ref[0].
+        last_call_ref: list[int | None] = [None]
+
+        # api_call_id values already folded into usage_ref, so a repeated
+        # event for the same call isn't double-counted.
+        seen_call_ids: set[str] = set()
 
         # Mutable container for the resolved model name (from assistant.usage event)
         resolved_model_ref: list[str | None] = [None]
@@ -1496,20 +1595,43 @@ class CopilotProvider(AgentProvider):
             if event_type == "assistant.message":
                 response_content = event.data.content
             elif event_type == "assistant.usage":
-                # Capture token usage from the assistant.usage event
+                # Capture token usage from the assistant.usage event. One
+                # event is emitted per API call, so accumulate across calls
+                # for billing (issue #412) rather than overwriting — a
+                # multi-turn tool-calling agent otherwise bills only its
+                # final call. A repeated event for the same call (matched by
+                # api_call_id, falling back to provider_call_id then
+                # service_request_id when the SDK omits it) is skipped so
+                # it isn't double-counted. All three id fields are optional
+                # per the SDK schema; if none are present, dedup cannot be
+                # applied and the event is treated as a new call.
+                call_id = (
+                    getattr(event.data, "api_call_id", None)
+                    or getattr(event.data, "provider_call_id", None)
+                    or getattr(event.data, "service_request_id", None)
+                )
+                already_seen = isinstance(call_id, str) and call_id and call_id in seen_call_ids
+                if isinstance(call_id, str) and call_id:
+                    seen_call_ids.add(call_id)
                 input_tokens = getattr(event.data, "input_tokens", None)
                 output_tokens = getattr(event.data, "output_tokens", None)
                 cache_read = getattr(event.data, "cache_read_tokens", None)
                 cache_write = getattr(event.data, "cache_write_tokens", None)
                 # Convert floats to ints if needed (SDK sometimes returns floats)
-                if input_tokens is not None:
-                    usage_ref[0] = int(input_tokens)
-                if output_tokens is not None:
-                    usage_ref[1] = int(output_tokens)
-                if cache_read is not None:
-                    usage_ref[2] = int(cache_read)
-                if cache_write is not None:
-                    usage_ref[3] = int(cache_write)
+                if not already_seen:
+                    if input_tokens is not None:
+                        usage_ref[0] = (usage_ref[0] or 0) + int(input_tokens)
+                    if output_tokens is not None:
+                        usage_ref[1] = (usage_ref[1] or 0) + int(output_tokens)
+                    if cache_read is not None:
+                        usage_ref[2] = (usage_ref[2] or 0) + int(cache_read)
+                    if cache_write is not None:
+                        usage_ref[3] = (usage_ref[3] or 0) + int(cache_write)
+                    if input_tokens is not None:
+                        # The most recent single call's prompt size — a
+                        # point-in-time context measurement, unlike the
+                        # accumulated usage_ref[0] used for billing.
+                        last_call_ref[0] = int(input_tokens)
                 # Capture the actual model resolved by the SDK (e.g., when model="auto")
                 sdk_model = getattr(event.data, "model", None)
                 if sdk_model:
@@ -1568,6 +1690,7 @@ class CopilotProvider(AgentProvider):
                 output_tokens=usage_ref[1],
                 cache_read_tokens=usage_ref[2],
                 cache_write_tokens=usage_ref[3],
+                last_call_input_tokens=last_call_ref[0],
                 partial=True,
                 resolved_model=resolved_model_ref[0],
             )
@@ -1584,6 +1707,7 @@ class CopilotProvider(AgentProvider):
             output_tokens=usage_ref[1],
             cache_read_tokens=usage_ref[2],
             cache_write_tokens=usage_ref[3],
+            last_call_input_tokens=last_call_ref[0],
             resolved_model=resolved_model_ref[0],
         )
 
@@ -1697,6 +1821,7 @@ class CopilotProvider(AgentProvider):
                 output_tokens=sdk_response.output_tokens,
                 cache_read_tokens=sdk_response.cache_read_tokens,
                 cache_write_tokens=sdk_response.cache_write_tokens,
+                last_call_input_tokens=sdk_response.last_call_input_tokens,
                 model=(sdk_response.resolved_model if agent_model in (None, "auto") else None)
                 or agent_model
                 or self._default_model,
@@ -1795,12 +1920,12 @@ class CopilotProvider(AgentProvider):
                 event icon so concurrent parallel/for-each iterations can be
                 distinguished in interleaved logs.
         """
-        from rich.console import Console
         from rich.text import Text
 
         from conductor.cli.run import _file_console
+        from conductor.console import make_console
 
-        console = Console(stderr=True, highlight=False)
+        console = make_console(stderr=True, highlight=False)
 
         def _print(renderable: Any) -> None:
             console.print(renderable)
@@ -2037,10 +2162,11 @@ class CopilotProvider(AgentProvider):
             agent_name: Optional agent identifier used to attribute the
                 recovery message to a specific concurrent agent.
         """
-        from rich.console import Console
         from rich.text import Text
 
-        console = Console(stderr=True, highlight=False)
+        from conductor.console import make_console
+
+        console = make_console(stderr=True, highlight=False)
 
         text = Text()
         text.append("    ├─ ", style="dim")
@@ -2719,7 +2845,15 @@ class CopilotProvider(AgentProvider):
         batch_size = getattr(token_prices, "batch_size", None)
         input_price = getattr(token_prices, "input_price", None)
         output_price = getattr(token_prices, "output_price", None)
-        cache_price = getattr(token_prices, "cache_price", None)
+        # ``cache_price`` is the original single cached-token rate. Copilot SDK
+        # >=1.0.9 deprecates it in favour of separate read and write rates, so
+        # prefer those and keep the old field as the fallback — a model that
+        # ships only the new fields would otherwise price cache reads at $0.00,
+        # which is the same silent-wrong-number failure as #386 one field over.
+        cache_read_price = getattr(token_prices, "cache_read_price", None)
+        if not _is_finite_nonneg(cache_read_price):
+            cache_read_price = getattr(token_prices, "cache_price", None)
+        cache_write_price = getattr(token_prices, "cache_write_price", None)
         # Require a positive batch size and finite, non-negative input/output
         # prices. Missing or malformed values (None / negative / NaN / inf) mean
         # we can't produce a trustworthy cost, so fall back to the static table
@@ -2742,10 +2876,12 @@ class CopilotProvider(AgentProvider):
         return ModelPricing(
             input_per_mtok=_per_mtok(input_price),
             output_per_mtok=_per_mtok(output_price),
-            # The SDK exposes a single cached-token price (a read rate); Copilot
-            # models have no separate cache-write price.
-            cache_read_per_mtok=_per_mtok(cache_price) if _is_finite_nonneg(cache_price) else 0.0,
-            cache_write_per_mtok=0.0,
+            cache_read_per_mtok=(
+                _per_mtok(cache_read_price) if _is_finite_nonneg(cache_read_price) else 0.0
+            ),
+            cache_write_per_mtok=(
+                _per_mtok(cache_write_price) if _is_finite_nonneg(cache_write_price) else 0.0
+            ),
         )
 
     async def list_models(self) -> list[str] | None:

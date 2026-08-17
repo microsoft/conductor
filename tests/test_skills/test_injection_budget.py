@@ -213,7 +213,7 @@ class TestSkillInjectionConfigSchema:
     def test_defaults(self) -> None:
         config = SkillInjectionConfig()
         assert config.warn_bytes == 64 * 1024
-        assert config.max_bytes == 128 * 1024
+        assert config.max_bytes == 160 * 1024
 
     def test_warn_above_max_is_rejected(self) -> None:
         """Such a config can never warn — the error fires first."""

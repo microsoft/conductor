@@ -13,6 +13,15 @@ import pytest
 
 from conductor.config.schema import ToolOutputConfig
 
+# Windows has no POSIX permission bits: os.chmod only toggles the read-only flag, and
+# stat.S_IMODE reports 0o666/0o777 regardless of the mode passed to mkdir/open. Assertions
+# about exact modes are therefore POSIX-only; the surrounding behaviour is asserted on all
+# platforms.
+_POSIX_PERMS = os.name != "nt"
+requires_posix_perms = pytest.mark.skipif(
+    not _POSIX_PERMS, reason="POSIX permission bits are not represented on Windows"
+)
+
 
 class _TruncationManagerFixture:
     """Helper that builds a patched MCPManager with a mocked MCP session."""
@@ -71,7 +80,8 @@ async def test_truncation_spills_to_file_with_marker(fixture: _TruncationManager
     spill_file = Path(spill_path)
     assert spill_file.exists()
     assert spill_file.read_text() == full_text
-    assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
+    if _POSIX_PERMS:
+        assert stat.S_IMODE(spill_file.stat().st_mode) == 0o600
     assert spill_file.name.startswith("mcp-server-tool-")
     assert spill_file.name.endswith(".txt")
 
@@ -159,18 +169,22 @@ async def test_spill_os_error_falls_back_to_marker_without_path(
     manager = fixture.make_manager(config)
     fixture.set_result(full_text)
 
-    readonly_dir = tmp_path / "readonly"
-    readonly_dir.mkdir(mode=0o500)
-    config.spill_dir = str(readonly_dir)
+    spill_target = tmp_path / "unwritable"
+    spill_target.mkdir()
+    config.spill_dir = str(spill_target)
 
-    result = await manager.call_tool("server__tool", {})
+    # Force the failure at the syscall rather than via directory permissions: mkdir(mode=0o500)
+    # is a no-op on Windows, so a permission-based simulation silently succeeds there and the
+    # with-path marker is produced instead. Patching os.open exercises the same
+    # ``except (OSError, ValueError)`` branch deterministically on every platform.
+    with patch(
+        "conductor.mcp.manager.os.open", side_effect=OSError("spill target is not writable")
+    ):
+        result = await manager.call_tool("server__tool", {})
 
     assert result.startswith("x" * 1000)
     assert "[output truncated: 1200 chars -> 1000 kept." in result
     assert "full output saved to:" not in result
-
-    # Cleanup: restore write permission so tmp_path can be removed.
-    readonly_dir.chmod(0o700)
 
 
 @pytest.mark.asyncio
@@ -208,7 +222,7 @@ async def test_marker_format_exactly_matches_specification(
 
     expected_marker = (
         "\n\n[output truncated: 1500 chars -> 1000 kept; full output saved to: "
-        f"{fixture.tmp_path}/conductor/tool-output/mcp-server-tool-"
+        f"{fixture.tmp_path / 'conductor' / 'tool-output'}{os.sep}mcp-server-tool-"
     )
     assert expected_marker in result
     assert "The full output was truncated; refine the tool arguments to return less data." in result
@@ -246,7 +260,8 @@ async def test_spill_directory_mode_and_contents(fixture: _TruncationManagerFixt
 
     spill_dir = fixture.tmp_path / "conductor" / "tool-output"
     assert spill_dir.exists()
-    assert stat.S_IMODE(spill_dir.stat().st_mode) == 0o700
+    if _POSIX_PERMS:
+        assert stat.S_IMODE(spill_dir.stat().st_mode) == 0o700
     spill_files = list(spill_dir.glob("*.txt"))
     assert len(spill_files) == 1
     assert spill_files[0].read_text() == full_text
@@ -335,6 +350,7 @@ async def test_spill_dir_symlink_is_rejected(
 
 
 @pytest.mark.asyncio
+@requires_posix_perms
 async def test_spill_dir_loose_permissions_are_tightened(
     fixture: _TruncationManagerFixture, tmp_path: Path
 ) -> None:

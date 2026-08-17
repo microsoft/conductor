@@ -1582,6 +1582,10 @@ and unpriced agents, the total is shown as a partial (e.g. `Total: ~$0.4200
 hides missing spend. The web dashboard shows the same `~$X (N unpriced)` marker.
 When *no* model can be priced, the summary reads `Cost data unavailable`.
 
+Run `conductor doctor --models` to see which models are priced and from
+where — the Models detail table's `Pricing` column shows `provider` / `table`
+/ `none` per model (see [`conductor doctor`](cli-reference.md#conductor-doctor)).
+
 To price an unknown model yourself, add a `cost.pricing` override:
 
 ```yaml
@@ -1848,7 +1852,7 @@ Two consequences worth knowing:
   `conductor validate` reports a path skill that is not, rather than letting
   it fail mid-run. The same skill works on `copilot` untouched.
 * **Eager injection is expensive.** The bundled `conductor` skill alone is
-  ~117KB (~29K tokens), prepended to *every* call and every retry.
+  ~132KB (~33K tokens), prepended to *every* call and every retry.
 
 ### Limiting eager injection
 
@@ -1860,7 +1864,7 @@ workflow:
   runtime:
     skill_injection:
       warn_bytes: 65536      # Default: 65536 (64KB). null disables the warning.
-      max_bytes: 131072      # Default: 131072 (128KB). null disables the limit.
+      max_bytes: 163840      # Default: 163840 (160KB). null disables the limit.
 ```
 
 Exceeding `warn_bytes` logs a warning and reports it from `conductor

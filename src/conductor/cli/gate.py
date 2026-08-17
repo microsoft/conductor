@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import os
 from typing import Annotated, Any
 
 import httpx
 import typer
-from rich.console import Console
+from rich.text import Text
 
-console = Console(stderr=True)
+from conductor.console import make_console, styled
+from conductor.web.auth import resolve_cli_token
+
+console = make_console(stderr=True)
 
 gate_app = typer.Typer(
     name="gate",
@@ -85,11 +87,24 @@ def _gate_respond_impl(
 
     Shared implementation behind ``conductor gate respond`` and the
     deprecated ``conductor gate-respond`` alias, so both stay in lockstep.
+
+    Also consumed directly by the Fleet Manager TUI's gate-resolve action
+    (D4, Fleet Manager E13-T2) -- see
+    ``conductor.fleet.tui.actions.resolve_gate`` -- so this function must
+    not be narrowed to assume a CLI-only caller. It is unchanged for that
+    reuse: still synchronous, still makes blocking ``httpx`` calls (5s/10s
+    timeouts), still writes every message to the module-level ``console``
+    below, and still raises ``typer.Exit`` on every failure path. The TUI
+    caller is responsible for running it off the UI thread (a Textual
+    worker), temporarily redirecting ``console`` to capture its output
+    instead of the real terminal, and translating a raised ``typer.Exit``
+    into an in-UI result rather than letting it propagate.
     """
     base_url = f"http://127.0.0.1:{port}"
 
-    # Resolve token from flag or environment variable
-    resolved_token = token or os.environ.get("CONDUCTOR_GATE_TOKEN")
+    # Resolve token: flag > CONDUCTOR_GATE_TOKEN env var > the per-run token
+    # file written by WebDashboard.start() (issue #397).
+    resolved_token = resolve_cli_token(port, token)
 
     # Auto-discover agent name if not provided
     prompt_id: str | None = None
@@ -99,7 +114,9 @@ def _gate_respond_impl(
             resp.raise_for_status()
             status = resp.json()
             if not status.get("waiting"):
-                console.print(f"[yellow]No gate is currently waiting on port {port}.[/yellow]")
+                console.print(
+                    styled("[yellow]No gate is currently waiting on port {}.[/yellow]", port)
+                )
                 raise typer.Exit(code=1)
             agent = status["agent_name"]
             # Echo the staleness token back. A questions node presents every
@@ -109,12 +126,17 @@ def _gate_respond_impl(
             prompt_id = status.get("prompt_id")
         except httpx.ConnectError:
             console.print(
-                f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
-                "Is the workflow running with --web or --web-bg?"
+                styled(
+                    "[bold red]Error:[/bold red] Cannot connect to dashboard on "
+                    "port {}. Is the workflow running with --web or --web-bg?",
+                    port,
+                )
             )
             raise typer.Exit(code=1) from None
         except httpx.HTTPError as exc:
-            console.print(f"[bold red]Error:[/bold red] Failed to query gate status: {exc}")
+            console.print(
+                styled("[bold red]Error:[/bold red] Failed to query gate status: {}", exc)
+            )
             raise typer.Exit(code=1) from None
 
     # Build request body
@@ -140,34 +162,48 @@ def _gate_respond_impl(
         resp = httpx.post(f"{base_url}/api/gate-respond", json=body, headers=headers, timeout=10)
     except httpx.ConnectError:
         console.print(
-            f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
-            "Is the workflow running with --web or --web-bg?"
+            styled(
+                "[bold red]Error:[/bold red] Cannot connect to dashboard on "
+                "port {}. Is the workflow running with --web or --web-bg?",
+                port,
+            )
         )
         raise typer.Exit(code=1) from None
     except httpx.HTTPError as exc:
-        console.print(f"[bold red]Error:[/bold red] Request failed: {exc}")
+        console.print(styled("[bold red]Error:[/bold red] Request failed: {}", exc))
         raise typer.Exit(code=1) from None
 
     if resp.status_code == 403:
         console.print(
-            "[bold red]Error:[/bold red] Authentication failed. "
-            "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
+            Text.from_markup(
+                "[bold red]Error:[/bold red] Authentication failed. "
+                "Provide a valid token with --token, CONDUCTOR_GATE_TOKEN env var, "
+                "or the auto-discovered token file in ~/.conductor/runs/."
+            )
         )
         raise typer.Exit(code=1)
     if resp.status_code == 409:
         detail = resp.json().get("error", "Gate is not waiting for this response")
-        console.print(f"[bold red]Error:[/bold red] {detail}")
+        console.print(styled("[bold red]Error:[/bold red] {}", detail))
         raise typer.Exit(code=1)
     if resp.status_code == 422:
         detail = resp.json().get("error", "Validation error")
-        console.print(f"[bold red]Error:[/bold red] {detail}")
+        console.print(styled("[bold red]Error:[/bold red] {}", detail))
         raise typer.Exit(code=1)
     if resp.status_code != 200:
         console.print(
-            f"[bold red]Error:[/bold red] Unexpected response ({resp.status_code}): {resp.text}"
+            styled(
+                "[bold red]Error:[/bold red] Unexpected response ({}): {}",
+                resp.status_code,
+                resp.text,
+            )
         )
         raise typer.Exit(code=1)
 
     console.print(
-        f"[green]Gate resolved:[/green] agent=[cyan]{agent}[/cyan] choice=[cyan]{choice}[/cyan]"
+        styled(
+            "[green]Gate resolved:[/green] agent=[cyan]{}[/cyan] choice=[cyan]{}[/cyan]",
+            agent,
+            choice,
+        )
     )

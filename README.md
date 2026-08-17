@@ -29,6 +29,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links
 - **Safety limits** - Max iterations and timeout enforcement
 - **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
+- **[Fleet Manager](#fleet-manager-tui)** - An interactive TUI over every running `conductor` process (foreground, `--web`, or `--web-bg`): live status, tokens and cost, gate alerts you can answer, step-level drill-down, and launching new runs — plus non-interactive `conductor stop` / `conductor fleet list`
 - **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
 
 ## Installation
@@ -75,6 +76,17 @@ conductor update --apply
 
 `--apply` launches the install script automatically — on Windows it opens in a new console window so you can watch progress; on macOS/Linux it replaces the current process. Either way, the running `conductor` exits before the installer touches the venv, so file locks release cleanly.
 
+**Optional extras survive the upgrade.** `uv tool install --force` replaces the tool's entire requirement set, so an upgrade that named no extras used to silently uninstall `[tui]` or `[aca]`. Both install scripts now read the existing install's uv receipt and carry those extras forward, and `conductor update` tells you which ones it found. To add one during an upgrade, or to drop back to a bare install:
+
+```bash
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --extras tui
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --no-preserve-extras
+```
+
+```powershell
+$env:CONDUCTOR_INSTALL_EXTRAS = 'tui'; irm https://aka.ms/conductor/install.ps1 | iex
+```
+
 The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
 
 Conductor periodically checks GitHub for newer releases (cached for 24 hours under `~/.conductor/update-check.json`) and prints a one-line hint when one is available. To silence the hint permanently — for example when you manage upgrades through a package manager or company-mirrored install — set `CONDUCTOR_NO_UPDATE_CHECK=1` in your shell environment. The check is also skipped automatically for non-TTY invocations, `--silent` mode, the `update` subcommand, and `--help` / `--version`.
@@ -116,6 +128,84 @@ conductor run workflow.yaml
 # Install a specific tag or commit
 pip install git+https://github.com/microsoft/conductor.git@v1.0.0
 ```
+
+### Installing behind a proxy or private package index
+
+Conductor's dependencies are resolved from the public Python package index
+(`pypi.org` / `files.pythonhosted.org`). Some networks — corporate or otherwise
+managed devices in particular — block direct access to public package
+registries and require every package to come from an internal mirror or proxy.
+
+Conductor ships **no default mirror** and never redirects your packages on its
+own. Point your package manager at whichever index your organization provides
+and the normal install commands work unchanged.
+
+**uv** (used by the install scripts, `uv tool install`, and `conductor update`):
+
+```bash
+# macOS / Linux
+export UV_DEFAULT_INDEX="internal=https://<your-index-host>/simple/"
+curl -sSfL https://aka.ms/conductor/install.sh | sh
+```
+
+```powershell
+# Windows -- for this shell only
+$env:UV_DEFAULT_INDEX = "internal=https://<your-index-host>/simple/"
+irm https://aka.ms/conductor/install.ps1 | iex
+
+# Windows -- persist for future shells (then open a new terminal)
+setx UV_DEFAULT_INDEX "internal=https://<your-index-host>/simple/"
+```
+
+The `internal=` prefix names the index. The name is optional for a plain
+public mirror, but it is what credential environment variables key off — so
+naming it up front saves reconfiguring later.
+
+Persist the setting in your shell profile (or with `setx`) so later upgrades
+and `conductor update --apply` inherit it. uv also reads a config file if you
+prefer that to an environment variable — `~/.config/uv/uv.toml` on macOS/Linux,
+`%APPDATA%\uv\uv.toml` on Windows:
+
+```toml
+[[index]]
+name = "internal"
+url = "https://<your-index-host>/simple/"
+default = true
+```
+
+**pipx / pip** (only if you install via the `pipx` or `pip` sections above):
+
+```bash
+pip config set global.index-url https://<your-index-host>/simple/
+```
+
+> **uv does not read pip's configuration.** Setting `pip config set
+> global.index-url` alone has no effect on the install scripts, `uv tool
+> install`, or `conductor update` — those need `UV_DEFAULT_INDEX` (or
+> `uv.toml`). Configure both if you use both toolchains.
+
+If the index requires credentials, uv accepts them inline in the URL or via
+`UV_INDEX_INTERNAL_USERNAME` / `UV_INDEX_INTERNAL_PASSWORD` — where `INTERNAL`
+is the index name from the `internal=` prefix (or the `name` key) above,
+upper-cased. See
+[uv's index documentation](https://docs.astral.sh/uv/concepts/indexes/#providing-credentials-directly).
+
+When an install fails because the index is unreachable, the install scripts say
+so explicitly and skip their retry backoff — retrying cannot fix a blocked
+index. Two related cases are reported separately rather than being blamed on
+the index:
+
+- **A blocked `github.com`.** The installer fetches Conductor itself from git,
+  and uv words that failure the same way it words an index failure. No index
+  setting fixes it, so the scripts say so and point at github.com instead.
+- **A transient connection blip.** These still get the full retry schedule,
+  since unlike a policy block they can genuinely heal.
+
+If the error mentions a certificate, your network is inspecting TLS — trust
+your organization's root CA via `SSL_CERT_FILE`, or set `UV_NATIVE_TLS=1` to
+use the system trust store. If it mentions a proxy (`407`), set `HTTPS_PROXY` /
+`NO_PROXY` as well as the index URL. Do not work around the block by disabling
+security tooling; ask your IT or platform team for the approved index endpoint.
 
 ### Use the Conductor skill in Claude Code or Copilot CLI
 
@@ -197,15 +287,60 @@ conductor run workflow.yaml --web --input question="What is Python?"
 - **Three-pane layout** — Resizable panels for the graph, agent detail, and a tabbed output pane (Log, Activity, Output)
 - **In-browser human gates** — Respond to human-in-the-loop decision points directly in the dashboard, no terminal needed
 - **Per-node detail** — Click any node to see its prompt, metadata (model, tokens, cost), activity stream, and output
-- **Background mode** — Run with `--web-bg` to start the dashboard in the background, print the URL, and exit. Use `conductor stop` to shut it down later.
+- **Mid-run guidance** — Send a correction to a running workflow — via the dashboard's **Guide** button or `conductor guide --text "..."` — without stopping it first. Works with both `--web` and `--web-bg`.
+- **Background mode** — Run with `--web-bg` to start the dashboard in the background, print the URL, and exit. Use `conductor stop` to shut it down later and `conductor status` to list what's running.
 
 ```bash
 # Run in background — prints dashboard URL and exits
 conductor run workflow.yaml --web-bg --input topic="AI in healthcare"
 
+# Send mid-run guidance to a running background workflow
+conductor guide --text "Prefer Python 3.12 examples"
+
 # Stop a background workflow
 conductor stop
 ```
+
+## Fleet Manager (TUI)
+
+The dashboard shows you one run in depth. The **Fleet Manager** shows you *every* run at once — and it's where you go when something needs you. Launch it with `conductor fleet`:
+
+```bash
+# One-time: the TUI ships as an optional extra.
+curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --extras tui
+conductor fleet
+```
+
+> The install command depends on how you installed Conductor. Running `conductor fleet`
+> without the extra prints the one that works on your machine — pinned to the version
+> you are running and carrying any extras you already have, because `uv tool install
+> --force` replaces the tool's whole requirement set. `conductor update` carries them
+> forward for the same reason.
+
+![Fleet Manager](docs/img/fleet-manager.png)
+
+> **TUI = breadth. Dashboard = depth.**
+>
+> The TUI answers *"what's happening across my fleet, and what needs me?"* The dashboard answers *"what exactly is this one run doing?"* They compose — press `w` on any run to open its dashboard in a browser.
+
+**Key features:**
+
+- **Every run is discoverable** — Foreground, `--web`, and `--web-bg` runs all appear. Previously only `--web-bg` runs were visible to `conductor stop`; a plain `conductor run` had to be hunted down and killed by hand.
+- **Live fleet table** — Each run's status, current step, elapsed time, tokens, cost, and a token-burn sparkline, polled continuously and sorted by recency
+- **Gates that find you** — A run blocked on a human gate is badged in the table and fires a terminal bell, so a waiting workflow doesn't sit unnoticed. Press `g` to answer it without leaving the TUI.
+- **Drill down** — `enter` opens a run's per-agent breakdown, then `enter` again on any step shows what it actually did: its input, output, and activity stream
+- **Launch new runs** — `n` builds a form from a workflow's declared `input:` block and starts it in the background, so the TUI both watches and starts work
+- **Browse and re-run** — Providers and model diagnostics (`p`), registries and their workflows (`r`), and History (`h`) for finished runs, which hands off to `conductor replay`
+- **Kill safely** — `k` stops the selected run, `K` the whole fleet. Both confirm first, and a foreground run is named explicitly, since stopping one discards in-flight progress unless periodic checkpoints are enabled.
+
+```bash
+# Not interactive? These need no extra dependency:
+conductor fleet list           # table of every live run
+conductor stop                 # stop the only running workflow, or list them
+conductor fleet prune          # bound the event logs in $TMPDIR/conductor
+```
+
+See [docs/fleet.md](docs/fleet.md) for every screen, key binding, the status vocabulary, and retention settings.
 
 ## Providers
 
@@ -348,6 +483,21 @@ Validate a workflow file without executing.
 conductor validate <workflow.yaml>
 ```
 
+### `conductor fleet`
+
+Discover and manage every running `conductor` process — foreground,
+`--web`, or `--web-bg`. See [Fleet Manager](#fleet-manager-tui) above for
+the interactive TUI; these need no extra dependency:
+
+```bash
+conductor stop                # stop the only running workflow, or list them
+conductor fleet list          # non-interactive table of every live run
+conductor fleet               # interactive TUI (requires the `tui` extra)
+```
+
+See [docs/fleet.md](docs/fleet.md) for the TUI's screens, key bindings, and
+status vocabulary.
+
 **Full CLI documentation:** [docs/cli-reference.md](docs/cli-reference.md)
 
 ## Workflow Registries
@@ -397,6 +547,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 |----------|-------------|
 | [Workflow Syntax](./docs/workflow-syntax.md) | Complete YAML schema reference |
 | [CLI Reference](./docs/cli-reference.md) | Full command-line documentation |
+| [Fleet Manager](./docs/fleet.md) | `conductor fleet` TUI: screens, key bindings, gate resolvability, retention |
 | [Parallel Execution](./docs/parallel-execution.md) | Static parallel groups |
 | [Dynamic Parallel](./docs/dynamic-parallel.md) | For-each groups and array processing |
 | [Claude Provider](./docs/providers/claude.md) | Claude setup and configuration |

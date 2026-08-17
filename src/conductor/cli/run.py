@@ -14,7 +14,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,8 +22,10 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from conductor.config.loader import load_config
+from conductor.console import MarkupFreeConsole, join, make_console, styled
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
     from conductor.config.instructions import DiscoveredInstruction
     from conductor.config.schema import ProviderSettings, WorkflowConfig
     from conductor.events import WorkflowEvent
+    from conductor.fleet.records import RunMode
 
 
 logger = logging.getLogger(__name__)
@@ -52,17 +55,21 @@ logger = logging.getLogger(__name__)
 # silently bypass ``--silent`` if used on this instance. All current call
 # sites in this module use only ``.print``; if you introduce a new one,
 # either route it through ``.print`` or extend this subclass.
-class _SilentAwareConsole(Console):
+class _SilentAwareConsole(MarkupFreeConsole):
     """``Console`` that honors ``--silent`` at the print level.
 
     The instance is locked to ``stderr=True`` to preserve the contract that
     ``--silent`` runs emit JSON on stdout with nothing else; routing gated
     output to stdout would corrupt that channel.
+
+    It is also locked to ``markup=False``, matching ``make_console``: this
+    console renders workflow, agent and for-each iteration names, so a plain
+    string must not be parsed as styling (#406). Style with ``styled``.
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        # Lock stderr=True; everything else (highlight, width, etc.) is
-        # caller-tunable.
+        # Lock stderr=True and markup=False; everything else (highlight,
+        # width, etc.) is caller-tunable.
         kwargs.pop("stderr", None)
         super().__init__(stderr=True, **kwargs)
 
@@ -141,25 +148,59 @@ def close_file_logging() -> None:
         _file_handle = None
 
 
-def verbose_log(message: str, style: str = "dim") -> None:
+def verbose_log(message: str | Text, style: str = "dim") -> None:
     """Log a message if verbose mode is enabled.
 
     Args:
-        message: The message to log.
+        message: The message to log. A ``str`` is treated as literal text; a
+            ``Text`` (e.g. from ``styled``) keeps its styling. Accepting both
+            matters because an f-string renders a ``Text`` as its plain form,
+            silently discarding the styling a caller went out of its way to
+            build (#406).
         style: Rich style for the message.
     """
     from conductor.cli.app import is_verbose
 
+    # ``Text`` not an f-string for a plain ``str``: ``message`` is
+    # agent-supplied, and interpolating it into markup makes a bracketed token
+    # like ``[/nestedType]`` a closing tag and raises MarkupError (#382).
+    # ``style=`` does not disable markup parsing, so it is not a substitute.
+    renderable = message if isinstance(message, Text) else Text(message)
     if is_verbose():
-        # ``Text`` not an f-string: ``message`` is agent-supplied, and
-        # interpolating it into markup makes a bracketed token like
-        # ``[/nestedType]`` a closing tag and raises MarkupError (#382).
-        # ``style=`` does not disable markup parsing, so it is not a substitute.
-        from rich.text import Text
-
-        _verbose_console.print(Text(message), style=style)
+        _verbose_console.print(renderable, style=style)
     if _file_console is not None:
-        _file_console.print(message)
+        _file_console.print(renderable)
+
+
+def _is_scoped_bg_child(web_bg: bool, web_port: int) -> bool:
+    """Whether this invocation is genuinely the ``--web-bg`` child the launcher tracks.
+
+    ``web_bg=True`` (the CLI flag on *this* invocation) is authoritative on
+    its own. Otherwise, ``CONDUCTOR_WEB_BG=1`` alone is not — it is set on
+    the bg child's environment by ``bg_runner._build_bg_env`` and, being a
+    normal env var, is inherited by *every* descendant of that child, not
+    just the one process the launcher is watching. A workflow that shells
+    out (a ``type: script`` step, an agent's shell tool) and happens to
+    invoke a fresh, non-bg ``conductor run --web`` would otherwise inherit
+    ``CONDUCTOR_WEB_BG=1`` and be misidentified as the tracked bg child too
+    (see ``cli/self_run.py``'s docstring, which documents and relies on this
+    same inheritance for a different feature — issue #399).
+
+    Cross-checking ``CONDUCTOR_WEB_PORT`` (also set by ``_build_bg_env``,
+    to the exact port ``--web-port`` binds on the tracked child) against
+    this invocation's own *web_port* mirrors ``self_run.py``'s signal 2:
+    only the literal child ``_spawn_bg_child`` launched has both env vars
+    agreeing with its own port.
+    """
+    if web_bg:
+        return True
+    if os.environ.get("CONDUCTOR_WEB_BG") != "1":
+        return False
+    try:
+        inherited_port = int(os.environ.get("CONDUCTOR_WEB_PORT", ""))
+    except ValueError:
+        return False
+    return inherited_port == web_port
 
 
 def _describe_provider(provider: ProviderSettings) -> str:
@@ -215,8 +256,6 @@ def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
         agent_name: Name of the agent being executed.
         iteration: Current iteration number (1-indexed).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -261,8 +300,6 @@ def verbose_log_agent_complete(
         input_tokens: Input tokens used (if available).
         output_tokens: Output tokens generated (if available).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -301,8 +338,6 @@ def verbose_log_route(target: str) -> None:
     Args:
         target: The routing target.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -335,8 +370,6 @@ def verbose_log_section(title: str, content: str) -> None:
         title: Section title.
         content: Section content.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_full, is_verbose
 
     # Sections are detail-level: show on console only in FULL mode
@@ -351,17 +384,31 @@ def verbose_log_section(title: str, content: str) -> None:
         # ``[/nestedType]`` in ordinary technical prose would raise MarkupError
         # and kill the run (#382). ``Text`` rather than ``escape``: escaping is
         # not byte-exact for input that already contains a backslash before a
-        # bracket (``\[0-9\]+`` renders as ``[0-9\]+``). ``title`` is
-        # conductor-controlled, so it keeps its styling.
+        # bracket (``\[0-9\]+`` renders as ``[0-9\]+``).
+        #
+        # ``title`` is *not* conductor-controlled, as this comment used to
+        # claim. Its only non-constant caller passes ``Prompt for '<agent>'``,
+        # and inside a for-each group the engine rewrites that name to
+        # ``<agent>[<key>]`` where the key comes from the source item -- so a
+        # key of ``task1`` erased the iteration identity the qualified name
+        # exists to carry, and one of ``/etc/x`` killed the run from a logging
+        # call (#406). ``Panel`` parses its title with ``Text.from_markup``
+        # regardless of the console's ``markup=False``, so this has to be a
+        # ``Text``, not an f-string.
         _verbose_console.print(
-            Panel(Text(content), title=f"[cyan]{title}[/cyan]", border_style="dim")
+            Panel(
+                Text(content),
+                title=styled("[cyan]{}[/cyan]", title),
+                border_style="dim",
+            )
         )
 
     # File always gets full untruncated content
     if _file_console is not None:
         # Deliberately not escaped: ``_file_console`` has ``markup=False``, so
-        # escaping here would write literal backslashes into the log.
-        _file_console.print(Panel(content, title=title, border_style="dim"))
+        # escaping here would write literal backslashes into the log. The title
+        # still needs wrapping -- ``markup=False`` does not reach it.
+        _file_console.print(Panel(content, title=Text(title), border_style="dim"))
 
 
 def verbose_log_timing(operation: str, elapsed: float) -> None:
@@ -374,7 +421,7 @@ def verbose_log_timing(operation: str, elapsed: float) -> None:
     from conductor.cli.app import is_verbose
 
     if is_verbose():
-        _verbose_console.print(f"[dim]⏱ {operation}: {elapsed:.2f}s[/dim]")
+        _verbose_console.print(styled("[dim]⏱ {}: {:.2f}s[/dim]", operation, elapsed))
     if _file_console is not None:
         _file_console.print(f"⏱ {operation}: {elapsed:.2f}s")
 
@@ -386,8 +433,6 @@ def verbose_log_parallel_start(group_name: str, agent_count: int) -> None:
         group_name: Name of the parallel group.
         agent_count: Number of agents in the group.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -426,8 +471,6 @@ def verbose_log_parallel_agent_complete(
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -468,8 +511,6 @@ def verbose_log_parallel_agent_failed(
         exception_type: Type of exception.
         message: Error message.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -506,8 +547,6 @@ def verbose_log_agent_timeout(
         elapsed: Elapsed time in seconds.
         timeout_seconds: Configured timeout limit.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -544,8 +583,6 @@ def verbose_log_budget_exceeded(
         budget_mode: Active mode (``audit`` or ``enforce``).
         current_agent: Agent executing when the budget was exceeded.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -580,8 +617,6 @@ def verbose_log_parallel_summary(
         failure_count: Number of agents that failed.
         total_elapsed: Total elapsed time in seconds.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -630,8 +665,6 @@ def verbose_log_for_each_start(
         max_concurrent: Maximum concurrent executions.
         failure_mode: Failure mode (fail_fast, continue_on_error, all_or_nothing).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -670,8 +703,6 @@ def verbose_log_for_each_item_complete(
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -710,8 +741,6 @@ def verbose_log_for_each_item_failed(
         exception_type: Type of exception.
         message: Error message.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -750,8 +779,6 @@ def verbose_log_for_each_summary(
         failure_count: Number of items that failed.
         total_elapsed: Total elapsed time in seconds.
     """
-    from rich.text import Text
-
     from conductor.cli.app import is_verbose
 
     should_console = is_verbose()
@@ -825,7 +852,6 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
     )
 
     from rich.panel import Panel
-    from rich.text import Text
 
     for provider_name, meta in providers.items():
         if not isinstance(meta, dict):
@@ -862,25 +888,29 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
                 exc,
             )
 
-        header_bits = [f"[bold]{provider_name}[/bold]"]
+        header_bits = [styled("[bold]{}[/bold]", provider_name)]
         if pin:
-            header_bits.append(f"([dim]{pin}[/dim])")
+            header_bits.append(styled("([dim]{}[/dim])", pin))
         if maintainer:
-            header_bits.append(f"maintained by [dim]{maintainer}[/dim]")
-        header = " ".join(header_bits)
+            header_bits.append(styled("maintained by [dim]{}[/dim]", maintainer))
+        header = join(" ", header_bits)
 
-        body_lines = [f"⚠ Experimental provider in use: {header}"]
+        body_lines = [styled("⚠ Experimental provider in use: {}", header)]
         if limitations:
-            body_lines.append("Limitations: " + ", ".join(limitations) + ".")
-        body_lines.append("See [link]docs/providers/experimental.md[/link] for stability policy.")
+            body_lines.append(Text("Limitations: " + ", ".join(limitations) + "."))
+        body_lines.append(
+            Text.from_markup(
+                "See [link]docs/providers/experimental.md[/link] for stability policy."
+            )
+        )
 
-        # ``Text.from_markup`` rather than a markup-bearing string: this panel
-        # goes to both consoles, and ``_file_console`` has ``markup=False``, so
-        # a raw string would write ``[bold]``/``[dim]`` tags literally into the
-        # log instead of styling them. Resolving the markup once here renders
-        # identically on both sinks.
+        # Built as ``Text`` rather than a markup-bearing string: this panel
+        # goes to both consoles, and both have ``markup=False``, so a raw
+        # string would write ``[bold]``/``[dim]`` tags literally instead of
+        # styling them. Resolving the markup once here renders identically on
+        # both sinks.
         panel = Panel(
-            Text.from_markup("\n".join(body_lines)),
+            join("\n", body_lines),
             border_style="yellow",
             expand=False,
         )
@@ -1099,6 +1129,15 @@ class ConsoleEventSubscriber:
                     style="yellow",
                 )
 
+        elif t == "pricing_hook_silent":
+            models = d.get("models") or []
+            names = ", ".join(models) if models else "any model"
+            verbose_log(
+                f"  WARNING: the provider returned no live pricing for {names} — "
+                f"costs are estimates from the static pricing table",
+                style="yellow",
+            )
+
         elif t == "agent_tool_output_truncated":
             tool_name = d.get("tool_name", "?")
             original = d.get("original_chars", "?")
@@ -1126,6 +1165,22 @@ class ConsoleEventSubscriber:
                 f"  WARNING: retrying '{agent_name}' output ({kind}) "
                 f"— attempt {attempt}/{max_attempts}{detail}",
                 style="yellow",
+            )
+
+        elif t == "guidance_received":
+            pending = d.get("pending", 1)
+            verbose_log(
+                f"  Guidance received (pending: {pending}): {d.get('text', '')}",
+                style="cyan",
+            )
+
+        elif t == "guidance_applied":
+            source = d.get("source", "?")
+            agent_name = d.get("agent_name")
+            target = f" before '{agent_name}'" if agent_name else ""
+            verbose_log(
+                f"  Guidance applied ({source}){target}: {d.get('text', '')}",
+                style="cyan",
             )
 
 
@@ -1164,7 +1219,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
 
     _print()
     _print("=" * 60, style="dim")
-    _print("[bold cyan]Token Usage Summary[/bold cyan]")
+    _print(Text.from_markup("[bold cyan]Token Usage Summary[/bold cyan]"))
 
     # Token totals
     total_input = usage_data.get("total_input_tokens", 0)
@@ -1176,7 +1231,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
         _print(f"  Output: {total_output:,} tokens", style="dim")
         _print(f"  Total:  {total_tokens:,} tokens", style="dim")
     else:
-        _print("  [dim]No token data available[/dim]")
+        _print(Text.from_markup("  [dim]No token data available[/dim]"))
 
     # Cost breakdown
     total_cost = usage_data.get("total_cost_usd")
@@ -1195,7 +1250,7 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
 
     if total_cost is not None and total_cost > 0:
         _print()
-        _print("[bold cyan]Cost Breakdown:[/bold cyan]")
+        _print(Text.from_markup("[bold cyan]Cost Breakdown:[/bold cyan]"))
 
         for agent in agents:
             agent_cost = agent.get("cost_usd")
@@ -1209,16 +1264,39 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
         if unpriced_count:
             # Partial total: flag it so a silently-undercounted number is not
             # presented as complete (see #265).
-            _print(f"  [bold]Total: ~${total_cost:.4f}[/bold][yellow]{_unpriced_suffix()}[/yellow]")
-            _print("  [dim]Partial total — some agents' models had no available pricing.[/dim]")
+            _print(
+                styled(
+                    "  [bold]Total: ~${:.4f}[/bold][yellow]{}[/yellow]",
+                    total_cost,
+                    _unpriced_suffix(),
+                )
+            )
+            _print(
+                Text.from_markup(
+                    "  [dim]Partial total — some agents' models had no available pricing.[/dim]"
+                )
+            )
         else:
-            _print(f"  [bold]Total: ${total_cost:.4f}[/bold]")
+            _print(styled("  [bold]Total: ${:.4f}[/bold]", total_cost))
     elif total_tokens > 0:
         _print()
         if unpriced_count:
-            _print(f"  [dim]Cost data unavailable{_unpriced_suffix()}[/dim]")
+            _print(styled("  [dim]Cost data unavailable{}[/dim]", _unpriced_suffix()))
         else:
-            _print("  [dim]Cost data unavailable (unknown model pricing)[/dim]")
+            _print(Text.from_markup("  [dim]Cost data unavailable (unknown model pricing)[/dim]"))
+
+    # The provider priced nothing this run, so every figure above that has a
+    # cost came from the static table. Without this the summary prints a
+    # confident number and the explanation goes only to stderr, where
+    # ``--web-bg`` writes it to a temp file nobody was told to read.
+    if usage_data.get("live_pricing_degraded"):
+        _print(
+            Text.from_markup(
+                "  [yellow]Live pricing unavailable for every model this run.[/yellow]"
+                "[dim] Costs shown are estimates from the static pricing table; "
+                "set `cost.pricing` in the workflow to supply rates.[/dim]"
+            )
+        )
 
     _print("=" * 60, style="dim")
 
@@ -1261,6 +1339,46 @@ def parse_input_flags(raw_inputs: list[str]) -> dict[str, Any]:
     return inputs
 
 
+def parse_input_json_flags(raw_inputs: list[str]) -> dict[str, Any]:
+    """Parse ``--input-json name=value`` flags, strictly JSON-decoding each value.
+
+    This is the Fleet Manager's background-launch typed transport (hidden,
+    internal-only flag): ``bg_runner.py::launch_background`` forwards
+    already-declared-type-coerced values here, JSON-encoded by
+    ``_serialize_input_value``, so they must be decoded with
+    :func:`coerce_typed_value` (strict ``json.loads``) rather than the
+    public ``--input`` heuristic in :func:`coerce_value`, which would
+    reinterpret an already-typed value (e.g. re-guess a JSON-quoted string).
+
+    Args:
+        raw_inputs: List of "name=value" strings, each value JSON-encoded.
+
+    Returns:
+        Dictionary of parsed input name-value pairs.
+
+    Raises:
+        typer.BadParameter: If the format is invalid or a value is not
+            valid JSON.
+    """
+    inputs: dict[str, Any] = {}
+
+    for raw in raw_inputs:
+        if "=" not in raw:
+            raise typer.BadParameter(
+                f"Invalid input-json format: '{raw}'. Expected format: name=value"
+            )
+
+        name, value = raw.split("=", 1)
+        name = name.strip()
+
+        if not name:
+            raise typer.BadParameter(f"Empty input name in: '{raw}'")
+
+        inputs[name] = coerce_typed_value(value)
+
+    return inputs
+
+
 def parse_metadata_flags(raw_metadata: list[str]) -> dict[str, str]:
     """Parse --metadata key=value flags into a dictionary.
 
@@ -1296,8 +1414,49 @@ def parse_metadata_flags(raw_metadata: list[str]) -> dict[str, str]:
     return result
 
 
+def parse_guidance_flags(raw_guidance: list[str]) -> list[str]:
+    """Validate ``--guidance`` flags, mirroring ``POST /api/guidance``.
+
+    ``resume --guidance`` calls :meth:`WorkflowEngine.add_user_guidance`
+    directly rather than going through the HTTP endpoint, so without this it
+    would skip the non-empty/length checks that endpoint enforces (issue
+    #400 review). Validating here — at the CLI boundary, before any
+    checkpoint restore or background-process fork — gives the same
+    ``typer.BadParameter`` treatment ``--metadata`` gets rather than letting
+    an empty or oversized entry reach the engine.
+
+    Args:
+        raw_guidance: List of raw ``--guidance`` values from the CLI.
+
+    Returns:
+        The stripped, validated guidance texts, in the order given.
+
+    Raises:
+        typer.BadParameter: If any entry is empty after stripping, or
+            exceeds :data:`conductor.engine.guidance.MAX_GUIDANCE_CHARS`.
+    """
+    from conductor.engine.guidance import validate_guidance_text
+
+    result: list[str] = []
+    for raw in raw_guidance:
+        try:
+            result.append(validate_guidance_text(raw))
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+    return result
+
+
 def coerce_value(value: str) -> Any:
     """Coerce a string value to an appropriate Python type.
+
+    This is the public ``--input``/``--input.*`` parsing heuristic used for
+    values a user types directly on the command line -- it must not change,
+    since it is a public, backward-compatibility-sensitive contract (e.g.
+    ``1e3``, ``NaN``, ``Infinity``, and an already-JSON-quoted string like
+    ``'"true"'`` all have established meanings here that differ from strict
+    JSON). The Fleet Manager's background launch path has its own strict,
+    unambiguous typed transport instead of reusing this heuristic -- see
+    :func:`coerce_typed_value` and ``--input-json``.
 
     Args:
         value: The string value to coerce.
@@ -1332,6 +1491,33 @@ def coerce_value(value: str) -> Any:
 
     # Return as string
     return value
+
+
+def coerce_typed_value(value: str) -> Any:
+    """Strictly decode a JSON-encoded typed value.
+
+    Used only for the Fleet Manager's background-launch input transport
+    (the ``--input-json`` flag, populated by
+    ``bg_runner.py::launch_background`` from already-declared-type-coerced
+    values). Unlike :func:`coerce_value`'s public, user-facing heuristic,
+    this never guesses: the value was JSON-encoded by the sender (see
+    ``cli/bg_runner.py::_serialize_input_value``), so it is JSON-decoded
+    verbatim here, with no ambiguity between e.g. the string ``"true"`` and
+    the boolean ``true``.
+
+    Args:
+        value: A JSON-encoded string, e.g. ``'"true"'`` or ``'42'``.
+
+    Returns:
+        The decoded value.
+
+    Raises:
+        typer.BadParameter: If ``value`` is not valid JSON.
+    """
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        raise typer.BadParameter(f"Invalid --input-json value: {value!r} ({e})") from None
 
 
 class InputCollector:
@@ -1570,6 +1756,11 @@ def _print_loaded_instructions(detailed: list[DiscoveredInstruction]) -> None:
     from conductor.config.instructions import ALWAYS_ON_SCOPE
 
     if not detailed:
+        # Plain strings on the builtin ``print``: this goes to stderr as a
+        # grep label, not through a Rich console. Wrapping it in
+        # ``Text.from_markup`` would delete the ``[workspace-instructions]``
+        # prefix outright — it starts with a lowercase letter, so Rich reads
+        # it as a style tag, and ``print`` then renders the Text's plain form.
         print("[workspace-instructions] 0 files discovered from CWD.", file=sys.stderr)
         return
     print(
@@ -1583,6 +1774,143 @@ def _print_loaded_instructions(detailed: list[DiscoveredInstruction]) -> None:
             f"    source={d.source}  reason={d.reason}{scope_part}",
             file=sys.stderr,
         )
+
+
+def _derive_run_mode(*, web: bool, web_bg: bool) -> RunMode:
+    """Derive the fleet run-record ``mode`` field from web/web-bg flags.
+
+    Mirrors the ``bg_mode`` expression used elsewhere in this module to
+    configure ``WebDashboard`` and ``RunContext.bg_mode`` (the ``web_bg``
+    CLI flag OR the ``CONDUCTOR_WEB_BG`` env var set on a ``--web-bg``
+    detached child), so a run is never ``"fg-web"`` from the dashboard's
+    perspective but ``"bg"`` from the run record's.
+
+    Returns:
+        ``"bg"`` for a background run (D1 never prompts for stop
+        confirmation on these), ``"fg-web"`` for a foreground run with a
+        dashboard, or ``"fg"`` for a plain foreground run.
+    """
+    if web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1":
+        return "bg"
+    return "fg-web" if web else "fg"
+
+
+def _write_run_record_for_current_process(
+    *,
+    event_log_subscriber: Any,
+    dashboard: Any,
+    workflow_path: Path,
+    web: bool,
+    web_bg: bool,
+) -> None:
+    """Write (or replace) this process's Fleet Manager run record.
+
+    Called from both ``run_workflow_async`` and ``resume_workflow_async``
+    (Fleet Manager E2 — see
+    ``docs/projects/fleet-manager/fleet-manager.design.md``) once
+    ``run_id``, ``event_log_path``, and the dashboard's actual port (if
+    any) are all known, so every execution path — foreground, foreground
+    with a dashboard, background, and resumed — produces a discoverable
+    record, closing the design's blocking problem that only ``--web-bg``
+    runs used to be visible.
+
+    A resumed run reuses ``event_log_subscriber.run_id`` (the checkpoint's
+    ``existing_run_id`` when available), so calling this again for the
+    same ``run_id`` *replaces* the prior record (``write_run_record``'s
+    ``os.replace``) rather than creating a second one.
+
+    ``workflow_name`` is derived from ``workflow_path.stem`` rather than
+    the YAML-declared ``config.workflow.name`` — the two can differ, and
+    ``CheckpointManager`` names checkpoint files after the workflow file's
+    stem (``engine/checkpoint.py`` uses ``workflow_path.stem`` for both
+    the checkpoint filename prefix and the periodic-checkpoint glob), so a
+    fleet consumer resolving *this run's* checkpoints via
+    ``workflow_name`` + ``run_id`` needs the same stem or the lookup silently
+    finds nothing.
+
+    Never raises: a failure to write this diagnostic/discovery record must
+    not abort the workflow it describes.
+    """
+    from conductor.cli.self_run import SELF_RUN_ID_ENV
+    from conductor.engine.checkpoint import CheckpointManager
+    from conductor.fleet.records import RunRecord, write_run_record
+
+    # Export the id so descendants inherit it. This is what makes `stop`'s
+    # self-exclusion signal 1 work for a *foreground* run: signal 2 is
+    # bg-only by definition and signal 3 walks `/proc`, so without this a fg
+    # run has no self-detection at all off Linux, and an agent step running
+    # `conductor stop --all` terminates its own workflow (issue #399). Set
+    # before the write so it holds even if the write fails.
+    os.environ[SELF_RUN_ID_ENV] = event_log_subscriber.run_id
+
+    try:
+        write_run_record(
+            RunRecord(
+                run_id=event_log_subscriber.run_id,
+                pid=os.getpid(),
+                workflow_path=str(workflow_path),
+                workflow_name=workflow_path.stem,
+                started_at=datetime.now(UTC).isoformat(),
+                event_log_path=str(event_log_subscriber.path),
+                port=(dashboard.port if dashboard is not None else None),
+                mode=_derive_run_mode(web=web, web_bg=web_bg),
+                checkpoint_dir=str(CheckpointManager.get_checkpoints_dir()),
+            )
+        )
+    except Exception as exc:
+        logger.warning("Failed to write fleet run record", exc_info=True)
+        # Conductor installs no logging handlers, so the line above reaches
+        # `logging.lastResort` as unattributed stderr. Without the record
+        # this run is invisible to `stop`/`status`/`fleet list`, i.e.
+        # silently back to the bug the run record exists to fix, so say so
+        # where the user will see it. (Under --web-bg the child's stderr is
+        # itself a temp log the parent captures -- this exact warning line
+        # is what the parent's `bg_runner._finalize_background_launch`
+        # points at via `_tail_log` when its own run-record poll times out.
+        # That gate no longer fails the launch over a missing record --
+        # issue #435 downgraded it to a warning, surfaced via
+        # `cli/app.py::_print_web_bg_no_run_record_notice` -- because the
+        # child may be executing perfectly normally; this line is what
+        # actually carries the underlying cause into the captured bg
+        # stderr log for the user to find.)
+        #
+        # Guarded with BaseException, not Exception: rich turns a broken
+        # pipe into `SystemExit` (`Console._on_broken_pipe`), which would
+        # sail past every `except Exception` between here and the top of
+        # `conductor run` and kill the workflow this diagnostic describes --
+        # breaking this function's "never raises" contract. A full disk
+        # triggers both halves at once: the record write fails *and* the
+        # stderr write fails.
+        try:
+            make_console(stderr=True).print(
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] could not write this run's fleet "
+                    "record ({}). It will not appear in `conductor status` / `fleet list` "
+                    "and cannot be stopped with `conductor stop`; use Ctrl-C or `kill {}`.",
+                    exc,
+                    os.getpid(),
+                )
+            )
+        except BaseException:  # noqa: BLE001 - a diagnostic must not kill the run
+            logger.debug("Could not print the run-record warning", exc_info=True)
+
+
+def _remove_run_record_for_current_process_safe() -> None:
+    """Remove this process's Fleet Manager run record, tolerating failure.
+
+    Wraps ``conductor.fleet.records.remove_run_record_for_current_process``
+    so a failure while scanning/removing the record (e.g. a permission
+    error creating/reading ``run_records_dir()``) cannot abort the rest of
+    the caller's ``finally`` block — stopping the dashboard, closing the
+    event log, and closing file logging must still happen even when this
+    diagnostic/discovery cleanup step fails.
+    """
+    from conductor.fleet.records import remove_run_record_for_current_process
+
+    try:
+        remove_run_record_for_current_process()
+    except Exception:
+        logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
 async def run_workflow_async(
@@ -1636,7 +1964,9 @@ async def run_workflow_async(
             init_file_logging(log_file)
         except OSError as e:
             _verbose_console.print(
-                f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_file, e
+                )
             )
 
     # Always create event emitter and JSONL log subscriber
@@ -1656,19 +1986,6 @@ async def run_workflow_async(
             workflow_root=Path(workflow_path).resolve().parent,
         )
 
-        try:
-            await dashboard.start()
-            from conductor.cli.app import is_verbose
-
-            if is_verbose():
-                _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
-        except Exception as e:
-            _verbose_console.print(
-                f"[bold yellow]Warning:[/bold yellow] "
-                f"Dashboard failed to start: {e}. Continuing without dashboard."
-            )
-            dashboard = None
-
     try:
         # Log workflow loading
         verbose_log(f"Loading workflow: {workflow_path}")
@@ -1687,11 +2004,78 @@ async def run_workflow_async(
         verbose_log(f"Entry point: {config.workflow.entry_point}")
         verbose_log(f"Agents: {len(config.agents)}")
 
+        # Start the dashboard only after config validation succeeds — never
+        # before. Binding the port before ``load_config`` meant a workflow
+        # that fails to even parse still left a live socket that
+        # ``--web-bg``'s launcher (and a concurrent ``conductor status``)
+        # would read as "started" (issue #410). Deliberately placed here
+        # rather than after ``_build_mcp_servers`` / plugin prefetch below:
+        # those can take tens of seconds (git clone), and the launcher's own
+        # port-reachability probe must not have to wait them out.
+        if dashboard is not None:
+            try:
+                await dashboard.start()
+                from conductor.cli.app import is_verbose
+
+                if is_verbose():
+                    _verbose_console.print(
+                        styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
+                    )
+            except Exception as e:
+                # Never leave ``dashboard`` pointing at one whose ``start()``
+                # failed — set this *before* the bg_mode branch below so the
+                # unconditional ``finally: dashboard.stop()`` further down
+                # can't await a serve task that never came up. Awaiting it
+                # would re-raise the same underlying failure (or worse, a
+                # bare ``SystemExit`` from uvicorn's own bind-failure path,
+                # which isn't even an ``Exception`` and would escape the
+                # CLI's error handler) and silently replace the informative
+                # RuntimeError below with that raw exception instead.
+                dashboard = None
+                if _is_scoped_bg_child(web_bg, web_port):
+                    # In a ``--web-bg`` child, silently continuing without a
+                    # dashboard would leave the port never reachable, which
+                    # the launcher's own probe (``bg_runner._wait_for_server``)
+                    # interprets as either a false success (fast workflow) or
+                    # a reason to kill an otherwise-healthy long-running
+                    # workflow (issue #410) — neither of which reports the
+                    # real cause. Propagate instead so the child exits
+                    # non-zero and the launcher's existing "process exited"
+                    # path surfaces this actual error via the stderr log.
+                    raise RuntimeError(f"Dashboard failed to start: {e}") from e
+                _verbose_console.print(
+                    styled(
+                        "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
+                        "start: {}. Continuing without dashboard.",
+                        e,
+                    )
+                )
+
         # Start JSONL event log subscriber (always-on structured diagnostics)
         from conductor.engine.event_log import EventLogSubscriber
 
         event_log_subscriber = EventLogSubscriber(config.workflow.name)
         emitter.subscribe(event_log_subscriber.on_event)
+
+        # Write the Fleet Manager run record (E2): this is the first point
+        # where run_id, event_log_path, and the already-started dashboard's
+        # port (dashboard.start() ran earlier, above, before this try block)
+        # are all available.
+        _write_run_record_for_current_process(
+            event_log_subscriber=event_log_subscriber,
+            dashboard=dashboard,
+            workflow_path=workflow_path,
+            web=web,
+            web_bg=web_bg,
+        )
+
+        # Opportunistic event-log retention sweep (E5 — D3). Best-effort and
+        # settings-driven (enabled by default, keep_last = 200): never
+        # raises, and the design measured a full 1522-file scan at
+        # ~0.136s, so this cannot meaningfully delay a run.
+        from conductor.fleet.retention import maybe_prune_event_logs
+
+        maybe_prune_event_logs()
 
         # Subscribe console output to the event emitter
         console_subscriber = ConsoleEventSubscriber()
@@ -1800,11 +2184,20 @@ async def run_workflow_async(
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            # Share the guidance sink with the dashboard so POST /api/guidance
+            # can push mid-run text into the engine (issue #400). Unlike
+            # set_interrupt_event this doesn't need interrupt_event -- a plain
+            # --web run with no keyboard listener still accepts guidance.
+            if dashboard is not None:
+                dashboard.set_guidance_sink(engine.submit_guidance)
+
             terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
                     await listener.start()
-                    _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    _verbose_console.print(
+                        Text.from_markup("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    )
 
                 result = await _run_with_stop_signal(engine, inputs, dashboard)
             except WorkflowTerminated as exc:
@@ -1855,14 +2248,17 @@ async def run_workflow_async(
 
                     if is_verbose():
                         banner = (
-                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            Text.from_markup("[bold yellow]Workflow terminated.[/bold yellow]")
                             if terminate_exc is not None
-                            else "[bold green]Workflow complete.[/bold green]"
+                            else Text.from_markup("[bold green]Workflow complete.[/bold green]")
                         )
                         _verbose_console.print(
-                            f"\n{banner} "
-                            f"Dashboard still running at {dashboard.url} — "
-                            f"press [bold]Ctrl+C[/bold] to exit."
+                            styled(
+                                "\n{} Dashboard still running at {} — press "
+                                "[bold]Ctrl+C[/bold] to exit.",
+                                banner,
+                                dashboard.url,
+                            )
                         )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
@@ -1873,12 +2269,15 @@ async def run_workflow_async(
                 raise terminate_exc
             return result
     finally:
-        # Clean up PID file if this is a background child process
-        is_bg_child = os.environ.get("CONDUCTOR_WEB_BG") == "1"
-        if is_bg_child:
-            from conductor.cli.pid import remove_pid_file_for_current_process
-
-            remove_pid_file_for_current_process()
+        # Clean up the Fleet Manager run record on every exit path (E2 —
+        # normal completion, an explicit WorkflowTerminated re-raise, or an
+        # unexpected exception all funnel through this finally). Unlike the
+        # legacy PID file (removed only by a background child), this runs
+        # unconditionally: foreground and foreground-with-dashboard runs now
+        # write a record too and must remove it on exit just the same.
+        # Guarded (never raises) so a failure here cannot prevent the
+        # dashboard/event-log/file-logging cleanup below from running.
+        _remove_run_record_for_current_process_safe()
 
         # Stop dashboard if it was started
         if dashboard is not None:
@@ -1887,25 +2286,27 @@ async def run_workflow_async(
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
             event_log_subscriber.close()
-            _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+            _verbose_console.print(
+                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+            )
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
-            _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
+            _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
         close_file_logging()
 
 
-def format_routes(routes: list[dict[str, Any]]) -> str:
+def format_routes(routes: list[dict[str, Any]]) -> Text:
     """Format routes for display in the dry-run table.
 
     Args:
         routes: List of route dictionaries with 'to', 'when', and 'is_conditional' keys.
 
     Returns:
-        Formatted string representation of routes.
+        Formatted representation of routes.
     """
     if not routes:
-        return "[dim]$end[/dim]"
+        return Text.from_markup("[dim]$end[/dim]")
 
     parts = []
     for route in routes:
@@ -1914,10 +2315,12 @@ def format_routes(routes: list[dict[str, Any]]) -> str:
             # Truncate long conditions
             if len(condition) > 40:
                 condition = condition[:37] + "..."
-            parts.append(f"→ {route['to']} [dim](if {condition})[/dim]")
+            parts.append(styled("→ {} [dim](if {})[/dim]", route["to"], condition))
         else:
             parts.append(f"→ {route['to']}")
-    return "\n".join(parts) if parts else "[dim]$end[/dim]"
+    # ``parts`` cannot be empty: ``routes`` is non-empty past the guard above
+    # and every iteration appends.
+    return join("\n", parts)
 
 
 def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) -> None:
@@ -1930,17 +2333,21 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
         plan: The execution plan to display.
         console: Optional Rich console. Creates one if not provided.
     """
-    output_console = console if console is not None else Console()
+    output_console = console if console is not None else make_console()
 
     # Header panel with workflow metadata
     timeout_display = f"{plan.timeout_seconds}s" if plan.timeout_seconds else "unlimited"
-    header_content = (
-        f"[bold]Workflow:[/bold] {plan.workflow_name}\n"
-        f"[bold]Entry Point:[/bold] {plan.entry_point}\n"
-        f"[bold]Max Iterations:[/bold] {plan.max_iterations}\n"
-        f"[bold]Timeout:[/bold] {timeout_display}"
+    header_content = styled(
+        "[bold]Workflow:[/bold] {}\n[bold]Entry Point:[/bold] "
+        "{}\n[bold]Max Iterations:[/bold] {}\n[bold]Timeout:[/bold] {}",
+        plan.workflow_name,
+        plan.entry_point,
+        plan.max_iterations,
+        timeout_display,
     )
-    output_console.print(Panel(header_content, title="[cyan]Execution Plan (Dry Run)[/cyan]"))
+    output_console.print(
+        Panel(header_content, title=Text.from_markup("[cyan]Execution Plan (Dry Run)[/cyan]"))
+    )
 
     # Steps table
     table = Table(title="Agent Sequence", show_lines=True)
@@ -1952,17 +2359,23 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
 
     for i, step in enumerate(plan.steps, 1):
         routes_str = format_routes(step.routes)
-        loop_marker = " [yellow](loop target)[/yellow]" if step.is_loop_target else ""
+        # Interpolated via ``styled`` rather than an f-string at the two call
+        # sites below: an f-string renders a ``Text`` as its plain form, which
+        # would silently drop the yellow that makes a loop target stand out
+        # from the agent names around it (#406).
+        loop_marker = (
+            Text.from_markup(" [yellow](loop target)[/yellow]") if step.is_loop_target else ""
+        )
 
         # Handle parallel groups differently
         if step.agent_type == "parallel_group":
             # Show parallel group with failure mode
             failure_mode_display = step.failure_mode or "fail_fast"
-            model_info = f"[dim]{failure_mode_display}[/dim]"
+            model_info = styled("[dim]{}[/dim]", failure_mode_display)
 
             table.add_row(
                 str(i),
-                f"{step.agent_name}{loop_marker}",
+                styled("{}{}", step.agent_name, loop_marker),
                 step.agent_type,
                 model_info,
                 routes_str,
@@ -1970,12 +2383,12 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
 
             # Add a detail row showing which agents execute in parallel
             if step.parallel_agents:
-                agents_display = ", ".join(
-                    f"[cyan]{agent}[/cyan]" for agent in step.parallel_agents
+                agents_display = join(
+                    ", ", (styled("[cyan]{}[/cyan]", agent) for agent in step.parallel_agents)
                 )
                 table.add_row(
                     "",
-                    f"[dim]  ⚡ {agents_display}[/dim]",
+                    styled("[dim]  ⚡ {}[/dim]", agents_display),
                     "",
                     "",
                     "",
@@ -1983,9 +2396,9 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
         else:
             table.add_row(
                 str(i),
-                f"{step.agent_name}{loop_marker}",
+                styled("{}{}", step.agent_name, loop_marker),
                 step.agent_type,
-                step.model or "[dim]default[/dim]",
+                step.model or Text.from_markup("[dim]default[/dim]"),
                 routes_str,
             )
 
@@ -1999,15 +2412,15 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
     )
 
     summary_parts = [
-        f"[dim]Total steps:[/dim] {len(plan.steps)}",
-        f"[dim]Loop targets:[/dim] {sum(1 for s in plan.steps if s.is_loop_target)}",
+        styled("[dim]Total steps:[/dim] {}", len(plan.steps)),
+        styled("[dim]Loop targets:[/dim] {}", sum(1 for s in plan.steps if s.is_loop_target)),
     ]
 
     if parallel_group_count > 0:
-        summary_parts.append(f"[dim]Parallel groups:[/dim] {parallel_group_count}")
-        summary_parts.append(f"[dim]Parallel agents:[/dim] {total_parallel_agents}")
+        summary_parts.append(styled("[dim]Parallel groups:[/dim] {}", parallel_group_count))
+        summary_parts.append(styled("[dim]Parallel agents:[/dim] {}", total_parallel_agents))
 
-    output_console.print(" | ".join(summary_parts))
+    output_console.print(join(" | ", summary_parts))
 
 
 def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
@@ -2094,14 +2507,25 @@ def _print_resume_instructions(engine: WorkflowEngine) -> None:
         return
 
     _verbose_console.print()
-    _verbose_console.print(f"[bold yellow]Workflow state saved to:[/bold yellow] {checkpoint_path}")
     _verbose_console.print(
-        f"[bold yellow]Resume with:[/bold yellow] conductor resume --from {checkpoint_path}"
+        styled("[bold yellow]Workflow state saved to:[/bold yellow] {}", checkpoint_path)
+    )
+    _verbose_console.print(
+        styled(
+            "[bold yellow]Resume with:[/bold yellow] conductor resume --from {}", checkpoint_path
+        )
     )
     if engine.workflow_path is not None:
         _verbose_console.print(
-            f"[dim]Or resume latest checkpoint:[/dim] conductor resume {engine.workflow_path}"
+            styled(
+                "[dim]Or resume latest checkpoint:[/dim] conductor resume {}", engine.workflow_path
+            )
         )
+    _verbose_console.print(
+        Text.from_markup(
+            '[dim]Add guidance for the resumed run with:[/dim] --guidance "correction text"'
+        )
+    )
     _verbose_console.print()
 
 
@@ -2117,6 +2541,7 @@ async def resume_workflow_async(
     web_port: int = 0,
     web_bg: bool = False,
     metadata: dict[str, str] | None = None,
+    guidance: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resume a workflow from a checkpoint.
 
@@ -2145,6 +2570,11 @@ async def resume_workflow_async(
             disconnect.
         metadata: Optional CLI metadata to merge on top of YAML-declared
             metadata for the resumed run.
+        guidance: Optional mid-run guidance text(s) applied to the restored
+            context before the resumed agent runs (issue #400). Applied via
+            ``engine.add_user_guidance(text, source="cli")`` for each entry,
+            in order, before the dashboard's ``workflow_started`` is
+            prepended so the seeded history reflects the applied guidance.
 
     Returns:
         The workflow output as a dictionary.
@@ -2167,7 +2597,9 @@ async def resume_workflow_async(
             init_file_logging(log_file)
         except OSError as e:
             _verbose_console.print(
-                f"[bold yellow]Warning:[/bold yellow] Cannot open log file {log_file}: {e}"
+                styled(
+                    "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_file, e
+                )
             )
 
     # Always create event emitter and JSONL log subscriber (parity with run)
@@ -2210,9 +2642,11 @@ async def resume_workflow_async(
         current_hash = CheckpointManager.compute_workflow_hash(resolved_workflow_path)
         if current_hash != cp.workflow_hash:
             _verbose_console.print(
-                "[bold yellow]⚠ Warning:[/bold yellow] "
-                "Workflow file has changed since checkpoint was created. "
-                "Resume may produce unexpected results."
+                Text.from_markup(
+                    "[bold yellow]⚠ Warning:[/bold yellow] "
+                    "Workflow file has changed since checkpoint was created. "
+                    "Resume may produce unexpected results."
+                )
             )
 
         # Log checkpoint details
@@ -2338,6 +2772,23 @@ async def resume_workflow_async(
             )
             emitter.subscribe(event_log_subscriber.on_event)
 
+            # Write the Fleet Manager run record immediately, before any
+            # further setup (dashboard seeding, engine construction) that
+            # could take an arbitrary amount of time. `existing_log_path`
+            # was just reopened in append mode above, so it must be marked
+            # live as soon as possible -- otherwise a concurrent process's
+            # retention sweep (E5) could see it as an unreferenced,
+            # possibly-old event log and delete it out from under this
+            # resume. The final call below (after the dashboard's actual
+            # port is known) replaces this record rather than duplicating it.
+            _write_run_record_for_current_process(
+                event_log_subscriber=event_log_subscriber,
+                dashboard=dashboard,
+                workflow_path=resolved_workflow_path,
+                web=web,
+                web_bg=web_bg,
+            )
+
             # Subscribe console output to the event emitter (parity with run)
             console_subscriber = ConsoleEventSubscriber()
             emitter.subscribe(console_subscriber.on_event)
@@ -2363,6 +2814,13 @@ async def resume_workflow_async(
             engine.set_context(restored_context)
             engine.set_limits(restored_limits)
 
+            # Apply any --guidance flags to the restored context before the
+            # dashboard is seeded, so the prepended workflow_started (which
+            # inserts at index 0) ends up before these guidance_applied
+            # events in history order (issue #400).
+            for guidance_text in guidance or []:
+                engine.add_user_guidance(guidance_text, source="cli")
+
             # Seed the dashboard with the original timeline so previously
             # completed agents remain visible. Order matters:
             #   1. Prepend a fresh ``workflow_started`` built from the
@@ -2376,7 +2834,26 @@ async def resume_workflow_async(
             #      resume — without this the dashboard would see two root
             #      starts and treat the live run as a child workflow.
             if dashboard is not None:
-                dashboard.prepend_workflow_started(await engine.build_workflow_started_data())
+                workflow_started_data = await engine.build_workflow_started_data()
+                dashboard.prepend_workflow_started(workflow_started_data)
+                # Persist a resume-generation marker directly to the JSONL
+                # log. The engine's own `workflow_started` emit is
+                # suppressed below (so the live dashboard doesn't see a
+                # duplicate root start) -- but that means a web-backed
+                # resume's *persisted* log would otherwise never record
+                # that a new execution attempt began here, leaving
+                # History's stale-terminal-state reset (E14 review round 1)
+                # unable to see it for a dashboard-backed resume (E14
+                # review round 2). Written directly to the subscriber,
+                # bypassing the emitter, so the dashboard is not handed a
+                # second copy of the same event.
+                from conductor.events import WorkflowEvent
+
+                event_log_subscriber.on_event(
+                    WorkflowEvent(
+                        type="workflow_started", timestamp=time.time(), data=workflow_started_data
+                    )
+                )
                 replayed = 0
                 if existing_log_path is not None:
                     replayed = dashboard.replay_events_from_jsonl(existing_log_path)
@@ -2396,28 +2873,81 @@ async def resume_workflow_async(
                     from conductor.cli.app import is_verbose
 
                     if is_verbose():
-                        _verbose_console.print(f"[bold cyan]Dashboard:[/bold cyan] {dashboard.url}")
+                        _verbose_console.print(
+                            styled("[bold cyan]Dashboard:[/bold cyan] {}", dashboard.url)
+                        )
                 except Exception as e:
-                    _verbose_console.print(
-                        f"[bold yellow]Warning:[/bold yellow] "
-                        f"Dashboard failed to start: {e}. Continuing without dashboard."
-                    )
-                    # Drop the dashboard everywhere it's been wired up.
-                    # The engine + DialogHandler captured it at construction
+                    # Drop the dashboard everywhere it's been wired up
+                    # *before* deciding whether to raise or warn — the
+                    # engine + DialogHandler captured it at construction
                     # time and would otherwise block waiting on a never-
-                    # running WebSocket for human gates / dialogs.
+                    # running WebSocket for human gates / dialogs. This
+                    # also ensures the unconditional
+                    # ``finally: dashboard.stop()`` further down can't await
+                    # a serve task that never came up, which would re-raise
+                    # the same underlying failure (or a bare ``SystemExit``
+                    # from uvicorn's bind-failure path) and silently replace
+                    # the informative RuntimeError below with that instead.
                     engine.clear_web_dashboard()
                     dashboard = None
+                    if _is_scoped_bg_child(web_bg, web_port):
+                        # Same reasoning as run_workflow_async: silently
+                        # continuing without a dashboard in a ``--web-bg``
+                        # child leaves the port never reachable, which the
+                        # launcher's probe reads as either a false success
+                        # or a reason to kill an otherwise-healthy resumed
+                        # workflow (issue #410). Propagate so the child
+                        # exits non-zero with the real cause.
+                        raise RuntimeError(f"Dashboard failed to start: {e}") from e
+                    _verbose_console.print(
+                        styled(
+                            "[bold yellow]Warning:[/bold yellow] Dashboard failed to "
+                            "start: {}. Continuing without dashboard.",
+                            e,
+                        )
+                    )
+
+            # Re-write the Fleet Manager run record (E2) now that the
+            # dashboard's actual resolved port (dashboard.start() — or its
+            # failure — has just been handled above) is known. An earlier
+            # call right after opening the event log subscriber already
+            # marked this run live (see the retention-race comment there);
+            # this one replaces that record with the final port value,
+            # rather than creating a second one for the same run.
+            _write_run_record_for_current_process(
+                event_log_subscriber=event_log_subscriber,
+                dashboard=dashboard,
+                workflow_path=resolved_workflow_path,
+                web=web,
+                web_bg=web_bg,
+            )
+
+            # Opportunistic event-log retention sweep (E5 — D3), mirroring
+            # run_workflow_async. Best-effort and settings-driven (enabled
+            # by default, keep_last = 200): never raises, and cannot
+            # meaningfully delay a resumed run.
+            from conductor.fleet.retention import maybe_prune_event_logs
+
+            maybe_prune_event_logs()
 
             # Share interrupt_event with dashboard so POST /api/stop can abort agents
             if dashboard is not None and interrupt_event is not None:
                 dashboard.set_interrupt_event(interrupt_event)
 
+            # Share the guidance sink with the dashboard so POST /api/guidance
+            # can push mid-run text into the engine (issue #400). Unlike
+            # set_interrupt_event this doesn't need interrupt_event -- a plain
+            # --web run with no keyboard listener still accepts guidance.
+            if dashboard is not None:
+                dashboard.set_guidance_sink(engine.submit_guidance)
+
             terminate_exc: WorkflowTerminated | None = None
             try:
                 if listener is not None:
                     await listener.start()
-                    _verbose_console.print("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    _verbose_console.print(
+                        Text.from_markup("[dim]Press Esc to interrupt and provide guidance[/dim]")
+                    )
 
                 result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
             except WorkflowTerminated as exc:
@@ -2468,14 +2998,17 @@ async def resume_workflow_async(
 
                     if is_verbose():
                         banner = (
-                            "[bold yellow]Workflow terminated.[/bold yellow]"
+                            Text.from_markup("[bold yellow]Workflow terminated.[/bold yellow]")
                             if terminate_exc is not None
-                            else "[bold green]Workflow complete.[/bold green]"
+                            else Text.from_markup("[bold green]Workflow complete.[/bold green]")
                         )
                         _verbose_console.print(
-                            f"\n{banner} "
-                            f"Dashboard still running at {dashboard.url} — "
-                            f"press [bold]Ctrl+C[/bold] to exit."
+                            styled(
+                                "\n{} Dashboard still running at {} — press "
+                                "[bold]Ctrl+C[/bold] to exit.",
+                                banner,
+                                dashboard.url,
+                            )
                         )
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.Event().wait()
@@ -2484,12 +3017,12 @@ async def resume_workflow_async(
                 raise terminate_exc
             return result
     finally:
-        # Clean up PID file if this is a background child process
-        is_bg_child = os.environ.get("CONDUCTOR_WEB_BG") == "1"
-        if is_bg_child:
-            from conductor.cli.pid import remove_pid_file_for_current_process
-
-            remove_pid_file_for_current_process()
+        # Clean up the Fleet Manager run record on every exit path (E2 —
+        # mirrors run_workflow_async so a resumed run's record is removed
+        # the same way a fresh run's is). Guarded (never raises) so a
+        # failure here cannot prevent the dashboard/event-log/file-logging
+        # cleanup below from running.
+        _remove_run_record_for_current_process_safe()
 
         # Stop dashboard if it was started
         if dashboard is not None:
@@ -2498,11 +3031,13 @@ async def resume_workflow_async(
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
             event_log_subscriber.close()
-            _verbose_console.print(f"[dim]Event log written to: {event_log_subscriber.path}[/dim]")
+            _verbose_console.print(
+                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+            )
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
-            _verbose_console.print(f"[dim]Log written to: {log_file}[/dim]")
+            _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
         close_file_logging()
 
 
@@ -2565,9 +3100,19 @@ async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str
         if entry.stale:
             # This line says the run used a plugin version nobody could
             # verify, so it gets the marker rather than reading as one more
-            # startup progress line.
-            detail = f"{detail} [yellow]⚠ cached; ref not re-checked[/yellow]"
-        verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
+            # startup progress line. Assembled in one ``styled`` call: an
+            # f-string would render the Text as its plain form and drop the
+            # yellow that makes it stand out.
+            verbose_log(
+                styled(
+                    "  {}: {} [yellow]⚠ cached; ref not re-checked[/yellow] — {} plugin(s)",
+                    name,
+                    detail,
+                    len(entry.marketplace.plugins),
+                )
+            )
+        else:
+            verbose_log(f"  {name}: {detail} — {len(entry.marketplace.plugins)} plugin(s)")
     return marketplaces_from(resolved)
 
 

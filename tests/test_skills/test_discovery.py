@@ -226,8 +226,12 @@ class TestWarnings:
         warnings: list[str] = []
         discover_skills(["personal"], home=home, on_warning=warnings.append)
         assert any("'personal' found no skills" in warning for warning in warnings)
-        # The searched locations are named so the user can see where to look.
-        assert any(".copilot/skills" in warning for warning in warnings)
+        # The searched locations are named so the user can see where to look. The message
+        # embeds repr() of the search list, which doubles backslashes on Windows.
+        searched = str(home / ".copilot" / "skills")
+        assert any(
+            searched in warning or searched.replace("\\", "\\\\") in warning for warning in warnings
+        )
 
     def test_source_that_finds_something_does_not_warn(self, home: Path) -> None:
         _make_skill(home / ".copilot" / "skills" / "alpha")

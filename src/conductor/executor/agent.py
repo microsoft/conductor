@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, get_args
@@ -532,20 +533,10 @@ class AgentExecutor:
         if not isinstance(output.content, dict):
             # Try to parse raw response as JSON if content is not a dict
             if output.raw_response and isinstance(output.raw_response, str):
-                output = AgentOutput(
-                    content=parse_json_output(output.raw_response),
-                    raw_response=output.raw_response,
-                    tokens_used=output.tokens_used,
-                    model=output.model,
-                )
+                output = dataclasses.replace(output, content=parse_json_output(output.raw_response))
             else:
                 # Wrap the content in a dict
-                output = AgentOutput(
-                    content={"result": output.content},
-                    raw_response=output.raw_response,
-                    tokens_used=output.tokens_used,
-                    model=output.model,
-                )
+                output = dataclasses.replace(output, content={"result": output.content})
 
         # Validate output against schema (skip for partial output from interrupts)
         if agent.output and not output.partial:

@@ -17,13 +17,18 @@ from conductor.aca_runner.server import create_app
 def main() -> None:
     """Run the runner's FastAPI app under uvicorn.
 
-    Binds to all interfaces by default (the process runs inside an Azure
-    Container Apps dynamic-sessions custom container, not on a developer's
-    machine). The port must match the custom container pool's configured
-    target port (``<TARGET_PORT>`` in the design's *API Contracts*) —
-    override both via `ACA_RUNNER_HOST` / `ACA_RUNNER_PORT` for local testing.
+    Binds loopback (``127.0.0.1``) by default (issue #396) — the safe
+    default for an ad-hoc local run, since a bare `python -m
+    conductor.aca_runner` should not listen on every interface. The
+    container image (`docker/aca-runner/Dockerfile`) sets
+    ``ACA_RUNNER_HOST=0.0.0.0`` explicitly: ACA must reach the port from
+    outside the container's network namespace, so that override is
+    load-bearing there, not redundant with this default. The port must
+    match the custom container pool's configured target port
+    (``<TARGET_PORT>`` in the design's *API Contracts*) — override both via
+    `ACA_RUNNER_HOST` / `ACA_RUNNER_PORT` for local testing.
     """
-    host = os.environ.get("ACA_RUNNER_HOST", "0.0.0.0")  # noqa: S104 - in-container by design
+    host = os.environ.get("ACA_RUNNER_HOST", "127.0.0.1")
     port = int(os.environ.get("ACA_RUNNER_PORT", "8080"))
     uvicorn.run(create_app(), host=host, port=port, log_level="info")
 

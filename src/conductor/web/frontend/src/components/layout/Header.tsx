@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
-import { Activity, Square, Play, X, Download, FileCode } from 'lucide-react';
+import { Activity, Square, Play, X, Download, FileCode, MessageSquarePlus } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { YamlViewer } from '@/components/layout/YamlViewer';
+import { GuidanceModal } from '@/components/dialogs/GuidanceModal';
+import { authHeaders } from '@/lib/auth';
 
 export function Header() {
   const workflowName = useWorkflowStore((s) => s.workflowName);
@@ -14,6 +16,7 @@ export function Header() {
   const [resuming, setResuming] = useState(false);
   const [killing, setKilling] = useState(false);
   const [showYaml, setShowYaml] = useState(false);
+  const [showGuidance, setShowGuidance] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
 
   // `ReplayDashboard` serves no /api/stop|resume|kill, so these controls
@@ -38,7 +41,10 @@ export function Header() {
     setPending(true);
     setControlError(null);
     try {
-      const res = await fetch(path, { method: 'POST' });
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      });
       // On success the pending flag stays set — the effect above clears it
       // once the run leaves the paused state.
       if (res.ok) return;
@@ -132,6 +138,19 @@ export function Header() {
             YAML
           </button>
         )}
+        {!replayMode && (
+          <button
+            onClick={() => setShowGuidance(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+              bg-[var(--surface-hover)] text-[var(--text-secondary)] border border-[var(--border)]
+              hover:text-[var(--text)] hover:bg-[var(--surface)]
+              transition-colors"
+            title="Send mid-run guidance to the workflow"
+          >
+            <MessageSquarePlus className="w-3 h-3" />
+            Guide
+          </button>
+        )}
         <a
           href="/api/logs"
           download="conductor-logs.json"
@@ -149,6 +168,7 @@ export function Header() {
       {showYaml && workflowYaml && (
         <YamlViewer yaml={workflowYaml} onClose={() => setShowYaml(false)} />
       )}
+      {showGuidance && <GuidanceModal onClose={() => setShowGuidance(false)} />}
     </header>
   );
 }

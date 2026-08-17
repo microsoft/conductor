@@ -3137,7 +3137,7 @@ class SkillInjectionConfig(BaseModel):
     have no progressive disclosure: :class:`~conductor.executor.agent.AgentExecutor`
     prepends every enabled skill's ``SKILL.md`` **plus its entire
     ``references/`` tree** to the rendered prompt, on every agent call and
-    every retry. The bundled ``conductor`` skill alone is ~117KB (~29K
+    every retry. The bundled ``conductor`` skill alone is ~132KB (~33K
     tokens), so an unbounded list is easy to turn into most of a context
     window by accident.
 
@@ -3149,7 +3149,7 @@ class SkillInjectionConfig(BaseModel):
         runtime:
             skill_injection:
                 warn_bytes: 65536     # warn above 64KB
-                max_bytes: 131072     # fail above 128KB
+                max_bytes: 163840     # fail above 160KB
     """
 
     # Frozen for the reason ``ProviderSettings`` documents: this model carries a
@@ -3162,16 +3162,22 @@ class SkillInjectionConfig(BaseModel):
     """Log a warning when injected skill content exceeds this many bytes.
 
     ``None`` disables the warning. The 64KB default is below the bundled
-    ``conductor`` skill's ~117KB so that combination is surfaced rather
+    ``conductor`` skill's ~132KB so that combination is surfaced rather
     than passing silently.
     """
 
-    max_bytes: int | None = Field(default=128 * 1024, ge=0)
+    max_bytes: int | None = Field(default=160 * 1024, ge=0)
     """Fail the agent when injected skill content exceeds this many bytes.
 
-    ``None`` disables the limit. The 128KB default is above the bundled
-    ``conductor`` skill's ~117KB, so enabling it does not break an
+    ``None`` disables the limit. The 160KB default is above the bundled
+    ``conductor`` skill's ~132KB, so enabling it does not break an
     existing single-skill workflow — it catches accumulation.
+
+    Raised from 128KB once the bundled skill grew past it: the ceiling was
+    chosen when that skill was ~117KB, and two independent documentation
+    additions carried it over. A default that the shipped skill fails is
+    not a limit, it is a broken workflow, so it tracks the skill with
+    headroom rather than pinning a number the content has outgrown.
     """
 
     @model_validator(mode="after")

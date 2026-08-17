@@ -2586,6 +2586,152 @@ class TestCopilotProviderResolvedModel:
         )
         assert result.resolved_model == self._RESOLVED_MODEL_FROM_SDK
 
+    @pytest.mark.asyncio
+    async def test_send_and_wait_sums_usage_across_multiple_calls(self) -> None:
+        """Three assistant.usage events accumulate for billing (#412);
+        last_call_input_tokens reflects only the final event."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        def _usage_event(input_tokens: int, output_tokens: int, call_id: str) -> Any:
+            ev = _Mock()
+            ev.type.value = "assistant.usage"
+            ev.data.input_tokens = input_tokens
+            ev.data.output_tokens = output_tokens
+            ev.data.cache_read_tokens = None
+            ev.data.cache_write_tokens = None
+            ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+            ev.data.api_call_id = call_id
+            return ev
+
+        usage_ev_1 = _usage_event(100, 50, "call-1")
+        usage_ev_2 = _usage_event(200, 75, "call-2")
+        usage_ev_3 = _usage_event(300, 25, "call-3")
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (usage_ev_1, usage_ev_2, usage_ev_3, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.input_tokens == 600
+        assert result.output_tokens == 150
+        assert result.last_call_input_tokens == 300
+
+    @pytest.mark.asyncio
+    async def test_send_and_wait_dedupes_repeated_api_call_id(self) -> None:
+        """Two events sharing one string api_call_id are counted once."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        def _usage_event(input_tokens: int, output_tokens: int, call_id: str) -> Any:
+            ev = _Mock()
+            ev.type.value = "assistant.usage"
+            ev.data.input_tokens = input_tokens
+            ev.data.output_tokens = output_tokens
+            ev.data.cache_read_tokens = None
+            ev.data.cache_write_tokens = None
+            ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+            ev.data.api_call_id = call_id
+            return ev
+
+        usage_ev_1 = _usage_event(100, 50, "same-call")
+        usage_ev_2 = _usage_event(100, 50, "same-call")  # repeat of the same call
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (usage_ev_1, usage_ev_2, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.input_tokens == 100
+        assert result.output_tokens == 50
+        assert result.last_call_input_tokens == 100
+
+    @pytest.mark.asyncio
+    async def test_send_and_wait_accumulates_events_without_api_call_id(self) -> None:
+        """Events with no api_call_id still accumulate normally."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        def _usage_event(input_tokens: int, output_tokens: int) -> Any:
+            ev = _Mock()
+            ev.type.value = "assistant.usage"
+            ev.data.input_tokens = input_tokens
+            ev.data.output_tokens = output_tokens
+            ev.data.cache_read_tokens = None
+            ev.data.cache_write_tokens = None
+            ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+            ev.data.api_call_id = None
+            return ev
+
+        usage_ev_1 = _usage_event(100, 50)
+        usage_ev_2 = _usage_event(200, 75)
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (usage_ev_1, usage_ev_2, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.input_tokens == 300
+        assert result.output_tokens == 125
+        assert result.last_call_input_tokens == 200
+
 
 # ---------------------------------------------------------------------------
 # Epic E9 (#284): forward a ``github_token`` to the Copilot SDK in memory
@@ -2768,3 +2914,207 @@ class TestGithubTokenSessionAuth:
 
         for record in caplog.records:
             assert "super-secret-gh-token" not in record.getMessage()
+
+
+class TestPricingSurvivesTheRealSDKShape:
+    """Guards the pricing hook against the SDK shape it actually receives (#386).
+
+    ``TestGetModelPricing`` builds its models from ``SimpleNamespace``, which
+    asserts what Conductor does with a billing object rather than whether the
+    SDK still hands it one. That is why #386 went unnoticed: 1.0.1's
+    hand-written ``client.ModelBilling`` declared only ``multiplier`` and its
+    ``from_dict`` dropped ``tokenPrices``, so the hook returned ``None`` for
+    every model while every fake-backed test stayed green.
+
+    These build the model through the SDK's own ``ModelInfo.from_dict``, so the
+    parser is the real one and a future SDK that stops carrying the field fails
+    here instead of silently reverting cost reporting to the static table.
+    """
+
+    @staticmethod
+    def _model_from_wire(payload: dict[str, Any]) -> Any:
+        from copilot.client import ModelInfo
+
+        return ModelInfo.from_dict(payload)
+
+    @pytest.mark.asyncio
+    async def test_the_sdk_still_parses_token_prices(self) -> None:
+        """The exact regression: ``tokenPrices`` must survive ``from_dict``."""
+        model = self._model_from_wire(
+            {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                # Required by ModelInfo.from_dict; only ``billing`` is under test here.
+                "capabilities": {},
+                "billing": {
+                    "multiplier": 1.0,
+                    "tokenPrices": {
+                        "batchSize": 1_000,
+                        "inputPrice": 1.5,
+                        "outputPrice": 7.5,
+                        "cachePrice": 0.15,
+                    },
+                },
+            }
+        )
+        token_prices = getattr(model.billing, "token_prices", None)
+        assert token_prices is not None, (
+            "SDK dropped billing.token_prices — the pricing hook now returns None for "
+            "every model and all cost falls back to the static table (see #386)"
+        )
+        assert token_prices.input_price == 1.5
+        assert token_prices.output_price == 7.5
+
+    @pytest.mark.asyncio
+    async def test_hook_prices_a_model_parsed_by_the_sdk(self) -> None:
+        """End to end: SDK-parsed model in, real USD rates out.
+
+        1.5 credits per 1,000 tokens is 1,500 credits per million, and at
+        100 credits to the dollar that is $15.00 per million input tokens.
+        """
+        model = self._model_from_wire(
+            {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                # Required by ModelInfo.from_dict; only ``billing`` is under test here.
+                "capabilities": {},
+                "billing": {
+                    "multiplier": 1.0,
+                    "tokenPrices": {
+                        "batchSize": 1_000,
+                        "inputPrice": 1.5,
+                        "outputPrice": 7.5,
+                    },
+                },
+            }
+        )
+
+        async def _list_models() -> list[Any]:
+            return [model]
+
+        provider = TestGetModelPricing._provider_with_list_models(_list_models)
+        pricing = await provider.get_model_pricing("claude-opus-5")
+
+        assert pricing is not None, "SDK-parsed billing data must yield live pricing"
+        assert pricing.input_per_mtok == pytest.approx(15.0)
+        assert pricing.output_per_mtok == pytest.approx(75.0)
+
+    @pytest.mark.asyncio
+    async def test_cache_rates_come_from_the_non_deprecated_fields(self) -> None:
+        """Copilot SDK >=1.0.9 splits the cached-token rate into read and write.
+
+        The hook read only ``cache_price``, which that release deprecates. A
+        model shipping just the replacements priced cache reads at $0.00 —
+        silently, and with every other figure correct, which is the #386
+        failure one field over.
+        """
+        model = self._model_from_wire(
+            {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                "capabilities": {},
+                "billing": {
+                    "tokenPrices": {
+                        "batchSize": 1_000,
+                        "inputPrice": 1.5,
+                        "outputPrice": 7.5,
+                        "cacheReadPrice": 0.15,
+                        "cacheWritePrice": 1.8,
+                    }
+                },
+            }
+        )
+
+        async def _list_models() -> list[Any]:
+            return [model]
+
+        provider = TestGetModelPricing._provider_with_list_models(_list_models)
+        pricing = await provider.get_model_pricing("claude-opus-5")
+
+        assert pricing is not None
+        assert pricing.cache_read_per_mtok == pytest.approx(1.5)
+        assert pricing.cache_write_per_mtok == pytest.approx(18.0)
+
+    @pytest.mark.asyncio
+    async def test_the_deprecated_cache_field_still_works(self) -> None:
+        """Kept as a fallback: an older payload must not lose its cache rate."""
+        model = self._model_from_wire(
+            {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                "capabilities": {},
+                "billing": {
+                    "tokenPrices": {
+                        "batchSize": 1_000,
+                        "inputPrice": 1.5,
+                        "outputPrice": 7.5,
+                        "cachePrice": 0.15,
+                    }
+                },
+            }
+        )
+
+        async def _list_models() -> list[Any]:
+            return [model]
+
+        provider = TestGetModelPricing._provider_with_list_models(_list_models)
+        pricing = await provider.get_model_pricing("claude-opus-5")
+
+        assert pricing is not None
+        assert pricing.cache_read_per_mtok == pytest.approx(1.5)
+
+
+class TestDefaultPermissionHandler:
+    """``approve_all`` does not always approve (Copilot SDK >=1.0.9).
+
+    It abstains with ``PermissionNoResult`` when the runtime sets
+    ``managed_approval_required`` on the request, and raises when managed
+    settings are enabled. Conductor is the only connected client, so an
+    abstention is never answered: the CLI blocks on a pending permission
+    request until idle recovery gives up minutes later and reports a timeout
+    that blames the network.
+
+    Nothing called this handler before — every reference asserted only that it
+    was passed to ``create_session`` — which is why the abstention went
+    unnoticed when the SDK floor moved.
+    """
+
+    @staticmethod
+    def _request(**fields: Any) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(tool_name="shell", **fields)
+
+    @staticmethod
+    def _handle(request: Any, invocation: dict[str, Any] | None = None) -> Any:
+        return CopilotProvider._default_permission_handler(
+            request, invocation or {"session_id": "s1"}
+        )
+
+    def test_an_ordinary_request_is_approved(self) -> None:
+        result = self._handle(self._request())
+        assert type(result).__name__ == "PermissionDecisionApproveOnce"
+
+    def test_managed_approval_is_declined_not_abstained(self) -> None:
+        """The load-bearing case: abstaining would hang the run."""
+        from copilot.session import PermissionNoResult
+
+        result = self._handle(self._request(managed_approval_required=True))
+
+        assert not isinstance(result, PermissionNoResult), (
+            "returning the SDK's abstention sentinel leaves the permission "
+            "request unanswered and blocks the CLI until the idle timeout"
+        )
+        assert type(result).__name__ == "PermissionDecisionUserNotAvailable"
+
+    def test_managed_settings_does_not_escape_as_an_exception(self) -> None:
+        """The SDK swallows exceptions from this callback onto its own logger.
+
+        An unguarded raise would surface as every tool being denied with no
+        reason Conductor ever states.
+        """
+        result = self._handle(
+            self._request(),
+            {"session_id": "s1", "managed_settings_enabled": True},
+        )
+        assert type(result).__name__ == "PermissionDecisionUserNotAvailable"

@@ -623,7 +623,9 @@ class TestScriptExecutorStdin:
             stdin="from-stdin",
         )
         output = await executor.execute(agent, {})
-        assert output.stdout == "from-args\nfrom-stdin"
+        # splitlines() rather than a literal "\n": the child's text-mode stdout emits
+        # "\r\n" on Windows, which is orthogonal to what this test asserts.
+        assert output.stdout.splitlines() == ["from-args", "from-stdin"]
         assert output.exit_code == 0
 
     @pytest.mark.asyncio

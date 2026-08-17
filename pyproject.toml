@@ -1,6 +1,6 @@
 [project]
 name = "conductor-cli"
-version = "0.1.27"
+version = "0.1.32"
 description = "A CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -37,7 +37,7 @@ dependencies = [
     "ruamel.yaml>=0.18.0",
     "jinja2>=3.1.0",
     "simpleeval>=1.0.0",
-    "github-copilot-sdk>=1.0.0",
+    "github-copilot-sdk>=1.0.9",
     "anthropic>=0.77.0,<1.0.0",
     "pydantic-ai>=1.44.0",
     "mcp>=1.28.1",
@@ -65,6 +65,13 @@ aca = [
     # via its own "aio" extra (aiohttp). Without it, constructing the
     # async credential raises ImportError at runtime (see aca.py).
     "azure-core[aio]>=1.29.0",
+]
+tui = [
+    # Floor is 8.x, not a looser bound: `BlockFooter` (fleet/tui/widgets.py)
+    # is written against 8.x `Footer` group rendering, and the
+    # `App.run_test()` / `Pilot` behavior every TUI pilot test depends on
+    # changed before it.
+    "textual>=8.0",
 ]
 
 [project.urls]
@@ -103,6 +110,9 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.8.0",
     "ty>=0.0.1a0",
+    # So Fleet Manager TUI pilot tests (App.run_test()) run in CI/dev without
+    # requiring an end user to install the `tui` extra just to run the suite.
+    "textual>=8.0",
 ]
 
 [tool.ruff]

@@ -3,8 +3,11 @@
 import json
 import time
 
+import pytest
+
 from conductor.engine.event_log import EventLogSubscriber
 from conductor.events import WorkflowEvent
+from conductor.run_id import is_valid_run_id
 
 
 class TestEventLogSubscriber:
@@ -64,7 +67,7 @@ class TestEventLogSubscriber:
         sub.close()
 
         parsed = json.loads(sub.path.read_text().strip())
-        assert parsed["data"]["path"] == "/some/path"
+        assert parsed["data"]["path"] == str(Path("/some/path"))
         assert parsed["data"]["raw"] == "bytes-data"
 
     def test_safe_after_close(self, tmp_path, monkeypatch):
@@ -78,6 +81,11 @@ class TestEventLogSubscriber:
 
     def test_filenames_unique_for_simultaneous_starts(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TMPDIR", str(tmp_path))
+        # A pinned CONDUCTOR_RUN_ID (e.g. from running this suite inside a
+        # --web-bg conductor session) would make every subscriber below
+        # adopt the same id and hence the same filename, defeating the
+        # very uniqueness this test checks.
+        monkeypatch.delenv("CONDUCTOR_RUN_ID", raising=False)
         subs = [EventLogSubscriber("same-workflow") for _ in range(3)]
         paths = [s.path for s in subs]
         # All paths must be distinct even when created in rapid succession
@@ -112,19 +120,27 @@ class TestEventLogSubscriber:
         finally:
             sub.close()
 
-    def test_lowercases_hex_run_id_from_env(self, tmp_path, monkeypatch):
-        """Mixed-case hex run ids are normalised to lowercase for filename consistency."""
+    def test_adopts_mixed_case_run_id_verbatim(self, tmp_path, monkeypatch):
+        """Mixed-case run ids are adopted verbatim, not folded to lowercase.
+
+        A resumed run reuses a checkpoint's ``run_id`` exactly as written
+        (see ``conductor.run_id``), and the parent's launch gate
+        (``cli/bg_runner.py::_finalize_background_launch``) polls for that
+        exact same key. Lowercasing it here would make the gate poll a key
+        this subscriber never actually writes its record/log under,
+        terminating a perfectly healthy resumed run (issue #435).
+        """
         monkeypatch.setenv("TMPDIR", str(tmp_path))
         monkeypatch.setenv("CONDUCTOR_RUN_ID", "ABCDEF01")
 
         sub = EventLogSubscriber("env-runid-case")
         try:
-            assert sub.run_id == "abcdef01"
+            assert sub.run_id == "ABCDEF01"
         finally:
             sub.close()
 
     def test_rejects_invalid_run_id_env(self, tmp_path, monkeypatch):
-        """Non-hex / overlong env values are rejected; a fresh random id is used.
+        """Non-path-safe / overlong env values are rejected; a fresh random id is used.
 
         This keeps the filename safe from accidental injection via the env
         var (e.g. path separators, control characters, very long values).
@@ -155,7 +171,7 @@ class TestEventLogSubscriber:
             sub.close()
 
     def test_accepts_32_char_hex_run_id(self, tmp_path, monkeypatch):
-        """Upper boundary: a 32-char hex string is the longest accepted run id."""
+        """Upper boundary: a 32-char hex string is well within the accepted length."""
         monkeypatch.setenv("TMPDIR", str(tmp_path))
         monkeypatch.setenv("CONDUCTOR_RUN_ID", "a" * 32)
 
@@ -166,21 +182,21 @@ class TestEventLogSubscriber:
         finally:
             sub.close()
 
-    def test_rejects_33_char_hex_run_id(self, tmp_path, monkeypatch):
-        """One past the upper boundary: 33-char hex is rejected, falls back to random.
+    def test_rejects_201_char_run_id(self, tmp_path, monkeypatch):
+        """One past the upper boundary: a 201-char id is rejected, falls back to random.
 
-        Guards against an accidental relaxation of the regex to ``{1,}``
-        or removal of the upper bound, which would let arbitrary-length
-        env values into the filename.
+        Guards against an accidental relaxation of the shared
+        ``conductor.run_id`` pattern's upper bound (200 characters), which
+        would let arbitrary-length env values into the filename.
         """
         import re
 
         monkeypatch.setenv("TMPDIR", str(tmp_path))
-        monkeypatch.setenv("CONDUCTOR_RUN_ID", "a" * 33)
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "a" * 201)
 
-        sub = EventLogSubscriber("env-runid-33")
+        sub = EventLogSubscriber("env-runid-201")
         try:
-            assert sub.run_id != "a" * 33
+            assert sub.run_id != "a" * 201
             assert re.fullmatch(r"[0-9a-f]{8}", sub.run_id), sub.run_id
         finally:
             sub.close()
@@ -310,3 +326,48 @@ class TestEventLogSubscriber:
         assert for_each["data"]["agent_name"] == "fan_agent[0]"
         assert for_each["data"]["item_key"] == "0"
         assert for_each["data"]["working_dir"] is None
+
+
+class TestRunIdContractAgreement:
+    """The subscriber's env-var adoption and ``conductor.run_id.is_valid_run_id`` agree.
+
+    Before issue #435, ``EventLogSubscriber`` enforced its own narrower
+    hex-only rule (and lowercased its input) while the fleet run-record
+    store enforced a broader one -- so a value the fleet considered a valid
+    run id could be silently rejected or reshaped here. This test makes
+    that kind of divergence unrepeatable: for any candidate, the subscriber
+    must adopt it verbatim if and only if the shared contract accepts it.
+    """
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            "deadbeef",
+            "DEADBEEF",
+            "custom-run_ID-42",
+            "a" * 200,
+            "a" * 201,
+            "run.id",
+            "foo/bar",
+            "..",
+            "",
+        ],
+    )
+    def test_env_run_id_adopted_iff_valid(self, tmp_path, monkeypatch, candidate):
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", candidate)
+
+        # Short workflow name: a 200-char run id plus a longer name/timestamp
+        # would overflow the filesystem's per-component filename limit
+        # (irrelevant to the contract this test is checking).
+        sub = EventLogSubscriber("w")
+        try:
+            if is_valid_run_id(candidate):
+                assert sub.run_id == candidate
+            else:
+                assert sub.run_id != candidate
+                import re
+
+                assert re.fullmatch(r"[0-9a-f]{8}", sub.run_id), sub.run_id
+        finally:
+            sub.close()

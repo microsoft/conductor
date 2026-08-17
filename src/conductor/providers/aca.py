@@ -5,11 +5,17 @@ shim implementing :class:`~conductor.providers.base.AgentProvider` that
 delegates agent execution to an in-sandbox ``conductor-agent-runner``
 process running inside an Azure Container Apps dynamic-sessions pool.
 
-The library is an optional dependency — install with:
-    pip install 'conductor-cli[aca]'
-(pins ``azure-identity`` plus ``azure-core[aio]`` — the latter supplies the
-``aiohttp``-based async transport the async ``DefaultAzureCredential`` in
-this module requires; ``azure-identity`` alone does not include one.)
+The library is an optional dependency. ``conductor run`` and ``conductor
+doctor`` print the install command for the detected install context (see
+:mod:`conductor.install_hint`); a hardcoded ``pip install`` string cannot
+work on the documented install path, where a uv tool venv is not
+pip-managed and ``conductor-cli`` is not on PyPI (issue #441). Note the
+provider is constructed lazily, so this surfaces when the first agent on
+it runs — not at ``conductor validate``.
+The extra pins ``azure-identity`` plus ``azure-core[aio]`` — the latter
+supplies the ``aiohttp``-based async transport the async
+``DefaultAzureCredential`` in this module requires; ``azure-identity``
+alone does not include one.
 
 The transport shim (epic E3, issue #284) derives a session ``identifier``
 from ``identifier_scope`` (DD5), acquires a cached AAD bearer token, issues a
@@ -39,7 +45,9 @@ import httpx
 from pydantic import SecretStr
 
 from conductor.exceptions import ProviderError
+from conductor.install_hint import install_command
 from conductor.providers.aca_protocol import (
+    RUNNER_TOKEN_HEADER,
     AcaAgentPayload,
     AcaErrorData,
     AcaExecuteRequest,
@@ -192,8 +200,9 @@ class AcaRuntimeProvider(AgentProvider):
     in-sandbox runner's NDJSON event stream verbatim to ``event_callback``,
     parsing the terminal ``result`` frame into :class:`AgentOutput`.
 
-    Requires the ``azure-identity`` package:
-        pip install 'conductor-cli[aca]'
+    Requires the ``azure-identity`` package, shipped by the ``aca`` extra.
+    See :mod:`conductor.install_hint` for how the install command is
+    resolved.
 
     Example:
         >>> provider = AcaRuntimeProvider(provider_settings=settings)
@@ -296,7 +305,7 @@ class AcaRuntimeProvider(AgentProvider):
         if not AZURE_IDENTITY_AVAILABLE:
             raise ProviderError(
                 "aca provider requires the azure-identity package",
-                suggestion="Install with: uv add 'conductor-cli[aca]'",
+                suggestion=f"Install with: {install_command('aca')}",
             )
 
         self._provider_settings = provider_settings
@@ -646,6 +655,14 @@ class AcaRuntimeProvider(AgentProvider):
         raw dict/JSON payload passed to ``model_validate``), so redaction
         does not depend solely on every caller using this helper.
 
+        Issue #396: the runner enforces a four-key allowlist on this dict's
+        keys (``aca_runner/auth.py::ALLOWED_INNER_PROVIDER_SETTINGS_KEYS`` —
+        exactly ``base_url``/``api_key``/``bearer_token``/``github_token``),
+        rejecting anything else (e.g. ``runtime_url``, ``headers``) with a
+        400. A future key added to this method's returned dict must be
+        added to that allowlist too, or the runner will reject every request
+        that carries it.
+
         Raises:
             ProviderError: when no credential of either kind is configured.
         """
@@ -679,6 +696,39 @@ class AcaRuntimeProvider(AgentProvider):
             provider_name="aca",
             is_retryable=False,
         )
+
+    def _resolve_runner_auth_token(self) -> SecretStr | None:
+        """Read the runner transport-token gate's expected value, if configured.
+
+        Issue #396: `ACA_RUNNER_AUTH_TOKEN` is the host-side half of the
+        opt-in transport-token gate the runner enforces on `/execute` only
+        — the runner-side half reads the same env var via
+        `aca_runner/auth.py::resolve_runner_token`. The host also sends
+        this header on `validate_connection()`'s `/health` probe (which
+        never requires it) so `_warn_on_auth_skew` can compare the two
+        postures, and on `_send_interrupt()`'s POST — a route the MVP
+        runner does not yet implement, so that header is currently
+        forward-looking. `None` when unset (the gate is disabled by
+        default — no new configuration is required for existing
+        deployments).
+        """
+        value = _clean_env("ACA_RUNNER_AUTH_TOKEN")
+        return SecretStr(value) if value is not None else None
+
+    def _runner_auth_headers(self) -> dict[str, str]:
+        """Build the `X-Conductor-Runner-Token` header dict, or `{}` when unset.
+
+        Issue #396: merged into the `Authorization` headers dict at the
+        three runner-forwarded call sites (`execute()`, `_send_interrupt()`,
+        `validate_connection()`) — never at `_stop_session()`, which is an
+        ACA *management-plane* operation that never reaches the runner
+        (see its own docstring); adding the header there would leak the
+        runner credential to the Azure control plane instead of the runner.
+        """
+        token = self._resolve_runner_auth_token()
+        if token is None:
+            return {}
+        return {RUNNER_TOKEN_HEADER: token.get_secret_value()}
 
     def _serialize_mcp_servers(self) -> dict[str, Any] | None:
         if not self._mcp_servers:
@@ -845,6 +895,7 @@ class AcaRuntimeProvider(AgentProvider):
             output_tokens=output_tokens,
             cache_read_tokens=result.cache_read_tokens,
             cache_write_tokens=result.cache_write_tokens,
+            last_call_input_tokens=result.last_call_input_tokens,
             model=result.model,
             partial=result.partial or interrupted,
             session_seconds=result.session_seconds,
@@ -887,7 +938,7 @@ class AcaRuntimeProvider(AgentProvider):
         response = await client.post(
             self._build_url("interrupt"),
             params={"identifier": identifier, "api-version": self._api_version},
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}", **self._runner_auth_headers()},
             timeout=10.0,
         )
         if response.status_code >= 400:
@@ -906,7 +957,10 @@ class AcaRuntimeProvider(AgentProvider):
         image — it is issued anyway, best-effort, in case that restriction
         is lifted for a future pool SKU, and its result never blocks the
         actual local abort: the caller always cancels its own read loop
-        regardless of whether this call succeeds.
+        regardless of whether this call succeeds. Deliberately does **not**
+        include the runner transport-token header (issue #396) — this
+        request never reaches the runner (it is Azure's own control plane),
+        so adding it would leak the runner credential there instead.
         """
         token = await self._get_access_token()
         client = self._ensure_client()
@@ -1053,7 +1107,7 @@ class AcaRuntimeProvider(AgentProvider):
             token = await self._get_access_token()
             url = self._build_url("execute")
             params = {"identifier": identifier, "api-version": self._api_version}
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {token}", **self._runner_auth_headers()}
             body = self._wire_body(request)
 
             try:
@@ -1143,7 +1197,13 @@ class AcaRuntimeProvider(AgentProvider):
         `conductor_version` mismatch between host and runner is logged as a
         warning, never raised — version skew is a compatibility hint, not a
         hard failure (mirrors the "safe degradation" convention of the other
-        best-effort provider hooks in `AgentProvider`).
+        best-effort provider hooks in `AgentProvider`). The runner
+        transport-token header (issue #396) is sent here too — not because
+        `/health` requires it (it never does — see
+        `aca_runner/server.py::health`'s docstring) but so a mismatch
+        between the host's configured token and the runner's own posture
+        surfaces as a `_warn_on_auth_skew` warning rather than only at the
+        first `/execute` call.
         """
         try:
             token = await self._get_access_token()
@@ -1168,7 +1228,7 @@ class AcaRuntimeProvider(AgentProvider):
                     "identifier": self._health_identifier,
                     "api-version": self._api_version,
                 },
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {token}", **self._runner_auth_headers()},
                 timeout=10.0,
             )
         except httpx.HTTPError as exc:
@@ -1181,7 +1241,9 @@ class AcaRuntimeProvider(AgentProvider):
             raise await self._error_from_response(response)
 
         with contextlib.suppress(Exception):
-            self._warn_on_version_skew(response.json())
+            health = response.json()
+            self._warn_on_version_skew(health)
+            self._warn_on_auth_skew(health)
         return True
 
     def _warn_on_version_skew(self, health: dict[str, Any]) -> None:
@@ -1196,6 +1258,51 @@ class AcaRuntimeProvider(AgentProvider):
                 "behavior may differ between host and sandbox.",
                 runner_version,
                 host_version,
+            )
+
+    def _warn_on_auth_skew(self, health: dict[str, Any]) -> None:
+        """Warn when the host's and runner's transport-token postures disagree.
+
+        Issue #396: `/health` reports two runner-side facts —
+        `auth_required` (whether `ACA_RUNNER_AUTH_TOKEN` is configured
+        there) and `auth_token_present` (whether *a* token header arrived on
+        this very request — never whether it matched). Comparing those
+        against whether the host has a token configured catches two
+        distinct real misconfigurations, in either direction:
+
+        - The runner requires a token but none arrived: the header did not
+          survive the trip (e.g. a gateway stripping custom headers), so
+          every `/execute` call will fail with a 401.
+        - The host has a token configured but the runner reports no gate:
+          `ACA_RUNNER_AUTH_TOKEN` isn't set there, so the header is being
+          silently ignored and the gate provides no protection.
+
+        A runner predating these fields omits both keys entirely
+        (`.get(...)` returns `None`, which is falsy), so this degrades
+        silently against an old image rather than warning spuriously.
+        """
+        if not isinstance(health, dict):
+            return
+        auth_required = health.get("auth_required")
+        auth_token_present = health.get("auth_token_present")
+        if auth_required is None or auth_token_present is None:
+            return
+
+        host_has_token = self._resolve_runner_auth_token() is not None
+        if auth_required and not auth_token_present:
+            logger.warning(
+                "aca: runner requires an auth token but none arrived on this "
+                "request; a gateway may be stripping the "
+                "X-Conductor-Runner-Token header, so /execute calls will "
+                "fail with 401. Unset ACA_RUNNER_AUTH_TOKEN on the runner "
+                "pool if the header cannot survive the trip."
+            )
+        elif host_has_token and not auth_required:
+            logger.warning(
+                "aca: ACA_RUNNER_AUTH_TOKEN is configured on the host but the "
+                "runner reports auth_required=false; the token is being "
+                "ignored and the transport-token gate is not actually "
+                "enabled. Set ACA_RUNNER_AUTH_TOKEN on the runner pool too."
             )
 
     async def close(self) -> None:

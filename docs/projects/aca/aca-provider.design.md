@@ -755,11 +755,22 @@ the architecture; it follows directly from ACA's documented model.
 - **Secret hygiene.** Forwarded credentials are `SecretStr`, redacted in events,
   checkpoints, and the dashboard via existing `ProviderSettings` redaction.
 - **Identifier as a capability.** The `identifier` is the routing/isolation key:
-  cryptographically salted, never guessable, always over HTTPS.
+  cryptographically salted, never guessable, always over HTTPS. It is a
+  gateway routing/isolation key consumed by the ACA session gateway, **not**
+  a caller-authentication signal — the runner deliberately does not inspect
+  it (issue #396). The runner-side authentication control is the optional
+  `ACA_RUNNER_AUTH_TOKEN` transport-token gate on `/execute`, checked via a
+  dedicated `X-Conductor-Runner-Token` header (the `Authorization` header is
+  unavailable for this — the ACA session gateway consumes it itself, since
+  it carries the AAD bearer token).
 - **Attack-surface delta.** New: a host→ACA management call and an in-container HTTP
   server. The *agent's* attack surface moves
   off-host into an ephemeral isolated VM (the point); the new host-side surface
-  must stay minimal and credential-light.
+  must stay minimal and credential-light. Issue #396 hardens that in-container
+  HTTP server so it does not depend *solely* on the session-gateway network
+  boundary: the runner binds loopback by default, optionally gates `/execute`
+  behind a transport token, and rejects any `inner_provider_settings` key
+  outside the four the host actually sends.
 
 ## Risks and Mitigations
 

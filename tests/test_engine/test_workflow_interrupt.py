@@ -1169,5 +1169,5 @@ class TestHandleWebPauseSubworkflow:
             engine._handle_web_pause("planner", partial),
             signal_then_resume(),
         )
-        # Resume returned True; no InterruptError raised.
-        assert result is True
+        # Resume returned handled=True; no InterruptError raised.
+        assert result.handled is True

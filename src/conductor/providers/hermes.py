@@ -466,9 +466,10 @@ class HermesProvider(AgentProvider):
         # If no output schema, wrap as plain text and we're done
         if not agent.output:
             content: dict[str, Any] = {"text": final_response}
+            recovered = False
         else:
             # Try to parse as JSON with recovery loop (mirrors Copilot pattern)
-            content = await self._parse_with_recovery(
+            content, recovered = await self._parse_with_recovery(
                 final_response,
                 result.get("messages", []),
                 schema_for_prompt,  # type: ignore[arg-type]
@@ -490,6 +491,14 @@ class HermesProvider(AgentProvider):
         tokens_used: int | None = result.get("total_tokens")
         if tokens_used is None and input_tokens is not None and output_tokens is not None:
             tokens_used = input_tokens + output_tokens
+
+        # The hermes SDK returns only run-level aggregates, so a single-call
+        # run is the only case where the aggregate *is* one call's prompt.
+        # A recovery run spins up a fresh AIAgent whose usage never reaches
+        # `result`, so its prompt size is unknown — hide the bar (issue #412).
+        last_call_input_tokens: int | None = None
+        if not recovered and result.get("api_calls") == 1:
+            last_call_input_tokens = input_tokens
 
         # Use the actual model reported by hermes (may differ from requested)
         actual_model = result.get("model") or resolved_model
@@ -513,6 +522,7 @@ class HermesProvider(AgentProvider):
             tokens_used=tokens_used,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            last_call_input_tokens=last_call_input_tokens,
             model=actual_model,
             partial=bool(result.get("partial", False)),
         )
@@ -545,16 +555,25 @@ class HermesProvider(AgentProvider):
         conversation_history: list[dict[str, Any]] | None,
         loop: asyncio.AbstractEventLoop,
         event_callback: EventCallback | None = None,
-    ) -> dict[str, Any]:
-        """Parse response as JSON, retrying via conversation if parsing fails."""
+    ) -> tuple[dict[str, Any], bool]:
+        """Parse response as JSON, retrying via conversation if parsing fails.
+
+        Returns:
+            A tuple of the parsed content and whether any recovery call ran.
+            A recovery call spins up a fresh ``AIAgent`` whose usage never
+            reaches the outer ``result`` dict, so the caller uses this flag
+            to know when the reported token counts no longer describe a
+            single API call (issue #412).
+        """
         last_error: str | None = None
         last_schema_failure: ValidationError | None = None
         max_recovery = self._resolve_parse_recovery_attempts(agent)
+        recovered = False
 
         for attempt in range(max_recovery + 1):
             content, failure, schema_failure = self._parse_and_validate(response, agent)
             if content is not None:
-                return content
+                return content, recovered
 
             last_error = str(failure)
             last_schema_failure = schema_failure
@@ -619,6 +638,7 @@ class HermesProvider(AgentProvider):
                 recovery_result = await loop.run_in_executor(None, _run_recovery)
                 response = recovery_result.get("final_response") or ""
                 messages = recovery_result.get("messages", [])
+                recovered = True
             except ValueError:
                 # A bad model name or kwargs surfaces as ValueError from the
                 # SDK. Left unwrapped: it is a caller error, not a transport

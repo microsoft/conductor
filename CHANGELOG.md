@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.27...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.32...HEAD)
 
 ### Added
 
@@ -31,6 +31,439 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depending on which agent happened to run first. `claude-agent-sdk`
   namespaces its own entries, so they cannot collide with Copilot's
   agent-name keys in the merged map.
+
+### Changed
+
+- **`runtime.skill_injection.max_bytes` now defaults to 160KB, up from
+  128KB.** The bundled `conductor` skill has grown to ~132KB, so the old
+  ceiling no longer sat above it: a `claude` or `hermes` agent enabling the
+  shipped skill would have failed outright instead of warning, which is the
+  opposite of what the two defaults are for. The 64KB `warn_bytes` default is
+  unchanged, so that combination still warns. Workflows that set `max_bytes`
+  explicitly are unaffected.
+
+## [0.1.32](https://github.com/microsoft/conductor/compare/v0.1.31...v0.1.32) - 2026-08-16
+
+### Fixed
+
+- **The `--web-bg` launch gate now terminates the whole workflow process
+  tree, not just the pid it spawned, closing the orphan a trampoline
+  `sys.executable` could leave behind** (#447). Issue #444 fixed the
+  launch gate's false-positive port conflicts but left its four failure
+  paths terminating only `subprocess.Popen.pid` — under a trampoline
+  `sys.executable` (e.g. a Windows `uv tool install`, the documented
+  install path), that pid is a re-exec shim, not the process actually
+  running the workflow, so a launch-gate failure could kill the shim and
+  leave the real workflow running, undiscoverable, and still burning
+  tokens. On Windows the child is now created suspended and assigned to a
+  fresh job object *before* it can run (so it cannot re-exec out of
+  reach), with `TerminateJobObject` reaching the whole tree regardless of
+  exec depth; the job deliberately has no `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  so the tree still survives the launcher exiting, which is the entire
+  point of `--web-bg`. On POSIX, `os.killpg` now reaches the process
+  group the detached child already leads. After the tree kill, a final
+  liveness sweep independently confirms every pid the gate knew about is
+  actually dead rather than assuming it — a survivor is now named
+  explicitly in the error message (with a `conductor status` /
+  `conductor stop --port` pointer) instead of the message unconditionally
+  claiming "The background process was terminated." A run record is only
+  removed once its pid is confirmed dead by that sweep, so a surviving
+  orphan keeps the record that is `conductor stop`'s only remaining
+  handle on it.
+
+- **`--web-bg` no longer fails on every port with a false "Port already in
+  use", killing a healthy run** (#444). The launch gate's two identity
+  checks both compared against the *spawned* process's pid
+  (`subprocess.Popen.pid`), which is not always the pid of the process that
+  ends up running the workflow: on a trampoline `sys.executable` (e.g. a
+  `uv tool install` on Windows, the documented install path) the spawned
+  process re-execs into a different one. That made the run-record poll
+  (stage one-and-a-half) never see its own child's record — surfacing as
+  "did not report a run record within 15 seconds, but is still running" —
+  and then made stage two's `/api/info` probe report every port as held by
+  a foreign process, terminating the healthy child. The run-record poll now
+  also accepts a record whose `pid` differs from `Popen.pid` when the
+  record is *fresh* (written at or after this launch spawned its child),
+  and carries the record's real `pid` forward as the confirmed identity for
+  stage two. A `PORT_CONFLICT` is now only raised when that identity was
+  confirmed; an unconfirmed mismatch degrades to the existing non-fatal
+  "still initializing" note instead of ever being fatal. The `PID unknown`
+  wording seen alongside the conflict is fixed too — the foreign pid is now
+  captured before the child is terminated instead of probed after, when it
+  can no longer answer.
+
+- **The Fleet Manager TUI no longer appears to freeze while a modal is
+  open** (#448). Opening the gate options modal (`g`) left the Runs screen
+  animating underneath it — a covered screen is still composited, so its
+  ~10fps repaints kept re-blending the modal sitting on top. Measured on
+  one 160x45 terminal at an open gate, that was roughly 2.5x the escape
+  sequences and ~40% more CPU than the same screen with no modal up. On a
+  terminal that cannot absorb that stream — over SSH, in a multiplexer, on
+  a slow emulator — keystrokes queued behind the redraw and the modal
+  appeared frozen. The animation is now suppressed while a screen is
+  covered and its timer paused, which also stops the Runs screen animating
+  under the splash, run-detail, history, providers, registries, and new-run
+  screens. The ~2s data poll is deliberately left running, so gate-entry
+  and run-failure notifications still fire while a modal is up. The
+  empty-fleet state also no longer pairs "no runs" with a preview pane
+  still offering `g` for a run that had gone.
+
+- **The Fleet Manager TUI's kill confirmation prompt is no longer an empty
+  red box** (#449). `#confirm-dialog` had `width: auto` while both of its
+  children fell back to Textual's base `1fr`, and an auto-width container
+  whose children are all `1fr` resolves to zero — so the dialog collapsed
+  to 0x0 and painted nothing but its border, leaving `k` looking like a
+  broken no-op with no way to see what was about to be killed. The dialog
+  now has a fixed width (capped at 90% of the terminal so it still fits a
+  narrow one), its message scrolls instead of overflowing or being silently
+  truncated, and the confirm/cancel hint is docked to the bottom so a long
+  message cannot push it off screen.
+
+- **Fleet Manager TUI no longer blocks the Textual event loop on the Runs
+  screen's ~2s poll, the run-detail screen's poll, History's initial load,
+  or opening a run's dashboard** (#437). Each screen's data load now runs in
+  a worker thread (`asyncio.to_thread`), with rendering back on the event
+  loop, so the UI stays responsive on a large fleet or a slow filesystem
+  (e.g. a WSL dashboard-open call that can take up to 15s). A tick arriving
+  while the previous scan is still running is skipped rather than started
+  alongside it, and each screen shows a brief "Loading…" line while its
+  first result is in flight. An *explicit* refresh — after a kill, or after
+  a gate is resolved — is coalesced rather than skipped, so those actions
+  still update the table without waiting out a poll interval.
+- **The Fleet Manager TUI now tells you when it cannot read a run**, instead
+  of showing something that looks like success (#437 review). A run-record
+  directory it cannot read is reported on the Runs screen rather than
+  leaving a "Loading…" line that never resolves or a table silently frozen
+  at its last good contents; a fleet whose summaries all fail to derive is
+  reported as an error rather than as the "no runs — launch one" empty
+  state, which invited launching a duplicate of a workflow that was still
+  running; and a History read failure is reported rather than rendered as
+  "No run history yet.", which claimed absence and, since that screen loads
+  once, never corrected itself. A run whose summary fails to derive on one
+  poll tick also no longer loses its notification history, which had made
+  it re-fire its gate/failure terminal notification on the next successful
+  tick.
+
+## [0.1.31](https://github.com/microsoft/conductor/compare/v0.1.30...v0.1.31) - 2026-08-15
+
+### Added
+
+- **Install scripts now diagnose a blocked package index instead of retrying
+  into a generic failure.** On networks that block direct access to the public
+  Python package index — increasingly common on managed corporate devices —
+  `uv tool install` fails with a fetch/403/DNS-shaped error. uv has already
+  exhausted its own retries by that point, so both scripts spent their
+  2s/5s/10s backoff on a failure that cannot heal, and `install.ps1` then
+  printed file-lock advice (including a Windows Defender exclusion suggestion)
+  that is both useless and misleading for a network-policy block. Both scripts
+  now classify the failure, stop after the attempt that hit it, and explain the
+  actual remedy: point uv at your organization's index with `UV_DEFAULT_INDEX`.
+  They also echo the active index at install time — with any credentials in the
+  URL redacted — so "did my override apply?" is answerable from the install log.
+  On the blocked-index path `install.ps1` no longer reaches its Defender advice.
+- **Two neighbouring failures are told apart rather than blamed on the index.**
+  uv words an unreachable *git remote* exactly as it words an unreachable index,
+  and the installer fetches Conductor itself from `git+https://github.com/...` —
+  so a blocked `github.com` was being reported as a blocked package index,
+  sending users to configure something that could not help. It now gets its own
+  message. Separately, connection-level blips (`connection reset` and friends)
+  still get the full retry schedule, since unlike a policy block they can
+  genuinely heal; only a definitive block short-circuits the retries.
+- **README: "Installing behind a proxy or private package index"** — how to
+  install through a mirrored/proxied index with uv (`UV_DEFAULT_INDEX`,
+  `uv.toml`, named-index credentials, TLS inspection, proxies) and with
+  pip/pipx, including the trap that **uv does not read pip's configuration**,
+  so `pip config set global.index-url` alone has no effect on the install
+  scripts, `uv tool install`, or `conductor update`. Conductor ships no default
+  mirror and never redirects package resolution on its own; the index is always
+  user-supplied configuration.
+
+### Fixed
+
+- **`--web-bg`/`resume --web-bg`: a failed run-record write no longer kills
+  a healthy background workflow** (#435). The launch gate's run-record poll
+  (Fleet Manager D2) used to terminate the child and fail the launch if it
+  couldn't confirm the run record within 15 seconds, even when the child was
+  alive and its dashboard was still reachable — treating a bookkeeping
+  failure as a workflow failure. It now downgrades to a warning
+  (`BackgroundLaunch.run_record_written=False`, surfaced via a new note
+  pointing at the captured stderr log, and via a TUI notification from the
+  Fleet Manager's New Run screen) and lets the launch proceed; only a child
+  that is actually dead, or whose dashboard has gone unreachable, still fails
+  the launch.
+- **The `run_id` format is now defined once**, in a new leaf module
+  `conductor.run_id` (#435). Previously `fleet/records.py` enforced a broad
+  path-safe pattern while `engine/event_log.py` independently enforced a
+  narrower hex-only pattern and lowercased its input; a resumed
+  `--web-bg` run whose checkpoint `run_id` contained uppercase characters
+  could be silently folded to a different value by the event log, causing
+  the parent's launch-gate poll to look for a key the child never wrote and
+  kill the resumed run 15 seconds after a successful start. `fleet/history.py`
+  and `fleet/retention.py`'s filename parsers, and `fleet/records.py`'s own
+  timestamp parser, now derive their run-id-matching regexes from the same
+  shared pattern.
+- **Install hints for optional extras now print a command that works, and
+  upgrades stop uninstalling the extras you have** (#441). Every hint pointing
+  at an optional extra hardcoded `pip install 'conductor-cli[<extra>]'`, which
+  cannot work on the documented install path: `install.sh`/`install.ps1` create
+  a `uv tool` venv, which is not pip-managed, and `conductor-cli` is not
+  published to PyPI so pip has nothing to resolve against there. `conductor
+  fleet` without the `tui` extra, and the `aca` / `claude-agent-sdk` provider
+  errors, now resolve the command from the *detected* install context — `uv
+  tool install --force '<spec>'` for an install-script install, `uv sync
+  --inexact --extra <extra>` for a source checkout, and `pip install` as the
+  fallback, carrying the git URL you installed from when there is one so a
+  `pip`/`pipx`-from-git install resolves too. The suggested command reuses the
+  install source recorded for your install (so a fork or a local build is not
+  redirected upstream) and carries the extras you already have, because `uv
+  tool install --force` replaces the tool's entire requirement set and `uv
+  sync` is exact by default. A receipt that cannot be read is reported rather
+  than treated as "no extras" — in the hint, and in both install scripts,
+  which warn and carry on rather than either dropping the extras silently or
+  refusing to run.
+  For the same reason, `install.sh` and `install.ps1` now read the existing
+  install's `uv-receipt.toml` and rebuild the source as
+  `conductor-cli[<extras>] @ <source>`, so `conductor update` (which drives
+  them) no longer silently uninstalls `[tui]` or `[aca]` on upgrade — it also
+  names the extras it found before you commit. New `--extras <a,b>` /
+  `CONDUCTOR_INSTALL_EXTRAS` adds an extra during an install or upgrade
+  (rejecting one this package does not declare, which uv would otherwise
+  accept with a warning and a zero exit status), and `--no-preserve-extras` /
+  `CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS` drops back to a bare install.
+- **Fleet Manager History no longer accumulates an entire retained event log
+  into memory to build one entry** (#436). `_read_full_log` now streams
+  parsed events one at a time instead of materializing them into a list
+  before scanning, so building a History entry from a large
+  `*.events.jsonl` file no longer holds the whole parsed log in memory at
+  once.
+
+## [0.1.30](https://github.com/microsoft/conductor/compare/v0.1.29...v0.1.30) - 2026-08-14
+
+### Added
+
+- **Fleet Manager: `conductor stop`, `conductor fleet list`, and a new
+  interactive `conductor fleet` TUI now discover every run, not just
+  `--web-bg` ones** (#431). Previously only `--web-bg` wrote a discoverable
+  (port-keyed `.pid`) record, so a plain `conductor run` or `conductor run
+  --web` process was invisible to `conductor stop` and had to be killed by
+  hand. Every run path now writes a `run_id`-keyed JSON record to
+  `~/.conductor/runs/<run_id>.json` describing its mode (`fg`/`fg-web`/`bg`),
+  PID, workflow path, and dashboard port (when it has one); `stop`,
+  `fleet list`, and the TUI all read from this same store. The legacy
+  port-keyed `.pid` file is still read (and cleaned up) for a still-running
+  pre-upgrade process, but is no longer written by any current code path.
+  **Behavior change:** stopping a **foreground** run (`mode` `fg`/`fg-web` —
+  anything holding a terminal) now requires interactive confirmation, since a
+  plain `SIGTERM` discards in-flight progress unless periodic checkpoints are
+  enabled for that run; a background-only fleet is unaffected. Use
+  `--yes`/`-y` to skip the prompt (e.g. scripts, CI); a non-interactive
+  `stdin` without `--yes` refuses to proceed rather than silently defaulting
+  to "yes". `stop` also gained `--run-id`, the only selector that can target a
+  foreground run with no dashboard port to match on. See
+  [`docs/cli-reference.md`](docs/cli-reference.md#conductor-stop).
+- **`conductor fleet`** (#431) — an optional interactive Textual TUI (`pip
+  install 'conductor-cli[tui]'`) for monitoring, managing, and launching
+  Conductor runs across dedicated screens: Runs (home, ~2s-polled, sorted by
+  recency), Run detail (per-agent topology and timings, not a DAG), Providers
+  (collapsed-by-default provider/model diagnostics, reusing
+  `providers/diagnostics.py`), Registries (registries → workflows → inputs),
+  New Run (form generated from a workflow's declared `input:`, launches via
+  the same `conductor run --web-bg` path the CLI uses), and History
+  (every retained run regardless of outcome, bounded by retention plus an
+  independent 200-entry display cap, delegating replay to `conductor
+  replay <log>` rather than re-implementing it). A human gate is displayed as
+  a persistent badge for every run mode; it can additionally be **resolved**
+  from the TUI (`g`) for any run with a dashboard port (`fg-web`/`bg`) via the
+  existing `conductor gate respond` HTTP path — a plain foreground run's gate
+  is display-only (its PID is shown) since its blocking prompt thread cannot
+  be reached remotely. A terminal bell / OSC 9 notification fires once per
+  transition into `at-gate` or a failure. `conductor fleet list` and
+  `conductor fleet prune` need no optional dependency; only the bare,
+  no-subcommand `conductor fleet` (which launches the TUI) requires the `tui`
+  extra. See [`docs/fleet.md`](docs/fleet.md).
+- **`~/.conductor/config.toml`** (#431) — a new machine-wide, read-only-in-v1
+  settings file (`src/conductor/settings.py`), read with stdlib `tomllib` and
+  honoring `$CONDUCTOR_HOME` the same way `registries.toml` does. Currently
+  controls `[fleet.retention]`: an opportunistic sweep (`enabled = true` by
+  default, `keep_last = 200`) that bounds the otherwise-unbounded
+  `$TMPDIR/conductor/` directory of event logs at the start of every
+  `conductor run`/`resume`. Never deletes the `checkpoints/` subdirectory or
+  an event log a live/resuming run still references. `conductor fleet prune`
+  is the explicit manual entry point (with `--keep-last`/`--dry-run`) and
+  always works regardless of the `enabled` setting. A missing file is normal
+  (every setting defaults cleanly); a malformed file only breaks an explicit
+  reader (`fleet prune` with no `--keep-last` override) — never `conductor
+  run`/`resume`, which swallow a settings load failure and just skip the
+  feature it configures. See
+  [`docs/configuration.md`](docs/configuration.md#machine-wide-settings-conductorconfigtoml).
+
+### Changed
+
+- **`workflow_started` now records the run's resolved `inputs`** (#431). Two
+  runs of the same workflow are otherwise indistinguishable in a listing. The
+  values are written to the run's JSONL event log, which is also read by
+  `conductor replay` and the dashboard.
+
+### Fixed
+
+- **`conductor stop` against a foreground run is no longer a silent no-op**
+  (#431). With the interactive keyboard listener active, the `SIGTERM` handler
+  delegated to the previous disposition only when it was *callable* — and in
+  an unmodified process `signal.getsignal(SIGTERM)` returns `SIG_DFL`, an
+  `IntEnum` member that is not callable, so the signal fell through and was
+  swallowed entirely: the process survived and kept running. The handler now
+  restores the default disposition and re-raises against itself. An inherited
+  `SIG_IGN` is honoured rather than converted into a termination.
+- **A `questions` node no longer leaves the run parked at an already-answered
+  gate** (#431). A questions node reuses `gate_presented` but never emitted the
+  matching `gate_resolved`, so every consumer of the event stream — the web
+  dashboard as well as the Fleet Manager — held a gate that never closed for
+  the remainder of the run.
+
+## [0.1.29](https://github.com/microsoft/conductor/compare/v0.1.28...v0.1.29) - 2026-08-13
+
+### Security
+
+- **Hardened the web dashboard's HTTP/WebSocket surface** (#397). Every
+  mutating route (`POST /api/stop`, `/api/kill`, `/api/resume`,
+  `/api/gate-respond`, `/api/guidance`) and the `/ws` handshake now require a
+  per-run token by default — previously the only protection was the
+  optional `CONDUCTOR_GATE_TOKEN` env var, and requests were unauthenticated
+  when it was unset. The token is minted automatically per run and
+  discoverable by `conductor gate respond` / `guide` / `stop` via a new
+  `0600` file (POSIX; on Windows the mode bits are not honoured and the
+  file relies on the user-profile ACL instead — see #425) at
+  `~/.conductor/runs/dashboard-<port>.token`;
+  `CONDUCTOR_GATE_TOKEN` still overrides it when set. A new pure-ASGI
+  `OriginHostGuard` middleware also validates the `Host` and (when present)
+  `Origin` headers on every HTTP and WebSocket request, closing the
+  DNS-rebinding and CSRF-from-another-open-page angles; `CONDUCTOR_WEB_ALLOW_ORIGINS`
+  (comma-separated origins) extends the allowlist for local dev servers.
+  **Breaking for external API callers:** every mutating route now also
+  requires `Content-Type: application/json` (415 otherwise), including the
+  previously bodyless control POSTs, and a request whose `Host`/`Origin`
+  doesn't match the bound dashboard is rejected with 403 regardless of
+  token. Read-only routes (`/api/state`, `/api/info`, `/api/logs`,
+  `/api/gate-status`, `/api/files/*`, and the replay dashboard) remain
+  unauthenticated, protected by Origin/Host only.
+- **Hardened the ACA agent runner's transport surface** (#396). The
+  experimental `aca` provider's in-container runner previously relied
+  entirely on the Azure session-gateway network boundary; it now adds four
+  independent layers, none individually load-bearing. The runner binds
+  `127.0.0.1` by default (the shipped container image sets
+  `ACA_RUNNER_HOST=0.0.0.0` explicitly, so a deployed pool is unaffected —
+  only a runner started by hand changes behaviour). An opt-in transport
+  token, `ACA_RUNNER_AUTH_TOKEN`, makes `/execute` require a matching
+  `X-Conductor-Runner-Token` header — checked before the inner Copilot
+  provider is constructed — and `401` otherwise; the host sends the header
+  automatically when the same value is set on its side. `GET /health` stays
+  unauthenticated (the image's own `HEALTHCHECK` sends no header) but now
+  reports `auth_required` and `auth_token_present`, letting the host warn
+  when a gateway is silently stripping the header or when only one side has
+  a token configured. The runner also rejects any `inner_provider_settings`
+  key outside `base_url` / `api_key` / `bearer_token` / `github_token`,
+  closing off `runtime_url` and `headers` injection, and
+  `ACA_RUNNER_ALLOWED_BASE_URLS` optionally restricts which BYOK `base_url`
+  values are accepted. See `docs/providers/aca.md#security`.
+
+### Fixed
+
+- **A pathological gate or dialog prompt no longer stalls the event loop**
+  (#395). `linkify_markdown` — which runs on human-gate prompts, dialog
+  turns, and rendered agent prompts — degraded to quadratic time on inputs
+  containing long unterminated runs of backticks/tildes or `[` characters,
+  so agent-generated text could freeze every concurrent agent sharing the
+  loop. The fenced-code opener no longer backtracks character-by-character,
+  and existing-markdown-link detection is now a linear single-pass scanner
+  (fuzz-verified equivalent to the regex it replaces). A defensive 256K
+  character cap skips linkification entirely on anything larger — whitespace
+  is still normalized — so a future pathological shape degrades gracefully
+  rather than hanging.
+
+- **Token cost is no longer massively overstated for cached, tool-calling
+  agents.** `AgentOutput.input_tokens` is the *whole* prompt and already
+  contains `cache_read_tokens` / `cache_write_tokens`, but `calculate_cost`
+  billed all four buckets additively — charging every cached token at the
+  full input rate *and again* at the cache rate (11x on `claude-sonnet-5`).
+  Because a long agentic loop re-reads almost its entire prompt from cache on
+  every turn, the error compounded across turns: a real run reporting
+  **$51.08** actually cost about **$8**. A cached bucket is now subtracted
+  from the input bucket before the input rate is applied, so each physical
+  token is priced exactly once — the same treatment `genai-prices` uses,
+  including its rule that a bucket is only subtracted when a rate exists to
+  charge it at (a `0.0` cache rate in the table means "no published rate",
+  not "free"). Cost figures on the dashboard, the CLI summary,
+  `agent_completed` events and the JSONL event log all drop accordingly; no
+  workflow config changes. The Claude Agent SDK provider, whose
+  Anthropic-shaped usage dict reports cached tokens *outside* `input_tokens`,
+  now folds them in and reports both cache buckets, so cached tokens there
+  are billed at the cache rate instead of not being billed at all — note this
+  also makes that provider's reported `input_tokens` / `tokens_used` counts
+  cache-inclusive, matching Copilot, so token totals rise even as cost falls.
+
+  **If you set `limits.budget_usd`:** existing values were calibrated against
+  the inflated figures and now permit correspondingly more real spend. Review
+  them, particularly under `budget_mode: enforce`.
+
+- **`claude-opus-5` and the dotted Claude 4.5 names are no longer unpriced.**
+  `DEFAULT_PRICING` had no `claude-opus-5` entry, and `get_pricing`'s
+  versioned-suffix fallback only extends a key with a `-` delimiter — so the
+  SDK-advertised `claude-haiku-4.5` never matched the dashed
+  `claude-haiku-4-5` entry either. Those models fell back to `None` and were
+  reported as unpriced whenever the provider's live pricing hook was
+  unavailable (an older Copilot SDK, or a non-Copilot provider). Added
+  `claude-opus-5`, `claude-opus-4.5`, `claude-sonnet-4.5` and
+  `claude-haiku-4.5` at the published Anthropic rates. Both spellings are
+  kept: the dashed keys are what price the date-suffixed Anthropic ids
+  (`claude-haiku-4-5-20251001`).
+- **`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are no longer unpriced**
+  (#386). Added to `DEFAULT_PRICING` as exact keys at the existing GPT-5.x
+  family rate ($2.00 in / $8.00 out per million tokens) — exact keys rather
+  than a `gpt-5.6` prefix key so the three resolve silently instead of
+  through `get_pricing`'s fuzzy-match warning path. `grok-4.5`,
+  `gemini-3.6-flash`, `mai-code-1.1-flash`, and `mai-code-1-flash-picker`
+  remain **deliberately** unpriced in the static table pending a published
+  rate; an invented rate would print as a confident cost, which is worse
+  than the honest `(N unpriced)` marker. The live provider-pricing hook
+  prices any model whose SDK metadata carries `billing.token_prices`
+  (verified for `claude-opus-5` in #418, on Copilot SDK `>=1.0.9` —
+  already the hard floor pinned in `pyproject.toml`) — the static-table
+  gap only matters when that hook is unavailable or the model's metadata
+  lacks a rate.
+
+### Added
+
+- **`conductor doctor --models` now shows per-model pricing** (#386). The
+  Models detail table gained `Input $/Mtok`, `Output $/Mtok`, and `Pricing`
+  columns — the last distinguishing `provider` (live
+  `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback),
+  and `none` (genuinely unpriced) so "why is my run unpriced" is answerable
+  with one read-only command (pricing resolution adds no new network
+  round-trip — the Copilot SDK memoizes `list_models()` for the process).
+  `--json` gains matching
+  `input_per_mtok` / `output_per_mtok` / `pricing_source` fields on each
+  model object.
+
+## [0.1.28](https://github.com/microsoft/conductor/compare/v0.1.27...v0.1.28) - 2026-08-12
+
+### Added
+
+- **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
+  previously offered only Stop, Resume, and Kill — there was no way to
+  correct a run's course without stopping it first. `conductor guide --text
+  "..."` (auto-discovering the dashboard port) and a dashboard **Guide**
+  button both POST to a new `POST /api/guidance` endpoint, which feeds a
+  `GuidanceChannel` the engine drains at the next step boundary (agents,
+  parallel groups, for-each groups, scripts, sets, and waits alike) or
+  immediately if an agent is currently paused, in which case it resumes with
+  the guidance applied — reusing a Copilot follow-up on the same session when
+  one is available. The TTY Esc/Ctrl+G interrupt path now goes through the
+  same `add_user_guidance` entry point, so that guidance is visible in the
+  dashboard and JSONL log too, and parallel/for-each group members now
+  receive the current guidance section (previously always omitted). `resume
+  --guidance "..."` (repeatable) applies guidance to the restored context
+  before the resumed agent runs. Protected by the same `CONDUCTOR_GATE_TOKEN`
+  as `conductor gate respond` when configured.
 - **`conductor status` — see what is running without stopping it** (#384).
   `conductor stop` with no arguments lists background workflows, but stops one
   when exactly one is running, so the natural "what's running?" reflex was
@@ -189,6 +622,276 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--web-bg` no longer reports success and prints a URL for workflows that
+  never actually started** (#410). The launcher's readiness check used to
+  trust a bare TCP connect: the moment *anything* accepted a connection on
+  the dashboard port, it wrote the PID file, printed the URL, and exited 0
+  — even for a workflow that failed `load_config` moments later. Two
+  changes close this: (1) `WebDashboard.start()` (which binds the port) now
+  runs *after* `load_config` succeeds in `run_workflow_async`, so a
+  `ConfigurationError` from a broken workflow never binds a port in the
+  first place; (2) `_finalize_background_launch` now confirms the workflow
+  actually started, not just that a socket answered. `_wait_for_server`
+  checks the child's exit status on every iteration of its connect loop, so
+  a dead child is detected in well under a second instead of after the full
+  15s timeout; a stage-two probe then polls `GET /api/info` (the same
+  identity endpoint `conductor stop` already uses) for up to 30s
+  (`CONDUCTOR_WEB_BG_START_TIMEOUT`, `0` disables it) until it reports a
+  `workflow_started` event, exiting 1 with the exit code and a tail of the
+  captured stderr log if the child dies first, or naming the conflicting
+  PID if the port turns out to be held by an unrelated process. The PID
+  file is written as soon as the port opens — before this second wait —
+  so a slow-starting run stays visible to `conductor status`/`stop`
+  throughout; if the child then dies, the entry is removed. Passing the
+  30s deadline with the child still alive is not treated as a failure — the
+  URL is still printed, alongside a note that the workflow hasn't reported
+  starting yet.
+
+- **Live provider pricing works again** (#386). Every Copilot model was being
+  costed from the static `DEFAULT_PRICING` table instead of the live rates the
+  SDK reports, and models absent from that table reported no cost at all.
+  `CopilotProvider.get_model_pricing` reads `billing.token_prices`, and
+  `github-copilot-sdk` 1.0.1 — the version the lock pinned — parsed the
+  `models.list` response with a hand-written `client.ModelBilling` that declared
+  only `multiplier` and discarded the `tokenPrices` wire field. The field never
+  left the API and is still modelled in the SDK's generated types; only the
+  client dataclass dropped it. The hook therefore returned `None` for every
+  model, so the resolution chain #265 built (workflow override → provider hook →
+  static table → unpriced) ran permanently on its fallback. No per-token rates
+  were invented for the missing models; with the hook alive they price from the
+  SDK.
+
+  The field was restored in SDK 1.0.7; the floor moves to `>=1.0.9`, the version
+  tested here. Moving the floor rather than only the lock is the point — the old
+  `>=1.0.0` was satisfied by 1.0.1, so an existing environment kept dead pricing
+  while reporting a healthy dependency. 1.0.9 also splits the cached-token rate
+  into separate read and write prices and deprecates the single `cache_price`
+  the hook read, which would have silently priced cache reads at $0.00, and it
+  ships a pure-Python wheel that fetches the CLI binary on first use instead of
+  bundling it per platform.
+
+  `_default_permission_handler` no longer forwards `approve_all`'s result
+  blindly. That helper stopped being unconditional: it abstains with
+  `PermissionNoResult` when the runtime marks a request `managed_approval_required`,
+  and raises when managed settings are enabled. Conductor is the only connected
+  client, so an abstention is never answered — the CLI blocks on a pending
+  permission request until idle recovery gives up minutes later and reports a
+  timeout that blames the network. Both cases now decline explicitly and say
+  why. Declining rather than approving is deliberate: managed approval is a
+  policy control, and overriding it would turn a hang into a bypass.
+
+  The existing hook tests built their models from `SimpleNamespace`, so they
+  asserted what Conductor does with a billing object rather than whether the SDK
+  still supplies one, and stayed green throughout. Tests now build the model
+  through the SDK's own `ModelInfo.from_dict`, so the next SDK release that
+  stops carrying the field fails the build instead of quietly reverting every
+  run to static pricing, and the permission handler has behavioural coverage for
+  the first time.
+- **Plugin checkouts from a `file://` source no longer land outside the plugin
+  cache on Windows.** The cache key is derived from the URL's path segments, but
+  the splitter only knew `/`, so a native Windows path arrived as a single
+  segment with its backslashes intact — and the key kept them, putting the
+  checkout at a drive-absolute location rather than under the cache root, which
+  is the same escape the `..` check exists to prevent. Two further problems sat
+  behind it: a drive colon made an owner of `C:_src` read as a drive (or, in the
+  middle of a name, as an NTFS alternate data stream), and flattening a deep
+  path into one segment produced a directory name long enough that `git` refused
+  to create `.git` inside it. Separators are now folded, the characters that
+  change a path's meaning on Windows are substituted, and an over-long segment
+  is replaced by a digest of itself — on every platform, so one workflow file
+  resolves to the same cache layout wherever it runs.
+- **Two sources resolving to the same commit no longer fail the whole fetch on
+  Windows.** Publishing a completed checkout tolerates losing the race to a
+  concurrent fetch, but recognised only the POSIX errnos for "destination
+  already exists"; Windows reports that as `ERROR_ACCESS_DENIED`, so the
+  tolerance never applied and the second source raised. Safe to accept because
+  the readiness sentinel is written after publishing: a winner that died
+  mid-clone leaves no sentinel, so the tree is re-fetched rather than read
+  half-written.
+- **A local path is recognised the same way on every platform** — `_is_local_path`
+  asked `pathlib.Path`, which is the *running* platform's flavour, so a POSIX
+  absolute path such as `/srv/plugins` was refused as an unrecognised source on
+  Windows. Both conventions are now consulted.
+- **Registry names are validated before they can corrupt the config** — a name
+  containing a quote, a space, `=` or `#` was accepted, written into
+  `registries.toml` as an unescaped table key, and then failed to parse. Since
+  `registry add`, `remove` and `get` all load the config first, the user could
+  not remove the entry that broke it and every unrelated registry went down
+  with it. Names are now restricted to letters, digits, `.`, `_` and `-`, which
+  also keeps them legal as cache directory names on Windows, and the table key
+  is quoted so a dotted name stays one registry instead of becoming a nested
+  table.
+- **`conductor doctor` no longer reports a missing Claude CLI on Windows** —
+  the CLI probe dropped five `~`-anchored fallback locations on Windows,
+  including `~/.claude/local/claude` where Claude Code's own installer puts it,
+  so `validate_connection()` returned False for a CLI the SDK would find and
+  run. Only `/usr/local/bin/claude` is now skipped there: it is rooted but
+  driveless, so it resolves against the current drive, which any unprivileged
+  local user can write to.
+- **Registry TOML values are escaped** — a registry whose source or type
+  contained a quote or a backslash produced a file that could not be re-read.
+- **Dashboard context-window bar no longer reports cumulative input tokens as
+  a false red at >100% of the cap** (#412). The bar reused
+  `AgentOutput.input_tokens` — a *billing* total summed across every API call
+  in an agent's execution — as a *context* measurement, so a multi-turn
+  tool-calling agent (or a Copilot parse-recovery retry) could report more
+  tokens than the model's context window physically allows. A new
+  `AgentOutput.last_call_input_tokens` field carries only the prompt size of
+  the most recent single API call, populated by every provider, and the
+  engine now sources `context_window_used` from it instead. When a provider
+  cannot isolate one call's prompt size, the field is `None` and the
+  dashboard hides the bar rather than showing a misleading number; a
+  `used > max` pair (impossible for one real API call) is dropped to `None`
+  entirely, logged at debug on every occurrence and at warning once per run
+  (nothing reads debug logs in production), since either the usage figure or
+  the looked-up cap is untrustworthy. Riding along: `copilot.py`'s
+  `assistant.usage` handler previously *overwrote* its running token counts
+  on every event instead of summing them, so a 20-turn tool-calling agent's
+  cost was billed only for its final API call — this under-report is fixed
+  at the same time, since fixing it alone (without the new field) would have
+  made the context bar report the sum of every turn rather than just the
+  last, making the original defect worse. The event's dedup guard (which
+  prevents a repeated `assistant.usage` event from double-billing the same
+  API call) keys on `api_call_id`, falling back to `provider_call_id` then
+  `service_request_id` when the SDK omits it, since all three are
+  independently optional. Cost figures for multi-turn Copilot agents will
+  rise as a result; a `cost.budget_usd` tuned against the old
+  under-reported total may now trip its limit sooner.
+
+- **`conductor stop` no longer kills the run it is executing inside** (#399).
+  An agent smoke-testing `conductor stop` from its own workflow's `bash` tool
+  inherited that workflow's background environment and terminated itself —
+  the process printed "Stopped" and was killed by what it printed. `stop` now
+  identifies the run it is executing inside via `CONDUCTOR_RUN_ID` (set on
+  every `--web-bg` child and inherited by descendants), the legacy
+  `CONDUCTOR_WEB_BG`/`CONDUCTOR_WEB_PORT` pair (for PID files predating
+  #411's `run_id` field), and POSIX process ancestry, and excludes it from
+  targeting by default: `--all` now means "stop all *other* runs", the
+  no-flag auto-stop skips it, and `--port <your own port>` is refused (exit
+  `1`, naming `--allow-self` as the remedy). If only your own run is alive, `stop`/`stop --all`
+  print a refusal and exit `0` rather than erroring, since nothing named was
+  declined. Pass `--allow-self` to restore the previous targeting exactly; a
+  yellow warning is printed whenever it actually causes your own run to be
+  signalled. Process-ancestry detection is POSIX-only — Windows relies on
+  the env-var signals alone.
+
+- **A pricing hook that silently prices nothing is now reported** (#386). #265
+  warns when the provider pricing hook *raises*; the companion case — a hook
+  that never raises and returns `None` for everything — looked identical to
+  "these models are simply unpriced", so live pricing could be dead for a whole
+  run with no symptom beyond newer models showing up as unpriced. The verdict is
+  drawn once when the run ends — however it ends, so a run that dies part way
+  still reports it, which is when a partial cost total most needs the caveat —
+  and is emitted as a `pricing_hook_silent` event as well as a log line, so it
+  reaches the event log and the console rather than only unattributed stderr.
+  The run summary gains `usage.live_pricing_degraded` and the cost breakdown
+  prints a matching caveat, because a model priced from the static table still
+  reports a confident cost and would otherwise carry no qualification.
+  Providers that do not implement the hook are excluded: returning
+  `None` is the documented default, so counting them accused four of the five
+  providers of a broken SDK for behaving correctly.
+- **`conductor stop` now confirms the process actually stopped, and never
+  stops the wrong one** (#344). `stop` sent one signal and reported success
+  without checking, so a workflow that ignored it was reported as stopped and
+  its PID file deleted — leaving a live run untracked, invisible to `stop`,
+  and holding its port. Termination is now a ladder (ask the dashboard to
+  cancel, then signal, then force-terminate), each rung confirmed before the
+  next, and the PID file is removed only once the process is confirmed gone.
+  Every PID-directed rung is gated on the dashboard confirming its own PID,
+  because between a PID file being written and `stop` reading it the OS may
+  have recycled that PID onto an unrelated process. `--force` overrides
+  *uncertainty* only: a positive identity mismatch blocks every rung, force
+  included. PID files are written atomically, so a concurrent `stop` can no
+  longer read a half-written file and deregister a live run, and the reader
+  logs before deleting anything it cannot parse. `--force` can clear an entry
+  whose liveness cannot be probed, which would otherwise wedge `stop --all`
+  at exit 2 permanently (#166).
+- **Bracketed text no longer crashes or corrupts CLI output** (#406). The same
+  defect as #382, which #387 fixed only in `cli/run.py`. `conductor validate`
+  died with an unhandled `MarkupError` traceback on a workflow whose `name:`
+  contained `[/bold]`, and silently deleted the token when it contained
+  `[dim]`. The quiet half is the more damaging one: a listing that drops part
+  of a name looks like it worked. Rich treats a bracketed token as a style tag
+  when its first character is lowercase, `#`, `/` or `@`, so `[0]` is fine,
+  `[task1]` disappears, and `[/etc/x]` raises — and `style=` does not turn
+  parsing off, which is what made the earlier fix look complete.
+
+  Two consequences shipped unnoticed. Every for-each iteration's verbose panel
+  read the same, because the engine qualifies a member's name as
+  `<agent>[<key>]` so interleaved output can be attributed to one iteration,
+  and a `key_by:` key of `task1` erased exactly that identity — while a key
+  starting with `/`, which `key_by:` over paths or URLs produces, killed the
+  run from a logging call. This needed no flags: verbose and full mode both
+  default on. Separately, `conductor status` (#389) and `conductor plugin
+  list` (#398) were written against the unfixed pattern in files #387 never
+  touched, and #398 made these strings third-party rather than the author's
+  own YAML, since plugin, marketplace, skill and subagent names are now read
+  out of git-cloned repositories.
+
+  Rather than escape ~450 call sites, the default is inverted: every console
+  is built by the new `conductor.console.make_console()` with `markup=False`,
+  so a plain string is literal unless it asks to be styled, and conductor's
+  own styling goes through `styled("<template>", value)`, which parses the
+  template but inserts values verbatim and byte-exact. `Panel` titles and
+  `Prompt` prompts are handled separately because rich parses those
+  regardless of the console setting — that is the trap that left #387
+  incomplete one line from the code it changed. `rich.markup.escape` is no
+  longer used anywhere: it cannot round-trip a value containing a backslash
+  before a bracket, so an ordinary regex came out mangled. Eight static guards
+  now read the source and fail with file:line if a new call site reintroduces
+  any of these shapes — including a `Text` flattened back into an f-string,
+  which is how the defect kept coming back, and unescaped brackets in `typer`
+  help text, which had silently cost `conductor run --help` the whole
+  `[@registry][@version]` syntax.
+- **`conductor status --json` no longer ships two permanently dead fields**
+  (#404). `--web-bg`'s launcher wrote every PID file's `run_id` empty and its
+  `log_file` was a promise it could never keep — the JSONL path is derived
+  inside the child by `EventLogSubscriber`, after the PID file is already
+  written. `write_pid_file` now records the launch's actual `run_id` and
+  `stderr_log`/`stdout_log` (replacing `log_file`, which the parent
+  legitimately knows) — the same three artefacts `_finalize_background_launch`
+  already had in scope but never threaded through. `run_id` is the join key to
+  the run's `conductor-<name>-<ts>-<run_id>.events.jsonl`, so a populated value
+  makes that file findable by glob without storing a path the parent would
+  otherwise have to guess. `conductor resume --web-bg` goes further: it now
+  resolves the checkpoint exactly as the resumed child does (`--from` first,
+  else the latest checkpoint for the workflow) and adopts *its* `run_id` for
+  the whole launch, rather than minting a fresh one that matches neither the
+  child's `EventLogSubscriber` (which reuses the checkpoint's id whenever the
+  original JSONL still exists) nor the events log filename. A checkpoint with
+  a missing or malformed `run_id` falls back to a fresh id rather than
+  failing the launch. `conductor status --json` also now emits `null` for an
+  absent/empty `run_id`/`stderr_log`/`stdout_log` instead of `""`, so a PID
+  file predating this fix is distinguishable from one that legitimately has
+  no run id. `conductor status` is unreleased, so the `log_file` →
+  `stderr_log`/`stdout_log` rename costs no released contract.
+- **`conductor status`'s dashboard URL no longer gets cropped at a default
+  80-column terminal** (#405). At that width, the `Dashboard` column — the
+  one field the command exists to surface — was the one rich elided,
+  leaving `http://127.0.0.1:…` reconstructable only by hand from the `Port`
+  column. Both the `Started` and `Dashboard` columns now fold onto a second
+  line instead of cropping — a folded value is complete and readable, a
+  cropped one is unrecoverable from the output. `Started` also renders to
+  minute precision in UTC (`2026-08-11 12:48Z`, down from a 32-character
+  microsecond-precision timestamp), leaving more room for `Workflow` before
+  folding is ever needed. The table is a glance-at listing, not an audit
+  log, so `--json` keeps reporting the exact recorded timestamp untouched —
+  only the human-readable rendering changed. `_print_running_list` is
+  shared with `conductor stop`, so its listing gets the shorter timestamp
+  too. The test fixture that let this through built its own PID-file JSON by
+  hand with a 19-character naive `started_at`, well short of production's
+  32-character value — it now goes through the real `write_pid_file`, so the
+  widths under test match the widths production writes.
+- **JSON result output no longer crashes on a legacy Windows stdout** (#342).
+  On a `cp1252` console, `conductor run` exited non-zero with
+  `UnicodeEncodeError` *after* the workflow had already succeeded, having
+  written a truncated document callers could not parse. `json.dumps` emits
+  ASCII by default, but rich's `print_json` re-parses and re-serialises with
+  `ensure_ascii=False` immediately before the write, restoring the character it
+  had escaped. Every JSON sink now passes `ensure_ascii=True`. Results carry
+  `\uXXXX` escapes on all platforms as a result, which is valid JSON and decodes
+  identically. `conductor doctor`'s default *table* output is unaffected by this
+  change and still fails on such a console (#401).
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
@@ -200,6 +903,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three of the five sinks; two of those were reachable on a bare `conductor run`
   with no flags. Opening tags such as `[bold]` were the quieter half of the same
   bug: rich consumed them without raising and the text simply disappeared.
+- **Non-ASCII workflow inputs are shown literally in verbose output**
+  ([#391](https://github.com/microsoft/conductor/pull/391)). The verbose
+  "Workflow Inputs" panel serialised inputs with `json.dumps`' default
+  `ensure_ascii=True`, so a Cyrillic, CJK or emoji input was displayed as
+  `\uXXXX` escapes rather than the text the user typed. Every other JSON
+  display path in the repo already passed `ensure_ascii=False` (#356); this
+  was the last one that did not. Machine-readable JSON *results* are
+  unaffected and still ASCII-escaped, which is what keeps them safe on a
+  legacy Windows console (#342).
 - **Structured `runtime.provider` for `name: claude` no longer drops a
   YAML-declared `api_key`** — the schema accepted `api_key` (alongside
   `base_url` and `auth_token`) but the provider factory silently discarded it,
@@ -342,6 +1054,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AgentExecutor`, upstream of every provider, so the path was always
   reachable and the declaration was simply inaccurate. Now bounded by
   `runtime.skill_injection` like `claude`.
+
 - **`claude-agent-sdk` provider now honors `working_dir`** — the directory
   resolved from `agent.working_dir` / `runtime.working_dir` is forwarded to
   `ClaudeAgentOptions.cwd`, so the `claude` CLI runs there and every stdio MCP

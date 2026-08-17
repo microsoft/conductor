@@ -7,6 +7,17 @@
 #   3. Downloads and verifies the constraints file (SHA-256)
 #   4. Installs Conductor via uv tool install with pinned dependencies
 #
+# Private / mirrored package index:
+#   uv resolves Conductor's dependencies from https://pypi.org/simple by
+#   default. On networks that block the public index, set UV_DEFAULT_INDEX
+#   (uv's own setting -- this script does not need a Conductor-specific flag)
+#   before running the installer:
+#
+#       $env:UV_DEFAULT_INDEX = "internal=https://<your-index-host>/simple/"
+#
+#   uv does NOT read pip's configuration, so `pip config set global.index-url`
+#   alone has no effect here.
+#
 # Robustness features for upgrade-over-existing-install:
 #   - Detects other running conductor processes; with -AutoStop kills them and
 #     continues, otherwise prompts (or aborts if no TTY)
@@ -32,13 +43,25 @@
 #       a throwaway UV_TOOL_BIN_DIR that must never leak into the real
 #       environment (note: `uv tool update-shell` intentionally modifies the
 #       shell and so ignores UV_NO_MODIFY_PATH).
+#   -Extras <a,b>             OR   $env:CONDUCTOR_INSTALL_EXTRAS
+#       Comma-separated optional extras to install (tui, aca,
+#       claude-agent-sdk). These are *added to* the extras already recorded in
+#       the existing install's uv receipt, which are preserved automatically --
+#       `uv tool install --force` rewrites the tool's whole requirement set, so
+#       an upgrade that named no extras used to silently uninstall
+#       `[tui]`/`[aca]` (issue #441).
+#   -NoPreserveExtras         OR   $env:CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS = '1'
+#       Do not carry the existing install's extras forward. Use this to drop
+#       back to a bare install.
 
 [CmdletBinding()]
 param(
     [string]$Source,
     [switch]$AutoStop,
     [switch]$Force,
-    [switch]$SkipPathUpdate
+    [switch]$SkipPathUpdate,
+    [string]$Extras,
+    [switch]$NoPreserveExtras
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +75,8 @@ if (-not $Source   -and $env:CONDUCTOR_INSTALL_SOURCE)               { $Source  
 if (-not $AutoStop -and $env:CONDUCTOR_INSTALL_AUTO_STOP -eq '1')    { $AutoStop = $true }
 if (-not $Force    -and $env:CONDUCTOR_INSTALL_FORCE     -eq '1')    { $Force    = $true }
 if (-not $SkipPathUpdate -and $env:CONDUCTOR_INSTALL_SKIP_PATH_UPDATE -eq '1') { $SkipPathUpdate = $true }
+if (-not $Extras  -and $env:CONDUCTOR_INSTALL_EXTRAS)                { $Extras   = $env:CONDUCTOR_INSTALL_EXTRAS }
+if (-not $NoPreserveExtras -and $env:CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS -eq '1') { $NoPreserveExtras = $true }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,11 +107,101 @@ function Get-UvToolsDir {
 }
 
 function Get-ConductorToolDir {
+    # Probes both directory names Get-InstalledVersion knows about, so the
+    # receipt lookup and the verification step agree about where the tool
+    # lives.
     $tools = Get-UvToolsDir
     if (-not $tools) { return $null }
+    foreach ($name in @('conductor-cli', 'conductor')) {
+        $dir = Join-Path $tools $name
+        if (Test-Path -LiteralPath (Join-Path $dir 'uv-receipt.toml')) { return $dir }
+    }
     $dir = Join-Path $tools 'conductor-cli'
     if (Test-Path -LiteralPath $dir) { return $dir }
     return $null
+}
+
+function Get-ReceiptExtras {
+    # Read the extras recorded in the existing install's uv tool receipt.
+    #
+    # `uv tool install --force` replaces the tool's entire requirement set, so
+    # an upgrade that names no extras silently uninstalls [tui]/[aca] -- which
+    # is exactly what `conductor update` used to do (issue #441). The receipt
+    # is the only authoritative record of what the current install carries;
+    # the CLI's `conductor.install_hint` reads the same file for its hints.
+    #
+    # Flattens newlines (uv may wrap the requirements array), splits the array
+    # into one requirement object per chunk, and keeps this distribution's
+    # entry -- so field order and extra `uv tool install --with` requirements
+    # are both tolerated.
+    $dir = Get-ConductorToolDir
+    if (-not $dir) { return '' }
+    $receipt = Join-Path $dir 'uv-receipt.toml'
+    if (-not (Test-Path -LiteralPath $receipt)) { return '' }
+    try {
+        $text = (Get-Content -LiteralPath $receipt -Raw) -replace '\r?\n', ' '
+    } catch {
+        # A receipt that exists but cannot be read is NOT a bare install, so
+        # do not report '' -- that would rebuild the tool without the extras
+        # it records. Signal unreadability and let the caller warn; aborting
+        # here would take away the reinstall that repairs this very state.
+        return $null
+    }
+    $found = $false
+    foreach ($chunk in ($text -split '\}')) {
+        # Match the whole `name = "conductor-cli"` field rather than the bare
+        # substring, so a `conductor-cli-plugin` requirement is not mistaken
+        # for this one. `[-_.]` covers a non-canonical (PEP 503) spelling.
+        if ($chunk -match 'name\s*=\s*"conductor[-_.]cli"') {
+            $found = $true
+            if ($chunk -match 'extras\s*=\s*\[([^\]]*)\]') {
+                return ($Matches[1] -replace '["'' ]', '')
+            }
+        }
+    }
+    if (-not $found) { return $null }
+    return ''
+}
+
+function Merge-Extras {
+    # Merge comma-separated extras lists, dropping blanks/duplicates and
+    # sorting so the generated spec is stable between runs (and comparable
+    # as a string).
+    #
+    # Lower-cases before deduplicating so the result matches `install.sh`'s
+    # `merge_extras`, whose `sort -u` is case-sensitive. Without it the two
+    # installers disagree on mixed-case input.
+    param([string]$A, [string]$B)
+    $parts = @("$A", "$B") -join ','
+    $names = $parts -split ',' |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ } |
+        Sort-Object -Unique
+    return ($names -join ',')
+}
+
+function Test-ExtrasKnown {
+    # Refuse an extra this package does not declare. uv treats an unknown
+    # extra as a *warning* and still exits 0, so without this a typo installs
+    # nothing and reports success.
+    param([string]$ExtrasList)
+    if (-not $ExtrasList) { return }
+    foreach ($name in ($ExtrasList -split ',')) {
+        $trimmed = $name.Trim()
+        if (-not $trimmed) { continue }
+        if (@('tui', 'aca', 'claude-agent-sdk') -notcontains $trimmed) {
+            Write-Err "unknown extra '$trimmed' (available: tui, aca, claude-agent-sdk)"
+        }
+    }
+}
+
+function Add-ExtrasToSource {
+    # Wrap an install source in a PEP 508 direct reference carrying the
+    # extras. uv accepts a git+ URL, a local directory, or a wheel path on
+    # the right-hand side of the `@`.
+    param([string]$InstallSource, [string]$ExtrasList)
+    if (-not $ExtrasList) { return $InstallSource }
+    return "conductor-cli[$ExtrasList] @ $InstallSource"
 }
 
 function Get-RunningConductorProcesses {
@@ -132,6 +247,17 @@ function Remove-StaleOldFiles {
     }
 }
 
+function Format-ProcessArgument {
+    # Quote an argument that contains whitespace so Start-Process passes it as
+    # one argv element. See the note in Invoke-UvInstall.
+    param([string]$Value)
+    if ($Value -notmatch '\s') { return $Value }
+    # Double any trailing backslashes so they escape each other rather than
+    # the closing quote, and escape embedded quotes.
+    $escaped = $Value -replace '(\\+)$', '$1$1' -replace '"', '\"'
+    return '"' + $escaped + '"'
+}
+
 function Invoke-UvInstall {
     param(
         [string]$InstallSource,
@@ -142,8 +268,12 @@ function Invoke-UvInstall {
     $stdoutFile = Join-Path $LogDir ("uv-stdout-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0,6)))
     $stderrFile = Join-Path $LogDir ("uv-stderr-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0,6)))
 
-    $argList = @('tool', 'install', '--force', $InstallSource)
-    if ($ConstraintsFile) { $argList += @('-c', $ConstraintsFile) }
+    # Start-Process joins -ArgumentList with spaces and does NOT quote the
+    # elements, so a PEP 508 direct reference ("conductor-cli[tui] @ <src>")
+    # would reach uv as three separate arguments and the extras would be
+    # silently dropped. Same hazard for a temp path containing a space.
+    $argList = @('tool', 'install', '--force', (Format-ProcessArgument $InstallSource))
+    if ($ConstraintsFile) { $argList += @('-c', (Format-ProcessArgument $ConstraintsFile)) }
 
     $proc = Start-Process -FilePath 'uv' `
         -ArgumentList $argList `
@@ -168,6 +298,158 @@ function Test-LockError {
         if ($lower.Contains($needle)) { return $true }
     }
     return $false
+}
+
+function Test-GitHostFailure {
+    # True when uv could not reach the *git remote* it fetches Conductor
+    # itself from. Checked before the index classifier because uv reports a
+    # failed git fetch with the same "failed to fetch" wording it uses for the
+    # index, and the remedies are completely different: no index setting fixes
+    # a blocked github.com.
+    param([string]$Output)
+    if (-not $Output) { return $false }
+    return $Output.ToLowerInvariant().Contains('git operation failed')
+}
+
+function Test-DefinitiveIndexBlock {
+    # Tier 1: uv states it gave up, or the condition is a policy, DNS, or TLS
+    # fact that a 2-second backoff cannot change. Safe to stop retrying.
+    param([string]$Output)
+    if (-not $Output) { return $false }
+    if (Test-GitHostFailure -Output $Output) { return $false }
+    $lower = $Output.ToLowerInvariant()
+    $needles = @(
+        'failed to fetch',
+        'request failed after',
+        '401 unauthorized',
+        '403 forbidden',
+        '407 proxy authentication required',
+        'dns error',
+        'invalid peer certificate',
+        'self-signed certificate',
+        'certificate verify failed',
+        'proxyerror',
+        'tls connect error'
+    )
+    foreach ($needle in $needles) {
+        if ($lower.Contains($needle)) { return $true }
+    }
+    return $false
+}
+
+function Test-NetworkBlockError {
+    # True when uv's output looks like the package index was unreachable
+    # rather than a transient local failure: a blocked/filtered network, an
+    # intercepting proxy, or a TLS-inspecting middlebox. Deliberately generic
+    # -- Conductor ships no default mirror and makes no assumption about
+    # whose network this is.
+    #
+    # Every needle names a *failure*, never merely a host. Matching on
+    # 'pypi.org' alone reported an integrity failure ("hash mismatch for
+    # https://files.pythonhosted.org/...") as an unreachable index, which is
+    # the worst available answer for a supply-chain signal.
+    #
+    # Tier 2 adds connection-level failures that a retry may genuinely fix (a
+    # VPN blip, a reset mid-download). Those still produce index guidance if
+    # they are what the run *finally* failed on, but they never cut the retry
+    # schedule short -- only Test-DefinitiveIndexBlock does that.
+    param([string]$Output)
+    if (-not $Output) { return $false }
+    if (Test-GitHostFailure -Output $Output) { return $false }
+    if (Test-DefinitiveIndexBlock -Output $Output) { return $true }
+    $lower = $Output.ToLowerInvariant()
+    $needles = @(
+        'error sending request',
+        'connection refused',
+        'connection reset',
+        'operation timed out'
+    )
+    foreach ($needle in $needles) {
+        if ($lower.Contains($needle)) { return $true }
+    }
+    return $false
+}
+
+function Get-RedactedUrl {
+    # Strip userinfo from a URL. An index URL is a documented place to put
+    # credentials, and the line that prints it reaches the terminal and every
+    # CI log that captures the installer.
+    param([string]$Url)
+    return ($Url -replace '://[^/@]*@', '://***@')
+}
+
+function Write-IndexOverrideInfo {
+    # Report the package index uv will resolve against, if the environment
+    # overrides the default. uv reads UV_DEFAULT_INDEX (current) and
+    # UV_INDEX_URL (deprecated but still honored); it does NOT read pip's
+    # configuration. Printing it makes "did my override actually apply?"
+    # answerable from the install log alone.
+    if ($env:UV_DEFAULT_INDEX) {
+        Write-Info "Package index (UV_DEFAULT_INDEX): $(Get-RedactedUrl $env:UV_DEFAULT_INDEX)"
+    } elseif ($env:UV_INDEX_URL) {
+        Write-Info "Package index (UV_INDEX_URL): $(Get-RedactedUrl $env:UV_INDEX_URL)"
+    }
+}
+
+function Write-IndexGuidance {
+    # Guidance for a failure that looks like a blocked/unreachable index.
+    Write-Host ""
+    Write-Host "  A package index this installer needs could not be reached." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  The most common cause is a network that blocks direct access to the"
+    Write-Host "  public Python package index (pypi.org / files.pythonhosted.org)."
+    Write-Host "  Managed or corporate devices often require all packages to come from"
+    Write-Host "  an internal mirror."
+    Write-Host ""
+    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL) {
+        Write-Host "  An index override is already set (shown above), so uv did not use the"
+        Write-Host "  public index. Check that the URL is correct and reachable from this"
+        Write-Host "  machine, and that any credentials it needs are supplied."
+        Write-Host ""
+    } else {
+        Write-Host "  If your organization provides a PyPI mirror or proxy, point uv at it"
+        Write-Host "  and re-run this installer:"
+        Write-Host ""
+        Write-Host '      $env:UV_DEFAULT_INDEX = "internal=https://<your-index-host>/simple/"' -ForegroundColor Cyan
+        Write-Host '      irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  To persist it for future shells (including 'conductor update --apply'),"
+        Write-Host "  set it once and open a new terminal:"
+        Write-Host ""
+        Write-Host '      setx UV_DEFAULT_INDEX "internal=https://<your-index-host>/simple/"' -ForegroundColor Cyan
+        Write-Host ""
+    }
+    Write-Host "  Notes:"
+    Write-Host "    * uv does not read pip's configuration. Setting"
+    Write-Host '      "pip config set global.index-url ..." alone has no effect here.'
+    Write-Host "    * Ask your IT or platform team for the index URL. Conductor ships no"
+    Write-Host "      default mirror and never redirects your packages on its own."
+    Write-Host "    * For credentials, name the index (the 'internal=' prefix above) and"
+    Write-Host "      set UV_INDEX_INTERNAL_USERNAME / UV_INDEX_INTERNAL_PASSWORD, or"
+    Write-Host "      embed them in the URL."
+    Write-Host "    * If the error mentions a certificate, the network is inspecting TLS."
+    Write-Host "      Trust your organization CA via SSL_CERT_FILE, or set UV_NATIVE_TLS=1."
+    Write-Host "    * If the error mentions a proxy (407), set HTTPS_PROXY / NO_PROXY."
+    Write-Host ""
+    Write-Host "  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index"
+    Write-Host ""
+}
+
+function Write-GitHostGuidance {
+    # Guidance for a failure fetching Conductor's own git repository. Kept
+    # separate from the index guidance because no index setting can fix it.
+    Write-Host ""
+    Write-Host "  Conductor's source repository could not be reached." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  This installer fetches Conductor itself from github.com. The error"
+    Write-Host "  above is a git failure, not a package-index failure, so setting"
+    Write-Host "  UV_DEFAULT_INDEX will not help."
+    Write-Host ""
+    Write-Host "  Check that this machine can reach github.com -- including any proxy"
+    Write-Host "  (HTTPS_PROXY / NO_PROXY) or TLS inspection your network requires."
+    Write-Host ""
+    Write-Host "  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index"
+    Write-Host ""
 }
 
 function Move-ConductorToolDirAside {
@@ -260,6 +542,33 @@ if ($Source) {
     $displayVersion = $tagName
 }
 
+# --- Extras: carry the existing install's extras forward, plus any requested ---
+#
+# $receiptNow is what is installed; $existingExtras is what we choose to carry.
+# They differ under -NoPreserveExtras, and the up-to-date check below has to
+# compare against the former -- comparing against the latter made the opt-out
+# a no-op, since the switch zeroes it and both sides then match.
+Test-ExtrasKnown $Extras
+$rawExtras = Get-ReceiptExtras
+$receiptReadable = $null -ne $rawExtras
+$receiptNow = Merge-Extras $rawExtras ''
+if (-not $receiptReadable) {
+    # Warn and continue rather than aborting: a broken receipt is exactly the
+    # state a reinstall is meant to repair, so refusing would remove the
+    # remedy. Proceeding silently is how [tui]/[aca] disappear unnoticed.
+    Write-Warn "Could not read the existing install's uv receipt; extras cannot be preserved."
+    Write-Warn "Re-run with -Extras <a,b> to reinstate any you had."
+}
+$existingExtras = ''
+if (-not $NoPreserveExtras) { $existingExtras = $receiptNow }
+$resolvedExtras = Merge-Extras $existingExtras $Extras
+if ($resolvedExtras) {
+    Write-Info "Including extras: $resolvedExtras"
+    $installSource = Add-ExtrasToSource $installSource $resolvedExtras
+} elseif ($receiptNow) {
+    Write-Info "Dropping extras: $receiptNow"
+}
+
 # --- Check existing installation (only meaningful for the GitHub-release path) ---
 if (-not $Source) {
     $existingConductor = Get-Command conductor -ErrorAction SilentlyContinue
@@ -271,7 +580,12 @@ if (-not $Source) {
         } catch { }
         if ($currentVersion) {
             $latestVersion = $tagName -replace '^v', ''
-            if ($currentVersion -eq $latestVersion) {
+            # An already-current version is only a no-op when the extras on
+            # disk already match what this run would install: `-Extras tui`
+            # (or -NoPreserveExtras) still has work to do, and reporting "up
+            # to date" would silently skip it.
+            if ($currentVersion -eq $latestVersion -and
+                $resolvedExtras -eq $receiptNow -and $receiptReadable) {
                 Write-Ok "Conductor v$currentVersion is already installed and up to date."
                 Write-Host ""
                 Write-Host "  Run 'conductor --help' to get started."
@@ -374,6 +688,10 @@ try {
     # --- Install with retries + rename-fallback ---
     $delays = @(2, 5, 10)
     Write-Info "Installing Conductor $displayVersion..."
+    Write-IndexOverrideInfo
+    $networkBlocked = $false
+    $gitHostFailure = $false
+    $lockFallbackTried = $false
     for ($attempt = 1; $attempt -le ($delays.Count + 1); $attempt++) {
         if ($attempt -gt 1) {
             $sleep = $delays[[Math]::Min($attempt - 2, $delays.Count - 1)]
@@ -387,12 +705,26 @@ try {
         $lastStderr   = $r.Stderr
         if ($lastExitCode -eq 0) {
             $installed = $true
+            # uv reports an extra it does not recognise as a warning and still
+            # exits 0, and this output is only shown on failure -- so without
+            # this the run ends in a green checkmark having installed nothing
+            # the user asked for.
+            foreach ($line in (($lastStdout + $lastStderr) -split "`r?`n")) {
+                if ($line -match 'does not have an extra named') { Write-Warn $line.Trim() }
+            }
             break
         }
 
-        # If we hit a directory-lock error and we haven't already renamed
-        # aside, try the rename-fallback before the next retry.
-        if (-not $renamedAside -and (Test-LockError -Output ($lastStderr + $lastStdout))) {
+        $attemptOutput = $lastStderr + $lastStdout
+
+        # If we hit a directory-lock error and we haven't already tried the
+        # fallback, rename the tool dir aside before the next retry. The guard
+        # tracks the *attempt*, not its result: Move-ConductorToolDirAside
+        # returns $null when there is no existing tool dir (a fresh install),
+        # so guarding on $renamedAside would keep this branch firing every
+        # iteration and starve the classifier below.
+        if (-not $lockFallbackTried -and (Test-LockError -Output $attemptOutput)) {
+            $lockFallbackTried = $true
             Write-Warn "Install blocked by a file lock; renaming the existing tool dir aside and retrying..."
             $renamedAside = Move-ConductorToolDirAside
             if ($renamedAside) {
@@ -402,8 +734,29 @@ try {
                 if ($existingTool2) {
                     Remove-StaleOldFiles -ScriptsDir (Join-Path $existingTool2 'Scripts')
                 }
+            } else {
+                Write-Warn "No existing tool dir to rename; the lock is elsewhere. Retrying anyway."
             }
+            continue
         }
+
+        # A definitively blocked index does not heal on a retry -- uv has
+        # already exhausted its own retries by this point. Backing off three
+        # more times just delays the only message that helps, so stop and
+        # explain instead. Connection-level failures are deliberately
+        # excluded: a VPN blip really can heal, and cutting the schedule
+        # short for one would trade a working install for a faster wrong
+        # answer. A git failure is excluded too, since uv does not retry git
+        # fetches internally, so a retry there is genuinely useful.
+        if (Test-DefinitiveIndexBlock -Output $attemptOutput) {
+            $networkBlocked = $true
+            break
+        }
+        # Not conclusive yet -- remember what this attempt looked like so the
+        # post-loop classification can explain whatever the run finally
+        # failed on.
+        $networkBlocked = Test-NetworkBlockError -Output $attemptOutput
+        $gitHostFailure = Test-GitHostFailure -Output $attemptOutput
     }
 
     if (-not $installed) {
@@ -415,16 +768,31 @@ try {
         } else {
             Write-Host "  (no output captured)" -ForegroundColor DarkGray
         }
+
+        # Printed before any early exit below, so a user whose install was
+        # renamed aside is always told where it went.
+        if ($renamedAside) {
+            Write-Host ""
+            Write-Info "The previous install was moved to: $renamedAside"
+            Write-Info "You can delete it manually once nothing has it open."
+        }
+
+        if ($networkBlocked) {
+            Write-IndexGuidance
+            Write-Err "uv tool install failed: could not reach the package index"
+        }
+
+        if ($gitHostFailure) {
+            Write-GitHostGuidance
+            Write-Err "uv tool install failed: could not reach github.com"
+        }
+
         Write-Host ""
         Write-Info "Install failed."
         Write-Info "If the error mentions 'Access is denied' or 'failed to remove directory':"
         Write-Info "  * Stop any running Conductor processes (try Task Manager or 'Get-Process conductor')"
         Write-Info "  * Windows Defender may be scanning the install directory. Try an exclusion:"
         Write-Info "      Add-MpPreference -ExclusionPath `"`$env:LOCALAPPDATA\uv`""
-        if ($renamedAside) {
-            Write-Info "  * The previous install was moved to: $renamedAside"
-            Write-Info "    You can delete it manually once nothing has it open."
-        }
         Write-Host ""
         Write-Err "uv tool install failed"
     }

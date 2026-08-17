@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from conductor.plugins.errors import PluginSourceError
 
@@ -76,6 +76,28 @@ _CREDENTIAL: re.Pattern[str] = re.compile(r"(\w+://)[^/@]+@")
 # Host recorded for a local-path source, so its cache key cannot collide
 # with a real host. Not a valid DNS name, deliberately.
 _LOCAL_HOST = "_local"
+
+# Characters that are legal in a URL path segment but change what a path
+# *means* on Windows, so a cache key built from them would not name the
+# directory it appears to. ``:`` is the one that actually occurs: a
+# ``file://C:/src/repo`` source derives the owner ``C:_src``, and Windows
+# reads ``C:`` as a drive (or, mid-component, as an NTFS alternate data
+# stream) rather than as part of the name. The rest are included because
+# they fail the same way and cost nothing to cover.
+#
+# Substituted rather than refused, unlike ``..``: a Windows path is a
+# legitimate source, so refusing it would make ``file://`` unusable there.
+# Substituted on *every* platform so one workflow file resolves to the same
+# cache layout everywhere.
+_PATH_UNSAFE = str.maketrans(dict.fromkeys(':<>"|?*', "_"))
+
+# Bound on one cache-key segment. Windows caps a path at 260 characters
+# unless long-path support is enabled, and the segment is only one part of a
+# path that also carries the cache root, the host, the leaf, a staging
+# directory, and whatever the repository itself nests. Sized against the
+# worst case seen in CI -- a pytest temporary root, which at 48 came to 264
+# characters and at 24 comes to 240.
+_MAX_SEGMENT = 24
 
 
 def redact_credentials(text: str) -> str:
@@ -243,10 +265,14 @@ def _is_local_path(location: str) -> bool:
     """
     if location.startswith(("~", ".")):
         return True
-    # Absolute on either platform. A bare Windows drive root ("C:\\") is
-    # caught by ntpath's isabs via PureWindowsPath, which PurePosixPath
-    # would call relative.
-    return Path(location).is_absolute() or bool(re.match(r"\A[A-Za-z]:[\\/]", location))
+    # Absolute in *either* convention, deliberately independent of the host
+    # OS. A plugin source is a string in a workflow file, so the same file
+    # must classify it the same way everywhere -- ``Path`` is the running
+    # platform's flavour, so on Windows it called "/srv/p" relative and the
+    # source was refused as unrecognised. ``PureWindowsPath`` also covers a
+    # bare drive root ("C:\\") and UNC paths, which the posix flavour calls
+    # relative; a drive-relative "C:" is absolute in neither, correctly.
+    return PurePosixPath(location).is_absolute() or PureWindowsPath(location).is_absolute()
 
 
 def _strip_git_suffix(name: str) -> str:
@@ -288,7 +314,38 @@ def _key_from_parts(raw: str, host: str, path: str) -> tuple[str, str, str]:
             f"Source {raw!r} contains a '.' or '..' path component, which would "
             "escape the plugin cache directory."
         )
-    return resolved
+    # Substitution happens after the '..' check, so a hostile segment is
+    # still refused rather than quietly renamed into a harmless one.
+    return tuple(_safe_segment(segment) for segment in resolved)  # type: ignore[return-value]
+
+
+def _safe_segment(segment: str) -> str:
+    """Make one cache-key segment safe to use as a directory name anywhere.
+
+    Two problems, both only reachable via a local ``file://`` source, and
+    both of which put the checkout somewhere other than where the key says.
+
+    Characters are substituted because ``:`` changes what a path *means* on
+    Windows: an owner of ``C:_src`` reads as a drive, or mid-component as an
+    NTFS alternate data stream. The rest of the set fails the same way.
+
+    Length is bounded because a local source flattens its whole directory
+    path into the owner segment, and Windows still caps a path at 260
+    characters by default -- a source under a deep directory produced a name
+    long enough that ``git`` refused to create ``.git`` inside it. Replacing
+    an over-long segment with a digest of itself costs nothing: the cache
+    key's leaf already carries a digest of the full location, so the owner
+    disambiguates nothing on its own.
+
+    The *tail* is kept rather than the head. What survives is then the
+    directory nearest the repository, which is the part someone browsing the
+    cache can recognise; the head is a drive letter and ``Users``.
+    """
+    segment = segment.translate(_PATH_UNSAFE)
+    if len(segment) > _MAX_SEGMENT:
+        digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()[:12]
+        return f"{segment[-(_MAX_SEGMENT - len(digest) - 1) :]}-{digest}"
+    return segment
 
 
 def _parse_url(raw: str, location: str, ref: str | None) -> PluginSource:
@@ -298,7 +355,14 @@ def _parse_url(raw: str, location: str, ref: str | None) -> PluginSource:
         # A file:// URL has no host worth keying on, and its path is
         # already absolute. Treated as a remote (git can clone it) but
         # keyed under the local host so it cannot collide with a forge.
-        host, owner, repo = _key_from_parts(raw, _LOCAL_HOST, remainder)
+        #
+        # Backslashes are folded to '/' first: this is the one URL form
+        # that carries a native Windows path, and the splitter below only
+        # knows '/'. Without this the whole of "C:\src\repo" arrives as a
+        # single segment, so the cache key kept its separators and the
+        # checkout landed at a drive-absolute path outside the plugin
+        # cache entirely -- the same escape the '..' check exists to stop.
+        host, owner, repo = _key_from_parts(raw, _LOCAL_HOST, remainder.replace("\\", "/"))
         return PluginSource(raw=raw, location=location, ref=ref, host=host, owner=owner, repo=repo)
 
     authority, _, path = remainder.partition("/")

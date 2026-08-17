@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -261,12 +262,71 @@ class TestResumeCommand:
             "work_item_id": "1814",
         }
 
+    def test_resume_with_guidance(self, tmp_path: Path) -> None:
+        """--guidance flags are forwarded to resume_workflow_async as a list."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(
+                app,
+                [
+                    "resume",
+                    str(wf_path),
+                    "--guidance",
+                    "Skip the benchmark step",
+                    "--guidance",
+                    "Prefer Python 3.12",
+                ],
+            )
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["guidance"] == [
+            "Skip the benchmark step",
+            "Prefer Python 3.12",
+        ]
+
     def test_resume_invalid_metadata_format(self, tmp_path: Path) -> None:
         """Test resume rejects malformed --metadata values."""
         wf_path = _write_workflow(tmp_path)
 
         result = runner.invoke(app, ["resume", str(wf_path), "--metadata", "no_equals"])
         assert result.exit_code != 0
+
+    def test_resume_guidance_stripped(self, tmp_path: Path) -> None:
+        """--guidance entries are stripped before being forwarded (issue #400)."""
+        wf_path = _write_workflow(tmp_path)
+
+        with patch(
+            "conductor.cli.run.resume_workflow_async", new_callable=AsyncMock
+        ) as mock_resume:
+            mock_resume.return_value = {"result": "ok"}
+            runner.invoke(app, ["resume", str(wf_path), "--guidance", "  padded text  "])
+
+        call_kwargs = mock_resume.call_args
+        assert call_kwargs[1]["guidance"] == ["padded text"]
+
+    def test_resume_rejects_empty_guidance(self, tmp_path: Path) -> None:
+        """--guidance rejects a blank/whitespace-only entry, matching POST /api/guidance."""
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(app, ["resume", str(wf_path), "--guidance", "   "])
+        assert result.exit_code != 0
+        assert "empty" in result.output.lower()
+
+    def test_resume_rejects_oversized_guidance(self, tmp_path: Path) -> None:
+        """--guidance rejects text over MAX_GUIDANCE_CHARS, matching POST /api/guidance."""
+        from conductor.engine.guidance import MAX_GUIDANCE_CHARS
+
+        wf_path = _write_workflow(tmp_path)
+
+        result = runner.invoke(
+            app, ["resume", str(wf_path), "--guidance", "x" * (MAX_GUIDANCE_CHARS + 1)]
+        )
+        assert result.exit_code != 0
+        assert "maximum length" in result.output.lower()
 
     def test_resume_with_web(self, tmp_path: Path) -> None:
         """Test resume passes --web and --web-port through."""
@@ -330,6 +390,80 @@ class TestResumeCommand:
         assert kwargs["skip_gates"] is True
         assert kwargs["web_port"] == 9092
         assert kwargs["metadata"] == {"tracker": "ado"}
+
+    def test_resume_web_bg_not_started_prints_note(self, tmp_path: Path) -> None:
+        """Issue #410: resume --web-bg also surfaces the "still initializing" note."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9094",
+                stderr_log=tmp_path / "stub-fadedbee.bg.stderr.log",
+                stdout_log=tmp_path / "stub-fadedbee.bg.stdout.log",
+                run_id="fadedbee",
+                workflow_started=False,
+            )
+            result = runner.invoke(app, ["resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "has not reported starting" in combined
+        assert "CONDUCTOR_WEB_BG_START_TIMEOUT" in combined
+
+    def test_resume_web_bg_no_run_record_prints_note(self, tmp_path: Path) -> None:
+        """Issue #435: resume --web-bg must surface the same "could not register
+        itself for discovery" note as a fresh ``run --web-bg`` — see
+        ``app.py``'s duplicated verbose bg-launch block, which is exactly the
+        kind of copy-paste omission the parity rule in AGENTS.md exists to
+        catch."""
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9096",
+                stderr_log=tmp_path / "stub-baddecaf.bg.stderr.log",
+                stdout_log=tmp_path / "stub-baddecaf.bg.stdout.log",
+                run_id="baddecaf",
+                run_record_written=False,
+            )
+            result = runner.invoke(app, ["resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "could not register itself for discovery" in combined
+        assert "conductor stop" in combined
+
+    def test_resume_web_bg_still_running_false_prints_completed_notice(
+        self, tmp_path: Path
+    ) -> None:
+        """Follow-up to issue #410: a resume that already exited must not
+
+        print a live dashboard URL — see ``BackgroundLaunch.still_running``.
+        """
+        from conductor.cli.bg_runner import BackgroundLaunch
+
+        wf_path = _write_workflow(tmp_path)
+
+        with patch("conductor.cli.bg_runner.launch_background_resume") as mock_launch:
+            mock_launch.return_value = BackgroundLaunch(
+                url="http://127.0.0.1:9095",
+                stderr_log=tmp_path / "stub-cafebabe.bg.stderr.log",
+                stdout_log=tmp_path / "stub-cafebabe.bg.stdout.log",
+                run_id="cafebabe",
+                workflow_started=True,
+                still_running=False,
+            )
+            result = runner.invoke(app, ["resume", str(wf_path), "--web-bg"])
+
+        assert result.exit_code == 0
+        combined = (result.output or "") + (result.stderr or "")
+        assert "Workflow completed" in combined
+        assert "Dashboard:" not in combined
+        assert "running in background" not in combined
 
     def test_silent_resume_web_bg_suppresses_dashboard_output(self, tmp_path: Path) -> None:
         """Test --silent suppresses resume --web-bg parent-process dashboard output."""
@@ -399,7 +533,9 @@ class TestLaunchBackgroundResume:
 
         captured: dict[str, list[str]] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:  # type: ignore[no-untyped-def]
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: object
+        ) -> MagicMock:  # type: ignore[no-untyped-def]
             captured["cmd"] = cmd
             proc = MagicMock()
             proc.pid = 12345
@@ -407,9 +543,13 @@ class TestLaunchBackgroundResume:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(12345, 9099),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path,
@@ -446,7 +586,9 @@ class TestLaunchBackgroundResume:
 
         captured: dict[str, list[str]] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:  # type: ignore[no-untyped-def]
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: object
+        ) -> MagicMock:  # type: ignore[no-untyped-def]
             captured["cmd"] = cmd
             proc = MagicMock()
             proc.pid = 12345
@@ -454,9 +596,13 @@ class TestLaunchBackgroundResume:
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(12345, 9100),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             bg_runner.launch_background_resume(
                 workflow_path=None,
@@ -601,15 +747,23 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None  # still running
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch("conductor.fleet.records.read_run_record", return_value=None) as mock_read,
+            # Prevent the launch gate's liveness sweep from mistaking pid
+            # 4242 for a still-alive process and sending it a real SIGKILL
+            # -- see tests/conftest.py's install_scripts hazard note.
+            patch("conductor.cli.pid.is_process_alive", return_value=False),
             pytest.raises(RuntimeError, match="terminated"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
         proc.terminate.assert_called_once()
-        mock_write.assert_not_called()
+        # The dashboard never came up, so the record-poll *gate* itself is
+        # never reached -- but issue #447's ``_peek_confirmed_pid`` still
+        # makes one best-effort, opportunistic read to find a trustworthy
+        # termination target before killing the child.
+        mock_read.assert_called_once()
 
     def test_reports_immediate_child_exit(self, tmp_path: Path) -> None:
         """If the child died before the server came up, surface its exit code."""
@@ -623,19 +777,24 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = 7  # exited with code 7
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=False),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch("conductor.fleet.records.read_run_record") as mock_read,
             pytest.raises(RuntimeError, match="exited immediately with code 7"),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
-        # Child already dead -> no terminate, no PID file written.
+        # Child already dead -> no terminate, no run-record poll reached.
         proc.terminate.assert_not_called()
-        mock_write.assert_not_called()
+        mock_read.assert_not_called()
 
-    def test_terminates_child_on_pid_write_failure(self, tmp_path: Path) -> None:
-        """If write_pid_file raises, the running child is killed (no orphan)."""
+    def test_terminates_child_when_run_record_never_appears(self, tmp_path: Path) -> None:
+        """When the child never writes its run record *and* its dashboard has
+        gone unreachable at the deadline re-probe, the running child is
+        killed (no orphan). See ``test_bg_runner.py``'s
+        ``TestRunRecordPollGate`` for the counterpart where the child stays
+        reachable and the launch is downgraded to a warning instead
+        (issue #435)."""
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -646,17 +805,28 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
-            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file", side_effect=OSError("disk full")),
-            pytest.raises(RuntimeError, match="Failed to write PID file"),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            # Second element is the deadline branch's 1s reachability
+            # re-probe, which fails here -- keeping this test on the fatal
+            # path.
+            patch("conductor.cli.bg_runner._wait_for_server", side_effect=[True, False]),
+            patch("conductor.fleet.records.read_run_record", return_value=None),
+            patch.object(bg_runner.time, "sleep"),
+            patch.object(bg_runner.time, "monotonic", side_effect=[0.0, 0.0, 20.0]),
+            # Prevent the launch gate's liveness sweep from mistaking pid
+            # 4244 for a still-alive process and sending it a real SIGKILL
+            # -- see tests/conftest.py's install_scripts hazard note.
+            patch("conductor.cli.pid.is_process_alive", return_value=False),
+            pytest.raises(RuntimeError, match="did not report a run record"),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             bg_runner.launch_background_resume(workflow_path=wf_path, checkpoint_path=None)
 
         proc.terminate.assert_called_once()
 
-    def test_pid_file_written_with_workflow_path(self, tmp_path: Path) -> None:
-        """When workflow_path is provided, the PID file is keyed to it."""
+    def test_run_record_looked_up_with_workflow_path(self, tmp_path: Path) -> None:
+        """When workflow_path is provided, the launch still succeeds once the
+        child's run record (keyed by ``run_id``, not by workflow path) appears."""
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -667,18 +837,22 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9201),
+            ) as mock_read,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
-            bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=wf_path, checkpoint_path=None, web_port=9201
             )
 
-        mock_write.assert_called_once_with(5555, 9201, wf_path)
+        mock_read.assert_called_once_with(launch.run_id)
 
-    def test_pid_file_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
-        """When only checkpoint_path is given, it is used for the PID file ref."""
+    def test_run_record_lookup_falls_back_to_checkpoint_path(self, tmp_path: Path) -> None:
+        """When only checkpoint_path is given, the launch still resolves via ``run_id``."""
         from conductor.cli import bg_runner
 
         cp_path = tmp_path / "cp.json"
@@ -689,25 +863,31 @@ class TestLaunchBackgroundResumeFailures:
         proc.poll.return_value = None
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", return_value=proc),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file") as mock_write,
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9202),
+            ) as mock_read,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
-            bg_runner.launch_background_resume(
+            launch = bg_runner.launch_background_resume(
                 workflow_path=None, checkpoint_path=cp_path, web_port=9202
             )
 
-        mock_write.assert_called_once_with(5556, 9202, cp_path)
+        mock_read.assert_called_once_with(launch.run_id)
 
     def test_subprocess_detachment_kwargs(self, tmp_path: Path) -> None:
-        """Verify Popen is called with detachment + bg env vars + redirected stdout/stderr.
+        """Verify ``_spawn_detached`` is called with bg env vars + redirected stdout/stderr.
 
         The child's stdout/stderr must be redirected to log files (NOT
         ``DEVNULL``) so a silent crash leaves a forensic trail. See
-        issue #116.
+        issue #116. Detachment kwargs themselves (``start_new_session`` /
+        Windows job breakaway / ``CREATE_SUSPENDED``) are internal to
+        ``_spawn_detached`` now (issue #447) and are covered directly by
+        ``tests/test_cli/test_bg_runner.py::TestSpawnDetached`` and
+        ``TestDetachmentKwargs`` instead of being re-asserted here.
         """
-        import sys as _sys
-
         from conductor.cli import bg_runner
 
         wf_path = tmp_path / "wf.yaml"
@@ -715,18 +895,25 @@ class TestLaunchBackgroundResumeFailures:
 
         captured: dict[str, object] = {}
 
-        def _fake_popen(cmd: list[str], **kwargs: object) -> MagicMock:
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: object
+        ) -> MagicMock:
             captured.update(kwargs)
             captured["cmd"] = cmd
+            captured["env"] = env
             proc = MagicMock()
             proc.pid = 1
             proc.poll.return_value = None
             return proc
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
-            patch("conductor.cli.pid.write_pid_file"),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(1, 9203),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             bg_runner.launch_background_resume(
                 workflow_path=wf_path, checkpoint_path=None, web_port=9203
@@ -734,8 +921,6 @@ class TestLaunchBackgroundResumeFailures:
 
         import subprocess as _sp
 
-        # stdin stays DEVNULL (detached child has no interactive input)
-        assert captured["stdin"] is _sp.DEVNULL
         # stdout/stderr must be redirected to writable text-mode file objects
         # so Python tracebacks and faulthandler dumps from the child survive
         # the parent's exit. DEVNULL is explicitly NOT allowed here.
@@ -748,11 +933,6 @@ class TestLaunchBackgroundResumeFailures:
             assert hasattr(stream, "write"), f"{stream_name} must be a writable file-like"
             assert hasattr(stream, "name"), f"{stream_name} must expose a name attribute"
             assert ".bg." in stream.name and stream.name.endswith(".log")
-        if _sys.platform == "win32":
-            expected_flags = _sp.CREATE_NEW_PROCESS_GROUP | _sp.CREATE_BREAKAWAY_FROM_JOB
-            assert captured["creationflags"] == expected_flags
-        else:
-            assert captured["start_new_session"] is True
         env = captured["env"]
         assert isinstance(env, dict)
         assert env["CONDUCTOR_WEB_BG"] == "1"
@@ -763,6 +943,421 @@ class TestLaunchBackgroundResumeFailures:
         assert len(env["CONDUCTOR_RUN_ID"]) == 8
         assert env["CONDUCTOR_BG_STDERR_LOG"].endswith(".bg.stderr.log")
         assert env["CONDUCTOR_BG_STDOUT_LOG"].endswith(".bg.stdout.log")
+
+
+def _write_checkpoint_with_log(tmp_path: Path, workflow_path: Path, run_id: str) -> Path:
+    """Checkpoint whose ``event_log_path`` points at a file that exists.
+
+    ``_peek_resume_run_id`` only adopts the checkpoint's run id when that log
+    survives -- mirroring ``EventLogSubscriber``, which reuses the id under
+    exactly the same condition. A checkpoint with a missing log makes the
+    child mint a fresh id, so the parent must not adopt either (it would then
+    poll a key the child never writes and terminate a healthy run). Creating
+    the log is therefore part of setting up the adoption case, not incidental.
+    """
+    log_path = tmp_path / f"conductor-run-{run_id}.events.jsonl"
+    log_path.write_text("")
+    return _write_checkpoint(tmp_path, workflow_path, run_id=run_id, event_log_path=str(log_path))
+
+
+def _record_poll_mock(pid: int, web_port: int):
+    """Stand in for the child writing its run record (Fleet Manager D2).
+
+    ``_finalize_background_launch`` polls ``read_run_record(run_id)`` and only
+    accepts a record matching the child's ``pid``/``mode``/``port``, so the
+    stub has to agree with the launch it is standing in for -- a mock with
+    fixed attributes would simply never match and the gate would time out.
+    """
+    from unittest.mock import MagicMock as _MagicMock
+
+    def _read(run_id: str):
+        return _MagicMock(run_id=run_id, pid=pid, mode="bg", port=web_port)
+
+    return _read
+
+
+class TestLaunchBackgroundResumeRunIdAdoption:
+    """``launch_background_resume`` adopts the checkpoint's ``run_id`` (issue #404).
+
+    Without this, the launcher always minted a fresh id — one that matches
+    neither the resumed child's ``EventLogSubscriber`` (which reuses the
+    checkpoint's ``run_id`` whenever the original JSONL still exists) nor the
+    events JSONL filename, leaving the PID file's ``run_id`` correlating with
+    nothing.
+    """
+
+    def test_explicit_from_checkpoint_run_id_is_adopted(self, tmp_path: Path) -> None:
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "deadbeef")
+
+        proc = MagicMock()
+        proc.pid = 6001
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9210),
+            ) as mock_write,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9210
+            )
+
+        # under this exact id and the launch gate polls that key, so folding
+        # the case here would poll a key the child never writes.
+        assert launch.run_id == "deadbeef"
+        assert "deadbeef" in launch.stderr_log.name
+        assert "deadbeef" in launch.stdout_log.name
+
+        # The launch gate polls for the child's record by run id, so the
+        # adopted id is what it must have asked for.
+        mock_write.assert_called_with("deadbeef")
+
+    def test_explicit_from_checkpoint_run_id_wires_env(self, tmp_path: Path) -> None:
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "deadbeef")
+
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(
+            cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any
+        ) -> MagicMock:
+            captured["env"] = env
+            proc = MagicMock()
+            proc.pid = 6002
+            proc.poll.return_value = None
+            return proc
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", side_effect=_fake_popen),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(6002, 9211),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9211
+            )
+
+        assert captured["env"]["CONDUCTOR_RUN_ID"] == "deadbeef"
+
+    def test_workflow_only_resume_mirrors_child_latest_checkpoint_resolution(
+        self, tmp_path: Path
+    ) -> None:
+        """A bare ``workflow_path`` resume finds the latest checkpoint, same as the child."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "cafef00d")
+
+        proc = MagicMock()
+        proc.pid = 6003
+        proc.poll.return_value = None
+
+        with (
+            patch(
+                "conductor.engine.checkpoint.CheckpointManager.find_latest_checkpoint",
+                return_value=cp_path,
+            ),
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9212),
+            ) as mock_write,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=wf_path, checkpoint_path=None, web_port=9212
+            )
+
+        assert launch.run_id == "cafef00d"
+        mock_write.assert_called_with("cafef00d")
+
+    def test_missing_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint with no ``run_id`` doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="")
+
+        proc = MagicMock()
+        proc.pid = 6004
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9213),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9213
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_malformed_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint whose ``run_id`` isn't 8 hex chars doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path, run_id="not-a-valid-run-id")
+
+        proc = MagicMock()
+        proc.pid = 6005
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9214),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9214
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_unreadable_checkpoint_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """An unreadable/absent checkpoint doesn't crash the launch."""
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        missing_cp = tmp_path / "does-not-exist.json"
+
+        proc = MagicMock()
+        proc.pid = 6006
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9215),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=missing_cp, web_port=9215
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_uppercase_checkpoint_run_id_is_adopted_verbatim(self, tmp_path: Path) -> None:
+        """A checkpoint's uppercase ``run_id`` is adopted as-is, not folded.
+
+        Every current writer of a checkpoint's ``run_id``
+        (``EventLogSubscriber``, ``secrets.token_hex``) produces lowercase
+        hex, but a hand-edited or future-format checkpoint could carry
+        uppercase — which must still be recognized and adopted, not treated
+        as malformed.
+
+        It must be adopted **verbatim**: ``EventLogSubscriber`` assigns
+        ``self._run_id = existing_run_id`` with no normalization, so the child
+        writes its run record under exactly this id. Lowercasing it here would
+        make the D2 launch gate poll a key that never appears and terminate a
+        perfectly healthy resumed run.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "DEADBEEF")
+
+        proc = MagicMock()
+        proc.pid = 6007
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9216),
+            ) as mock_write,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9216
+            )
+
+        # Preserved verbatim, not lowercased: the child writes its run record
+        # under this exact id and the D2 launch gate polls that key, so folding
+        # the case here would poll a key the child never writes.
+        assert launch.run_id == "DEADBEEF"
+        # The launch gate polls for the child's record by run id, so the
+        # adopted id is what it must have asked for.
+        mock_write.assert_called_with("DEADBEEF")
+
+    def test_hyphenated_checkpoint_run_id_is_adopted_verbatim(self, tmp_path: Path) -> None:
+        """A checkpoint's hyphenated ``run_id`` is adopted verbatim too.
+
+        The shared ``conductor.run_id`` contract (issue #435) allows
+        ``-``/``_`` in addition to alphanumerics, so a checkpoint carrying
+        one (e.g. a hand-authored or externally-generated run id) must be
+        adopted the same way a plain hex one is.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "nightly-run_7")
+
+        proc = MagicMock()
+        proc.pid = 6010
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9219),
+            ) as mock_write,
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9219
+            )
+
+        assert launch.run_id == "nightly-run_7"
+        mock_write.assert_called_with("nightly-run_7")
+
+    def test_parent_poll_key_matches_child_env_fallback_when_log_vanishes(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The two rules agree even on the branch that used to diverge (issue #435).
+
+        ``_peek_resume_run_id`` (parent side) adopts the checkpoint's
+        ``run_id`` whenever its event log exists *at peek time*. But the
+        actual child may find that log gone by the time it constructs its
+        own ``EventLogSubscriber`` (e.g. a retention sweep raced it) --
+        in which case the child falls through to the ``CONDUCTOR_RUN_ID``
+        env-var branch instead of the ``existing_run_id`` branch. Before
+        issue #435, that branch enforced a narrower hex-only rule and
+        lowercased the result, so an uppercase or hyphenated checkpoint
+        ``run_id`` the parent adopted here could be silently folded into a
+        *different* value by the child -- making the parent's launch-gate
+        poll (``_finalize_background_launch``) wait on a key the child
+        never writes. With one shared rule, the two agree unconditionally.
+        """
+        from conductor.cli import bg_runner
+        from conductor.engine.event_log import EventLogSubscriber
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint_with_log(tmp_path, wf_path, "DEADBEEF-42")
+        checkpoint = json.loads(cp_path.read_text())
+        event_log_path = Path(checkpoint["event_log_path"])
+
+        # Parent peeks while the log still exists -- adopts the checkpoint's
+        # run_id verbatim.
+        forced_run_id = bg_runner._peek_resume_run_id(None, cp_path)
+        assert forced_run_id == "DEADBEEF-42"
+
+        # The log vanishes before the child actually constructs its
+        # EventLogSubscriber (e.g. a retention sweep raced it) -- the child
+        # takes the env-var fallback branch instead of `existing_run_id`.
+        event_log_path.unlink()
+
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", forced_run_id)
+        sub = EventLogSubscriber(
+            "test-workflow", existing_path=event_log_path, existing_run_id=forced_run_id
+        )
+        try:
+            # The id the child actually writes its run record/log under
+            # must equal the id the parent is polling for.
+            assert sub.run_id == forced_run_id
+        finally:
+            sub.close()
+
+    def test_non_string_checkpoint_run_id_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint whose ``run_id`` field is a non-string JSON value doesn't crash.
+
+        ``CheckpointData.run_id: str`` is a type hint, not an enforced
+        constraint — a hand-edited or corrupted checkpoint can carry e.g. a
+        JSON number for ``run_id``, which would otherwise raise a bare
+        ``AttributeError`` from ``.lower()`` and crash the whole launch.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+        checkpoint = json.loads(cp_path.read_text())
+        checkpoint["run_id"] = 12345678  # a JSON number, not a string
+        cp_path.write_text(json.dumps(checkpoint))
+
+        proc = MagicMock()
+        proc.pid = 6008
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9217),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9217
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
+
+    def test_non_dict_checkpoint_content_falls_back_to_fresh_id(self, tmp_path: Path) -> None:
+        """A checkpoint file whose top-level JSON isn't an object doesn't crash.
+
+        ``CheckpointManager.load_checkpoint`` calls ``.get()`` on the parsed
+        JSON without an ``isinstance(data, dict)`` guard, so a checkpoint
+        file that is syntactically valid JSON but not an object (e.g. a bare
+        list) raises ``AttributeError`` rather than ``CheckpointError`` —
+        this must still degrade to a fresh id rather than crash the launch.
+        """
+        from conductor.cli import bg_runner
+
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        cp_path = tmp_path / "wf-20260224-153000.json"
+        cp_path.write_text(json.dumps([1, 2, 3]))
+
+        proc = MagicMock()
+        proc.pid = 6009
+        proc.poll.return_value = None
+
+        with (
+            patch("conductor.cli.bg_runner._spawn_detached", return_value=proc),
+            patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                side_effect=_record_poll_mock(proc.pid, 9218),
+            ),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
+        ):
+            launch = bg_runner.launch_background_resume(
+                workflow_path=None, checkpoint_path=cp_path, web_port=9218
+            )
+
+        assert re.fullmatch(r"[0-9a-f]{8}", launch.run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -978,8 +1573,18 @@ class TestResumeWiring:
     """Verify resume_workflow_async actually wires the new components."""
 
     @pytest.mark.asyncio
-    async def test_dashboard_start_oserror_is_non_fatal(self, tmp_path: Path) -> None:
-        """Mirror of run-side test: dashboard start failure must not abort resume."""
+    async def test_dashboard_start_oserror_is_non_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mirror of run-side test: dashboard start failure must not abort resume.
+
+        Explicitly clears ``CONDUCTOR_WEB_BG``/``CONDUCTOR_WEB_PORT``: this
+        test asserts the non-bg fallback behavior, which must not depend on
+        ambient environment state possibly leaked from a --web-bg parent
+        process (this repo's own dogfooding pattern can do exactly that).
+        """
+        monkeypatch.delenv("CONDUCTOR_WEB_BG", raising=False)
+        monkeypatch.delenv("CONDUCTOR_WEB_PORT", raising=False)
         from conductor.cli.run import resume_workflow_async
 
         wf_path = _write_workflow(tmp_path)
@@ -1010,6 +1615,91 @@ class TestResumeWiring:
 
         assert result == {"result": "ok"}
         assert mock_engine.resume.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_dashboard_start_failure_falls_back_despite_leaked_bg_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-bg resume must not be misidentified as the tracked bg child.
+
+        Regression guard: ``CONDUCTOR_WEB_BG`` is inherited by every
+        descendant of a --web-bg child, so a nested, non-bg
+        ``conductor resume --web`` would otherwise wrongly be treated as the
+        launcher-tracked child. Simulates the leak: ``CONDUCTOR_WEB_BG=1``
+        present but ``CONDUCTOR_WEB_PORT`` naming a different port than this
+        invocation's own (default 0).
+        """
+        monkeypatch.setenv("CONDUCTOR_WEB_BG", "1")
+        monkeypatch.setenv("CONDUCTOR_WEB_PORT", "55555")
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.start = AsyncMock(side_effect=OSError("port busy"))
+        mock_dashboard.stop = AsyncMock()
+
+        mock_web_module = MagicMock()
+        mock_web_module.WebDashboard.return_value = mock_dashboard
+
+        mock_registry, mock_engine = _make_resume_mocks()
+
+        import sys as _sys
+
+        with (
+            patch.dict(_sys.modules, {"conductor.web.server": mock_web_module}),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await resume_workflow_async(checkpoint_path=cp_path, web=True)
+
+        assert result == {"result": "ok"}
+        assert mock_engine.resume.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_dashboard_start_failure_raises_in_web_bg_child(self, tmp_path: Path) -> None:
+        """A genuine ``--web-bg`` resume child must propagate a dashboard failure.
+
+        Also guards the ordering fix: ``dashboard.stop()`` must never be
+        awaited after a failed ``start()``.
+        """
+        from conductor.cli.run import resume_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.start = AsyncMock(side_effect=OSError("port busy"))
+        mock_dashboard.stop = AsyncMock()
+
+        mock_web_module = MagicMock()
+        mock_web_module.WebDashboard.return_value = mock_dashboard
+
+        mock_registry, mock_engine = _make_resume_mocks()
+
+        import sys as _sys
+
+        with (
+            patch.dict(_sys.modules, {"conductor.web.server": mock_web_module}),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pytest.raises(RuntimeError, match="Dashboard failed to start"),
+        ):
+            await resume_workflow_async(checkpoint_path=cp_path, web=True, web_bg=True)
+
+        mock_dashboard.stop.assert_not_awaited()
+        mock_engine.clear_web_dashboard.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_provider_override_mutates_config(self, tmp_path: Path) -> None:
@@ -1210,6 +1900,93 @@ class TestResumeReplaysIntoDashboard:
         assert types[0] == "workflow_started"
         assert "agent_started" in types
         assert "agent_completed" in types
+
+    @pytest.mark.asyncio
+    async def test_web_backed_resume_persists_a_fresh_workflow_started_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """A web-backed resume (``--web``/``--web-bg``) suppresses the
+        engine's own ``workflow_started`` re-emit so the *live dashboard*
+        doesn't see a duplicate root start -- but the *persisted* JSONL
+        log must still record a fresh ``workflow_started`` marking this
+        resume as a new execution generation, so the Fleet Manager's
+        History screen can reset a stale prior terminal outcome (E14
+        review round 2). Without this, a dashboard-backed resume's log
+        would never regain a root-level ``workflow_started`` after the
+        first run, and History would keep reporting the earlier
+        failed/completed outcome indefinitely."""
+        from conductor.cli.run import resume_workflow_async
+
+        log_path = tmp_path / "conductor-test.events.jsonl"
+        log_path.write_text(
+            '{"type":"workflow_started","timestamp":1.0,"data":{"name":"test-workflow"}}\n'
+            '{"type":"agent_started","timestamp":2.0,"data":{"agent_name":"greeter"}}\n'
+            '{"type":"agent_completed","timestamp":3.0,'
+            '"data":{"agent_name":"greeter","output":{"greeting":"hi"}}}\n'
+            '{"type":"workflow_failed","timestamp":4.0,"data":{"error_type":"ProviderError"}}\n'
+        )
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(
+            tmp_path,
+            wf_path,
+            run_id="abc12345",
+            event_log_path=str(log_path),
+        )
+
+        captured: dict[str, Any] = {}
+        from conductor.web.server import WebDashboard as _RealDashboard
+
+        def _capture_dashboard(*args, **kwargs):
+            dash = _RealDashboard(*args, **kwargs)
+            dash.wait_for_clients_disconnect = AsyncMock(return_value=None)
+            captured["dashboard"] = dash
+            return dash
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.web.server.WebDashboard", side_effect=_capture_dashboard),
+        ):
+            mock_registry = AsyncMock()
+            mock_registry_cls.return_value = mock_registry
+            mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+            mock_engine = MagicMock()
+            mock_engine.resume = AsyncMock(return_value={"result": "ok"})
+            mock_engine.config = MagicMock()
+            mock_engine.config.workflow.cost.show_summary = False
+            mock_engine.build_workflow_started_data = AsyncMock(
+                return_value={"name": "test-workflow"}
+            )
+            mock_engine_cls.return_value = mock_engine
+
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                web=True,
+                web_bg=True,
+                web_port=0,
+                no_interactive=True,
+            )
+
+        persisted_lines = log_path.read_text().strip().splitlines()
+        persisted_events = [json.loads(line) for line in persisted_lines]
+        persisted_types = [ev["type"] for ev in persisted_events]
+
+        # The original 4 events are untouched, and a fresh root-level
+        # ``workflow_started`` was appended marking the resume boundary.
+        assert persisted_types[:4] == [
+            "workflow_started",
+            "agent_started",
+            "agent_completed",
+            "workflow_failed",
+        ]
+        assert persisted_types[4] == "workflow_started"
+        # Strictly after the prior terminal event's timestamp, and not
+        # stamped with a subworkflow_path (a root-level event).
+        assert persisted_events[4]["timestamp"] > persisted_events[3]["timestamp"]
+        assert "subworkflow_path" not in persisted_events[4].get("data", {})
 
     @pytest.mark.asyncio
     async def test_falls_back_to_synthetic_when_log_missing(self, tmp_path: Path) -> None:

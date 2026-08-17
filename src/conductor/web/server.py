@@ -20,21 +20,29 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json
 import logging
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from conductor.engine.guidance import validate_guidance_text
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.executor.linkify import LINKABLE_EXTENSIONS
+from conductor.web.auth import (
+    OriginHostGuard,
+    constant_time_match,
+    mint_token,
+    remove_token_file,
+    resolve_expected_token,
+    write_token_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +145,27 @@ class WebDashboard:
         # instead of falling back to a hard cancel that loses progress (#245).
         self._pending_stop = False
 
+        # Guidance sink (dashboard → engine, issue #400). Bound via
+        # set_guidance_sink once the engine exists; POST /api/guidance calls
+        # it directly rather than being polled, mirroring set_interrupt_event.
+        self._guidance_sink: Callable[[str], int] | None = None
+
+        # Pre-sink latch — guidance submitted during the startup window
+        # before set_guidance_sink is called (mirrors _pending_stop). Drained
+        # into the sink the moment it binds.
+        self._pending_guidance: list[str] = []
+
+        # Tracks whether an agent is currently paused (from agent_paused /
+        # agent_resumed events), so POST /api/guidance can report whether a
+        # submission resumed a paused agent or is merely queued.
+        self._agent_paused = False
+
+        # Per-run auth token (issue #397). Minted unconditionally so the
+        # protected configuration is the default; CONDUCTOR_GATE_TOKEN
+        # overrides it when set (see resolve_expected_token). Written to a
+        # discoverable file once the port is known (see start()).
+        self._token = mint_token()
+
         # Server internals
         self._server: Any = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -180,23 +209,48 @@ class WebDashboard:
             lifespan=lifespan,
         )
 
+        # Origin/Host validation + token auth (issue #397). A pure-ASGI
+        # middleware so WebSocket scopes are covered too — Starlette's
+        # BaseHTTPMiddleware (and @app.middleware("http")) never sees them.
+        # get_bound / get_expected_token are lazy callables: the port is
+        # unknown until start() binds the socket, and the token can be
+        # overridden by CONDUCTOR_GATE_TOKEN at any time.
+        app.add_middleware(
+            OriginHostGuard,  # ty: ignore[invalid-argument-type]
+            get_bound=lambda: (dashboard._host, dashboard.port),
+            get_expected_token=lambda: resolve_expected_token(dashboard._token),
+            protected_paths=frozenset(
+                {
+                    "/api/stop",
+                    "/api/kill",
+                    "/api/resume",
+                    "/api/gate-respond",
+                    "/api/guidance",
+                }
+            ),
+            websocket_paths=frozenset({"/ws"}),
+        )
+
         @app.get("/")
-        async def index() -> FileResponse:
+        async def index() -> HTMLResponse:
             # Serve index.html with `no-cache` so browsers always revalidate
-            # it with the server before reusing a cached copy (this is a
-            # plain FileResponse, not StaticFiles, so it doesn't honor
-            # conditional requests -> every load is a fresh 200, not a cheap
-            # 304). index.html references version-hashed /assets/* bundles;
-            # without this, a browser can keep serving a stale index.html
-            # after a `conductor update`, pinning the dashboard to the
-            # previous build's bundle. The hashed asset files under /assets
-            # are unaffected by this header and get no explicit Cache-Control
-            # here; that's safe because a content change always produces a
-            # new filename, so a browser holding onto a stale hash is
-            # harmless.
-            return FileResponse(
-                _STATIC_DIR / "index.html",
-                media_type="text/html",
+            # it with the server before reusing a cached copy (this used to
+            # be a plain FileResponse; it is now read and templated so the
+            # per-run token can be injected -> every load is a fresh 200,
+            # not a cheap 304). index.html references version-hashed
+            # /assets/* bundles; without the no-cache header, a browser can
+            # keep serving a stale index.html after a `conductor update`,
+            # pinning the dashboard to the previous build's bundle. The
+            # hashed asset files under /assets are unaffected by this header
+            # and get no explicit Cache-Control here; that's safe because a
+            # content change always produces a new filename, so a browser
+            # holding onto a stale hash is harmless.
+            html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            token = resolve_expected_token(dashboard._token)
+            injection = f"<script>window.__CONDUCTOR_TOKEN__={json.dumps(token)};</script>"
+            html = html.replace("</head>", f"{injection}</head>", 1)
+            return HTMLResponse(
+                content=html,
                 headers={"Cache-Control": "no-cache"},
             )
 
@@ -213,19 +267,31 @@ class WebDashboard:
 
         @app.get("/api/info")
         async def get_info() -> JSONResponse:
-            """Return run identity for dashboard linking."""
-            # Extract from first workflow_started event
-            info: dict[str, Any] = {}
+            """Return run identity for dashboard linking and for ``conductor stop``.
+
+            ``pid`` is the identity ``conductor stop`` relies on: the dashboard
+            runs in the same process as the workflow, so it proves that the PID
+            recorded in a PID file really is the process listening on this port
+            and has not been recycled onto something unrelated. It is reported
+            unconditionally, unlike the ``workflow_started``-derived fields
+            below, which are empty until the workflow actually starts.
+            """
+            info: dict[str, Any] = {"pid": os.getpid()}
+            # Remaining fields come from the first workflow_started event.
             for event in self._event_history:
                 if event.get("type") == "workflow_started":
                     data = event.get("data", {})
-                    info = {
-                        "run_id": data.get("run_id", ""),
-                        "workflow_name": data.get("name", ""),
-                        "started_at": event.get("timestamp", 0),
-                        "metadata": data.get("metadata", {}),
-                        "conductor_version": data.get("system", {}).get("conductor_version", ""),
-                    }
+                    info.update(
+                        {
+                            "run_id": data.get("run_id", ""),
+                            "workflow_name": data.get("name", ""),
+                            "started_at": event.get("timestamp", 0),
+                            "metadata": data.get("metadata", {}),
+                            "conductor_version": data.get("system", {}).get(
+                                "conductor_version", ""
+                            ),
+                        }
+                    )
                     break
             return JSONResponse(content=info)
 
@@ -336,6 +402,71 @@ class WebDashboard:
             )
             return JSONResponse({"status": "accepted"})
 
+        @app.post("/api/guidance")
+        async def guidance_api(request: Request) -> JSONResponse:
+            """Submit mid-run guidance text to the running workflow (issue #400).
+
+            Body: ``{"text": str}``. Applied at the next step boundary
+            (``_drain_pending_guidance``), or immediately if an agent is
+            currently paused (the fourth wait-arm in ``_handle_web_pause``).
+
+            When the ``CONDUCTOR_GATE_TOKEN`` environment variable is set,
+            the request must carry a matching token in the
+            ``Authorization: Bearer <token>`` header — the same check as
+            ``POST /api/gate-respond``.
+            """
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=422)
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"error": "Request body must be a JSON object"}, status_code=422
+                )
+
+            if not self._gate_token_ok(request.headers.get("authorization")):
+                return JSONResponse({"error": "Invalid or missing token"}, status_code=403)
+
+            # A completed run has nobody left to read the guidance — accepting
+            # it here would silently discard text the user believes was heard.
+            if self._workflow_completed:
+                return JSONResponse({"error": "Workflow has already completed"}, status_code=409)
+
+            text = body.get("text")
+            if not isinstance(text, str):
+                return JSONResponse(
+                    {"error": "Missing or non-string required field: text"}, status_code=422
+                )
+            try:
+                text = validate_guidance_text(text)
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=422)
+
+            if self._guidance_sink is not None:
+                pending = self._guidance_sink(text)
+            else:
+                # Startup race: the engine hasn't bound the sink yet. Queue
+                # it — set_guidance_sink drains this the moment it binds.
+                self._pending_guidance.append(text)
+                pending = len(self._pending_guidance)
+
+            # This is the first place the dashboard *produces* an event
+            # rather than merely reacting to one — it lands in
+            # _event_history via _on_event's normal subscription, and in the
+            # JSONL log.
+            import time as _time
+
+            self._emitter.emit(
+                WorkflowEvent(
+                    type="guidance_received",
+                    timestamp=_time.time(),
+                    data={"text": text, "pending": pending},
+                )
+            )
+            return JSONResponse(
+                {"status": "accepted", "pending": pending, "paused": self._agent_paused}
+            )
+
         @app.get("/api/files/{file_path:path}")
         async def get_file(file_path: str) -> JSONResponse:
             """Serve a local file relative to the workflow root directory.
@@ -427,14 +558,11 @@ class WebDashboard:
                     try:
                         msg = json.loads(raw)
                         if isinstance(msg, dict) and msg.get("type") == "gate_response":
-                            # Apply the same auth + waiting-state checks as the
-                            # HTTP endpoint so the WebSocket path cannot bypass
-                            # CONDUCTOR_GATE_TOKEN or resolve a non-waiting gate.
-                            if not self._gate_token_ok(ws.headers.get("authorization")):
-                                logger.warning(
-                                    "Rejecting WS gate_response: invalid or missing token"
-                                )
-                            elif (
+                            # The WebSocket handshake already authenticated
+                            # this connection (OriginHostGuard checks the
+                            # token before accept()), so only the
+                            # waiting-state check is needed here.
+                            if (
                                 target_error := self._validate_gate_target(
                                     str(msg.get("agent_name", "")),
                                     msg.get("prompt_id"),
@@ -489,6 +617,13 @@ class WebDashboard:
         event_dict = event.to_dict()
         self._event_history.append(event_dict)
         self._queue.put_nowait(event_dict)
+
+        # Track paused-ness so POST /api/guidance can report whether a
+        # submission resumed a paused agent or is merely queued (issue #400).
+        if event.type == "agent_paused":
+            self._agent_paused = True
+        elif event.type == "agent_resumed":
+            self._agent_paused = False
 
         # Also arm the grace timer here (not only from the WebSocket-disconnect
         # paths) so an unwatched run — zero clients ever connected — still
@@ -562,6 +697,14 @@ class WebDashboard:
             "iteration_limit_resolved",
             "dialog_started",
             "dialog_completed",
+            # ``guidance_received`` is the opening half of a pair whose closer
+            # is ``guidance_applied`` (issue #400) — a submission still
+            # pending when the original run died would otherwise replay as a
+            # phantom "pending" entry forever. ``guidance_applied`` is
+            # deliberately NOT filtered: ``WorkflowContext.from_dict``
+            # restores ``user_guidance``, so that guidance really is still in
+            # effect on the resumed run and must stay listed.
+            "guidance_received",
         }
     )
 
@@ -915,24 +1058,25 @@ class WebDashboard:
         return len(self._connections) > 0
 
     def _gate_token_ok(self, auth_header: str | None) -> bool:
-        """Return True if the gate token requirement is satisfied.
+        """Return True if the presented token matches the resolved gate token.
 
-        When ``CONDUCTOR_GATE_TOKEN`` is unset, gate responses are always
-        allowed. Otherwise the header must be ``Authorization: Bearer
-        <token>`` matching the env var, compared in constant time so the
-        token cannot be recovered via timing.
+        The header must be ``Authorization: Bearer <token>`` matching the
+        resolved token (``CONDUCTOR_GATE_TOKEN`` if set, else the per-run
+        minted token -- see ``conductor.web.auth.resolve_expected_token``),
+        compared in constant time so the token cannot be recovered via
+        timing. Note the ``OriginHostGuard`` middleware already enforces
+        this on ``/api/gate-respond`` and ``/api/guidance`` before the
+        request reaches these handlers; this check is defense in depth.
 
         Args:
             auth_header: The raw ``Authorization`` header value, or None.
 
         Returns:
-            True if the token check passes (or no token is configured).
+            True if the token check passes.
         """
-        expected_token = os.environ.get("CONDUCTOR_GATE_TOKEN")
-        if not expected_token:
-            return True
+        expected_token = resolve_expected_token(self._token)
         scheme, _, presented = (auth_header or "").partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(presented, expected_token)
+        return scheme.lower() == "bearer" and constant_time_match(presented, expected_token)
 
     def _validate_gate_target(self, agent_name: str, prompt_id: str | None = None) -> str | None:
         """Validate that a gate response targets the currently-waiting prompt.
@@ -1285,6 +1429,19 @@ class WebDashboard:
         if self._actual_port is None:
             self._actual_port = self._port
 
+        # Write the token file now that the actual port is known (issue
+        # #397). Deliberately here rather than __init__: with port=0 the
+        # bound port is only known after the socket binds, and this method
+        # runs for both --web and --web-bg (cli/run.py calls start()/stop()
+        # on both the run and resume paths, and the --web-bg child goes
+        # through the same code). Written as *resolved* token
+        # (CONDUCTOR_GATE_TOKEN if set, else the minted one) — the guard
+        # validates against resolve_expected_token(self._token), not the
+        # raw minted value, so writing the minted value here would make the
+        # file useless (and CLI auto-discovery would always 403) whenever
+        # the env var override is set.
+        write_token_file(self._actual_port, resolve_expected_token(self._token))
+
     async def stop(self) -> None:
         """Shut down the server gracefully.
 
@@ -1312,6 +1469,21 @@ class WebDashboard:
         except RuntimeError:
             pass  # No running loop (e.g. during interpreter shutdown)
 
+        # Remove the token file (issue #397) — best-effort, and identity-
+        # checked against the token *this* run wrote: the socket was just
+        # released above, so a concurrent run can already have bound the
+        # same port and overwritten the file by the time we get here.
+        # Deleting it unconditionally would delete that newer run's token
+        # file out from under it, exactly the port-reuse hazard
+        # cli/pid.py::remove_pid_file_at already guards against. Placed
+        # before the WebSocket drain (rather than after) so it isn't
+        # delayed by however long that unbounded per-connection loop takes.
+        if self._actual_port is not None:
+            try:
+                remove_token_file(self._actual_port, resolve_expected_token(self._token))
+            except OSError as exc:
+                logger.warning("Failed to remove dashboard token file: %s", exc)
+
         # Close remaining WebSocket connections
         for ws in list(self._connections):
             with contextlib.suppress(Exception):
@@ -1330,6 +1502,11 @@ class WebDashboard:
         """Return the dashboard URL (e.g., ``http://127.0.0.1:8080``)."""
         port = self._actual_port if self._actual_port is not None else self._port
         return f"http://{self._host}:{port}"
+
+    @property
+    def token(self) -> str:
+        """The token requests must present (env override else the minted per-run token)."""
+        return resolve_expected_token(self._token)
 
     @property
     def app(self) -> FastAPI:
@@ -1379,3 +1556,27 @@ class WebDashboard:
         if self._pending_stop:
             self._pending_stop = False
             event.set()
+
+    def set_guidance_sink(self, sink: Callable[[str], int]) -> None:
+        """Bind the callable ``POST /api/guidance`` pushes submitted text into.
+
+        Called during engine setup — the exact mirror of
+        ``set_interrupt_event()`` above, but pushing into the engine rather
+        than sharing an ``asyncio.Event``: the engine's ``_web_dashboard`` is
+        duck-typed and stubbed across many tests, so a new attribute read in
+        the engine's hot loop would be fragile. ``sink`` is
+        ``WorkflowEngine.submit_guidance``.
+
+        Any guidance submitted during the startup window before this was
+        called (``_pending_guidance``) is drained into the sink immediately,
+        mirroring the ``_pending_stop`` latch above.
+
+        Args:
+            sink: Callable taking guidance text and returning the number of
+                entries now pending in the engine's channel.
+        """
+        self._guidance_sink = sink
+        if self._pending_guidance:
+            pending_texts, self._pending_guidance = self._pending_guidance, []
+            for text in pending_texts:
+                sink(text)

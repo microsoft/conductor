@@ -977,3 +977,77 @@ class TestSessionKeyCapabilityRejection:
             validate_workflow_config(config)
         with pytest.raises(ExecutionError, match="does not support session continuity"):
             await AgentExecutor(self._copilot()).execute(self._KEYED, {})
+
+
+class _NonDictContentProvider:
+    """Minimal provider stub returning a non-dict ``AgentOutput.content``.
+
+    Exercises the ``AgentExecutor`` reconstruction path (issue #412): when
+    ``output.content`` isn't a dict, the executor must rebuild the
+    ``AgentOutput`` via ``dataclasses.replace`` so usage fields (including
+    ``last_call_input_tokens``) survive rather than being dropped.
+    """
+
+    def __init__(self, output: AgentOutput) -> None:
+        self._output = output
+
+    async def execute(self, agent, context, rendered_prompt, tools=None, **kwargs):  # type: ignore[no-untyped-def]
+        return self._output
+
+    async def validate_connection(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+class TestAgentExecutorNonDictContentPreservesUsage:
+    """Issue #412: a provider returning non-dict content still yields an
+    AgentOutput retaining all usage fields via dataclasses.replace."""
+
+    @pytest.mark.asyncio
+    async def test_scalar_content_without_raw_response_preserves_usage(self) -> None:
+        agent = AgentDef(name="test", model="gpt-4", prompt="Test", output=None)
+        raw_output = AgentOutput(
+            content=42,
+            raw_response=None,
+            tokens_used=150,
+            input_tokens=100,
+            output_tokens=50,
+            last_call_input_tokens=80,
+            model="gpt-4",
+        )
+        provider = _NonDictContentProvider(raw_output)
+        executor = AgentExecutor(provider)
+
+        output = await executor.execute(agent, {})
+
+        assert output.content == {"result": 42}
+        assert output.input_tokens == 100
+        assert output.output_tokens == 50
+        assert output.last_call_input_tokens == 80
+        assert output.tokens_used == 150
+        assert output.model == "gpt-4"
+
+    @pytest.mark.asyncio
+    async def test_string_raw_response_parsed_as_json_preserves_usage(self) -> None:
+        agent = AgentDef(name="test", model="gpt-4", prompt="Test", output=None)
+        raw_output = AgentOutput(
+            content="not a dict",
+            raw_response='{"parsed": true}',
+            tokens_used=90,
+            input_tokens=60,
+            output_tokens=30,
+            last_call_input_tokens=45,
+            model="gpt-4",
+        )
+        provider = _NonDictContentProvider(raw_output)
+        executor = AgentExecutor(provider)
+
+        output = await executor.execute(agent, {})
+
+        assert output.content == {"parsed": True}
+        assert output.input_tokens == 60
+        assert output.output_tokens == 30
+        assert output.last_call_input_tokens == 45
+        assert output.tokens_used == 90

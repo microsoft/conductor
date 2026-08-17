@@ -53,7 +53,11 @@ import type {
   IterationLimitReachedData,
   IterationLimitResolvedData,
   IterationLimitResponseTarget,
+  GuidanceReceivedData,
+  GuidanceAppliedData,
 } from '@/types/events';
+import { mergeGuidance, type GuidanceEntry } from '@/lib/guidance';
+import { authHeaders } from '@/lib/auth';
 
 export interface ActivityEntry {
   type: string;
@@ -351,6 +355,25 @@ interface WorkflowState {
    * for too long after the underlying process silently died (issue #330).
    */
   wsDisconnectedSince: number | null;
+  /**
+   * Set when the WebSocket handshake appears to have been rejected by the
+   * server's auth guard (issue #397) rather than a generic network drop:
+   * `/api/state` succeeded (so the server is reachable) but the
+   * subsequent `/ws` connection closed without ever reaching `onopen`.
+   * A rejected handshake is otherwise indistinguishable from a dead
+   * process — both surface as `onclose` code 1006 — so without this the
+   * dashboard looks "healthy" while every gate approval, dialog reply, and
+   * guidance submission silently goes nowhere.
+   */
+  wsAuthFailed: boolean;
+  /**
+   * Set when a user action tried to send over the WebSocket
+   * (`sendGateResponse`/`sendDialogMessage`/`sendDialogDecline`/
+   * `sendIterationLimitResponse`) while it wasn't connected, so the UI can
+   * surface "your response was not sent" instead of silently discarding
+   * the click (issue #397).
+   */
+  wsSendFailed: boolean;
   /** `system.log_file` (the always-on `*.events.jsonl` structured event log, unrelated to `--log-file`) from the root `workflow_started` event, when non-empty (issue #330). */
   systemLogFile: string | null;
   /** `system.bg_stderr_log` from the root `workflow_started` event, only present for `--web-bg` runs (issue #330). */
@@ -366,6 +389,8 @@ interface WorkflowState {
   isPaused: boolean;
   /** Set when the engine is blocked on a max-iterations gate (issue #134). */
   iterationLimitGate: IterationLimitReachedData | null;
+  /** Accumulated mid-run guidance entries, in submission/application order (issue #400). */
+  userGuidance: GuidanceEntry[];
 
   // --- Subworkflow depth tracking ---
   /** Current nesting depth: 0 = root workflow events are active */
@@ -399,6 +424,8 @@ interface WorkflowState {
   replayState: (events: WorkflowEvent[]) => void;
   selectNode: (name: string | null) => void;
   setWsStatus: (status: WsStatus) => void;
+  setWsAuthFailed: (failed: boolean) => void;
+  setWsSendFailed: (failed: boolean) => void;
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => void;
   clearEdgeHighlight: (from: string, to: string) => void;
 
@@ -465,6 +492,23 @@ interface WorkflowState {
     gateId: string,
     additionalIterations: number,
   ) => void;
+
+  /**
+   * Submit mid-run guidance text to the running workflow (issue #400).
+   *
+   * POSTs to ``/api/guidance`` (not the WebSocket — a 403/409/422 needs a
+   * status code the caller can render, and an HTTP response is the one
+   * server-side code path shared with ``conductor guide``). Returns a
+   * discriminated result so the modal can show the exact rejection reason
+   * (403/409/422) rather than a generic failure, and separately handle an
+   * unreachable dashboard.
+   */
+  sendGuidance: (
+    text: string,
+  ) => Promise<
+    | { ok: true; pending: number; paused: boolean }
+    | { ok: false; status: number | null; error: string }
+  >;
 }
 
 function ensureNode(nodes: Record<string, NodeData>, name: string, type: NodeType = 'agent'): NodeData {
@@ -789,6 +833,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   selectedNode: null,
   wsStatus: 'connecting',
   wsDisconnectedSince: null,
+  wsAuthFailed: false,
+  wsSendFailed: false,
   systemLogFile: null,
   bgStderrLog: null,
   bgStdoutLog: null,
@@ -798,6 +844,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   lastEventTime: null,
   isPaused: false,
   iterationLimitGate: null,
+  userGuidance: [],
   wfDepth: 0,
   subworkflowContexts: [],
   activeContextPath: [],
@@ -827,6 +874,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         // question opened — every prompt in a questions node shares one name.
         prompt_id: promptId ?? null,
       });
+      set({ wsSendFailed: false });
+    } else {
+      console.error('sendGateResponse: WebSocket not connected, response was not sent');
+      set({ wsSendFailed: true });
     }
   },
 
@@ -851,6 +902,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       // `dialog_awaiting_response` accordingly. Keeps state transitions in one
       // place and avoids a race where the agent reply arrives before the
       // optimistic set commits.
+      set({ wsSendFailed: false });
+    } else {
+      console.error('sendDialogMessage: WebSocket not connected, message was not sent');
+      set({ wsSendFailed: true });
     }
   },
 
@@ -862,12 +917,22 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         agent_name: agentName,
         dialog_id: dialogId,
       });
+      set({ wsSendFailed: false });
+    } else {
+      console.error('sendDialogDecline: WebSocket not connected, decline was not sent');
+      set({ wsSendFailed: true });
     }
   },
 
   sendIterationLimitResponse: (target, gateId, additionalIterations) => {
     const send = useWorkflowStore.getState()._wsSend;
-    if (!send) return;
+    if (!send) {
+      console.error(
+        'sendIterationLimitResponse: WebSocket not connected, response was not sent',
+      );
+      set({ wsSendFailed: true });
+      return;
+    }
     // Clamp to non-negative integer. 0 means "stop", N>0 means "continue with N more".
     const additional = Math.max(0, Math.floor(Number(additionalIterations) || 0));
     // ``target`` is a discriminated union — exactly one branch is set, so a
@@ -883,6 +948,28 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       ...targetFields,
       additional_iterations: additional,
     });
+    set({ wsSendFailed: false });
+  },
+
+  sendGuidance: async (text) => {
+    try {
+      const res = await fetch('/api/guidance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ text }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        pending?: number;
+        paused?: boolean;
+        error?: string;
+      };
+      if (res.ok) {
+        return { ok: true, pending: body.pending ?? 0, paused: body.paused ?? false };
+      }
+      return { ok: false, status: res.status, error: body.error || `HTTP ${res.status}` };
+    } catch {
+      return { ok: false, status: null, error: 'The dashboard is unreachable.' };
+    }
   },
 
   processEvent: (event: WorkflowEvent) => {
@@ -1074,6 +1161,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         forEachGroups: [],
         isPaused: false,
         iterationLimitGate: null,
+        userGuidance: [],
         lastEventTime: null,
         activeDialog: null,
         dialogEngaged: false,
@@ -1108,17 +1196,31 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       // Track when the connection last dropped from a healthy state so a
       // "stuck reconnecting" banner (#330) can measure elapsed time across
       // the connecting/reconnecting backoff churn, rather than resetting
-      // every retry cycle. Only start the clock on a *fresh* disconnect
-      // (previous status was 'connected'); once set, preserve it through
-      // subsequent non-connected statuses; clear it once reconnected.
+      // every retry cycle. Starts the clock on a *fresh* disconnect
+      // (previous status was 'connected') OR on the very first failed
+      // connection attempt (wsDisconnectedSince still null from the
+      // initial 'connecting' state) -- without the latter, a WebSocket
+      // that never connects at all (e.g. rejected at the auth guard, issue
+      // #397) never starts the clock, so the banner never fires even
+      // though the dashboard looks identically "stuck" to the user. Once
+      // set, preserve it through subsequent non-connected statuses; clear
+      // it once reconnected.
       let wsDisconnectedSince = prev.wsDisconnectedSince;
       if (status === 'connected') {
         wsDisconnectedSince = null;
-      } else if (prev.wsStatus === 'connected') {
+      } else if (prev.wsStatus === 'connected' || wsDisconnectedSince === null) {
         wsDisconnectedSince = Date.now();
       }
       return { wsStatus: status, wsDisconnectedSince };
     });
+  },
+
+  setWsAuthFailed: (failed: boolean) => {
+    set({ wsAuthFailed: failed });
+  },
+
+  setWsSendFailed: (failed: boolean) => {
+    set({ wsSendFailed: failed });
   },
 
   setEdgeHighlight: (from: string, to: string, state: 'highlighted' | 'taken' | 'failed') => {
@@ -1352,6 +1454,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       state.routes = data.routes || [];
       state.parallelGroups = data.parallel_groups || [];
       state.forEachGroups = data.for_each_groups || [];
+      // Reset accumulated guidance for a fresh root run (issue #400). A
+      // resumed run's restored context re-populates this via replayed
+      // guidance_applied events, not this reset.
+      state.userGuidance = [];
 
       ensureNode(state.nodes, '$start', 'start');
       state.nodes['$start']!.status = 'running';
@@ -1497,6 +1603,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.output = undefined;
     nd.error_type = undefined;
     nd.error_message = undefined;
+    nd.context_pct = undefined;
     replaceNode(t.nodes, data.agent_name);
   },
 
@@ -1518,6 +1625,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.context_window_max = data.context_window_max;
     if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
       nd.context_pct = Math.round((data.context_window_used / data.context_window_max) * 100);
+    } else {
+      nd.context_pct = undefined;
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
@@ -1864,6 +1973,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.context_window_max = data.context_window_max;
     if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
       nd.context_pct = Math.round((data.context_window_used / data.context_window_max) * 100);
+    } else {
+      nd.context_pct = undefined;
     }
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
@@ -2291,10 +2402,38 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       type: 'agent_resumed',
       icon: '▶',
       label: 'Resumed',
-      text: 'Agent resumed — re-executing',
+      text: data.with_guidance
+        ? 'Agent resumed with guidance — re-executing'
+        : 'Agent resumed — re-executing',
     });
     replaceNode(state.nodes, data.agent_name);
     state.isPaused = false;
+  },
+
+  guidance_received: (state, _data) => {
+    const data = _data as unknown as GuidanceReceivedData;
+    state.userGuidance = mergeGuidance(state.userGuidance, {
+      type: 'guidance_received',
+      data,
+    });
+  },
+
+  guidance_applied: (state, _data) => {
+    const data = _data as unknown as GuidanceAppliedData;
+    state.userGuidance = mergeGuidance(state.userGuidance, {
+      type: 'guidance_applied',
+      data,
+    });
+    if (data.agent_name) {
+      const nd = ensureNode(state.nodes, data.agent_name);
+      nd.activity.push({
+        type: 'guidance_applied',
+        icon: '💬',
+        label: 'Guidance',
+        text: `Guidance applied (${data.source}): ${data.text}`,
+      });
+      replaceNode(state.nodes, data.agent_name);
+    }
   },
 
   iteration_limit_reached: (state, _data) => {
@@ -2616,7 +2755,20 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
       return { timestamp: ts, level: 'warning', source: String(d.agent_name), message: 'Agent paused — waiting for resume' };
 
     case 'agent_resumed':
-      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: 'Agent resumed — re-executing' };
+      return {
+        timestamp: ts,
+        level: 'info',
+        source: String(d.agent_name),
+        message: d.with_guidance ? 'Agent resumed with guidance — re-executing' : 'Agent resumed — re-executing',
+      };
+
+    case 'guidance_received':
+      return { timestamp: ts, level: 'info', source: 'guidance', message: `Guidance received (pending: ${d.pending}): ${d.text}` };
+
+    case 'guidance_applied': {
+      const target = (d.agent_name as string) || 'workflow';
+      return { timestamp: ts, level: 'info', source: target, message: `Guidance applied (${d.source}): ${d.text}` };
+    }
 
     case 'iteration_limit_reached': {
       const target = (d.agent_name ?? d.group_name ?? 'workflow') as string;

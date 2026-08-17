@@ -54,7 +54,7 @@ class TestHelpPanels:
     def test_noun_groups_listed(self) -> None:
         result = runner.invoke(app, ["--help"], env=_WIDE)
         assert result.exit_code == 0
-        for group in ("gate", "checkpoint", "registry"):
+        for group in ("gate", "checkpoint", "registry", "fleet"):
             assert group in result.output
 
     def test_commands_mapped_to_correct_panels(self) -> None:
@@ -72,9 +72,11 @@ class TestHelpPanels:
             "status": "Run & Recover",
             "stop": "Run & Recover",
             "replay": "Run & Recover",
+            "fleet": "Run & Recover",
             "validate": "Author & Inspect",
             "show": "Author & Inspect",
             "gate": "Interact",
+            "guide": "Interact",
             "checkpoint": "State",
             "registry": "Environment",
             "plugin": "Environment",

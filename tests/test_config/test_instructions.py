@@ -611,8 +611,9 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -636,8 +637,9 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -667,8 +669,9 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -697,8 +700,9 @@ class TestBgRunnerInstructionFlags:
         from conductor.cli.bg_runner import launch_background
 
         with (
-            patch("conductor.cli.bg_runner.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.bg_runner._spawn_detached") as mock_popen,
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
         ):
             mock_popen.return_value.pid = 12345
 
@@ -1403,7 +1407,10 @@ class TestEmitLoadedInstructionsDebug:
 
         _emit_loaded_instructions_debug(tmp_path, enabled=True)
         captured = capsys.readouterr()
-        assert "1 file(s) discovered from CWD" in captured.err
+        # Includes the prefix: it is a grep label users search for in a
+        # merged stderr stream, and asserting only the tail let it be
+        # silently deleted by a markup parser (#406).
+        assert "[workspace-instructions] 1 file(s) discovered from CWD" in captured.err
         assert "AGENTS.md" in captured.err
         # stdout invariant preserved
         assert captured.out == ""
@@ -1425,7 +1432,7 @@ class TestPrintLoadedInstructionsHelper:
         captured = capsys.readouterr()
         # stdout MUST stay clean (don't pollute JSON output)
         assert captured.out == ""
-        assert "0 files discovered" in captured.err
+        assert "[workspace-instructions] 0 files discovered" in captured.err
 
     def test_emits_populated_state_with_scope(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1459,7 +1466,7 @@ class TestPrintLoadedInstructionsHelper:
         captured = capsys.readouterr()
 
         # Header tracks count
-        assert "3 file(s) discovered from CWD" in captured.err
+        assert "[workspace-instructions] 3 file(s) discovered from CWD" in captured.err
         # All three paths emitted
         assert "AGENTS.md" in captured.err
         assert "cs.md" in captured.err

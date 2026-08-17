@@ -41,13 +41,30 @@ the source design:
 
 ### 1. Install the azure-identity extra
 
-```bash
-# Using uv (recommended)
-uv add 'conductor-cli[aca]'
+The command depends on how Conductor itself was installed. `conductor run`
+and `conductor doctor` print the right one when the extra is missing, so you
+can also just run your workflow and copy what it says. (`conductor validate`
+does not — the provider is constructed lazily, so the guard only fires once
+an `aca`-backed agent actually runs.)
 
-# Using pip
+```bash
+# Installed via the install script (uv tool install)
+uv tool install --force 'conductor-cli[aca] @ git+https://github.com/microsoft/conductor.git@v<version>'
+
+# A source checkout
+uv sync --extra aca
+
+# A wheel from a GitHub Release or a private index
 pip install 'conductor-cli[aca]'
 ```
+
+`conductor-cli` is not published to PyPI, so the `pip` form resolves only
+where pip can already see an installed `conductor-cli` — never inside a uv
+tool venv (issue #441). The `uv tool install` form must name every
+extra you want to keep — `--force` replaces the tool's entire requirement
+set, so `[aca]` alone would remove an already-installed `[tui]`. Conductor's
+own hint builds that list for you, and `conductor update` preserves it
+across upgrades.
 
 This pins `azure-identity` plus `azure-core[aio]` (which pulls in `aiohttp`),
 used to acquire a `dynamicsessions.io` bearer token via the async
@@ -312,16 +329,38 @@ exposes two HTTP endpoints:
 ### `GET /health`
 
 Readiness + version probe, used by `validate_connection()` to detect
-host/runner version skew and by the image's own `HEALTHCHECK`.
+host/runner version skew and by the image's own `HEALTHCHECK`. Deliberately
+unauthenticated (issue #396) — the image's `HEALTHCHECK` sends no header at
+all, so gating this endpoint would break it.
 
 ```json
-{"ready": true, "conductor_version": "0.4.0", "runner_version": "0.1.0"}
+{
+  "ready": true,
+  "conductor_version": "0.4.0",
+  "runner_version": "0.1.0",
+  "auth_required": false,
+  "auth_token_present": false
+}
 ```
+
+- `auth_required` — whether the runner has `ACA_RUNNER_AUTH_TOKEN`
+  configured (the transport-token gate on `/execute` is opt-in — see
+  below).
+- `auth_token_present` — whether *a* `X-Conductor-Runner-Token` header
+  arrived on **this** request, never whether it matched. This is what
+  actually detects a gateway that strips custom headers: the caller already
+  knows whether it sent a header, so this leaks nothing and cannot be used
+  as a brute-force oracle. `validate_connection()` warns when this
+  disagrees with the host's own configured posture in either direction.
 
 ### `POST /execute?identifier=<id>&api-version=<v>`
 
 Runs one agent turn and streams the result back as
-`application/x-ndjson`. Request body:
+`application/x-ndjson`. Optionally gated by an
+`X-Conductor-Runner-Token` header (see [Security](#security)) — a
+missing/incorrect header when `ACA_RUNNER_AUTH_TOKEN` is configured returns
+a `401` with `{"error": {"message": "..."}}` before the inner Copilot
+provider is ever constructed. Request body:
 
 ```json
 {
@@ -364,7 +403,18 @@ Runs one agent turn and streams the result back as
   Copilot capacity) or BYOK custom-routing settings (fallback), resolved
   host-side and delivered in-memory per request. See
   [Inner Copilot Authentication](#inner-copilot-authentication) and the
-  design's Security Considerations.
+  design's Security Considerations. The runner rejects (`400`) any key
+  outside `base_url`/`api_key`/`bearer_token`/`github_token` — the four the
+  host ever sends — and, when `ACA_RUNNER_ALLOWED_BASE_URLS` is configured,
+  any `base_url` not on that allowlist (issue #396).
+- `identifier` (query parameter) — gateway routing metadata **only**. ACA
+  routes by it, auto-allocating a session if none exists yet; it is
+  deliberately never validated as a caller-authentication signal — the
+  runner has no independent source of truth for which identifier it should
+  be serving, and the container's own `HEALTHCHECK` sends none at all. The
+  `X-Conductor-Runner-Token` header above is the actual runner-side
+  authentication control.
+
 
 ## NDJSON Event Frame Schema
 
@@ -703,12 +753,55 @@ lifetime** instead of trying to keep it out entirely:
 See the design's [Security Considerations](../projects/aca/aca-provider.design.md#security-considerations)
 section for the full threat model.
 
+### Runner transport hardening (issue #396)
+
+The MVP runner's posture depended entirely on the assumption that the
+runner port is unreachable except through the ACA session gateway. That
+boundary is now defended in depth, though every added layer is opt-in
+except the two that are pure narrowing (binding loopback, the
+`inner_provider_settings` key allowlist):
+
+- **The runner port must never be reachable outside the session gateway.**
+  This was always the intended posture; issue #396 hardens the runner so
+  it does not depend *solely* on that boundary holding.
+- **Transport credential vs. model credential.** `ACA_RUNNER_AUTH_TOKEN`
+  (below) is a **transport** credential — it authenticates a caller
+  reaching the runner's HTTP endpoints at all. It is a distinct concern
+  from `inner_provider_settings` (the **model** credential, DD4) covered
+  above. Setting `ACA_RUNNER_AUTH_TOKEN` as a pool-level environment
+  variable is *not* an instance of the "never bake a long-lived secret as a
+  pool secret" anti-pattern above — that bullet is about the model
+  credential, which authorizes Copilot inference spend; the transport token
+  only gates reachability of the runner's own HTTP surface.
+- **Opt-in transport-token gate.** Set `ACA_RUNNER_AUTH_TOKEN` to the same
+  value on both the runner pool and the host to require an
+  `X-Conductor-Runner-Token` header on `/execute`. `GET /health` stays
+  unauthenticated (the image's own `HEALTHCHECK` sends no header) but
+  reports `auth_required`/`auth_token_present` so `validate_connection()`
+  can detect a gateway silently stripping the header before you rely on
+  the gate. Not mandatory — the runner works unchanged with this unset.
+- **`inner_provider_settings` key allowlist.** The runner rejects any key
+  outside `base_url`/`api_key`/`bearer_token`/`github_token` (the four the
+  host ever sends), closing off a caller sending e.g. `runtime_url` or
+  `headers` directly at the runner. Set `ACA_RUNNER_ALLOWED_BASE_URLS`
+  (comma-separated) on the pool to additionally restrict which BYOK
+  `base_url` values are accepted.
+- **`identifier` is routing metadata, not authentication.** The runner has
+  no independent source of truth for which identifier it should be
+  serving — Azure allocates/reuses sessions from a warm pool and routes to
+  the container — so `identifier` is deliberately never validated as a
+  caller-authentication signal; the transport-token gate above is the
+  runner-side control for that.
+
 ## Troubleshooting
 
 ### `aca provider requires the azure-identity package`
 
-Install the extra: `pip install 'conductor-cli[aca]'` (or `uv add
-'conductor-cli[aca]'`).
+Install the `aca` extra. The error's own `suggestion` carries the exact
+command for how this Conductor was installed — see
+[Install the azure-identity extra](#1-install-the-azure-identity-extra) for
+the three forms and why a hardcoded `pip install 'conductor-cli[aca]'`
+does not work on the documented install path.
 
 ### `'pool_endpoint' is required when name='aca'`
 
@@ -752,6 +845,33 @@ available.
 Confirm the identity `DefaultAzureCredential` resolves (`az login`, or the
 appropriate managed-identity / service-principal environment variables) has
 been granted the *Session Executor* role on the pool.
+
+### `aca runner: missing or invalid runner auth token`
+
+The runner has `ACA_RUNNER_AUTH_TOKEN` configured and rejected the
+request's `X-Conductor-Runner-Token` header (missing or not matching).
+Set the same `ACA_RUNNER_AUTH_TOKEN` value on both the host and the runner
+pool, or unset it on the pool if you don't need the transport-token gate.
+
+### `aca runner: unsupported inner_provider_settings key`
+
+The request's `inner_provider_settings` carried a key outside the runner's
+allowlist (`base_url`/`api_key`/`bearer_token`/`github_token`), or a
+`base_url` not on the pool's configured `ACA_RUNNER_ALLOWED_BASE_URLS`. No
+in-repo caller produces an unlisted key — `AcaRuntimeProvider
+._resolve_inner_provider_settings` only ever returns those four — so this
+means either a hand-rolled request or a stale/mismatched host and runner
+version. See [Runner transport hardening](#runner-transport-hardening-issue-396).
+
+### Runner requires an auth token but the header didn't arrive
+
+`validate_connection()` logged a warning that the runner reports
+`auth_required: true` but `auth_token_present: false` on the `/health`
+probe. This means a gateway between the host and the runner is stripping
+the `X-Conductor-Runner-Token` header — every `/execute` call will fail
+with a 401 until that's fixed. If the header provably cannot survive the
+trip, unset `ACA_RUNNER_AUTH_TOKEN` on the runner pool (the gate is opt-in;
+the runner works unchanged without it).
 
 ### A declared MCP server / tool isn't available in the sandbox
 

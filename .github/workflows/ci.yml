@@ -7,12 +7,15 @@
 # Jobs:
 # - lint: Runs ruff linter and formatter check
 # - typecheck: Runs ty (Red Knot) type checker
-# - test: Runs pytest with coverage on Python 3.12 and 3.13
+# - test: Runs pytest with coverage on Python 3.12 + 3.13 (Ubuntu) and 3.13
+#         (Windows, where the platform-specific code actually lives)
 # - validate-examples: Validates all example workflow YAML files
 # - build: Verifies the package builds correctly
 # - frontend: Type-checks, tests (Vitest), and builds the web dashboard
 # - install-scripts: End-to-end exercise of install.ps1 / install.sh on
 #                    Windows + Ubuntu (opt-in pytest marker; ~90s)
+# - web-bg-smoke: Real `uv tool install` + `conductor run --web-bg` launcher
+#                 smoke test on Windows + Ubuntu (issue #447)
 
 name: CI
 
@@ -81,12 +84,27 @@ jobs:
         run: uv run ty check src
 
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: [lint, typecheck]
     strategy:
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13"]
+        # Windows carries a substantial amount of platform-specific code —
+        # cli/pid.py is an entire OpenProcess/GetExitCodeProcess ctypes
+        # implementation, cli/bg_runner.py handles process groups and job-object
+        # breakaway — and none of it was executed anywhere. The existing tests
+        # cover that logic on Linux by monkey-patching a `_kernel32` mock, which
+        # is good design but means nothing validates the real ctypes signatures.
+        #
+        # Deliberately ONE Python version on Windows rather than a full 2x2: the
+        # platform is the variable here, not the interpreter, and the
+        # install-scripts job already provisions a Windows runner on every PR so
+        # this is incremental cost rather than a new platform commitment.
+        include:
+          - os: windows-latest
+            python-version: "3.13"
       fail-fast: false
 
     steps:
@@ -109,14 +127,42 @@ jobs:
         run: uv sync --group dev --extra claude-agent-sdk
 
       - name: Remove bundled Copilot CLI binary
+        # `shell: bash` so this runs identically on the Windows runner (Git Bash
+        # is preinstalled). Without it the step fails on Windows, where a bare
+        # `find` resolves to the unrelated DOS search tool in System32.
+        shell: bash
         run: |
-          # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
-          # authenticate with GitHub on startup. Remove it so tests that invoke
-          # the real CLI path fail fast instead of hanging on auth.
-          find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
+          set -euo pipefail
+          # Copilot SDK <1.0.2 shipped per-platform wheels with a bundled CLI
+          # binary that tries to authenticate with GitHub on startup. Remove it
+          # so a test taking the real CLI path fails fast instead of hanging on
+          # auth.
+          #
+          # The binary ships inside the package (copilot/bin/), not in the venv's
+          # scripts directory — there is no console-script entry point — so one
+          # pattern covers both platforms: the leading */ absorbs lib/pythonX.Y/
+          # or Lib/, and the trailing * absorbs the .exe suffix on Windows.
+          #
+          # Finding nothing is expected on the pinned SDK and is not an error:
+          # the wheel is pure-Python from 1.0.2 on and fetches the CLI on first
+          # use instead of bundling it. What stops that fetch from reinstating
+          # the same hang is COPILOT_SKIP_CLI_DOWNLOAD in the test step's env,
+          # so this step is now only for a venv restored from an older lock.
+          removed=$(find .venv -path '*/copilot/bin/copilot*' -print -delete)
+          if [ -n "$removed" ]; then
+            echo "Removed bundled CLI: $removed"
+          else
+            echo "No bundled CLI present (expected for github-copilot-sdk >=1.0.2)."
+          fi
 
       - name: Run tests with coverage
-        timeout-minutes: 10
+        # 20, not 10: the Fleet Manager added ~600 tests, most of them Textual
+        # `App.run_test()` pilots, which took the Windows step from ~5m to
+        # ~10m and tripped the old limit at 9m56s with every test passing.
+        # Windows runs the suite at roughly twice the Linux wall time, so this
+        # is ~2x headroom there and ~3x on Linux — still short enough to catch
+        # a genuine hang rather than burning a full job timeout on one.
+        timeout-minutes: 20
         run: uv run pytest --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not performance"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
@@ -125,10 +171,16 @@ jobs:
           # contain timing-sensitive assertions that are flaky on shared CI runners.
           # This ensures CI tests are fast, free, and don't leak credentials.
           ANTHROPIC_API_KEY: "sk-ant-test-fake-key-for-mocking"
+          # The Copilot SDK fetches its CLI binary from GitHub Releases on
+          # first use. A test that reaches the real CLI path should fail fast
+          # rather than pull ~90MB inside a 10-minute job and then hang on auth.
+          COPILOT_SKIP_CLI_DOWNLOAD: "1"
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
-        if: matrix.python-version == '3.12'
+        # One upload per commit. Without the os guard a second runner would
+        # upload a partial report for the same commit and skew the totals.
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
@@ -271,3 +323,79 @@ jobs:
       - name: Run install-script integration tests
         timeout-minutes: 10
         run: uv run pytest -m install_scripts -v
+
+  web-bg-smoke:
+    name: Web BG Smoke (${{ matrix.os }})
+    # A launcher-level smoke test, not a workflow-execution test: it drives
+    # the real `conductor run --web-bg` launch gate against a genuine `uv
+    # tool install` on both platforms, which is what actually reproduces a
+    # trampoline `sys.executable` (issue #444) and would have caught it --
+    # mocking the spawn seam, as the unit tests do, cannot. Runs on Windows
+    # (where the trampoline actually happens) and Ubuntu (parity sanity
+    # check). `examples/wait-smoke.yaml` needs no provider and caps itself
+    # at `timeout_seconds: 3`, so the run completes well inside the launch
+    # gate's own window and the assertion is on the *launcher*'s output,
+    # not on workflow correctness.
+    runs-on: ${{ matrix.os }}
+    needs: [lint]
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+      fail-fast: false
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install into an isolated tool sandbox
+        # Mirrors the install-scripts job's UV_TOOL_DIR sandbox so this
+        # never touches the runner's own environment. `uv tool install .`
+        # on Windows is exactly what makes `sys.executable` a trampoline
+        # (a wrapper `.exe` that re-execs the real interpreter) -- the
+        # documented install path this job exists to cover.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/uv-tool-dir" "$RUNNER_TEMP/uv-tool-bin-dir"
+          export UV_TOOL_DIR="$RUNNER_TEMP/uv-tool-dir"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv-tool-bin-dir"
+          echo "UV_TOOL_DIR=$UV_TOOL_DIR" >> "$GITHUB_ENV"
+          echo "UV_TOOL_BIN_DIR=$UV_TOOL_BIN_DIR" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/uv-tool-bin-dir" >> "$GITHUB_PATH"
+          uv tool install .
+
+      - name: Run conductor run --web-bg and assert launcher success
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          output=$(conductor run examples/wait-smoke.yaml --web-bg 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "conductor run --web-bg exited with code $status"
+            exit 1
+          fi
+          if echo "$output" | grep -qi "already in use"; then
+            echo "launch gate reported a false port conflict (issue #444/#447 regression)"
+            exit 1
+          fi
+          if echo "$output" | grep -qi "did not start within"; then
+            echo "launch gate reported the dashboard never became reachable"
+            exit 1
+          fi
+          if echo "$output" | grep -qi "did not report a run record"; then
+            echo "launch gate reported the child never wrote its run record"
+            exit 1
+          fi

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic_ai.messages import ModelRequest, ModelResponse, RequestUsage, TextPart, UserPromptPart
 from pydantic_ai.usage import RunUsage
 
 from conductor.providers._pydantic_ai.usage import (
     build_agent_output,
+    last_request_input_tokens,
     run_usage_to_agent_output_fields,
 )
 from conductor.providers.base import AgentOutput
@@ -181,3 +183,55 @@ class TestBuildAgentOutput:
         assert output.output_tokens is None
         assert output.cache_read_tokens is None
         assert output.cache_write_tokens is None
+
+    def test_build_agent_output_forwards_last_call_input_tokens(self) -> None:
+        """The context-window figure (issue #412) rides alongside the billing usage."""
+        usage = RunUsage(input_tokens=1000, output_tokens=200)
+        output = build_agent_output(
+            {"answer": "42"},
+            None,
+            usage=usage,
+            model="claude-sonnet-5",
+            last_call_input_tokens=600,
+        )
+
+        assert output.input_tokens == 1000
+        assert output.last_call_input_tokens == 600
+
+
+class TestLastRequestInputTokens:
+    """Requirement: ``last_request_input_tokens`` isolates one call's prompt size (issue #412)."""
+
+    def test_returns_final_response_input_tokens(self) -> None:
+        """A multi-request history returns only the final ModelResponse's tokens."""
+        messages = [
+            ModelRequest(parts=[UserPromptPart(content="first")]),
+            ModelResponse(
+                parts=[TextPart(content="reply 1")],
+                usage=RequestUsage(input_tokens=100),
+            ),
+            ModelRequest(parts=[UserPromptPart(content="second")]),
+            ModelResponse(
+                parts=[TextPart(content="reply 2")],
+                usage=RequestUsage(input_tokens=250),
+            ),
+        ]
+
+        assert last_request_input_tokens(messages) == 250
+
+    def test_empty_history_returns_none(self) -> None:
+        assert last_request_input_tokens([]) is None
+        assert last_request_input_tokens(None) is None
+
+    def test_history_with_no_model_response_returns_none(self) -> None:
+        messages = [ModelRequest(parts=[UserPromptPart(content="only a request")])]
+
+        assert last_request_input_tokens(messages) is None
+
+    def test_zero_input_tokens_returns_none(self) -> None:
+        """A response with no usage recorded (input_tokens == 0) is unmeasurable."""
+        messages = [
+            ModelResponse(parts=[TextPart(content="reply")], usage=RequestUsage(input_tokens=0)),
+        ]
+
+        assert last_request_input_tokens(messages) is None

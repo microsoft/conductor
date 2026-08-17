@@ -276,3 +276,44 @@ class TestCopilotSchemaShapeRecovery:
         output = asyncio.run(provider.execute(_agent(), {}, "review it", event_callback=_boom))
 
         assert output.content == {"decision": "APPROVE"}
+
+    def test_recovery_call_billing_and_context_figures_stay_distinct(self) -> None:
+        """The exact #412 scenario: original call 559_847 input tokens, one
+        recovery call 561_285 input tokens. Billing (`input_tokens`) sums
+        both calls, but `last_call_input_tokens` reflects only the most
+        recent (recovery) call's prompt size."""
+        provider = CopilotProvider()
+        provider._client = _FakeClient()
+        provider._mock_handler = None
+        provider._started = True
+
+        responses = [
+            SDKResponse(
+                content='{"decision": {"a": 1, "b": 2}}',
+                input_tokens=559_847,
+                output_tokens=100,
+                last_call_input_tokens=559_847,
+            ),
+            SDKResponse(
+                content='{"decision": "APPROVE"}',
+                input_tokens=561_285,
+                output_tokens=50,
+                last_call_input_tokens=561_285,
+            ),
+        ]
+        remaining = list(responses)
+
+        async def _noop() -> None:
+            return None
+
+        async def _fake_send_and_wait(*args: Any, **kwargs: Any) -> SDKResponse:
+            return remaining.pop(0) if remaining else responses[-1]
+
+        provider._ensure_client_started = _noop  # type: ignore[method-assign]
+        provider._send_and_wait = _fake_send_and_wait  # type: ignore[method-assign]
+
+        output = asyncio.run(provider.execute(_agent(), {}, "review it"))
+
+        assert output.content == {"decision": "APPROVE"}
+        assert output.input_tokens == 1_121_132
+        assert output.last_call_input_tokens == 561_285

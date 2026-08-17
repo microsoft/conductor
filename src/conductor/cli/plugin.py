@@ -17,11 +17,13 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-console = Console(stderr=True)
-output_console = Console()
+from conductor.console import make_console, styled
+
+console = make_console(stderr=True)
+output_console = make_console()
 
 plugin_app = typer.Typer(
     name="plugin",
@@ -37,12 +39,12 @@ def _load(workflow: Path):  # noqa: ANN202  (WorkflowConfig, imported lazily)
 
     resolved = workflow.resolve()
     if not resolved.is_file():
-        console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
+        console.print(styled("[bold red]Error:[/bold red] Workflow file not found: {}", workflow))
         raise typer.Exit(code=1)
     try:
         return load_workflow(resolved), resolved
     except ConductorError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
+        console.print(styled("[bold red]Error:[/bold red] {}", exc))
         raise typer.Exit(code=1) from None
 
 
@@ -64,13 +66,13 @@ def _resolve(config, workflow_path: Path, *, allow_network: bool, strict: bool =
                 declared,
                 base_dir=workflow_path.parent,
                 allow_network=allow_network,
-                on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
+                on_warning=lambda message: console.print(styled("[yellow]⚠[/yellow] {}", message)),
             )
         except (PluginError, OSError) as exc:
             # OSError too: the cache is created during acquisition, so an
             # unwritable home or a full disk surfaces here as a bare
             # PermissionError and would otherwise print a raw traceback.
-            console.print(f"[bold red]Error:[/bold red] {exc}")
+            console.print(styled("[bold red]Error:[/bold red] {}", exc))
             raise typer.Exit(code=1) from None
 
     resolved: dict = {}
@@ -81,11 +83,13 @@ def _resolve(config, workflow_path: Path, *, allow_network: bool, strict: bool =
                     {name: entry},
                     base_dir=workflow_path.parent,
                     allow_network=allow_network,
-                    on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
+                    on_warning=lambda message: console.print(
+                        styled("[yellow]⚠[/yellow] {}", message)
+                    ),
                 )
             )
         except (PluginError, OSError) as exc:
-            console.print(f"[yellow]⚠[/yellow] {name}: {exc}")
+            console.print(styled("[yellow]⚠[/yellow] {}: {}", name, exc))
     return resolved
 
 
@@ -127,24 +131,40 @@ def fetch_plugins(
     for name, entry in sources.items():
         detail = entry.source.describe()
         if entry.sha:
-            detail = f"{detail} @ [cyan]{entry.sha[:12]}[/cyan]"
+            detail = styled("{} @ [cyan]{}[/cyan]", detail, entry.sha[:12])
         if entry.source.is_local:
             state = "local"
         elif entry.stale:
             state = "cached (ref not re-checked)"
         else:
             state = "fetched" if entry.fetched else "cached"
-        mark = "[yellow]⚠[/yellow]" if entry.stale else "[green]✓[/green]"
+        # Passed as a value rather than concatenated into the template: the
+        # template is meant to be a conductor literal, and building it from a
+        # variable is the shape that becomes an injection site the day the
+        # variable holds runtime data. ``styled`` splices a pre-styled
+        # ``Text`` with its spans intact, which is what it is for.
+        mark = (
+            Text.from_markup("[yellow]⚠[/yellow]")
+            if entry.stale
+            else Text.from_markup("[green]✓[/green]")
+        )
         output_console.print(
-            f"  {mark} {name} — {detail} — {state}, {len(entry.marketplace.plugins)} plugin(s)"
+            styled(
+                "  {} {} — {} — {}, {} plugin(s)",
+                mark,
+                name,
+                detail,
+                state,
+                len(entry.marketplace.plugins),
+            )
         )
     stale = sum(1 for entry in sources.values() if entry.stale)
-    summary = f"\n{len(sources)} source(s) ready ({fetched} newly fetched)"
+    summary = Text(f"\n{len(sources)} source(s) ready ({fetched} newly fetched)")
     if stale:
         # The command exists to acquire; a row it could not verify must not
         # read as a green light, least of all in the CI step that gates on it.
-        summary += f", [yellow]{stale} not re-checked[/yellow]"
-    output_console.print(f"{summary}.")
+        summary += styled(", [yellow]{} not re-checked[/yellow]", stale)
+    output_console.print(summary + ".")
 
 
 @plugin_app.command("list")
@@ -246,17 +266,17 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
             PluginDef(name=name, skills=skills, agents=agents_on, mcp=mcp)
             for name, skills, agents_on, mcp in key
         ]
-        output_console.print(f"\n[bold]Agents:[/bold] {', '.join(agents)}")
+        output_console.print(styled("\n[bold]Agents:[/bold] {}", ", ".join(agents)))
         try:
             resolved = resolve_plugins(
                 entries,
                 base_dir=workflow_path.parent,
                 marketplaces=marketplaces,
                 declared_sources=declared_names,
-                on_warning=lambda message: console.print(f"[yellow]⚠[/yellow] {message}"),
+                on_warning=lambda message: console.print(styled("[yellow]⚠[/yellow] {}", message)),
             )
         except (PluginError, SkillError, OSError) as exc:
-            output_console.print(f"  [yellow]⚠[/yellow] {exc}")
+            output_console.print(styled("  [yellow]⚠[/yellow] {}", exc))
             continue
 
         for plugin in resolved:
@@ -265,20 +285,26 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
                 f"{len(plugin.agents)} agent(s), "
                 f"{len(plugin.mcp_servers)} MCP server(s)"
             )
-            output_console.print(f"  [cyan]•[/cyan] {plugin.source} — {parts}")
-            output_console.print(f"    [dim]{plugin.root}[/dim]")
+            output_console.print(styled("  [cyan]•[/cyan] {} — {}", plugin.source, parts))
+            output_console.print(styled("    [dim]{}[/dim]", plugin.root))
             if plugin.agents:
                 names = ", ".join(item.qualified_name for item in plugin.agents)
-                output_console.print(f"    [dim]agents: {names}[/dim]")
+                output_console.print(styled("    [dim]agents: {}[/dim]", names))
             if plugin.mcp_servers:
-                output_console.print(f"    [dim]mcp: {', '.join(sorted(plugin.mcp_servers))}[/dim]")
+                output_console.print(
+                    styled("    [dim]mcp: {}[/dim]", ", ".join(sorted(plugin.mcp_servers)))
+                )
             if plugin.disabled:
                 output_console.print(
-                    f"    [dim]disabled by this workflow: {', '.join(plugin.disabled)}[/dim]"
+                    styled(
+                        "    [dim]disabled by this workflow: {}[/dim]", ", ".join(plugin.disabled)
+                    )
                 )
             if plugin.dropped:
                 output_console.print(
-                    f"    [dim]not loaded: {', '.join(f'{d}/' for d in plugin.dropped)}[/dim]"
+                    styled(
+                        "    [dim]not loaded: {}[/dim]", ", ".join(f"{d}/" for d in plugin.dropped)
+                    )
                 )
 
 
