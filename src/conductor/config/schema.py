@@ -631,7 +631,13 @@ class RetryPolicy(BaseModel):
     """Backoff strategy between retries."""
 
     delay_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
-    """Base delay in seconds before the first retry."""
+    """Base delay in seconds before the first retry.
+
+    Also raises the provider's internal 30s backoff cap when set above 30
+    (the effective cap is ``max(30, delay_seconds)``); a value below 30
+    leaves the cap unchanged. See the Retry section of
+    docs/workflow-syntax.md for the resulting wait sequence.
+    """
 
     retry_on: list[Literal["provider_error", "timeout"]] = Field(
         default_factory=lambda: ["provider_error", "timeout"]

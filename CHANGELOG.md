@@ -45,10 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **The Pydantic AI provider (`claude`) never retried on HTTP 429/5xx or
-  transport errors** (#454). `pydantic_ai.models.anthropic._map_api_errors`
-  translates the Anthropic SDK's exceptions into `ModelHTTPError` (for an
-  HTTP error response) and `ModelAPIError` (for a connection/timeout
-  failure) before Conductor ever sees them, so neither the SDK class names
+  transport errors** (#454). pydantic-ai's Anthropic model translates the
+  SDK's exceptions before Conductor ever sees them (a private helper,
+  `_map_api_errors` in pydantic-ai 2.x, written inline at the 1.44.0 floor)
+  into `ModelHTTPError` (for an HTTP error response) and `ModelAPIError`
+  (for a connection/timeout failure), so neither the SDK class names
   nor the `anthropic.APIStatusError` check that `_is_retryable_error`
   relied on ever matched — every attempt failed fast as a non-retryable
   error regardless of `retry:` configuration. Both translated types are now

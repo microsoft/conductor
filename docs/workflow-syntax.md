@@ -190,9 +190,11 @@ agents:
 |-------|------|---------|-------------|
 | `max_attempts` | `1-10` | `1` | Total attempts including the first. `1` = no retry. |
 | `backoff` | `exponential \| fixed` | `exponential` | Backoff strategy between retries. |
-| `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. This value also raises the internal backoff cap, so exponential growth never exceeds it — `delay_seconds: 60` produces 60s waits rather than being clamped to the 30s provider default. |
+| `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. See below for how it interacts with the internal backoff cap. |
 | `retry_on` | list | `[provider_error, timeout]` | Error categories that trigger a retry. |
 | `max_parse_recovery_attempts` | `0-10` | Provider default | In-session recovery attempts before giving up. See below. |
+
+`delay_seconds` also raises the provider's internal 30s backoff cap when set above 30, rather than being clamped down to it: the effective cap is `max(30, delay_seconds)`. It does **not** change the cap when set below 30 — with the default `delay_seconds: 2.0` and `backoff: exponential`, the wait sequence is `2, 4, 8, 16, 30, 30` seconds, well beyond `delay_seconds` itself. Setting `delay_seconds: 60` raises the cap to 60s, so waits grow up to ~60s before the default `jitter` of `0.25` (applied after the cap) adds up to another 25%. Note that once `delay_seconds` reaches or exceeds 30s, the base delay and the cap become equal, so `backoff: exponential` degenerates into a fixed wait on every attempt.
 
 #### `max_parse_recovery_attempts`
 

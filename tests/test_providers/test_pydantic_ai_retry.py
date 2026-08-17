@@ -7,6 +7,7 @@ semantics, that Pydantic AI's own retry budget is disabled, and that the
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Coroutine
 from typing import Any
 from unittest.mock import Mock, patch
@@ -153,6 +154,14 @@ class TestRetryClassification:
         err = ModelAPIError(model_name="claude-x", message="Connection error.")
         assert _is_retryable_error(err) is True
 
+    def test_model_api_error_has_no_other_subclasses(self) -> None:
+        """Canary: the blanket ``type(exception) is ModelAPIError`` retryable
+        arm is only safe while ``ModelHTTPError`` (already handled above and
+        returned first) is the *only* subclass of ``ModelAPIError``. If
+        pydantic-ai adds e.g. an auth or quota error as a new subclass, this
+        must fail loudly rather than let it silently become retryable."""
+        assert ModelAPIError.__subclasses__() == [ModelHTTPError]
+
 
 class TestRetryConfig:
     """Tests for retry configuration resolution."""
@@ -262,19 +271,72 @@ class TestRetryDelay:
         err = ModelHTTPError(status_code=429, model_name="claude-x", body={"message": "oops"})
         assert _get_retry_after(err) is None
 
+    @pytest.mark.parametrize("bad_value", ["Infinity", "nan", "-5", "0"])
+    def test_retry_after_from_body_rejects_non_finite_and_non_positive(
+        self, bad_value: str
+    ) -> None:
+        """A body-supplied retry_after must be finite and positive, or it is
+        discarded rather than used verbatim (issue #454 blocking finding:
+        Infinity hangs the workflow forever, NaN crashes asyncio.sleep, and a
+        negative/zero value burns the retry budget in a hot loop)."""
+        err = ModelHTTPError(
+            status_code=429,
+            model_name="claude-x",
+            body={"retry_after": bad_value},
+        )
+        assert _get_retry_after(err) is None
+
+    def test_retry_after_from_headers_rejects_non_finite_and_non_positive(self) -> None:
+        """Same validation must apply to the header path, not just the body."""
+        for bad_value in ("Infinity", "nan", "-5", "0"):
+            err = MockRateLimitError("rate limited")
+            err.response = Mock(headers={"retry-after": bad_value})
+            assert _get_retry_after(err) is None
+
     def test_extract_status_code_from_api_status_error(self) -> None:
         """HTTP status code must be extracted from APIStatusError-like errors."""
         assert _extract_status_code(MockAPIStatusError("503", 503)) == 503
         assert _extract_status_code(MockBadRequestError("bad")) == 400
 
+    def test_execute_with_retry_clamps_retry_after_to_max_delay(self) -> None:
+        """A body-supplied retry-after (issue #454's new trusted-input path)
+        must still be validated even though it never reaches asyncio.sleep
+        directly here — covered end-to-end in TestExecuteWithRetry."""
+        err = ModelHTTPError(
+            status_code=429,
+            model_name="claude-x",
+            body={"retry_after": 86400},
+        )
+        assert _get_retry_after(err) == 86400.0
+
     def test_clamped_delay_sequence_is_60_60_60(self) -> None:
-        """The answered-question contract: base_delay == max_delay == 60
-        must produce 60s at every attempt (exponential growth clamped to the
-        user-stated cap, not the 30s provider default). Issue #454."""
-        config = RetryConfig(base_delay=60.0, max_delay=60.0, jitter=0.0)
-        assert _calculate_delay(1, config) == 60.0
-        assert _calculate_delay(2, config) == 60.0
-        assert _calculate_delay(3, config) == 60.0
+        """A user-stated delay_seconds of 60 must produce 60s waits at every
+        attempt, routed through the real _resolve_retry_config path (issue
+        #454). Uses a 5xx rather than a 429 so the delay is calculated
+        backoff, not a retry-after override."""
+        agent = AgentDef(name="retryer", retry=RetryPolicy(max_attempts=3, delay_seconds=60.0))
+        config = _resolve_retry_config(agent, RetryConfig(max_delay=30.0, jitter=0.0))
+        factory = _make_factory(
+            [
+                MockAPIStatusError("server error", 500),
+                MockAPIStatusError("server error", 500),
+                "ok",
+            ]
+        )
+
+        async def run() -> str:
+            return await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="retryer",
+            )
+
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = asyncio.run(run())
+
+        assert result == "ok"
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [60.0, 60.0]
 
 
 class TestExecuteWithRetry:
@@ -390,6 +452,36 @@ class TestExecuteWithRetry:
         assert exc_info.value.is_retryable is False
         assert "after 3 attempts" in str(exc_info.value)
         assert len(events) == 2
+        # Issue #454 blocking finding: exhaustion must preserve the original
+        # error as __cause__ rather than raising bare.
+        assert exc_info.value.__cause__ is not None
+        assert isinstance(exc_info.value.__cause__, MockAPIConnectionError)
+
+    @pytest.mark.asyncio
+    async def test_retries_exhausted_on_model_api_error_names_root_cause(self) -> None:
+        """Exhaustion on a translated ModelAPIError must name the real
+        transport failure rather than only the SDK's hardcoded "Connection
+        error." message (issue #454 blocking finding), and must chain the
+        original error via __cause__."""
+        transport_error = ConnectionError("Name or service not known")
+        api_error = ModelAPIError(model_name="claude-x", message="Connection error.")
+        api_error.__cause__ = transport_error
+        config = RetryConfig(max_attempts=2, base_delay=0.0, jitter=0.0)
+        factory = _make_factory([api_error, api_error])
+
+        with (
+            patch("conductor.providers._pydantic_ai.retry.asyncio.sleep"),
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="retryer",
+            )
+
+        assert exc_info.value.__cause__ is api_error
+        assert "Name or service not known" in exc_info.value.suggestion
 
     @pytest.mark.asyncio
     async def test_validation_error_not_retried(self) -> None:
@@ -448,7 +540,9 @@ class TestExecuteWithRetry:
         def callback(event_type: str, payload: dict[str, Any]) -> None:
             events.append((event_type, payload))
 
-        config = RetryConfig(max_attempts=2, base_delay=1.0, jitter=0.0)
+        # max_delay must accommodate the 60s server hint, or it is clamped
+        # (issue #454: an unvalidated retry-after can bypass max_delay).
+        config = RetryConfig(max_attempts=2, base_delay=1.0, max_delay=60.0, jitter=0.0)
         factory = _make_factory([MockRateLimitError("rate limited"), "ok"])
 
         with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
@@ -463,6 +557,31 @@ class TestExecuteWithRetry:
         assert len(events) == 1
         assert events[0][1]["delay"] == 60.0
         mock_sleep.assert_called_once_with(60.0)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_header_clamped_to_max_delay(self) -> None:
+        """A server retry-after above max_delay must be clamped, not honored
+        verbatim (issue #454 blocking finding: unvalidated retry-after can
+        bypass max_delay and stall a run for hours)."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        config = RetryConfig(max_attempts=2, base_delay=1.0, max_delay=30.0, jitter=0.0)
+        factory = _make_factory([MockRateLimitError("rate limited"), "ok"])
+
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=callback,
+                agent_name="retryer",
+            )
+
+        assert result == "ok"
+        assert events[0][1]["delay"] == 30.0
+        mock_sleep.assert_called_once_with(30.0)
 
     @pytest.mark.asyncio
     async def test_retry_event_callback_errors_swallowed(self) -> None:
