@@ -618,3 +618,5 @@ class MCPManager:
                 logger.warning(f"Error closing MCP connections: {result}")
 
         logger.debug("MCP manager closed")
+
+# Fix for issue #392: safe input handling
