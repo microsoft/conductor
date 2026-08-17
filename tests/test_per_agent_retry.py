@@ -198,7 +198,10 @@ class TestResolveRetryConfig:
         assert config is not provider._retry_config
 
     def test_agent_retry_preserves_provider_jitter_and_max_delay(self) -> None:
-        """Test that resolved config preserves provider's jitter and max_delay."""
+        """Test that resolved config preserves provider's jitter, and that
+        the provider's max_delay acts as a floor for max_delay (not a fixed
+        value) — see test_agent_retry_raises_max_delay_when_delay_seconds_larger
+        below for the case where the agent's delay_seconds exceeds it."""
         custom_retry_config = RetryConfig(
             max_attempts=3, base_delay=1.0, max_delay=60.0, jitter=0.5
         )
@@ -211,10 +214,24 @@ class TestResolveRetryConfig:
 
         config = provider._resolve_retry_config(agent)
 
-        assert config.max_delay == 60.0  # From provider
+        assert config.max_delay == 60.0  # From provider (floor, unaffected here)
         assert config.jitter == 0.5  # From provider
         assert config.max_attempts == 2  # From agent
         assert config.base_delay == 5.0  # From agent
+
+    def test_agent_retry_raises_max_delay_when_delay_seconds_larger(self) -> None:
+        """A user-stated delay_seconds larger than the provider default must
+        raise the cap rather than be silently clamped below it (issue #454)."""
+        provider = CopilotProvider(retry_config=RetryConfig(max_delay=30.0))
+        agent = AgentDef(
+            name="test",
+            prompt="Test",
+            retry=RetryPolicy(delay_seconds=60.0),
+        )
+
+        config = provider._resolve_retry_config(agent)
+
+        assert config.max_delay == 60.0
 
     def test_agent_retry_on_is_forwarded(self) -> None:
         """Test that retry_on from agent policy is forwarded to config."""

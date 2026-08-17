@@ -42,6 +42,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged, so that combination still warns. Workflows that set `max_bytes`
   explicitly are unaffected.
 
+### Fixed
+
+- **The Pydantic AI provider (`claude`) never retried on HTTP 429/5xx or
+  transport errors** (#454). `pydantic_ai.models.anthropic._map_api_errors`
+  translates the Anthropic SDK's exceptions into `ModelHTTPError` (for an
+  HTTP error response) and `ModelAPIError` (for a connection/timeout
+  failure) before Conductor ever sees them, so neither the SDK class names
+  nor the `anthropic.APIStatusError` check that `_is_retryable_error`
+  relied on ever matched — every attempt failed fast as a non-retryable
+  error regardless of `retry:` configuration. Both translated types are now
+  classified directly, matching the existing 429/5xx retryable set, and a
+  server's `retry-after` value is recovered from `__cause__` (the
+  translation drops response headers, but preserves the original SDK
+  exception there) or from the response body.
+- **A per-agent `retry.delay_seconds` larger than the 30s provider default
+  was silently clamped back down to 30s** on both the Pydantic AI (`claude`)
+  and Copilot providers, so `delay_seconds: 60` produced 30s waits instead
+  of the stated 60s. The internal backoff cap is now `max(default_max_delay,
+  delay_seconds)`, so a larger stated delay raises the cap instead of being
+  clamped by it; existing configurations with `delay_seconds` below the
+  default are unaffected.
+
 ## [0.1.32](https://github.com/microsoft/conductor/compare/v0.1.31...v0.1.32) - 2026-08-16
 
 ### Fixed

@@ -12,7 +12,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
-from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
 
 from conductor.config.schema import AgentDef, RetryPolicy
 from conductor.exceptions import ProviderError, ValidationError
@@ -128,6 +128,31 @@ class TestRetryClassification:
         err = UnexpectedModelBehavior("Exceeded maximum output retries (2)")
         assert _is_retryable_error(err) is True
 
+    def test_model_http_error_429_and_5xx_are_retryable(self) -> None:
+        """pydantic-ai's translated ModelHTTPError must be retryable at 429/5xx.
+
+        Regression test for issue #454: pydantic_ai.models.anthropic
+        translates the Anthropic SDK's APIStatusError/RateLimitError into
+        ModelHTTPError before Conductor ever sees them.
+        """
+        assert _is_retryable_error(ModelHTTPError(status_code=429, model_name="claude-x")) is True
+        assert _is_retryable_error(ModelHTTPError(status_code=500, model_name="claude-x")) is True
+        assert _is_retryable_error(ModelHTTPError(status_code=503, model_name="claude-x")) is True
+
+    def test_model_http_error_4xx_are_not_retryable(self) -> None:
+        """A ModelHTTPError for a client error must stay fatal.
+
+        Guards against the broader ModelAPIError arm (ModelHTTPError is a
+        subclass of ModelAPIError) swallowing 4xx errors.
+        """
+        assert _is_retryable_error(ModelHTTPError(status_code=400, model_name="claude-x")) is False
+        assert _is_retryable_error(ModelHTTPError(status_code=401, model_name="claude-x")) is False
+
+    def test_bare_model_api_error_is_retryable(self) -> None:
+        """A bare ModelAPIError (connection/timeout translation) must be retryable."""
+        err = ModelAPIError(model_name="claude-x", message="Connection error.")
+        assert _is_retryable_error(err) is True
+
 
 class TestRetryConfig:
     """Tests for retry configuration resolution."""
@@ -166,6 +191,26 @@ class TestRetryConfig:
         assert config.max_attempts == 7
         assert config.base_delay == 0.5
 
+    def test_max_delay_raised_to_delay_seconds_when_larger(self) -> None:
+        """A user-stated delay_seconds larger than the provider default must
+        raise the cap rather than be silently clamped below it. Issue #454."""
+        agent = AgentDef(name="retryer", retry=RetryPolicy(delay_seconds=60.0))
+        default = RetryConfig(max_delay=30.0)
+
+        config = _resolve_retry_config(agent, default)
+
+        assert config.max_delay == 60.0
+
+    def test_max_delay_unaffected_when_delay_seconds_smaller(self) -> None:
+        """A delay_seconds smaller than the provider default must leave the
+        existing cap in place (no regression for existing users)."""
+        agent = AgentDef(name="retryer", retry=RetryPolicy(delay_seconds=2.0))
+        default = RetryConfig(max_delay=30.0)
+
+        config = _resolve_retry_config(agent, default)
+
+        assert config.max_delay == 30.0
+
 
 class TestRetryDelay:
     """Tests for backoff and retry-after behavior."""
@@ -193,10 +238,43 @@ class TestRetryDelay:
         err = MockRateLimitError("rate limited")
         assert _get_retry_after(err) == 60.0
 
+    def test_retry_after_recovered_from_model_http_error_cause(self) -> None:
+        """A ModelHTTPError's response headers live on its __cause__, since
+        pydantic-ai's translation (_map_api_errors) drops them. Issue #454."""
+        cause = MockRateLimitError("rate limited")
+        err = ModelHTTPError(status_code=429, model_name="claude-x")
+        err.__cause__ = cause
+        assert _get_retry_after(err) == 60.0
+
+    def test_retry_after_recovered_from_model_http_error_body(self) -> None:
+        """A ModelHTTPError with no cause but a body carrying retry_after must
+        still surface a delay."""
+        err = ModelHTTPError(
+            status_code=429,
+            model_name="claude-x",
+            body={"error": {"retry_after": 45}},
+        )
+        assert _get_retry_after(err) == 45.0
+
+    def test_retry_after_none_when_no_cause_and_opaque_body(self) -> None:
+        """A ModelHTTPError with neither a usable cause nor a recognizable body
+        must fall through to None so the caller uses calculated backoff."""
+        err = ModelHTTPError(status_code=429, model_name="claude-x", body={"message": "oops"})
+        assert _get_retry_after(err) is None
+
     def test_extract_status_code_from_api_status_error(self) -> None:
         """HTTP status code must be extracted from APIStatusError-like errors."""
         assert _extract_status_code(MockAPIStatusError("503", 503)) == 503
         assert _extract_status_code(MockBadRequestError("bad")) == 400
+
+    def test_clamped_delay_sequence_is_60_60_60(self) -> None:
+        """The answered-question contract: base_delay == max_delay == 60
+        must produce 60s at every attempt (exponential growth clamped to the
+        user-stated cap, not the 30s provider default). Issue #454."""
+        config = RetryConfig(base_delay=60.0, max_delay=60.0, jitter=0.0)
+        assert _calculate_delay(1, config) == 60.0
+        assert _calculate_delay(2, config) == 60.0
+        assert _calculate_delay(3, config) == 60.0
 
 
 class TestExecuteWithRetry:
@@ -540,6 +618,71 @@ class TestExecuteWithRetry:
         # The original pydantic ValidationError must be preserved as the cause
         # so callers can introspect field-level errors (issue #343 contract).
         assert exc_info.value.__cause__ is schema_error
+
+    @pytest.mark.asyncio
+    async def test_model_http_error_429_retried_and_succeeds(self) -> None:
+        """Regression test for issue #454, reproduced end to end: a
+        ModelHTTPError(429) — pydantic-ai's translated form of an Anthropic
+        RateLimitError — must be retried rather than raised immediately.
+
+        ``retry_on=["provider_error"]`` mirrors the issue's YAML and exercises
+        ``_classify_error``'s fall-through for a non-ProviderError exception.
+        """
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        config = RetryConfig(
+            max_attempts=3,
+            base_delay=0.0,
+            jitter=0.0,
+            retry_on=["provider_error"],
+        )
+        factory = _make_factory([ModelHTTPError(status_code=429, model_name="claude-x"), "ok"])
+
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=callback,
+                agent_name="retryer",
+            )
+
+        assert result == "ok"
+        assert len(events) == 1
+        assert events[0][0] == "agent_retry"
+        assert events[0][1]["error_type"] == "ModelHTTPError"
+        mock_sleep.assert_called_once_with(0.0)
+
+    @pytest.mark.asyncio
+    async def test_model_http_error_400_raises_immediately(self) -> None:
+        """A ModelHTTPError(400) must raise a non-retryable ProviderError
+        after exactly one attempt (no retry loop entered)."""
+        config = RetryConfig(max_attempts=3, base_delay=0.0, jitter=0.0)
+        factory = _make_factory([ModelHTTPError(status_code=400, model_name="claude-x")])
+        call_count = 0
+
+        async def counting_factory() -> Any:
+            nonlocal call_count
+            call_count += 1
+            return await factory()
+
+        with (
+            patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep,
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await execute_with_retry(
+                counting_factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="retryer",
+            )
+
+        assert exc_info.value.is_retryable is False
+        assert exc_info.value.status_code == 400
+        assert call_count == 1
+        mock_sleep.assert_not_called()
 
 
 class TestPydanticAIRetriesSplit:

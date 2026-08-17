@@ -190,7 +190,7 @@ agents:
 |-------|------|---------|-------------|
 | `max_attempts` | `1-10` | `1` | Total attempts including the first. `1` = no retry. |
 | `backoff` | `exponential \| fixed` | `exponential` | Backoff strategy between retries. |
-| `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. |
+| `delay_seconds` | `0.0-300.0` | `2.0` | Base delay in seconds before the first retry. This value also raises the internal backoff cap, so exponential growth never exceeds it — `delay_seconds: 60` produces 60s waits rather than being clamped to the 30s provider default. |
 | `retry_on` | list | `[provider_error, timeout]` | Error categories that trigger a retry. |
 | `max_parse_recovery_attempts` | `0-10` | Provider default | In-session recovery attempts before giving up. See below. |
 

@@ -828,7 +828,11 @@ class CopilotProvider(AgentProvider):
         return RetryConfig(
             max_attempts=retry.max_attempts,
             base_delay=retry.delay_seconds,
-            max_delay=self._retry_config.max_delay,
+            # A user who writes delay_seconds: 60 must not have it silently
+            # clamped to the 30s provider default. The cap becomes their
+            # stated value, so exponential growth is clamped to it rather
+            # than below it. Issue #454.
+            max_delay=max(self._retry_config.max_delay, retry.delay_seconds),
             jitter=self._retry_config.jitter,
             backoff=retry.backoff,
             retry_on=list(retry.retry_on),

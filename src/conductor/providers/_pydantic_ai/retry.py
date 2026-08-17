@@ -7,6 +7,18 @@ Structured-output recovery retries are left enabled in ``build_agent`` because
 plain-text answers to a tool-output schema must be recovered in-session before
 ``execute_with_retry`` can see a result. If that internal budget is exhausted,
 Conductor retries the whole call.
+
+pydantic-ai translates the Anthropic SDK's own exceptions before Conductor
+ever sees them (``pydantic_ai.models.anthropic._map_api_errors``): an HTTP
+error response (``APIStatusError``, including ``RateLimitError``) becomes
+``ModelHTTPError``, and a transport failure (``APIConnectionError``,
+including ``APITimeoutError``) becomes a bare ``ModelAPIError``. Those are
+the exception types actually observed on this path, not the SDK's own
+classes, so ``_is_retryable_error`` and ``_get_retry_after`` classify those
+translated types directly (issue #454). The translation also drops the
+original response headers, so a server's ``retry-after`` value is only
+recoverable through ``__cause__``, which ``_map_api_errors`` sets to the
+untranslated SDK exception.
 """
 
 from __future__ import annotations
@@ -16,12 +28,14 @@ import contextlib
 import logging
 import random
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Any, cast
 
 try:
     import anthropic
 except ImportError:
     anthropic = None  # type: ignore[assignment]
+
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 
 from conductor.config.schema import RetryPolicy
 from conductor.exceptions import ProviderError, ValidationError
@@ -81,7 +95,10 @@ def _resolve_retry_config(
     return RetryConfig(
         max_attempts=retry.max_attempts,
         base_delay=retry.delay_seconds,
-        max_delay=default.max_delay,
+        # A user who writes delay_seconds: 60 must not have it silently clamped
+        # to the 30s provider default. The cap becomes their stated value, so
+        # exponential growth is clamped to it rather than below it. Issue #454.
+        max_delay=max(default.max_delay, retry.delay_seconds),
         jitter=default.jitter,
         backoff=retry.backoff,
         retry_on=list(retry.retry_on),
@@ -113,10 +130,24 @@ def _classify_error(error: Exception) -> str:
 def _is_retryable_error(exception: Exception) -> bool:
     """Determine if an error should trigger a retry.
 
-    Mirrors ``ClaudeProvider._is_retryable_error``.
+    Mirrors ``ClaudeProvider._is_retryable_error``, extended to classify the
+    ``ModelHTTPError``/``ModelAPIError`` types pydantic-ai actually raises on
+    this path (see the module docstring; issue #454).
     """
     if isinstance(exception, ProviderError):
         return exception.is_retryable
+
+    # pydantic-ai translates the Anthropic SDK's exceptions before Conductor
+    # sees them (pydantic_ai.models.anthropic._map_api_errors), so neither the
+    # SDK class names nor the anthropic.APIStatusError isinstance check below
+    # ever match. Issue #454.
+    if isinstance(exception, ModelHTTPError):
+        code = exception.status_code
+        return code == 429 or 500 <= code < 600
+    # A bare ModelAPIError is what APIConnectionError/APITimeoutError become —
+    # a transport failure, retryable for the same reason the SDK names below are.
+    if isinstance(exception, ModelAPIError):
+        return True
 
     error_type_name = type(exception).__name__
 
@@ -151,10 +182,12 @@ def _is_retryable_error(exception: Exception) -> bool:
     return False
 
 
-def _get_retry_after(exception: Exception) -> float | None:
-    """Extract retry-after value from a rate limit exception.
+def _retry_after_from_headers(exception: BaseException) -> float | None:
+    """Extract a retry-after value from a rate-limit exception's response headers.
 
-    Mirrors ``ClaudeProvider._get_retry_after``.
+    Mirrors ``ClaudeProvider._get_retry_after``'s original header-reading
+    behavior, unchanged, so it can be reused both on the exception itself and
+    when walking ``__cause__`` for a translated pydantic-ai exception.
     """
     error_type_name = type(exception).__name__
     is_rate_limit = False
@@ -174,6 +207,68 @@ def _get_retry_after(exception: Exception) -> float | None:
                 return float(retry_after)
             except ValueError:
                 pass
+    return None
+
+
+def _retry_after_from_body(exception: ModelHTTPError) -> float | None:
+    """Extract a retry-after value from a ``ModelHTTPError``'s response body.
+
+    ``ModelHTTPError`` carries the Anthropic API's parsed JSON ``body`` but
+    not the response headers, so a server that reports retry timing in the
+    body (rather than, or in addition to, a ``retry-after`` header) is only
+    recoverable here. No prose parsing of message strings — that is
+    unreliable and would misfire.
+    """
+    body = exception.body
+    if not isinstance(body, dict):
+        return None
+    body_dict = cast("dict[str, Any]", body)
+
+    candidates: list[Any] = [body_dict.get("retry_after"), body_dict.get("retry-after")]
+    error = body_dict.get("error")
+    if isinstance(error, dict):
+        error_dict = cast("dict[str, Any]", error)
+        candidates.extend([error_dict.get("retry_after"), error_dict.get("retry-after")])
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _get_retry_after(exception: Exception) -> float | None:
+    """Extract retry-after value from a rate limit exception.
+
+    Mirrors ``ClaudeProvider._get_retry_after``, extended for pydantic-ai's
+    translated exceptions (issue #454): ``ModelHTTPError``/``ModelAPIError``
+    carry no response headers, since ``_map_api_errors`` drops them, but
+    ``__cause__`` is the original, untranslated Anthropic SDK exception with
+    ``.response.headers`` intact, so it is walked as a fallback.
+    """
+    retry_after = _retry_after_from_headers(exception)
+    if retry_after is not None:
+        return retry_after
+
+    if isinstance(exception, ModelHTTPError):
+        retry_after = _retry_after_from_body(exception)
+        if retry_after is not None:
+            return retry_after
+
+    seen: set[int] = {id(exception)}
+    cause = exception.__cause__
+    depth = 0
+    while cause is not None and depth < 5 and id(cause) not in seen:
+        retry_after = _retry_after_from_headers(cause)
+        if retry_after is not None:
+            return retry_after
+        seen.add(id(cause))
+        cause = cause.__cause__
+        depth += 1
+
     return None
 
 
