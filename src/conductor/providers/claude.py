@@ -264,6 +264,17 @@ class ClaudeProvider(AgentProvider):
         self._max_input_cache: dict[str, int | None] | None = None
         self._max_input_cache_lock = asyncio.Lock()
 
+        # Set when validate_connection()'s models.list() probe is inconclusive
+        # (see _connection_probe_verdict) rather than a confirmed success.
+        # connection_note carries a human-readable reason for diagnostics
+        # (cli/doctor.py, providers/diagnostics.py) to surface instead of
+        # silently claiming "connected". model_listing_unavailable short-
+        # circuits get_max_prompt_tokens()/list_models() so an endpoint that
+        # doesn't implement /v1/models isn't re-probed on every call.
+        self._connection_probe_note: str | None = None
+        self._model_listing_unavailable = False
+        self._model_listing_unavailable_warned = False
+
         # Initialize the client (sync initialization)
         self._initialize_client()
 
@@ -390,6 +401,9 @@ class ClaudeProvider(AgentProvider):
             models_page = await self._client.models.list()
             # Log available models for debugging
             self._report_available_models(models_page)
+            self._connection_probe_note = None
+            self._model_listing_unavailable = False
+            self._model_listing_unavailable_warned = False
             return True
         except Exception as e:
             return self._connection_probe_verdict(e)
@@ -418,6 +432,13 @@ class ClaudeProvider(AgentProvider):
             status_code = getattr(exc, "status_code", None)
             if status_code is None:
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            # A duck-typed status_code may be a non-int (e.g. a stringified "401"
+            # from a proxy wrapper) or an auto-created Mock attribute; neither is
+            # usable for the 401/403 check below, so route it into the fail-CLOSED
+            # arm rather than let it silently pass through as inconclusive. `bool`
+            # is excluded explicitly since `isinstance(True, int)` is `True`.
+            if not isinstance(status_code, int) or isinstance(status_code, bool):
+                status_code = None
 
         if status_code is None:
             logger.error(f"Connection validation failed: {exc}")
@@ -432,6 +453,9 @@ class ClaudeProvider(AgentProvider):
             "This endpoint may not implement /v1/models. Continuing startup; credentials "
             "will be verified on the first agent call."
         )
+        self._connection_probe_note = f"unverified (HTTP {status_code})"
+        self._model_listing_unavailable = True
+        self._model_listing_unavailable_warned = False
         return True
 
     def _report_available_models(self, models_page: Any) -> None:
@@ -464,6 +488,23 @@ class ClaudeProvider(AgentProvider):
             info.id: getattr(info, "max_input_tokens", None) for info in models_data
         }
 
+    def _log_model_listing_unavailable(self) -> None:
+        """Log that model listing is unavailable, once at warning then at debug.
+
+        Called by ``get_max_prompt_tokens``/``list_models`` when
+        ``_model_listing_unavailable`` is set (an inconclusive
+        ``validate_connection()`` probe) so repeated calls don't each re-attempt
+        a guaranteed-failing ``models.list()`` round-trip.
+        """
+        if not self._model_listing_unavailable_warned:
+            logger.warning(
+                "Model listing is unavailable for this endpoint; context-window "
+                "reporting disabled for this endpoint."
+            )
+            self._model_listing_unavailable_warned = True
+        else:
+            logger.debug("Model listing remains unavailable for this endpoint.")
+
     async def get_max_prompt_tokens(self, model: str) -> int | None:
         """Return the Anthropic SDK's ``max_input_tokens`` for ``model``.
 
@@ -471,7 +512,9 @@ class ClaudeProvider(AgentProvider):
         ``client.models.list()``; subsequent calls are dictionary lookups.
         ``validate_connection()`` already populates the cache, so callers
         that go through normal connection setup never pay for an extra
-        round-trip.
+        round-trip — unless the probe was inconclusive (see
+        ``_connection_probe_verdict``), in which case the cache is never seeded
+        and this method short-circuits instead of re-attempting the call.
 
         Resolves aliases (``-latest``, dated suffixes, base/versioned name
         mismatches) via :func:`match_model_id`. Returns ``None`` when the
@@ -485,6 +528,10 @@ class ClaudeProvider(AgentProvider):
         reports the default window.
         """
         if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
             return None
 
         if self._max_input_cache is None:
@@ -517,6 +564,9 @@ class ClaudeProvider(AgentProvider):
         constructed, or the listing call fails — diagnostics must never raise.
         """
         if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
             return None
         try:
             page = await self._client.models.list()

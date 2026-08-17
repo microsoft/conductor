@@ -273,6 +273,8 @@ def _connection_cell(diag: ProviderDiagnostic) -> Text:
     """Format the connection-check result cell."""
     if not diag.checked or diag.connection_ok is None:
         return _DASH
+    if diag.connection_ok and diag.connection_note:
+        return styled("[yellow]⚠[/yellow] {}", diag.connection_note)
     if diag.connection_ok:
         return styled("{} connected", _CHECK)
     if diag.connection_error:

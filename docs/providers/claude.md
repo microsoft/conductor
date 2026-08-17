@@ -158,8 +158,11 @@ workflow:
 
 ### Startup Connection Validation
 
-`conductor validate` and `conductor run` probe the endpoint with `client.models.list()` before
-running any agent. Not every Anthropic-compatible endpoint implements model listing — Azure AI
+`conductor run` probes the endpoint with `client.models.list()` when it lazily constructs the
+Claude provider — before the first agent on that provider runs. `conductor doctor --check` /
+`--models` run the same probe. `conductor validate` does **not** — it is a static YAML/schema
+check that never constructs a provider or contacts the endpoint. Not every Anthropic-compatible
+endpoint implements model listing — Azure AI
 Foundry's Anthropic endpoint (`https://<resource>.services.ai.azure.com/anthropic`) and some
 LiteLLM/Databricks AI Gateway configurations answer it with a 404 while `/v1/messages` (the
 endpoint agents actually use) works fine. To avoid failing startup on those endpoints, the probe
@@ -628,15 +631,17 @@ This will log:
 #### Test Provider Connection
 
 ```bash
-conductor validate workflow.yaml --provider claude
+conductor doctor --check -p claude
 ```
 
 This validates:
 - API key is set and (on endpoints that implement `/v1/models`) verified against the API — on
   endpoints that don't (e.g. Azure AI Foundry), credentials are instead verified at first agent
-  execution; see [Startup Connection Validation](#startup-connection-validation)
+  execution; see [Startup Connection Validation](#startup-connection-validation) above
 - Provider can connect to Claude API
-- Workflow YAML is syntactically correct
+
+Separately, `conductor validate workflow.yaml` checks that the workflow YAML is syntactically
+correct — it never contacts the Claude endpoint.
 
 #### Check SDK Installation
 

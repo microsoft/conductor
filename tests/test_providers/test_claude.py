@@ -453,6 +453,55 @@ class TestConnectionValidation:
         provider = ClaudeProvider()
         assert await provider.validate_connection() is True
 
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_duck_typed_string_status_fails_closed(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A stringified status_code (e.g. "401" from a proxy wrapper) must not fail open.
+
+        `"401" in (401, 403)` is `False`, so without narrowing to `int` this would
+        be misclassified as inconclusive and return `True` for a rejected credential.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+
+        class _StringStatusError(Exception):
+            def __init__(self) -> None:
+                super().__init__("unauthorized")
+                self.response = Mock(status_code="401")
+
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_StringStatusError())
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is False
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_duck_typed_status_code_attribute_401_fails_closed(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A duck-typed integer status_code set directly on the exception (no
+        `.response`) must still be checked against the 401/403 rule."""
+        mock_anthropic_module.__version__ = "0.77.0"
+
+        class _DirectStatusError(Exception):
+            def __init__(self) -> None:
+                super().__init__("unauthorized")
+                self.status_code = 401
+
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_DirectStatusError())
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is False
+
 
 class TestCloseMethod:
     """Tests for resource cleanup."""
