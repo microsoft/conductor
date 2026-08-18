@@ -569,6 +569,190 @@ class TestProvidersCollapsedCount:
 
 
 # ---------------------------------------------------------------------------
+# `enter` footer advertisement (issue #459)
+# ---------------------------------------------------------------------------
+
+
+class TestProvidersFooter:
+    """`enter` must both toggle expand/collapse *and* actually appear in
+    the footer -- `DataTable` binds `enter` itself (`show=False`), so
+    without `priority=True` the screen's own binding is shadowed and the
+    key silently vanishes from the footer while it still works (see
+    `runs.py`'s identical `Detail` binding, which this mirrors)."""
+
+    async def test_expand_collapse_binding_survives_datatables_own_enter(
+        self, fleet_env: Path
+    ) -> None:
+        with patch(
+            "conductor.fleet.tui.screens.providers.gather",
+            new=AsyncMock(return_value=_FakeReport([_diag("copilot")])),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_providers(pilot)
+
+                shown = [
+                    ab.binding.description
+                    for ab in app.screen.active_bindings.values()
+                    if ab.binding.show and ab.enabled
+                ]
+                assert "Expand/Collapse" in shown
+
+    async def test_enter_expands_exactly_once(self, fleet_env: Path) -> None:
+        """`enter` is bound twice over -- `DataTable`'s own hidden binding
+        and the screen's visible one -- so prove the two paths stay
+        mutually exclusive and don't fire the check twice."""
+        checked_diag = _diag(
+            "copilot",
+            checked=True,
+            connection_ok=True,
+            models=[ModelDiagnostic(id="gpt-5")],
+        )
+        with (
+            patch(
+                "conductor.fleet.tui.screens.providers.gather",
+                new=AsyncMock(return_value=_FakeReport([_diag("copilot", checked=False)])),
+            ),
+            patch(
+                "conductor.fleet.tui.screens.providers.gather_provider",
+                new=AsyncMock(return_value=checked_diag),
+            ) as fake_gather_provider,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_providers(pilot)
+
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+                await pilot.press("enter")
+                await settle(pilot)
+
+                fake_gather_provider.assert_called_once_with(
+                    "copilot", check=True, list_models=True
+                )
+                assert table.row_count == 2  # provider + 1 model row
+
+    async def test_mouse_click_still_expands(self, fleet_env: Path) -> None:
+        """A mouse click posts `RowSelected` directly (rather than going
+        through the `priority` screen binding), so this exercises
+        `on_data_table_row_selected` -- the other of the two paths that
+        must both funnel into the same toggle."""
+        checked_diag = _diag(
+            "copilot",
+            checked=True,
+            connection_ok=True,
+            models=[ModelDiagnostic(id="gpt-5")],
+        )
+        with (
+            patch(
+                "conductor.fleet.tui.screens.providers.gather",
+                new=AsyncMock(return_value=_FakeReport([_diag("copilot", checked=False)])),
+            ),
+            patch(
+                "conductor.fleet.tui.screens.providers.gather_provider",
+                new=AsyncMock(return_value=checked_diag),
+            ) as fake_gather_provider,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_providers(pilot)
+
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+                row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+                app.screen.post_message(DataTable.RowSelected(table, 0, row_key))
+                await settle(pilot)
+
+                fake_gather_provider.assert_called_once_with(
+                    "copilot", check=True, list_models=True
+                )
+                assert table.row_count == 2  # provider + 1 model row
+
+    async def test_hidden_with_a_model_sub_row_highlighted(self, fleet_env: Path) -> None:
+        """The acceptance criterion: `enter` is not offered while a model
+        sub-row is highlighted, since a sub-row has no expand/collapse
+        action of its own."""
+        checked_diag = _diag(
+            "copilot",
+            checked=True,
+            connection_ok=True,
+            models=[ModelDiagnostic(id="gpt-5")],
+        )
+        with (
+            patch(
+                "conductor.fleet.tui.screens.providers.gather",
+                new=AsyncMock(return_value=_FakeReport([checked_diag])),
+            ),
+            patch("conductor.fleet.tui.screens.providers.gather_provider"),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_providers(pilot)
+
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+                await pilot.press("enter")  # expand
+                await settle(pilot)
+                assert table.row_count == 2  # provider + 1 model row
+
+                table.move_cursor(row=1)  # the model sub-row
+                await pilot.pause()
+
+                assert app.screen.check_action("toggle_provider", ()) is False
+                shown = [
+                    ab.binding.description
+                    for ab in app.screen.active_bindings.values()
+                    if ab.binding.show and ab.enabled
+                ]
+                assert "Expand/Collapse" not in shown
+
+    async def test_second_enter_collapses_the_same_provider_just_expanded(
+        self, fleet_env: Path
+    ) -> None:
+        """Regression test for the `_render_table` cursor-reset bug:
+        `DataTable.clear()` unconditionally resets `cursor_coordinate` to
+        row 0, so without restoring the cursor by row KEY after a rebuild,
+        expanding a non-first provider (`charlie`, row 2) would leave the
+        cursor on row 0 (`alpha`) -- and a second `enter` would collapse
+        the WRONG provider instead of the one just expanded."""
+        checked_diag = _diag(
+            "charlie", checked=True, connection_ok=True, models=[ModelDiagnostic(id="m1")]
+        )
+        diags = [_diag("alpha", checked=True), _diag("bravo", checked=True), checked_diag]
+        with (
+            patch(
+                "conductor.fleet.tui.screens.providers.gather",
+                new=AsyncMock(return_value=_FakeReport(diags)),
+            ),
+            patch(
+                "conductor.fleet.tui.screens.providers.gather_provider",
+                new=AsyncMock(return_value=checked_diag),
+            ),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_providers(pilot)
+
+                table = app.screen.query_one(DataTable)
+                assert table.row_count == 3
+                table.move_cursor(row=2)  # charlie
+
+                await pilot.press("enter")  # expand charlie
+                await settle(pilot)
+
+                assert app.screen._expanded == {"charlie"}
+                # The cursor must follow the row it was on, not snap back
+                # to row 0 -- `clear()`'s own default behaviour.
+                key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+                assert key == "charlie"
+
+                await pilot.press("enter")  # collapse -- must still be charlie
+                await settle(pilot)
+
+                assert app.screen._expanded == set()
+
+
+# ---------------------------------------------------------------------------
 # Registries drill-down (Fleet Manager E11)
 # ---------------------------------------------------------------------------
 #
@@ -1125,3 +1309,210 @@ class TestRunFromRegistryDrilldown:
             await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
+
+
+# ---------------------------------------------------------------------------
+# `enter` footer advertisement (issue #459)
+# ---------------------------------------------------------------------------
+
+
+class TestRegistriesFooter:
+    """`enter` must both open the highlighted registry's workflows *and*
+    actually appear in the footer -- `DataTable` binds `enter` itself
+    (`show=False`), so without `priority=True` the screen's own binding is
+    shadowed and the key silently vanishes from the footer while it still
+    works (see `runs.py`'s identical `Detail` binding, which this
+    mirrors)."""
+
+    async def test_workflows_binding_survives_datatables_own_enter(self, fleet_env: Path) -> None:
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Workflows" in shown
+
+    async def test_enter_pushes_exactly_one_workflows_screen(self, fleet_env: Path) -> None:
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert len(app.screen_stack) == before + 1
+            assert isinstance(app.screen, RegistryWorkflowsScreen)
+
+    async def test_mouse_click_still_pushes_workflows_screen(self, fleet_env: Path) -> None:
+        """A mouse click posts `RowSelected` directly (rather than going
+        through the `priority` screen binding), so this exercises
+        `on_data_table_row_selected` -- the other of the two paths that
+        must both funnel into the same push."""
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            before = len(app.screen_stack)
+            app.screen.post_message(DataTable.RowSelected(table, 0, row_key))
+            await settle(pilot)
+
+            assert len(app.screen_stack) == before + 1
+            assert isinstance(app.screen, RegistryWorkflowsScreen)
+
+    async def test_hidden_and_harmless_with_no_registries_configured(self, fleet_env: Path) -> None:
+        """With no registries configured the table is empty, so `enter`
+        must not be advertised (previously a new footer inaccuracy
+        introduced alongside the priority binding) -- and pressing it
+        anyway must not crash the app (the empty-table guard in
+        `action_open_workflows` is the only thing preventing that today)."""
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+
+            table = app.screen.query_one(DataTable)
+            assert table.row_count == 0
+            assert app.screen.check_action("open_workflows", ()) is False
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Workflows" not in shown
+
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert app.is_running
+            assert len(app.screen_stack) == before
+
+
+class TestRegistryWorkflowsFooter:
+    """`enter` must both open the highlighted workflow's inputs *and*
+    actually appear in the footer -- same shadowing hazard as
+    ``TestRegistriesFooter`` above."""
+
+    async def test_inputs_binding_survives_datatables_own_enter(self, fleet_env: Path) -> None:
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, RegistryWorkflowsScreen)
+
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Inputs" in shown
+
+    async def test_enter_pushes_exactly_one_inputs_screen(self, fleet_env: Path) -> None:
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, RegistryWorkflowsScreen)
+
+            wf_table = app.screen.query_one(DataTable)
+            wf_table.move_cursor(row=0)
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert len(app.screen_stack) == before + 1
+            assert isinstance(app.screen, WorkflowInputsScreen)
+
+    async def test_mouse_click_still_pushes_inputs_screen(self, fleet_env: Path) -> None:
+        """A mouse click posts `RowSelected` directly (rather than going
+        through the `priority` screen binding), so this exercises
+        `on_data_table_row_selected` -- the other of the two paths that
+        must both funnel into the same push."""
+        _configure_registry(_write_local_registry(fleet_env))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, RegistryWorkflowsScreen)
+
+            wf_table = app.screen.query_one(DataTable)
+            wf_table.move_cursor(row=0)
+            row_key = wf_table.coordinate_to_cell_key(wf_table.cursor_coordinate).row_key
+            before = len(app.screen_stack)
+            app.screen.post_message(DataTable.RowSelected(wf_table, 0, row_key))
+            await settle(pilot)
+
+            assert len(app.screen_stack) == before + 1
+            assert isinstance(app.screen, WorkflowInputsScreen)
+
+    async def test_hidden_and_harmless_with_no_workflows_in_registry(self, fleet_env: Path) -> None:
+        """A registry with no workflows in its index leaves the table
+        empty, so `enter`/`n` must not be advertised, and pressing either
+        anyway must not crash the app (registries.py's "no workflows found"
+        state, not an error)."""
+        from ruamel.yaml import YAML
+
+        registry_dir = fleet_env / "empty-registry"
+        registry_dir.mkdir(parents=True, exist_ok=True)
+        yaml = YAML()
+        with open(registry_dir / "index.yaml", "w") as f:
+            yaml.dump({"workflows": {}}, f)
+        _configure_registry(registry_dir)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_registries(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, RegistryWorkflowsScreen)
+
+            wf_table = app.screen.query_one(DataTable)
+            assert wf_table.row_count == 0
+            assert app.screen.check_action("open_inputs", ()) is False
+            assert app.screen.check_action("new_run", ()) is False
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Inputs" not in shown
+            assert "Run" not in shown
+
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await pilot.press("n")
+            await settle(pilot)
+
+            assert app.is_running
+            assert len(app.screen_stack) == before

@@ -32,6 +32,7 @@ from conductor.fleet.summary import derive_run_summary
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.run_detail import RunDetailScreen, _collect_detail
 from conductor.fleet.tui.screens.runs import RunsScreen
+from conductor.fleet.tui.screens.step_detail import StepDetailScreen
 from tests.test_fleet.conftest import settle
 
 # ---------------------------------------------------------------------------
@@ -486,6 +487,37 @@ class TestRunDetailGracefulDegradation:
             assert table.display is False
             assert placeholder.display is True
 
+    async def test_enter_hidden_and_harmless_while_placeholder_showing(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """With no topology to act on (the placeholder is showing), the
+        `enter` binding must not be advertised in the footer, and pressing
+        it anyway must not crash the app or push a step-detail screen."""
+        _write_record(tmp_path, "run-a")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert isinstance(app.screen, RunDetailScreen)
+            assert app.screen.query_one("#detail-placeholder", Static).display is True
+            assert app.screen.check_action("open_step", ()) is False
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Step" not in shown
+
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert app.is_running
+            assert len(app.screen_stack) == before
+
     async def test_escape_from_placeholder_still_returns_to_runs(
         self, fleet_env: Path, tmp_path: Path
     ) -> None:
@@ -776,3 +808,88 @@ class TestRunDetailWorkerThreading:
                 assert loading.display is False
                 table = app.screen.query_one(DataTable)
                 assert table.display is True
+
+
+# ---------------------------------------------------------------------------
+# `enter` footer advertisement (issue #459)
+# ---------------------------------------------------------------------------
+
+
+class TestStepDrilldownFooter:
+    """`enter` must both drill down to Step detail *and* actually appear in
+    the footer -- `DataTable` binds `enter` itself (`show=False`), so
+    without `priority=True` the screen's own binding is shadowed and the
+    key silently vanishes from the footer while the drill-down still works
+    (see `runs.py`'s identical `Detail` binding, which this mirrors)."""
+
+    async def test_step_binding_survives_datatables_own_enter(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert isinstance(app.screen, RunDetailScreen)
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Step" in shown
+
+    async def test_enter_pushes_exactly_one_step_detail_screen(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, RunDetailScreen)
+
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert len(app.screen_stack) == before + 1
+            assert isinstance(app.screen, StepDetailScreen)
+
+    async def test_mouse_click_still_pushes_step_detail(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """A mouse click posts `RowSelected` directly (rather than going
+        through the `priority` screen binding), so this exercises
+        `on_data_table_row_selected` -- the other of the two paths that
+        must both funnel into the same push."""
+        log_path = tmp_path / "run-a.events.jsonl"
+        _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
+        _write_record(tmp_path, "run-a", event_log_path=str(log_path))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, RunDetailScreen)
+
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            before = len(app.screen_stack)
+            app.screen.post_message(DataTable.RowSelected(table, 0, row_key))
+            await settle(pilot)
+
+            assert len(app.screen_stack) == before + 1
+            assert isinstance(app.screen, StepDetailScreen)

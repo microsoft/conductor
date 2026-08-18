@@ -10,7 +10,7 @@ run-record poll gate) -- this module deliberately does not re-implement any
 of it, since doing so would make runs die with the TUI rather than survive
 it.
 
-Two responsibilities:
+Three responsibilities:
 
 * :func:`resolve_workflow` -- accept a file path or registry reference and
   resolve it to a local workflow file plus its declared inputs, reusing the
@@ -24,6 +24,10 @@ Two responsibilities:
   itself failing -- including its own D2 run-record-poll timeout) raises
   :class:`LaunchError` with a plain-text message suitable for display in the
   TUI, never a raw traceback.
+* :func:`launch_resume` -- resume a run from an on-disk checkpoint (issue
+  #460, the History screen's Resume action) by calling
+  :func:`conductor.cli.bg_runner.launch_background_resume` directly, for the
+  exact same never-re-implement-spawning reason as ``launch_workflow``.
 """
 
 from __future__ import annotations
@@ -255,6 +259,64 @@ def launch_workflow(
         return launch_background(
             workflow_path=workflow_path,
             inputs=inputs,
+            provider_override=provider_override,
+            skip_gates=skip_gates,
+            metadata=metadata,
+        )
+    except Exception as e:  # noqa: BLE001 - surfaced as a LaunchError, not a traceback
+        raise LaunchError(str(e)) from e
+
+
+def launch_resume(
+    checkpoint_path: Path,
+    *,
+    provider_override: str | None = None,
+    skip_gates: bool = False,
+    metadata: dict[str, str] | None = None,
+) -> BackgroundLaunch:
+    """Resume a workflow from an on-disk checkpoint in the background (issue #460).
+
+    Calls :func:`conductor.cli.bg_runner.launch_background_resume` directly
+    -- never spawns a ``conductor`` subprocess itself -- for the same reason
+    :func:`launch_workflow` calls ``launch_background()`` directly: the one
+    already cross-platform-hardened detached-spawn implementation (and its
+    D2 run-record poll gate) is reused rather than duplicated.
+
+    Passes ``workflow_path=None`` and only ``checkpoint_path`` -- the
+    History screen's :class:`~conductor.fleet.history.HistoryEntry` carries
+    no workflow path of its own, so the checkpoint (which records its own
+    ``workflow_path``) is the only route to one, and the child resolves it
+    from the checkpoint itself.
+
+    A successful return means the workflow is running, but not always
+    already discoverable: check the returned ``BackgroundLaunch.
+    run_record_written`` -- ``False`` means the run-record poll's own
+    bookkeeping failed (issue #435), so the run will not (yet) show up via
+    ``read_run_records()`` even though it is executing normally, exactly as
+    for a fresh :func:`launch_workflow` launch.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file to resume from.
+        provider_override: Optional provider name override.
+        skip_gates: Whether to auto-select first option at human gates.
+        metadata: Optional CLI metadata key=value pairs.
+
+    Returns:
+        The ``BackgroundLaunch`` describing the launch. See above for the
+        ``run_record_written`` caveat.
+
+    Raises:
+        LaunchError: When ``launch_background_resume()`` itself fails (child
+            died early, dashboard never came up, or the D2 gate). The
+            original exception's message is preserved verbatim so the TUI
+            can show it, but never the raw traceback.
+    """
+    from conductor.cli.bg_runner import launch_background_resume
+
+    try:
+        return launch_background_resume(
+            workflow_path=None,
+            checkpoint_path=checkpoint_path,
             provider_override=provider_override,
             skip_gates=skip_gates,
             metadata=metadata,

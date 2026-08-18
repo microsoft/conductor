@@ -36,10 +36,12 @@ from typing import TYPE_CHECKING, cast
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from conductor.console import styled
+from conductor.fleet.tui.widgets import highlighted_row_key
 from conductor.providers.diagnostics import RegistryDiagnostic, gather_registries
 from conductor.registry.config import RegistryEntry, get_registry
 from conductor.registry.index import RegistryIndex, load_index
@@ -60,7 +62,14 @@ logger = logging.getLogger(__name__)
 class RegistriesScreen(Screen):
     """Configured registries: name, type, source, default marker (E11-T1)."""
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        # Row-scoped -- opens the highlighted registry's workflows.
+        # `priority` is required or `DataTable`'s hidden `enter` shadows it
+        # in the footer; same reasoning as `runs.py`'s `BINDINGS` comment,
+        # issue #459.
+        Binding("enter", "open_workflows", "Workflows", priority=True),
+        ("escape", "back", "Back"),
+    ]
 
     def action_back(self) -> None:
         """Pop back to the Runs screen -- bound to ``escape``."""
@@ -125,10 +134,49 @@ class RegistriesScreen(Screen):
             )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Push the workflows drill-down for the selected registry."""
+        """Push the workflows drill-down for the selected registry (mouse click)."""
         name = event.row_key.value
         if name is None:
             return
+        self._push_workflows_for(name)
+
+    def _selected_registry_name(self) -> str | None:
+        """Return the registry name behind the currently highlighted row.
+
+        ``None`` when the table is empty or the cursor's row key can't be
+        resolved -- mirrors ``runs.py``'s ``_selected_key``.
+        """
+        return highlighted_row_key(self.query_one(DataTable))
+
+    def action_open_workflows(self) -> None:
+        """Open the highlighted registry's workflows -- the ``enter`` binding.
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_push_workflows_for`, so keyboard and mouse each take exactly
+        one path and ``enter`` cannot push two screens.
+        """
+        name = self._selected_registry_name()
+        if name is None:
+            return
+        self._push_workflows_for(name)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide ``open_workflows`` while no registry is selected (e.g. an
+        empty or failed-to-load table), so the footer never advertises a
+        key that does nothing."""
+        if action == "open_workflows":
+            return self._selected_registry_name() is not None
+        return True
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Refresh the footer when the cursor moves to a different row."""
+        self.refresh_bindings()
+
+    def _push_workflows_for(self, name: str) -> None:
+        """Push the workflows drill-down for registry ``name``."""
         self.app.push_screen(RegistryWorkflowsScreen(name))
 
 
@@ -141,8 +189,12 @@ class RegistryWorkflowsScreen(Screen):
     """Workflows listed in one registry's index (E11-T2)."""
 
     BINDINGS = [
-        ("escape", "back", "Back"),
+        # Row-scoped -- act on the highlighted workflow. `enter` must be
+        # `priority`, or `DataTable`'s hidden `enter` shadows it in the
+        # footer; same reasoning as `runs.py`'s `BINDINGS` comment, issue #459.
+        Binding("enter", "open_inputs", "Inputs", priority=True),
         ("n", "new_run", "Run"),
+        ("escape", "back", "Back"),
     ]
 
     def __init__(self, registry_name: str) -> None:
@@ -220,9 +272,62 @@ class RegistryWorkflowsScreen(Screen):
             table.add_row(Text(wf_name), Text(info.description or "-"), key=wf_name)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Push the inputs drill-down for the selected workflow."""
+        """Push the inputs drill-down for the selected workflow (mouse click)."""
         wf_name = event.row_key.value
-        if wf_name is None or self._entry is None:
+        if wf_name is None:
+            return
+        self._push_inputs_for(wf_name)
+
+    def _selected_workflow_name(self) -> str | None:
+        """Return the workflow name behind the currently highlighted row.
+
+        ``None`` when the table is empty or the cursor's row key can't be
+        resolved -- mirrors ``runs.py``'s ``_selected_key``.
+        """
+        return highlighted_row_key(self.query_one(DataTable))
+
+    def action_open_inputs(self) -> None:
+        """Open the highlighted workflow's inputs -- the ``enter`` binding.
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_push_inputs_for`, so keyboard and mouse each take exactly one
+        path and ``enter`` cannot push two screens.
+        """
+        wf_name = self._selected_workflow_name()
+        if wf_name is None:
+            return
+        self._push_inputs_for(wf_name)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide ``open_inputs``/``new_run`` while no workflow is selected,
+        or the registry's index hasn't resolved yet -- so the footer never
+        advertises a key that does nothing (e.g. an empty/still-loading
+        table)."""
+        if action in {"open_inputs", "new_run"}:
+            return self._selected_workflow_name() is not None and self._entry is not None
+        return True
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Refresh the footer when the cursor moves to a different row."""
+        self.refresh_bindings()
+
+    def _push_inputs_for(self, wf_name: str) -> None:
+        """Push the inputs drill-down for workflow ``wf_name``, if the
+        registry entry has resolved.
+
+        ``self._entry`` is only set once the async :meth:`load_workflows`
+        worker resolves (or stays ``None`` forever if it failed and
+        surfaced an error instead). ``check_action`` hides the ``enter``
+        binding for this case, but a mouse click bypasses it entirely, so
+        this still needs its own guard -- and now that the footer actively
+        advertises "Inputs", a silent no-op reads as a bug rather than the
+        undocumented `DataTable` side effect it used to be.
+        """
+        if self._entry is None:
+            self.notify("Still loading this registry's index…", severity="warning", markup=False)
             return
         self.app.push_screen(
             WorkflowInputsScreen(
@@ -239,11 +344,7 @@ class RegistryWorkflowsScreen(Screen):
         own syntax), so the New-run screen resolves it through the
         ordinary path rather than being handed a pre-fetched file.
         """
-        table = self.query_one(DataTable)
-        if not table.row_count:
-            return
-        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
-        wf_name = row_key.value
+        wf_name = self._selected_workflow_name()
         if wf_name is None:
             return
         cast("FleetApp", self.app).push_new_run(f"{wf_name}@{self._registry_name}")
@@ -262,8 +363,8 @@ class WorkflowInputsScreen(Screen):
     """
 
     BINDINGS = [
-        ("escape", "back", "Back"),
         ("n", "new_run", "Run"),
+        ("escape", "back", "Back"),
     ]
 
     def __init__(self, *, registry_name: str, entry: RegistryEntry, workflow_name: str) -> None:

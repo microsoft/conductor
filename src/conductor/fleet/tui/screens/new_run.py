@@ -44,6 +44,7 @@ from textual.widgets import Checkbox, Footer, Header, Input, Label, Static
 from conductor.config.schema import InputDef
 from conductor.console import styled
 from conductor.fleet.launch import LaunchError, ResolvedWorkflow, launch_workflow, resolve_workflow
+from conductor.fleet.tui.actions import report_background_launch
 
 if TYPE_CHECKING:
     # The app module imports this screen module, so a top-level import of
@@ -482,15 +483,7 @@ class NewRunScreen(Screen):
         # pop would land back on a workflow's inputs with the just-started
         # run nowhere in sight.
         cast("FleetApp", self.app).return_to_runs()
-        self.app.notify(f"Launched: {launch.url}", markup=False)
-        if not launch.run_record_written:
-            # The run is executing normally, but its discovery bookkeeping
-            # failed (issue #435) -- it will not appear on the Runs screen
-            # this notification just switched to, so say so rather than
-            # leaving the user wondering why a "successful" launch vanished.
-            self.app.notify(
-                "This run could not register itself for discovery and will not "
-                "appear in the list. Check its stderr log for the cause.",
-                severity="warning",
-                markup=False,
-            )
+        # `still_running`/`workflow_started`/`run_record_written` are all
+        # checked, in that order, by the shared helper (issue #410/#435) --
+        # never report a URL for a process that has already exited.
+        report_background_launch(self.app, launch, verb="Launched")

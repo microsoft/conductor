@@ -215,10 +215,32 @@ stack rather than each managing its own navigation state.
   records (a completed run's record has already been removed). A log
   with no `workflow_completed`/`workflow_failed` terminal event is listed
   too, shown as **unknown**, never as "running" — a non-terminal log is
-  not evidence of a live run. Selecting a row surfaces the exact
+  not evidence of a live run, and a **currently-live** run is always
+  excluded from Resume regardless of what checkpoint would otherwise
+  correlate to it, since resuming it would make the new process adopt
+  the live run's `run_id`, overwrite its run record, and interleave two
+  processes' events into one log. Selecting a row surfaces the exact
   `conductor replay <log>` command rather than opening a viewer inside
   the TUI — depth, again, belongs to `replay`/the dashboard, not this
-  screen.
+  screen. A row whose event log correlates to a checkpoint on disk also
+  offers `r`/Resume: pressing it resumes that run in the background
+  through the same `launch_background_resume` path `conductor resume
+  --web-bg` uses, then returns to Runs — the one action this screen
+  performs itself rather than delegating (replay stays a viewer;
+  resuming a run is an action, like Runs killing a process or resolving
+  a gate). The key is offered only when a checkpoint correlates to the
+  row **and** its recorded workflow file still exists; availability is
+  entirely **checkpoint-driven, never outcome-driven** — an `unknown` row
+  with a periodic checkpoint offers Resume, while a `failed` row from an
+  explicit `type: terminate` does not, because that step writes no
+  checkpoint by design. A `completed` row can offer it too, which would
+  re-execute already-finished (possibly billable) work; the notification
+  shown before resuming names the checkpoint's save time and step so that
+  choice is informed rather than hidden. In practice, Resume shows up
+  mostly on `failed` rows, which always carry a failure checkpoint — an
+  `unknown` row only offers it when the workflow opted into
+  [periodic checkpoints](workflow-syntax.md#periodic-checkpoints)
+  (`runtime.checkpoint`), which are off by default.
 
 ## Key bindings
 
@@ -238,8 +260,23 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `h` | History |
 | `q` | Quit |
 
-On Run detail, `enter` opens the highlighted step; that screen binds `r`
-to reload and `tab` to switch panes.
+Screens with a row-scoped `enter` advertise it in their own footer:
+
+| Screen | `enter` |
+|--------|---------|
+| Runs | Open run detail for the selected row |
+| Run detail | Open step detail for the highlighted step |
+| History | Surface `conductor replay <log>` for the selected row |
+| Providers | Expand/collapse the highlighted provider |
+| Registries | Open that registry's workflows |
+| Registry workflows | Open that workflow's inputs |
+
+On Providers, `enter` is not offered while a model/status sub-row is
+highlighted — only a provider row itself can be expanded or collapsed.
+The Step-detail screen that `enter` opens from Run detail binds `r` to
+reload and `tab` to switch panes. On History, `r` resumes the
+highlighted row's checkpoint in the background when a checkpoint is
+available (see [above](#screens)).
 
 Inside the Registries drill-down, `n` runs the highlighted (or currently
 displayed) workflow rather than starting from an empty form. A launch
@@ -349,6 +386,15 @@ itself, not for this display). There is no pagination: per the design's
 history in favor of staying simple. Pruning an event log makes that
 run's history permanently unavailable to both the History screen and
 `conductor replay`, since both read the JSONL file directly.
+
+The sweep never descends into the `checkpoints/` subdirectory, and
+checkpoint rotation (`keep_last` on `runtime.checkpoint`) runs entirely
+independently of event-log retention — the two are on separate clocks.
+So a History row can outlive its checkpoint (an event log survives the
+`keep_last` window longer than the checkpoint it once correlated to,
+and Resume disappears from that row) and a checkpoint can just as
+easily outlive its row (the event log gets pruned first, leaving a
+checkpoint on disk with no History entry to resume it from).
 
 ## See Also
 
