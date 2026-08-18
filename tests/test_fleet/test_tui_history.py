@@ -11,7 +11,11 @@ directory (redirected via ``tempfile.gettempdir``, mirroring
 - The empty state renders when there is no history yet.
 - Selecting a row offers ``conductor replay <log>`` via a notification --
   it never opens a replay dashboard itself (depth is delegated, not
-  re-implemented).
+  re-implemented for viewing).
+- ``TestHistoryResume`` (issue #460): pressing ``r`` on a row correlated to
+  an on-disk checkpoint resumes it in the background via the exact same
+  ``launch_background_resume`` path ``conductor resume --web-bg`` uses,
+  gated purely on checkpoint existence -- never on the row's ``outcome``.
 """
 
 from __future__ import annotations
@@ -22,11 +26,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from textual.widgets import DataTable, Static
 
+from conductor.cli.bg_runner import BackgroundLaunch
+from conductor.engine.checkpoint import CheckpointManager
 from conductor.fleet.history import build_history_entries
 from conductor.fleet.retention import event_log_root
 from conductor.fleet.tui.app import FleetApp
@@ -64,7 +70,9 @@ def event_log_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     Mirrors ``tests/test_fleet/test_history.py``'s own ``temp_root``
     fixture -- patches ``tempfile.gettempdir`` directly since ``tempfile``
-    caches its resolved directory per-process.
+    caches its resolved directory per-process. This is also the same seam
+    ``CheckpointManager.get_checkpoints_dir()`` reads, so a checkpoint
+    written under it and an event log written under it can genuinely join.
     """
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     return event_log_root()
@@ -88,6 +96,62 @@ def _write_log(
     """Write a ``conductor-<name>-<ts>-<run_id>.events.jsonl`` file under ``root``."""
     path = root / f"conductor-{name}-{ts}-{run_id}.events.jsonl"
     path.write_text("\n".join(lines or []) + ("\n" if lines else ""))
+    return path
+
+
+_RESUME_WORKFLOW_YAML = """\
+workflow:
+  name: resumable-workflow
+  entry_point: helper
+agents:
+  - name: helper
+    model: copilot
+    prompt: Say hello
+"""
+
+
+@pytest.fixture()
+def resume_workflow_file(tmp_path: Path) -> Path:
+    """A real workflow YAML on disk -- ``correlate_checkpoints``'s validity
+    filter requires the checkpoint's recorded ``workflow_path`` to exist."""
+    path = tmp_path / "resumable-workflow.yaml"
+    path.write_text(_RESUME_WORKFLOW_YAML)
+    return path
+
+
+def _write_checkpoint(
+    workflow_path: Path,
+    *,
+    event_log_path: str,
+    run_id: str = "",
+    created_at: str | None = None,
+    current_agent: str = "step-1",
+    trigger: str = "failure",
+) -> Path:
+    """Write a schema-valid checkpoint JSON file to
+    ``CheckpointManager.get_checkpoints_dir()`` -- which, under the
+    ``event_log_dir`` fixture, resolves under the same ``tmp_path`` as the
+    event logs it correlates to.
+    """
+    if created_at is None:
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    data = {
+        "version": CheckpointManager.CHECKPOINT_VERSION,
+        "workflow_path": str(workflow_path),
+        "workflow_hash": "sha256:deadbeef",
+        "created_at": created_at,
+        "failure": {"error_type": None, "message": None, "agent": current_agent, "iteration": 0},
+        "inputs": {},
+        "current_agent": current_agent,
+        "context": {},
+        "limits": {},
+        "run_id": run_id,
+        "event_log_path": event_log_path,
+        "trigger": trigger,
+    }
+    checkpoints_dir = CheckpointManager.get_checkpoints_dir()
+    path = checkpoints_dir / f"{workflow_path.stem}-{run_id or 'nocp'}.json"
+    path.write_text(json.dumps(data))
     return path
 
 
@@ -466,3 +530,368 @@ class TestHistoryWorkerThreading:
                 await settle(pilot)
 
                 assert app.is_running
+
+
+# ---------------------------------------------------------------------------
+# Resume from a correlated checkpoint (issue #460)
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryResume:
+    async def test_matched_row_offers_resume(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="aaaa1111",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="aaaa1111")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+
+            assert app.screen.check_action("resume", ()) is True
+
+    async def test_unmatched_row_hides_resume(self, fleet_env: Path, event_log_dir: Path) -> None:
+        _write_log(
+            event_log_dir,
+            name="no-checkpoint-workflow",
+            run_id="bbbb1111",
+            lines=[_event("workflow_started", {"name": "no-checkpoint-workflow"}, ts=1000.0)],
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+
+            assert app.screen.check_action("resume", ()) is False
+
+    async def test_explicit_terminate_failure_with_no_checkpoint_hides_resume(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """A ``status: failed`` terminate step writes no checkpoint by
+        design -- gating must fall out of "no checkpoint correlates",
+        never a special-cased read of ``is_explicit``/``outcome``."""
+        _write_log(
+            event_log_dir,
+            name="terminated-workflow",
+            run_id="cccc1111",
+            lines=[
+                _event("workflow_started", {"name": "terminated-workflow"}, ts=1000.0),
+                _event(
+                    "workflow_failed",
+                    {"error_type": "WorkflowTerminated", "is_explicit": True},
+                    ts=1001.0,
+                ),
+            ],
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+
+            assert app.screen.check_action("resume", ()) is False
+
+    async def test_missing_workflow_path_hides_resume(
+        self, fleet_env: Path, event_log_dir: Path, tmp_path: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="gone-workflow",
+            run_id="dddd1111",
+            lines=[_event("workflow_started", {"name": "gone-workflow"}, ts=1000.0)],
+        )
+        missing_workflow = tmp_path / "gone.yaml"  # never written
+        _write_checkpoint(missing_workflow, event_log_path=str(log_path), run_id="dddd1111")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+
+            assert app.screen.check_action("resume", ()) is False
+
+    async def test_completed_row_with_checkpoint_offers_resume(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        """Q2 regression guard: gating is checkpoint-driven only. A
+        ``completed`` row must offer Resume exactly like any other outcome
+        when a checkpoint correlates to it -- no outcome special-case."""
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="eeee1111",
+            lines=[
+                _event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 1.0}, ts=1001.0),
+            ],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="eeee1111")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+
+            assert app.screen.check_action("resume", ()) is True
+
+    async def test_unknown_row_with_periodic_checkpoint_offers_resume(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="ffff1111",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(
+            resume_workflow_file,
+            event_log_path=str(log_path),
+            run_id="ffff1111",
+            trigger="periodic",
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+
+            assert app.screen.check_action("resume", ()) is True
+
+    async def test_pressing_r_launches_resume_and_returns_to_runs(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00001111",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        cp_path = _write_checkpoint(
+            resume_workflow_file, event_log_path=str(log_path), run_id="00001111"
+        )
+
+        launch = BackgroundLaunch(
+            url="http://127.0.0.1:8080",
+            stderr_log=event_log_dir / "00001111.bg.stderr.log",
+            stdout_log=event_log_dir / "00001111.bg.stdout.log",
+            run_id="00001111",
+        )
+        fake_launch = Mock(return_value=launch)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            with patch("conductor.cli.bg_runner.launch_background_resume", fake_launch):
+                await _goto_history(pilot)
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+
+                await pilot.press("r")
+                await settle(pilot)
+
+            assert isinstance(app.screen, RunsScreen)
+
+        fake_launch.assert_called_once()
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["workflow_path"] is None
+        assert kwargs["checkpoint_path"] == cp_path
+
+    async def test_run_record_not_written_shows_warning_notification(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        """Issue #435: a resume that succeeded but could not confirm its own
+        discovery record must warn -- a real ``BackgroundLaunch`` is
+        required since a ``Mock(...)`` would leave ``run_record_written``
+        an auto-created truthy attribute (mirrors
+        ``test_tui_new_run.py``'s identical case)."""
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00002222",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="00002222")
+
+        launch = BackgroundLaunch(
+            url="http://127.0.0.1:8080",
+            stderr_log=event_log_dir / "00002222.bg.stderr.log",
+            stdout_log=event_log_dir / "00002222.bg.stdout.log",
+            run_id="00002222",
+            run_record_written=False,
+        )
+
+        notifications: list[tuple[str, str]] = []
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            original_notify = app.notify
+
+            def _capture(message, **kwargs):
+                notifications.append((message, str(kwargs.get("severity", "information"))))
+                original_notify(message, **kwargs)
+
+            with (
+                patch(
+                    "conductor.cli.bg_runner.launch_background_resume",
+                    Mock(return_value=launch),
+                ),
+                patch.object(app, "notify", _capture),
+            ):
+                await _goto_history(pilot)
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+
+                await pilot.press("r")
+                await settle(pilot)
+
+            assert isinstance(app.screen, RunsScreen)
+
+        warnings = [message for message, severity in notifications if severity == "warning"]
+        assert any("could not register itself for discovery" in m for m in warnings), notifications
+
+    async def test_launch_error_surfaces_as_notification_without_navigating(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00003333",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="00003333")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            with patch(
+                "conductor.cli.bg_runner.launch_background_resume",
+                side_effect=RuntimeError("boom"),
+            ):
+                await _goto_history(pilot)
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+
+                with patch.object(HistoryScreen, "notify") as mock_notify:
+                    await pilot.press("r")
+                    await settle(pilot)
+
+            assert app.is_running
+            assert isinstance(app.screen, HistoryScreen)
+
+        severities = [call.kwargs.get("severity") for call in mock_notify.call_args_list]
+        assert "error" in severities
+
+    async def test_correlate_checkpoints_runs_off_the_main_thread(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00004444",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="00004444")
+
+        seen_main_thread: list[bool] = []
+
+        from conductor.fleet.resume import correlate_checkpoints
+
+        def _tracking_correlate(entries):
+            seen_main_thread.append(threading.current_thread() is threading.main_thread())
+            return correlate_checkpoints(entries)
+
+        with patch(
+            "conductor.fleet.tui.screens.history.correlate_checkpoints",
+            side_effect=_tracking_correlate,
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_history(pilot)
+
+        assert seen_main_thread == [False]
+
+    async def test_correlate_checkpoints_failure_still_renders_rows_and_warns(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00005555",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+
+        with patch(
+            "conductor.fleet.tui.screens.history.correlate_checkpoints",
+            side_effect=OSError("checkpoints unreadable"),
+        ):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await _goto_history(pilot)
+
+                table = app.screen.query_one(DataTable)
+                assert table.display is True
+                assert table.row_count == 1
+                assert app.screen.check_action("resume", ()) is False
+
+    async def test_second_r_while_resuming_does_not_launch_twice(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00006666",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="00006666")
+
+        call_count = 0
+        release_launch = threading.Event()
+
+        def _blocking_launch_background_resume(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            release_launch.wait(timeout=2)
+            return BackgroundLaunch(
+                url="http://127.0.0.1:8080",
+                stderr_log=event_log_dir / "00006666.bg.stderr.log",
+                stdout_log=event_log_dir / "00006666.bg.stdout.log",
+                run_id="00006666",
+            )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            with patch(
+                "conductor.cli.bg_runner.launch_background_resume",
+                _blocking_launch_background_resume,
+            ):
+                await _goto_history(pilot)
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+
+                await pilot.press("r")
+                # Not `settle`: the launch worker is genuinely blocked on
+                # `release_launch`, so this must observe the in-flight
+                # state rather than wait it out (see AGENTS.md's test
+                # caution about `settle` deadlocking on a suspended worker).
+                await pilot.pause()
+
+                assert app.screen._resuming is True
+
+                await pilot.press("r")
+                await pilot.pause()
+
+                release_launch.set()
+                await pilot.pause(0.3)
+
+        assert call_count == 1

@@ -30,6 +30,7 @@ from conductor.fleet.launch import (
     ResolvedWorkflow,
     build_launch_inputs,
     coerce_input_value,
+    launch_resume,
     launch_workflow,
     resolve_workflow,
 )
@@ -362,6 +363,72 @@ class TestLaunchWorkflow:
             pytest.raises(LaunchError, match="run record within 15 seconds"),
         ):
             launch_workflow(workflow_file, {}, {})
+
+
+# ---------------------------------------------------------------------------
+# launch_resume (issue #460)
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchResume:
+    def test_calls_launch_background_resume_with_workflow_path_none(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.json"
+        fake_result = object()
+        with patch(
+            "conductor.cli.bg_runner.launch_background_resume", return_value=fake_result
+        ) as fake:
+            result = launch_resume(checkpoint_path)
+
+        assert result is fake_result
+        fake.assert_called_once()
+        _args, kwargs = fake.call_args
+        assert kwargs["workflow_path"] is None
+        assert kwargs["checkpoint_path"] == checkpoint_path
+
+    def test_never_spawns_a_subprocess_directly(self, tmp_path: Path) -> None:
+        """Mirrors ``TestLaunchWorkflow::test_never_spawns_a_subprocess_directly``
+        -- ``launch_resume`` must delegate to ``launch_background_resume()``
+        rather than construct its own detached ``conductor`` subprocess."""
+        checkpoint_path = tmp_path / "checkpoint.json"
+        with (
+            patch("conductor.cli.bg_runner.launch_background_resume") as fake_launch,
+            patch("subprocess.Popen") as fake_popen,
+        ):
+            launch_resume(checkpoint_path)
+
+        fake_launch.assert_called_once()
+        fake_popen.assert_not_called()
+
+    def test_forwards_optional_kwargs(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.json"
+        with patch("conductor.cli.bg_runner.launch_background_resume") as fake_launch:
+            launch_resume(
+                checkpoint_path,
+                provider_override="claude",
+                skip_gates=True,
+                metadata={"source": "fleet-tui"},
+            )
+
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["provider_override"] == "claude"
+        assert kwargs["skip_gates"] is True
+        assert kwargs["metadata"] == {"source": "fleet-tui"}
+
+    def test_launch_background_resume_failure_surfaces_as_launch_error(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint_path = tmp_path / "checkpoint.json"
+        with (
+            patch(
+                "conductor.cli.bg_runner.launch_background_resume",
+                side_effect=RuntimeError(
+                    "Background process did not report a run record within 15 seconds "
+                    "(run_id=abc123). The background process was terminated."
+                ),
+            ),
+            pytest.raises(LaunchError, match="run record within 15 seconds"),
+        ):
+            launch_resume(checkpoint_path)
 
 
 # ---------------------------------------------------------------------------
