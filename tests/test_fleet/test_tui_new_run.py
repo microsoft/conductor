@@ -345,6 +345,97 @@ class TestNewRunSubmission:
         warnings = [message for message, severity in notifications if severity == "warning"]
         assert any("could not register itself for discovery" in m for m in warnings), notifications
 
+    async def test_launch_that_already_completed_reports_no_url(
+        self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Blocking finding 2 (issue #460 review): ``BackgroundLaunch``'s own
+        docstring on ``still_running`` says callers must not report a URL
+        for a process that has already exited (issue #410) -- check this
+        field *before* ``workflow_started``. A ``Mock(...)`` would leave
+        ``still_running`` an auto-created truthy attribute, so a real
+        ``BackgroundLaunch`` is required to reach this branch at all."""
+        launch = BackgroundLaunch(
+            url="http://127.0.0.1:8080",
+            stderr_log=fleet_env / "completed01.bg.stderr.log",
+            stdout_log=fleet_env / "completed01.bg.stdout.log",
+            run_id="completed01",
+            still_running=False,
+        )
+        monkeypatch.setattr(
+            "conductor.fleet.tui.screens.new_run.launch_workflow",
+            Mock(return_value=launch),
+        )
+
+        notifications: list[tuple[str, str]] = []
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            original_notify = app.notify
+
+            def _capture(message, **kwargs):
+                notifications.append((message, str(kwargs.get("severity", "information"))))
+                original_notify(message, **kwargs)
+
+            with patch.object(app, "notify", _capture):
+                await _goto_new_run(pilot)
+                await _resolve(pilot, fixture_workflow)
+
+                question_input = app.screen._input_widgets["question"]
+                question_input.value = "What is Python?"
+
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.3)
+
+                assert isinstance(app.screen, RunsScreen)
+
+        messages = [message for message, _severity in notifications]
+        assert not any(launch.url in m for m in messages), notifications
+        assert any("completed" in m.lower() for m in messages), notifications
+
+    async def test_launch_not_yet_started_shows_initializing_warning(
+        self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the CLI's three-way branch this screen was
+        missing entirely: ``workflow_started=False`` (with the process
+        still alive) must warn that the workflow may still be
+        initializing, distinct from the ``run_record_written`` warning."""
+        launch = BackgroundLaunch(
+            url="http://127.0.0.1:8080",
+            stderr_log=fleet_env / "slowstart1.bg.stderr.log",
+            stdout_log=fleet_env / "slowstart1.bg.stdout.log",
+            run_id="slowstart1",
+            workflow_started=False,
+        )
+        monkeypatch.setattr(
+            "conductor.fleet.tui.screens.new_run.launch_workflow",
+            Mock(return_value=launch),
+        )
+
+        notifications: list[tuple[str, str]] = []
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            original_notify = app.notify
+
+            def _capture(message, **kwargs):
+                notifications.append((message, str(kwargs.get("severity", "information"))))
+                original_notify(message, **kwargs)
+
+            with patch.object(app, "notify", _capture):
+                await _goto_new_run(pilot)
+                await _resolve(pilot, fixture_workflow)
+
+                question_input = app.screen._input_widgets["question"]
+                question_input.value = "What is Python?"
+
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.3)
+
+                assert isinstance(app.screen, RunsScreen)
+
+        warnings = [message for message, severity in notifications if severity == "warning"]
+        assert any("initializ" in m.lower() for m in warnings), notifications
+
     async def test_missing_required_field_shows_error_without_launching(
         self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

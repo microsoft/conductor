@@ -62,6 +62,7 @@ from conductor.console import styled
 from conductor.fleet.history import HistoryEntry, build_history_entries
 from conductor.fleet.launch import LaunchError, launch_resume
 from conductor.fleet.resume import ResumableCheckpoint, correlate_checkpoints
+from conductor.fleet.tui.actions import report_background_launch
 from conductor.fleet.tui.theme import loading_text, status_label
 
 if TYPE_CHECKING:
@@ -322,8 +323,8 @@ class HistoryScreen(Screen):
         checkpoint = self._resumable.get(entry.path)
         if checkpoint is not None:
             message += (
-                f"  ·  Press r to resume from the checkpoint saved "
-                f"{checkpoint.created_at} at {checkpoint.current_agent}."
+                f"  ·  Press r to resume {checkpoint.workflow_path.name} from the "
+                f"checkpoint saved {checkpoint.created_at} at {checkpoint.current_agent}."
             )
         self.notify(message, markup=False)
 
@@ -407,7 +408,8 @@ class HistoryScreen(Screen):
 
         self._resuming = True
         self.notify(
-            f"Resuming from checkpoint saved {target.created_at} at {target.current_agent}…",
+            f"Resuming {target.workflow_path.name} from checkpoint saved "
+            f"{target.created_at} at {target.current_agent}…",
             markup=False,
         )
 
@@ -425,15 +427,7 @@ class HistoryScreen(Screen):
         # rather than popping one level, mirroring `NewRunScreen`'s own
         # `return_to_runs()` call.
         cast("FleetApp", self.app).return_to_runs()
-        self.app.notify(f"Resumed: {launch.url}", markup=False)
-        if not launch.run_record_written:
-            # The run is executing normally, but its discovery bookkeeping
-            # failed (issue #435) -- it will not appear on the Runs screen
-            # this notification just switched to, so say so rather than
-            # leaving the user wondering why a "successful" resume vanished.
-            self.app.notify(
-                "This run could not register itself for discovery and will not "
-                "appear in the list. Check its stderr log for the cause.",
-                severity="warning",
-                markup=False,
-            )
+        # `still_running`/`workflow_started`/`run_record_written` are all
+        # checked, in that order, by the shared helper (issue #410/#435) --
+        # never report a URL for a process that has already exited.
+        report_background_launch(self.app, launch, verb="Resumed")

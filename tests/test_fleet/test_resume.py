@@ -33,6 +33,7 @@ import pytest
 
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.fleet.history import HistoryEntry
+from conductor.fleet.records import RunRecord
 from conductor.fleet.resume import ResumableCheckpoint, correlate_checkpoints
 
 # ---------------------------------------------------------------------------
@@ -167,11 +168,55 @@ class TestEventLogPathJoin:
         entry's -- both sides normalize with ``os.path.realpath`` so a
         ``./``-relative or symlinked path still joins."""
         entry = _entry(tmp_path, run_id="aaaa0002")
-        # Record a path with a redundant "./" segment inserted -- realpath
-        # collapses it, plain string equality would not.
-        recorded = str(entry.path.parent / "." / entry.path.name)
+        # Build the redundant "./" segment as a raw string -- `Path`
+        # collapses "." at construction time (`Path("/x") / "." / "y" ==
+        # Path("/x/y")`), which would make `recorded` byte-identical to
+        # `str(entry.path)` and the realpath normalization untested.
+        recorded = f"{entry.path.parent}{os.sep}.{os.sep}{entry.path.name}"
+        assert recorded != str(entry.path)
         _write_checkpoint(
             checkpoints_dir, workflow_file, run_id="aaaa0002", event_log_path=recorded
+        )
+
+        result = correlate_checkpoints([entry])
+
+        assert entry.path in result
+        assert result[entry.path].matched_by == "event_log_path"
+
+    def test_event_log_path_join_normalizes_via_symlinked_parent(
+        self, checkpoints_dir: Path, workflow_file: Path, tmp_path: Path
+    ) -> None:
+        """The module docstring sells a symlinked ``$TMPDIR`` as the actual
+        motivation for ``os.path.realpath`` normalization -- exercise that
+        directly rather than only the ``./`` collapsing case above."""
+        real_dir = tmp_path / "real_logs"
+        real_dir.mkdir()
+        link_dir = tmp_path / "linked_logs"
+        link_dir.symlink_to(real_dir)
+
+        log_path = real_dir / "conductor-wf-20260101-120000-aaaa0009.events.jsonl"
+        log_path.write_text("")
+        # The entry references the log through the symlinked directory,
+        # while the checkpoint records it through the *real* one -- only
+        # realpath normalization joins the two.
+        entry = HistoryEntry(
+            path=link_dir / log_path.name,
+            workflow_name="wf",
+            run_id="aaaa0009",
+            outcome="unknown",
+            started_at=None,
+            ended_at=None,
+            duration_seconds=None,
+            total_tokens=0,
+            total_cost_usd=None,
+            unpriced_agent_count=0,
+        )
+
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="aaaa0009",
+            event_log_path=str(log_path),
         )
 
         result = correlate_checkpoints([entry])
@@ -211,6 +256,55 @@ class TestRunIdFallback:
 
         assert entry.path in result
         assert result[entry.path].matched_by == "run_id"
+
+    def test_run_id_fallback_used_when_recorded_path_no_longer_exists(
+        self, checkpoints_dir: Path, workflow_file: Path, tmp_path: Path
+    ) -> None:
+        """The second justified fallback case: ``event_log_path`` was
+        recorded but the file it names has since been deleted (e.g. by
+        retention)."""
+        entry = _entry(tmp_path, run_id="cccc0002")
+        gone_log_path = tmp_path / "conductor-gone-20260101-120000-cccc0002.events.jsonl"
+        # Deliberately never written to disk -- this is the "recorded path
+        # no longer exists" case, not the "never recorded" (empty) one.
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="cccc0002",
+            event_log_path=str(gone_log_path),
+        )
+
+        result = correlate_checkpoints([entry])
+
+        assert entry.path in result
+        assert result[entry.path].matched_by == "run_id"
+
+    def test_run_id_fallback_refused_when_recorded_path_still_exists_elsewhere(
+        self, checkpoints_dir: Path, workflow_file: Path, tmp_path: Path
+    ) -> None:
+        """Issue #460 review, blocking finding 3: the fallback must not fire
+        just because the primary lookup found no *current* entry for
+        ``event_log_path`` -- only when that path was never recorded or has
+        genuinely vanished. Here the checkpoint's recorded path is still a
+        real file (simulating one outside this scan, e.g. filtered out
+        elsewhere) that merely isn't among the entries being correlated;
+        falling back on ``run_id`` in that case previously let a checkpoint
+        for a completely different workflow join to an unrelated row that
+        happens to share the same (inherited) ``run_id``."""
+        entry = _entry(tmp_path, run_id="cccc0003")
+        other_real_log_path = tmp_path / "conductor-other-20260101-120000-cccc0003.events.jsonl"
+        other_real_log_path.write_text("")
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="cccc0003",
+            event_log_path=str(other_real_log_path),
+        )
+
+        result = correlate_checkpoints([entry])
+
+        assert entry.path not in result
+        assert result == {}
 
     def test_run_id_fallback_refused_when_ambiguous(
         self, checkpoints_dir: Path, workflow_file: Path, tmp_path: Path
@@ -284,16 +378,39 @@ class TestValidityFilter:
         assert correlate_checkpoints([entry]) == {}
 
     def test_excludes_a_deleted_checkpoint_file(
-        self, checkpoints_dir: Path, workflow_file: Path, tmp_path: Path
+        self,
+        checkpoints_dir: Path,
+        workflow_file: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """The checkpoint file must vanish *between* ``list_checkpoints``'s
+        own scan and this module's re-check -- unlinking it before calling
+        ``correlate_checkpoints`` (as this test previously did) means
+        ``list_checkpoints``'s own glob never yields it at all, so
+        ``resume.py``'s own existence re-check is never exercised. Patch
+        ``list_checkpoints`` to return a hand-built ``CheckpointData``
+        pointing at a path that was never written, simulating the race
+        instead."""
+        from conductor.engine.checkpoint import CheckpointData
+
         entry = _entry(tmp_path, run_id="00020001")
-        cp_path = _write_checkpoint(
-            checkpoints_dir,
-            workflow_file,
+        missing_checkpoint_path = checkpoints_dir / "gone-00020001.json"
+        cp = CheckpointData(
+            version=CheckpointManager.CHECKPOINT_VERSION,
+            workflow_path=str(workflow_file),
+            workflow_hash="sha256:deadbeef",
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+            failure={"error_type": None, "message": None, "agent": "step-1", "iteration": 0},
+            inputs={},
+            current_agent="step-1",
+            context={},
+            limits={},
+            file_path=missing_checkpoint_path,
             run_id="00020001",
             event_log_path=str(entry.path),
         )
-        cp_path.unlink()
+        monkeypatch.setattr(CheckpointManager, "list_checkpoints", staticmethod(lambda _: [cp]))
 
         assert correlate_checkpoints([entry]) == {}
 
@@ -337,6 +454,106 @@ class TestTriggerAgnostic:
 
         assert entry.path in result
         assert result[entry.path].trigger == "periodic"
+
+
+def _run_record(*, event_log_path: str, pid: int = 12345) -> RunRecord:
+    """Build a minimal :class:`RunRecord` for liveness-exclusion tests."""
+    return RunRecord(
+        run_id="live-run",
+        pid=pid,
+        workflow_path="workflow.yaml",
+        workflow_name="workflow",
+        started_at="2026-01-01T00:00:00+00:00",
+        event_log_path=event_log_path,
+        port=8080,
+        mode="bg",
+        checkpoint_dir=None,
+    )
+
+
+class TestLiveRunExclusion:
+    """Blocking finding 1 (issue #460 review): a currently-live run must
+    never be offered Resume, regardless of what checkpoint would otherwise
+    correlate to it -- pressing ``r`` on it corrupts the live run (adopted
+    ``run_id``, overwritten run record, interleaved event log, the same
+    workflow executing twice)."""
+
+    def test_live_run_excluded_even_with_a_matching_checkpoint(
+        self,
+        checkpoints_dir: Path,
+        workflow_file: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        entry = _entry(tmp_path, run_id="live0001")
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="live0001",
+            event_log_path=str(entry.path),
+        )
+        monkeypatch.setattr(
+            "conductor.fleet.records.read_run_records",
+            lambda: [_run_record(event_log_path=str(entry.path))],
+        )
+
+        assert correlate_checkpoints([entry]) == {}
+
+    def test_a_non_live_entry_still_correlates_alongside_a_live_one(
+        self,
+        checkpoints_dir: Path,
+        workflow_file: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        live_entry = _entry(tmp_path, name="wf-live", run_id="live0002")
+        finished_entry = _entry(tmp_path, name="wf-finished", run_id="live0003")
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="live0002",
+            event_log_path=str(live_entry.path),
+        )
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="live0003",
+            event_log_path=str(finished_entry.path),
+        )
+        monkeypatch.setattr(
+            "conductor.fleet.records.read_run_records",
+            lambda: [_run_record(event_log_path=str(live_entry.path))],
+        )
+
+        result = correlate_checkpoints([live_entry, finished_entry])
+
+        assert live_entry.path not in result
+        assert finished_entry.path in result
+
+    def test_fails_closed_when_liveness_cannot_be_determined(
+        self,
+        checkpoints_dir: Path,
+        workflow_file: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``read_run_records`` itself fails, ``_live_event_log_paths``
+        returns ``None`` and this module must offer no Resume at all for the
+        scan -- never assume nothing is live."""
+        entry = _entry(tmp_path, run_id="live0004")
+        _write_checkpoint(
+            checkpoints_dir,
+            workflow_file,
+            run_id="live0004",
+            event_log_path=str(entry.path),
+        )
+
+        def _raise() -> list[RunRecord]:
+            raise OSError("cannot read run records")
+
+        monkeypatch.setattr("conductor.fleet.records.read_run_records", _raise)
+
+        assert correlate_checkpoints([entry]) == {}
 
 
 def test_resumable_checkpoint_is_frozen() -> None:

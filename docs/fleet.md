@@ -152,7 +152,11 @@ stack rather than each managing its own navigation state.
   records (a completed run's record has already been removed). A log
   with no `workflow_completed`/`workflow_failed` terminal event is listed
   too, shown as **unknown**, never as "running" — a non-terminal log is
-  not evidence of a live run. Selecting a row surfaces the exact
+  not evidence of a live run, and a **currently-live** run is always
+  excluded from Resume regardless of what checkpoint would otherwise
+  correlate to it, since resuming it would make the new process adopt
+  the live run's `run_id`, overwrite its run record, and interleave two
+  processes' events into one log. Selecting a row surfaces the exact
   `conductor replay <log>` command rather than opening a viewer inside
   the TUI — depth, again, belongs to `replay`/the dashboard, not this
   screen. A row whose event log correlates to a checkpoint on disk also
@@ -169,7 +173,11 @@ stack rather than each managing its own navigation state.
   checkpoint by design. A `completed` row can offer it too, which would
   re-execute already-finished (possibly billable) work; the notification
   shown before resuming names the checkpoint's save time and step so that
-  choice is informed rather than hidden.
+  choice is informed rather than hidden. In practice, Resume shows up
+  mostly on `failed` rows, which always carry a failure checkpoint — an
+  `unknown` row only offers it when the workflow opted into
+  [periodic checkpoints](workflow-syntax.md#periodic-checkpoints)
+  (`runtime.checkpoint`), which are off by default.
 
 ## Key bindings
 
