@@ -4463,12 +4463,23 @@ class WorkflowEngine:
                             else agent
                         )
 
+                        # Only an LLM agent has a context window to report, and
+                        # asking for one *constructs the provider* — an SDK
+                        # client build charged to `limits.timeout_seconds`,
+                        # since this runs inside the timed loop. A wait / set /
+                        # script / terminate / human_gate / workflow step has no
+                        # model, so that cost bought a guaranteed ``None``: it
+                        # made a provider-free workflow spawn a provider anyway
+                        # and, on a cold Windows runner, spent seconds of the
+                        # workflow's own timeout budget doing it.
                         started_payload: dict[str, Any] = {
                             "agent_name": agent.name,
                             "iteration": agent_execution_count,
                             "agent_type": agent.type or "agent",
-                            "context_window_max": await self._get_context_window_for_agent(
-                                resolved_agent
+                            "context_window_max": (
+                                await self._get_context_window_for_agent(resolved_agent)
+                                if is_llm_agent
+                                else None
                             ),
                         }
                         if is_llm_agent:

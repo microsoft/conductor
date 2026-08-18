@@ -333,9 +333,13 @@ jobs:
     # mocking the spawn seam, as the unit tests do, cannot. Runs on Windows
     # (where the trampoline actually happens) and Ubuntu (parity sanity
     # check). `examples/wait-smoke.yaml` needs no provider and caps itself
-    # at `timeout_seconds: 3`, so the run completes well inside the launch
+    # at `timeout_seconds: 15`, so the run completes well inside the launch
     # gate's own window and the assertion is on the *launcher*'s output,
-    # not on workflow correctness.
+    # not on workflow correctness. That cap is deliberately far above the
+    # ~1s the fixture actually waits: a child that fails its *own* workflow
+    # timeout exits non-zero, which the launch gate reports as a launch
+    # failure, so a cap tight enough for a cold Windows runner to miss
+    # would fail this job for a reason it does not test.
     runs-on: ${{ matrix.os }}
     needs: [lint]
     strategy:

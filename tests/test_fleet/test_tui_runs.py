@@ -69,6 +69,35 @@ def fleet_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+async def _assert_guard_released(pilot: Any, screen: RunsScreen, *, timeout: float = 5.0) -> None:
+    """Assert ``_refreshing`` *clears*, rather than sampling it once.
+
+    The guard-recovery tests shrink ``POLL_INTERVAL_SECONDS`` so a later
+    tick can be observed unattended, which means the flag legitimately
+    flips back to ``True`` every interval -- including during ``settle()``'s
+    trailing ``pilot.pause()``, where a tick can dispatch a fresh refresh
+    between the last worker finishing and the assertion reading the flag.
+    A single-instant ``assert screen._refreshing is False`` therefore fails
+    at random (it did, on CI and ~20% of local runs) for a reason that has
+    nothing to do with the ``finally`` it is meant to pin.
+
+    What that ``finally`` actually guarantees is that the flag *clears*.
+    Without it the flag latches ``True`` for the rest of the session and
+    every subsequent tick is dropped, so this wait times out -- the
+    regression is still caught, just not by a coin flip.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if screen._refreshing is False:
+            return
+        await pilot.pause()
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        "_refreshing never cleared -- a transient failure wedged the screen, "
+        "so no later refresh can run"
+    )
+
+
 _BLOCK_RULE = "▏"
 """The glyph Textual's ``vkey`` border paints -- the rule ``BlockFooter``
 draws between the row-scoped and fleet-scoped key blocks (and the same one
@@ -945,7 +974,7 @@ class TestRunsScreenGuardRecovery:
                 screen.refresh_runs()
                 await settle(pilot)
 
-            assert screen._refreshing is False
+            await _assert_guard_released(pilot, screen)
 
             # And it genuinely recovers on a later tick.
             await asyncio.sleep(0.3)
@@ -974,7 +1003,7 @@ class TestRunsScreenGuardRecovery:
                 await settle(pilot)
 
             assert app.is_running
-            assert screen._refreshing is False
+            await _assert_guard_released(pilot, screen)
 
             await asyncio.sleep(0.2)
             await settle(pilot)

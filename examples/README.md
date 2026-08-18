@@ -298,7 +298,7 @@ conductor run examples/wait-smoke.yaml
 conductor run examples/wait-smoke.yaml --web
 
 # Trigger the workflow timeout cancelling an in-flight wait:
-conductor run examples/wait-smoke.yaml --input middle_duration_ms=10000
+conductor run examples/wait-smoke.yaml --input middle_duration_ms=30000
 ```
 
 ## Planning and Implementation
