@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The Fleet Manager TUI's History screen can now resume a run** by
+  pressing `r` on a row that correlates to an on-disk checkpoint, launching
+  `conductor resume --web-bg` in the background the same way the New Run
+  screen launches a fresh workflow. Gating is checkpoint-driven, never
+  derived from the row's outcome — an `unknown` row (no terminal event)
+  offers Resume exactly like a `failed` one when a checkpoint exists for it,
+  though this only applies when the workflow opted into periodic
+  checkpoints (`runtime.checkpoint`) or failed and left a failure
+  checkpoint behind. A currently-live run is always excluded, regardless of
+  outcome or checkpoint — resuming a run that is still executing would make
+  the new process adopt the original `run_id`, overwrite its run record,
+  and interleave two processes' events into one log. See
+  [`docs/fleet.md`](docs/fleet.md).
 - **Session continuity for the `claude-agent-sdk` provider via a per-agent
   `session_key`** — executions tagged with the same key now continue one
   Claude session instead of each starting cold, so an investigate → check →

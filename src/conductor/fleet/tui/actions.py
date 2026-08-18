@@ -71,7 +71,67 @@ from conductor.fleet.summary import GateInfo
 if TYPE_CHECKING:
     from textual.app import App, ComposeResult
 
+    from conductor.cli.bg_runner import BackgroundLaunch
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Background-launch reporting (E12/issue #460)
+# ---------------------------------------------------------------------------
+
+
+def report_background_launch(app: App, launch: BackgroundLaunch, *, verb: str) -> None:
+    """Notify about a completed :func:`~conductor.fleet.launch.launch_workflow`
+    / :func:`~conductor.fleet.launch.launch_resume` call, honoring
+    ``BackgroundLaunch``'s documented check order (``cli/bg_runner.py``):
+    ``still_running`` first, then ``workflow_started``, then
+    ``run_record_written``.
+
+    Mirrors ``cli/app.py``'s ``run``/``resume --web-bg`` handling, which the
+    docstring on ``still_running`` explicitly requires of every caller
+    (issue #410): reporting a dashboard URL for a process that has already
+    exited is a false-success bug, not a cosmetic one. Shared between
+    ``new_run.py::action_launch`` and ``history.py::action_resume`` so both
+    screens get the same fix (and the same wording) at once.
+
+    Args:
+        app: The running Textual app (used to push notifications).
+        launch: The result of the launch/resume call.
+        verb: The past-tense action word for the success notification
+            (``"Launched"`` or ``"Resumed"``).
+    """
+    if not launch.still_running:
+        # The child already exited (cleanly) before the launcher finished
+        # waiting -- the dashboard is gone, so reporting its URL / "running
+        # in background" would describe a process that no longer exists
+        # (issue #410).
+        app.notify(
+            f"Workflow completed before the launcher finished waiting. "
+            f"Check its stderr log: {launch.stderr_log}",
+            markup=False,
+        )
+        return
+
+    app.notify(f"{verb}: {launch.url}", markup=False)
+    if not launch.workflow_started:
+        app.notify(
+            "The workflow has not reported starting yet; it may still be "
+            "initializing. Check the dashboard or the stderr log.",
+            severity="warning",
+            markup=False,
+        )
+    if not launch.run_record_written:
+        # The run is executing normally, but its discovery bookkeeping
+        # failed (issue #435) -- it will not appear on the Runs screen the
+        # caller just switched to, so say so rather than leaving the user
+        # wondering why a "successful" launch vanished.
+        app.notify(
+            "This run could not register itself for discovery and will not "
+            "appear in the list. Check its stderr log for the cause.",
+            severity="warning",
+            markup=False,
+        )
 
 
 # ---------------------------------------------------------------------------

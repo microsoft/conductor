@@ -8,13 +8,27 @@ removes*, there is deliberately no long-horizon audit history and no
 pagination: the list is exactly as bounded as
 ``build_history_entries``'s own retention-driven cap, nothing more.
 
-**Depth is delegated, not re-implemented** (E14-T3, the design's *Division
-of labor*: TUI = breadth, dashboard/replay = depth). Selecting a row does
-not open any viewer inside this screen -- it surfaces the exact
+**Depth is delegated for viewing, not for resuming** (E14-T3, the design's
+*Division of labor*: TUI = breadth, dashboard/replay = depth). Selecting a
+row does not open any viewer inside this screen -- it surfaces the exact
 ``conductor replay <log>`` command for that run's event log via a Textual
 notification, so the operator runs it themselves in a terminal. This
 avoids taking on a second, TUI-owned subprocess/dashboard lifecycle for a
 screen whose whole job is a retrospective list, not live supervision.
+
+**Resume is the one exception** (issue #460): pressing ``r`` on a row that
+correlates to an on-disk checkpoint (:mod:`conductor.fleet.resume`) launches
+a resume of that run through the exact same ``launch_background_resume``
+path ``conductor resume --web-bg`` uses (:func:`conductor.fleet.launch.
+launch_resume`), then unwinds to Runs -- mirroring how
+:class:`~conductor.fleet.tui.screens.new_run.NewRunScreen` launches a fresh
+run. This is not a re-implementation of "depth": replay is a *viewer* and
+stays delegated to a separate terminal invocation, while resume is an
+*action* this screen already has the precedent for, the same way Runs kills
+processes and resolves gates rather than delegating those to a shell
+command. ``r`` is bound via :meth:`check_action`, which is checkpoint-driven
+and never consults ``outcome`` -- see :mod:`conductor.fleet.resume`'s module
+docstring for why an already-``completed`` row can offer Resume too.
 
 Loaded once on mount, like the Providers/Registries screens (E10/E11) --
 unlike the Runs/run-detail screens' live ~2s poll, a completed run's
@@ -25,13 +39,18 @@ The read is bounded by ``min(keep_last, _MAX_HISTORY_ENTRIES)`` -- the
 200-entry display cap is independent of retention, so raising
 ``keep_last`` cannot grow this screen -- and happens off the event loop,
 in a worker thread (issue #437); how much of each log is read once
-retrieved is issue #436's concern, not this one.
+retrieved is issue #436's concern, not this one. The checkpoint
+correlation (:func:`conductor.fleet.resume.correlate_checkpoints`) runs the
+same way, as a second thread hop in the same load, so ``r`` becomes
+available a beat after the table itself paints rather than blocking it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from rich.text import Text
 from textual import work
@@ -42,8 +61,16 @@ from textual.widgets import DataTable, Footer, Header, Static
 
 from conductor.console import styled
 from conductor.fleet.history import HistoryEntry, build_history_entries
+from conductor.fleet.launch import LaunchError, launch_resume
+from conductor.fleet.resume import ResumableCheckpoint, correlate_checkpoints
+from conductor.fleet.tui.actions import report_background_launch
 from conductor.fleet.tui.theme import loading_text, status_label
 from conductor.fleet.tui.widgets import highlighted_row_key
+
+if TYPE_CHECKING:
+    # The app module imports this screen module, so a top-level import of
+    # FleetApp here would cycle (same reason new_run.py defers it).
+    from conductor.fleet.tui.app import FleetApp
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +146,7 @@ class HistoryScreen(Screen):
         # in the footer; same reasoning as `runs.py`'s `BINDINGS` comment,
         # issue #459.
         Binding("enter", "show_replay_command", "Replay cmd", priority=True),
+        ("r", "resume", "Resume"),
         ("escape", "back", "Back"),
     ]
 
@@ -130,6 +158,19 @@ class HistoryScreen(Screen):
         the table itself only renders formatted cell text, so the
         row-selection handler (the replay-command action) needs this to
         recover the entry's log path."""
+        self._resumable: dict[Path, ResumableCheckpoint] = {}
+        """Maps a :class:`~conductor.fleet.history.HistoryEntry.path` to
+        the :class:`~conductor.fleet.resume.ResumableCheckpoint` that
+        correlates to it, populated by :meth:`load_history`'s checkpoint
+        scan. Empty until that scan lands, and permanently empty if it
+        fails (see :meth:`load_history`) -- either way, an absent entry
+        simply means Resume is not offered for that row, never a crash."""
+        self._resuming = False
+        """Synchronous guard against a second Resume keystroke starting a
+        duplicate (potentially billable) background run while one launch
+        is already in flight -- mirrors ``NewRunScreen._launching``. A
+        fresh :class:`HistoryScreen` is constructed on every
+        ``push_history()``, so this can never go stale across visits."""
 
     def action_back(self) -> None:
         """Pop back to the Runs screen -- bound to ``escape``."""
@@ -188,6 +229,29 @@ class HistoryScreen(Screen):
             # method defaults to ``exit_on_error``, so an exception here
             # would take the whole TUI down rather than log a warning.
             logger.warning("Failed to render run history", exc_info=True)
+            return
+
+        # A second, independent thread hop for the checkpoint correlation
+        # (issue #460) -- kept separate from the history-entries load above
+        # so a checkpoint-scan failure is caught on its own and never blanks
+        # an otherwise-successful history listing (the "failed load
+        # degraded into an empty state" mistake this screen's own docstring
+        # already calls out, applied to Resume rather than to the list
+        # itself). The table has already been rendered by the time this
+        # runs, so `r` simply isn't offered during this window -- exactly
+        # what `check_action` gating already means.
+        try:
+            self._resumable = await asyncio.to_thread(correlate_checkpoints, entries)
+        except Exception:  # noqa: BLE001 - surfaced, not crashed
+            logger.warning("Failed to correlate checkpoints for history", exc_info=True)
+            self._resumable = {}
+            self.notify(
+                "Could not read checkpoints; Resume is unavailable.",
+                severity="warning",
+                markup=False,
+            )
+            return
+        self.refresh_bindings()
 
     def _render_history(self, entries: list[HistoryEntry]) -> None:
         """Repopulate the table (or the empty state) from a completed load."""
@@ -249,10 +313,20 @@ class HistoryScreen(Screen):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Offer ``conductor replay <log>`` for the selected row (mouse click).
 
-        A key not present in :attr:`_displayed_entries` (e.g. a row
-        selected in the narrow window between a refresh and this handler
-        running) is silently ignored, mirroring ``runs.py``'s identical
-        guard for its own row-selection handler.
+        Depth is delegated for viewing: this never opens a replay
+        dashboard itself -- it surfaces the exact command via a
+        notification so the operator can run it in a terminal (per the
+        design's *Division of labor*, TUI = breadth). A key not present in
+        :attr:`_displayed_entries` (e.g. a row selected in the narrow
+        window between a refresh and this handler running) is silently
+        ignored, mirroring ``runs.py``'s identical guard for its own
+        row-selection handler.
+
+        When the row also correlates to a checkpoint, the same
+        notification names its provenance (``created_at``/``current_agent``)
+        and that ``r`` resumes it -- a single call, not a second
+        notification, since exactly one call is asserted in
+        ``test_tui_history.py``.
         """
         key = event.row_key.value
         if key is None:
@@ -283,18 +357,6 @@ class HistoryScreen(Screen):
         """
         return highlighted_row_key(self.query_one(DataTable))
 
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide ``show_replay_command`` while no row is selected (e.g. an
-        empty or still-loading table), so the footer never advertises a
-        key that does nothing."""
-        if action == "show_replay_command":
-            return self._selected_history_key() is not None
-        return True
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Refresh the footer when the cursor moves to a different row."""
-        self.refresh_bindings()
-
     def _notify_replay_for(self, key: str) -> None:
         """Notify the replay command for ``key``, if it still resolves.
 
@@ -306,4 +368,119 @@ class HistoryScreen(Screen):
         entry = self._displayed_entries.get(key)
         if entry is None:
             return
-        self.notify(f"Replay with: conductor replay {entry.path}", markup=False)
+        message = f"Replay with: conductor replay {entry.path}"
+        checkpoint = self._resumable.get(entry.path)
+        if checkpoint is not None:
+            message += (
+                f"  ·  Press r to resume {checkpoint.workflow_path.name} from the "
+                f"checkpoint saved {checkpoint.created_at} at {checkpoint.current_agent}."
+            )
+        self.notify(message, markup=False)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Refresh the footer as the cursor moves (issues #459, #460).
+
+        Without this, ``check_action``'s ``show_replay_command``/``resume``
+        gates keep reporting whichever row was selected when the footer was
+        last built -- the exact reason ``runs.py::_refresh_row_bindings``
+        exists for its own row-scoped bindings.
+        """
+        self.refresh_bindings()
+
+    def _selected_entry(self) -> HistoryEntry | None:
+        """Return the :class:`~conductor.fleet.history.HistoryEntry` behind
+        the currently highlighted row, modelled on ``runs.py::_selected_key``
+        / ``_selected_record``.
+
+        ``None`` when the table is empty, the cursor position can't be
+        resolved (e.g. a stale cursor mid-refresh), or the resolved key
+        isn't (yet) in :attr:`_displayed_entries`.
+        """
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_coordinate is None:
+            return None
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+        if key is None:
+            return None
+        return self._displayed_entries.get(key)
+
+    def _resume_target(self) -> ResumableCheckpoint | None:
+        """Return the checkpoint that would be resumed by pressing ``r`` now,
+        or ``None`` if the highlighted row has none."""
+        entry = self._selected_entry()
+        if entry is None:
+            return None
+        return self._resumable.get(entry.path)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide ``show_replay_command`` while no row is selected (e.g. an
+        empty or still-loading table), and hide ``r``/Resume when the
+        highlighted row has no checkpoint (issue #460), so the footer
+        never advertises a key that does nothing.
+
+        Mirrors ``runs.py::check_action``'s ``g``/Gate reasoning: a key that
+        can't currently do anything is hidden from the footer outright
+        rather than shown disabled. Resume gating is checkpoint-driven
+        only -- never ``outcome`` -- so this returns ``True`` for a
+        ``completed`` row with a correlated checkpoint exactly as it would
+        for an ``unknown`` or ``failed`` one (see ``conductor.fleet.resume``'s
+        module docstring for why).
+        """
+        if action == "show_replay_command":
+            return self._selected_history_key() is not None
+        if action == "resume":
+            return self._resume_target() is not None
+        return True
+
+    @work
+    async def action_resume(self) -> None:
+        """Resume the highlighted row's checkpoint in the background --
+        bound to ``r`` (issue #460).
+
+        Mirrors ``NewRunScreen.action_launch``: run as an awaited worker
+        (``launch_resume`` blocks on ``launch_background_resume()``'s own
+        dashboard-reachability and D2 run-record-poll waits, each up to
+        15s), guarded by :attr:`_resuming` against a second keystroke
+        starting a duplicate, potentially billable run while one launch is
+        already in flight. The guard is not cleared on success -- the
+        screen is gone by then (unwound to Runs).
+        """
+        if self._resuming:
+            return
+
+        target = self._resume_target()
+        if target is None:
+            # Defensive: the key is hidden via `check_action` whenever
+            # there is nothing to resume, so this should be unreachable in
+            # practice.
+            self.notify("No checkpoint found for this run.", severity="warning", markup=False)
+            return
+
+        self._resuming = True
+        self.notify(
+            f"Resuming {target.workflow_path.name} from checkpoint saved "
+            f"{target.created_at} at {target.current_agent}…",
+            markup=False,
+        )
+
+        try:
+            launch = await asyncio.to_thread(launch_resume, target.checkpoint_path)
+        except LaunchError as e:
+            logger.warning("Failed to resume checkpoint %s", target.checkpoint_path, exc_info=True)
+            self.notify(str(e), severity="error", markup=False)
+            self._resuming = False
+            return
+
+        # Success: hand off to the Runs screen, whose own poll timer will
+        # pick up the resumed run's record -- this screen never tracks the
+        # launched run itself (viewer, not supervisor). Unwinds to Runs
+        # rather than popping one level, mirroring `NewRunScreen`'s own
+        # `return_to_runs()` call.
+        cast("FleetApp", self.app).return_to_runs()
+        # `still_running`/`workflow_started`/`run_record_written` are all
+        # checked, in that order, by the shared helper (issue #410/#435) --
+        # never report a URL for a process that has already exited.
+        report_background_launch(self.app, launch, verb="Resumed")
