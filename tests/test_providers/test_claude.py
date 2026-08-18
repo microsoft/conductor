@@ -26,6 +26,8 @@ import os
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+import anthropic
+import httpx
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent
@@ -54,6 +56,13 @@ def _build_structured_agent(model_cls: type[BaseModel], data: dict[str, Any]) ->
         model=TestModel(custom_output_args=data),
         output_type=model_cls,
     )
+
+
+def _make_status_error(error_cls: type[Exception], status_code: int) -> Exception:
+    """Build a real ``anthropic.APIStatusError`` (or subclass) for a given HTTP status."""
+    request = httpx.Request("GET", "https://example.com/v1/models")
+    response = httpx.Response(status_code, request=request)
+    return error_cls(f"error {status_code}", response=response, body=None)  # type: ignore[call-arg]
 
 
 class TestClaudeProviderInitialization:
@@ -233,7 +242,7 @@ class TestModelVerification:
         provider = ClaudeProvider()
         await provider.validate_connection()
 
-        assert mock_client.models.list.call_count == 2
+        assert mock_client.models.list.call_count == 1
 
         info_calls = [call[0][0] for call in mock_logger.info.call_args_list]
         assert any("Available Claude models" in call for call in info_calls)
@@ -294,7 +303,8 @@ class TestConnectionValidation:
     async def test_validate_connection_failure(
         self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
     ) -> None:
-        """Test connection validation failure."""
+        """A bare non-HTTP exception (no status_code, not a connection error) still fails
+        startup — there is no positive evidence the endpoint merely lacks /v1/models."""
         mock_anthropic_module.__version__ = "0.77.0"
         mock_client = Mock()
         mock_client.models.list = AsyncMock(side_effect=Exception("API key invalid"))
@@ -304,6 +314,193 @@ class TestConnectionValidation:
         result = await provider.validate_connection()
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_no_client_returns_false(self) -> None:
+        """No client at all (e.g. SDK unavailable at construction) fails immediately."""
+        with (
+            patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude.AsyncAnthropic"),
+            patch("conductor.providers.claude.anthropic") as mock_anthropic_module,
+        ):
+            mock_anthropic_module.__version__ = "0.77.0"
+            provider = ClaudeProvider()
+        provider._client = None
+
+        assert await provider.validate_connection() is False
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @patch("conductor.providers.claude.logger")
+    @pytest.mark.asyncio
+    async def test_validate_connection_404_is_inconclusive_not_fatal(
+        self, mock_logger: Mock, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """404 from models.list() (Azure AI Foundry, issue #455) doesn't fail startup."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            side_effect=_make_status_error(anthropic.NotFoundError, 404)
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        result = await provider.validate_connection()
+
+        assert result is True
+        assert mock_logger.warning.called
+        warning_calls = [call[0][0] for call in mock_logger.warning.call_args_list]
+        assert any("404" in call and "/v1/models" in call for call in warning_calls)
+
+    @pytest.mark.parametrize(
+        ("error_cls", "status_code"),
+        [
+            (anthropic.BadRequestError, 400),
+            (anthropic.RateLimitError, 429),
+            (anthropic.APIStatusError, 500),
+            (anthropic.APIStatusError, 501),
+            (anthropic.APIStatusError, 405),
+        ],
+    )
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_other_http_status_is_inconclusive(
+        self,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        error_cls: type[Exception],
+        status_code: int,
+    ) -> None:
+        """Any HTTP status other than 401/403 from models.list() is inconclusive, not fatal."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_make_status_error(error_cls, status_code))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is True
+
+    @pytest.mark.parametrize(
+        ("error_cls", "status_code"),
+        [
+            (anthropic.AuthenticationError, 401),
+            (anthropic.PermissionDeniedError, 403),
+        ],
+    )
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_rejected_credentials_fails(
+        self,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+        error_cls: type[Exception],
+        status_code: int,
+    ) -> None:
+        """Rejected credentials (401/403) from models.list() still fail startup."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_make_status_error(error_cls, status_code))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is False
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_unreachable_host_fails(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """An unreachable host (APIConnectionError, no status code) still fails startup."""
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            side_effect=anthropic.APIConnectionError(
+                request=httpx.Request("GET", "https://example.invalid/v1/models")
+            )
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is False
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_duck_typed_gateway_status_is_inconclusive(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A gateway wrapper exposing only `.response.status_code` is still classified
+        (e.g. an httpx.HTTPStatusError raised by a proxy layer in front of the SDK)."""
+        mock_anthropic_module.__version__ = "0.77.0"
+
+        class _GatewayError(Exception):
+            def __init__(self) -> None:
+                super().__init__("upstream returned 404")
+                self.response = Mock(status_code=404)
+
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_GatewayError())
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is True
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_duck_typed_string_status_fails_closed(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A stringified status_code (e.g. "401" from a proxy wrapper) must not fail open.
+
+        `"401" in (401, 403)` is `False`, so without narrowing to `int` this would
+        be misclassified as inconclusive and return `True` for a rejected credential.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+
+        class _StringStatusError(Exception):
+            def __init__(self) -> None:
+                super().__init__("unauthorized")
+                self.response = Mock(status_code="401")
+
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_StringStatusError())
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is False
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @pytest.mark.asyncio
+    async def test_validate_connection_duck_typed_status_code_attribute_401_fails_closed(
+        self, mock_anthropic_module: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        """A duck-typed integer status_code set directly on the exception (no
+        `.response`) must still be checked against the 401/403 rule."""
+        mock_anthropic_module.__version__ = "0.77.0"
+
+        class _DirectStatusError(Exception):
+            def __init__(self) -> None:
+                super().__init__("unauthorized")
+                self.status_code = 401
+
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=_DirectStatusError())
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        assert await provider.validate_connection() is False
 
 
 class TestCloseMethod:

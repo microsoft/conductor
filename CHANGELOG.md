@@ -41,6 +41,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opposite of what the two defaults are for. The 64KB `warn_bytes` default is
   unchanged, so that combination still warns. Workflows that set `max_bytes`
   explicitly are unaffected.
+- **`examples/wait-smoke.yaml` now caps itself at `timeout_seconds: 15`,
+  up from `3`.** It doubles as CI's `--web-bg` launcher smoke fixture, and a
+  cold Windows runner spends seconds of that budget on process and step
+  overhead — so a cap sized for the ~1s the workflow actually waits reported
+  a slow runner as a launcher failure. The timeout path it demonstrates is
+  unchanged; drive it with a larger `--input middle_duration_ms`.
+
+### Fixed
+
+- **`claude` provider: `validate_connection()` no longer fails startup when an
+  Anthropic-compatible endpoint doesn't implement `models.list()`** (issue
+  #455). Azure AI Foundry's Anthropic endpoint, and some LiteLLM/Databricks AI
+  Gateway configurations, answer `/v1/models` with a 404 while `/v1/messages`
+  (what agents actually call) works fine — previously this made every workflow
+  using such an endpoint fail before running a single agent. The startup probe
+  now only fails on positive evidence of a broken setup: an unreachable host,
+  rejected credentials (401/403), or a non-HTTP error. Any other HTTP status
+  logs a warning naming the status code and continues, deferring credential
+  verification to the first agent execution — the same posture the `hermes`
+  provider already documents. See
+  [`docs/providers/claude.md`](docs/providers/claude.md#startup-connection-validation).
+- **A step with no model no longer constructs a provider just to report a
+  context window.** Every step type emitted `agent_started` with a
+  `context_window_max` resolved through the provider, and the registry builds
+  providers lazily — so a `wait`, `set`, `script`, `terminate`, or
+  `human_gate` step built an SDK client whose only possible answer was
+  `None`. That construction runs inside the engine's timed loop, so it was
+  charged to `limits.timeout_seconds`: a provider-free wait workflow paid
+  ~0.4s of it locally and enough on a cold Windows CI runner to time the
+  workflow out and fail the `--web-bg` launcher smoke job. Provider-backed
+  agents are unaffected — they still report the window on both
+  `agent_started` and `agent_completed`.
 
 ### Fixed
 

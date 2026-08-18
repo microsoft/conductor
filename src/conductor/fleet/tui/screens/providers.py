@@ -125,6 +125,8 @@ def _models_summary_cell(diag: ProviderDiagnostic, *, loading: bool) -> Text:
         return Text.from_markup("[dim]enter to check[/dim]")
     if diag.connection_ok is False:
         return Text.from_markup("[red]✗[/red] connection failed")
+    if diag.connection_ok and diag.connection_note:
+        return styled("[yellow]⚠[/yellow] {}", diag.connection_note)
     if diag.models is None:
         return Text.from_markup("[dim]n/a[/dim]")
     count = len(diag.models)
@@ -305,6 +307,16 @@ class ProvidersScreen(Screen):
                 "",
                 "",
                 key=f"{name}{_SUB_ROW_DELIMITER}connection-failed",
+            )
+            return
+        if diag.connection_ok and diag.connection_note:
+            table.add_row(
+                styled("    [yellow]⚠[/yellow] {}", diag.connection_note),
+                "",
+                "",
+                "",
+                "",
+                key=f"{name}{_SUB_ROW_DELIMITER}connection-note",
             )
             return
         if diag.models is None:

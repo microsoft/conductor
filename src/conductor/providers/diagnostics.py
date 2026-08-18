@@ -194,6 +194,7 @@ class ProviderDiagnostic:
     checked: bool = False
     connection_ok: bool | None = None
     connection_error: str | None = None
+    connection_note: str | None = None
     models: list[ModelDiagnostic] | None = None
     models_error: str | None = None
     note: str | None = None
@@ -210,6 +211,7 @@ class ProviderDiagnostic:
             "checked": self.checked,
             "connection_ok": self.connection_ok,
             "connection_error": self.connection_error,
+            "connection_note": self.connection_note,
             "models": [m.to_dict() for m in self.models] if self.models is not None else None,
             "models_error": self.models_error,
             "note": self.note,
@@ -605,11 +607,24 @@ async def gather_provider(
     try:
         try:
             diag.connection_ok = bool(await provider.validate_connection())
+            # Some providers (e.g. claude, issue #455) return True for a
+            # merely inconclusive probe (an endpoint that doesn't implement
+            # model listing). connection_note carries that caveat so a
+            # renderer doesn't claim "connected" when nothing was verified.
+            # Restricted to str: an AsyncMock/Mock-based test double without
+            # this attribute set auto-creates a truthy Mock via getattr(),
+            # which is not a real note.
+            note = getattr(provider, "_connection_probe_note", None)
+            diag.connection_note = note if isinstance(note, str) else None
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             diag.connection_ok = False
             diag.connection_error = _format_error(e)
 
-        if list_models and diag.connection_ok:
+        # Gate on a verified (not merely truthy) connection: an inconclusive
+        # probe means models.list() already failed once, so calling
+        # list_models() here would just be a second guaranteed-failing
+        # round-trip.
+        if list_models and diag.connection_ok and diag.connection_note is None:
             try:
                 model_ids = await provider.list_models()
                 diag.models = (

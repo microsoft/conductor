@@ -26,6 +26,7 @@ from conductor.config.schema import (
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.providers.copilot import CopilotProvider
+from conductor.providers.registry import ProviderRegistry
 
 
 class EventCollector:
@@ -763,3 +764,57 @@ class TestContextWindowResolutionOrder:
 
         # output.model returned None; chain fell back to agent.model.
         assert collector.first("agent_completed").data["context_window_max"] == 200_000
+
+
+class TestNonLlmStepsSkipTheProviderLookup:
+    """A step with no model must not resolve a provider to report a window.
+
+    ``_get_context_window_for_agent`` resolves the provider, and the
+    registry builds it lazily on first use -- so asking on behalf of a
+    ``wait`` / ``set`` / ``script`` / ``terminate`` step constructed an SDK
+    client whose only possible answer was ``None``. That construction runs
+    inside the engine's timed loop, so it is charged to
+    ``limits.timeout_seconds``: on a cold Windows CI runner it consumed
+    enough of a provider-free wait workflow's budget to time the workflow
+    out and fail the ``--web-bg`` launcher smoke job.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_wait_step_never_resolves_a_provider(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point="pause",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=5),
+            ),
+            agents=[
+                AgentDef(
+                    name="pause",
+                    type="wait",
+                    duration="1ms",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"waited": "{{ pause.output.waited_seconds }}"},
+        )
+
+        registry = ProviderRegistry(config)
+        resolved: list[str] = []
+
+        async def spy_get_provider(agent: AgentDef) -> None:
+            # Records rather than builds: constructing the real provider is
+            # the cost under test, and ``None`` is the documented "metadata
+            # unavailable" answer callers already handle.
+            resolved.append(agent.name)
+            return None
+
+        registry.get_provider = spy_get_provider  # type: ignore[method-assign]
+
+        engine = WorkflowEngine(config, registry=registry, event_emitter=emitter)
+        await engine.run({})
+
+        assert resolved == []
+        assert collector.first("agent_started").data["context_window_max"] is None

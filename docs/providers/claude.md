@@ -156,6 +156,26 @@ workflow:
 - **Credential precedence**: `api_key` and `auth_token` are resolved together, not independently. Setting **either** in YAML makes the Anthropic SDK skip environment-variable credential resolution entirely, so a YAML `auth_token` also suppresses `ANTHROPIC_API_KEY`, and vice versa. If you set one credential in YAML and expect the other from the environment, it resolves to `None` with no warning.
 - **Authentication header selection**: Use `api_key` for standard Anthropic keys (`x-api-key` header). Use `auth_token` for gateways expecting bearer authentication (`Authorization: Bearer` header). **Set exactly one.** If both are configured, the Anthropic SDK does not choose between them: it sends `X-Api-Key` and `Authorization: Bearer` on every request, so your Anthropic key reaches whatever `base_url` points at. Conductor forwards both without arbitrating and logs a warning.
 
+### Startup Connection Validation
+
+`conductor run` probes the endpoint with `client.models.list()` when it lazily constructs the
+Claude provider — before the first agent on that provider runs. `conductor doctor --check` /
+`--models` run the same probe. `conductor validate` does **not** — it is a static YAML/schema
+check that never constructs a provider or contacts the endpoint. Not every Anthropic-compatible
+endpoint implements model listing — Azure AI
+Foundry's Anthropic endpoint (`https://<resource>.services.ai.azure.com/anthropic`) and some
+LiteLLM/Databricks AI Gateway configurations answer it with a 404 while `/v1/messages` (the
+endpoint agents actually use) works fine. To avoid failing startup on those endpoints, the probe
+only fails when there is positive evidence of a broken setup:
+
+- An unreachable host (connection error) — fails startup.
+- Rejected credentials (HTTP 401/403) — fails startup.
+- A non-HTTP error (no status code and not a connection error) — fails startup.
+- Any other HTTP status (e.g. 404, 400, 405, 429, 5xx) — logs a warning naming the status code
+  and **continues**. On these endpoints your credentials are first verified when the first agent
+  actually calls `/v1/messages`, and model-discovery-derived features (context-window reporting,
+  `conductor doctor --models`) are unavailable since the model list could never be fetched.
+
 ### Security Warning
 
 Secrets must always use environment variable interpolation (such as `${ANTHROPIC_API_KEY}` or `${GATEWAY_TOKEN}`), never literal string values. Conductor embeds raw workflow source code inside the `yaml_source` attribute of `workflow_started` events. Hardcoding a literal secret key in YAML exposes it in JSONL event logs and the web dashboard.
@@ -577,6 +597,22 @@ pip install --upgrade 'anthropic>=0.77.0,<1.0.0'
 uv add 'anthropic>=0.77.0,<1.0.0'
 ```
 
+#### 8. `models.list()` Not Supported (Azure AI Foundry, some gateways)
+
+**Warning**: `Could not verify connection via models.list() (HTTP 404): ...`
+
+**Cause**: The endpoint (e.g. Azure AI Foundry's Anthropic endpoint, or a LiteLLM/Databricks-style
+gateway) does not implement `/v1/models`, even though `/v1/messages` works fine. This is not
+treated as a startup failure — see [Startup Connection
+Validation](#startup-connection-validation) above.
+
+**Solutions**:
+- No action needed if agents run successfully afterward; the warning is informational.
+- If agent execution then fails with an authentication error, your credentials really are wrong —
+  check `api_key`/`auth_token` as in [Authentication Errors](#1-authentication-errors) above.
+- Context-window reporting and `conductor doctor --models` will be unavailable on this endpoint,
+  since they depend on the same model-listing call.
+
 ### Debugging Tips
 
 #### Enable Debug Logging
@@ -595,13 +631,17 @@ This will log:
 #### Test Provider Connection
 
 ```bash
-conductor validate workflow.yaml --provider claude
+conductor doctor --check -p claude
 ```
 
 This validates:
-- API key is set and valid
+- API key is set and (on endpoints that implement `/v1/models`) verified against the API — on
+  endpoints that don't (e.g. Azure AI Foundry), credentials are instead verified at first agent
+  execution; see [Startup Connection Validation](#startup-connection-validation) above
 - Provider can connect to Claude API
-- Workflow YAML is syntactically correct
+
+Separately, `conductor validate workflow.yaml` checks that the workflow YAML is syntactically
+correct — it never contacts the Claude endpoint.
 
 #### Check SDK Installation
 

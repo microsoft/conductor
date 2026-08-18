@@ -27,7 +27,7 @@
 #
 #   # Watch the workflow timeout cancel an in-flight wait:
 #   conductor run examples/wait-smoke.yaml --input middle_duration_ms=30000
-#   # → workflow.limits.timeout_seconds (3) fires before middle finishes.
+#   # → workflow.limits.timeout_seconds (15) fires before middle finishes.
 
 workflow:
   name: wait-smoke
@@ -52,7 +52,13 @@ workflow:
     # If the templated middle_duration_ms is set very high, the workflow
     # timeout will fire and cancel the in-flight wait — useful for
     # exercising the timeout path.
-    timeout_seconds: 3
+    #
+    # Deliberately generous relative to the ~1s of default waiting: this
+    # file is also CI's `--web-bg` launcher smoke fixture, and a cold
+    # Windows runner spends multiple seconds on process and step overhead
+    # inside this budget. A cap tight enough to fail there would report a
+    # slow runner as a launcher bug.
+    timeout_seconds: 15
 
 agents:
   # Suffixed string duration — the most common form.
