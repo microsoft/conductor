@@ -32,102 +32,118 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **[Fleet Manager](#fleet-manager-tui)** - An interactive TUI over every running `conductor` process (foreground, `--web`, or `--web-bg`): live status, tokens and cost, gate alerts you can answer, step-level drill-down, and launching new runs — plus non-interactive `conductor stop` / `conductor fleet list`
 - **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
 
-## Installation
 
-### Quick Install (Recommended)
+## Prerequisites
 
-**macOS / Linux:**
-```bash
-curl -sSfL https://aka.ms/conductor/install.sh | sh
-```
+Python 3.12+ is the only hard requirement. Everything below runs out of the
+clone — nothing is installed onto your `PATH`.
 
-**Windows (PowerShell):**
-```powershell
-irm https://aka.ms/conductor/install.ps1 | iex
-```
+There are two ways to build the environment. [uv](https://docs.astral.sh/uv/)
+is faster and resolves from the committed `uv.lock`; the `venv` + `pip` path
+needs no third-party tooling at all. Pick either.
 
-The installer checks for [uv](https://docs.astral.sh/uv/) (installs it if missing), fetches the latest release with pinned dependencies, and verifies integrity via SHA-256 checksum.
-
-### Updating
-
-`conductor update` checks for a newer release and tells you the one-line command to upgrade. Upgrades happen via the install script — the same script you used to install — because in-process self-upgrade is unreliable on Windows (the running Python interpreter sits inside the venv that needs replacing).
+**With uv** — install it once:
 
 ```bash
-conductor update
-```
-
-To upgrade, run the install script in a **new shell** (not from inside a running `conductor` process):
-
-**macOS / Linux:**
-```bash
-curl -sSfL https://aka.ms/conductor/install.sh | sh
-```
-
-**Windows (PowerShell):**
-```powershell
-irm https://aka.ms/conductor/install.ps1 | iex
-```
-
-Or skip the copy-paste with `--apply`:
-
-```bash
-conductor update --apply
-```
-
-`--apply` launches the install script automatically — on Windows it opens in a new console window so you can watch progress; on macOS/Linux it replaces the current process. Either way, the running `conductor` exits before the installer touches the venv, so file locks release cleanly.
-
-**Optional extras survive the upgrade.** `uv tool install --force` replaces the tool's entire requirement set, so an upgrade that named no extras used to silently uninstall `[tui]` or `[aca]`. Both install scripts now read the existing install's uv receipt and carry those extras forward, and `conductor update` tells you which ones it found. To add one during an upgrade, or to drop back to a bare install:
-
-```bash
-curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --extras tui
-curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --no-preserve-extras
+# macOS / Linux
+curl -sSfL https://astral.sh/uv/install.sh | sh
 ```
 
 ```powershell
-$env:CONDUCTOR_INSTALL_EXTRAS = 'tui'; irm https://aka.ms/conductor/install.ps1 | iex
+# Windows (PowerShell)
+irm https://astral.sh/uv/install.ps1 | iex
 ```
 
-The install script handles file-lock safety (process detection, stale-file cleanup, and on Windows a rename-fallback when the venv directory can't be removed), retries with backoff, and verifies the installed version after install. If your shell ever gets into a bad state from a failed update, re-running the install script is always the right next step.
-
-Conductor periodically checks GitHub for newer releases (cached for 24 hours under `~/.conductor/update-check.json`) and prints a one-line hint when one is available. To silence the hint permanently — for example when you manage upgrades through a package manager or company-mirrored install — set `CONDUCTOR_NO_UPDATE_CHECK=1` in your shell environment. The check is also skipped automatically for non-TTY invocations, `--silent` mode, the `update` subcommand, and `--help` / `--version`.
-
-### Manual Install
+uv can supply the interpreter too, so a matching system Python is optional:
 
 ```bash
-# Install from GitHub
-uv tool install git+https://github.com/microsoft/conductor.git
-
-# Run the CLI
-conductor run workflow.yaml
-
-# Or run directly without installing
-uvx --from git+https://github.com/microsoft/conductor.git conductor run workflow.yaml
-
-# Install a specific branch, tag, or commit
-uv tool install git+https://github.com/microsoft/conductor.git@branch-name
-uv tool install git+https://github.com/microsoft/conductor.git@v1.0.0
-uv tool install git+https://github.com/microsoft/conductor.git@abc1234
+uv python install 3.12
 ```
 
-### Using pipx
+**Without uv** — `venv` and `pip` both ship with Python, so there is nothing
+to install first. See [Using venv and pip](#using-venv-and-pip) below.
+
+## Running from a Clone
+
+To run Conductor straight from a checkout, use `uv run` from the repo root.
+It builds the working tree into a local `.venv` and runs your code from
+there, so nothing needs to be installed onto your system first:
 
 ```bash
-pipx install git+https://github.com/microsoft/conductor.git
-conductor run workflow.yaml
-
-# Install a specific branch or tag
-pipx install git+https://github.com/microsoft/conductor.git@branch-name
+git clone https://github.com/microsoft/conductor.git
+cd conductor
+uv run conductor run examples/simple-qa.yaml
 ```
 
-### Using pip
+Every command works this way — prefix it with `uv run`:
 
 ```bash
-pip install git+https://github.com/microsoft/conductor.git
-conductor run workflow.yaml
-
-# Install a specific tag or commit
-pip install git+https://github.com/microsoft/conductor.git@v1.0.0
+uv run conductor validate examples/simple-qa.yaml
+uv run conductor run my-workflow.yaml --input question="What is Python?"
+uv run conductor fleet list
 ```
+
+The install is editable, so edits under `src/` take effect on the next run
+with no reinstall step. The first `uv run` resolves and installs dependencies;
+later runs reuse the existing `.venv`.
+
+`make run` wraps the same thing when you prefer the Makefile:
+
+```bash
+make run WORKFLOW=examples/simple-qa.yaml ARGS='--input question="What is Python?"'
+```
+
+**Running against workflows in another directory.** `uv run` needs to know
+which project to build, so use `--project` and Conductor will still resolve
+workflow paths relative to your current directory:
+
+```bash
+uv run --project /path/to/conductor conductor run ./my-workflow.yaml
+```
+
+If you do that often, alias it:
+
+```bash
+alias conductor-dev='uv run --project /path/to/conductor conductor'
+```
+
+Then `conductor-dev run ./my-workflow.yaml` runs your clone's code from
+anywhere, while still building from the checkout on every invocation.
+
+## Using venv and pip
+
+If you would rather not install uv, the standard library covers it. `venv`
+ships with Python and creates the environment with `pip` already inside, so
+this path needs no third-party tooling:
+
+```bash
+git clone https://github.com/microsoft/conductor.git
+cd conductor
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+Then call the entrypoint out of the venv:
+
+```bash
+.venv/bin/conductor run examples/simple-qa.yaml
+.venv/bin/conductor validate examples/simple-qa.yaml
+```
+
+Or activate the venv once and drop the prefix:
+
+```bash
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+conductor run examples/simple-qa.yaml
+```
+
+`-e` makes it an editable install, so edits under `src/` apply on the next
+run, exactly as with `uv run`. The trade-off is that pip resolves
+dependencies fresh rather than from the committed `uv.lock`, so you may get
+newer versions than CI pins. Optional extras work the same way —
+`.venv/bin/pip install -e '.[tui]'`.
+
+## Network and proxy setup
 
 ### Installing behind a proxy or private package index
 
@@ -207,7 +223,7 @@ use the system trust store. If it mentions a proxy (`407`), set `HTTPS_PROXY` /
 `NO_PROXY` as well as the index URL. Do not work around the block by disabling
 security tooling; ask your IT or platform team for the approved index endpoint.
 
-### Use the Conductor skill in Claude Code or Copilot CLI
+## Use the Conductor skill in Claude Code or Copilot CLI
 
 This repo doubles as a single-plugin marketplace that ships the `conductor`
 skill from `plugins/conductor/skills/conductor/`. The skill teaches the
