@@ -18,7 +18,10 @@ value. That exists because a TUI that repaints ten times a second is
 genuinely unwelcome in some places -- over a slow SSH link, inside a
 terminal multiplexer being recorded, or on battery -- and because a reader
 who finds movement distracting should not have to choose between that and
-the whole tool.
+the whole tool. That slow-SSH-link case is no longer left to the reader to
+notice and work around: :func:`is_remote_session` detects an RDP or SSH
+session and :func:`animations_enabled` turns animation off automatically
+for it, with ``CONDUCTOR_FLEET_ANIM`` as the explicit force-on override.
 """
 
 from __future__ import annotations
@@ -50,14 +53,77 @@ _BREATH_DIVISOR = 4
 SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
 
 
+def is_remote_session() -> str | None:
+    """Detect an RDP or SSH session, where a 10fps repaint is genuinely costly.
+
+    Modelled on :func:`conductor.fleet.tui.actions._is_wsl`'s style: stdlib
+    environment sniffing only, nothing here raises, and each signal is
+    trusted for a documented reason rather than guessed at.
+
+    RDP: ``SESSIONNAME`` names the session type Windows assigned this
+    logon, and every Remote Desktop session's name starts with
+    ``RDP-Tcp`` (e.g. ``RDP-Tcp#0``) -- the physical console session is
+    named plain ``Console`` instead, which is why the match is a prefix
+    check rather than "is the variable set at all".
+
+    SSH: either ``SSH_CONNECTION`` or ``SSH_TTY`` being set is how every
+    OpenSSH server has told the shell it started this session since before
+    this project existed; a client-side tool has no comparably reliable
+    signal to add on top.
+
+    Returns:
+        ``"RDP"`` or ``"SSH"`` when detected, otherwise ``None``.
+    """
+    session_name = os.environ.get("SESSIONNAME", "")
+    if session_name.strip().lower().startswith("rdp-tcp"):
+        return "RDP"
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return "SSH"
+    return None
+
+
 def animations_enabled() -> bool:
     """Return whether animation should run at all.
 
+    An explicit precedence chain, in order:
+
+    1. ``CONDUCTOR_FLEET_NO_ANIM`` set to a non-empty value -- always wins,
+       even over a forced-on request.
+    2. ``CONDUCTOR_FLEET_ANIM`` set to a non-empty value -- forces animation
+       back on over a detected remote session.
+    3. :func:`is_remote_session` -- off by default on a detected RDP or SSH
+       session.
+    4. Otherwise on.
+
     Returns:
-        ``False`` when ``CONDUCTOR_FLEET_NO_ANIM`` is set to a non-empty
-        value, otherwise ``True``.
+        Whether animation should run.
     """
-    return not os.environ.get("CONDUCTOR_FLEET_NO_ANIM")
+    if os.environ.get("CONDUCTOR_FLEET_NO_ANIM"):
+        return False
+    if os.environ.get("CONDUCTOR_FLEET_ANIM"):
+        return True
+    return is_remote_session() is None
+
+
+def disabled_reason() -> str | None:
+    """Return why animation was turned off *by detection*, if it was.
+
+    Deliberately distinct from ``not animations_enabled()``: an explicit
+    ``CONDUCTOR_FLEET_NO_ANIM`` is the reader's own choice and should not
+    produce a notification explaining it back to them -- and the whole test
+    suite sets that variable unconditionally (see ``conftest.py``), so a
+    reason tied to it would fire on every test run rather than only the
+    ones that actually exercise detection.
+
+    Returns:
+        ``"RDP"`` or ``"SSH"`` when a detected remote session is what
+        disabled animation, otherwise ``None``.
+    """
+    if os.environ.get("CONDUCTOR_FLEET_NO_ANIM"):
+        return None
+    if os.environ.get("CONDUCTOR_FLEET_ANIM"):
+        return None
+    return is_remote_session()
 
 
 def spinner(frame: int, frames: str = SPINNER_FRAMES) -> str:

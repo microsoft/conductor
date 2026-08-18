@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depending on which agent happened to run first. `claude-agent-sdk`
   namespaces its own entries, so they cannot collide with Copilot's
   agent-name keys in the merged map.
+- **Fleet Manager TUI: remote-session detection turns animation off
+  automatically** (issue #462). An RDP (`SESSIONNAME` starting `RDP-Tcp`) or
+  SSH (`SSH_CONNECTION`/`SSH_TTY`) session now disables the ~10fps animation
+  clock by default — the same repaint that made the TUI feel laggy over a
+  slow link — and also sets Textual's own `App.animation_level` to `none`.
+  The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch is unchanged and
+  still wins; a new `CONDUCTOR_FLEET_ANIM` force-on switch overrides
+  detection when the operator knows the link can take it. See
+  [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
 
 ### Changed
 
@@ -50,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fleet Manager TUI: the ~10fps animation tick no longer repaints the
+  preview pane and footer** (issue #462). `RunsScreen._tick` used to end by
+  calling `_update_gate_detail()`, rebuilding the whole preview `Text` and
+  re-evaluating the footer's key bindings ten times a second for the sake of
+  one spinner glyph — over RDP/SSH this made the whole TUI feel laggy. The
+  preview pane is now split into `#run-preview` (the gate section and
+  progress header, rebuilt on data/selection changes only) and
+  `#run-preview-score` (the flowed step chips, the only part that actually
+  animates); the frame tick now only repaints the latter, alongside the
+  animated table cells it already updated. See
+  [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
 - **`claude` provider: `validate_connection()` no longer fails startup when an
   Anthropic-compatible endpoint doesn't implement `models.list()`** (issue
   #455). Azure AI Foundry's Anthropic endpoint, and some LiteLLM/Databricks AI

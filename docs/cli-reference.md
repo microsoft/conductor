@@ -1121,7 +1121,8 @@ are hidden from `--help` and are slated for removal in a future release.
 | `CONDUCTOR_GATE_TOKEN` | Overrides the dashboard's per-run minted auth token. Checked by `POST /api/stop`, `/api/kill`, `/api/resume`, `/api/gate-respond`, and `/api/guidance`, and by the `/ws` WebSocket handshake; also read by `conductor gate respond` and `conductor guide` |
 | `CONDUCTOR_WEB_ALLOW_ORIGINS` | Comma-separated list of additional origins (`scheme://host:port`) the dashboard's `OriginHostGuard` accepts, on top of the loopback aliases and configured bind host. Dev-server escape hatch (e.g. Vite's `http://localhost:5173`); nothing else is disabled by setting it |
 | `CONDUCTOR_HOME` | Overrides `~/.conductor/` as the location of run records, the registry config, and `config.toml` |
-| `CONDUCTOR_FLEET_NO_ANIM` | Set to any non-empty value to disable Fleet Manager TUI animation (spinners, sparkline motion, splash). Useful over slow SSH links, in recorded terminals, and where movement is distracting |
+| `CONDUCTOR_FLEET_NO_ANIM` | Set to any non-empty value to disable Fleet Manager TUI animation (spinners, sparkline motion, splash) and set Textual's own `animation_level` to `none`. Wins over `CONDUCTOR_FLEET_ANIM` and over remote-session detection if both apply. Useful over slow SSH links, in recorded terminals, and where movement is distracting. Remote (RDP/SSH) sessions are detected automatically and disable animation by default even without this variable set |
+| `CONDUCTOR_FLEET_ANIM` | Set to any non-empty value to force Fleet Manager TUI animation back on over a detected RDP/SSH session. Has no effect when `CONDUCTOR_FLEET_NO_ANIM` is also set |
 
 ## Exit Codes
 

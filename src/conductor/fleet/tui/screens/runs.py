@@ -394,13 +394,29 @@ def _gate_section(gate: GateInfo, resolvable: bool, width: int, max_prompt_lines
     return out
 
 
+@dataclass(frozen=True)
+class PreviewParts:
+    """The preview pane's two halves, rebuilt at different rates.
+
+    ``main`` (the gate section, plus the ``Progress N/M`` header and bar)
+    changes only when the selected run or the data behind it changes -- a
+    poll tick or a cursor move. ``score`` (the flowed step chips) is the
+    one part of the pane that moves on its own, so it is kept separate to
+    let :meth:`RunsScreen._animate_preview` repaint it alone at the
+    animation clock's own rate without touching anything else (issue #462).
+    """
+
+    main: Text
+    score: Text
+
+
 def _preview_text(
     summary: RunSummary,
     *,
     width: int = 100,
     height: int = 12,
     frame: int = 0,
-) -> Text:
+) -> PreviewParts:
     """Render the selected run's detail for the preview pane.
 
     The Runs table is deliberately one line per run, so an open gate's
@@ -413,30 +429,47 @@ def _preview_text(
     # table already carries (step, elapsed, tokens, cost, mode, PID and port)
     # is left out. What remains is the two things a one-line row cannot hold:
     # an open gate's full prompt, and the shape of the workflow.
-    out = Text()
+    main = Text()
 
     # Built first so its height is known: the progress view is bounded
     # (`_SCORE_MAX_LINES`) while the gate prompt is not, so the fixed
-    # section is measured and the variable one is given what remains.
-    progress = _progress_section(summary, width=width, frame=frame)
-    progress_lines = len(progress.plain.splitlines()) if progress.plain else 0
+    # section is measured and the variable one is given what remains. Both
+    # halves are still built here (rather than passing the budget down to
+    # a later, separate render) because the budget for the gate section
+    # depends on the combined height of both.
+    header = _progress_header(summary, width=width)
+    score = _score_text(summary, width=width, frame=frame)
+    header_lines = len(header.plain.splitlines()) if header.plain else 0
+    score_lines = len(score.plain.splitlines()) if score.plain else 0
+    progress_lines = header_lines + score_lines
 
     gate = summary.gate
     if gate is not None:
         budget = height - progress_lines - _GATE_CHROME_LINES
         if progress_lines:
             budget -= 1  # the blank line separating the two sections
-        out.append_text(_gate_section(gate, summary.gate_resolvable, width, max(1, budget)))
+        main.append_text(_gate_section(gate, summary.gate_resolvable, width, max(1, budget)))
 
-    if progress.plain:
+    if header.plain:
         if gate is not None:
-            out.append("\n\n")
-        out.append_text(progress)
-    return out
+            main.append("\n\n")
+        main.append_text(header)
+        # No trailing newline here: `main` and `score` render as two
+        # separately-stacked widgets now, so a newline after the header
+        # would open a blank line between them that the single-widget
+        # version never had.
+
+    return PreviewParts(main=main, score=score)
 
 
-def _progress_section(summary: RunSummary, *, width: int, frame: int) -> Text:
-    """Render the run's position in its workflow, or empty if unknown."""
+def _progress_header(summary: RunSummary, *, width: int) -> Text:
+    """Render the run's ``Progress N/M <bar>`` line, or empty if unknown.
+
+    Split from :func:`_score_text` (issue #462) so the preview pane can
+    rebuild this on data/selection changes only, while the animated step
+    chips repaint separately at the frame clock's own rate.
+    """
+    del width  # unused: kept for signature symmetry with `_score_text`
     out = Text()
     topology = summary.topology
     if topology is not None and topology.agents:
@@ -451,7 +484,17 @@ def _progress_section(summary: RunSummary, *, width: int, frame: int) -> Text:
         out.append("Progress", style="bold")
         out.append(f"  {done}/{len(topology.agents)}  ", style="dim")
         out.append_text(progress_bar(done, len(topology.agents)))
-        out.append("\n")
+    return out
+
+
+def _score_text(summary: RunSummary, *, width: int, frame: int) -> Text:
+    """Render the flowed step chips -- the one part of the preview pane
+    that animates. See :func:`_progress_header` for the rest of the split
+    (issue #462)."""
+    out = Text()
+    topology = summary.topology
+    if topology is not None and topology.agents:
+        statuses = step_statuses([a.name for a in topology.agents], summary.current_step)
         out.append_text(
             render_score(
                 topology,
@@ -749,7 +792,18 @@ class RunsScreen(Screen):
         yield Static(loading_text(), id="runs-loading", classes="notice")
         yield DataTable(id="runs-table")
         yield Static(_EMPTY_STATE_TEXT, id="empty-state", classes="empty-state")
-        yield Vertical(Static(id="run-preview"), id="preview-pane")
+        # Two `Static`s rather than one (issue #462): `#run-preview` (the
+        # gate section and the progress header/bar) is rebuilt only on
+        # data/selection changes, while `#run-preview-score` (the flowed
+        # step chips) is the one thing the ~10fps animation clock repaints
+        # on its own -- see `_animate_preview`. No extra CSS rule is
+        # needed: `#preview-pane` is a `Vertical` with auto-height
+        # children, and two `Static`s stack inside it exactly as one did.
+        yield Vertical(
+            Static(id="run-preview"),
+            Static(id="run-preview-score"),
+            id="preview-pane",
+        )
         yield BlockFooter(first_block_actions=self._ROW_SCOPED_ACTIONS | {"resolve_gate"})
 
     def on_mount(self) -> None:
@@ -853,8 +907,18 @@ class RunsScreen(Screen):
 
         Rebuilding the whole table at frame rate would fight the cursor and
         the reader's scroll position, so this updates the animated cell of
-        each live row in place and re-renders the preview, which owns the
-        one other moving thing (the score's live step).
+        each live row in place and, via :meth:`_animate_preview`, the one
+        other moving thing on screen: the preview's live step.
+
+        This is the frame clock's *entire* jurisdiction (issue #462): the
+        preview pane's gate section and progress header, and the footer's
+        bindings, belong to the data poll (:meth:`_update_gate_detail`) and
+        to selection changes, not to this ~10fps timer. Before this fix,
+        `_tick` ended by calling `_update_gate_detail()` directly, which
+        rebuilt the whole pane and called `refresh_bindings()` ten times a
+        second for the sake of one spinner glyph -- do not re-add that
+        call here; it is the exact regression this method now guards
+        against by construction.
         """
         # This guard, not `on_screen_suspend`'s pause, is what actually
         # stops frames landing on a covered screen. `App.push_screen`
@@ -885,7 +949,57 @@ class RunsScreen(Screen):
             except Exception:  # noqa: BLE001 - a row can vanish mid-tick
                 logger.debug("Skipped animating row %s", key, exc_info=True)
 
-        self._update_gate_detail()
+        self._animate_preview()
+
+    def _animate_preview(self) -> None:
+        """Repaint only the preview's live step (``#run-preview-score``).
+
+        Called from :meth:`_tick` at ~10fps in place of
+        :meth:`_update_gate_detail`, which used to be called there and
+        rebuilt the *whole* pane's ``Text`` plus the footer's bindings for
+        the sake of one spinner glyph inside it (issue #462). Everything
+        else the preview shows -- the gate section, the progress header,
+        the footer -- is driven by the data poll and by selection changes,
+        not by this timer; see :meth:`_update_gate_detail`.
+
+        A no-op when there is nothing that could actually move: the pane
+        isn't displayed, no run is selected, or the selected run has no
+        topology or no current step. :func:`~conductor.fleet.tui.dag.
+        step_statuses` only ever marks the single current step
+        ``"running"`` -- everything else is ``"completed"``/``"pending"``,
+        neither of which animates -- so a run with no ``current_step`` has
+        nothing here for a frame to change.
+        """
+        pane = self.query_one("#preview-pane", Vertical)
+        if not pane.display:
+            return
+
+        summary = self._selected_summary()
+        if summary is None:
+            return
+
+        topology = summary.topology
+        if topology is None or not topology.agents or summary.current_step is None:
+            return
+
+        # Same width derivation as `_update_gate_detail`, so the animated
+        # frame flows identically to the poll-rendered one instead of
+        # re-wrapping every couple of seconds when the two disagree.
+        pane_size = pane.size
+        if not pane_size.width or not pane_size.height:
+            pane_size = self.size
+
+        try:
+            score_widget = self.query_one("#run-preview-score", Static)
+            score = _score_text(
+                summary,
+                width=max(20, pane_size.width - _PREVIEW_PADDING),
+                frame=self._frame,
+            )
+            score_widget.update(score)
+            score_widget.display = bool(score.plain)
+        except Exception:  # noqa: BLE001 - a frame can land mid-teardown
+            logger.debug("Skipped animating preview score", exc_info=True)
 
     def _burn_cell(self, key: str) -> Text:
         """Render this run's recent token-burn sparkline.
@@ -1203,7 +1317,14 @@ class RunsScreen(Screen):
         Called after every table rebuild (a poll tick may open or close the
         selected run's gate) and on every cursor move
         (:meth:`on_data_table_row_highlighted`), since the selected row can
-        change independently of a poll tick.
+        change independently of a poll tick. Owns the *data and selection*
+        half of the preview -- the gate section, the progress header, and
+        the footer's bindings -- and everything else on this screen except
+        the animated cells. It is never called from the ~10fps
+        :meth:`_tick` (issue #462): the one thing in the pane that moves on
+        its own, the score's live step, is repainted separately by
+        :meth:`_animate_preview`, so this method rebuilding both widgets
+        stays a data/selection-rate operation rather than a per-frame one.
 
         A no-op while another screen is on top -- repainting for a reader
         who is looking at a modal costs a re-blend of that modal for
@@ -1219,6 +1340,7 @@ class RunsScreen(Screen):
             return
         pane = self.query_one("#preview-pane", Vertical)
         panel = self.query_one("#run-preview", Static)
+        score_widget = self.query_one("#run-preview-score", Static)
 
         summary = self._selected_summary()
         record = self._selected_record()
@@ -1228,6 +1350,8 @@ class RunsScreen(Screen):
             # empty state's own launch hint.
             pane.display = False
             panel.update("")
+            score_widget.update("")
+            score_widget.display = False
             self._refresh_row_bindings()
             return
 
@@ -1242,14 +1366,18 @@ class RunsScreen(Screen):
         pane_size = pane.size
         if not pane_size.width or not pane_size.height:
             pane_size = self.size
-        panel.update(
-            _preview_text(
-                summary,
-                width=max(20, pane_size.width - _PREVIEW_PADDING),
-                height=max(4, pane_size.height - _PREVIEW_VERTICAL_PADDING),
-                frame=self._frame,
-            )
+        parts = _preview_text(
+            summary,
+            width=max(20, pane_size.width - _PREVIEW_PADDING),
+            height=max(4, pane_size.height - _PREVIEW_VERTICAL_PADDING),
+            frame=self._frame,
         )
+        panel.update(parts.main)
+        score_widget.update(parts.score)
+        # Hidden rather than shown blank: a run with no topology yet (or
+        # too narrow a pane to render one) would otherwise gain a stray
+        # blank line under the gate/progress section.
+        score_widget.display = bool(parts.score.plain)
         self._refresh_row_bindings()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -1291,7 +1419,11 @@ class RunsScreen(Screen):
         gate opening or closing between polls — or the last run in the fleet
         exiting, which retires every row-scoped key at once — would otherwise
         leave the footer showing yesterday's answer until some other event
-        forced a redraw.
+        forced a redraw. Called only from :meth:`_update_gate_detail`, which
+        runs at data/selection rate — never from the ~10fps :meth:`_tick`
+        (issue #462), so this docstring's claim ("after the selection
+        moves") is now actually true rather than also covering ten
+        redundant re-evaluations a second.
         """
         self.refresh_bindings()
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 from textual.app import App
 
 from conductor.fleet.records import RunRecord
-from conductor.fleet.tui.anim import animations_enabled
+from conductor.fleet.tui.anim import animations_enabled, disabled_reason
 from conductor.fleet.tui.screens.history import HistoryScreen
 from conductor.fleet.tui.screens.new_run import NewRunScreen
 from conductor.fleet.tui.screens.providers import ProvidersScreen
@@ -132,6 +132,26 @@ class FleetApp(App):
         # adding to it.
         if animations_enabled():
             self.push_screen(SplashScreen())
+        else:
+            # `animations_enabled()` already gates every spinner and the
+            # splash above; this additionally stops Textual's *own*
+            # widget animations (e.g. the tables' smooth-scroll easing),
+            # which is not something the app's own frame clock owns.
+            self.animation_level = "none"
+
+        reason = disabled_reason()
+        if reason is not None:
+            # Only fires when *detection* is what disabled animation, not
+            # an explicit `CONDUCTOR_FLEET_NO_ANIM` -- see
+            # `anim.disabled_reason`'s docstring for why that distinction
+            # matters. `markup=False`: `reason` is a runtime value and
+            # Textual's `notify()` defaults to parsing it as markup (rule I).
+            self.notify(
+                f"Animation disabled: detected a {reason} session. "
+                "Set CONDUCTOR_FLEET_ANIM=1 to force it back on.",
+                title="Fleet",
+                markup=False,
+            )
 
     def push_run_detail(self, record: RunRecord) -> None:
         """Push the run-detail screen (E9) for ``record`` onto the screen stack.

@@ -10,6 +10,7 @@ same run-discovery mechanism.
 
 - [The problem this solves](#the-problem-this-solves)
 - [Installing the TUI](#installing-the-tui)
+- [Animation and remote sessions](#animation-and-remote-sessions)
 - [Screens](#screens)
 - [Key bindings](#key-bindings)
 - [Status vocabulary](#status-vocabulary)
@@ -92,6 +93,68 @@ curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --no-preserve-extras
 
 `conductor fleet list` and `conductor fleet prune` are unaffected either
 way — only the bare, no-subcommand invocation needs `textual`.
+
+## Animation and remote sessions
+
+The TUI animates three things: the status badge of a running or at-gate
+row (a spinner or a breathing glyph), the Runs screen's preview pane —
+specifically the live step in its flowed score of chips, which is the
+one part of the pane that moves — and the launch splash. All three are
+driven by one ~10fps frame clock and gate on the same check, so they turn
+on and off together.
+
+That clock only ever repaints what actually moves: the animated table
+cells and the preview's score line. Rebuilding the whole preview pane and
+re-evaluating the footer's key bindings ten times a second — which the
+clock used to do — is what made the TUI feel laggy over a slow link
+(issue #462); those now update at the ~2s data-poll rate and on cursor
+moves instead.
+
+A repaint ten times a second is also genuinely costly over some
+connections, so Conductor detects two kinds of remote session and turns
+animation off automatically for them:
+
+- **RDP**, detected from `SESSIONNAME` starting with `RDP-Tcp` (Windows
+  names every Remote Desktop session that way; the physical console
+  session is named plain `Console` and is not a match).
+- **SSH**, detected from `SSH_CONNECTION` or `SSH_TTY` being set — the
+  same signal every OpenSSH server has set on the shell it started since
+  before this project existed.
+
+When detection turns animation off, it also sets Textual's own
+`App.animation_level` to `"none"`, which additionally stops Textual's
+built-in widget animations (for example the tables' smooth-scroll
+easing) — a broader effect than the Fleet-specific clock alone, and worth
+knowing if you were relying on that easing.
+
+Two environment variables override this, and the *off* switch always
+wins if both are set:
+
+| Variable | Effect |
+| --- | --- |
+| `CONDUCTOR_FLEET_NO_ANIM` | Force animation off, regardless of session detection. Wins over `CONDUCTOR_FLEET_ANIM` if both are set. |
+| `CONDUCTOR_FLEET_ANIM` | Force animation back on over a detected RDP/SSH session. |
+
+```bash
+# Force animation off (e.g. recording a terminal session, or on battery):
+CONDUCTOR_FLEET_NO_ANIM=1 conductor fleet
+
+# Force animation on over SSH/RDP, once you know the link can take it:
+CONDUCTOR_FLEET_ANIM=1 conductor fleet
+```
+
+A detected remote session shows a one-time notification naming the
+detected session type and the `CONDUCTOR_FLEET_ANIM=1` override; an
+explicit `CONDUCTOR_FLEET_NO_ANIM` does not, since that path is already
+the reader's own choice.
+
+Three more Textual-level knobs — `TEXTUAL_FPS`, `TEXTUAL_SMOOTH_SCROLL`,
+and `TEXTUAL_ANIMATIONS` — tune the framework's own rendering and are
+deliberately **not** set by Conductor for you. They are read once, at
+import time, as `Final` module constants (`textual/constants.py`), so
+honoring them would mean setting them before `textual` is imported —
+i.e. before every `conductor` invocation, not just `conductor fleet`.
+Set them yourself in your shell environment if you want to tune them.
 
 ## Screens
 

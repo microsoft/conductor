@@ -124,6 +124,108 @@ class TestAnimationsEnabled:
         monkeypatch.setenv("CONDUCTOR_FLEET_NO_ANIM", "")
         assert anim.animations_enabled() is True
 
+    def test_no_anim_wins_over_the_force_on_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CONDUCTOR_FLEET_NO_ANIM", "1")
+        monkeypatch.setenv("CONDUCTOR_FLEET_ANIM", "1")
+        assert anim.animations_enabled() is False
+
+    def test_force_on_wins_over_a_detected_remote_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("CONDUCTOR_FLEET_ANIM", "1")
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.animations_enabled() is True
+
+    def test_disabled_by_a_detected_rdp_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.animations_enabled() is False
+
+    def test_disabled_by_a_detected_ssh_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22")
+        assert anim.animations_enabled() is False
+
+    def test_the_console_session_is_not_a_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The physical/console session is named plain ``Console`` -- it
+        must not be treated as remote."""
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("SESSIONNAME", "Console")
+        assert anim.animations_enabled() is True
+
+    def test_empty_force_on_value_does_not_enable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("CONDUCTOR_FLEET_ANIM", "")
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.animations_enabled() is False
+
+    def test_empty_ssh_values_do_not_disable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("SSH_CONNECTION", "")
+        monkeypatch.setenv("SSH_TTY", "")
+        assert anim.animations_enabled() is True
+
+
+class TestIsRemoteSession:
+    def test_no_signal_is_not_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SESSIONNAME", raising=False)
+        monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        monkeypatch.delenv("SSH_TTY", raising=False)
+        assert anim.is_remote_session() is None
+
+    def test_rdp_session_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.is_remote_session() == "RDP"
+
+    def test_rdp_match_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SESSIONNAME", "rdp-tcp#1")
+        assert anim.is_remote_session() == "RDP"
+
+    def test_console_session_is_not_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SESSIONNAME", "Console")
+        assert anim.is_remote_session() is None
+
+    def test_ssh_connection_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SESSIONNAME", raising=False)
+        monkeypatch.setenv("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22")
+        assert anim.is_remote_session() == "SSH"
+
+    def test_ssh_tty_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SESSIONNAME", raising=False)
+        monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        monkeypatch.setenv("SSH_TTY", "/dev/pts/3")
+        assert anim.is_remote_session() == "SSH"
+
+
+class TestDisabledReason:
+    def test_none_when_animation_is_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        assert anim.disabled_reason() is None
+
+    def test_none_when_disabled_by_the_explicit_off_switch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit ``CONDUCTOR_FLEET_NO_ANIM`` is the reader's own
+        choice -- it must not trigger the detection notification, or every
+        test in this suite (which sets it unconditionally) would."""
+        monkeypatch.setenv("CONDUCTOR_FLEET_NO_ANIM", "1")
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.disabled_reason() is None
+
+    def test_none_when_forced_on_over_a_detected_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("CONDUCTOR_FLEET_ANIM", "1")
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.disabled_reason() is None
+
+    def test_names_the_detected_session_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
+        assert anim.disabled_reason() == "RDP"
+
 
 class TestArt:
     def test_wordmark_widths_match_the_art(self) -> None:
