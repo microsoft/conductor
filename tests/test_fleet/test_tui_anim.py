@@ -142,10 +142,20 @@ class TestAnimationsEnabled:
         monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
         assert anim.animations_enabled() is False
 
-    def test_disabled_by_a_detected_ssh_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_an_ssh_session_alone_does_not_disable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SSH is deliberately *not* an automatic trigger (issue #462).
+
+        Locks in the scoping decision rather than merely omitting a test:
+        SSH ships the ANSI byte stream and the client renders it, so the
+        per-frame cost is bytes of changed text, not the changed pixel
+        regions RDP has to encode and ship. Measured in practice as fine.
+        See :func:`conductor.fleet.tui.anim.is_remote_session`.
+        """
         monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.delenv("SESSIONNAME", raising=False)
         monkeypatch.setenv("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22")
-        assert anim.animations_enabled() is False
+        monkeypatch.setenv("SSH_TTY", "/dev/pts/3")
+        assert anim.animations_enabled() is True
 
     def test_the_console_session_is_not_a_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The physical/console session is named plain ``Console`` -- it
@@ -160,18 +170,10 @@ class TestAnimationsEnabled:
         monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
         assert anim.animations_enabled() is False
 
-    def test_empty_ssh_values_do_not_disable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
-        monkeypatch.setenv("SSH_CONNECTION", "")
-        monkeypatch.setenv("SSH_TTY", "")
-        assert anim.animations_enabled() is True
-
 
 class TestIsRemoteSession:
     def test_no_signal_is_not_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SESSIONNAME", raising=False)
-        monkeypatch.delenv("SSH_CONNECTION", raising=False)
-        monkeypatch.delenv("SSH_TTY", raising=False)
         assert anim.is_remote_session() is None
 
     def test_rdp_session_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,16 +188,18 @@ class TestIsRemoteSession:
         monkeypatch.setenv("SESSIONNAME", "Console")
         assert anim.is_remote_session() is None
 
-    def test_ssh_connection_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_ssh_signals_are_not_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Neither OpenSSH signal makes a session "remote" for this purpose.
+
+        A negative assertion on purpose: SSH detection was implemented and
+        then deliberately scoped back out (issue #462), so this pins the
+        decision where a missing test would just look like an oversight
+        and invite someone to "fix" it.
+        """
         monkeypatch.delenv("SESSIONNAME", raising=False)
         monkeypatch.setenv("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22")
-        assert anim.is_remote_session() == "SSH"
-
-    def test_ssh_tty_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("SESSIONNAME", raising=False)
-        monkeypatch.delenv("SSH_CONNECTION", raising=False)
         monkeypatch.setenv("SSH_TTY", "/dev/pts/3")
-        assert anim.is_remote_session() == "SSH"
+        assert anim.is_remote_session() is None
 
 
 class TestDisabledReason:

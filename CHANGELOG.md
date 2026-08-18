@@ -44,11 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depending on which agent happened to run first. `claude-agent-sdk`
   namespaces its own entries, so they cannot collide with Copilot's
   agent-name keys in the merged map.
-- **Fleet Manager TUI: remote-session detection turns animation off
-  automatically** (issue #462). An RDP (`SESSIONNAME` starting `RDP-Tcp`) or
-  SSH (`SSH_CONNECTION`/`SSH_TTY`) session now disables the ~10fps animation
-  clock by default — the same repaint that made the TUI feel laggy over a
-  slow link. The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch still
+- **Fleet Manager TUI: RDP session detection turns animation off
+  automatically** (issue #462). An RDP session (`SESSIONNAME` starting
+  `RDP-Tcp`) now disables the ~10fps animation clock by default — the same
+  repaint that made the TUI feel laggy over that transport. SSH is
+  deliberately *not* detected: it ships the ANSI byte stream for the local
+  terminal to render (a few hundred bytes per frame), where RDP renders
+  remotely and ships changed pixel regions, so only the latter is costly in
+  practice. `CONDUCTOR_FLEET_NO_ANIM` remains the remedy for a genuinely
+  slow SSH link and for transports with no reliable signal (VNC, Citrix,
+  xrdp). The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch still
   wins over detection, and a new `CONDUCTOR_FLEET_ANIM` force-on switch
   overrides detection when the operator knows the link can take it. Any path
   that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or detection —
@@ -80,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preview pane and footer** (issue #462). `RunsScreen._tick` used to end by
   calling `_update_gate_detail()`, rebuilding the whole preview `Text` and
   re-evaluating the footer's key bindings ten times a second for the sake of
-  one spinner glyph — over RDP/SSH this made the whole TUI feel laggy. The
+  one spinner glyph — over RDP this made the whole TUI feel laggy. The
   preview pane is now split into `#run-preview` (the gate section and
   progress header, rebuilt on data/selection changes only) and
   `#run-preview-score` (the flowed step chips, the only part that actually

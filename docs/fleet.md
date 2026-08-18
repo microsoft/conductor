@@ -111,15 +111,24 @@ clock used to do — is what made the TUI feel laggy over a slow link
 moves instead.
 
 A repaint ten times a second is also genuinely costly over some
-connections, so Conductor detects two kinds of remote session and turns
-animation off automatically for them:
+connections, so Conductor detects one kind of remote session and turns
+animation off automatically for it:
 
 - **RDP**, detected from `SESSIONNAME` starting with `RDP-Tcp` (Windows
   names every Remote Desktop session that way; the physical console
   session is named plain `Console` and is not a match).
-- **SSH**, detected from `SSH_CONNECTION` or `SSH_TTY` being set — the
-  same signal every OpenSSH server has set on the shell it started since
-  before this project existed.
+
+**SSH is deliberately not detected**, even though a slow SSH link is a
+real reason to want animation off. The two transports are not comparable:
+RDP renders on the remote machine and then diffs, encodes and ships
+*changed pixel regions*, so its cost scales with pixels changed per second
+and a churning text region is the worst case for it. SSH ships the ANSI
+byte stream and your local terminal does the rendering, so its cost is a
+few hundred bytes per frame — negligible, and measured as such. What
+actually hurts is a *slow* link, and there is no signal for slow, only for
+"SSH at all", which is usually a fast one. Set `CONDUCTOR_FLEET_NO_ANIM=1`
+when your link genuinely is slow — that is also the answer for remote
+transports with no reliable signal at all, such as VNC, Citrix, or xrdp.
 
 Any path that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or
 detection — also sets Textual's own `App.animation_level` to `"none"`,
@@ -133,13 +142,14 @@ wins if both are set:
 | Variable | Effect |
 | --- | --- |
 | `CONDUCTOR_FLEET_NO_ANIM` | Force animation off, regardless of session detection. Wins over `CONDUCTOR_FLEET_ANIM` if both are set. |
-| `CONDUCTOR_FLEET_ANIM` | Force animation back on over a detected RDP/SSH session. |
+| `CONDUCTOR_FLEET_ANIM` | Force animation back on over a detected RDP session. |
 
 ```bash
-# Force animation off (e.g. recording a terminal session, or on battery):
+# Force animation off (e.g. a slow SSH link, recording a terminal
+# session, or on battery):
 CONDUCTOR_FLEET_NO_ANIM=1 conductor fleet
 
-# Force animation on over SSH/RDP, once you know the link can take it:
+# Force animation on over RDP, once you know the link can take it:
 CONDUCTOR_FLEET_ANIM=1 conductor fleet
 ```
 

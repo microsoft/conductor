@@ -6,7 +6,7 @@ for every test in this package, which makes ``anim.disabled_reason()`` return
 ``None`` unconditionally and the ``self.notify(...)`` branch in
 ``FleetApp.on_mount`` unreachable -- these tests opt back out of that default
 (the same way ``test_tui_splash.py`` and parts of ``test_tui_runs.py`` opt
-back into animation) so the branch that only ever fires under RDP/SSH is
+back into animation) so the branch that only ever fires under RDP is
 actually exercised somewhere in CI.
 """
 
@@ -49,7 +49,7 @@ class TestRemoteSessionDetectionWiring:
         self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
-        monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22")
+        monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
 
         app = FleetApp()
         async with app.run_test(notifications=True) as pilot:
@@ -61,7 +61,7 @@ class TestRemoteSessionDetectionWiring:
             assert app.animation_level == "none"
             assert len(app._notifications) == 1
             (notification,) = list(app._notifications)
-            assert "SSH" in notification.message
+            assert "RDP" in notification.message
 
     async def test_explicit_no_anim_disables_animation_without_a_notification(
         self, fleet_env: Path

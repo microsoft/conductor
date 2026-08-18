@@ -18,10 +18,14 @@ value. That exists because a TUI that repaints ten times a second is
 genuinely unwelcome in some places -- over a slow SSH link, inside a
 terminal multiplexer being recorded, or on battery -- and because a reader
 who finds movement distracting should not have to choose between that and
-the whole tool. That slow-SSH-link case is no longer left to the reader to
-notice and work around: :func:`is_remote_session` detects an RDP or SSH
-session and :func:`animations_enabled` turns animation off automatically
-for it, with ``CONDUCTOR_FLEET_ANIM`` as the explicit force-on override.
+the whole tool.
+
+One of those cases is detected rather than left to the reader to notice:
+:func:`is_remote_session` identifies an RDP session, and
+:func:`animations_enabled` turns animation off automatically for it, with
+``CONDUCTOR_FLEET_ANIM`` as the explicit force-on override. The list above
+is deliberately *not* all detected -- see :func:`is_remote_session` for why
+RDP is the only one that earns an automatic default.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
 
 
 def is_remote_session() -> str | None:
-    """Detect an RDP or SSH session, where a 10fps repaint is genuinely costly.
+    """Detect a session whose transport makes a 10fps repaint genuinely costly.
 
     Modelled on :func:`conductor.fleet.tui.actions._is_wsl`'s style: stdlib
     environment sniffing only, nothing here raises, and each signal is
@@ -66,19 +70,35 @@ def is_remote_session() -> str | None:
     named plain ``Console`` instead, which is why the match is a prefix
     check rather than "is the variable set at all".
 
-    SSH: either ``SSH_CONNECTION`` or ``SSH_TTY`` being set is how every
-    OpenSSH server has told the shell it started this session since before
-    this project existed; a client-side tool has no comparably reliable
-    signal to add on top.
+    **SSH is deliberately not detected here**, even though it is the case
+    the module docstring above names, because the two transports are not
+    comparable and measurement bore that out. RDP renders server-side into
+    a framebuffer and then diffs, encodes and ships *changed pixel
+    regions* with codecs tuned for mostly-static desktop content, so cost
+    scales with pixels changed per second and a churning text region is
+    the pathological case. SSH ships the *ANSI byte stream* and the
+    client's own terminal renders it, so cost scales with bytes of changed
+    text -- a few hundred per frame, fire-and-forget with no per-frame
+    round trip, meaning neither bandwidth nor latency compounds. The two
+    differ by orders of magnitude.
+
+    What the module docstring actually names is a *slow* SSH link, and
+    there is no signal for slow -- only for "SSH at all", which is
+    overwhelmingly a fast LAN or broadband link. Disabling on that signal
+    would degrade the common case, and announce a problem the reader does
+    not have, to buy nothing. ``CONDUCTOR_FLEET_NO_ANIM`` remains the
+    remedy for a link that genuinely is slow, and for every remote
+    transport with no reliable signal at all (VNC, Citrix, xrdp).
 
     Returns:
-        ``"RDP"`` or ``"SSH"`` when detected, otherwise ``None``.
+        ``"RDP"`` when detected, otherwise ``None``. Typed as ``str |
+        None`` rather than ``bool`` so a second transport that later earns
+        an automatic default can be added without churning either this
+        signature or :func:`disabled_reason`'s.
     """
     session_name = os.environ.get("SESSIONNAME", "")
     if session_name.strip().lower().startswith("rdp-tcp"):
         return "RDP"
-    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
-        return "SSH"
     return None
 
 
@@ -91,7 +111,7 @@ def animations_enabled() -> bool:
        even over a forced-on request.
     2. ``CONDUCTOR_FLEET_ANIM`` set to a non-empty value -- forces animation
        back on over a detected remote session.
-    3. :func:`is_remote_session` -- off by default on a detected RDP or SSH
+    3. :func:`is_remote_session` -- off by default on a detected RDP
        session.
     4. Otherwise on.
 
@@ -116,8 +136,8 @@ def disabled_reason() -> str | None:
     ones that actually exercise detection.
 
     Returns:
-        ``"RDP"`` or ``"SSH"`` when a detected remote session is what
-        disabled animation, otherwise ``None``.
+        ``"RDP"`` when a detected remote session is what disabled
+        animation, otherwise ``None``.
     """
     if os.environ.get("CONDUCTOR_FLEET_NO_ANIM"):
         return None

@@ -33,19 +33,16 @@ def _no_tui_animation(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests that specifically exercise animation opt back in with
     ``monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)``.
 
-    Also clears the remote-session detection signals (``SSH_CONNECTION``,
-    ``SSH_TTY``, ``SESSIONNAME``) and the force-on override
-    (``CONDUCTOR_FLEET_ANIM``). This is load-bearing, not hygiene: without
-    it, running the suite over SSH would make ``animations_enabled()``
-    return ``False`` even in the tests that deliberately opt back in by
-    deleting ``CONDUCTOR_FLEET_NO_ANIM`` (``test_tui_splash.py``,
-    ``test_tui_runs.py``), which would pass on a local machine and fail for
-    a developer working over a remote box.
+    Also clears the remote-session detection signal (``SESSIONNAME``) and
+    the force-on override (``CONDUCTOR_FLEET_ANIM``). This is load-bearing,
+    not hygiene: without it, running the suite inside an RDP session would
+    make ``animations_enabled()`` return ``False`` even in the tests that
+    deliberately opt back in by deleting ``CONDUCTOR_FLEET_NO_ANIM``
+    (``test_tui_splash.py``, ``test_tui_runs.py``), which would pass on a
+    local machine and fail for a developer working over a remote box.
     """
     monkeypatch.setenv("CONDUCTOR_FLEET_NO_ANIM", "1")
     monkeypatch.delenv("CONDUCTOR_FLEET_ANIM", raising=False)
-    monkeypatch.delenv("SSH_CONNECTION", raising=False)
-    monkeypatch.delenv("SSH_TTY", raising=False)
     monkeypatch.delenv("SESSIONNAME", raising=False)
 
 
