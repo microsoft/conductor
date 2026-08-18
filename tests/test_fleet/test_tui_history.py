@@ -533,6 +533,32 @@ class TestReplayCommandFooter:
         assert "conductor replay" in message
         assert str(log_path) in message
 
+    async def test_hidden_and_harmless_with_no_history(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """With no run history at all, the table is empty, so `enter` must
+        not be advertised -- and pressing it anyway must not crash the app."""
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+
+            table = app.screen.query_one(DataTable)
+            assert table.row_count == 0
+            assert app.screen.check_action("show_replay_command", ()) is False
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Replay cmd" not in shown
+
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await settle(pilot)
+
+            mock_notify.assert_not_called()
+            assert app.is_running
+
     async def test_mouse_click_still_notifies(self, fleet_env: Path, event_log_dir: Path) -> None:
         """A mouse click posts `RowSelected` directly (rather than going
         through the `priority` screen binding), so this exercises

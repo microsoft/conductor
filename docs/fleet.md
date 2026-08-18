@@ -175,8 +175,7 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `h` | History |
 | `q` | Quit |
 
-Every drill-down screen's own `enter` binding is advertised in its footer
-too, and does something specific to that screen:
+Screens with a row-scoped `enter` advertise it in their own footer:
 
 | Screen | `enter` |
 |--------|---------|
@@ -189,8 +188,8 @@ too, and does something specific to that screen:
 
 On Providers, `enter` is not offered while a model/status sub-row is
 highlighted — only a provider row itself can be expanded or collapsed.
-On Run detail, that screen also binds `r` to reload and `tab` to switch
-panes.
+The Step-detail screen that `enter` opens from Run detail binds `r` to
+reload and `tab` to switch panes.
 
 Inside the Registries drill-down, `n` runs the highlighted (or currently
 displayed) workflow rather than starting from an empty form. A launch

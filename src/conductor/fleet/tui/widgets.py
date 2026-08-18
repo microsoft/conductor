@@ -5,10 +5,37 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from textual.app import ComposeResult
-from textual.widgets import Footer
+from textual.widgets import DataTable, Footer
 from textual.widgets._footer import FooterKey
+from textual.widgets.data_table import CellDoesNotExist
 
-__all__ = ["BlockFooter"]
+__all__ = ["BlockFooter", "highlighted_row_key"]
+
+
+def highlighted_row_key(table: DataTable) -> str | None:
+    """Return the DataTable row key behind the currently highlighted row.
+
+    ``None`` when the table is empty (the cursor coordinate is undefined,
+    or ``row_count`` is zero) or the cursor's row key can't be resolved
+    (e.g. a stale coordinate mid-refresh).
+
+    The single implementation of a pattern that had been independently
+    duplicated across ``runs.py``, ``history.py``, ``providers.py``,
+    ``run_detail.py``, and (twice) ``registries.py`` -- and the copies had
+    already diverged: the two ``registries.py`` sites arrived with neither
+    the ``cursor_coordinate is None`` check nor the ``try/except`` the
+    other four already carried, which is exactly the risk a single shared
+    implementation removes. Callers that need to transform or filter the
+    resolved key (``providers.py``'s sub-row delimiter check,
+    ``run_detail.py``'s trailing-index strip) do so on the return value,
+    since that logic is genuinely per-screen.
+    """
+    if table.row_count == 0 or table.cursor_coordinate is None:
+        return None
+    try:
+        return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+    except CellDoesNotExist:
+        return None
 
 
 class BlockFooter(Footer):

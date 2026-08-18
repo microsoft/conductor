@@ -47,6 +47,7 @@ from conductor.fleet.summary import (
     derive_run_summary,
 )
 from conductor.fleet.tui.theme import loading_text, muted, status_label
+from conductor.fleet.tui.widgets import highlighted_row_key
 
 if TYPE_CHECKING:
     # app.py imports this module, so a top-level import would cycle.
@@ -158,12 +159,9 @@ class RunDetailScreen(Screen):
     waiting out the full interval."""
 
     BINDINGS = [
-        # Row-scoped -- operates on the highlighted agent. Must be
-        # `priority`: `DataTable` binds `enter` itself (to `select_cursor`,
-        # `show=False`) and, as the focused widget, sits ahead of the
-        # screen in the binding chain -- so without priority its hidden
-        # binding shadows this one and the drill-down never appears in the
-        # footer (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        # Row-scoped -- operates on the highlighted agent. `priority` is
+        # required or `DataTable`'s hidden `enter` shadows it in the
+        # footer; same reasoning as `runs.py`'s `BINDINGS` comment, issue #459.
         Binding("enter", "open_step", "Step", priority=True),
         ("escape", "back", "Back"),
     ]
@@ -202,27 +200,29 @@ class RunDetailScreen(Screen):
         key = event.row_key.value
         if key is None:
             return
-        # Row keys are `<agent-name>-<index>` (agent names are not unique),
-        # so the trailing index is stripped back off here.
-        agent_name = key.rsplit("-", 1)[0]
-        self._push_step_for(agent_name)
+        self._push_step_for(self._agent_name_from_row_key(key))
+
+    def _agent_name_from_row_key(self, key: str) -> str:
+        """Strip a row's per-refresh index back off to recover the agent name.
+
+        Row keys are ``<agent-name>-<index>`` (agent names are not unique:
+        two for-each iterations, or a loop-back reusing an agent id, can
+        legitimately share one -- see :meth:`_render_detail`), so the
+        trailing index is stripped back off here.
+        """
+        return key.rsplit("-", 1)[0]
 
     def _selected_agent_name(self) -> str | None:
-        """Return the agent name behind the currently highlighted row.
+        """Return the agent name (not the raw row key) behind the currently
+        highlighted row.
 
         ``None`` when the table is empty or the cursor's row key can't be
         resolved -- mirrors ``runs.py``'s ``_selected_key``.
         """
-        table = self.query_one(DataTable)
-        if table.row_count == 0 or table.cursor_coordinate is None:
-            return None
-        try:
-            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
-        except Exception:
-            return None
+        key = highlighted_row_key(self.query_one(DataTable))
         if key is None:
             return None
-        return key.rsplit("-", 1)[0]
+        return self._agent_name_from_row_key(key)
 
     def action_open_step(self) -> None:
         """Open the highlighted agent's step detail -- the ``enter`` binding.
@@ -238,6 +238,18 @@ class RunDetailScreen(Screen):
         if agent_name is None:
             return
         self._push_step_for(agent_name)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide ``open_step`` while no agent row is selected (e.g. the
+        placeholder is showing, or the table hasn't loaded yet), so the
+        footer never advertises a key that does nothing."""
+        if action == "open_step":
+            return self._selected_agent_name() is not None
+        return True
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Refresh the footer when the cursor moves to a different row."""
+        self.refresh_bindings()
 
     def _push_step_for(self, agent_name: str) -> None:
         """Push the step-detail screen for ``agent_name``."""
@@ -367,6 +379,7 @@ class RunDetailScreen(Screen):
             table.display = False
             placeholder.display = True
             table.clear()
+            self.refresh_bindings()
             return
 
         table.display = True
@@ -398,6 +411,11 @@ class RunDetailScreen(Screen):
         if previous_row and table.row_count:
             with contextlib.suppress(Exception):
                 table.move_cursor(row=min(previous_row, table.row_count - 1))
+
+        # The row set just changed shape (agents complete, fail, or start
+        # running on every poll tick), so the footer's `enter` label needs
+        # re-evaluating the same way a cursor move would.
+        self.refresh_bindings()
 
     def _add_row(self, table: DataTable, agent: AgentDetail, key: str) -> None:
         """Add one agent's row: status, elapsed, tokens, cost -- the

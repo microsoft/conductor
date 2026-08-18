@@ -487,6 +487,37 @@ class TestRunDetailGracefulDegradation:
             assert table.display is False
             assert placeholder.display is True
 
+    async def test_enter_hidden_and_harmless_while_placeholder_showing(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """With no topology to act on (the placeholder is showing), the
+        `enter` binding must not be advertised in the footer, and pressing
+        it anyway must not crash the app or push a step-detail screen."""
+        _write_record(tmp_path, "run-a")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert isinstance(app.screen, RunDetailScreen)
+            assert app.screen.query_one("#detail-placeholder", Static).display is True
+            assert app.screen.check_action("open_step", ()) is False
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Step" not in shown
+
+            before = len(app.screen_stack)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert app.is_running
+            assert len(app.screen_stack) == before
+
     async def test_escape_from_placeholder_still_returns_to_runs(
         self, fleet_env: Path, tmp_path: Path
     ) -> None:

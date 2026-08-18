@@ -79,7 +79,7 @@ from conductor.fleet.tui.theme import (
     status_badge,
     status_style,
 )
-from conductor.fleet.tui.widgets import BlockFooter
+from conductor.fleet.tui.widgets import BlockFooter, highlighted_row_key
 
 if TYPE_CHECKING:
     # Guarded to avoid a runtime circular import: app.py imports RunsScreen
@@ -1166,14 +1166,7 @@ class RunsScreen(Screen):
         position mid-refresh). Shared by :meth:`_selected_record` and
         :meth:`_selected_summary` so both look up the same row.
         """
-        table = self.query_one(DataTable)
-        if table.row_count == 0 or table.cursor_coordinate is None:
-            return None
-        try:
-            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
-        except Exception:
-            return None
-        return key
+        return highlighted_row_key(self.query_one(DataTable))
 
     def _selected_record(self) -> RunRecord | None:
         """Return the :class:`RunRecord` behind the currently highlighted row."""

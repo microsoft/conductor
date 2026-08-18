@@ -43,6 +43,7 @@ from textual.widgets import DataTable, Footer, Header, Static
 from conductor.console import styled
 from conductor.fleet.history import HistoryEntry, build_history_entries
 from conductor.fleet.tui.theme import loading_text, status_label
+from conductor.fleet.tui.widgets import highlighted_row_key
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +115,9 @@ class HistoryScreen(Screen):
 
     BINDINGS = [
         # Row-scoped -- surfaces the replay command for the highlighted row.
-        # Must be `priority`: `DataTable` binds `enter` itself (to
-        # `select_cursor`, `show=False`) and, as the focused widget, sits
-        # ahead of the screen in the binding chain -- so without priority
-        # its hidden binding shadows this one and the key never appears in
-        # the footer (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        # `priority` is required or `DataTable`'s hidden `enter` shadows it
+        # in the footer; same reasoning as `runs.py`'s `BINDINGS` comment,
+        # issue #459.
         Binding("enter", "show_replay_command", "Replay cmd", priority=True),
         ("escape", "back", "Back"),
     ]
@@ -227,6 +226,11 @@ class HistoryScreen(Screen):
                 continue
             displayed[key] = entry
         self._displayed_entries = displayed
+        # The row set just changed shape (a load can go from zero rows to
+        # many, or vice versa on a rebuild), so the footer's `enter` label
+        # needs to be re-evaluated the same way a cursor move would --
+        # this screen has no poll timer, so nothing else would trigger it.
+        self.refresh_bindings()
 
     def _add_row(self, table: DataTable, entry: HistoryEntry, key: str) -> None:
         """Add one history entry's row: workflow, outcome, duration, tokens, cost."""
@@ -266,16 +270,30 @@ class HistoryScreen(Screen):
         :meth:`_notify_replay_for`, so keyboard and mouse each take exactly
         one path and ``enter`` cannot notify twice.
         """
-        table = self.query_one(DataTable)
-        if table.row_count == 0 or table.cursor_coordinate is None:
-            return
-        try:
-            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
-        except Exception:
-            return
+        key = self._selected_history_key()
         if key is None:
             return
         self._notify_replay_for(key)
+
+    def _selected_history_key(self) -> str | None:
+        """Return the DataTable row key behind the currently highlighted row.
+
+        ``None`` when the table is empty or the cursor's row key can't be
+        resolved -- mirrors ``runs.py``'s ``_selected_key``.
+        """
+        return highlighted_row_key(self.query_one(DataTable))
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide ``show_replay_command`` while no row is selected (e.g. an
+        empty or still-loading table), so the footer never advertises a
+        key that does nothing."""
+        if action == "show_replay_command":
+            return self._selected_history_key() is not None
+        return True
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Refresh the footer when the cursor moves to a different row."""
+        self.refresh_bindings()
 
     def _notify_replay_for(self, key: str) -> None:
         """Notify the replay command for ``key``, if it still resolves.
