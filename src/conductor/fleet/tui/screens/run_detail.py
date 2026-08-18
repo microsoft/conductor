@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.timer import Timer
 from textual.widgets import DataTable, Footer, Header, Static
@@ -156,7 +157,16 @@ class RunDetailScreen(Screen):
     shrink it and observe a real poll tick pick up new events without
     waiting out the full interval."""
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        # Row-scoped -- operates on the highlighted agent. Must be
+        # `priority`: `DataTable` binds `enter` itself (to `select_cursor`,
+        # `show=False`) and, as the focused widget, sits ahead of the
+        # screen in the binding chain -- so without priority its hidden
+        # binding shadows this one and the drill-down never appears in the
+        # footer (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        Binding("enter", "open_step", "Step", priority=True),
+        ("escape", "back", "Back"),
+    ]
 
     def __init__(self, record: RunRecord) -> None:
         super().__init__()
@@ -182,7 +192,7 @@ class RunDetailScreen(Screen):
         self.app.pop_screen()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Open the step drill-down for the selected agent (``enter``).
+        """Open the step drill-down for the selected agent (mouse click).
 
         The table says whether a step succeeded and what it cost; this is
         how you see what it actually *did* -- the prompt it was given and
@@ -195,6 +205,42 @@ class RunDetailScreen(Screen):
         # Row keys are `<agent-name>-<index>` (agent names are not unique),
         # so the trailing index is stripped back off here.
         agent_name = key.rsplit("-", 1)[0]
+        self._push_step_for(agent_name)
+
+    def _selected_agent_name(self) -> str | None:
+        """Return the agent name behind the currently highlighted row.
+
+        ``None`` when the table is empty or the cursor's row key can't be
+        resolved -- mirrors ``runs.py``'s ``_selected_key``.
+        """
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_coordinate is None:
+            return None
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+        if key is None:
+            return None
+        return key.rsplit("-", 1)[0]
+
+    def action_open_step(self) -> None:
+        """Open the highlighted agent's step detail -- the ``enter`` binding.
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_push_step_for`, so keyboard and mouse each take exactly one
+        path and ``enter`` cannot push two screens.
+        """
+        agent_name = self._selected_agent_name()
+        if agent_name is None:
+            return
+        self._push_step_for(agent_name)
+
+    def _push_step_for(self, agent_name: str) -> None:
+        """Push the step-detail screen for ``agent_name``."""
         cast("FleetApp", self.app).push_step_detail(self._record, agent_name)
 
     def _update_inputs(self, summary: RunSummary | None) -> None:

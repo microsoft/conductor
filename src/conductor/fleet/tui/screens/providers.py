@@ -31,6 +31,7 @@ import logging
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header
 
@@ -167,7 +168,20 @@ class ProvidersScreen(Screen):
     """Providers drill-down: collapsed provider summary by default, expand
     for per-model reasoning-effort and context-window detail (E10)."""
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        # Row-scoped -- toggles the highlighted provider's expand/collapse
+        # state. Must be `priority`: `DataTable` binds `enter` itself (to
+        # `select_cursor`, `show=False`) and, as the focused widget, sits
+        # ahead of the screen in the binding chain -- so without priority
+        # its hidden binding shadows this one and the key never appears in
+        # the footer (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        # The label is a single static "Expand/Collapse" rather than one
+        # that tracks the highlighted row's current state -- honest in both
+        # states without overriding `active_bindings` to rebuild Textual's
+        # internal `ActiveBinding` tuples on every cursor move.
+        Binding("enter", "toggle_provider", "Expand/Collapse", priority=True),
+        ("escape", "back", "Back"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -247,6 +261,12 @@ class ProvidersScreen(Screen):
             )
             if name in self._expanded:
                 self._render_expanded_rows(table, diag, name)
+        # Expanding/collapsing rewrites the row set beneath a stationary
+        # cursor, which may not emit its own highlight message -- so the
+        # footer is refreshed here too, not just on
+        # `on_data_table_row_highlighted`, or `check_action` would keep
+        # showing yesterday's answer for the row now under the cursor.
+        self.refresh_bindings()
 
     def _render_expanded_rows(self, table: DataTable, diag: ProviderDiagnostic, name: str) -> None:
         """Add the sub-rows shown under an expanded provider (E10-T2/E10-T3).
@@ -350,13 +370,57 @@ class ProvidersScreen(Screen):
             )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Toggle a provider row's expand/collapse state -- a model/status
-        sub-row (its key contains :data:`_SUB_ROW_DELIMITER`) has no action
-        of its own and is ignored."""
+        """Toggle a provider row's expand/collapse state (mouse click) -- a
+        model/status sub-row (its key contains :data:`_SUB_ROW_DELIMITER`)
+        has no action of its own and is ignored."""
         key = event.row_key.value
         if key is None or _SUB_ROW_DELIMITER in key:
             return
-        name = key
+        self._toggle_provider(key)
+
+    def _selected_provider_name(self) -> str | None:
+        """Return the provider name behind the currently highlighted row.
+
+        ``None`` when the table is empty, the cursor's row key can't be
+        resolved, or the highlighted row is a model/status sub-row (its
+        key contains :data:`_SUB_ROW_DELIMITER`) -- mirrors ``runs.py``'s
+        ``_selected_key``.
+        """
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_coordinate is None:
+            return None
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+        if key is None or _SUB_ROW_DELIMITER in key:
+            return None
+        return key
+
+    def action_toggle_provider(self) -> None:
+        """Toggle the highlighted provider's expand/collapse state -- the
+        ``enter`` binding (E10-T2).
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_toggle_provider`, so keyboard and mouse each take exactly one
+        path and ``enter`` cannot toggle twice.
+
+        :meth:`check_action` hides this binding while a model sub-row is
+        highlighted, so this is only reachable with a provider row
+        selected -- but the same delimiter check as
+        :meth:`_selected_provider_name` guards it anyway, defensively.
+        """
+        name = self._selected_provider_name()
+        if name is None:
+            return
+        self._toggle_provider(name)
+
+    def _toggle_provider(self, name: str) -> None:
+        """Toggle ``name``'s expand/collapse state, checking its models on
+        first expand if it hasn't been checked yet."""
         if name not in self._providers:
             return
 
@@ -376,6 +440,33 @@ class ProvidersScreen(Screen):
             self.check_provider_models(name)
         else:
             self._render_table()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide ``toggle_provider`` while a model/status sub-row is highlighted.
+
+        Mirrors ``runs.py``'s ``check_action``: returning ``False`` hides
+        the key outright rather than greying it out, so ``enter`` is not
+        advertised as "Expand/Collapse" on a row that can't be expanded
+        (issue #459 acceptance criterion). When ``check_action`` returns
+        ``False`` the screen binding is skipped entirely, so the keypress
+        falls through to ``DataTable``'s own hidden ``enter`` ->
+        ``RowSelected`` -> :meth:`on_data_table_row_selected`, which already
+        ignores sub-rows -- sub-row behaviour is therefore unchanged, not
+        merely hidden.
+        """
+        if action == "toggle_provider":
+            return self._selected_provider_name() is not None
+        return True
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Refresh the footer when the cursor moves to a different row.
+
+        ``check_action`` is only consulted when bindings are refreshed, so
+        without this the footer would keep showing yesterday's answer as
+        the cursor moves between a provider row and its model sub-rows --
+        mirrors ``runs.py``'s identical hook.
+        """
+        self.refresh_bindings()
 
     @work
     async def check_provider_models(self, name: str) -> None:

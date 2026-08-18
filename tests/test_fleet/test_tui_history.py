@@ -466,3 +466,100 @@ class TestHistoryWorkerThreading:
                 await settle(pilot)
 
                 assert app.is_running
+
+
+# ---------------------------------------------------------------------------
+# `enter` footer advertisement (issue #459)
+# ---------------------------------------------------------------------------
+
+
+class TestReplayCommandFooter:
+    """`enter` must both surface the replay command *and* actually appear
+    in the footer -- `DataTable` binds `enter` itself (`show=False`), so
+    without `priority=True` the screen's own binding is shadowed and the
+    key silently vanishes from the footer while it still works (see
+    `runs.py`'s identical `Detail` binding, which this mirrors)."""
+
+    async def test_replay_cmd_binding_survives_datatables_own_enter(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _write_log(
+            event_log_dir,
+            name="completed-wf",
+            run_id="00000001",
+            lines=[
+                _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+            ],
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+
+            shown = [
+                ab.binding.description
+                for ab in app.screen.active_bindings.values()
+                if ab.binding.show and ab.enabled
+            ]
+            assert "Replay cmd" in shown
+
+    async def test_enter_notifies_exactly_once(self, fleet_env: Path, event_log_dir: Path) -> None:
+        """`enter` is bound twice over -- `DataTable`'s own hidden binding
+        and the screen's visible one -- so prove the two paths stay
+        mutually exclusive and don't double-notify."""
+        log_path = _write_log(
+            event_log_dir,
+            name="completed-wf",
+            run_id="00000001",
+            lines=[
+                _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+            ],
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await settle(pilot)
+
+        mock_notify.assert_called_once()
+        message = mock_notify.call_args.args[0]
+        assert "conductor replay" in message
+        assert str(log_path) in message
+
+    async def test_mouse_click_still_notifies(self, fleet_env: Path, event_log_dir: Path) -> None:
+        """A mouse click posts `RowSelected` directly (rather than going
+        through the `priority` screen binding), so this exercises
+        `on_data_table_row_selected` -- the other of the two paths that
+        must both funnel into the same notification."""
+        log_path = _write_log(
+            event_log_dir,
+            name="completed-wf",
+            run_id="00000001",
+            lines=[
+                _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+            ],
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                app.screen.post_message(DataTable.RowSelected(table, 0, row_key))
+                await settle(pilot)
+
+        mock_notify.assert_called_once()
+        message = mock_notify.call_args.args[0]
+        assert "conductor replay" in message
+        assert str(log_path) in message

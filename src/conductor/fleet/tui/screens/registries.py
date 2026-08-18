@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, cast
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
@@ -60,7 +61,16 @@ logger = logging.getLogger(__name__)
 class RegistriesScreen(Screen):
     """Configured registries: name, type, source, default marker (E11-T1)."""
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        # Row-scoped -- opens the highlighted registry's workflows. Must be
+        # `priority`: `DataTable` binds `enter` itself (to `select_cursor`,
+        # `show=False`) and, as the focused widget, sits ahead of the
+        # screen in the binding chain -- so without priority its hidden
+        # binding shadows this one and the key never appears in the footer
+        # (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        Binding("enter", "open_workflows", "Workflows", priority=True),
+        ("escape", "back", "Back"),
+    ]
 
     def action_back(self) -> None:
         """Pop back to the Runs screen -- bound to ``escape``."""
@@ -125,10 +135,33 @@ class RegistriesScreen(Screen):
             )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Push the workflows drill-down for the selected registry."""
+        """Push the workflows drill-down for the selected registry (mouse click)."""
         name = event.row_key.value
         if name is None:
             return
+        self._push_workflows_for(name)
+
+    def action_open_workflows(self) -> None:
+        """Open the highlighted registry's workflows -- the ``enter`` binding.
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_push_workflows_for`, so keyboard and mouse each take exactly
+        one path and ``enter`` cannot push two screens.
+        """
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        name = row_key.value
+        if name is None:
+            return
+        self._push_workflows_for(name)
+
+    def _push_workflows_for(self, name: str) -> None:
+        """Push the workflows drill-down for registry ``name``."""
         self.app.push_screen(RegistryWorkflowsScreen(name))
 
 
@@ -141,8 +174,15 @@ class RegistryWorkflowsScreen(Screen):
     """Workflows listed in one registry's index (E11-T2)."""
 
     BINDINGS = [
-        ("escape", "back", "Back"),
+        # Row-scoped -- act on the highlighted workflow. `enter` must be
+        # `priority`: `DataTable` binds it itself (to `select_cursor`,
+        # `show=False`) and, as the focused widget, sits ahead of the
+        # screen in the binding chain -- so without priority its hidden
+        # binding shadows this one and the key never appears in the footer
+        # (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        Binding("enter", "open_inputs", "Inputs", priority=True),
         ("n", "new_run", "Run"),
+        ("escape", "back", "Back"),
     ]
 
     def __init__(self, registry_name: str) -> None:
@@ -220,9 +260,40 @@ class RegistryWorkflowsScreen(Screen):
             table.add_row(Text(wf_name), Text(info.description or "-"), key=wf_name)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Push the inputs drill-down for the selected workflow."""
+        """Push the inputs drill-down for the selected workflow (mouse click)."""
         wf_name = event.row_key.value
-        if wf_name is None or self._entry is None:
+        if wf_name is None:
+            return
+        self._push_inputs_for(wf_name)
+
+    def action_open_inputs(self) -> None:
+        """Open the highlighted workflow's inputs -- the ``enter`` binding.
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_push_inputs_for`, so keyboard and mouse each take exactly one
+        path and ``enter`` cannot push two screens.
+        """
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        wf_name = row_key.value
+        if wf_name is None:
+            return
+        self._push_inputs_for(wf_name)
+
+    def _push_inputs_for(self, wf_name: str) -> None:
+        """Push the inputs drill-down for workflow ``wf_name``, if the
+        registry entry has resolved.
+
+        ``self._entry`` is only set once the async :meth:`load_workflows`
+        worker resolves, so a keypress or click that arrives before then is
+        silently ignored, matching the pre-existing guard.
+        """
+        if self._entry is None:
             return
         self.app.push_screen(
             WorkflowInputsScreen(

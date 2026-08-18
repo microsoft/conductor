@@ -36,6 +36,7 @@ import logging
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
@@ -111,7 +112,16 @@ def _format_cost(entry: HistoryEntry) -> str:
 class HistoryScreen(Screen):
     """Completed-run history, bounded by retention (E14)."""
 
-    BINDINGS = [("escape", "back", "Back")]
+    BINDINGS = [
+        # Row-scoped -- surfaces the replay command for the highlighted row.
+        # Must be `priority`: `DataTable` binds `enter` itself (to
+        # `select_cursor`, `show=False`) and, as the focused widget, sits
+        # ahead of the screen in the binding chain -- so without priority
+        # its hidden binding shadows this one and the key never appears in
+        # the footer (see `runs.py`'s identical `BINDINGS` comment, issue #459).
+        Binding("enter", "show_replay_command", "Replay cmd", priority=True),
+        ("escape", "back", "Back"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -233,20 +243,48 @@ class HistoryScreen(Screen):
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Offer ``conductor replay <log>`` for the selected row (E14-T3).
+        """Offer ``conductor replay <log>`` for the selected row (mouse click).
 
-        Depth is delegated, not re-implemented: this never opens a replay
-        dashboard itself -- it surfaces the exact command via a
-        notification so the operator can run it in a terminal (per the
-        design's *Division of labor*, TUI = breadth). A key not present in
-        :attr:`_displayed_entries` (e.g. a row selected in the narrow
-        window between a refresh and this handler running) is silently
-        ignored, mirroring ``runs.py``'s identical guard for its own
-        row-selection handler.
+        A key not present in :attr:`_displayed_entries` (e.g. a row
+        selected in the narrow window between a refresh and this handler
+        running) is silently ignored, mirroring ``runs.py``'s identical
+        guard for its own row-selection handler.
         """
         key = event.row_key.value
         if key is None:
             return
+        self._notify_replay_for(key)
+
+    def action_show_replay_command(self) -> None:
+        """Surface the replay command for the highlighted row -- the
+        ``enter`` binding (E14-T3).
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_notify_replay_for`, so keyboard and mouse each take exactly
+        one path and ``enter`` cannot notify twice.
+        """
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_coordinate is None:
+            return
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return
+        if key is None:
+            return
+        self._notify_replay_for(key)
+
+    def _notify_replay_for(self, key: str) -> None:
+        """Notify the replay command for ``key``, if it still resolves.
+
+        Depth is delegated, not re-implemented: this never opens a replay
+        dashboard itself -- it surfaces the exact command via a
+        notification so the operator can run it in a terminal (per the
+        design's *Division of labor*, TUI = breadth).
+        """
         entry = self._displayed_entries.get(key)
         if entry is None:
             return
