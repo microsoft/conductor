@@ -100,8 +100,8 @@ The TUI animates three things: the status badge of a running or at-gate
 row (a spinner or a breathing glyph), the Runs screen's preview pane —
 specifically the live step in its flowed score of chips, which is the
 one part of the pane that moves — and the launch splash. All three are
-driven by one ~10fps frame clock and gate on the same check, so they turn
-on and off together.
+driven by the same ~10fps interval and gate on the same check, so they
+turn on and off together.
 
 That clock only ever repaints what actually moves: the animated table
 cells and the preview's score line. Rebuilding the whole preview pane and
@@ -121,11 +121,11 @@ animation off automatically for them:
   same signal every OpenSSH server has set on the shell it started since
   before this project existed.
 
-When detection turns animation off, it also sets Textual's own
-`App.animation_level` to `"none"`, which additionally stops Textual's
-built-in widget animations (for example the tables' smooth-scroll
-easing) — a broader effect than the Fleet-specific clock alone, and worth
-knowing if you were relying on that easing.
+Any path that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or
+detection — also sets Textual's own `App.animation_level` to `"none"`,
+which additionally stops Textual's built-in widget animations (for example
+the tables' smooth-scroll easing) — a broader effect than the Fleet-specific
+clock alone, and worth knowing if you were relying on that easing.
 
 Two environment variables override this, and the *off* switch always
 wins if both are set:

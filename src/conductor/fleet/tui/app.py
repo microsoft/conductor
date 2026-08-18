@@ -147,7 +147,7 @@ class FleetApp(App):
             # matters. `markup=False`: `reason` is a runtime value and
             # Textual's `notify()` defaults to parsing it as markup (rule I).
             self.notify(
-                f"Animation disabled: detected a {reason} session. "
+                f"Animation disabled: {reason} session detected. "
                 "Set CONDUCTOR_FLEET_ANIM=1 to force it back on.",
                 title="Fleet",
                 markup=False,

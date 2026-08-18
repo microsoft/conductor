@@ -963,7 +963,8 @@ class RunsScreen(Screen):
         not by this timer; see :meth:`_update_gate_detail`.
 
         A no-op when there is nothing that could actually move: the pane
-        isn't displayed, no run is selected, or the selected run has no
+        isn't displayed, no run is selected, the selected run's status
+        isn't one of :data:`_ANIMATED_STATUSES`, or the selected run has no
         topology or no current step. :func:`~conductor.fleet.tui.dag.
         step_statuses` only ever marks the single current step
         ``"running"`` -- everything else is ``"completed"``/``"pending"``,
@@ -975,7 +976,7 @@ class RunsScreen(Screen):
             return
 
         summary = self._selected_summary()
-        if summary is None:
+        if summary is None or summary.status not in _ANIMATED_STATUSES:
             return
 
         topology = summary.topology
@@ -996,7 +997,12 @@ class RunsScreen(Screen):
                 width=max(20, pane_size.width - _PREVIEW_PADDING),
                 frame=self._frame,
             )
-            score_widget.update(score)
+            # `layout=False`: every glyph in `SPINNER_FRAMES` is exactly one
+            # cell wide and `_score_text` only swaps that glyph per frame, so
+            # the widget's size provably cannot change -- the default
+            # `layout=True` would force a full screen layout pass every
+            # frame for no reason.
+            score_widget.update(score, layout=False)
             score_widget.display = bool(score.plain)
         except Exception:  # noqa: BLE001 - a frame can land mid-teardown
             logger.debug("Skipped animating preview score", exc_info=True)
@@ -1319,8 +1325,7 @@ class RunsScreen(Screen):
         (:meth:`on_data_table_row_highlighted`), since the selected row can
         change independently of a poll tick. Owns the *data and selection*
         half of the preview -- the gate section, the progress header, and
-        the footer's bindings -- and everything else on this screen except
-        the animated cells. It is never called from the ~10fps
+        the footer's bindings. It is never called from the ~10fps
         :meth:`_tick` (issue #462): the one thing in the pane that moves on
         its own, the score's live step, is repainted separately by
         :meth:`_animate_preview`, so this method rebuilding both widgets
@@ -1419,11 +1424,9 @@ class RunsScreen(Screen):
         gate opening or closing between polls — or the last run in the fleet
         exiting, which retires every row-scoped key at once — would otherwise
         leave the footer showing yesterday's answer until some other event
-        forced a redraw. Called only from :meth:`_update_gate_detail`, which
-        runs at data/selection rate — never from the ~10fps :meth:`_tick`
-        (issue #462), so this docstring's claim ("after the selection
-        moves") is now actually true rather than also covering ten
-        redundant re-evaluations a second.
+        forced a redraw. Called only from :meth:`_update_gate_detail` --
+        i.e. at poll/selection/resume rate, never from the ~10fps
+        :meth:`_tick` (issue #462).
         """
         self.refresh_bindings()
 

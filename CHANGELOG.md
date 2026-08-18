@@ -35,10 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automatically** (issue #462). An RDP (`SESSIONNAME` starting `RDP-Tcp`) or
   SSH (`SSH_CONNECTION`/`SSH_TTY`) session now disables the ~10fps animation
   clock by default — the same repaint that made the TUI feel laggy over a
-  slow link — and also sets Textual's own `App.animation_level` to `none`.
-  The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch is unchanged and
-  still wins; a new `CONDUCTOR_FLEET_ANIM` force-on switch overrides
-  detection when the operator knows the link can take it. See
+  slow link. The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch still
+  wins over detection, and a new `CONDUCTOR_FLEET_ANIM` force-on switch
+  overrides detection when the operator knows the link can take it. Any path
+  that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or detection —
+  now also sets Textual's own `App.animation_level` to `none`, which
+  additionally stops Textual's built-in widget animations (e.g. the tables'
+  smooth-scroll easing); this is a behavior change for existing
+  `CONDUCTOR_FLEET_NO_ANIM` users, not only for the new detection path. See
   [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
 
 ### Changed

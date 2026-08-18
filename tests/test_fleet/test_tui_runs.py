@@ -1424,6 +1424,11 @@ class TestFrameTickDoesNotRepaintPreviewOrFooter:
         animation having been quietly deleted."""
         monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
         monkeypatch.setenv("CONDUCTOR_FLEET_ANIM", "1")
+        # Well above the test's whole run time, so the ~2s data poll cannot
+        # land inside the idle-frame measurement window below and make the
+        # `== 0` assertions racy -- only the frame clock can then possibly
+        # call `_preview_text`/`refresh_bindings` (issue #462 review).
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 60.0)
 
         log = tmp_path / "running.events.jsonl"
         _write_events(
@@ -1480,6 +1485,7 @@ class TestFrameTickDoesNotRepaintPreviewOrFooter:
             assert isinstance(screen, RunsScreen)
             assert screen._anim_timer is not None, "animation must be forced on for this test"
 
+            panel = screen.query_one("#run-preview", Static)
             score_widget = screen.query_one("#run-preview-score", Static)
             frame_before = screen._frame
             text_before = str(score_widget.render())
@@ -1489,9 +1495,23 @@ class TestFrameTickDoesNotRepaintPreviewOrFooter:
 
             # Several idle frames, well under the ~2s poll interval, so
             # nothing but the frame clock could be responsible for
-            # whatever moved (or didn't) during this window.
-            await asyncio.sleep(FRAME_INTERVAL * 5)
-            await pilot.pause()
+            # whatever moved (or didn't) during this window. Also asserted
+            # behaviourally (not just via the `_preview_text`/
+            # `refresh_bindings` call counters above, which only catch a
+            # rename): a future inline rebuild of `#run-preview` that
+            # bypasses `_preview_text` entirely would leave those counters
+            # at 0 while still repainting the wrong widget.
+            with (
+                patch.object(panel, "update", wraps=panel.update) as panel_painted,
+                patch.object(score_widget, "update", wraps=score_widget.update) as score_painted,
+            ):
+                await asyncio.sleep(FRAME_INTERVAL * 5)
+                await pilot.pause()
+
+                assert panel_painted.call_count == 0, "#run-preview must not repaint on idle frames"
+                assert score_painted.call_count >= 1, (
+                    "#run-preview-score must repaint across idle frames"
+                )
 
             assert screen._frame > frame_before, "the animation clock must keep advancing"
             assert preview_calls == 0, "_preview_text must not be rebuilt by idle frames"
@@ -1500,6 +1520,67 @@ class TestFrameTickDoesNotRepaintPreviewOrFooter:
             text_after = str(score_widget.render())
             assert text_after != text_before, (
                 "the score widget must still animate across these frames"
+            )
+
+    async def test_a_paused_runs_chip_does_not_spin(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`agent_paused` sets `status="paused"` without closing the open
+        step (`summary.py`), so `current_step` survives -- `_animate_preview`
+        must still treat this the same as `_tick`'s row loop, which skips
+        any status outside `_ANIMATED_STATUSES` (issue #462 review)."""
+        monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        monkeypatch.setenv("CONDUCTOR_FLEET_ANIM", "1")
+        monkeypatch.setattr(RunsScreen, "POLL_INTERVAL_SECONDS", 60.0)
+
+        log = tmp_path / "paused.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event(
+                    "workflow_started",
+                    {
+                        "workflow_name": "wf",
+                        "agents": [
+                            {"name": "first", "type": "agent"},
+                            {"name": "second", "type": "agent"},
+                        ],
+                    },
+                ),
+                _event("agent_started", {"agent_name": "first"}),
+                _event("agent_paused", {"agent_name": "first"}),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0100", workflow_name="wf", event_log_path=str(log))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("x")
+            for _ in range(40):
+                await pilot.pause()
+                if isinstance(app.screen, RunsScreen):
+                    break
+                await asyncio.sleep(0.05)
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+            assert screen._anim_timer is not None, "animation must be forced on for this test"
+
+            summary = screen._selected_summary()
+            assert summary is not None
+            assert summary.status == "paused"
+            assert summary.current_step == "first"
+
+            score_widget = screen.query_one("#run-preview-score", Static)
+            text_before = str(score_widget.render())
+
+            await asyncio.sleep(FRAME_INTERVAL * 5)
+            await pilot.pause()
+
+            text_after = str(score_widget.render())
+            assert text_after == text_before, (
+                "a paused run's chip must not spin -- its own row is frozen"
             )
 
 
