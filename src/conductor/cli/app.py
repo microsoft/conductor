@@ -72,6 +72,9 @@ output_console = make_console()
 # rung gets the longest budget because it is the only one that lets the run
 # flush a resume checkpoint. Mirrors the child-termination timings already used
 # at launch in ``bg_runner._terminate_child`` (5s polite, 2s forceful).
+# Upper bound on error-panel lines.
+_MAX_ERROR_LINES = 40
+
 _GRACEFUL_TIMEOUT = 5.0
 _SIGNAL_TIMEOUT = 5.0
 _TERMINATE_TIMEOUT = 2.0
@@ -122,9 +125,17 @@ def format_error(error: Exception) -> Panel:
     # Build error content
     content = Text()
 
-    # Error message (red)
-    error_message = str(error).split("\n")[0]  # First line only for main message
-    content.append(error_message, style="bold red")
+    # Whole message, not just line one: an aggregate error's actionable
+    # per-item detail lives below the headline. Bounded to stay readable.
+    text = str(error)
+    # ``__str__`` already appends the suggestion; the panel adds it below.
+    if isinstance(error, ConductorError) and error.suggestion:
+        text = text.split("\n\n💡 Suggestion: ")[0]
+    lines = text.split("\n")
+    if len(lines) > _MAX_ERROR_LINES:
+        omitted = len(lines) - _MAX_ERROR_LINES
+        lines = lines[:_MAX_ERROR_LINES] + [f"... ({omitted} more lines)"]
+    content.append("\n".join(lines), style="bold red")
 
     # Add location info if available
     if isinstance(error, ConductorError):

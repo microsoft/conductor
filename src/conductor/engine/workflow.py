@@ -6985,9 +6985,15 @@ class WorkflowEngine:
                     f"All items in for-each group '{for_each_group.name}' failed:\n"
                     + "\n".join(error_details)
                 )
+                # The item's own suggestion is the actionable one.
+                single = next(iter(for_each_output.errors.values()), None)
                 raise ExecutionError(
                     error_msg,
-                    suggestion="At least one item must succeed in continue_on_error mode",
+                    suggestion=(
+                        single.suggestion
+                        if len(for_each_output.errors) == 1 and single and single.suggestion
+                        else "At least one item must succeed in continue_on_error mode"
+                    ),
                 )
 
         elif for_each_group.failure_mode == "all_or_nothing" and failure_count > 0:
