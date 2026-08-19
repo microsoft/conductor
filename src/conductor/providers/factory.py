@@ -6,13 +6,14 @@ the appropriate AgentProvider based on the requested provider type.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
-from conductor.config.schema import ToolOutputConfig
-from conductor.exceptions import ProviderError
+from conductor.config.schema import ProviderName, ToolOutputConfig
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.install_hint import install_command
 from conductor.providers.aca import AZURE_IDENTITY_AVAILABLE, AcaRuntimeProvider
 from conductor.providers.base import AgentProvider
+from conductor.providers.capabilities import get_capabilities
 from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
 from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
@@ -28,15 +29,24 @@ if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
 
 
-ProviderType = Literal[
-    "copilot",
-    "openai",
-    "openai-agents",
-    "claude",
-    "claude-agent-sdk",
-    "hermes",
-    "aca",
-]
+ProviderType = ProviderName
+
+
+def _enforce_temperature(provider_type: str, temperature: float | None) -> None:
+    """Raise if ``temperature`` exceeds the provider's declared ceiling."""
+    if temperature is None:
+        return
+    try:
+        caps = get_capabilities(provider_type)
+    except (KeyError, AttributeError):
+        return
+    if caps.max_temperature is not None and temperature > caps.max_temperature:
+        raise ValidationError(
+            f"Provider {provider_type!r} only supports temperatures up to "
+            f"{caps.max_temperature}; received {temperature!r}. "
+            "Lower the temperature or use a provider that accepts higher values.",
+            suggestion="Set `runtime.temperature` to a value within the provider's range.",
+        )
 
 
 async def create_provider(
@@ -98,6 +108,8 @@ async def create_provider(
         >>> # Use provider for agent execution
         >>> await provider.close()
     """
+    _enforce_temperature(provider_type, temperature)
+
     match provider_type:
         case "copilot":
             idle_recovery_config = None
@@ -141,11 +153,7 @@ async def create_provider(
                 default_reasoning_effort=default_reasoning_effort,
                 tool_output=tool_output,
             )
-        case "openai-agents":
-            raise ProviderError(
-                "OpenAI Agents provider not yet implemented",
-                suggestion="Use 'copilot' provider for now",
-            )
+
         case "claude":
             if not ANTHROPIC_SDK_AVAILABLE:
                 raise ProviderError(
@@ -266,8 +274,7 @@ async def create_provider(
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
                 suggestion=(
-                    "Valid providers are: copilot, openai, openai-agents, claude, "
-                    "claude-agent-sdk, hermes, aca"
+                    "Valid providers are: copilot, openai, claude, claude-agent-sdk, hermes, aca"
                 ),
             )
 
@@ -309,9 +316,10 @@ class ProviderFactory:
             ProviderError: If provider creation or validation fails.
         """
         provider_settings = getattr(runtime_config, "provider", None)
+        provider_type: ProviderType
         # Support both the new ProviderSettings object and any legacy
         # string-typed mock that test code might still pass in.
-        if hasattr(provider_settings, "name"):
+        if provider_settings is not None and hasattr(provider_settings, "name"):
             provider_type = provider_settings.name
         elif isinstance(provider_settings, str):
             provider_type = provider_settings
@@ -329,6 +337,8 @@ class ProviderFactory:
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
         default_context_tier = getattr(runtime_config, "default_context_tier", None)
         tool_output = getattr(runtime_config, "tool_output", None)
+
+        _enforce_temperature(provider_type, temperature)
 
         return await create_provider(
             provider_type=provider_type,

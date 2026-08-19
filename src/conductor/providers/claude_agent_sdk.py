@@ -648,6 +648,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``session_key`` is honored: executions sharing a key resume one
         # Claude session, and the map is persisted across ``conductor resume``.
         session_continuity=True,
+        max_temperature=1.0,
         upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
     )

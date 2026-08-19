@@ -9,6 +9,7 @@ extended-thinking budgets, and Anthropic API constraint coercion.
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -183,21 +184,82 @@ class TestOpenAIBackend:
 
     @pytest.mark.parametrize(
         ("effort",),
-        [("low",), ("medium",), ("high",), ("xhigh",), ("max",)],
+        [("low",), ("medium",), ("high",)],
     )
     def test_openai_reasoning_effort_maps_to_openai_reasoning_effort(self, effort: str) -> None:
-        """Each reasoning effort level must be forwarded as openai_reasoning_effort."""
+        """Each supported reasoning effort level must be forwarded as openai_reasoning_effort."""
         agent_def = AgentDef(
             name="reasoner",
-            model="gpt-5",
+            model="gpt-5-mini",
             reasoning=ReasoningConfig(effort=effort),  # type: ignore[arg-type]
         )
 
-        pydantic_agent = build_agent(
-            agent_def, system_prompt="", rendered_prompt="", backend="openai"
-        )
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+            return_value=True,
+        ):
+            pydantic_agent = build_agent(
+                agent_def, system_prompt="", rendered_prompt="", backend="openai"
+            )
 
         assert pydantic_agent.model_settings.get("openai_reasoning_effort") == effort
+
+    def test_openai_reasoning_effort_rejected_on_non_reasoning_model(self) -> None:
+        """Requirement: reasoning effort on a non-reasoning model raises ValidationError.
+
+        The shared helper reports False for the model, so build_agent must fail fast.
+        """
+        agent_def = AgentDef(
+            name="reasoner",
+            model="gpt-4o",
+            reasoning=ReasoningConfig(effort="low"),
+        )
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+            return_value=False,
+        ), pytest.raises(ValidationError, match="does not support reasoning.effort"):
+            build_agent(agent_def, system_prompt="", rendered_prompt="", backend="openai")
+
+    def test_openai_reasoning_effort_accepted_on_reasoning_model(self) -> None:
+        """Requirement: reasoning effort on a reasoning-capable model succeeds."""
+        agent_def = AgentDef(
+            name="reasoner",
+            model="o3-mini",
+            reasoning=ReasoningConfig(effort="high"),
+        )
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+            return_value=True,
+        ):
+            pydantic_agent = build_agent(
+                agent_def, system_prompt="", rendered_prompt="", backend="openai"
+            )
+
+        assert pydantic_agent.model_settings.get("openai_reasoning_effort") == "high"
+
+    def test_openai_reasoning_validated_against_default_model_when_agent_model_unset(self) -> None:
+        """Requirement: the reasoning-support check must use the workflow's default_model
+        when agent.model is unset, not the hardcoded library default."""
+        agent_def = AgentDef(
+            name="reasoner",
+            reasoning=ReasoningConfig(effort="low"),
+        )
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+            return_value=True,
+        ):
+            pydantic_agent = build_agent(
+                agent_def,
+                system_prompt="",
+                rendered_prompt="",
+                backend="openai",
+                default_model="o3-mini",
+            )
+
+        assert pydantic_agent.model_settings.get("openai_reasoning_effort") == "low"
 
     def test_openai_custom_base_url_without_key_raises(
         self, monkeypatch: pytest.MonkeyPatch

@@ -52,7 +52,9 @@ PricingSource = Literal["provider", "table", "none"]
 
 # Provider names that are known to the schema/factory but not yet implemented.
 # Surfaced as an informational note, not an error.
-_NOT_IMPLEMENTED: frozenset[str] = frozenset({"openai-agents"})
+_NOT_IMPLEMENTED: frozenset[str] = frozenset()
+
+_REMOVED_PROVIDER_NAMES: frozenset[str] = frozenset({"openai-agents"})
 
 # One-shot latch so a systemically-raising get_model_pricing hook logs once
 # per process rather than once per model (mirrors
@@ -107,9 +109,8 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
             "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
         ),
     ),
-    "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY", "OPENAI_BASE_URL")),
+    "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
     "hermes": _CredentialSpec(),
-    "openai-agents": _CredentialSpec(),
 }
 
 # Update-check opt-out env var (mirrors cli/update.py so diagnostics does not
@@ -572,9 +573,16 @@ async def gather_provider(
     Returns:
         A fully-populated :class:`ProviderDiagnostic`.
     """
-    implemented = name not in _NOT_IMPLEMENTED
+    implemented = name not in _NOT_IMPLEMENTED and name not in _REMOVED_PROVIDER_NAMES
     installed = _sdk_available(name) if implemented else False
     spec = _CREDENTIAL_SPECS.get(name, _CredentialSpec())
+
+    if name in _REMOVED_PROVIDER_NAMES:
+        note = "removed"
+    elif not implemented:
+        note = "not yet implemented"
+    else:
+        note = spec.optional_auth_note
 
     diag = ProviderDiagnostic(
         name=name,
@@ -583,10 +591,7 @@ async def gather_provider(
         tier=_provider_tier(name),
         credential_env_vars=_credential_env_vars(spec),
         credentials_optional=spec.optional,
-        # "not yet implemented" always wins over a provider's own credential
-        # note — there is nothing useful to say about a provider's auth path
-        # when it can't be instantiated at all.
-        note="not yet implemented" if not implemented else spec.optional_auth_note,
+        note=note,
     )
 
     do_check = check or list_models

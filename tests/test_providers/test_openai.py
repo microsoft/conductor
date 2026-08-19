@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 from pydantic import SecretStr
 from pydantic_ai import Agent
@@ -60,12 +62,9 @@ class TestProviderConstruction:
     def test_base_url_env_fallback_used_when_yaml_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Requirement: explicit env resolution (OPENAI_API_KEY, OPENAI_BASE_URL read in code,
-        never delegated to SDK ambient fallback).
-
-        Verify OPENAI_BASE_URL environment variable is used as a fallback for base_url
-        when not explicitly provided in the YAML config, and that explicit parameters
-        still win over the environment variable.
+        """Requirement: OPENAI_BASE_URL environment variable is used as a fallback for base_url
+        when not explicitly provided in the YAML config, and explicit parameters still win over
+        the environment variable.
         """
         monkeypatch.setenv("OPENAI_BASE_URL", "http://env-fallback:1234/v1")
 
@@ -79,6 +78,46 @@ class TestProviderConstruction:
         assert p_explicit._client is not None
         assert str(p_explicit._client.base_url) == "http://explicit-url:5678/v1/"
 
+    def test_custom_base_url_requires_explicit_api_key_with_ambient_key_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: ambient OPENAI_API_KEY is never forwarded to a custom endpoint.
+
+        When base_url is set (even via env) and no explicit api_key is passed, construction
+        must raise ValidationError even if OPENAI_API_KEY is present.
+        """
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://custom:1234/v1")
+
+        with pytest.raises(ValidationError, match="custom base_url requires an explicit api_key"):
+            OpenAIProvider(base_url="http://custom:1234/v1")
+
+    def test_custom_base_url_with_explicit_api_key_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: custom base_url is allowed when api_key is passed explicitly."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        p = OpenAIProvider(api_key="sk-explicit", base_url="http://custom:1234/v1")
+        assert p._api_key == "sk-explicit"
+        assert p._base_url == "http://custom:1234/v1"
+        assert p._client is not None
+
+    def test_api_key_stays_none_when_only_ambient_key_is_used(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: the builder guard stays reachable when only an ambient key is used.
+
+        With no custom base_url and OPENAI_API_KEY set, construction must succeed and
+        self._api_key must remain None so the builder can apply its own env fallback.
+        """
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        p = OpenAIProvider()
+        assert p._api_key is None
+        assert p._client is not None
+
     def test_temperature_validation_accepts_range(self) -> None:
         """OpenAI accepts temperatures up to 2.0."""
         p = OpenAIProvider(api_key="test-key", temperature=2.0)
@@ -90,14 +129,19 @@ class TestProviderConstruction:
             OpenAIProvider(api_key="test-key", temperature=2.5)
 
     def test_capabilities_are_stable(self) -> None:
-        """CAPABILITIES declares the expected stable-provider contract."""
+        """Requirement: CAPABILITIES reflects the reviewed OpenAI contract.
+
+        agent_reasoning_events is False because Chat Completions does not surface
+        reasoning content from api.openai.com, and reasoning_effort omits xhigh
+        until GPT-5.1-Codex-Max support is verified for arbitrary endpoints.
+        """
         caps = OpenAIProvider.CAPABILITIES
         assert caps.tier == "stable"
         assert caps.mcp_tools is True
         assert caps.workflow_tools_passthrough is True
         assert caps.streaming_events is True
-        assert caps.agent_reasoning_events is True
-        assert caps.reasoning_effort == ("low", "medium", "high", "xhigh")
+        assert caps.agent_reasoning_events is False
+        assert caps.reasoning_effort == ("low", "medium", "high")
         assert caps.structured_output == "native"
         assert caps.interrupt is True
         assert caps.max_session_seconds is True
@@ -235,7 +279,7 @@ class TestExecute:
     async def test_execute_accepts_supported_reasoning_effort(
         self, provider: OpenAIProvider, no_mcp_manager: Any
     ) -> None:
-        """Requirement: reasoning.effort='xhigh' is accepted at runtime.
+        """Requirement: reasoning.effort='high' is accepted at runtime.
 
         Verify that a supported effort level is allowed and passed down correctly.
         """
@@ -244,9 +288,9 @@ class TestExecute:
 
         agent = AgentDef(
             name="test_agent",
-            model="gpt-5",
+            model="gpt-5-mini",
             prompt="hi",
-            reasoning=ReasoningConfig(effort="xhigh"),
+            reasoning=ReasoningConfig(effort="high"),
         )
         captured_kwargs: dict[str, Any] = {}
 
@@ -261,7 +305,26 @@ class TestExecute:
             await provider.execute(agent, {}, "say hi")
 
         assert agent.reasoning is not None
-        assert agent.reasoning.effort == "xhigh"
+        assert agent.reasoning.effort == "high"
+
+    async def test_execute_rejects_xhigh_reasoning_effort(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """Requirement: reasoning.effort='xhigh' is rejected at the provider level.
+
+        xhigh is no longer in the OpenAI provider's supported reasoning_effort tuple.
+        """
+        # Requirement: Verify xhigh is rejected by CAPABILITIES membership.
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="test_agent",
+            model="gpt-5-mini",
+            prompt="hi",
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+        with pytest.raises(ValidationError, match="resolves to reasoning.effort='xhigh'"):
+            await provider.execute(agent, {}, "say hi")
 
 
 class TestExecuteDialogTurn:
@@ -296,6 +359,58 @@ class TestExecuteDialogTurn:
         assert kwargs.get("api_key") == "test-key"
         assert kwargs.get("timeout") == 600.0
 
+    async def test_dialog_turn_accepts_reasoning_on_reasoning_model(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: a supported effort on a reasoning-capable model succeeds."""
+        provider = OpenAIProvider(api_key="test-key", default_reasoning_effort="high")
+
+        async def fake_run(*args: Any, **kwargs: Any) -> Any:
+            class FakeResult:
+                output = "dialog reply"
+
+            return FakeResult()
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._resolve_openai_model"
+            ) as mock_resolve_model,
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+                return_value=True,
+            ),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run = fake_run
+            result = await provider.execute_dialog_turn(
+                "system prompt",
+                "user message",
+                history=[{"role": "user", "content": "previous"}],
+                model="gpt-5-mini",
+            )
+
+        assert result == "dialog reply"
+        kwargs = mock_resolve_model.call_args.kwargs
+        assert kwargs.get("api_key") == "test-key"
+        assert kwargs.get("timeout") == 600.0
+
+    async def test_dialog_turn_rejects_reasoning_on_non_reasoning_model(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: a supported effort on a non-reasoning model is rejected.
+
+        Per-model reasoning support is verified via the shared helper; a False result
+        must raise ValidationError before the request is sent.
+        """
+        provider = OpenAIProvider(api_key="test-key", default_reasoning_effort="high")
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+            return_value=False,
+        ), pytest.raises(ValidationError, match="does not support reasoning.effort"):
+            await provider.execute_dialog_turn("system prompt", "user message", model="gpt-4o")
+
     async def test_dialog_turn_rejects_unsupported_reasoning_effort(self) -> None:
         """Requirement: execute_dialog_turn() rejects unsupported reasoning effort.
 
@@ -315,27 +430,94 @@ class TestConnectionHelpers:
 
     @pytest.mark.asyncio
     async def test_validate_connection_returns_true_when_list_succeeds(
-        self, provider: OpenAIProvider
+        self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """validate_connection() returns True when models.list() succeeds."""
+        """Requirement: validate_connection() succeeds, logs models, and clears note."""
         from unittest.mock import AsyncMock
 
         mock_client = MagicMock()
-        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[]))
+        mock_client.models.list = AsyncMock(
+            return_value=MagicMock(data=[MagicMock(id="gpt-5-mini")])
+        )
         provider._client = mock_client  # type: ignore[assignment]
-        assert await provider.validate_connection() is True
+        with caplog.at_level("INFO"):
+            assert await provider.validate_connection() is True
+        assert provider._connection_probe_note is None
+        assert "Available OpenAI models: gpt-5-mini" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_validate_connection_returns_false_on_error(
+    async def test_validate_connection_warns_when_default_model_missing(
+        self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: a default model absent from the listing triggers a warning."""
+        from unittest.mock import AsyncMock
+
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[MagicMock(id="other")]))
+        provider._client = mock_client  # type: ignore[assignment]
+        with caplog.at_level("WARNING"):
+            assert await provider.validate_connection() is True
+        assert "Requested model 'gpt-5-mini' is not in the list" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_returns_false_on_non_http_error(
         self, provider: OpenAIProvider
     ) -> None:
-        """validate_connection() returns False when models.list() fails."""
+        """Requirement: a non-HTTP error from models.list() fails startup."""
         from unittest.mock import AsyncMock
 
         mock_client = MagicMock()
         mock_client.models.list = AsyncMock(side_effect=RuntimeError("boom"))
         provider._client = mock_client  # type: ignore[assignment]
         assert await provider.validate_connection() is False
+        assert provider._connection_probe_note is None
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_returns_false_on_api_connection_error(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: an unreachable host fails startup."""
+        from unittest.mock import AsyncMock
+
+        request = httpx.Request("GET", "http://custom/v1/models")
+        exc = openai.APIConnectionError(message="connection refused", request=request)
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(side_effect=exc)
+        provider._client = mock_client  # type: ignore[assignment]
+        assert await provider.validate_connection() is False
+        assert provider._connection_probe_note is None
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_returns_false_on_auth_error(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: rejected credentials (401/403) fail startup."""
+        from unittest.mock import AsyncMock
+
+        request = httpx.Request("GET", "http://custom/v1/models")
+        response = httpx.Response(401, request=request)
+        exc = openai.APIStatusError("unauthorized", response=response, body=None)
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(side_effect=exc)
+        provider._client = mock_client  # type: ignore[assignment]
+        assert await provider.validate_connection() is False
+        assert provider._connection_probe_note is None
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_returns_true_with_note_on_404(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: a non-auth HTTP failure is treated as inconclusive."""
+        from unittest.mock import AsyncMock
+
+        request = httpx.Request("GET", "http://custom/v1/models")
+        response = httpx.Response(404, request=request)
+        exc = openai.APIStatusError("not found", response=response, body=None)
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(side_effect=exc)
+        provider._client = mock_client  # type: ignore[assignment]
+        assert await provider.validate_connection() is True
+        assert provider._connection_probe_note == "unverified (HTTP 404)"
 
     @pytest.mark.asyncio
     async def test_list_models_returns_ids(self, provider: OpenAIProvider) -> None:
@@ -351,17 +533,68 @@ class TestConnectionHelpers:
         assert ids == ["gpt-5-mini", "gpt-5"]
 
     @pytest.mark.asyncio
-    async def test_get_model_capabilities_reasoning_models(self, provider: OpenAIProvider) -> None:
-        """Reasoning models advertise the full supported effort tuple."""
+    async def test_get_model_capabilities_reasoning_models(
+        self, provider: OpenAIProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: reasoning-capable models advertise the provider effort tuple."""
+
+        def _fake_profile(model: str) -> Any:
+            class Profile:
+                openai_supports_reasoning = True
+
+            return Profile()
+
+        monkeypatch.setattr("pydantic_ai.profiles.openai.openai_model_profile", _fake_profile)
         caps = await provider.get_model_capabilities("o3-mini")
         assert caps is not None
-        assert caps.supported_reasoning_efforts == ["low", "medium", "high", "xhigh"]
+        assert caps.supported_reasoning_efforts == ["low", "medium", "high"]
 
     @pytest.mark.asyncio
     async def test_get_model_capabilities_non_reasoning_models(
-        self, provider: OpenAIProvider
+        self, provider: OpenAIProvider, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Non-reasoning models advertise no supported reasoning efforts."""
-        caps = await provider.get_model_capabilities("gpt-5-mini")
+        """Requirement: non-reasoning models advertise no supported reasoning efforts."""
+
+        def _fake_profile(model: str) -> Any:
+            class Profile:
+                openai_supports_reasoning = False
+
+            return Profile()
+
+        monkeypatch.setattr("pydantic_ai.profiles.openai.openai_model_profile", _fake_profile)
+        caps = await provider.get_model_capabilities("gpt-4o")
         assert caps is not None
         assert caps.supported_reasoning_efforts == []
+
+    @pytest.mark.asyncio
+    async def test_get_model_capabilities_openrouter_prefix_not_misclassified(
+        self, provider: OpenAIProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: 'openai/gpt-4o-mini' must not be misclassified as reasoning."""
+
+        def _fake_profile(model: str) -> Any:
+            class Profile:
+                openai_supports_reasoning = False
+
+            return Profile()
+
+        monkeypatch.setattr("pydantic_ai.profiles.openai.openai_model_profile", _fake_profile)
+        caps = await provider.get_model_capabilities("openai/gpt-4o-mini")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == []
+
+    @pytest.mark.asyncio
+    async def test_get_model_capabilities_returns_none_when_profile_attr_missing(
+        self, provider: OpenAIProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: missing profile support attribute yields unknown capabilities."""
+
+        def _fake_profile(model: str) -> Any:
+            class Profile:
+                pass
+
+            return Profile()
+
+        monkeypatch.setattr("pydantic_ai.profiles.openai.openai_model_profile", _fake_profile)
+        caps = await provider.get_model_capabilities("some-model")
+        assert caps is None

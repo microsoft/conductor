@@ -327,7 +327,7 @@ class TestProvidersExpansion:
                 "conductor.fleet.tui.screens.providers.gather",
                 new=AsyncMock(
                     return_value=_FakeReport(
-                        [_diag("openai-agents", implemented=False, installed=False)]
+                        [_diag("openai", implemented=False, installed=False)]
                     )
                 ),
             ),

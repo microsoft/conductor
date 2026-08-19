@@ -27,7 +27,7 @@ workflow:
 
   # Runtime configuration
   runtime:
-    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", "hermes", or "openai-agents"
+    provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", "hermes", or "openai"
                                     # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
     temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude/hermes)
@@ -811,7 +811,7 @@ endpoints (Ollama, vLLM, LM Studio, Azure OpenAI, etc.).
 ```yaml
 runtime:
   provider:
-    name: string                  # "copilot" (default), "claude", "hermes", "openai-agents"
+    name: string                  # "copilot" (default), "openai", "claude", "claude-agent-sdk", "hermes"
     type: string                  # "openai" | "azure" | "anthropic" (Copilot-only)
     wire_api: string              # "completions" | "responses" (Copilot-only)
     base_url: string              # Endpoint base URL (copilot + hermes)

@@ -152,6 +152,7 @@ class ClaudeProvider(AgentProvider):
         # dispatch to, and a plugin that loaded only its skills would be
         # exactly the partial load ``plugins:`` exists to prevent.
         plugins=False,
+        max_temperature=1.0,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )

@@ -153,7 +153,7 @@ class TestConfigLoader:
         with patch.dict(
             os.environ,
             {
-                "PROVIDER": "openai-agents",
+                "PROVIDER": "openai",
                 "DEFAULT_MODEL": "gpt-4-turbo",
                 "AGENT_MODEL": "gpt-3.5",
                 "API_KEY": "secret123",
@@ -162,7 +162,7 @@ class TestConfigLoader:
             loader = ConfigLoader()
             config = loader.load(fixtures_dir / "valid_env_vars.yaml")
 
-        assert config.workflow.runtime.provider.name == "openai-agents"
+        assert config.workflow.runtime.provider.name == "openai"
         assert config.workflow.runtime.default_model == "gpt-4-turbo"
         assert config.agents[0].model == "gpt-3.5"
         assert "secret123" in config.agents[0].prompt

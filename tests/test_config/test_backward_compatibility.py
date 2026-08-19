@@ -91,9 +91,8 @@ class TestBackwardCompatibility:
         assert config.workflow.runtime is not None
         assert isinstance(config.workflow.runtime, RuntimeConfig)
 
-        # Verify provider is copilot (or not explicitly set to claude)
         if config.workflow.runtime.provider.name:
-            assert config.workflow.runtime.provider.name in ["copilot", "openai-agents"]
+            assert config.workflow.runtime.provider.name in ["copilot", "openai"]
 
     def test_copilot_workflow_with_new_schema_no_validation_errors(self):
         """Test that Copilot workflows load without validation errors with new schema.

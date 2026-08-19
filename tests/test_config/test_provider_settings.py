@@ -90,9 +90,11 @@ class TestProviderSettingsValidation:
         with pytest.raises(ValidationError, match="only supported when name='copilot'"):
             ProviderSettings(name="openai", headers={"X-Foo": "1"})
 
-    def test_non_copilot_with_base_url_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not yet implemented"):
-            ProviderSettings(name="openai-agents", base_url="http://some-proxy/v1")
+    def test_openai_wire_api_rejected(self) -> None:
+        with pytest.raises(
+            ValidationError, match=r"Provider fields \['wire_api'\] are Copilot-only"
+        ):
+            ProviderSettings(name="openai", wire_api="completions")
 
     def test_openai_with_base_url_and_api_key_accepted(self) -> None:
         s = ProviderSettings(name="openai", base_url="https://api.openai.com/v1", api_key="sk-xxx")

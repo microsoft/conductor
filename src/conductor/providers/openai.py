@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_OPENAI_REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
+_OPENAI_REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
 
 class RetryConfig(BaseModel):
@@ -106,11 +106,14 @@ class OpenAIProvider(AgentProvider):
         # Per-agent ``tools:`` allowlists are passed through to the Pydantic AI agent.
         workflow_tools_passthrough=True,
         streaming_events=True,
-        # Reasoning content is surfaced as ``agent_reasoning`` events when the model
-        # returns it.
-        agent_reasoning_events=True,
-        # OpenAI supports reasoning_effort on its reasoning models (o-series, etc.).
-        reasoning_effort=("low", "medium", "high", "xhigh"),
+        # Chat Completions never returns reasoning content from api.openai.com; only
+        # third-party proxies echoing ``reasoning_content`` would surface it. This
+        # becomes ``True`` only on an OpenAIResponsesModel backend.
+        agent_reasoning_events=False,
+        # OpenAI's reasoning models accept low/medium/high. ``xhigh`` arrived with the
+        # GPT-5.1-Codex-Max generation and upstream support is unverified for arbitrary
+        # endpoints, so declare the narrower tuple.
+        reasoning_effort=("low", "medium", "high"),
         # Tool-based structured output: the schema is enforced via a forced tool call.
         structured_output="native",
         # ``interrupt_signal`` is monitored by the shared Pydantic AI interrupt helper.
@@ -166,13 +169,17 @@ class OpenAIProvider(AgentProvider):
         """Initialize the OpenAI provider.
 
         Args:
-            api_key: OpenAI API key. If None, falls back to ``OPENAI_API_KEY`` env var.
-            base_url: Optional custom API endpoint. If set, ``api_key`` must be provided
-                explicitly — Conductor does not rely on ambient ``OPENAI_API_KEY`` for
-                authenticated custom endpoints.
+            api_key: OpenAI API key. If ``None`` and no custom ``base_url`` is set,
+                falls back to ``OPENAI_API_KEY``. A custom ``base_url`` requires an
+                explicit ``api_key`` because Conductor will not forward an ambient
+                ``OPENAI_API_KEY`` to a non-OpenAI endpoint.
+            base_url: Optional custom API endpoint. Resolves from ``OPENAI_BASE_URL``
+                when not passed explicitly. When set, ``api_key`` must also be provided
+                explicitly.
             model: Default model to use. Defaults to ``gpt-5-mini``.
             temperature: Default temperature (0.0-2.0).
-            max_tokens: Maximum output tokens. Defaults to 4096.
+            max_tokens: Maximum output tokens. ``None`` leaves the parameter unset so
+                the server applies its own default.
             timeout: Request timeout in seconds. Defaults to 600s.
             retry_config: Optional retry configuration. Uses default if not provided.
             mcp_servers: Optional MCP server configurations for tool support.
@@ -207,7 +214,7 @@ class OpenAIProvider(AgentProvider):
 
         if max_tokens is not None:
             self._validate_max_tokens(max_tokens)
-        self._default_max_tokens = max_tokens or 4096
+        self._default_max_tokens = max_tokens
 
         self._timeout = timeout
         self._sdk_version: str | None = None
@@ -227,6 +234,11 @@ class OpenAIProvider(AgentProvider):
         if self._base_url is None:
             self._base_url = os.environ.get("OPENAI_BASE_URL")
 
+        # Set when validate_connection()'s models.list() probe is inconclusive
+        # (see _connection_probe_verdict) rather than a confirmed success.
+        # diagnostics.py surfaces this note instead of silently claiming "connected".
+        self._connection_probe_note: str | None = None
+
         self._initialize_client()
 
     def _initialize_client(self) -> None:
@@ -241,19 +253,28 @@ class OpenAIProvider(AgentProvider):
         from openai import AsyncOpenAI
 
         client_kwargs: dict[str, Any] = {"timeout": self._timeout, "max_retries": 0}
-        effective_api_key = self._api_key
-        if effective_api_key is None:
-            effective_api_key = os.environ.get("OPENAI_API_KEY")
 
-        if not effective_api_key:
+        # A custom base_url must be paired with an explicit api_key. Conductor does not
+        # forward an ambient OPENAI_API_KEY to a non-OpenAI endpoint.
+        if self._base_url is not None and self._api_key is None:
             raise ValidationError(
-                "OPENAI_API_KEY environment variable is not set and no api_key was provided",
-                suggestion="Set OPENAI_API_KEY or pass api_key to the provider.",
+                "A custom base_url requires an explicit api_key.",
+                suggestion="Pass api_key in the provider config; Conductor will not forward "
+                "an ambient OPENAI_API_KEY to a non-OpenAI endpoint.",
             )
 
-        self._api_key = effective_api_key
+        if self._api_key is not None:
+            client_kwargs["api_key"] = self._api_key
+        else:
+            # Only fall back to the ambient key when no custom base_url was requested.
+            effective_api_key = os.environ.get("OPENAI_API_KEY")
+            if not effective_api_key:
+                raise ValidationError(
+                    "OPENAI_API_KEY environment variable is not set and no api_key was provided",
+                    suggestion="Set OPENAI_API_KEY or pass api_key to the provider.",
+                )
+            client_kwargs["api_key"] = effective_api_key
 
-        client_kwargs["api_key"] = effective_api_key
         if self._base_url is not None:
             client_kwargs["base_url"] = self._base_url
 
@@ -304,18 +325,92 @@ class OpenAIProvider(AgentProvider):
     async def validate_connection(self) -> bool:
         """Verify the provider can connect to the OpenAI API.
 
+        ``models.list()`` is not implemented by every OpenAI-compatible endpoint
+        (Ollama returns 404, some LiteLLM/Databricks gateways return other non-auth
+        status codes while ``/v1/chat/completions`` works), so a non-connection,
+        non-credential HTTP failure from this probe is treated as inconclusive
+        rather than fatal: the workflow proceeds and credentials are verified at
+        the first agent execution instead. Only an unreachable host, rejected
+        credentials (401/403), or a non-HTTP error still fail startup.
+
         Returns:
-            True if connection successful, False otherwise.
+            True if connection successful (or probe inconclusive), False otherwise.
         """
         if self._client is None:
             return False
 
         try:
-            await self._client.models.list()
+            models_page = await self._client.models.list()
+            self._report_available_models(models_page)
+            self._connection_probe_note = None
             return True
         except Exception as e:
-            logger.error(f"Connection validation failed: {e}")
+            return self._connection_probe_verdict(e)
+
+    def _connection_probe_verdict(self, exc: Exception) -> bool:
+        """Classify a ``models.list()`` failure as fatal or merely inconclusive.
+
+        Args:
+            exc: The exception raised by ``client.models.list()``.
+
+        Returns:
+            False when the failure indicates an unreachable host, rejected credentials,
+            or a non-HTTP error. True when the endpoint returned some other HTTP status
+            (it likely doesn't implement model listing) — startup proceeds and
+            credentials are verified on the first agent call.
+        """
+        if isinstance(exc, openai.APIConnectionError):
+            logger.error(f"Connection validation failed: {exc}")
             return False
+
+        if isinstance(exc, openai.APIStatusError):
+            # APIStatusError exposes status_code as a typed attribute.
+            status_code: int | None = getattr(exc, "status_code", None)
+        else:
+            # Fall back for a duck-typed error (e.g. a gateway-layer httpx.HTTPStatusError)
+            # that carries a status code without being an APIStatusError itself.
+            status_code = getattr(exc, "status_code", None)
+            if status_code is None:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            # A duck-typed status_code may be a non-int (e.g. a stringified "401" from
+            # a proxy wrapper) or an auto-created Mock attribute; neither is usable for
+            # the 401/403 check below, so route it into the fail-closed arm. `bool` is
+            # excluded explicitly since ``isinstance(True, int)`` is ``True``.
+            if not isinstance(status_code, int) or isinstance(status_code, bool):
+                status_code = None
+
+        if status_code is None:
+            logger.error(f"Connection validation failed: {exc}")
+            return False
+
+        if status_code in (401, 403):
+            logger.error(f"Connection validation failed: {exc}")
+            return False
+
+        logger.warning(
+            f"Could not verify connection via models.list() (HTTP {status_code}): {exc}. "
+            "This endpoint may not implement /v1/models. Continuing startup; credentials "
+            "will be verified on the first agent call."
+        )
+        self._connection_probe_note = f"unverified (HTTP {status_code})"
+        return True
+
+    def _report_available_models(self, models_page: Any) -> None:
+        """Log available models, warn if default model is unavailable.
+
+        Args:
+            models_page: The result of ``client.models.list()``.
+        """
+        available_models = [model.id for model in models_page.data]
+        logger.info(f"Available OpenAI models: {', '.join(available_models)}")
+
+        if self._default_model not in available_models:
+            logger.warning(
+                f"Requested model '{self._default_model}' is not in the list of "
+                f"available models. API calls may fail. Available: {available_models}"
+            )
+        else:
+            logger.debug(f"Default model '{self._default_model}' verified in available models")
 
     async def list_models(self) -> list[str] | None:
         """Return the model ids advertised by the OpenAI API.
@@ -343,15 +438,21 @@ class OpenAIProvider(AgentProvider):
     async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
         """Return reasoning-effort support and prompt-token limits for ``model``.
 
-        OpenAI does not expose token limits or reasoning defaults through its model
-        listing, so only the reasoning-effort capability is inferred from the model
-        id: models that are part of the OpenAI reasoning family advertise the
-        provider's supported effort tuple; other models advertise an empty list
-        ("supports none"). Unknown fields remain ``None``.
+        OpenAI does not expose token limits through its model listing, so only
+        reasoning-effort capability is inferred from the pydantic-ai model profile.
+        Returns ``None`` when the profile cannot be queried.
         """
-        lowered = model.lower()
-        is_reasoning_model = lowered.startswith("o") or "reasoning" in lowered
-        supported = list(_OPENAI_REASONING_EFFORTS) if is_reasoning_model else []
+        from pydantic_ai.profiles.openai import openai_model_profile
+
+        try:
+            profile = openai_model_profile(model)
+        except Exception:  # noqa: BLE001 - profile lookup is a best-effort capability probe
+            return None
+
+        supports_reasoning = getattr(profile, "openai_supports_reasoning", None)
+        if supports_reasoning is None:
+            return None
+        supported = list(_OPENAI_REASONING_EFFORTS) if supports_reasoning else []
         return ModelCapabilityInfo(
             supported_reasoning_efforts=supported,
             default_reasoning_effort=None,
@@ -469,6 +570,7 @@ class OpenAIProvider(AgentProvider):
         from pydantic_ai.models.openai import OpenAIChatModelSettings
 
         from conductor.providers._pydantic_ai.agent_builder import (
+            _openai_model_supports_reasoning,
             _resolve_openai_model,
         )
 
@@ -498,6 +600,16 @@ class OpenAIProvider(AgentProvider):
                     suggestion=(
                         "Choose a supported reasoning effort level, or use the "
                         "Copilot or Claude provider for 'max'."
+                    ),
+                )
+            supports_reasoning = _openai_model_supports_reasoning(resolved_model)
+            if supports_reasoning is False:
+                raise ValidationError(
+                    f"Model {resolved_model!r} does not support reasoning.effort, but "
+                    f"default_reasoning_effort={self._default_reasoning_effort!r} was requested.",
+                    suggestion=(
+                        "Use a reasoning-capable model (e.g. o-series, gpt-5-mini) or "
+                        "remove the reasoning config."
                     ),
                 )
             model_settings["openai_reasoning_effort"] = self._default_reasoning_effort

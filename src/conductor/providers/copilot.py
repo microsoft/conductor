@@ -271,6 +271,7 @@ class CopilotProvider(AgentProvider):
         # ``mcp_servers`` for MCP. The SDK's ``plugin_directories`` is
         # deliberately unused — see conductor.plugins for why.
         plugins=True,
+        max_temperature=1.0,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )

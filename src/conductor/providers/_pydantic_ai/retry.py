@@ -40,6 +40,11 @@ try:
 except ImportError:
     anthropic = None  # type: ignore[assignment]
 
+try:
+    import openai
+except ImportError:
+    openai = None  # type: ignore[assignment]
+
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 
 from conductor.config.schema import RetryPolicy
@@ -153,7 +158,7 @@ def _is_retryable_error(exception: Exception) -> bool:
     # translation. Issue #454.
     if isinstance(exception, ModelHTTPError):
         code = exception.status_code
-        return code == 429 or 500 <= code < 600
+        return code == 429 or code == 408 or 500 <= code < 600
     # A bare ModelAPIError is what APIConnectionError/APITimeoutError become —
     # a transport failure, retryable for the same reason the SDK names below
     # are. Checked with `type(...) is ...` rather than isinstance: ModelHTTPError
@@ -184,6 +189,11 @@ def _is_retryable_error(exception: Exception) -> bool:
             is_api_status = isinstance(exception, anthropic.APIStatusError)
         except TypeError:
             is_api_status = error_type_name in ("APIStatusError", "MockAPIStatusError")
+
+    if not is_api_status and openai is not None:
+        with contextlib.suppress(TypeError, AttributeError):
+            is_api_status = isinstance(exception, openai.APIStatusError)
+
     if not is_api_status:
         is_api_status = error_type_name in ("APIStatusError", "MockAPIStatusError")
 

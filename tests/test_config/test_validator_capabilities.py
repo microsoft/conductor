@@ -38,6 +38,7 @@ def _caps(**overrides: object) -> ProviderCapabilities:
         "usage_tracking": True,
         "concurrent_safe": True,
         "skills": True,
+        "max_temperature": 1.0,
     }
     base.update(overrides)
     return ProviderCapabilities(**base)  # type: ignore[arg-type]
@@ -213,7 +214,7 @@ class TestOpenAIProviderCrossCheck:
                 ),
             ],
         )
-        with pytest.raises(ConfigurationError, match="supports only.*low.*medium.*high.*xhigh"):
+        with pytest.raises(ConfigurationError, match="supports only.*low.*medium.*high"):
             validate_workflow_config(config)
 
     def test_non_empty_tools_allowlist_passes(self, patch_caps: Any) -> None:
@@ -266,7 +267,7 @@ class TestOpenAIProviderCrossCheck:
 
 class TestTemperatureCrossCheck:
     def test_temperature_above_one_with_openai_default_passes(self, patch_caps: Any) -> None:
-        patch_caps({"openai": _caps()})
+        patch_caps({"openai": _caps(max_temperature=2.0)})
         config = _build_workflow(
             temperature=1.5,
             agents=[AgentDef(name="a", prompt="hi", provider="openai")],
@@ -283,7 +284,7 @@ class TestTemperatureCrossCheck:
             validate_workflow_config(config)
 
     def test_temperature_above_one_agent_override_to_openai_passes(self, patch_caps: Any) -> None:
-        patch_caps({"copilot": _caps(), "openai": _caps()})
+        patch_caps({"copilot": _caps(), "openai": _caps(max_temperature=2.0)})
         config = _build_workflow(
             temperature=1.5,
             agents=[
@@ -294,7 +295,7 @@ class TestTemperatureCrossCheck:
         validate_workflow_config(config)  # no raise
 
     def test_temperature_above_one_mixed_providers_errors(self, patch_caps: Any) -> None:
-        patch_caps({"copilot": _caps(), "openai": _caps()})
+        patch_caps({"copilot": _caps(), "openai": _caps(max_temperature=2.0)})
         config = _build_workflow(
             temperature=1.5,
             agents=[
@@ -328,7 +329,7 @@ class TestTemperatureCrossCheck:
     ) -> None:
         """Requirement: workflow default=openai + temperature=1.5 with a per-agent
         provider='claude' override fails validation, naming temperature and claude."""
-        patch_caps({"openai": _caps(), "claude": _caps()})
+        patch_caps({"openai": _caps(max_temperature=2.0), "claude": _caps()})
         config = _build_workflow(
             provider="openai",
             temperature=1.5,
@@ -345,7 +346,7 @@ class TestTemperatureCrossCheck:
     ) -> None:
         """Requirement: workflow default=openai + temperature=1.5 with a for_each
         inline provider='claude' override fails validation, naming temperature and claude."""
-        patch_caps({"openai": _caps(), "claude": _caps()})
+        patch_caps({"openai": _caps(max_temperature=2.0), "claude": _caps()})
         config = _build_workflow(
             provider="openai",
             temperature=1.5,
@@ -704,7 +705,7 @@ class TestReasoningEffortCrossCheck:
                 ),
             ],
         )
-        with pytest.raises(ConfigurationError, match="supports only.*low.*medium.*high.*xhigh"):
+        with pytest.raises(ConfigurationError, match="supports only.*low.*medium.*high"):
             validate_workflow_config(config)
 
     def test_xhigh_effort_passes_against_real_hermes_capabilities(self, patch_caps: Any) -> None:
@@ -980,27 +981,25 @@ class TestRubberDuckFollowups:
         )
         validate_workflow_config(config)  # must not raise
 
-    def test_openai_agents_placeholder_does_not_error_at_validate(
+    def test_openai_agents_rejected_by_schema_at_validate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Known-but-unimplemented providers return a permissive placeholder.
+        """The removed `openai-agents` provider name now fails at schema load time.
 
-        Previously `openai-agents` would surface "no declared
-        ProviderCapabilities" at validate time — overriding the factory's
-        authoritative "not yet implemented" error at runtime.
+        Removing the placeholder ensures a workflow naming it fails early with
+        a schema validation error instead of a confusing runtime message.
         """
-        # Use the REAL resolver (don't monkeypatch) so the placeholder path
-        # is exercised end-to-end.
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="t",
-                entry_point="a",
-                runtime=RuntimeConfig(provider="openai-agents"),
-            ),
-            agents=[AgentDef(name="a", prompt="hi")],
-        )
-        # No raise expected — placeholder permits everything.
-        validate_workflow_config(config)
+        from pydantic import ValidationError as PydanticValidationError
+
+        with pytest.raises(PydanticValidationError, match="openai-agents"):
+            WorkflowConfig(
+                workflow=WorkflowDef(
+                    name="t",
+                    entry_point="a",
+                    runtime=RuntimeConfig(provider="openai-agents"),
+                ),
+                agents=[AgentDef(name="a", prompt="hi")],
+            )
 
 
 class TestConcurrencyOverrides:

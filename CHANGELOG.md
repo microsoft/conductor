@@ -560,7 +560,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Chat Completions endpoint (Ollama, vLLM, LM Studio, OpenRouter, corporate
   proxies). Supports MCP tools, structured output, interrupts, reasoning effort
   (`low`/`medium`/`high`/`xhigh`), and full temperature range `0.0`–`2.0`.
-  See `docs/providers/openai.md` and `examples/openai-compatible.yaml`.
+  The Pydantic AI dependency was narrowed from the full `pydantic-ai` package
+  to `pydantic-ai-slim[anthropic,openai]`; this drops the bundled
+  `pydantic_ai.mcp` module, which Conductor replaces with its own toolset
+  bridge, so the change is transparent to users.
+  The previously reserved `openai-agents` provider name has been removed from
+  the schema and factory; workflows that named it now fail at schema load time
+  rather than at the first agent execution. See `docs/providers/openai.md` and
+  `examples/openai-compatible.yaml`.
 - **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
   previously offered only Stop, Resume, and Kill — there was no way to
   correct a run's course without stopping it first. `conductor guide --text

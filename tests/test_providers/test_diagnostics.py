@@ -159,11 +159,11 @@ class TestGatherProviderOffline:
         diag = await d.gather_provider("hermes")
         assert diag.installed is False
 
-    async def test_openai_agents_not_implemented(self) -> None:
+    async def test_removed_provider_rejected(self) -> None:
         diag = await d.gather_provider("openai-agents")
         assert diag.implemented is False
         assert diag.installed is False
-        assert diag.note == "not yet implemented"
+        assert "removed" in (diag.note or "").lower()
 
     async def test_credential_presence(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
@@ -731,7 +731,7 @@ class TestGather:
         assert report.providers is not None
         assert report.registries is not None
         names = {p.name for p in report.providers}
-        assert {"copilot", "claude", "openai-agents"} <= names
+        assert {"copilot", "claude", "openai"} <= names
 
     async def test_single_section(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", "1")

@@ -682,9 +682,14 @@ class TestRuntimeConfig:
 
     def test_custom_provider(self) -> None:
         """Test custom provider setting."""
-        config = RuntimeConfig(provider="openai-agents", default_model="gpt-4")
-        assert config.provider.name == "openai-agents"
+        config = RuntimeConfig(provider="openai", default_model="gpt-4")
+        assert config.provider.name == "openai"
         assert config.default_model == "gpt-4"
+
+    def test_openai_agents_rejected_by_schema(self) -> None:
+        """The removed `openai-agents` provider name now fails schema validation."""
+        with pytest.raises(ValidationError):
+            RuntimeConfig(provider="openai-agents", default_model="gpt-4")
 
     def test_working_dir_defaults_to_none(self) -> None:
         """Requirement: runtime.working_dir is an optional workflow-wide default."""

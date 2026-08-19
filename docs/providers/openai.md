@@ -16,23 +16,13 @@ The OpenAI provider enables Conductor workflows to execute agents using OpenAI's
 
 ## Quick Start
 
-### 1. Install the OpenAI SDK
-
-```bash
-# Using uv (recommended)
-uv add 'openai>=1.0.0'
-
-# Using pip
-pip install 'openai>=1.0.0'
-```
-
-### 2. Set up your API key
+### 1. Set up your API key
 
 ```bash
 export OPENAI_API_KEY=sk-...
 ```
 
-### 3. Update your workflow
+### 2. Update your workflow
 
 ```yaml
 workflow:
@@ -53,7 +43,7 @@ agents:
       - to: $end
 ```
 
-### 4. Run your workflow
+### 3. Run your workflow
 
 ```bash
 conductor run my-openai-workflow.yaml --input question="What is Python?"
@@ -207,11 +197,13 @@ OpenAI reasoning models (such as `o1`, `o3-mini`) support the `reasoning.effort`
 
 | Effort Level | Supported by OpenAI | Note |
 |--------------|----------------------|------|
-| `low` | Yes | Fast reasoning |
-| `medium` | Yes | Balanced reasoning |
-| `high` | Yes | Deep reasoning |
-| `xhigh` | Yes | Extra high reasoning |
+| `low` | Yes (reasoning models) | Fast reasoning |
+| `medium` | Yes (reasoning models) | Balanced reasoning |
+| `high` | Yes (reasoning models) | Deep reasoning |
+| `xhigh` | **No (Rejected)** | Only `low`/`medium`/`high` are accepted by the GPT-5.1-Codex-Max generation and by `o1`/`o3-mini`/`o4-mini`; `xhigh` is rejected. |
 | `max` | **No (Rejected)** | Raises `ValidationError` |
+
+Only reasoning models accept `reasoning.effort`; on a non-reasoning model such as `gpt-4o` the setting is validated against the model and also raises `ValidationError`.
 
 ```yaml
 workflow:
@@ -241,15 +233,6 @@ workflow:
 HTTP and SSE MCP server types are not supported by the OpenAI provider (`stdio` only).
 
 ## Troubleshooting
-
-### Missing OpenAI SDK
-
-If `openai` package is not installed:
-
-```text
-ProviderError: OpenAI SDK not installed
-Suggestion: Install with: uv add 'openai>=1.0.0'
-```
 
 ### Missing API Key
 

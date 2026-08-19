@@ -190,12 +190,15 @@ class ProviderCapabilities(BaseModel):
     to ``False``."""
 
     session_continuity: bool = False
-    """``True`` when the provider honors an agent's ``session_key``, reusing
-    one provider session across every execution tagged with that key.
+    """``True`` when the provider supports per-agent ``session_key``."""
 
-    Agents that set ``session_key:`` against a provider with
-    ``session_continuity=False`` fail validation, rather than silently losing
-    the context the author asked to keep. Defaults to ``False``."""
+    max_temperature: float | None = None
+    """Highest temperature the provider accepts.
+
+    ``None`` means no provider-specific cap (the schema bound ``0..2``
+    applies). The validator enforces this statically; ``create_provider``
+    enforces it at construction so ``run`` / ``resume`` are covered too.
+    """
 
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.
@@ -296,7 +299,7 @@ _PROVIDER_CLASS_PATHS: Final[dict[str, str]] = {
 # the validator does NOT pre-empt the factory's "not yet implemented"
 # error — the workflow author should see one clear failure at run time,
 # not a misleading "no capabilities declared" error at validate time.
-_NOT_YET_IMPLEMENTED_PROVIDERS: Final[frozenset[str]] = frozenset({"openai-agents"})
+_NOT_YET_IMPLEMENTED_PROVIDERS: Final[frozenset[str]] = frozenset()
 
 
 def _build_unimplemented_placeholder() -> ProviderCapabilities:

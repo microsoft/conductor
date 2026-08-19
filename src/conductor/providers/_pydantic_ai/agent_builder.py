@@ -335,18 +335,37 @@ def _coerce_for_thinking(
     return 1.0, effective_max_tokens
 
 
+def _openai_model_supports_reasoning(model_name: str) -> bool | None:
+    """Return whether ``model_name`` supports OpenAI ``reasoning_effort``.
+
+    Uses pydantic-ai's model profile when available. Returns ``None`` when the
+    profile attribute is missing (older pydantic-ai), so callers can skip the
+    check rather than guess.
+    """
+    from pydantic_ai.profiles.openai import openai_model_profile
+
+    try:
+        profile = openai_model_profile(model_name)
+    except Exception:  # noqa: BLE001 - profile lookup is a best-effort capability probe
+        return None
+    return getattr(profile, "openai_supports_reasoning", None)
+
+
 def _build_openai_model_settings(
     agent: AgentDef,
     default_temperature: float | None,
     default_max_tokens: int | None,
     default_reasoning_effort: ReasoningEffort | None,
+    default_model: str | None = None,
     timeout: float | None = None,
 ) -> OpenAIChatModelSettings:
     """Build ``OpenAIChatModelSettings`` from the agent and runtime defaults.
 
     OpenAI reasoning effort is forwarded directly as the
     ``openai_reasoning_effort`` field; unlike Anthropic extended thinking it
-    does not require coercion of temperature or max_tokens.
+    does not require coercion of temperature or max_tokens. When reasoning is
+    requested, the model is checked via pydantic-ai's profile so a non-reasoning
+    model fails fast instead of producing a 400 at runtime.
     """
     effort = resolve_reasoning_effort(agent, default_reasoning_effort)
 
@@ -354,6 +373,19 @@ def _build_openai_model_settings(
     temperature = agent_temperature if agent_temperature is not None else default_temperature
     agent_max_tokens = getattr(agent, "max_tokens", None)
     max_tokens = agent_max_tokens if agent_max_tokens is not None else default_max_tokens
+
+    if effort is not None:
+        model_name = (agent.model or default_model) or DEFAULT_OPENAI_MODEL
+        supports_reasoning = _openai_model_supports_reasoning(model_name)
+        if supports_reasoning is False:
+            raise ValidationError(
+                f"Model {model_name!r} does not support reasoning.effort, but "
+                f"reasoning.effort={effort!r} was requested for agent {agent.name!r}.",
+                suggestion=(
+                    "Use a reasoning-capable model (e.g. o-series, gpt-5-mini) or "
+                    "remove the reasoning config."
+                ),
+            )
 
     settings: OpenAIChatModelSettings = OpenAIChatModelSettings()
     if temperature is not None:
@@ -488,6 +520,7 @@ def build_agent(
             default_temperature,
             default_max_tokens,
             default_reasoning_effort,
+            default_model=default_model,
             timeout=timeout,
         )
     else:

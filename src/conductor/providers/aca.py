@@ -265,9 +265,10 @@ class AcaRuntimeProvider(AgentProvider):
         # `aca`-backed agent rather than silently dropping it.
         skills=False,
         # No plugin surface for the same reason: subagent definitions and
-        # MCP declarations live in host-filesystem directories the
-        # in-sandbox runner cannot read.
+        # MCP declarations live in host-filesystem directories the in-sandbox
+        # runner cannot read.
         plugins=False,
+        max_temperature=1.0,
         upstream_pin="azure-identity>=1.19.0",
         maintainer=None,
     )

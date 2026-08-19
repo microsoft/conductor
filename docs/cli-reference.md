@@ -903,11 +903,10 @@ in the `env` section (cache-first, short timeout, silent, and skipped when
 - **env** — Conductor version, Python version, OS/platform, and update
   availability.
 - **providers** — for each known provider (`copilot`, `claude`,
-  `claude-agent-sdk`, `hermes`, `openai-agents`): whether the SDK is
-  installed, the capability tier (`stable` / `experimental`), which
-  credential environment variables are **present** (presence only — values
-  are never printed), and — with `--check` / `--models` — connection status
-  and a model count. `openai-agents` is surfaced as "not yet implemented".
+  `claude-agent-sdk`, `hermes`, `openai`): whether the SDK is installed,
+  the capability tier (`stable` / `experimental`), which credential environment
+  variables are **present** (presence only — values are never printed), and
+  — with `--check` / `--models` — connection status and a model count.
 - **registries** — configured workflow registries and which is the default
   (see [`conductor registry`](#conductor-registry)).
 
@@ -940,10 +939,10 @@ Coverage varies by provider — every field degrades independently to `n/a` /
   none) and reports only `Prompt` (via the Anthropic API's
   `max_input_tokens`) — `Output` and `Context` are always `—` and `Default`
   is always `—` (Anthropic has no per-model default-effort concept).
-- **`claude-agent-sdk`**, **`hermes`**, and **`openai-agents`** don't
-  implement model enumeration (`list_models`) at all, so `--models` shows
-  `n/a` for them in the Providers table and they get **no** Models detail
-  table — there is nothing to detail.
+- **`claude-agent-sdk`** and **`hermes`** don't implement model
+  enumeration (`list_models`) at all, so `--models` shows `n/a` for them in
+  the Providers table and they get **no** Models detail table — there is
+  nothing to detail.
 
 In `--json`, each provider's `models` field is a list of objects (not plain
 id strings):
@@ -973,7 +972,7 @@ values are never read or printed. Detected variables per provider:
 | `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | required (direct Anthropic API) |
 | `claude-agent-sdk` | `ANTHROPIC_API_KEY` | optional override — authenticates via `claude login` |
 | `hermes` | *(none — endpoint / API key are passed explicitly)* | — |
-| `openai-agents` | *(none — not yet implemented)* | — |
+| `openai` | `OPENAI_API_KEY` | required (direct OpenAI API) |
 
 For **`copilot`** and **`claude-agent-sdk`**, these env vars are *optional
 overrides*: both providers authenticate primarily via an on-disk CLI login

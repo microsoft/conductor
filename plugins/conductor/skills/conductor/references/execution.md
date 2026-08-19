@@ -17,7 +17,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--input`, `-i NAME=VALUE` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | Alternative input syntax |
 | `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML `metadata:` (repeatable; values stay strings) |
-| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `claude`, `claude-agent-sdk`, `hermes`, `openai-agents`) |
+| `--provider`, `-p PROVIDER` | Override provider (`copilot`, `openai`, `claude`, `claude-agent-sdk`, `hermes`) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
 | `--web` | Start real-time web dashboard |
@@ -623,7 +623,7 @@ If the workflow file has changed since the checkpoint was saved, a warning is di
 conductor run workflow.yaml -p claude          # Use Claude for all agents
 conductor run workflow.yaml -p copilot         # Use Copilot (default)
 conductor run workflow.yaml -p hermes          # Use Hermes (NousResearch agent SDK)
-conductor run workflow.yaml -p openai-agents   # Use OpenAI Agents SDK
+conductor run workflow.yaml -p openai        # Use OpenAI provider
 ```
 
 ### Per-Agent Provider Override
@@ -667,7 +667,7 @@ conductor run workflow.yaml --input q="test" | jq '.answer'
 |----------|-------------|
 | `GITHUB_TOKEN` | GitHub Copilot authentication |
 | `ANTHROPIC_API_KEY` | Claude provider API key |
-| `OPENAI_API_KEY` | OpenAI Agents provider API key (when `provider: openai-agents`) |
+| `OPENAI_API_KEY` | OpenAI provider API key (when `provider: openai`) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `CONDUCTOR_NO_UPDATE_CHECK` | Set to `1` to suppress the passive update-check hint |
 

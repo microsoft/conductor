@@ -1136,6 +1136,14 @@ def _validate_skill_entries(entries: list[str]) -> list[str]:
     return entries
 
 
+ProviderName = Literal["copilot", "openai", "claude", "claude-agent-sdk", "hermes", "aca"]
+"""Canonical set of supported agent provider names.
+
+Used by :attr:`AgentDef.provider` and :attr:`ProviderSettings.name` so the
+schema, factory, and registry cannot drift out of sync.
+"""
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow.
 
@@ -1191,7 +1199,7 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "openai", "claude", "claude-agent-sdk", "hermes"] | None = None
+    provider: ProviderName | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -2602,9 +2610,7 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal[
-        "copilot", "openai", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"
-    ] = "copilot"
+    name: ProviderName = "copilot"
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None

@@ -6,8 +6,9 @@ provider instances with lazy instantiation and caching.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
+from conductor.config.schema import ProviderName
 from conductor.providers.base import AgentProvider
 from conductor.providers.factory import create_provider
 
@@ -15,15 +16,7 @@ if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
 
 
-ProviderType = Literal[
-    "copilot",
-    "openai",
-    "openai-agents",
-    "claude",
-    "claude-agent-sdk",
-    "hermes",
-    "aca",
-]
+ProviderType = ProviderName
 
 
 class ProviderRegistry:

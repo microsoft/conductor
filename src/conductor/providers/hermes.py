@@ -116,6 +116,7 @@ class HermesProvider(AgentProvider):
         # Hermes runs its own internal toolsets (mcp_tools=False); a
         # per-agent working directory has no meaning for the session.
         working_dir=False,
+        max_temperature=1.0,
         upstream_pin="hermes-agent",
         maintainer="(community contribution)",
     )

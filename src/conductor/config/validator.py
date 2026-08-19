@@ -2525,21 +2525,24 @@ def _validate_provider_capabilities(
                     f"or remove the workflow-level skills."
                 )
 
-    if runtime_temperature is not None and runtime_temperature > 1.0:
-        providers_over_one: dict[str, list[str]] = {}
+    if runtime_temperature is not None:
+        providers_over_ceiling: dict[str, list[str]] = {}
         for agent in all_llm_agents:
             pname = _resolved_provider_name(agent, default_provider)
-            if pname == "openai":
+            pcaps = _caps_for(pname)
+            if pcaps is None or pcaps.max_temperature is None:
                 continue
-            providers_over_one.setdefault(pname, []).append(agent.name)
-        for pname, agent_names in providers_over_one.items():
+            if runtime_temperature > pcaps.max_temperature:
+                providers_over_ceiling.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_over_ceiling.items():
+            pcaps = _caps_for(pname)
+            ceiling = pcaps.max_temperature if pcaps is not None else 1.0
             errors.append(
                 f"Workflow declares 'runtime.temperature'={runtime_temperature!r} "
-                f"but provider '{pname}' only supports temperatures up to 1.0 "
+                f"but provider '{pname}' only supports temperatures up to {ceiling!r} "
                 f"and is used by agent(s): {sorted(agent_names)!r}. "
-                f"Override these agents to provider 'openai', lower the "
-                f"temperature to 1.0 or below, or remove the workflow-level "
-                f"temperature."
+                f"Override these agents to a provider with a higher temperature ceiling, "
+                f"lower the temperature, or remove the workflow-level temperature."
             )
 
     # ----- Per-agent checks -----
