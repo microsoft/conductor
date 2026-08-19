@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.32...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
+
+## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 
 ### Added
 
@@ -115,9 +117,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workflow out and fail the `--web-bg` launcher smoke job. Provider-backed
   agents are unaffected — they still report the window on both
   `agent_started` and `agent_completed`.
-
-### Fixed
-
+- **Fleet Manager TUI: the footer now says what `enter` does on each
+  screen** (issue #459). Every drill-down screen bound `enter` but left it
+  unlabeled, so the one key that navigates the TUI was the one key the
+  footer never advertised — Runs opens the run detail, Run detail opens the
+  step detail, History surfaces the `conductor replay` command, Providers
+  expands or collapses a provider, and Registries opens that registry's
+  workflows. The binding is also hidden whenever it would do nothing: an
+  empty, failed, or still-loading table, or a Providers sub-row that is not
+  a provider. Expanding a provider a second time now collapses the provider
+  you were actually on rather than whichever row the rebuild left under the
+  cursor. See [`docs/fleet.md`](docs/fleet.md).
 - **The Pydantic AI provider (`claude`) never retried on HTTP 429/5xx or
   transport errors** (#454). pydantic-ai's Anthropic model translates the
   SDK's exceptions before Conductor ever sees them (a private helper,
