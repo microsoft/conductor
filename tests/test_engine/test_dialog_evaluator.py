@@ -232,3 +232,36 @@ class TestDialogEvaluatorEvaluate:
         call_args = provider.execute_dialog_turn.call_args
         assert "Trigger when confused" in call_args.kwargs["system_prompt"]
         assert "my_agent" in call_args.kwargs["user_message"]
+
+
+class TestUnsupportedProviderIsLoud:
+    """A provider with no dialog support must fail, not skip silently."""
+
+    async def test_not_implemented_raises_provider_error(self) -> None:
+        from conductor.exceptions import ProviderError
+
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            side_effect=NotImplementedError("does not support dialog turns")
+        )
+        agent = AgentDef(
+            name="grill",
+            prompt="hi",
+            dialog=DialogConfig(trigger_prompt="ask if unsure"),
+        )
+
+        with pytest.raises(ProviderError, match="does not support dialog turns"):
+            await DialogEvaluator()._run_evaluator(agent, {"result": "text"}, provider)
+
+    async def test_other_failures_still_skip(self) -> None:
+        """A transient evaluator failure must stay fail-open, as before."""
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(side_effect=RuntimeError("boom"))
+        agent = AgentDef(
+            name="grill",
+            prompt="hi",
+            dialog=DialogConfig(trigger_prompt="ask if unsure"),
+        )
+
+        result = await DialogEvaluator()._run_evaluator(agent, {"result": "text"}, provider)
+        assert result.trigger is False

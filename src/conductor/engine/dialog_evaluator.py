@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from conductor.exceptions import ProviderError
+
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
     from conductor.providers.base import AgentProvider
@@ -148,6 +150,17 @@ class DialogEvaluator:
                 model=agent.model,
             )
             return self._parse_evaluation(result)
+        except NotImplementedError as exc:
+            # Otherwise the agent silently never asks — reads as "no questions".
+            raise ProviderError(
+                f"Agent '{agent.name}' declares 'dialog:' but provider "
+                f"{type(provider).__name__} does not support dialog turns.",
+                suggestion=(
+                    "Remove the 'dialog:' block, or run this agent on a provider "
+                    "that supports it (copilot, claude)."
+                ),
+                is_retryable=False,
+            ) from exc
         except Exception:
             logger.warning(
                 "Dialog evaluation failed for agent '%s', skipping dialog",
