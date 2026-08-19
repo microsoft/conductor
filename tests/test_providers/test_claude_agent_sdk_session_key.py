@@ -231,7 +231,7 @@ class TestUnresolvableSession:
             output = await _run(provider, "analyze", "investigation")
 
         assert rec.resumes == [None, None]
-        assert output.content == {"response": "working"}
+        assert output.content == {"result": "working"}
         # The newer session replaces the one that could not be resumed.
         assert provider.get_session_ids() == {_ck("investigation"): "sess-2"}
 

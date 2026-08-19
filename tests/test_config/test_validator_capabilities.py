@@ -179,7 +179,15 @@ class TestToolsAllowlistCrossCheck:
         configured MCP server set unconditionally (``mcp_tools=True`` +
         ``workflow_tools_passthrough=False``, e.g. ``aca``) — every tool stays
         attached regardless of the empty allowlist."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        patch_caps(
+            {
+                "copilot": _caps(
+                    workflow_tools_passthrough=False,
+                    mcp_tools=True,
+                    mcp_servers_always_attached=True,
+                )
+            }
+        )
         config = _build_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
             mcp_servers={"docs": MCPServerDef(command="docs-server")},
@@ -311,7 +319,15 @@ class TestForEachInlineToolsCrossCheck:
     def test_inline_empty_tools_with_mcp_servers_errors(self, patch_caps: Any) -> None:
         """Mirror of the top-level case: ``tools: []`` cannot be honored when
         the provider attaches every declared MCP server regardless."""
-        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        patch_caps(
+            {
+                "copilot": _caps(
+                    workflow_tools_passthrough=False,
+                    mcp_tools=True,
+                    mcp_servers_always_attached=True,
+                )
+            }
+        )
         config = self._for_each_mcp_config(
             inline=AgentDef(name="inner", prompt="{{ item }}", tools=[]),
             mcp_servers={"docs": MCPServerDef(command="docs-server")},
@@ -1515,6 +1531,7 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
         agents: list[AgentDef],
         mcp_servers: dict[str, MCPServerDef] | None = None,
         working_dir: str | None = None,
+        tools: list[str] | None = None,
     ) -> WorkflowConfig:
         from conductor.config.schema import ProviderSettings
 
@@ -1529,6 +1546,7 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
                 ),
             ),
             agents=agents,
+            tools=tools or [],
         )
 
     def _patch(self, patch_caps: Any) -> None:
@@ -1563,12 +1581,21 @@ class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
         config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", tools=[])])
         validate_workflow_config(config)  # no raise
 
-    def test_non_empty_tools_is_still_rejected(self, patch_caps: Any) -> None:
-        """``workflow_tools_passthrough`` stays False — #335 did not change it."""
+    def test_non_empty_tools_is_accepted(self, patch_caps: Any) -> None:
+        """A non-empty allowlist is now honored, so validate must not reject it.
+
+        The provider enumerates the declared MCP servers and denies every tool
+        the agent did not allowlist, so ``workflow_tools_passthrough`` is
+        genuinely True — this is the capability flip, pinned the same way
+        ``test_agent_working_dir_is_accepted`` pins #348's.
+        """
         self._patch(patch_caps)
-        config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", tools=["search"])])
-        with pytest.raises(ConfigurationError, match="does not honor per-agent tool allowlists"):
-            validate_workflow_config(config)
+        config = self._sdk_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=["docs__read"])],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
+            tools=["docs__read", "docs__write"],
+        )
+        validate_workflow_config(config)  # no raise
 
     def test_agent_working_dir_is_accepted(self, patch_caps: Any) -> None:
         """The whole point of #348: an agent-level working_dir no longer fails

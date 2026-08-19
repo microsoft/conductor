@@ -1894,20 +1894,27 @@ def _validate_provider_capabilities(
           and hits the same refusal mid-run (now a ``resolves to tools=[...]``
           ``ProviderError``) rather than failing fast at validate.
         """
-        if agent.tools is not None and not caps.workflow_tools_passthrough:
-            if agent.tools:
+        if agent.tools is not None and (
+            not caps.workflow_tools_passthrough or caps.mcp_servers_always_attached
+        ):
+            if agent.tools and not caps.workflow_tools_passthrough:
                 errors.append(
                     f"Agent '{agent.name}' declares tools={agent.tools!r} but provider "
                     f"'{provider_name}' does not honor per-agent tool allowlists "
                     f"(capabilities.workflow_tools_passthrough=False). Silently "
                     f"granting different tools than declared is a security regression."
                 )
-            elif caps.mcp_tools and workflow_mcp_servers:
+            elif (
+                not agent.tools
+                and caps.mcp_servers_always_attached
+                and caps.mcp_tools
+                and workflow_mcp_servers
+            ):
                 errors.append(
                     f"Agent '{agent.name}' declares 'tools: []' to disable all tools, but "
                     f"provider '{provider_name}' forwards the full configured MCP server "
                     f"set unconditionally (capabilities.mcp_tools=True, "
-                    f"workflow_tools_passthrough=False) — there is no way to disable "
+                    f"mcp_servers_always_attached=True) — there is no way to disable "
                     f"tools for this provider yet. Remove 'tools: []' or the workflow's "
                     f"'mcp_servers:' entirely."
                 )

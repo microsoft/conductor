@@ -218,6 +218,20 @@ _DEFAULT_TOOL_PRESET: dict[str, str] = {"type": "preset", "preset": "claude_code
 # enabled.
 _SKILL_TOOL: Final[str] = "Skill"
 
+# Conductor's ``<server>__<tool>`` is the CLI's ``mcp__<server>__<tool>``.
+_MCP_TOOL_PREFIX: Final[str] = "mcp__"
+
+# Denied alongside any allowlist: ``allowed_tools`` only pre-approves, so a
+# read-only MCP list is void if native Write/Bash stay open.
+_BUILTIN_WRITE_TOOLS: Final[tuple[str, ...]] = (
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+)
+
 # Keys ``_translate_mcp_servers`` can carry onto the SDK's config shapes.
 # ``tools`` and ``timeout`` are handled explicitly above (refused / warned),
 # so they count as recognised even though they are not forwarded.
@@ -245,8 +259,8 @@ _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
 
 # Sentinel meaning "expose every tool this server offers" in
-# ``MCPServerDef.tools``. Any other value is a narrowing filter the SDK has no
-# way to express — see :func:`_translate_mcp_servers`.
+# ``MCPServerDef.tools``. Any other value narrows, honored by denying the
+# complement — see :func:`_server_tool_filters`.
 _ALL_TOOLS: Final[str] = "*"
 
 # Prefix for our entries in the checkpoint session map, a flat dict shared by
@@ -286,6 +300,51 @@ def _warn_if_session_lookup_unavailable() -> None:
     )
 
 
+def _server_tool_filters(mcp_servers: dict[str, Any]) -> dict[str, set[str]]:
+    """Narrowing per-server ``tools:`` filters as ``{server: {tool, ...}}``.
+
+    Names are unqualified as authored. Servers with no filter, or ``["*"]``, are
+    absent — nothing to narrow.
+    """
+    return {
+        name: set(config["tools"])
+        for name, config in mcp_servers.items()
+        if config.get("tools") is not None and list(config["tools"]) != [_ALL_TOOLS]
+    }
+
+
+def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
+    """Absolute directory args of stdio MCP servers, for ``add_dirs``.
+
+    The CLI's MCP Roots override a server's own path args with cwd +
+    ``--add-dir``, so a server declared with two directories is rooted at one
+    and the rest denied. Forwarding these restores the declared scope.
+    """
+    paths: list[str] = []
+    for config in mcp_servers.values():
+        if config.get("type") != "stdio":
+            continue
+        for arg in config.get("args") or []:
+            if isinstance(arg, str) and arg.startswith("/") and Path(arg).is_dir():
+                paths.append(arg)
+    return sorted(set(paths))
+
+
+def _server_filter_denials(enumerated: set[str], filters: dict[str, set[str]]) -> list[str]:
+    """Names to deny so each filtered server exposes only its listed tools.
+
+    ``enumerated`` holds ``<server>__<tool>``; ``filters`` maps server to the
+    unqualified tools it may expose. Unfiltered servers are untouched.
+    """
+    denied: list[str] = []
+    for qualified in enumerated:
+        server, _, tool = qualified.partition("__")
+        allowed = filters.get(server)
+        if allowed is not None and tool not in allowed:
+            denied.append(f"{_MCP_TOOL_PREFIX}{qualified}")
+    return sorted(denied)
+
+
 def _translate_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
     """Translate Conductor MCP server configs into the SDK's config shapes.
 
@@ -323,24 +382,8 @@ def _translate_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
     for name, config in mcp_servers.items():
         server_type = config.get("type") or "stdio"
 
-        tools = config.get("tools")
-        if tools is not None and list(tools) != [_ALL_TOOLS]:
-            raise ProviderError(
-                f"MCP server '{name}' declares a tool filter tools={list(tools)!r}, "
-                "but claude-agent-sdk cannot enforce per-server tool filters "
-                "(the SDK's MCP config has no equivalent field). Forwarding the "
-                "server unfiltered would grant more tools than declared.",
-                suggestion=(
-                    f"Set 'tools: [\"*\"]' on MCP server '{name}' to accept every "
-                    "tool it offers, or use the 'copilot' provider for agents that "
-                    "need per-server tool filtering."
-                ),
-                # Config errors never become valid on a retry. Set explicitly:
-                # the default heuristic sniffs the message for "timeout" /
-                # "connection", which user-controlled server and tool names
-                # could otherwise trip.
-                is_retryable=False,
-            )
+        # ``tools:`` is not an SDK field: stripped here, honored by denying the
+        # complement at execute time (see :func:`_server_tool_filters`).
 
         if config.get("timeout") is not None:
             logger.warning(
@@ -579,17 +622,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ambient project/user MCP config is ignored. A narrowing per-server
         # ``tools:`` filter has no SDK equivalent and is refused.
         mcp_tools=True,
+        # `tools: []` disables built-ins only; declared servers stay attached.
+        mcp_servers_always_attached=True,
         # Per-agent ``tools: []`` disables all *built-in* tools except the
         # ``Skill`` loader when skills are enabled; declared MCP servers
         # still attach (the SDK has no per-request MCP toggle), which
         # is why the validator rejects ``tools: []`` alongside ``mcp_servers:``
-        # for this provider. Per-agent ``tools: [<names>]`` is refused loudly
-        # at execute time because workflow tool names do not translate to
-        # Claude CLI tool IDs.
-        # The capability records the strict end of that contract — when the
-        # user declares a non-empty allowlist, the validator surfaces it as
-        # an error before runtime hits the refusal.
-        workflow_tools_passthrough=False,
+        # for this provider.
+        #
+        # Enforced by denying the complement of the allowlist; an http/sse
+        # server cannot be enumerated, so an allowlist alongside one raises.
+        workflow_tools_passthrough=True,
         # The SDK yields messages incrementally via the async iterator —
         # ``agent_message`` / ``agent_tool_*`` events fire as they arrive.
         streaming_events=True,
@@ -672,10 +715,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # constructed lazily, so an untranslatable server config surfaces when
         # the first agent on this provider runs — not at `conductor validate`.
         self._mcp_servers = _translate_mcp_servers(mcp_servers) if mcp_servers else {}
+        # Per-server filters apply to EVERY agent, unlike a per-agent allowlist.
+        self._server_tool_filters = _server_tool_filters(mcp_servers) if mcp_servers else {}
         # Claude session ids keyed by ``(session_key, cwd)`` — by the authored
         # key rather than agent name, since sharing a session between agents is
         # the point, and by cwd because the CLI stores transcripts per working
         # directory, so one key under two directories is two sessions.
+        # ``None`` = not yet enumerated; empty set is a valid result.
+        self._enumerated_mcp_tools: set[str] | None = None
         self._session_ids: dict[tuple[str, str], str] = {}
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
@@ -893,11 +940,19 @@ class ClaudeAgentSdkProvider(AgentProvider):
             else self._max_session_seconds
         )
 
-        sdk_tools, permission_mode = self._resolve_tool_config(
+        # Only when a filter is in force — otherwise no server is started.
+        enumerated_mcp_tools: set[str] = set()
+        server_denied: list[str] = []
+        if tools or self._server_tool_filters:
+            enumerated_mcp_tools = await self._enumerate_mcp_tools()
+            server_denied = _server_filter_denials(enumerated_mcp_tools, self._server_tool_filters)
+
+        sdk_tools, permission_mode, allowed_tools, disallowed_tools = self._resolve_tool_config(
             tools,
             agent,
             skills_enabled=bool(skill_names),
             agents_enabled=bool(custom_agents),
+            enumerated_mcp_tools=enumerated_mcp_tools,
         )
 
         session_key = agent.session_key
@@ -918,10 +973,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
+            # MCP Roots override a server's own path args with cwd + these.
+            add_dirs=_stdio_path_args({**self._mcp_servers, **(extra_mcp_servers or {})}),
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,
             tools=sdk_tools,
+            # ``allowed_tools`` pre-approves; ``disallowed_tools`` enforces.
+            allowed_tools=allowed_tools,
+            # Union: a tool excluded by either filter stays unreachable.
+            disallowed_tools=sorted(set(disallowed_tools) | set(server_denied)),
             # Unconditional, including when this workflow declares no servers:
             # the CLI would otherwise load project .mcp.json, user-global, and
             # plugin-provided servers, and permission_mode bypasses approval
@@ -1269,6 +1330,53 @@ class ClaudeAgentSdkProvider(AgentProvider):
         )
         return False
 
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Execute a single dialog turn — see :meth:`AgentProvider.execute_dialog_turn`.
+
+        Without this, ``dialog:`` agents silently never ask anything: the
+        evaluator in ``engine/dialog_evaluator.py`` catches every exception and
+        skips the dialog, so the base ``NotImplementedError`` became a warning
+        nobody saw.
+
+        Tools are disabled and no MCP server attaches — this is a plain
+        text-in/text-out turn, matching the other providers.
+        """
+        if not CLAUDE_AGENT_SDK_AVAILABLE:
+            raise ProviderError("Claude Agent SDK not available")
+
+        prior = "".join(
+            f"\n\n{turn.get('role', 'user')}: {turn.get('content', '')}" for turn in (history or [])
+        )
+        options = ClaudeAgentOptions(
+            model=model or self._default_model,
+            system_prompt=system_prompt,
+            max_turns=1,
+            tools=[],
+            # Same reasoning as `execute`: without these the CLI loads ambient
+            # MCP servers, settings and skills the workflow never declared.
+            strict_mcp_config=True,
+            setting_sources=[],
+        )
+
+        parts: list[str] = []
+        prompt = f"{prior}\n\n{user_message}".strip()
+        try:
+            async for message in query(prompt=prompt, options=options):
+                for block in getattr(message, "content", None) or []:
+                    text = getattr(block, "text", None)
+                    if text:
+                        parts.append(text)
+        except Exception as exc:
+            raise ProviderError(f"Dialog turn failed: {exc}") from exc
+
+        return "\n".join(parts).strip()
+
     async def close(self) -> None:
         pass
 
@@ -1420,6 +1528,68 @@ class ClaudeAgentSdkProvider(AgentProvider):
             logger.debug("Session lookup failed for %s under %s", session_id, cwd, exc_info=True)
             return False
 
+    async def _enumerate_mcp_tools(self) -> set[str]:
+        """Enumerate every tool on the declared stdio MCP servers.
+
+        Returns conductor-style ``<server>__<tool>`` names (``MCPManager``
+        already prefixes them), so the caller can subtract an agent's allowlist
+        to get the complement to deny. Cached: enumeration starts real servers.
+
+        ``MCPManager`` is stdio-only, so an http/sse server raises rather than
+        being treated as "no tools" — that would look enforced and not be.
+
+        Raises:
+            ProviderError: If a declared server is not stdio, or enumeration
+                fails. Both are non-retryable: neither becomes valid on retry.
+        """
+        if self._enumerated_mcp_tools is not None:
+            return self._enumerated_mcp_tools
+
+        from conductor.mcp.manager import MCPManager
+
+        non_stdio = sorted(
+            name for name, cfg in self._mcp_servers.items() if cfg.get("type") != "stdio"
+        )
+        if non_stdio:
+            raise ProviderError(
+                f"Cannot enforce a per-agent 'tools:' allowlist: MCP server(s) "
+                f"{non_stdio!r} use an http/sse transport, which Conductor cannot "
+                f"enumerate, so the tools to deny are unknown.",
+                suggestion=(
+                    "Remove the per-agent 'tools:' allowlist for agents on this "
+                    "provider, or move those servers to a stdio transport."
+                ),
+                is_retryable=False,
+            )
+
+        manager = MCPManager()
+        names: set[str] = set()
+        try:
+            for server_name, cfg in self._mcp_servers.items():
+                tools = await manager.connect_server(
+                    server_name,
+                    cfg["command"],
+                    cfg.get("args"),
+                    cfg.get("env"),
+                )
+                names.update(tool["name"] for tool in tools)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"Failed to enumerate MCP tools for a per-agent 'tools:' allowlist: {exc}",
+                suggestion=(
+                    "Verify the declared MCP servers start correctly, or remove "
+                    "the per-agent 'tools:' allowlist for agents on this provider."
+                ),
+                is_retryable=False,
+            ) from exc
+        finally:
+            await manager.close()
+
+        self._enumerated_mcp_tools = names
+        return names
+
     @staticmethod
     def _resolve_tool_config(
         tools: list[str] | None,
@@ -1427,7 +1597,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         *,
         skills_enabled: bool,
         agents_enabled: bool = False,
-    ) -> tuple[Any, str | None]:
+        enumerated_mcp_tools: set[str] | None = None,
+    ) -> tuple[Any, str | None, list[str], list[str]]:
         """Resolve the SDK ``tools`` and ``permission_mode`` for an agent.
 
         Conductor's ``tools:`` allowlist contains workflow-tool names that
@@ -1471,8 +1642,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 affects the explicit ``tools: []`` case.
 
         Returns:
-            A ``(sdk_tools, permission_mode)`` tuple suitable for
-            ``ClaudeAgentOptions``.
+            A ``(sdk_tools, permission_mode, allowed_tools, disallowed_tools)``
+            tuple suitable for ``ClaudeAgentOptions``. The last two are empty
+            unless the agent declares a non-empty allowlist.
 
         Raises:
             ProviderError: If ``tools`` is a non-empty list.
@@ -1483,7 +1655,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # per-agent field, which the executor's resolution erased.
             if agent.tools is None:
                 # Omitted -> default claude_code preset (filesystem/bash/web).
-                return _DEFAULT_TOOL_PRESET, "bypassPermissions"
+                return _DEFAULT_TOOL_PRESET, "bypassPermissions", [], []
             # Explicit `tools: []` -> no tools, no permission bypass. The
             # Skill tool is the one exception, and only when skills are on:
             # it loads declared skill content and grants nothing else. The
@@ -1508,19 +1680,30 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     is_retryable=False,
                 )
             if skills_enabled:
-                return [_SKILL_TOOL], None
-            return [], None
-        raise ProviderError(
-            f"Agent '{agent.name}' resolves to tools={tools!r} (declared on "
-            "the agent or inherited from the workflow-level 'tools:' list), "
-            "but claude-agent-sdk does not support workflow tool allowlists "
-            "(workflow tool names do not translate to Claude CLI tool IDs).",
-            suggestion=(
-                "Omit both the per-agent and workflow-level 'tools:' to grant "
-                "the full claude_code preset, or set 'tools: []' to disable "
-                "every built-in tool (bar the Skill loader when the agent "
-                "declares skills)."
-            ),
+                return [_SKILL_TOOL], None, [], []
+            return [], None, [], []
+        # Non-empty allowlist: forwarded as ``allowed_tools``, enforced via the
+        # complement in ``disallowed_tools``.
+        mcp_tools = sorted(f"{_MCP_TOOL_PREFIX}{name}" for name in tools if "__" in name)
+        native_tools = sorted(name for name in tools if "__" not in name)
+        allowed = mcp_tools + native_tools
+        if skills_enabled:
+            allowed.append(_SKILL_TOOL)
+
+        # Deny every enumerated tool not allowlisted, plus unnamed built-ins.
+        allowlisted = set(tools)
+        denied_mcp = sorted(
+            f"{_MCP_TOOL_PREFIX}{name}"
+            for name in (enumerated_mcp_tools or set())
+            if name not in allowlisted
+        )
+        denied_builtin = [name for name in _BUILTIN_WRITE_TOOLS if name not in native_tools]
+        # Preset stays: it is the base set the denial list filters.
+        return (
+            _DEFAULT_TOOL_PRESET,
+            "bypassPermissions",
+            allowed,
+            denied_mcp + denied_builtin,
         )
 
     @staticmethod
@@ -1670,8 +1853,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         2. JSON-parsed concatenation of text blocks (when ``agent.output`` is
            declared — fails loudly with ``ValidationError`` on parse error
            unless this is partial output, in which case the raw text is
-           wrapped under ``{"response": ...}``).
-        3. Bare ``{"response": ...}`` wrapper (when no schema declared).
+           wrapped under ``{"result": ...}``).
+        3. Bare ``{"result": ...}`` wrapper (when no schema declared).
 
         Args:
             content_parts: Text fragments captured from AssistantMessages.
@@ -1721,12 +1904,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
                                 "fields, or remove the `output:` schema."
                             ),
                         ) from e
-                    content = {"response": structured_output}
+                    content = {"result": structured_output}
             else:
                 # The SDK returned ``structured_output`` of a shape the
                 # provider does not understand (not a dict, not a str —
                 # likely an SDK version drift). If the agent declared an
-                # output schema, silently coercing to ``{"response": ...}``
+                # output schema, silently coercing to ``{"result": ...}``
                 # would violate the schema contract; downstream routes /
                 # templates that key off declared fields would then fail
                 # with confusing KeyError / UndefinedError in unrelated
@@ -1742,7 +1925,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
                             "version, or remove the `output:` schema."
                         ),
                     )
-                content = {"response": str(structured_output)}
+                content = {"result": str(structured_output)}
         elif agent.output:
             combined = "\n".join(content_parts)
             try:
@@ -1758,9 +1941,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
                             "or remove the `output:` schema."
                         ),
                     ) from e
-                content = {"response": combined}
+                content = {"result": combined}
         else:
-            content = {"response": "\n".join(content_parts)}
+            content = {"result": "\n".join(content_parts)}
 
         total = input_tokens + output_tokens
         return AgentOutput(

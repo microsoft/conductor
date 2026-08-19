@@ -214,6 +214,8 @@ class AcaRuntimeProvider(AgentProvider):
         # Full `runtime.mcp_servers` is forwarded to the runner, which wraps
         # a real `CopilotProvider` in-container (runner-image contract).
         mcp_tools=True,
+        # The runner attaches every server, so `tools: []` cannot mean "none".
+        mcp_servers_always_attached=True,
         # The per-agent `tools:` allowlist is forwarded to the runner in the
         # request body, but the in-container `CopilotProvider` it wraps
         # never applies that list to the SDK session (no filtering of which

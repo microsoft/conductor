@@ -373,17 +373,15 @@ class TestClaudeAgentSdkFactoryRejections:
         await provider.close()
 
     @pytest.mark.asyncio
-    async def test_factory_rejects_per_server_tool_filter(self) -> None:
-        """A narrowing per-server allowlist has no SDK equivalent — fail fast."""
+    async def test_factory_keeps_per_server_tool_filter(self) -> None:
+        """A narrowing per-server allowlist is honored via complement denial."""
         pytest.importorskip("claude_agent_sdk")
-        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
-            await create_provider(
-                "claude-agent-sdk",
-                validate=False,
-                mcp_servers={
-                    "docs": {"type": "stdio", "command": "docs-server", "tools": ["search"]}
-                },
-            )
+        provider = await create_provider(
+            "claude-agent-sdk",
+            validate=False,
+            mcp_servers={"docs": {"type": "stdio", "command": "docs-server", "tools": ["search"]}},
+        )
+        assert provider._server_tool_filters == {"docs": {"search"}}
 
     @pytest.mark.asyncio
     async def test_factory_rejects_temperature(self) -> None:

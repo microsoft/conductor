@@ -85,6 +85,17 @@ class ProviderCapabilities(BaseModel):
     to the underlying SDK. Workflows that declare ``runtime.mcp_servers``
     against a provider with ``mcp_tools=False`` fail validation."""
 
+    mcp_servers_always_attached: bool = False
+    """``True`` when the provider attaches every declared MCP server regardless
+    of the per-agent ``tools:`` list, so ``tools: []`` cannot detach them and
+    validation must reject it alongside ``mcp_servers:``.
+
+    Deliberately independent of :attr:`workflow_tools_passthrough`:
+    ``claude-agent-sdk`` honors a non-empty allowlist by denying the complement
+    (so passthrough is ``True``) while still *attaching* every declared server,
+    so one cannot be derived from the other. Defaults to ``False`` so a provider
+    that says nothing keeps the permissive behavior."""
+
     workflow_tools_passthrough: bool
     """``True`` when an agent's ``tools:`` allowlist is honored by the
     provider. Workflows that set ``tools:`` against a provider with

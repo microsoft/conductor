@@ -186,7 +186,7 @@ class TestExecute:
                 rendered_prompt="What is the answer?",
             )
 
-        assert output.content == {"response": "The answer is 42"}
+        assert output.content == {"result": "The answer is 42"}
         assert output.input_tokens == 100
         assert output.output_tokens == 50
         assert output.partial is False
@@ -479,7 +479,7 @@ class TestBuildOutput:
             agent = AgentDef(name="test", prompt="hi")
             output = await provider.execute(agent=agent, context={}, rendered_prompt="hi")
 
-        assert output.content == {"response": "42"}
+        assert output.content == {"result": "42"}
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -487,7 +487,7 @@ class TestBuildOutput:
         """When `output:` schema is declared and content doesn't parse, raise ValidationError.
 
         Regression test for #241 (A11): previously the provider silently
-        wrapped non-JSON text as ``{"response": text}``, violating the
+        wrapped non-JSON text as ``{"result": text}``, violating the
         declared schema contract and causing downstream routes/templates
         to see undefined fields.
         """
@@ -534,7 +534,7 @@ class TestMessageDispatch:
             agent = AgentDef(name="test", prompt="hi")
             output = await provider.execute(agent=agent, context={}, rendered_prompt="hi")
 
-        assert output.content == {"response": "done"}
+        assert output.content == {"result": "done"}
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -639,28 +639,31 @@ class TestToolResolution:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
-    async def test_non_empty_tools_list_raises(self) -> None:
-        """Non-empty workflow tool allowlists are refused loudly.
-
-        Conductor workflow tool names do not translate to Claude CLI tool
-        IDs. Forwarding them would either silently grant the wrong native
-        tools or silently drop the allowlist — both unsafe. Refuse loudly
-        until proper name translation is implemented.
-        """
+    async def test_non_empty_tools_translates_and_enforces(self) -> None:
+        """Allowlist is forwarded ``mcp__``-prefixed AND enforced by denial."""
+        captured: dict = {}
 
         async def fake_query(**kwargs):
+            captured.update(kwargs)
             yield _result(result="done")
 
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="my_agent", prompt="hi")
-            with pytest.raises(ProviderError, match="does not support workflow tool allowlists"):
-                await provider.execute(
-                    agent=agent,
-                    context={},
-                    rendered_prompt="hi",
-                    tools=["search", "read_file"],
-                )
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_file", "youtrack__issue_details"],
+            )
+
+        opts = captured["options"]
+        assert opts.allowed_tools == [
+            "mcp__filesystem__read_file",
+            "mcp__youtrack__issue_details",
+        ]
+        assert "Write" in opts.disallowed_tools
+        assert "Bash" in opts.disallowed_tools
 
 
 class TestOmittedToolsDefaultPreset:
@@ -740,67 +743,53 @@ class TestOmittedToolsDefaultPreset:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
-    async def test_explicit_non_empty_tools_still_raises(self) -> None:
-        """An explicit non-empty per-agent allowlist is still refused loudly.
-
-        Captures the exception so both the message AND the ``suggestion`` (also
-        reworded by this fix) are pinned — a regression that drops the
-        "set 'tools: []'" escape hatch from the suggestion is caught here.
-        """
+    async def test_explicit_non_empty_tools_honored(self) -> None:
+        """A natively-named entry (``Bash``) must not be denied."""
+        captured: dict = {}
 
         async def fake_query(**kwargs):
+            captured.update(kwargs)
             yield _result(result="done")
 
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider()
-            agent = AgentDef(name="my_agent", prompt="hi", tools=["search", "read_file"])
-            with pytest.raises(ProviderError) as exc:
-                await provider.execute(
-                    agent=agent,
-                    context={},
-                    rendered_prompt="hi",
-                    tools=["search", "read_file"],
-                )
+            agent = AgentDef(name="my_agent", prompt="hi", tools=["filesystem__read_file", "Bash"])
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_file", "Bash"],
+            )
 
-        assert "does not support workflow tool allowlists" in str(exc.value)
-        assert exc.value.suggestion is not None
-        assert "tools: []" in exc.value.suggestion
+        opts = captured["options"]
+        assert "mcp__filesystem__read_file" in opts.allowed_tools
+        assert "Bash" in opts.allowed_tools
+        assert "Bash" not in opts.disallowed_tools
+        assert "Write" in opts.disallowed_tools
 
-    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
-    async def test_inherited_workflow_tools_raise_with_inheritance_wording(self) -> None:
-        """An omitted ``tools:`` that inherits a non-empty workflow-level list.
-
-        This is the inheritance path: ``agent.tools is None`` (omitted) but the
-        executor resolved a non-empty list from the workflow-level ``tools:`` and
-        handed it to the provider. The refusal must name the workflow-level
-        inheritance — not just "declared on the agent" — so the user knows where
-        the list came from. This guards the new "inherited from the
-        workflow-level" wording the fix introduced.
-        """
+    async def test_inherited_workflow_tools_honored(self) -> None:
+        """An inherited workflow-level list is enforced like a declared one."""
+        captured: dict = {}
 
         async def fake_query(**kwargs):
+            captured.update(kwargs)
             yield _result(result="done")
 
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider()
-            # Omitted per-agent tools (None), but the executor resolved a
-            # non-empty list inherited from the workflow-level `tools:`.
             agent = AgentDef(name="inheritor", prompt="hi")
             assert agent.tools is None
-            with pytest.raises(ProviderError) as exc:
-                await provider.execute(
-                    agent=agent,
-                    context={},
-                    rendered_prompt="hi",
-                    tools=["search", "read_file"],
-                )
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_file"],
+            )
 
-        assert "inherited from the workflow-level" in str(exc.value)
-        assert exc.value.suggestion is not None
-        assert "tools: []" in exc.value.suggestion
+        opts = captured["options"]
+        assert opts.allowed_tools == ["mcp__filesystem__read_file"]
+        assert "Write" in opts.disallowed_tools
 
-    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_executor_to_provider_end_to_end_grants_preset(self) -> None:
         """End-to-end through AgentExecutor: an omitted ``tools:`` reaches the
         provider as the ``claude_code`` preset, with NO workflow tools declared.
@@ -1497,7 +1486,7 @@ class TestMaxSessionSeconds:
                 rendered_prompt="hi",
             )
 
-        assert output.content == {"response": "done"}
+        assert output.content == {"result": "done"}
 
 
 class TestRetryableClassification:
@@ -1659,7 +1648,7 @@ class TestSchemaContractEnforcement:
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_no_schema_still_tolerates_non_json(self) -> None:
-        """Without a declared schema, the response wrapper fallback is fine."""
+        """Without a declared schema, the result wrapper fallback is fine."""
 
         async def fake_query(**kwargs):
             yield _assistant(content=[TextBlock(text="just some prose")])
@@ -1673,7 +1662,7 @@ class TestSchemaContractEnforcement:
                 rendered_prompt="hi",
             )
 
-        assert output.content == {"response": "just some prose"}
+        assert output.content == {"result": "just some prose"}
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -1705,8 +1694,8 @@ class TestSchemaContractEnforcement:
             )
 
         assert output.partial is True
-        # Fallback to {"response": ...} is acceptable for partial output.
-        assert output.content == {"response": 'incomplete partial json {"key":'}
+        # Fallback to {"result": ...} is acceptable for partial output.
+        assert output.content == {"result": 'incomplete partial json {"key":'}
 
 
 class TestParityCoverage:
@@ -1870,8 +1859,8 @@ class TestParityCoverage:
         assert output.partial is True
         # First chunk content is in the partial output; second chunk is NOT
         # (interrupt fires at top of loop before second message processes).
-        assert "first chunk" in output.content["response"]
-        assert "second chunk" not in output.content["response"]
+        assert "first chunk" in output.content["result"]
+        assert "second chunk" not in output.content["result"]
 
 
 class TestPerAgentMaxSessionSeconds:
@@ -2035,7 +2024,7 @@ class TestSafeCallbackSwallowing:
                 rendered_prompt="hi",
                 event_callback=boom,
             )
-        assert output.content == {"response": "hi"}
+        assert output.content == {"result": "hi"}
 
 
 def _mcp_temp_files() -> set[str]:
@@ -2106,19 +2095,27 @@ class TestMcpServerTranslation:
         )
         assert translated == {"remote": {"type": "http", "url": "https://x.test"}}
 
-    def test_narrowing_tool_filter_is_refused(self) -> None:
-        """Ignoring a per-server allowlist would grant more tools than declared."""
-        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
-            _translate_mcp_servers(
-                {"docs": {"type": "stdio", "command": "docs-server", "tools": ["search"]}}
-            )
+    def test_narrowing_tool_filter_is_stripped_not_forwarded(self) -> None:
+        """``tools:`` is not an SDK field, so it must not be forwarded."""
+        out = _translate_mcp_servers(
+            {"docs": {"type": "stdio", "command": "docs-server", "tools": ["search"]}}
+        )
+        assert "tools" not in out["docs"]
+        assert out["docs"]["command"] == "docs-server"
 
-    def test_empty_tool_filter_is_refused(self) -> None:
-        """``tools: []`` is still a narrowing filter the SDK cannot express."""
-        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
-            _translate_mcp_servers(
-                {"docs": {"type": "stdio", "command": "docs-server", "tools": []}}
-            )
+    def test_empty_tool_filter_denies_everything(self) -> None:
+        """``tools: []`` means expose nothing, so every enumerated tool is denied."""
+        from conductor.providers.claude_agent_sdk import (
+            _server_filter_denials,
+            _server_tool_filters,
+        )
+
+        filters = _server_tool_filters({"docs": {"command": "docs-server", "tools": []}})
+        assert filters == {"docs": set()}
+        assert _server_filter_denials({"docs__read", "docs__write"}, filters) == [
+            "mcp__docs__read",
+            "mcp__docs__write",
+        ]
 
     def test_unsupported_type_is_refused(self) -> None:
         with pytest.raises(ProviderError, match="unsupported type 'grpc'"):
@@ -2136,14 +2133,13 @@ class TestMcpServerTranslation:
         assert "5000" in caplog.text
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    def test_provider_translates_at_construction(self) -> None:
-        """Translation happens once, when the provider is built -- not per
-        execute() call. Providers are constructed lazily, so this surfaces on
-        the first agent that uses the provider, not at validate time."""
-        with pytest.raises(ProviderError, match="cannot enforce per-server tool filters"):
-            ClaudeAgentSdkProvider(
-                mcp_servers={"docs": {"type": "stdio", "command": "d", "tools": ["search"]}}
-            )
+    def test_provider_collects_filters_at_construction(self) -> None:
+        """Built once, not per execute(): filter stripped and kept for denial."""
+        provider = ClaudeAgentSdkProvider(
+            mcp_servers={"docs": {"type": "stdio", "command": "d", "tools": ["search"]}}
+        )
+        assert provider._server_tool_filters == {"docs": {"search"}}
+        assert "tools" not in provider._mcp_servers["docs"]
 
 
 class TestMcpConfigFile:
@@ -2427,9 +2423,7 @@ class TestMcpRequiredFields:
         """A server named e.g. 'timeout-probe' must not flip the retryability
         heuristic, which sniffs the message for 'timeout'/'connection'."""
         with pytest.raises(ProviderError) as exc:
-            _translate_mcp_servers(
-                {"timeout-probe": {"type": "stdio", "command": "d", "tools": ["connection"]}}
-            )
+            _translate_mcp_servers({"timeout-probe": {"type": "grpc", "url": "https://x.test"}})
         assert exc.value.is_retryable is False
 
 
@@ -2909,3 +2903,103 @@ class TestValidateConnectionProbeSetPerPlatform:
             "a Windows user's local install must still be found"
         )
         assert any(p.endswith(".npm-global/bin/claude") for p in probed)
+
+
+class TestMcpAllowlistEnforcement:
+    """Allowlists are enforced by denying the complement."""
+
+    def test_complement_of_the_allowlist_is_denied(self) -> None:
+        """A sibling tool on an allowlisted server is denied by name."""
+        agent = AgentDef(name="judge", prompt="hi", tools=["filesystem__read_text_file"])
+        enumerated = {
+            "filesystem__read_text_file",
+            "filesystem__write_file",
+            "filesystem__edit_file",
+        }
+        _tools, _mode, allowed, denied = ClaudeAgentSdkProvider._resolve_tool_config(
+            ["filesystem__read_text_file"],
+            agent,
+            skills_enabled=False,
+            enumerated_mcp_tools=enumerated,
+        )
+        assert allowed == ["mcp__filesystem__read_text_file"]
+        assert "mcp__filesystem__write_file" in denied
+        assert "mcp__filesystem__edit_file" in denied
+        assert "mcp__filesystem__read_text_file" not in denied
+
+    def test_builtin_write_tools_are_denied_alongside(self) -> None:
+        """Denying MCP writers is pointless if native Write/Bash stay open."""
+        agent = AgentDef(name="judge", prompt="hi", tools=["filesystem__read_file"])
+        _t, _m, _allowed, denied = ClaudeAgentSdkProvider._resolve_tool_config(
+            ["filesystem__read_file"],
+            agent,
+            skills_enabled=False,
+            enumerated_mcp_tools={"filesystem__read_file"},
+        )
+        assert "Write" in denied
+        assert "Bash" in denied
+
+    def test_natively_named_allowlist_entry_is_not_denied(self) -> None:
+        """An agent that legitimately asks for Bash keeps it."""
+        agent = AgentDef(name="impl", prompt="hi", tools=["Bash"])
+        _t, _m, allowed, denied = ClaudeAgentSdkProvider._resolve_tool_config(
+            ["Bash"], agent, skills_enabled=False, enumerated_mcp_tools=set()
+        )
+        assert "Bash" in allowed
+        assert "Bash" not in denied
+        assert "Write" in denied
+
+    async def test_http_server_with_allowlist_is_refused(self) -> None:
+        """stdio-only enumeration: http/sse must raise, not under-enforce."""
+        provider = ClaudeAgentSdkProvider(
+            mcp_servers={"remote": {"type": "http", "url": "https://example.test/mcp"}}
+        )
+        with pytest.raises(ProviderError, match="http/sse"):
+            await provider._enumerate_mcp_tools()
+
+    async def test_enumeration_is_cached(self) -> None:
+        """Enumeration starts real servers, so it must happen once per provider."""
+        provider = ClaudeAgentSdkProvider()
+        provider._enumerated_mcp_tools = {"docs__read"}
+        assert await provider._enumerate_mcp_tools() == {"docs__read"}
+
+
+class TestServerToolFilterEnforcement:
+    """A per-server ``tools:`` filter is honored by denying the complement."""
+
+    def test_unfiltered_servers_are_untouched(self) -> None:
+        from conductor.providers.claude_agent_sdk import _server_filter_denials
+
+        denied = _server_filter_denials(
+            {"docs__read", "docs__write", "other__anything"}, {"docs": {"read"}}
+        )
+        assert denied == ["mcp__docs__write"]
+        assert "mcp__other__anything" not in denied
+
+
+class TestDialogTurn:
+    """``dialog:`` agents need ``execute_dialog_turn`` or they never ask."""
+
+    async def test_returns_the_agents_question(self) -> None:
+        from claude_agent_sdk import TextBlock
+
+        captured: dict = {}
+
+        async def fake_query(prompt, options):
+            captured["prompt"] = prompt
+            captured["options"] = options
+            yield _assistant([TextBlock(text="What are the acceptance criteria?")])
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            answer = await provider.execute_dialog_turn(
+                system_prompt="sys",
+                user_message="evaluate this",
+                history=[{"role": "user", "content": "earlier turn"}],
+            )
+
+        assert answer == "What are the acceptance criteria?"
+        # A dialog turn is text-in/text-out: no tools, no ambient config.
+        assert captured["options"].tools == []
+        assert captured["options"].setting_sources == []
+        assert "earlier turn" in captured["prompt"]
