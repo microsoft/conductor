@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from rich.table import Table
 from rich.text import Text
@@ -35,20 +35,66 @@ if TYPE_CHECKING:
     from conductor.providers.diagnostics import Section
 
 
-_CHECK = Text.from_markup("[green]✓[/green]")
-_CROSS = Text.from_markup("[red]✗[/red]")
-_DASH = Text.from_markup("[dim]—[/dim]")
-_OPTIONAL_MARK = "○"
-"""Neutral glyph for an absent *optional* credential — deliberately not the
-red ``✗`` used for a genuinely missing required credential (issue #319).
+class _Glyphs(NamedTuple):
+    """The status glyphs a table render uses, resolved for one console."""
 
-.. note::
-   ``✓``, ``✗`` and ``○`` are not encodable in cp1252, so the default *table*
-   output of ``conductor doctor`` still fails on such a console — see #401.
-   This module's ``--json`` path is safe (``ensure_ascii=True``); the table path
-   is deliberately out of scope here because every glyph consumer would need the
-   console threaded through it. The em-dash is encodable in cp1252.
-"""
+    check: Text
+    cross: Text
+    dash: Text
+    optional: str
+    """Neutral glyph for an absent *optional* credential — deliberately not
+    ``cross``, which is reserved for a genuinely missing required credential
+    (issue #319)."""
+
+
+_UNICODE_GLYPHS = _Glyphs(
+    check=Text.from_markup("[green]✓[/green]"),
+    cross=Text.from_markup("[red]✗[/red]"),
+    dash=Text.from_markup("[dim]—[/dim]"),
+    optional="○",
+)
+_ASCII_GLYPHS = _Glyphs(
+    check=Text.from_markup("[green]OK[/green]"),
+    cross=Text.from_markup("[red]X[/red]"),
+    dash=Text.from_markup("[dim]-[/dim]"),
+    optional="o",
+)
+
+
+def _encodable(text: str, encoding: str | None) -> bool:
+    """Whether *text* survives a round trip through *encoding*.
+
+    ``encoding`` of ``None`` (the stream has no ``.encoding`` attribute, e.g.
+    an in-memory buffer) is treated as capable: there is nothing to protect
+    against, so it is better to render full-width Unicode than to needlessly
+    downgrade every invocation to ASCII.
+    """
+    if not encoding:
+        return True
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _resolve_glyphs(console: Console) -> _Glyphs:
+    """Pick Unicode or ASCII-safe glyphs for *console*'s stream encoding.
+
+    Rich hands a rendered line straight to the underlying file's ``write()``;
+    it does not check whether the target encoding can represent it. A legacy
+    Windows console (``cp1252``) cannot encode ``✓``/``✗``/``○``, so the table
+    used to die mid-write, part-printed (issue #401). Resolved once per
+    ``run_doctor`` call and passed down, rather than re-checked per cell: the
+    stream's encoding cannot change mid-render.
+    """
+    encoding = getattr(getattr(console, "file", None), "encoding", None)
+    return _Glyphs(
+        check=_UNICODE_GLYPHS.check if _encodable("✓", encoding) else _ASCII_GLYPHS.check,
+        cross=_UNICODE_GLYPHS.cross if _encodable("✗", encoding) else _ASCII_GLYPHS.cross,
+        dash=_UNICODE_GLYPHS.dash if _encodable("—", encoding) else _ASCII_GLYPHS.dash,
+        optional=_UNICODE_GLYPHS.optional if _encodable("○", encoding) else _ASCII_GLYPHS.optional,
+    )
 
 
 def run_doctor(
@@ -109,14 +155,15 @@ def run_doctor(
         console.print_json(data=report.to_dict(), ensure_ascii=True)
         return _compute_exit_code(report.providers, check=check, provider=provider)
 
+    glyphs = _resolve_glyphs(console)
     if report.env is not None:
         _render_env(report.env, console)
     if report.providers is not None:
-        _render_providers(report.providers, console, check=check, models=models)
+        _render_providers(report.providers, console, glyphs, check=check, models=models)
         if models:
-            _render_models(report.providers, console)
+            _render_models(report.providers, console, glyphs)
     if report.registries is not None:
-        _render_registries(report.registries, console)
+        _render_registries(report.registries, console, glyphs)
 
     return _compute_exit_code(report.providers, check=check, provider=provider)
 
@@ -204,6 +251,7 @@ def _render_env(env: EnvDiagnostic, console: Console) -> None:
 def _render_providers(
     providers: list[ProviderDiagnostic],
     console: MarkupFreeConsole,
+    glyphs: _Glyphs,
     *,
     check: bool,
     models: bool,
@@ -223,30 +271,30 @@ def _render_providers(
     for diag in providers:
         row = [
             diag.name,
-            _CHECK if diag.installed else _CROSS,
-            _tier_cell(diag.tier),
-            _credentials_cell(diag),
+            glyphs.check if diag.installed else glyphs.cross,
+            _tier_cell(diag.tier, glyphs),
+            _credentials_cell(diag, glyphs),
         ]
         if check:
-            row.append(_connection_cell(diag))
+            row.append(_connection_cell(diag, glyphs))
         if models:
-            row.append(_models_cell(diag))
-        row.append(diag.note or _DASH)
+            row.append(_models_cell(diag, glyphs))
+        row.append(diag.note or glyphs.dash)
         table.add_row(*row)
 
     console.print(table)
 
 
-def _tier_cell(tier: str | None) -> Text:
+def _tier_cell(tier: str | None, glyphs: _Glyphs) -> Text:
     """Format the tier cell."""
     if tier is None:
-        return _DASH
+        return glyphs.dash
     if tier == "experimental":
         return Text.from_markup("[yellow]experimental[/yellow]")
     return Text(tier)
 
 
-def _credentials_cell(diag: ProviderDiagnostic) -> Text:
+def _credentials_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
     """Format credential env-var presence (presence only, never values).
 
     A present credential is a green ``✓``. An absent credential renders as a
@@ -257,32 +305,32 @@ def _credentials_cell(diag: ProviderDiagnostic) -> Text:
     accompanying auth-path note is surfaced in the Notes column (issue #319).
     """
     if not diag.credential_env_vars:
-        return _DASH
+        return glyphs.dash
     lines: list[Text] = []
     for cred in diag.credential_env_vars:
         if cred.present:
-            lines.append(styled("{} {}", _CHECK, cred.name))
+            lines.append(styled("{} {}", glyphs.check, cred.name))
         elif diag.credentials_optional:
-            lines.append(styled("[dim]{} {}[/dim]", _OPTIONAL_MARK, cred.name))
+            lines.append(styled("[dim]{} {}[/dim]", glyphs.optional, cred.name))
         else:
-            lines.append(styled("[dim]{} {}[/dim]", _CROSS, cred.name))
+            lines.append(styled("[dim]{} {}[/dim]", glyphs.cross, cred.name))
     return join("\n", lines)
 
 
-def _connection_cell(diag: ProviderDiagnostic) -> Text:
+def _connection_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
     """Format the connection-check result cell."""
     if not diag.checked or diag.connection_ok is None:
-        return _DASH
+        return glyphs.dash
     if diag.connection_ok and diag.connection_note:
         return styled("[yellow]⚠[/yellow] {}", diag.connection_note)
     if diag.connection_ok:
-        return styled("{} connected", _CHECK)
+        return styled("{} connected", glyphs.check)
     if diag.connection_error:
-        return styled("{} [dim]{}[/dim]", _CROSS, diag.connection_error)
-    return styled("{} [dim]connection failed[/dim]", _CROSS)
+        return styled("{} [dim]{}[/dim]", glyphs.cross, diag.connection_error)
+    return styled("{} [dim]connection failed[/dim]", glyphs.cross)
 
 
-def _models_cell(diag: ProviderDiagnostic) -> Text:
+def _models_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
     """Format the models cell in the Providers summary table.
 
     Shows a count/status only — per-model reasoning-effort and
@@ -291,19 +339,19 @@ def _models_cell(diag: ProviderDiagnostic) -> Text:
     models is ``None`` (not enumerated), ``(none)`` for an empty list.
     """
     if diag.models_error:
-        return styled("{} [dim]{}[/dim]", _CROSS, diag.models_error)
+        return styled("{} [dim]{}[/dim]", glyphs.cross, diag.models_error)
     if diag.models is None:
         return Text.from_markup("[dim]n/a[/dim]")
     count = len(diag.models)
     if not count:
         return Text.from_markup("[dim](none)[/dim]")
-    return styled("{} {} model{}", _CHECK, count, "s" if count != 1 else "")
+    return styled("{} {} model{}", glyphs.check, count, "s" if count != 1 else "")
 
 
-def _format_tokens(value: int | None) -> Text:
+def _format_tokens(value: int | None, glyphs: _Glyphs) -> Text:
     """Format a token-limit value with grouped digits, or ``—`` when unknown."""
     if value is None:
-        return _DASH
+        return glyphs.dash
     return Text(f"{value:,}")
 
 
@@ -320,10 +368,10 @@ def _efforts_cell(model: ModelDiagnostic) -> Text:
     return Text(", ".join(model.supported_reasoning_efforts))
 
 
-def _default_effort_cell(model: ModelDiagnostic) -> Text:
+def _default_effort_cell(model: ModelDiagnostic, glyphs: _Glyphs) -> Text:
     """Format the default-reasoning-effort cell."""
     if model.default_reasoning_effort is None:
-        return _DASH
+        return glyphs.dash
     return Text(model.default_reasoning_effort)
 
 
@@ -337,12 +385,14 @@ _PRICING_SOURCE_CELLS: dict[str, Text] = {
 (issue #386), plus the synthetic ``"error"`` key used for ``None`` (pricing
 resolution itself failed). Built as module-level constants to avoid
 re-parsing the same markup literal on every table row (matching the
-``_CHECK``/``_CROSS``/``_DASH`` constants above) — each markup argument is
-still a literal template, not an interpolated value, keeping this inside the
-repo's console rules (see AGENTS.md "Console Output")."""
+``_UNICODE_GLYPHS``/``_ASCII_GLYPHS`` constants above) — each markup argument
+is still a literal template, not an interpolated value, keeping this inside
+the repo's console rules (see AGENTS.md "Console Output"). None of these
+values are drawn from the encoding-sensitive glyph set, so they need no
+ASCII fallback."""
 
 
-def _rate_cell(value: float | None) -> Text:
+def _rate_cell(value: float | None, glyphs: _Glyphs) -> Text:
     """Format a per-Mtok rate, or ``—`` when unknown.
 
     Deliberately never renders ``0.00`` for ``None`` — a zero would read as
@@ -350,7 +400,7 @@ def _rate_cell(value: float | None) -> Text:
     #386 is about.
     """
     if value is None:
-        return _DASH
+        return glyphs.dash
     return Text(f"{value:,.2f}")
 
 
@@ -368,7 +418,7 @@ def _pricing_source_cell(model: ModelDiagnostic) -> Text:
     return _PRICING_SOURCE_CELLS.get(model.pricing_source, Text(model.pricing_source))
 
 
-def _render_models(providers: list[ProviderDiagnostic], console: Console) -> None:
+def _render_models(providers: list[ProviderDiagnostic], console: Console, glyphs: _Glyphs) -> None:
     """Render a per-provider Models detail table (``--models`` only).
 
     One table per provider that returned at least one model, with columns
@@ -395,23 +445,23 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console) -> Non
             table.add_row(
                 model.id,
                 _efforts_cell(model),
-                _default_effort_cell(model),
-                _format_tokens(model.max_prompt_tokens),
-                _format_tokens(model.max_output_tokens),
-                _format_tokens(model.max_context_window_tokens),
-                _rate_cell(model.input_per_mtok),
-                _rate_cell(model.output_per_mtok),
+                _default_effort_cell(model, glyphs),
+                _format_tokens(model.max_prompt_tokens, glyphs),
+                _format_tokens(model.max_output_tokens, glyphs),
+                _format_tokens(model.max_context_window_tokens, glyphs),
+                _rate_cell(model.input_per_mtok, glyphs),
+                _rate_cell(model.output_per_mtok, glyphs),
                 _pricing_source_cell(model),
             )
 
         console.print(table)
 
 
-def _render_registries(registries: RegistryDiagnostic, console: Console) -> None:
+def _render_registries(registries: RegistryDiagnostic, console: Console, glyphs: _Glyphs) -> None:
     """Render the registries section."""
     if registries.error is not None:
         console.print(
-            styled("{} [dim]failed to load registries: {}[/dim]", _CROSS, registries.error)
+            styled("{} [dim]failed to load registries: {}[/dim]", glyphs.cross, registries.error)
         )
         return
     if not registries.registries:
@@ -429,7 +479,7 @@ def _render_registries(registries: RegistryDiagnostic, console: Console) -> None
             reg.name,
             reg.type,
             reg.source,
-            _CHECK if reg.is_default else _DASH,
+            glyphs.check if reg.is_default else glyphs.dash,
         )
 
     console.print(table)
