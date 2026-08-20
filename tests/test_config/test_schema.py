@@ -694,9 +694,7 @@ class TestAgentDefMaxTokens:
 
     def test_allowed_on_regular_agent(self) -> None:
         """Test that regular agents can have max_tokens."""
-        agent = AgentDef(
-            name="a", type="agent", model="gpt-4", prompt="test", max_tokens=32768
-        )
+        agent = AgentDef(name="a", type="agent", model="gpt-4", prompt="test", max_tokens=32768)
         assert agent.max_tokens == 32768
 
     def test_rejects_over_200000(self) -> None:
@@ -732,9 +730,7 @@ class TestAgentDefMaxTokens:
     def test_rejected_on_terminate_agent(self) -> None:
         """Test that terminate agents cannot have max_tokens."""
         with pytest.raises(ValidationError) as exc_info:
-            AgentDef(
-                name="t", type="terminate", status="success", reason="done", max_tokens=8192
-            )
+            AgentDef(name="t", type="terminate", status="success", reason="done", max_tokens=8192)
         assert "max_tokens" in str(exc_info.value)
 
 
