@@ -8,6 +8,7 @@ flag/exit-code cases; one test runs the real offline path end-to-end.
 from __future__ import annotations
 
 import importlib
+import io
 import json
 from unittest.mock import AsyncMock
 
@@ -859,3 +860,110 @@ class TestDoctorMarkupSafety:
         assert "failed to load registries" in result.output
         assert "line 3" in result.output
         assert "No registries configured" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Encoding fallback (issue #401)
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorEncodingFallback:
+    """The table output degrades to ASCII glyphs on a stream that cannot
+    encode the Unicode ones, instead of dying part-written."""
+
+    def _bind_console(
+        self, monkeypatch: pytest.MonkeyPatch, encoding: str
+    ) -> tuple[io.BytesIO, io.TextIOWrapper]:
+        """Point the CLI's output console at a fresh buffer with *encoding*.
+
+        Returns the raw byte buffer rather than relying on ``result.output``:
+        the CLI's real console is bound directly to it, decoded with the same
+        *encoding* it was written with, so a character neither side can
+        represent surfaces as a decode error rather than being silently
+        swallowed by pytest's own UTF-8 capture.
+        """
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding=encoding, newline="")
+        monkeypatch.setattr(_app_module, "output_console", make_console(file=stream, width=200))
+        monkeypatch.setattr(
+            _app_module, "console", make_console(file=stream, stderr=True, width=200)
+        )
+        return buffer, stream
+
+    def test_cp1252_console_renders_ascii_glyphs_without_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "cp1252")
+        report = DoctorReport(
+            providers=[_prov("copilot", installed=True)],
+            registries=RegistryDiagnostic(
+                default="local",
+                registries=[
+                    RegistryInfo(name="local", type="path", source="~/.conductor", is_default=True)
+                ],
+            ),
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        stream.flush()
+        assert result.exception is None
+        assert result.exit_code == 0
+        output = buffer.getvalue().decode("cp1252")  # raises if a raw glyph leaked through
+        assert "OK" in output
+        assert "✓" not in output
+
+    def test_utf8_console_keeps_unicode_glyphs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "utf-8")
+        report = DoctorReport(providers=[_prov("copilot", installed=True)])
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        stream.flush()
+        assert result.exception is None
+        assert result.exit_code == 0
+        output = buffer.getvalue().decode("utf-8")
+        assert "✓" in output
+        assert "OK" not in output
+
+    def test_stream_with_no_encoding_keeps_unicode_glyphs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A console file with no encoding (``.encoding is None``, e.g. an
+        in-memory ``StringIO``) is treated as capable of anything, not
+        downgraded to ASCII (#401)."""
+        stream = io.StringIO()
+        assert stream.encoding is None
+        monkeypatch.setattr(_app_module, "output_console", make_console(file=stream, width=200))
+        monkeypatch.setattr(
+            _app_module, "console", make_console(file=stream, stderr=True, width=200)
+        )
+        report = DoctorReport(providers=[_prov("copilot", installed=True)])
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "✓" in stream.getvalue()
+        assert "OK" not in stream.getvalue()
+
+
+class TestDoctorTierAndModelsErrorCells:
+    """Two more per-cell branches driven by the same glyph set as the
+    encoding-fallback tests above, exercised on the default UTF-8 path."""
+
+    def test_missing_tier_renders_dash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(providers=[_prov("copilot", tier=None)])
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "—" in result.output
+
+    def test_models_error_renders_cross_with_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov("copilot", checked=True, connection_ok=True, models_error="rate limited")
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        assert "rate limited" in result.output
+        assert "✗" in result.output
