@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as fatal.
 - `runtime.default_reasoning_effort` was silently dropped at run time for every
   provider and is now forwarded through `ProviderRegistry`.
+- **`conductor doctor`'s table output no longer dies part-written on a
+  `cp1252` console** (#401). The Installed/Credentials/Connection/Models
+  columns hardcoded `✓`/`✗`/`○`, none of which cp1252 can encode, so a run
+  on a legacy Windows console raised `UnicodeEncodeError` mid-table, after
+  the Environment section had already printed. `conductor doctor` now
+  resolves each glyph once per invocation against the output console's
+  stream encoding, falling back to `OK`/`X`/`o` when the Unicode glyphs
+  cannot be encoded; the `--json` path was already safe and is unchanged.
 - **MCP tool discovery and structured tool results no longer break with MCP
   2.0** (#419). MCP 2.0 renamed the Python field on `mcp.types.Tool` from
   `inputSchema` to `input_schema` and on `mcp.types.CallToolResult` from
