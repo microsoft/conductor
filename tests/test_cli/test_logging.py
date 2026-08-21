@@ -395,6 +395,68 @@ class TestGenerateLogPath:
         assert str(path).startswith(tempfile.gettempdir())
 
 
+class TestTryInitFileLogging:
+    """Tests for _try_init_file_logging helper."""
+
+    def test_try_init_with_valid_path(self, tmp_path: Path) -> None:
+        """Test successful initialization with a valid path."""
+        from conductor.cli.run import (
+            _try_init_file_logging,
+            close_file_logging,
+            verbose_log,
+        )
+
+        log_path = tmp_path / "test.log"
+        token = verbose_mode.set(False)
+        try:
+            result = _try_init_file_logging(log_path)
+            assert result is True
+            assert log_path.exists()
+
+            verbose_log("hello from try_init")
+            close_file_logging()
+
+            content = log_path.read_text(encoding="utf-8")
+            assert "hello from try_init" in content
+        finally:
+            close_file_logging()
+            verbose_mode.reset(token)
+
+    def test_try_init_with_none(self) -> None:
+        """Test no-op when path is None."""
+        from conductor.cli.run import _try_init_file_logging
+
+        result = _try_init_file_logging(None)
+        assert result is False
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix-specific chmod permissions")
+    def test_try_init_with_permission_error(self, tmp_path: Path) -> None:
+        """Test graceful handling of OSError (warning to stderr, no raise)."""
+        import os
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import _try_init_file_logging, close_file_logging
+
+        readonly_dir = tmp_path / "readonly"
+        readonly_dir.mkdir()
+        os.chmod(readonly_dir, 0o444)
+
+        stderr_output = StringIO()
+        mock_console = Console(file=stderr_output, no_color=True, highlight=False)
+
+        try:
+            with patch("conductor.cli.run._verbose_console", mock_console):
+                result = _try_init_file_logging(readonly_dir / "test.log")
+
+            assert result is False
+            assert "Cannot open log file" in stderr_output.getvalue()
+        finally:
+            close_file_logging()
+            os.chmod(readonly_dir, 0o755)
+
+
 class TestVerboseLogging:
     """Tests for verbose logging functions (migrated from test_verbose.py)."""
 
@@ -1620,6 +1682,163 @@ class TestFileLoggingDualWrite:
         finally:
             full_mode.reset(token_full)
             verbose_mode.reset(token_verbose)
+
+
+class TestYamlLogFileFallback:
+    """Tests for runtime.log_file fallback and CLI precedence."""
+
+    @staticmethod
+    def _write_workflow(tmp_path: Path, log_path: Path) -> Path:
+        workflow_file = tmp_path / "test.yaml"
+        workflow_file.write_text(
+            f"""\
+workflow:
+  name: test-workflow
+  entry_point: agent1
+  runtime:
+    log_file: "{log_path.as_posix()}"
+
+agents:
+  - name: agent1
+    prompt: "Hello"
+    routes:
+      - to: $end
+
+output:
+  result: "done"
+""",
+            encoding="utf-8",
+        )
+        return workflow_file
+
+    @staticmethod
+    def _run_with_mocked_engine(
+        workflow_file: Path,
+        *,
+        log_file: Path | None,
+    ) -> dict[str, object]:
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from conductor.cli.run import run_workflow_async
+
+        mock_registry = AsyncMock()
+        mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+        mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+        mock_engine = MagicMock()
+        mock_engine.run = AsyncMock(return_value={"result": "done"})
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+        ):
+            return asyncio.run(run_workflow_async(workflow_file, {}, log_file=log_file))
+
+    def test_yaml_log_file_explicit_path(self, tmp_path: Path) -> None:
+        """Use runtime.log_file when the CLI option is unset."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        log_path = tmp_path / "yaml.log"
+        workflow_file = self._write_workflow(tmp_path, log_path)
+        stderr_output = StringIO()
+        mock_console = Console(
+            file=stderr_output,
+            no_color=True,
+            highlight=False,
+            width=500,
+        )
+
+        with patch("conductor.cli.run._verbose_console", mock_console):
+            result = self._run_with_mocked_engine(workflow_file, log_file=None)
+
+        assert result == {"result": "done"}
+        assert log_path.exists()
+        assert "Log written to" in stderr_output.getvalue()
+        assert str(log_path) in stderr_output.getvalue()
+
+    def test_cli_log_file_overrides_yaml(self, tmp_path: Path) -> None:
+        """Prefer the CLI log path over runtime.log_file."""
+        yaml_log_path = tmp_path / "yaml.log"
+        cli_log_path = tmp_path / "cli.log"
+        workflow_file = self._write_workflow(tmp_path, yaml_log_path)
+
+        result = self._run_with_mocked_engine(workflow_file, log_file=cli_log_path)
+
+        assert result == {"result": "done"}
+        assert cli_log_path.exists()
+        assert not yaml_log_path.exists()
+
+    def test_resume_yaml_log_file_fallback(self, tmp_path: Path) -> None:
+        """Use runtime.log_file when resume has no CLI log path."""
+        import asyncio
+        import json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from conductor.cli.run import resume_workflow_async
+        from conductor.engine.checkpoint import CheckpointManager
+
+        log_path = tmp_path / "resume.log"
+        workflow_file = self._write_workflow(tmp_path, log_path)
+        workflow_hash = CheckpointManager.compute_workflow_hash(workflow_file)
+        checkpoint_file = tmp_path / "checkpoint.json"
+        checkpoint_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "workflow_path": str(workflow_file.resolve()),
+                    "workflow_hash": workflow_hash,
+                    "created_at": "2026-02-24T15:30:00+00:00",
+                    "failure": {
+                        "error_type": "ProviderError",
+                        "message": "Network error",
+                        "agent": "agent1",
+                        "iteration": 1,
+                    },
+                    "inputs": {},
+                    "current_agent": "agent1",
+                    "context": {
+                        "workflow_inputs": {},
+                        "agent_outputs": {},
+                        "current_iteration": 0,
+                        "execution_history": [],
+                    },
+                    "limits": {
+                        "current_iteration": 0,
+                        "max_iterations": 10,
+                        "execution_history": [],
+                    },
+                    "copilot_session_ids": {},
+                    "run_id": "",
+                    "event_log_path": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        mock_registry = AsyncMock()
+        mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+        mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+        mock_engine = MagicMock()
+        mock_engine.resume = AsyncMock(return_value={"result": "done"})
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+        ):
+            result = asyncio.run(
+                resume_workflow_async(
+                    workflow_file,
+                    checkpoint_file,
+                    log_file=None,
+                )
+            )
+
+        assert result == {"result": "done"}
+        assert log_path.exists()
 
 
 class TestFileLoggingStderrNotification:
