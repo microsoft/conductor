@@ -2054,7 +2054,13 @@ async def run_workflow_async(
         # Start JSONL event log subscriber (always-on structured diagnostics)
         from conductor.engine.event_log import EventLogSubscriber
 
-        event_log_subscriber = EventLogSubscriber(config.workflow.name)
+        _eld = config.workflow.runtime.event_log_dir
+        _event_log_dir = Path(_eld).resolve() if _eld else None
+
+        event_log_subscriber = EventLogSubscriber(
+            config.workflow.name,
+            event_log_dir=_event_log_dir,
+        )
         emitter.subscribe(event_log_subscriber.on_event)
 
         # Write the Fleet Manager run record (E2): this is the first point
@@ -2765,10 +2771,14 @@ async def resume_workflow_async(
             # appends to it and reuses run_id; otherwise it generates fresh.
             from conductor.engine.event_log import EventLogSubscriber
 
+            _eld = config.workflow.runtime.event_log_dir
+            _event_log_dir = Path(_eld).resolve() if _eld else None
+
             event_log_subscriber = EventLogSubscriber(
                 config.workflow.name,
                 existing_path=existing_log_path,
                 existing_run_id=cp.run_id or None,
+                event_log_dir=_event_log_dir,
             )
             emitter.subscribe(event_log_subscriber.on_event)
 
