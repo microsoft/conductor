@@ -1690,8 +1690,7 @@ class TestYamlLogFileFallback:
     @staticmethod
     def _write_workflow(tmp_path: Path, log_path: Path) -> Path:
         workflow_file = tmp_path / "test.yaml"
-        workflow_file.write_text(
-            f"""\
+        workflow_yaml = f"""\
 workflow:
   name: test-workflow
   entry_point: agent1
@@ -1706,9 +1705,8 @@ agents:
 
 output:
   result: "done"
-""",
-            encoding="utf-8",
-        )
+"""
+        workflow_file.write_text(workflow_yaml, encoding="utf-8")
         return workflow_file
 
     @staticmethod

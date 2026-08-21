@@ -56,6 +56,7 @@ workflow:
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
+    log_file: auto                   # Optional: "auto" or file path (default: no file logging)
     default_reasoning_effort: medium  # Optional: low | medium | high | xhigh | max
                                       # Workflow-wide default for reasoning /
                                       # extended-thinking effort. Inherited by
@@ -79,6 +80,16 @@ workflow:
                                       # and their MCP servers. Relative paths resolve against the
                                       # parent directory of the workflow YAML file.
 ```
+
+**Runtime file logging** enables debug file logging using the same destination
+forms as CLI `--log-file`.
+Set `log_file: auto` to generate a timestamped file in the OS temporary
+directory's `conductor/` subdirectory, or specify a path such as
+`./logs/run.log`. Relative paths are resolved from the Conductor process's
+current working directory. The setting applies to both `conductor run` and
+`conductor resume`. An explicitly supplied CLI `--log-file` takes precedence;
+if neither value is set, file logging remains disabled. See the
+[CLI reference](cli-reference.md#conductor-run) for the command-line option.
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
 
