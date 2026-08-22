@@ -37,14 +37,16 @@ from typing import TYPE_CHECKING, cast
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Checkbox, Footer, Header, Input, Label, Static
 
 from conductor.config.schema import InputDef
-from conductor.console import styled
+from conductor.console import join, styled
 from conductor.fleet.launch import LaunchError, ResolvedWorkflow, launch_workflow, resolve_workflow
-from conductor.fleet.tui.actions import report_background_launch
+from conductor.fleet.tui.actions import change_launch_directory, report_background_launch
+from conductor.fleet.tui.theme import shorten_home
 
 if TYPE_CHECKING:
     # The app module imports this screen module, so a top-level import of
@@ -183,6 +185,13 @@ class NewRunScreen(Screen):
         ("escape", "back", "Back"),
         ("ctrl+r", "resolve", "Resolve"),
         ("ctrl+s", "launch", "Launch"),
+        # `priority=True` is required for the same reason `enter` on Runs'
+        # `open_detail` needs it: `Input` binds `ctrl+d` itself
+        # (`delete_right`, `show=False`), and as the focused widget it sits
+        # ahead of the screen in the binding chain. Verified empirically --
+        # with priority the screen action fires and the Input's value is
+        # untouched; `delete` still deletes-right (issue #477).
+        Binding("ctrl+d", "change_dir", "Dir", priority=True),
     ]
 
     def __init__(self, initial_ref: str | None = None) -> None:
@@ -216,6 +225,10 @@ class NewRunScreen(Screen):
         """Bumped at the start of every ``action_resolve`` call so an
         out-of-order (slower, superseded) resolve worker can detect it is
         stale and discard its result instead of overwriting a newer one."""
+        self._changing_dir = False
+        """Guards against a second, concurrent ``ctrl+d`` press opening a
+        second directory-picker modal while one is already in flight,
+        matching ``RunsScreen``'s ``_changing_dir`` guard (issue #477)."""
 
     def action_back(self) -> None:
         """Pop back to the Runs screen -- bound to ``escape``."""
@@ -228,17 +241,29 @@ class NewRunScreen(Screen):
         ``disabled`` state: with no button, "you cannot launch yet" has to
         be said in words, and saying *why* is more useful than a greyed-out
         control was.
+
+        Appends the current launch directory (issue #477) -- exactly where
+        relative references resolve against, so this is where a reader
+        needs to see it. That directory is runtime data, so it is built
+        with ``styled()``/``join()`` rather than interpolated into the
+        ``Text.from_markup`` literal above it (guard rules C/F,
+        ``tests/test_cli/test_markup_guards.py``).
         """
         hint = self.query_one("#form-hint", Static)
         if self._resolved is None:
-            hint.update(
-                Text.from_markup(
-                    "[dim]Enter a workflow reference above, then press "
-                    "[/dim]enter[dim] to resolve it.[/dim]"
-                )
+            first_line = Text.from_markup(
+                "[dim]Enter a workflow reference above, then press "
+                "[/dim]enter[dim] to resolve it.[/dim]"
             )
-            return
-        hint.update(Text.from_markup("[dim]Press [/dim]ctrl+s[dim] to launch this workflow.[/dim]"))
+        else:
+            first_line = Text.from_markup(
+                "[dim]Press [/dim]ctrl+s[dim] to launch this workflow.[/dim]"
+            )
+        directory_line = styled(
+            "[dim]Relative paths resolve against {} ([/dim]ctrl+d[dim] to change).[/dim]",
+            shorten_home(cast("FleetApp", self.app).launch_dir),
+        )
+        hint.update(join("\n", [first_line, directory_line]))
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -258,6 +283,7 @@ class NewRunScreen(Screen):
     def on_mount(self) -> None:
         """Focus the reference field, pre-filling and resolving it when the
         caller supplied one (the Registries drill-down's ``n``)."""
+        self.sub_title = shorten_home(cast("FleetApp", self.app).launch_dir)
         self._update_hint()
         ref_input = self.query_one("#workflow-ref", Input)
         if self._initial_ref:
@@ -279,6 +305,41 @@ class NewRunScreen(Screen):
         name = self._widget_names.get(event.checkbox)
         if name is not None:
             self._checkbox_touched.add(name)
+
+    # -----------------------------------------------------------------
+    # Launch directory (issue #477)
+    # -----------------------------------------------------------------
+
+    @work
+    async def action_change_dir(self) -> None:
+        """Open the directory picker -- bound to ``ctrl+d`` (``priority``,
+        since ``Input`` holds focus for most of this screen's life and
+        binds ``ctrl+d`` itself as ``delete_right``).
+
+        Re-resolves the reference field on success, when it holds
+        something, so a relative reference immediately re-resolves against
+        the new base rather than silently pointing at the old one until
+        the next explicit ``ctrl+r``/Enter. Also refreshes the hint, which
+        names the current directory.
+
+        Guarded by :attr:`_changing_dir` against a second, concurrent
+        ``ctrl+d`` press opening a second modal while one is already in
+        flight.
+        """
+        if self._changing_dir:
+            return
+        self._changing_dir = True
+        try:
+            chosen = await change_launch_directory(self.app)
+        finally:
+            self._changing_dir = False
+
+        if chosen is None:
+            return
+        self.sub_title = shorten_home(chosen)
+        self._update_hint()
+        if self.query_one("#workflow-ref", Input).value.strip():
+            self.action_resolve()
 
     @work
     async def action_resolve(self) -> None:
@@ -317,8 +378,13 @@ class NewRunScreen(Screen):
             return
 
         message.update(Text.from_markup("[dim]Resolving…[/dim]"))
+        # Read on the event loop *before* the thread hop -- `launch_dir` is
+        # a Textual reactive and the resolve itself runs in a worker
+        # thread, where reading app state directly would be a cross-thread
+        # access.
+        base_dir = cast("FleetApp", self.app).launch_dir
         try:
-            resolved = await asyncio.to_thread(resolve_workflow, ref)
+            resolved = await asyncio.to_thread(resolve_workflow, ref, base_dir=base_dir)
         except LaunchError as e:
             if generation != self._resolve_generation:
                 return
@@ -464,10 +530,11 @@ class NewRunScreen(Screen):
         message = self.query_one("#launch-message", Static)
         message.update(Text.from_markup("[dim]Launching…[/dim]"))
         raw_values = {name: self._raw_value_for(name) for name in resolved.inputs}
+        cwd = cast("FleetApp", self.app).launch_dir
 
         try:
             launch = await asyncio.to_thread(
-                launch_workflow, resolved.path, raw_values, resolved.inputs
+                launch_workflow, resolved.path, raw_values, resolved.inputs, cwd=cwd
             )
         except LaunchError as e:
             logger.warning("Failed to launch workflow %s", resolved.path, exc_info=True)

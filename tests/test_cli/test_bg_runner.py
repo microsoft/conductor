@@ -205,7 +205,26 @@ class TestSpawnDetached:
         assert kwargs["stderr"] is subprocess.DEVNULL
         assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["env"] == {"X": "1"}
+        assert kwargs["cwd"] is None
         assert proc.pid in bg_runner._SPAWNED_GROUP_LEADERS
+
+    def test_posix_cwd_is_passed_through_to_popen(self, tmp_path: Path) -> None:
+        """Issue #477: a supplied ``cwd`` reaches ``subprocess.Popen`` --
+        the child's own ``os.getcwd()`` is what ``engine/workflow.py``
+        stamps as ``system.cwd``, so this is the honest seam to assert on."""
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured["kwargs"] = kwargs
+            return MagicMock(pid=1234)
+
+        with (
+            patch.object(bg_runner.sys, "platform", "linux"),
+            patch.object(bg_runner.subprocess, "Popen", side_effect=_fake_popen),
+        ):
+            bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"}, cwd=tmp_path)
+
+        assert captured["kwargs"]["cwd"] == tmp_path
 
     def test_windows_happy_path_includes_breakaway_and_suspended(self) -> None:
         winapi, kernel32 = _make_windows_mocks()
@@ -220,6 +239,21 @@ class TestSpawnDetached:
         assert creationflags & bg_runner._CREATE_NEW_PROCESS_GROUP
         assert creationflags & bg_runner._CREATE_BREAKAWAY_FROM_JOB
         assert creationflags & bg_runner._CREATE_SUSPENDED
+        # `current_directory` (the 8th positional arg) is `None` when no
+        # `cwd` was supplied.
+        assert call.args[7] is None
+
+    def test_windows_cwd_is_passed_as_current_directory(self, tmp_path: Path) -> None:
+        """Issue #477: a supplied ``cwd`` reaches ``_winapi.CreateProcess``'s
+        ``current_directory`` argument (the 8th positional)."""
+        winapi, kernel32 = _make_windows_mocks()
+
+        with _patched_windows_platform(winapi, kernel32):
+            bg_runner._spawn_detached(["python", "-c", "pass"], {"X": "1"}, cwd=tmp_path)
+
+        winapi.CreateProcess.assert_called_once()
+        call = winapi.CreateProcess.call_args
+        assert call.args[7] == str(tmp_path)
 
     def test_windows_happy_path_assigns_job_and_resumes_in_order(self) -> None:
         winapi, kernel32 = _make_windows_mocks()
@@ -491,6 +525,148 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
                 checkpoint_path=None,
                 web_port=9304,
             )
+
+
+# ---------------------------------------------------------------------------
+# cwd (issue #477): threading the Fleet Manager's launch directory through
+# to the detached child.
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchBackgroundCwd:
+    """``launch_background``/``launch_background_resume(cwd=...)`` reach
+    ``_spawn_detached`` and ``PYTHONSAFEPATH`` is set only when a ``cwd``
+    was actually supplied."""
+
+    def test_launch_background_forwards_cwd_to_spawn_detached(self, tmp_path: Path) -> None:
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        launch_dir = tmp_path / "launch-dir"
+        launch_dir.mkdir()
+
+        fake_proc = MagicMock(pid=11)
+        fake_proc.poll.return_value = None
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=MagicMock(pid=11, mode="bg", port=9311),
+            ),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9311,
+                cwd=launch_dir,
+            )
+
+        mock_spawn.assert_called_once()
+        assert mock_spawn.call_args.kwargs["cwd"] == launch_dir
+        env = mock_spawn.call_args.args[1]
+        assert env["PYTHONSAFEPATH"] == "1"
+
+    def test_launch_background_without_cwd_leaves_pythonsafepath_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+
+        fake_proc = MagicMock(pid=12)
+        fake_proc.poll.return_value = None
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=MagicMock(pid=12, mode="bg", port=9312),
+            ),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9312,
+            )
+
+        assert mock_spawn.call_args.kwargs["cwd"] is None
+        env = mock_spawn.call_args.args[1]
+        assert "PYTHONSAFEPATH" not in env
+
+    def test_launch_background_resume_forwards_cwd_to_spawn_detached(self, tmp_path: Path) -> None:
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        launch_dir = tmp_path / "launch-dir"
+        launch_dir.mkdir()
+
+        fake_proc = MagicMock(pid=13)
+        fake_proc.poll.return_value = None
+
+        with (
+            patch.object(bg_runner, "_spawn_detached", return_value=fake_proc) as mock_spawn,
+            patch.object(bg_runner, "_wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=MagicMock(pid=13, mode="bg", port=9313),
+            ),
+            patch.object(bg_runner, "_resolve_start_timeout", return_value=0.0),
+        ):
+            bg_runner.launch_background_resume(
+                workflow_path=wf_path,
+                checkpoint_path=None,
+                web_port=9313,
+                cwd=launch_dir,
+            )
+
+        mock_spawn.assert_called_once()
+        assert mock_spawn.call_args.kwargs["cwd"] == launch_dir
+        env = mock_spawn.call_args.args[1]
+        assert env["PYTHONSAFEPATH"] == "1"
+
+    def test_bad_cwd_raises_before_any_spawn_is_attempted(self, tmp_path: Path) -> None:
+        """A ``cwd`` that is not a directory is rejected *before* the bg log
+        files are opened or ``_spawn_detached`` is called (issue #477) --
+        otherwise a POSIX ``Popen`` with a bad cwd raises a bare
+        ``FileNotFoundError`` indistinguishable from a missing interpreter."""
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        bad_cwd = tmp_path / "does-not-exist"
+
+        with (
+            patch.object(bg_runner, "_spawn_detached") as mock_spawn,
+            pytest.raises(RuntimeError, match=re.escape(str(bad_cwd))),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9314,
+                cwd=bad_cwd,
+            )
+
+        mock_spawn.assert_not_called()
+
+    def test_cwd_naming_a_file_is_also_rejected(self, tmp_path: Path) -> None:
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        file_cwd = tmp_path / "not-a-dir.txt"
+        file_cwd.write_text("")
+
+        with (
+            patch.object(bg_runner, "_spawn_detached") as mock_spawn,
+            pytest.raises(RuntimeError, match=re.escape(str(file_cwd))),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9315,
+                cwd=file_cwd,
+            )
+
+        mock_spawn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

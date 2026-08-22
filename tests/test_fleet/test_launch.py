@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -122,6 +123,15 @@ class TestResolveWorkflowFile:
         assert resolved.inputs["question"].required is True
         assert resolved.inputs["verbose"].default is False
 
+    def test_resolved_path_is_absolute(self, workflow_file: Path) -> None:
+        """Issue #477: ``launch_background`` puts ``str(workflow_path)``
+        straight into a detached child's argv, so a relative path would
+        resolve against whatever cwd that child happens to inherit rather
+        than the directory it was actually typed against."""
+        resolved = resolve_workflow(str(workflow_file))
+
+        assert resolved.path.is_absolute()
+
     def test_nonexistent_file_raises_launch_error(self, tmp_path: Path) -> None:
         missing = tmp_path / "does-not-exist.yaml"
 
@@ -134,6 +144,64 @@ class TestResolveWorkflowFile:
 
         with pytest.raises(LaunchError, match="Failed to parse"):
             resolve_workflow(str(bad))
+
+
+class TestResolveWorkflowBaseDir:
+    """``base_dir`` (issue #477): the Fleet Manager's launch directory a
+    relative *file* reference resolves against, instead of the process cwd."""
+
+    def test_relative_reference_resolves_against_base_dir(self, tmp_path: Path) -> None:
+        base_dir = tmp_path / "project"
+        base_dir.mkdir()
+        (base_dir / "workflow.yaml").write_text(_WORKFLOW_YAML)
+
+        resolved = resolve_workflow("workflow.yaml", base_dir=base_dir)
+
+        assert resolved.path == Path(os.path.abspath(base_dir / "workflow.yaml"))
+        assert resolved.path.is_absolute()
+        assert resolved.name == "test-workflow"
+
+    def test_relative_reference_with_base_dir_none_uses_process_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``base_dir=None`` preserves the prior behaviour: relative to the
+        process's current working directory."""
+        (tmp_path / "workflow.yaml").write_text(_WORKFLOW_YAML)
+        monkeypatch.chdir(tmp_path)
+
+        resolved = resolve_workflow("workflow.yaml")
+
+        assert resolved.path == Path(os.path.abspath(tmp_path / "workflow.yaml"))
+        assert resolved.path.is_absolute()
+
+    def test_absolute_reference_ignores_base_dir(self, workflow_file: Path, tmp_path: Path) -> None:
+        unrelated_base = tmp_path / "unrelated"
+        unrelated_base.mkdir()
+
+        resolved = resolve_workflow(str(workflow_file), base_dir=unrelated_base)
+
+        assert resolved.path == workflow_file
+
+    def test_relative_reference_missing_under_base_dir_raises_launch_error(
+        self, tmp_path: Path
+    ) -> None:
+        base_dir = tmp_path / "project"
+        base_dir.mkdir()
+
+        with pytest.raises(LaunchError, match="not found"):
+            resolve_workflow("does-not-exist.yaml", base_dir=base_dir)
+
+    def test_registry_reference_ignores_base_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _registry_env(tmp_path, monkeypatch)
+        _configure_registry(_write_registry(tmp_path), name="my-reg")
+        unrelated_base = tmp_path / "unrelated"
+        unrelated_base.mkdir()
+
+        resolved = resolve_workflow("test-workflow@my-reg", base_dir=unrelated_base)
+
+        assert resolved.name == "test-workflow"
 
 
 class TestResolveWorkflowRegistry:
@@ -334,6 +402,24 @@ class TestLaunchWorkflow:
         assert kwargs["skip_gates"] is True
         assert kwargs["metadata"] == {"source": "fleet-tui"}
 
+    def test_forwards_cwd(self, workflow_file: Path, tmp_path: Path) -> None:
+        """Issue #477: the Fleet Manager's launch directory reaches
+        ``launch_background`` as ``cwd``."""
+        launch_dir = tmp_path / "launch-dir"
+        launch_dir.mkdir()
+        with patch("conductor.cli.bg_runner.launch_background") as fake_launch:
+            launch_workflow(workflow_file, {}, {}, cwd=launch_dir)
+
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["cwd"] == launch_dir
+
+    def test_cwd_defaults_to_none(self, workflow_file: Path) -> None:
+        with patch("conductor.cli.bg_runner.launch_background") as fake_launch:
+            launch_workflow(workflow_file, {}, {})
+
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["cwd"] is None
+
     def test_required_field_rejected_before_launch_background_is_called(
         self, workflow_file: Path
     ) -> None:
@@ -413,6 +499,26 @@ class TestLaunchResume:
         assert kwargs["provider_override"] == "claude"
         assert kwargs["skip_gates"] is True
         assert kwargs["metadata"] == {"source": "fleet-tui"}
+
+    def test_forwards_cwd(self, tmp_path: Path) -> None:
+        """Issue #477: the Fleet Manager's launch directory reaches
+        ``launch_background_resume`` as ``cwd``."""
+        checkpoint_path = tmp_path / "checkpoint.json"
+        launch_dir = tmp_path / "launch-dir"
+        launch_dir.mkdir()
+        with patch("conductor.cli.bg_runner.launch_background_resume") as fake_launch:
+            launch_resume(checkpoint_path, cwd=launch_dir)
+
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["cwd"] == launch_dir
+
+    def test_cwd_defaults_to_none(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.json"
+        with patch("conductor.cli.bg_runner.launch_background_resume") as fake_launch:
+            launch_resume(checkpoint_path)
+
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["cwd"] is None
 
     def test_launch_background_resume_failure_surfaces_as_launch_error(
         self, tmp_path: Path

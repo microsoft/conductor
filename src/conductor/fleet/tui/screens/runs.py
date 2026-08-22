@@ -52,6 +52,7 @@ from conductor.fleet.summary import (
 )
 from conductor.fleet.tui.actions import (
     GateResolveOutcome,
+    change_launch_directory,
     dashboard_disabled_reason,
     dashboard_url,
     gate_resolve_disabled_reason,
@@ -76,6 +77,7 @@ from conductor.fleet.tui.theme import (
     loading_text,
     mode_label,
     muted,
+    shorten_home,
     status_badge,
     status_style,
 )
@@ -207,9 +209,7 @@ def _directory_cell(cwd: str | None) -> Text:
     """
     if not cwd:
         return empty_cell()
-    home = str(Path.home())
-    shown = f"~{cwd[len(home) :]}" if cwd.startswith(home) else cwd
-    return Text(shown, style="dim")
+    return Text(shorten_home(cwd), style="dim")
 
 
 def _dim_if_empty(value: str) -> Text:
@@ -638,9 +638,15 @@ class RunsScreen(Screen):
     # longer wording ("Dashboard", "Resolve Gate") overflowed it, and an
     # overflowing footer does not wrap -- it truncates mid-word and drops
     # whatever came after, which is how `h History` disappeared entirely.
-    # The full set currently needs ~91 columns; `test_footer_fits_without_
-    # truncation` pins that, so adding a binding fails a test rather than
-    # silently dropping the last one off the edge again.
+    # The full set now needs ~97 columns at the *gated* worst case (`g Gate`
+    # visible); `test_footer_fits_without_truncation` pins that against a
+    # gated record, so adding a binding fails a test rather than silently
+    # dropping the last one off the edge again. What bought the room for
+    # `d Dir` (issue #477): `BlockFooter` hides the docked `^p palette` key
+    # (`ctrl+p` still opens it -- see `BlockFooter`'s own docstring), and
+    # `Providers`/`Registries` were shortened to `Prov`/`Regs`. The tank is
+    # nearly empty after this -- the next binding will need to reclaim
+    # columns of its own before it can land.
     #
     # Ordered in two blocks, because these keys are not one flat set: the
     # first acts on whichever run the cursor is on, the second navigates the
@@ -650,7 +656,9 @@ class RunsScreen(Screen):
     # invisible when every key has identical styling and spacing. `K` (kill
     # *all*) sits in the fleet block despite pairing visually with `k`: it is
     # fleet-scoped, and leaving the two adjacent put "kill everything" one
-    # stray Shift away from "kill this one".
+    # stray Shift away from "kill this one". `d` (change directory, issue
+    # #477) sits in the fleet block too -- it commands the app's launch
+    # directory, not the highlighted row.
     BINDINGS = [
         # Row-scoped -- operate on the highlighted run.
         #
@@ -665,8 +673,9 @@ class RunsScreen(Screen):
         ("g", "resolve_gate", "Gate"),
         # Fleet-scoped -- navigation and whole-fleet commands.
         ("n", "open_new_run", "New"),
-        ("p", "open_providers", "Providers"),
-        ("r", "open_registries", "Registries"),
+        ("d", "change_dir", "Dir"),
+        ("p", "open_providers", "Prov"),
+        ("r", "open_registries", "Regs"),
         ("h", "open_history", "History"),
         ("K", "kill_all", "Kill all"),
         ("q", "quit", "Quit"),
@@ -740,11 +749,49 @@ class RunsScreen(Screen):
         """Debounces the "could not read run records" notification to once
         per run of consecutive failures, so a persistently unreadable
         directory doesn't emit one toast per ~2s tick."""
+        self._changing_dir = False
+        """Guards against a second, concurrent ``d`` press opening a second
+        directory-picker modal while one is already in flight (issue #477),
+        matching the ``_resolving_gate``/``_opening_dashboard`` "first one
+        wins" convention."""
 
     def action_quit(self) -> None:
         """Quit the app -- bound to ``q`` (Textual dispatches bindings to the
         focused screen, not the App, so this must live here to take effect)."""
         self.app.exit()
+
+    # -----------------------------------------------------------------
+    # Launch directory (issue #477)
+    # -----------------------------------------------------------------
+
+    @work
+    async def action_change_dir(self) -> None:
+        """Open the directory picker and apply a chosen launch directory --
+        bound to ``d``. Not tied to the currently-selected run row, since
+        the launch directory is an app-wide setting, not a per-run action.
+
+        Guarded by :attr:`_changing_dir` against a second, concurrent ``d``
+        press opening a second modal while one is already in flight.
+        """
+        if self._changing_dir:
+            return
+        self._changing_dir = True
+        try:
+            await change_launch_directory(self.app)
+        finally:
+            self._changing_dir = False
+
+    def _update_sub_title(self, _old: Path | None = None, _new: Path | None = None) -> None:
+        """Refresh the header sub-title from ``app.launch_dir``.
+
+        Registered with ``self.watch(...)`` in :meth:`on_mount` so a
+        directory change made from this screen (or from New Run) updates
+        the header without waiting for the next poll tick. The optional
+        old/new parameters match Textual's watch-callback signature but are
+        unused -- the sub-title is always rebuilt from the app's current
+        value, not from the deltas.
+        """
+        self.sub_title = shorten_home(cast("FleetApp", self.app).launch_dir)
 
     # -----------------------------------------------------------------
     # Providers drill-down (E10-T4)
@@ -807,6 +854,11 @@ class RunsScreen(Screen):
         yield BlockFooter(first_block_actions=self._ROW_SCOPED_ACTIONS | {"resolve_gate"})
 
     def on_mount(self) -> None:
+        self._update_sub_title()
+        # `init=False`: the sub-title is already set by the line above, so
+        # rerunning the callback immediately on registration would just
+        # repeat that same work.
+        self.watch(self.app, "launch_dir", self._update_sub_title, init=False)
         table = self.query_one(DataTable)
         # The first key is kept because `_tick` repaints that column in
         # place: `update_cell` addresses a column by key, not by index.

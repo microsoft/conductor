@@ -10,7 +10,11 @@ one on top.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from textual.app import App
+from textual.reactive import reactive
 
 from conductor.fleet.records import RunRecord
 from conductor.fleet.tui.anim import animations_enabled, disabled_reason
@@ -22,6 +26,19 @@ from conductor.fleet.tui.screens.run_detail import RunDetailScreen
 from conductor.fleet.tui.screens.runs import RunsScreen
 from conductor.fleet.tui.screens.splash import SplashScreen
 from conductor.fleet.tui.screens.step_detail import StepDetailScreen
+
+
+def _initial_launch_dir() -> Path:
+    """Return the process's current working directory at app startup.
+
+    Falls back to the home directory on ``OSError`` -- the process cwd can
+    be deleted out from under a running process, and ``engine/workflow.py``
+    guards ``os.getcwd()`` the same way for the same reason.
+    """
+    try:
+        return Path(os.getcwd())
+    except OSError:
+        return Path.home()
 
 
 class FleetApp(App):
@@ -37,6 +54,30 @@ class FleetApp(App):
     any more -- so picking a theme from the command palette silently does
     nothing. Set it on the instance instead, which goes *through* the
     reactive and leaves the palette working."""
+
+    launch_dir: reactive[Path] = reactive[Path](_initial_launch_dir, init=False)
+    """The directory new runs are launched from (issue #477): the base a
+    relative workflow reference on the New Run screen resolves against, and
+    the working directory a launched run's detached child inherits (hence
+    its Directory column and any ``type: script`` step's default cwd).
+
+    **Process-lifetime only.** There is no ``config.toml`` key and no state
+    file backing this -- it starts at the process's cwd
+    (:func:`_initial_launch_dir`) every time ``conductor fleet`` runs, and a
+    change made via the footer's ``d``/``ctrl+d`` picker (see
+    ``fleet/tui/actions.py::DirectoryPickerModal``) is gone the moment this
+    process exits. It does **not** affect ``runtime.working_dir`` /
+    ``agent.working_dir`` or sub-workflow references, which always resolve
+    against the *workflow file's* directory, and it is not a filter on what
+    Runs/History display -- the Fleet Manager always shows the whole fleet.
+
+    A Textual ``reactive`` (not a plain attribute) so screens can
+    ``self.watch(self.app, "launch_dir", callback)`` the same way
+    ``textual.widgets._header.Header`` watches ``app.title``/
+    ``screen.sub_title``. ``init=False`` because the callable default is
+    evaluated once regardless, and re-running every registered watcher at
+    startup (Textual's ``init=True`` default) would fire before a screen's
+    own ``on_mount`` has registered anything to receive it."""
 
     CSS = """
     /* ------------------------------------------------------------------
@@ -152,6 +193,17 @@ class FleetApp(App):
                 title="Fleet",
                 markup=False,
             )
+
+    def set_launch_dir(self, path: Path) -> None:
+        """Set :attr:`launch_dir` -- the one named mutation site (issue #477).
+
+        Called by ``fleet/tui/actions.py::change_launch_directory`` once the
+        directory picker modal dismisses with a chosen, validated directory.
+        Matches this module's ``push_*``/``return_to_runs`` convention of
+        centralizing state mutation in one named method rather than having
+        screens assign ``self.app.launch_dir`` directly.
+        """
+        self.launch_dir = path
 
     def push_run_detail(self, record: RunRecord) -> None:
         """Push the run-detail screen (E9) for ``record`` onto the screen stack.

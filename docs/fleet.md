@@ -13,6 +13,7 @@ same run-discovery mechanism.
 - [Animation and remote sessions](#animation-and-remote-sessions)
 - [Screens](#screens)
 - [Key bindings](#key-bindings)
+- [Launch directory](#launch-directory)
 - [Status vocabulary](#status-vocabulary)
 - [Gates: display vs. resolve](#gates-display-vs-resolve)
 - [Division of labor: TUI vs. dashboard](#division-of-labor-tui-vs-dashboard)
@@ -213,9 +214,11 @@ stack rather than each managing its own navigation state.
 - **New run** (`n`) — enter a file path or registry reference, resolve it,
   and fill in a form generated from the workflow's declared `input:`
   block (required fields marked, defaults pre-filled, descriptions shown).
-  Submitting shells out to `conductor run --web-bg` via the same
-  `launch_background()` the CLI itself uses, so a launched run outlives
-  the TUI rather than dying with it. Once the launch succeeds, this screen pops
+  A relative reference resolves against the current
+  [launch directory](#launch-directory) (`ctrl+d` to change it, from either
+  this screen or Runs). Submitting shells out to `conductor run --web-bg`
+  via the same `launch_background()` the CLI itself uses, so a launched run
+  outlives the TUI rather than dying with it. Once the launch succeeds, this screen pops
   back to Runs, where the new run appears on the next poll tick; the TUI
   never tracks a launched run's lifecycle beyond that (**viewer, not
   supervisor**).
@@ -264,11 +267,16 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `k` | Kill the selected run (confirms first) |
 | `K` | Kill every displayed run (confirms once) |
 | `g` | Resolve the selected run's open gate (see [below](#gates-display-vs-resolve)) |
+| `n` | New run |
+| `d` | Change the [launch directory](#launch-directory) |
 | `p` | Providers |
 | `r` | Registries |
-| `n` | New run |
 | `h` | History |
 | `q` | Quit |
+
+The Runs footer also hides the docked `^p palette` key to make room for the
+above (`ctrl+p` still opens the command palette — only the footer key is
+hidden, not the palette itself).
 
 Screens with a row-scoped `enter` advertise it in their own footer:
 
@@ -300,6 +308,32 @@ specifically in the confirmation, since a plain `SIGTERM` on a foreground
 run discards in-flight progress unless periodic checkpoints are enabled
 for it (the same warning `conductor stop`'s own confirmation shows — one
 policy, two presentations, sharing the same underlying implementation).
+
+## Launch directory
+
+`d` (Runs) / `ctrl+d` (New run) opens a directory picker — type a path, or
+browse a tree rooted at the current directory's parent (so a sibling
+checkout is one keypress away) — and sets the TUI's **launch directory**
+for the rest of this `conductor fleet` session.
+
+The launch directory affects two things:
+
+- A **relative** workflow reference on the New Run screen resolves against
+  it, not against wherever `conductor fleet` happened to be started.
+- A launched run's detached child inherits it as its working directory,
+  which is what its Directory column shows and what a `type: script` step
+  without an explicit `working_dir:` defaults to.
+
+It does **not** affect `runtime.working_dir` / `agent.working_dir` or a
+sub-workflow's own workflow-file reference — those always resolve against
+the *workflow file's* directory, unrelated to where the TUI itself was
+launched from or later pointed at. It is also not a filter: the Runs and
+History screens always show the whole fleet, regardless of the current
+launch directory.
+
+**Process-lifetime only** — there is no `config.toml` key and no state file
+behind it. It starts at `conductor fleet`'s own working directory every
+time, and resets the moment this process exits.
 
 ## Status vocabulary
 

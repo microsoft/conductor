@@ -28,11 +28,19 @@ Three responsibilities:
   #460, the History screen's Resume action) by calling
   :func:`conductor.cli.bg_runner.launch_background_resume` directly, for the
   exact same never-re-implement-spawning reason as ``launch_workflow``.
+
+The Fleet Manager's launch directory (issue #477, ``FleetApp.launch_dir``) is
+threaded into this module as an argument -- ``base_dir`` on
+:func:`resolve_workflow`, ``cwd`` on :func:`launch_workflow`/:func:`launch_resume`
+-- and never read off the process itself (no ``os.getcwd()`` here). That
+keeps this module a pure function of its arguments; the one place the
+directory is actually decided is ``fleet/tui/app.py``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,7 +79,7 @@ class ResolvedWorkflow:
     the same shape ``conductor show`` renders (``cli/app.py``)."""
 
 
-def resolve_workflow(ref: str) -> ResolvedWorkflow:
+def resolve_workflow(ref: str, *, base_dir: Path | None = None) -> ResolvedWorkflow:
     """Resolve a file path or registry reference to a launchable workflow.
 
     Mirrors ``conductor show``'s resolution exactly (``cli/app.py``): a
@@ -81,9 +89,20 @@ def resolve_workflow(ref: str) -> ResolvedWorkflow:
     Args:
         ref: A local file path or registry reference
             (``name[@registry][#version]``).
+        base_dir: The directory a *relative file* reference is resolved
+            against (Fleet Manager E12/issue #477 -- the TUI's
+            ``FleetApp.launch_dir``, not the process cwd).
+            ``None`` preserves the prior behaviour of resolving relative to
+            the process's current working directory. Ignored for an
+            absolute reference or a registry reference, neither of which
+            are relative to anything.
 
     Returns:
         A :class:`ResolvedWorkflow` with the local path and declared inputs.
+        ``path`` is always absolute -- ``launch_background`` puts it
+        straight into a detached child's argv, so a relative path would
+        resolve against whatever cwd that child happens to inherit rather
+        than the directory it was actually typed against.
 
     Raises:
         LaunchError: If the reference cannot be resolved, the file does not
@@ -98,12 +117,26 @@ def resolve_workflow(ref: str) -> ResolvedWorkflow:
         if resolved.kind == "file":
             assert resolved.path is not None
             workflow_path = resolved.path
+            if base_dir is not None and not workflow_path.is_absolute():
+                workflow_path = base_dir / workflow_path
             if not workflow_path.exists():
+                if base_dir is not None:
+                    raise LaunchError(
+                        f"Workflow file not found: {ref} (resolved against {base_dir})"
+                    )
                 raise LaunchError(f"Workflow file not found: {ref}")
         else:
             workflow_path = resolve_and_fetch(resolved)
     except RegistryError as e:
         raise LaunchError(str(e)) from e
+
+    # `Path(os.path.abspath(...))`, not `.resolve()`: matches this repo's
+    # existing "normpath, not resolve" convention
+    # (`_resolve_agent_working_dir`, `skills/registry.py`) so a symlinked
+    # project directory stays the alias the user typed rather than being
+    # collapsed to its real path. A registry-fetched cache path is already
+    # absolute, so this is a no-op for it.
+    workflow_path = Path(os.path.abspath(workflow_path))
 
     try:
         from conductor.config.loader import load_config as load_workflow_config
@@ -217,6 +250,7 @@ def launch_workflow(
     provider_override: str | None = None,
     skip_gates: bool = False,
     metadata: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Validate/coerce inputs and launch the workflow in the background.
 
@@ -238,6 +272,9 @@ def launch_workflow(
         provider_override: Optional provider name override.
         skip_gates: Whether to auto-select first option at human gates.
         metadata: Optional CLI metadata key=value pairs.
+        cwd: Working directory for the detached child (issue #477 --
+            the TUI's ``FleetApp.launch_dir``). ``None`` preserves the
+            child's inherited cwd (today's behaviour).
 
     Returns:
         The ``BackgroundLaunch`` describing the launch. See above for the
@@ -262,6 +299,7 @@ def launch_workflow(
             provider_override=provider_override,
             skip_gates=skip_gates,
             metadata=metadata,
+            cwd=cwd,
         )
     except Exception as e:  # noqa: BLE001 - surfaced as a LaunchError, not a traceback
         raise LaunchError(str(e)) from e
@@ -273,6 +311,7 @@ def launch_resume(
     provider_override: str | None = None,
     skip_gates: bool = False,
     metadata: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Resume a workflow from an on-disk checkpoint in the background (issue #460).
 
@@ -300,6 +339,9 @@ def launch_resume(
         provider_override: Optional provider name override.
         skip_gates: Whether to auto-select first option at human gates.
         metadata: Optional CLI metadata key=value pairs.
+        cwd: Working directory for the detached child (issue #477 --
+            the TUI's ``FleetApp.launch_dir``). ``None`` preserves the
+            child's inherited cwd (today's behaviour).
 
     Returns:
         The ``BackgroundLaunch`` describing the launch. See above for the
@@ -320,6 +362,7 @@ def launch_resume(
             provider_override=provider_override,
             skip_gates=skip_gates,
             metadata=metadata,
+            cwd=cwd,
         )
     except Exception as e:  # noqa: BLE001 - surfaced as a LaunchError, not a traceback
         raise LaunchError(str(e)) from e

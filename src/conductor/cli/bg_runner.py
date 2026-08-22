@@ -522,6 +522,7 @@ def _spawn_detached_windows(
     stdout: Any,
     stderr: Any,
     stdin: Any,
+    cwd: Path | None = None,
 ) -> _WindowsDetachedProcess:
     """Windows ``_spawn_detached``: suspend, job-assign, then resume (issue #447).
 
@@ -547,6 +548,8 @@ def _spawn_detached_windows(
         stdout: ``subprocess.DEVNULL`` or an open file-like object.
         stderr: ``subprocess.DEVNULL`` or an open file-like object.
         stdin: ``subprocess.DEVNULL`` or an open file-like object.
+        cwd: Working directory for the child, or ``None`` to inherit the
+            parent's (issue #477).
 
     Returns:
         A :class:`_WindowsDetachedProcess` wrapping the running child,
@@ -560,6 +563,7 @@ def _spawn_detached_windows(
         _resolve_stdio_handle(stdout, for_write=True),
         _resolve_stdio_handle(stderr, for_write=True),
     ]
+    current_directory = str(cwd) if cwd is not None else None
     try:
         si = _StartupInfo()
         si.dwFlags |= _winapi.STARTF_USESTDHANDLES
@@ -570,7 +574,7 @@ def _spawn_detached_windows(
         creationflags = _CREATE_NEW_PROCESS_GROUP | _CREATE_BREAKAWAY_FROM_JOB | _CREATE_SUSPENDED
         try:
             hp, ht, pid, _tid = _winapi.CreateProcess(
-                None, cmd_line, None, None, True, creationflags, env, None, si
+                None, cmd_line, None, None, True, creationflags, env, current_directory, si
             )
         except OSError as exc:
             if not _is_breakaway_denied(exc):
@@ -583,7 +587,7 @@ def _spawn_detached_windows(
             )
             creationflags &= ~_CREATE_BREAKAWAY_FROM_JOB
             hp, ht, pid, _tid = _winapi.CreateProcess(
-                None, cmd_line, None, None, True, creationflags, env, None, si
+                None, cmd_line, None, None, True, creationflags, env, current_directory, si
             )
     finally:
         for handle in handles:
@@ -616,6 +620,7 @@ def _spawn_detached_posix(
     stdout: Any,
     stderr: Any,
     stdin: Any,
+    cwd: Path | None = None,
 ) -> subprocess.Popen[Any]:
     """POSIX ``_spawn_detached`` -- unchanged ``subprocess.Popen`` call.
 
@@ -626,8 +631,19 @@ def _spawn_detached_posix(
     child. ``proc.pid`` is recorded in :data:`_SPAWNED_GROUP_LEADERS` so
     that call is only ever made against a pid this module spawned as a
     group leader.
+
+    ``cwd`` (issue #477) is passed straight through to ``Popen`` -- the
+    child's own ``os.getcwd()`` is what ``engine/workflow.py`` stamps as
+    ``system.cwd``, so this is the only seam that needs to change for the
+    Directory column and a ``type: script`` step's default cwd to follow.
     """
-    base: dict[str, Any] = {"stdout": stdout, "stderr": stderr, "stdin": stdin, "env": env}
+    base: dict[str, Any] = {
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdin": stdin,
+        "env": env,
+        "cwd": cwd,
+    }
     proc = subprocess.Popen(cmd, **base, start_new_session=True)  # noqa: S603
     _SPAWNED_GROUP_LEADERS.add(proc.pid)
     return proc
@@ -640,6 +656,7 @@ def _spawn_detached(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
     stdin: Any = subprocess.DEVNULL,
+    cwd: Path | None = None,
 ) -> _DetachedChild:
     """Launch a fully-detached child process for ``--web-bg`` mode.
 
@@ -661,6 +678,8 @@ def _spawn_detached(
         stderr: Popen ``stderr`` argument; defaults to ``DEVNULL``. Pass
             an open file handle to capture the child's stderr.
         stdin: Popen ``stdin`` argument; defaults to ``DEVNULL``.
+        cwd: Working directory for the child, or ``None`` to inherit the
+            parent's (issue #477 -- the Fleet Manager TUI's ``launch_dir``).
 
     Returns:
         The running detached child -- a :class:`subprocess.Popen` on
@@ -672,8 +691,8 @@ def _spawn_detached(
             missing executable). Callers wrap this in a ``RuntimeError``.
     """
     if sys.platform == "win32":
-        return _spawn_detached_windows(cmd, env, stdout=stdout, stderr=stderr, stdin=stdin)
-    return _spawn_detached_posix(cmd, env, stdout=stdout, stderr=stderr, stdin=stdin)
+        return _spawn_detached_windows(cmd, env, stdout=stdout, stderr=stderr, stdin=stdin, cwd=cwd)
+    return _spawn_detached_posix(cmd, env, stdout=stdout, stderr=stderr, stdin=stdin, cwd=cwd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1829,6 +1848,8 @@ def _build_bg_env(
     web_port: int,
     stderr_log: Path,
     stdout_log: Path,
+    *,
+    cwd: Path | None = None,
 ) -> dict[str, str]:
     """Compose the child's environment with the bg-diagnostics env vars.
 
@@ -1839,6 +1860,15 @@ def _build_bg_env(
         web_port: The TCP port the child should listen on.
         stderr_log: Path to the child's captured stderr log file.
         stdout_log: Path to the child's captured stdout log file.
+        cwd: The child's working directory, if one was explicitly chosen
+            (issue #477). When set, ``PYTHONSAFEPATH=1`` is also set so
+            ``python -m conductor`` does not put the child's cwd on
+            ``sys.path[0]`` -- a chosen directory containing a stray
+            ``conductor/`` package or ``conductor.py`` would otherwise
+            shadow the installed one. Scoped to this case only (rather than
+            set unconditionally) so every existing CLI ``--web-bg`` path is
+            untouched; conductor never imports user code, so nothing
+            legitimate depends on the cwd being importable.
 
     Returns:
         The new environment dict for ``subprocess.Popen``.
@@ -1849,6 +1879,8 @@ def _build_bg_env(
     env["CONDUCTOR_RUN_ID"] = run_id
     env["CONDUCTOR_BG_STDERR_LOG"] = str(stderr_log)
     env["CONDUCTOR_BG_STDOUT_LOG"] = str(stdout_log)
+    if cwd is not None:
+        env["PYTHONSAFEPATH"] = "1"
     return env
 
 
@@ -1874,6 +1906,7 @@ def _spawn_bg_child(
     web_port: int,
     pid_workflow_ref: Path,
     forced_run_id: str | None = None,
+    cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Open the bg log files, spawn the detached child, and finalize the launch.
 
@@ -1894,17 +1927,28 @@ def _spawn_bg_child(
             ``_open_bg_log_files`` so the bg log filenames, the
             ``CONDUCTOR_RUN_ID`` env var, and the run-record poll key in
             ``_finalize_background_launch`` all agree on one id.
+        cwd: Working directory for the detached child (issue #477 -- the
+            Fleet Manager TUI's ``launch_dir``). ``None`` preserves the
+            child's inherited cwd. Validated to be an existing directory
+            *before* the bg log files are opened -- a bad ``cwd`` reaching
+            ``subprocess.Popen`` directly would otherwise raise a bare
+            ``FileNotFoundError`` indistinguishable from a missing
+            interpreter.
 
     Returns:
         ``BackgroundLaunch`` describing the live launch.
 
     Raises:
-        RuntimeError: If the log files cannot be created, the child fails to
-            start, the dashboard doesn't become reachable, or the child is
-            found to have exited with a non-zero code in the narrow window
-            between ``_finalize_background_launch`` reporting success and
-            this function's own final liveness check.
+        RuntimeError: If ``cwd`` is given and is not a directory, the log
+            files cannot be created, the child fails to start, the
+            dashboard doesn't become reachable, or the child is found to
+            have exited with a non-zero code in the narrow window between
+            ``_finalize_background_launch`` reporting success and this
+            function's own final liveness check.
     """
+    if cwd is not None and not cwd.is_dir():
+        raise RuntimeError(f"Working directory does not exist: {cwd}")
+
     try:
         run_id, stderr_path, stdout_path, stderr_handle, stdout_handle = _open_bg_log_files(
             pid_workflow_ref, forced_run_id=forced_run_id
@@ -1927,9 +1971,10 @@ def _spawn_bg_child(
             launched_at = datetime.now(UTC)
             proc = _spawn_detached(
                 cmd,
-                _build_bg_env(run_id, web_port, stderr_path, stdout_path),
+                _build_bg_env(run_id, web_port, stderr_path, stdout_path, cwd=cwd),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
+                cwd=cwd,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -2010,6 +2055,7 @@ def launch_background(
     workspace_instructions: bool = False,
     cli_instructions: list[str] | None = None,
     print_loaded_instructions: bool = False,
+    cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Fork a detached child process running the workflow with a web dashboard.
 
@@ -2032,6 +2078,9 @@ def launch_background(
         print_loaded_instructions: Whether to forward ``--print-loaded-instructions``
             to the background child. Output goes to the child's captured stderr
             log, not to the parent's TTY.
+        cwd: Working directory for the detached child (issue #477); becomes
+            the run's recorded ``system.cwd``. ``None`` (every CLI path)
+            preserves the child's inherited cwd.
 
     Returns:
         A ``BackgroundLaunch`` describing the launch (dashboard URL,
@@ -2093,7 +2142,7 @@ def launch_background(
     if print_loaded_instructions:
         cmd.append("--print-loaded-instructions")
 
-    return _spawn_bg_child(cmd=cmd, web_port=web_port, pid_workflow_ref=workflow_path)
+    return _spawn_bg_child(cmd=cmd, web_port=web_port, pid_workflow_ref=workflow_path, cwd=cwd)
 
 
 def _peek_resume_run_id(workflow_path: Path | None, checkpoint_path: Path | None) -> str | None:
@@ -2175,6 +2224,7 @@ def launch_background_resume(
     web_port: int = 0,
     metadata: dict[str, str] | None = None,
     guidance: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Fork a detached child process resuming the workflow with a web dashboard.
 
@@ -2198,6 +2248,9 @@ def launch_background_resume(
         metadata: Optional CLI metadata key=value pairs.
         guidance: Optional mid-run guidance text(s) to apply before the
             resumed agent runs. Forwarded as repeated ``--guidance`` flags.
+        cwd: Working directory for the detached child (issue #477); becomes
+            the run's recorded ``system.cwd``. ``None`` (every CLI path)
+            preserves the child's inherited cwd.
 
     Returns:
         A ``BackgroundLaunch`` describing the launch (dashboard URL,
@@ -2282,6 +2335,7 @@ def launch_background_resume(
         web_port=web_port,
         pid_workflow_ref=pid_workflow_ref,
         forced_run_id=forced_run_id,
+        cwd=cwd,
     )
 
 

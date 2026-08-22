@@ -24,6 +24,7 @@ user's terminal palette, which a hard-coded hex would not.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.text import Text
 
@@ -139,3 +140,17 @@ LOADING = "Loading…"
 def loading_text() -> Text:
     """Render the standard dim "still loading" placeholder."""
     return Text(LOADING, style="dim")
+
+
+def shorten_home(path: str | Path) -> str:
+    """Render ``path`` with the user's home directory shortened to ``~``.
+
+    One presentation vocabulary shared by three consumers (issue #477): the
+    Runs screen's Directory column (previously inlined in
+    ``runs.py::_directory_cell``), its sub-title, and the New Run screen's
+    launch-directory hint. Falls back to ``path`` unchanged when it isn't
+    rooted under the home directory.
+    """
+    text = str(path)
+    home = str(Path.home())
+    return f"~{text[len(home) :]}" if text.startswith(home) else text

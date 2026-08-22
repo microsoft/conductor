@@ -768,7 +768,7 @@ class TestNewRunResolveRace:
         real_resolve_workflow = launch_module.resolve_workflow
         second_call_started = threading.Event()
 
-        def _tracking_resolve_workflow(ref: str):
+        def _tracking_resolve_workflow(ref: str, *, base_dir: Path | None = None) -> object:
             if ref == str(fixture_workflow):
                 # The first (slower) resolve waits for the second call to
                 # start before returning, so it finishes *after* it --
@@ -776,7 +776,7 @@ class TestNewRunResolveRace:
                 second_call_started.wait(timeout=2)
             else:
                 second_call_started.set()
-            return real_resolve_workflow(ref)
+            return real_resolve_workflow(ref, base_dir=base_dir)
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
@@ -799,3 +799,89 @@ class TestNewRunResolveRace:
 
                 assert app.screen._resolved is not None
                 assert app.screen._resolved.name == "dotted-name-workflow"
+
+
+# ---------------------------------------------------------------------------
+# Launch directory (issue #477)
+# ---------------------------------------------------------------------------
+
+
+class TestNewRunLaunchDirectory:
+    """The New Run screen threads ``FleetApp.launch_dir`` through to
+    ``resolve_workflow``/``launch_workflow`` and offers ``ctrl+d`` to
+    change it."""
+
+    async def test_ctrl_d_opens_picker_while_input_has_focus_and_leaves_it_untouched(
+        self, fleet_env: Path
+    ) -> None:
+        """Pins ``priority=True``: a bare ``d`` cannot work here because the
+        reference ``Input`` holds focus for most of this screen's life and
+        binds ``ctrl+d`` itself (``delete_right``, ``show=False``)."""
+        from conductor.fleet.tui.actions import DirectoryPickerModal
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_new_run(pilot)
+            ref_input = app.screen.query_one("#workflow-ref", Input)
+            ref_input.value = "hello"
+            assert app.focused is ref_input
+
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+
+            assert isinstance(app.screen, DirectoryPickerModal)
+            await pilot.press("escape")
+            await settle(pilot)
+
+            assert isinstance(app.screen, NewRunScreen)
+            assert app.screen.query_one("#workflow-ref", Input).value == "hello"
+
+    async def test_resolve_uses_app_launch_dir_as_base_dir(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        launch_dir = tmp_path / "launch-dir"
+        launch_dir.mkdir()
+        (launch_dir / "relative.yaml").write_text(_FIXTURE_WORKFLOW_YAML)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            app.set_launch_dir(launch_dir)
+            await _goto_new_run(pilot)
+            await _resolve(pilot, Path("relative.yaml"))
+
+            assert app.screen._resolved is not None
+            assert app.screen._resolved.path == Path(os.path.abspath(launch_dir / "relative.yaml"))
+
+    async def test_launch_forwards_app_launch_dir_as_cwd(
+        self, fleet_env: Path, fixture_workflow: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        launch_dir = fixture_workflow.parent
+        fake_result = Mock(url="http://127.0.0.1:8080")
+        launch_mock = Mock(return_value=fake_result)
+        monkeypatch.setattr("conductor.fleet.tui.screens.new_run.launch_workflow", launch_mock)
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            app.set_launch_dir(launch_dir)
+            await _goto_new_run(pilot)
+            await _resolve(pilot, fixture_workflow)
+
+            question_input = app.screen._input_widgets["question"]
+            question_input.value = "What is Python?"
+
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.3)
+
+        launch_mock.assert_called_once()
+        _args, kwargs = launch_mock.call_args
+        assert kwargs["cwd"] == launch_dir
+
+    async def test_hint_names_the_current_launch_directory(self, fleet_env: Path) -> None:
+        from conductor.fleet.tui.theme import shorten_home
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_new_run(pilot)
+
+            hint = str(app.screen.query_one("#form-hint", Static).render())
+            assert shorten_home(app.launch_dir) in hint

@@ -40,7 +40,7 @@ def highlighted_row_key(table: DataTable) -> str | None:
 
 class BlockFooter(Footer):
     """A :class:`~textual.widgets.Footer` that draws a rule between two
-    groups of keys.
+    groups of keys, with the docked command-palette key hidden (issue #477).
 
     The Runs screen's bindings are two different kinds of thing -- keys that
     act on the highlighted run, and keys that navigate the app or command the
@@ -60,6 +60,14 @@ class BlockFooter(Footer):
     The divider is attached to the *first* key of the second block rather than
     emitted as its own widget, so it costs no additional footer columns -- the
     footer is a single non-wrapping line with no room to spare.
+
+    ``show_command_palette=False`` is passed to the parent constructor for
+    the same reason: it is only the docked ``^p palette`` *key* that is
+    hidden, not the palette itself -- ``Footer.compose`` guards just the
+    ``FooterKey`` yield, so ``ctrl+p`` remains in ``screen.active_bindings``
+    and still opens it. The reclaimed columns are what let the Runs footer's
+    ``d Dir`` binding (issue #477) fit at 100 columns without truncating the
+    keys after it.
     """
 
     DEFAULT_CSS = """
@@ -87,7 +95,7 @@ class BlockFooter(Footer):
             id: The ID of the widget in the DOM.
             classes: The CSS classes for the widget.
         """
-        super().__init__(id=id, classes=classes)
+        super().__init__(id=id, classes=classes, show_command_palette=False)
         self._first_block_actions = frozenset(first_block_actions)
 
     def compose(self) -> ComposeResult:

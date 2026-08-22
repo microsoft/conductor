@@ -1674,7 +1674,7 @@ class TestGateBindingVisibility:
         assert keys.index("K") > keys.index("k") + 1
 
         row_scoped = ["enter", "w", "k", "g"]
-        fleet_scoped = ["n", "p", "r", "h", "K", "q"]
+        fleet_scoped = ["n", "d", "p", "r", "h", "K", "q"]
         assert keys == row_scoped + fleet_scoped
 
     async def test_a_rule_is_drawn_between_the_two_blocks(
@@ -1712,7 +1712,9 @@ class TestGateBindingVisibility:
         assert _BLOCK_RULE not in line[: line.index("n New")], line
 
     async def test_footer_fits_without_truncation(self, fleet_env: Path, tmp_path: Path) -> None:
-        """Every visible footer key must fit inside the footer.
+        """Every visible footer key must fit inside the footer, at the
+        *gated* worst case -- the widest the row-scoped block gets, since
+        `g Gate` is the one row-scoped key that isn't always shown.
 
         The footer is a single non-wrapping line: once the keys overrun it,
         Textual clips the tail rather than wrapping, which is how `h History`
@@ -1722,13 +1724,29 @@ class TestGateBindingVisibility:
 
         Checked at 100 columns -- comfortably under the width the 12-column
         runs table itself needs, so this is a floor on the footer, not an
-        assertion about the terminal anyone actually uses.
+        assertion about the terminal anyone actually uses. What buys the
+        room at this width (issue #477): the Runs footer hides the docked
+        `^p palette` key (`BlockFooter(show_command_palette=False)`) and
+        `Providers`/`Registries` are shortened to `Prov`/`Regs`.
         """
-        _write_record(tmp_path, "aaaa0016", workflow_name="plain")
+        log = tmp_path / "gated.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "plain"}),
+                _event("agent_started", {"agent_name": "planner"}),
+                _event("gate_presented", {"agent_name": "planner", "prompt": "Approve?"}),
+            ],
+        )
+        _write_record(tmp_path, "aaaa0016", workflow_name="plain", event_log_path=str(log))
 
         app = FleetApp()
         async with app.run_test(size=(100, 30)) as pilot:
             await settle(pilot)
+            # Exercise the actual worst case rather than assuming it: `g`
+            # must be genuinely visible here, or this test isn't pinning
+            # anything.
+            assert app.screen.check_action("resolve_gate", ()) is True
             footer = app.screen.query_one(Footer)
             overflowing = [
                 (child.region.x, child.region.right, getattr(child, "description", "?"))
@@ -1736,6 +1754,22 @@ class TestGateBindingVisibility:
                 if child.display and child.region.right > footer.region.width
             ]
             assert not overflowing, f"footer keys clipped at 100 cols: {overflowing}"
+
+    async def test_footer_has_no_docked_command_palette_key(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The Runs footer hides the docked `^p palette` `FooterKey` to make
+        room for `d Dir` (issue #477) -- but `ctrl+p` must still open the
+        palette; only the footer key is hidden, not the binding itself."""
+        _write_record(tmp_path, "aaaa0018", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test(size=(140, 30)) as pilot:
+            await settle(pilot)
+            footer = app.screen.query_one(Footer)
+            descriptions = [getattr(child, "description", "") for child in footer.children]
+            assert not any("palette" in d.lower() for d in descriptions)
+            assert "ctrl+p" in app.screen.active_bindings
 
     async def test_detail_binding_survives_datatables_own_enter(
         self, fleet_env: Path, tmp_path: Path
@@ -2147,3 +2181,66 @@ class TestAwaitNextGateThreading:
 
         assert seen_main_thread, "the gate re-read never ran"
         assert not any(seen_main_thread), "the gate re-read blocked the event loop"
+
+
+# ---------------------------------------------------------------------------
+# Change launch directory (issue #477)
+# ---------------------------------------------------------------------------
+
+
+class TestChangeDirBinding:
+    """``d`` opens the directory picker (``RunsScreen.action_change_dir``);
+    a chosen directory lands in ``app.launch_dir`` and the screen's
+    ``sub_title``, and cancelling leaves both unchanged."""
+
+    async def test_d_opens_picker_and_applies_chosen_directory(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        from textual.widgets import Input
+
+        from conductor.fleet.tui.actions import DirectoryPickerModal
+        from conductor.fleet.tui.theme import shorten_home
+
+        _write_record(tmp_path, "aaaa0022", workflow_name="plain")
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("d")
+            # Two keypresses resolving one modal -- must use a plain
+            # `pilot.pause()`, never `settle()` (AGENTS.md test caution):
+            # `settle` awaits `workers.wait_for_complete()`, and the
+            # suspended `action_change_dir` worker cannot finish until the
+            # second keypress below.
+            await pilot.pause()
+
+            assert isinstance(app.screen, DirectoryPickerModal)
+            app.screen.query_one("#dir-path", Input).value = str(chosen)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert app.launch_dir == chosen
+            assert isinstance(app.screen, RunsScreen)
+            assert app.screen.sub_title == shorten_home(chosen)
+
+    async def test_cancelling_leaves_launch_dir_unchanged(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _write_record(tmp_path, "aaaa0023", workflow_name="plain")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            original = app.launch_dir
+            original_sub_title = app.screen.sub_title
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("escape")
+            await settle(pilot)
+
+            assert app.launch_dir == original
+            assert isinstance(app.screen, RunsScreen)
+            assert app.screen.sub_title == original_sub_title

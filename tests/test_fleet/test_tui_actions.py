@@ -1275,3 +1275,206 @@ class TestKillConfirmationRendering:
                 await pilot.pause()
 
         mock_kill.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# DirectoryPickerModal (issue #477)
+# ---------------------------------------------------------------------------
+
+
+class TestDirectoryPickerModal:
+    """The launch-directory picker: reject-in-place validation, ``~``
+    expansion, directories-only tree filtering, and dismiss-with-Path on a
+    valid directory."""
+
+    @staticmethod
+    async def _push(app: FleetApp, current: Path) -> dict[str, object]:
+        """Push :class:`DirectoryPickerModal` via ``push_screen_wait`` in a
+        worker, mirroring ``TestGateOptionsModalMarkupSafety``'s pattern --
+        a plain ``push_screen`` wouldn't let the test read the eventual
+        dismiss result."""
+        result_holder: dict[str, object] = {}
+
+        async def _push_modal() -> None:
+            result_holder["result"] = await app.push_screen_wait(
+                tui_actions.DirectoryPickerModal(current)
+            )
+
+        app.run_worker(_push_modal())
+        return result_holder
+
+    async def test_nonexistent_path_is_rejected_in_place(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        from textual.widgets import Input, Static
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            bad_path = tmp_path / "does-not-exist"
+            modal.query_one("#dir-path", Input).value = str(bad_path)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # Rejected in place: still on the stack, dismiss not called.
+            assert app.screen is modal
+            assert "result" not in result_holder
+            message = str(modal.query_one("#dir-message", Static).render())
+            assert str(bad_path) in message
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert result_holder["result"] is None
+
+    async def test_path_naming_a_file_is_rejected_in_place(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        from textual.widgets import Input, Static
+
+        a_file = tmp_path / "not-a-dir.txt"
+        a_file.write_text("")
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            modal.query_one("#dir-path", Input).value = str(a_file)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.screen is modal
+            assert "result" not in result_holder
+            message = str(modal.query_one("#dir-message", Static).render())
+            assert str(a_file) in message
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+    async def test_tilde_is_expanded(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from textual.widgets import Input
+
+        home = tmp_path / "home"
+        home.mkdir()
+        sub = home / "project"
+        sub.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            modal.query_one("#dir-path", Input).value = "~/project"
+            await pilot.press("enter")
+            await settle(pilot)
+
+        assert result_holder["result"] == Path(os.path.abspath(sub))
+
+    async def test_valid_directory_dismisses_with_absolute_path(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        from textual.widgets import Input
+
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            modal.query_one("#dir-path", Input).value = str(chosen)
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert app.screen is not modal
+
+        result = result_holder["result"]
+        assert isinstance(result, Path)
+        assert result == chosen
+        assert result.is_absolute()
+
+    async def test_escape_dismisses_with_none(self, fleet_env: Path, tmp_path: Path) -> None:
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, tmp_path)
+            await pilot.pause()
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+        assert result_holder["result"] is None
+
+    async def test_filter_paths_yields_directories_only(self, tmp_path: Path) -> None:
+        a_dir = tmp_path / "a_dir"
+        a_dir.mkdir()
+        a_file = tmp_path / "a_file.txt"
+        a_file.write_text("")
+
+        tree = tui_actions._DirectoryOnlyTree(tmp_path)
+        filtered = list(tree.filter_paths([a_dir, a_file]))
+
+        assert filtered == [a_dir]
+
+
+# ---------------------------------------------------------------------------
+# change_launch_directory (issue #477)
+# ---------------------------------------------------------------------------
+
+
+class TestChangeLaunchDirectory:
+    """The shared helper both the Runs and New Run screens' ``d``/``ctrl+d``
+    bindings dispatch through."""
+
+    async def test_applies_the_chosen_directory(self, fleet_env: Path, tmp_path: Path) -> None:
+        from textual.widgets import Input
+
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder: dict[str, object] = {}
+
+            async def _call() -> None:
+                result_holder["result"] = await tui_actions.change_launch_directory(app)
+
+            app.run_worker(_call())
+            await pilot.pause()
+
+            modal = app.screen
+            modal.query_one("#dir-path", Input).value = str(chosen)
+            await pilot.press("enter")
+            await settle(pilot)
+
+        assert app.launch_dir == chosen
+        assert result_holder["result"] == chosen
+
+    async def test_cancelling_leaves_launch_dir_unchanged(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            original = app.launch_dir
+            result_holder: dict[str, object] = {}
+
+            async def _call() -> None:
+                result_holder["result"] = await tui_actions.change_launch_directory(app)
+
+            app.run_worker(_call())
+            await pilot.pause()
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+        assert app.launch_dir == original
+        assert result_holder["result"] is None

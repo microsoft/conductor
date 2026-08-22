@@ -51,20 +51,22 @@ import shutil
 import subprocess
 import threading
 import webbrowser
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import typer
 from rich.console import Console
 from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import OptionList, Static
+from textual.widgets import DirectoryTree, Input, OptionList, Static, Tree
+from textual.widgets._directory_tree import DirEntry
 from textual.widgets.option_list import Option
 
 from conductor.cli.app import StopOutcome, _foreground_stop_warning_lines, stop_records
-from conductor.console import make_console
+from conductor.console import make_console, styled
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import GateInfo
 
@@ -72,6 +74,7 @@ if TYPE_CHECKING:
     from textual.app import App, ComposeResult
 
     from conductor.cli.bg_runner import BackgroundLaunch
+    from conductor.fleet.tui.app import FleetApp
 
 logger = logging.getLogger(__name__)
 
@@ -705,3 +708,201 @@ async def resolve_gate(app: App, record: RunRecord, gate: GateInfo) -> GateResol
     port = record.port
     worker = app.run_worker(lambda: _resolve_gate_sync(port, choice, gate.agent_name), thread=True)
     return await worker.wait()
+
+
+# ---------------------------------------------------------------------------
+# Launch directory (Fleet Manager, issue #477)
+# ---------------------------------------------------------------------------
+
+
+class _DirectoryOnlyTree(DirectoryTree):
+    """A :class:`~textual.widgets.DirectoryTree` that lists directories only.
+
+    :class:`DirectoryPickerModal` is a *directory* picker -- listing files
+    too would let one be highlighted and mirrored into the ``Input`` as if
+    it were a valid launch directory, which is only caught later at accept
+    time. Filtering here means the tree never offers a choice that could
+    not be accepted.
+    """
+
+    def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
+        return [path for path in paths if path.is_dir()]
+
+
+class DirectoryPickerModal(ModalScreen[Path | None]):
+    """Pick a new launch directory -- the footer's ``d``/``ctrl+d`` action
+    (issue #477).
+
+    Modelled on :class:`ConfirmKillModal` and :class:`GateOptionsModal`: a
+    centered, bordered dialog with a docked hint line and an ``escape``
+    binding that cancels. Two controls that stay in sync -- typing (or
+    editing) a path in ``Input#dir-path``, pre-filled with the current
+    launch directory and focused on mount, or browsing
+    ``DirectoryTree#dir-tree`` -- but exactly **one** way to accept: pressing
+    Enter in the input. The tree's highlighted node is mirrored into the
+    input rather than accepted directly, so the input stays the single
+    source of truth for what Enter will submit.
+
+    A bad path -- one that does not exist, or names a file rather than a
+    directory -- is rejected *in place*: a red message line appears and the
+    modal stays on the stack, dismissed only by a valid directory or
+    cancellation. This is deliberate: silently dismissing on a bad path
+    would either apply no change with no explanation, or (worse) look like
+    it accepted something it didn't.
+    """
+
+    DEFAULT_CSS = """
+    DirectoryPickerModal {
+        align: center middle;
+    }
+    #dir-dialog {
+        /* Fixed width, `max-height` bounded -- same reasoning as
+           `ConfirmKillModal`/`GateOptionsModal`: an `auto`-width container
+           whose children are all `1fr` resolves to 0 (#449), and a tree
+           listing a large directory is routinely taller than the terminal. */
+        width: 70;
+        max-width: 90%;
+        height: auto;
+        max-height: 90%;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    #dir-path {
+        margin-bottom: 1;
+    }
+    #dir-tree {
+        height: 1fr;
+        max-height: 16;
+    }
+    #dir-message {
+        height: auto;
+    }
+    #dir-hint {
+        /* Docked, matching `ConfirmKillModal`/`GateOptionsModal`: the keys a
+           user needs can never be pushed off the bottom by a long tree or a
+           rejection message. */
+        dock: bottom;
+        height: 1;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, current: Path) -> None:
+        """
+        Args:
+            current: The launch directory to pre-fill the input with and
+                to derive the tree's root from.
+        """
+        super().__init__()
+        self._current = current
+
+    @staticmethod
+    def _tree_root(current: Path) -> Path:
+        """The directory tree's root: ``current``'s parent, so sibling
+        projects -- the common reason to switch -- are one keypress away.
+
+        Falls back to ``current`` itself at a filesystem root, which has no
+        parent to climb to (``Path("/").parent == Path("/")``).
+        """
+        parent = current.parent
+        return current if parent == current else parent
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Input(value=str(self._current), id="dir-path"),
+            _DirectoryOnlyTree(self._tree_root(self._current), id="dir-tree"),
+            Static(id="dir-message"),
+            Static(
+                Text.from_markup("[dim]enter accept · esc cancel[/dim]"),
+                id="dir-hint",
+            ),
+            id="dir-dialog",
+        )
+
+    def on_mount(self) -> None:
+        """Focus the input -- this is what Enter submits (E13-style: one
+        widget owns the accept action, matching ``GateOptionsModal``
+        focusing its option list)."""
+        self.query_one("#dir-path", Input).focus()
+
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted[DirEntry]) -> None:
+        """Mirror the highlighted tree node's path into the input.
+
+        The input remains the single source of truth for what Enter
+        accepts -- the tree is a browsing aid, not a second accept path.
+        """
+        data = event.node.data
+        if data is not None:
+            self.query_one("#dir-path", Input).value = str(data.path)
+
+    def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
+        """Double-click / Enter-on-the-tree accepts that directory directly."""
+        self._accept(str(event.path))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the input accepts its current value (the one meaning
+        of Enter on this screen)."""
+        if event.input.id == "dir-path":
+            self._accept(event.value)
+
+    def _accept(self, raw: str) -> None:
+        """Validate ``raw`` and dismiss with it, or reject in place.
+
+        ``expanduser()`` then ``Path(os.path.abspath(...))`` -- not
+        ``.resolve()`` -- matching this repo's "normpath, not resolve"
+        convention (``_resolve_agent_working_dir``, ``skills/registry.py``)
+        so a symlinked project directory stays the alias the user typed.
+        """
+        try:
+            candidate = Path(os.path.abspath(os.path.expanduser(raw)))
+            is_dir = candidate.is_dir()
+        except OSError as e:
+            self._reject(f"Cannot access {raw!r}: {e}")
+            return
+        if not is_dir:
+            self._reject(f"Not a directory: {candidate}")
+            return
+        self.dismiss(candidate)
+
+    def _reject(self, message: str) -> None:
+        """Render ``message`` in place, leaving the modal on the stack.
+
+        ``styled(...)``, never an f-string into ``Text.from_markup``: the
+        message carries a runtime path (guard rule C,
+        ``tests/test_cli/test_markup_guards.py``).
+        """
+        self.query_one("#dir-message", Static).update(styled("[red]{}[/red]", message))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+async def change_launch_directory(app: App) -> Path | None:
+    """Prompt for and apply a new launch directory (issue #477).
+
+    Presents :class:`DirectoryPickerModal` -- awaited with
+    ``app.push_screen_wait`` -- pre-filled with the app's current
+    ``launch_dir``. On a chosen directory, calls ``FleetApp.set_launch_dir``
+    (the one named mutation site) and notifies the user of the change.
+    Shared by the Runs screen's ``d`` binding and the New Run screen's
+    ``ctrl+d`` binding, exactly as :func:`kill_runs` / :func:`resolve_gate`
+    are already shared between screens.
+
+    Args:
+        app: The running Textual app (used to push the modal and read/set
+            ``launch_dir``).
+
+    Returns:
+        The newly chosen directory, or ``None`` if the user cancelled --
+        ``launch_dir`` is left unchanged in that case.
+    """
+    fleet_app = cast("FleetApp", app)
+    chosen = await app.push_screen_wait(DirectoryPickerModal(fleet_app.launch_dir))
+    if chosen is None:
+        return None
+    fleet_app.set_launch_dir(chosen)
+    app.notify(f"Launch directory: {chosen}", markup=False)
+    return chosen
