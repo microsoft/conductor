@@ -326,9 +326,7 @@ class TestProvidersExpansion:
             patch(
                 "conductor.fleet.tui.screens.providers.gather",
                 new=AsyncMock(
-                    return_value=_FakeReport(
-                        [_diag("openai", implemented=False, installed=False)]
-                    )
+                    return_value=_FakeReport([_diag("openai", implemented=False, installed=False)])
                 ),
             ),
             patch("conductor.fleet.tui.screens.providers.gather_provider") as fake_gather_provider,

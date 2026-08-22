@@ -200,7 +200,7 @@ class OpenAIProvider(AgentProvider):
         if not OPENAI_SDK_AVAILABLE:
             raise ProviderError(
                 "OpenAI SDK not installed",
-                suggestion="Install with: uv add 'openai>=1.0.0'",
+                suggestion="Install with: uv add 'openai>=2.48.0'",
             )
 
         self._client: AsyncOpenAI | None = None

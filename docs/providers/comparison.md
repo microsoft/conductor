@@ -7,7 +7,7 @@ This guide helps you choose between GitHub Copilot, OpenAI, Anthropic Claude, Cl
 | Feature | Copilot | OpenAI | Claude | Claude Agent SDK | Hermes |
 |---------|---------|--------|--------|------------------|--------|
 | **Tier** | Stable | Stable | Stable | Experimental | Experimental |
-| **Context Window** | per-model (SDK-reported) | per-model (SDK-reported) | per-model (SDK-reported) | 200K | per-model |
+| **Context Window** | per-model (SDK-reported) | not reported | per-model (SDK-reported) | 200K | per-model |
 | **Pricing Model** | Subscription ($10-39/mo) | Pay-per-token | Pay-per-token | Via Claude Code CLI | Pay-per-token (via hermes) |
 | **Setup** | GitHub auth | API key | API key | `claude` CLI auth | API key (model-provider's key) |
 | **Model Selection** | GPT-5.2, o1 | GPT-4o, GPT-5-mini, o1, o3-mini | Haiku, Sonnet, Opus | Haiku, Sonnet, Opus | Any OpenRouter-style model |

@@ -215,10 +215,13 @@ class TestOpenAIBackend:
             reasoning=ReasoningConfig(effort="low"),
         )
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
-            return_value=False,
-        ), pytest.raises(ValidationError, match="does not support reasoning.effort"):
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+                return_value=False,
+            ),
+            pytest.raises(ValidationError, match="does not support reasoning.effort"),
+        ):
             build_agent(agent_def, system_prompt="", rendered_prompt="", backend="openai")
 
     def test_openai_reasoning_effort_accepted_on_reasoning_model(self) -> None:

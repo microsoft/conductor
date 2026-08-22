@@ -132,7 +132,7 @@ async def create_provider(
             if not OPENAI_SDK_AVAILABLE:
                 raise ProviderError(
                     "OpenAI provider requires the openai package",
-                    suggestion="Install with: uv add 'openai>=1.0.0'",
+                    suggestion="Install with: uv add 'openai>=2.48.0'",
                 )
             openai_api_key: str | None = None
             openai_base_url: str | None = None

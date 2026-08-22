@@ -82,8 +82,9 @@ workflow:
 ### Precedence Rules
 
 1. **YAML over Environment**: Values explicitly configured in YAML (`api_key`, `base_url`) override environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
-2. **Environment Fallback**: When omitted in YAML, `OPENAI_API_KEY` and `OPENAI_BASE_URL` are read from the environment.
-3. **No Ambient Rerouting**: Ambient environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`) never divert an unconfigured provider. If a workflow specifies `provider: copilot` (or omits provider), ambient `OPENAI_*` variables have zero effect and will not reroute execution.
+2. **Environment Fallback**: When omitted in YAML, `OPENAI_BASE_URL` is read from the environment, and `OPENAI_API_KEY` is read from the environment *only when no custom `base_url` is in effect*.
+3. **A Custom `base_url` Requires an Explicit `api_key`**: Once a custom endpoint is in effect — from YAML **or** from `OPENAI_BASE_URL` — the ambient `OPENAI_API_KEY` is never forwarded to it, and construction fails with a `ValidationError` unless `api_key` is set in YAML. This keeps a personal OpenAI credential from reaching a third-party endpoint that the workflow author did not explicitly pair it with. Use `api_key: "${OPENAI_API_KEY}"` to opt in deliberately, as the recipes below do.
+4. **No Ambient Rerouting**: Ambient environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`) never divert an unconfigured provider. If a workflow specifies `provider: copilot` (or omits provider), ambient `OPENAI_*` variables have zero effect and will not reroute execution.
 
 ## Custom Endpoints and Gateways
 
@@ -103,7 +104,13 @@ workflow:
 | Field | Description | Env Fallback |
 |-------|-------------|--------------|
 | `base_url` | Custom OpenAI-compatible base URL (typically ending in `/v1`) | `OPENAI_BASE_URL` |
-| `api_key` | API key for authentication | `OPENAI_API_KEY` |
+| `api_key` | API key for authentication | `OPENAI_API_KEY`, but only when no custom `base_url` is in effect (see [Precedence Rules](#precedence-rules)) |
+
+> Setting `OPENAI_BASE_URL` and `OPENAI_API_KEY` together in the environment is **not** a
+> working configuration: the custom endpoint activates, the ambient key is refused, and
+> construction raises `ValidationError`. Put the key in YAML — `api_key: "${OPENAI_API_KEY}"`
+> interpolates it at load time, so the literal value still never lands in checkpoints or
+> dashboard events.
 
 ### Recipe: Omniroute-style Proxy
 
@@ -200,7 +207,7 @@ OpenAI reasoning models (such as `o1`, `o3-mini`) support the `reasoning.effort`
 | `low` | Yes (reasoning models) | Fast reasoning |
 | `medium` | Yes (reasoning models) | Balanced reasoning |
 | `high` | Yes (reasoning models) | Deep reasoning |
-| `xhigh` | **No (Rejected)** | Only `low`/`medium`/`high` are accepted by the GPT-5.1-Codex-Max generation and by `o1`/`o3-mini`/`o4-mini`; `xhigh` is rejected. |
+| `xhigh` | **No (Rejected)** | `o1`, `o3-mini` and `o4-mini` accept only `low`/`medium`/`high`; `xhigh` arrived with a later model generation and is not offered by this provider. |
 | `max` | **No (Rejected)** | Raises `ValidationError` |
 
 Only reasoning models accept `reasoning.effort`; on a non-reasoning model such as `gpt-4o` the setting is validated against the model and also raises `ValidationError`.
@@ -210,7 +217,7 @@ workflow:
   runtime:
     provider: openai
     default_model: o3-mini
-    default_reasoning_effort: medium  # low, medium, high, xhigh
+    default_reasoning_effort: medium  # low, medium, high
 ```
 
 Attempting to set `reasoning.effort: max` with the OpenAI provider will be rejected during validation or execution.

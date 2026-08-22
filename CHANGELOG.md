@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
 
+### Added
+
+- **Native OpenAI provider** — new stable `openai` provider built on the shared
+  Pydantic AI runtime. Works with the real OpenAI API and any OpenAI-compatible
+  Chat Completions endpoint (Ollama, vLLM, LM Studio, OpenRouter, corporate
+  proxies). Supports MCP tools, structured output, interrupts, reasoning effort
+  (`low`/`medium`/`high`), and the full `0.0`–`2.0` temperature range, which is
+  now expressed as `ProviderCapabilities.max_temperature` and enforced in
+  `create_provider` so `conductor run` and `conductor resume` are covered rather
+  than only `conductor validate`. See `docs/providers/openai.md` and
+  `examples/openai-compatible.yaml`.
+
+  A custom `base_url` requires an explicit `api_key`: an ambient `OPENAI_API_KEY`
+  is never forwarded to a non-OpenAI endpoint.
+
+### Changed
+
+- The Pydantic AI dependency was narrowed from the full `pydantic-ai` package to
+  `pydantic-ai-slim[anthropic,openai]`. This drops the bundled `pydantic_ai.mcp`
+  module, which Conductor replaces with its own toolset bridge, so the change is
+  transparent to users.
+- The previously reserved `openai-agents` provider name has been removed from the
+  schema, factory, registry and diagnostics. Workflows that named it now fail at
+  schema load time rather than at the first agent execution.
+
+### Fixed
+
+- Retry classification now covers the `ModelHTTPError` and `ModelAPIError` types
+  pydantic-ai actually raises, so `408`, `429` and `5xx` responses are retried on
+  the Claude provider as well as the new OpenAI one. Previously they were treated
+  as fatal.
+- `runtime.default_reasoning_effort` was silently dropped at run time for every
+  provider and is now forwarded through `ProviderRegistry`.
+
 ## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 
 ### Added
@@ -555,19 +589,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Native OpenAI provider** — new stable `openai` provider built on the shared
-  Pydantic AI runtime. Works with the real OpenAI API and any OpenAI-compatible
-  Chat Completions endpoint (Ollama, vLLM, LM Studio, OpenRouter, corporate
-  proxies). Supports MCP tools, structured output, interrupts, reasoning effort
-  (`low`/`medium`/`high`/`xhigh`), and full temperature range `0.0`–`2.0`.
-  The Pydantic AI dependency was narrowed from the full `pydantic-ai` package
-  to `pydantic-ai-slim[anthropic,openai]`; this drops the bundled
-  `pydantic_ai.mcp` module, which Conductor replaces with its own toolset
-  bridge, so the change is transparent to users.
-  The previously reserved `openai-agents` provider name has been removed from
-  the schema and factory; workflows that named it now fail at schema load time
-  rather than at the first agent execution. See `docs/providers/openai.md` and
-  `examples/openai-compatible.yaml`.
 - **Mid-run guidance for `--web` and `--web-bg` runs** (#400). The dashboard
   previously offered only Stop, Resume, and Kill — there was no way to
   correct a run's course without stopping it first. `conductor guide --text

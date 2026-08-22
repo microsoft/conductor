@@ -405,10 +405,13 @@ class TestExecuteDialogTurn:
         """
         provider = OpenAIProvider(api_key="test-key", default_reasoning_effort="high")
 
-        with patch(
-            "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
-            return_value=False,
-        ), pytest.raises(ValidationError, match="does not support reasoning.effort"):
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder._openai_model_supports_reasoning",
+                return_value=False,
+            ),
+            pytest.raises(ValidationError, match="does not support reasoning.effort"),
+        ):
             await provider.execute_dialog_turn("system prompt", "user message", model="gpt-4o")
 
     async def test_dialog_turn_rejects_unsupported_reasoning_effort(self) -> None:
