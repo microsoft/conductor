@@ -3471,6 +3471,16 @@ class RuntimeConfig(BaseModel):
     provider declares ``capabilities.working_dir=False``.
     """
 
+    event_log_dir: str | None = None
+    """Directory for event log output.
+
+    When set, event logs are written to this directory instead of
+    ``$TMPDIR/conductor/``. Relative paths are resolved against the
+    workflow file's directory.
+
+    When omitted, behavior is unchanged (writes to ``$TMPDIR/conductor/``).
+    """
+
     skills: list[str] = Field(default_factory=list)
     """Workflow-wide default skills for every provider-backed agent.
 
