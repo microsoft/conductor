@@ -1913,6 +1913,101 @@ def _remove_run_record_for_current_process_safe() -> None:
         logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
+def _write_terminal_record_for_current_process(
+    *,
+    event_log_subscriber: Any,
+    workflow_path: Path | None,
+    started_at: str,
+    status: str,
+    output: dict[str, Any],
+    error_type: str | None,
+    error_message: str | None,
+    engine: WorkflowEngine | None,
+) -> None:
+    """Write this run's Fleet Manager *terminal* run record (MCP server plan E2).
+
+    Called from the ``finally`` block of both ``run_workflow_async`` and
+    ``resume_workflow_async``, immediately before
+    :func:`_remove_run_record_for_current_process_safe` removes the *live*
+    record — so a completed run remains resolvable by ``run_id`` after this
+    process exits (the design's "one genuinely new artifact"). A resumed
+    run reuses its predecessor's ``run_id``, so this replaces the earlier
+    terminal record rather than creating a second one, exactly as
+    ``write_run_record`` already does for the live record.
+
+    No-op when ``event_log_subscriber`` is ``None``: without one, no
+    ``run_id`` was ever established for this process (e.g. a failure
+    before the JSONL subscriber was even constructed), so there is no live
+    record for this to replace and nothing to key a terminal record by.
+    ``workflow_path`` is likewise permitted to be ``None`` (``resume``'s
+    ``resolved_workflow_path`` is not assigned until after checkpoint
+    resolution succeeds) but is only ever dereferenced once
+    ``event_log_subscriber`` has already been confirmed non-``None``, since
+    the JSONL subscriber is always constructed after the workflow path is
+    resolved on every call path.
+
+    Token/cost totals are read from ``engine.get_execution_summary()``
+    *unconditionally* — not gated on ``config.workflow.cost.show_summary``
+    the way the console usage-summary display is — because a terminal
+    record that silently omits cost for every run where that display
+    happens to be off is worse than one that omits cost never. ``engine``
+    may itself be ``None`` (a failure before ``WorkflowEngine`` was
+    constructed), in which case the totals are left ``None``/``0``.
+
+    Never raises: a diagnostic write must not break the dashboard/event-log
+    cleanup that runs immediately after this in the same ``finally`` block.
+    """
+    if event_log_subscriber is None:
+        return
+    if workflow_path is None:
+        # Defensive only: every call path constructs `event_log_subscriber`
+        # strictly after resolving its workflow path, so this should be
+        # unreachable in practice -- but a diagnostic write must not raise
+        # an `AttributeError` on `workflow_path.stem` below if it somehow
+        # is.
+        logger.warning("Terminal run record skipped: no workflow_path available")
+        return
+
+    from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+    total_tokens: int | None = None
+    total_cost_usd: float | None = None
+    unpriced_agent_count = 0
+    if engine is not None:
+        try:
+            usage = engine.get_execution_summary().get("usage")
+        except Exception:
+            logger.warning("Failed to read usage summary for terminal run record", exc_info=True)
+            usage = None
+        if usage is not None:
+            total_tokens = usage.get("total_tokens")
+            total_cost_usd = usage.get("total_cost_usd")
+            unpriced_agent_count = usage.get("unpriced_agent_count", 0)
+
+    try:
+        write_terminal_record(
+            TerminalRunRecord(
+                run_id=event_log_subscriber.run_id,
+                workflow_path=str(workflow_path),
+                workflow_name=workflow_path.stem,
+                started_at=started_at,
+                ended_at=datetime.now(UTC).isoformat(),
+                status=status,
+                output=output,
+                error_type=error_type,
+                error_message=error_message,
+                total_tokens=total_tokens,
+                total_cost_usd=total_cost_usd,
+                unpriced_agent_count=unpriced_agent_count,
+                event_log_path=str(event_log_subscriber.path),
+                bg_stderr_log=os.environ.get("CONDUCTOR_BG_STDERR_LOG"),
+                bg_stdout_log=os.environ.get("CONDUCTOR_BG_STDOUT_LOG"),
+            )
+        )
+    except Exception:
+        logger.warning("Failed to write terminal run record", exc_info=True)
+
+
 async def run_workflow_async(
     workflow_path: Path,
     inputs: dict[str, Any],
@@ -1957,6 +2052,10 @@ async def run_workflow_async(
     from conductor.events import WorkflowEventEmitter
 
     start_time = time.time()
+    # Captured once, up front, so the terminal run record (MCP server plan
+    # E2) reports the same start time regardless of which exit path below
+    # actually writes it.
+    started_at_iso = datetime.now(UTC).isoformat()
 
     # Initialize file logging if requested
     if log_file is not None:
@@ -1973,6 +2072,17 @@ async def run_workflow_async(
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
     dashboard: Any = None
+
+    # Terminal-outcome locals (MCP server plan E2): populated on every exit
+    # path below -- clean completion, an explicit `WorkflowTerminated`, or
+    # an unexpected exception -- so the `finally` block can write a
+    # terminal run record describing whichever outcome actually occurred,
+    # even when it happens before the engine is ever constructed.
+    terminal_status = "failed"
+    terminal_output: dict[str, Any] = {}
+    terminal_error_type: str | None = None
+    terminal_error_message: str | None = None
+    engine: WorkflowEngine | None = None
 
     if web:
         from conductor.web.server import WebDashboard
@@ -2218,6 +2328,18 @@ async def run_workflow_async(
                 if listener is not None:
                     await listener.stop()
 
+            # Capture the terminal outcome for the Fleet Manager terminal
+            # run record (MCP server plan E2) -- both a clean completion
+            # and an explicit `type: terminate` reach this point, so this
+            # is the one place that covers both.
+            terminal_output = result
+            if terminate_exc is None:
+                terminal_status = "success"
+            else:
+                terminal_status = "failed"
+                terminal_error_type = "WorkflowTerminated"
+                terminal_error_message = terminate_exc.reason
+
             # Log completion
             verbose_log_timing("Total workflow execution", time.time() - start_time)
             if terminate_exc is None:
@@ -2268,7 +2390,35 @@ async def run_workflow_async(
                 # and prints the structured termination message/output.
                 raise terminate_exc
             return result
+    except BaseException as exc:
+        if not isinstance(exc, WorkflowTerminated):
+            # An unexpected failure -- either a setup error before the
+            # engine ever ran (config load, plugin prefetch, dashboard
+            # startup, ...) or one that escaped the inner try/except above.
+            # `WorkflowTerminated` is excluded: its terminal outcome was
+            # already captured where it was raised, above, and re-raising
+            # it here must not clobber that with a generic "failed"/no
+            # message (MCP server plan E2).
+            terminal_status = "failed"
+            terminal_error_type = type(exc).__name__
+            terminal_error_message = str(exc)
+        raise
     finally:
+        # Write the terminal run record (MCP server plan E2) before
+        # removing the live one below, so a completed run remains
+        # resolvable by run_id after this process exits. Never raises --
+        # see the helper's own docstring.
+        _write_terminal_record_for_current_process(
+            event_log_subscriber=event_log_subscriber,
+            workflow_path=workflow_path,
+            started_at=started_at_iso,
+            status=terminal_status,
+            output=terminal_output,
+            error_type=terminal_error_type,
+            error_message=terminal_error_message,
+            engine=engine,
+        )
+
         # Clean up the Fleet Manager run record on every exit path (E2 —
         # normal completion, an explicit WorkflowTerminated re-raise, or an
         # unexpected exception all funnel through this finally). Unlike the
@@ -2590,6 +2740,12 @@ async def resume_workflow_async(
     from conductor.exceptions import CheckpointError
 
     start_time = time.time()
+    # Captured once, up front, so the terminal run record (MCP server plan
+    # E2) reports the same start time regardless of which exit path below
+    # actually writes it. Note this is the *resume* start time, not the
+    # original run's -- the checkpoint's own timestamps are preserved
+    # separately in the checkpoint file itself.
+    started_at_iso = datetime.now(UTC).isoformat()
 
     # Initialize file logging if requested
     if log_file is not None:
@@ -2606,6 +2762,18 @@ async def resume_workflow_async(
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
     dashboard: Any = None
+
+    # Terminal-outcome locals (MCP server plan E2), mirroring
+    # `run_workflow_async`: populated on every exit path below so the
+    # `finally` block can write a terminal run record describing whichever
+    # outcome actually occurred, even when it happens before
+    # `resolved_workflow_path`/the engine are ever established.
+    terminal_status = "failed"
+    terminal_output: dict[str, Any] = {}
+    terminal_error_type: str | None = None
+    terminal_error_message: str | None = None
+    engine: WorkflowEngine | None = None
+    resolved_workflow_path: Path | None = None
 
     try:
         # Resolve checkpoint file
@@ -2965,6 +3133,17 @@ async def resume_workflow_async(
                 if listener is not None:
                     await listener.stop()
 
+            # Capture the terminal outcome for the Fleet Manager terminal
+            # run record (MCP server plan E2) -- mirrors the equivalent
+            # block in `run_workflow_async`.
+            terminal_output = result
+            if terminate_exc is None:
+                terminal_status = "success"
+            else:
+                terminal_status = "failed"
+                terminal_error_type = "WorkflowTerminated"
+                terminal_error_message = terminate_exc.reason
+
             # Log completion
             verbose_log_timing("Total resumed execution", time.time() - start_time)
             if terminate_exc is None:
@@ -3016,7 +3195,34 @@ async def resume_workflow_async(
             if terminate_exc is not None:
                 raise terminate_exc
             return result
+    except BaseException as exc:
+        if not isinstance(exc, WorkflowTerminated):
+            # Mirror of the matching arm in `run_workflow_async`: capture
+            # any failure that didn't already flow through the
+            # `WorkflowTerminated` branch above -- a setup error before the
+            # engine ever ran (checkpoint resolution, config load, ...) or
+            # one that escaped the inner try/except (MCP server plan E2).
+            terminal_status = "failed"
+            terminal_error_type = type(exc).__name__
+            terminal_error_message = str(exc)
+        raise
     finally:
+        # Write the terminal run record (MCP server plan E2) before
+        # removing the live one below -- mirrors run_workflow_async. A
+        # resumed run reuses its predecessor's run_id, so this call
+        # replaces the earlier terminal record rather than duplicating it.
+        # Never raises -- see the helper's own docstring.
+        _write_terminal_record_for_current_process(
+            event_log_subscriber=event_log_subscriber,
+            workflow_path=resolved_workflow_path,
+            started_at=started_at_iso,
+            status=terminal_status,
+            output=terminal_output,
+            error_type=terminal_error_type,
+            error_message=terminal_error_message,
+            engine=engine,
+        )
+
         # Clean up the Fleet Manager run record on every exit path (E2 —
         # mirrors run_workflow_async so a resumed run's record is removed
         # the same way a fresh run's is). Guarded (never raises) so a

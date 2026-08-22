@@ -390,7 +390,9 @@ the `except ImportError` guard at `mcp/manager.py:39` cannot catch.
 
 ---
 
-### E2 — The terminal run record (DD1, P3, G5)
+### E2 — The terminal run record (DD1, P3, G5) — DONE
+
+**Status: DONE** (completed 2026-08-22)
 
 **Goal.** Make a completed run resolvable by `run_id` after its process has
 exited — the design's "one genuinely new artifact" and the hard prerequisite
@@ -414,19 +416,19 @@ protects all three.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E2-T1 | IMPL | Define `TerminalRunRecord` (frozen dataclass, `to_dict`/`from_dict` mirroring `RunRecord`'s tolerant coercion) carrying the identifying fields plus `status`, `ended_at`, `output` (the rendered `output:` dict), `error_type`, `error_message`, `total_tokens`, `total_cost_usd`, `unpriced_agent_count`, `event_log_path`, `bg_stderr_log`, `bg_stdout_log` (*Key Components → 4*). `from_dict` must tolerate every field being absent so a record written by a newer Conductor still parses. | `src/conductor/fleet/records.py` | TO DO |
-| E2-T2 | IMPL | `terminal_records_dir()` returning `run_records_dir() / "terminal"`, plus `write_terminal_record` (temp file + `_replace_with_retry`, reusing the existing atomic-write helper), `read_terminal_record(run_id)`, `read_terminal_records()`, and `remove_terminal_record(run_id)`. Reuse `_validate_run_id` / `_RUN_ID_PATTERN` so a non-path-safe id can never produce a file. `read_terminal_records()` sorts newest-first by `ended_at` and takes a `limit`, since E4 renders it per invocation. | `src/conductor/fleet/records.py` | TO DO |
-| E2-T3 | IMPL | Capture the terminal outcome in `run_workflow_async` so the `finally` has something to write: today `result` is a `try`-local and the exception is not retained. Add locals for status / error / output set on the success, `WorkflowTerminated`, and `except BaseException` paths, then write the record in the `finally` immediately before `_remove_run_record_for_current_process_safe()`. Wrap in a never-raises guard modelled on that function (`cli/run.py:1892`) — a diagnostic write must not break the dashboard/event-log cleanup that follows. | `src/conductor/cli/run.py` | TO DO |
-| E2-T4 | IMPL | Mirror E2-T3 in `resume_workflow_async` (`:3018`), per the Run/Resume Parity rule in `AGENTS.md`. A resumed run reuses its predecessor's `run_id`, so the write **replaces** the earlier terminal record rather than creating a second one — assert it rather than assuming it. | `src/conductor/cli/run.py` | TO DO |
-| E2-T5 | IMPL | Populate token/cost totals from `engine.get_execution_summary()["usage"]` (`engine/workflow.py:7188`), which already exposes `total_tokens`, `total_cost_usd` and `unpriced_agent_count`. Read it unconditionally rather than only when `cost.show_summary` is set — the existing call site is gated on that flag, and a terminal record that silently omits cost for half of all runs is worse than one that omits it never. | `src/conductor/cli/run.py` | TO DO |
-| E2-T6 | TEST | Round-trip; a record written under `terminal/` is invisible to `read_run_records()`, `scan_run_records()` **and** `remove_run_record_for_current_process()` (all three glob non-recursively — assert each, since the design only names two); a corrupt terminal record is skipped, not raised; `write_terminal_record` never raises on a read-only directory; `read_terminal_records()` honours its limit and newest-first order. | `tests/test_fleet/test_terminal_records.py` | TO DO |
-| E2-T7 | TEST | Wiring: a terminal record appears after a clean run, after `WorkflowTerminated`, and after an unexpected exception, with the right `status` in each case, the rendered `output:` on success, and `error_type`/`error_message` on failure. A resumed run replaces rather than duplicates. Assert explicitly that a `kill -9`-style exit leaves **no** terminal record — this is the ⚠️ limitation in *Key Components → 4* and must be a documented, tested boundary rather than a surprise. | `tests/test_fleet/test_run_record_wiring.py` | TO DO |
+| E2-T1 | IMPL | Define `TerminalRunRecord` (frozen dataclass, `to_dict`/`from_dict` mirroring `RunRecord`'s tolerant coercion) carrying the identifying fields plus `status`, `ended_at`, `output` (the rendered `output:` dict), `error_type`, `error_message`, `total_tokens`, `total_cost_usd`, `unpriced_agent_count`, `event_log_path`, `bg_stderr_log`, `bg_stdout_log` (*Key Components → 4*). `from_dict` must tolerate every field being absent so a record written by a newer Conductor still parses. | `src/conductor/fleet/records.py` | DONE |
+| E2-T2 | IMPL | `terminal_records_dir()` returning `run_records_dir() / "terminal"`, plus `write_terminal_record` (temp file + `_replace_with_retry`, reusing the existing atomic-write helper), `read_terminal_record(run_id)`, `read_terminal_records()`, and `remove_terminal_record(run_id)`. Reuse `_validate_run_id` / `_RUN_ID_PATTERN` so a non-path-safe id can never produce a file. `read_terminal_records()` sorts newest-first by `ended_at` and takes a `limit`, since E4 renders it per invocation. | `src/conductor/fleet/records.py` | DONE |
+| E2-T3 | IMPL | Capture the terminal outcome in `run_workflow_async` so the `finally` has something to write: today `result` is a `try`-local and the exception is not retained. Add locals for status / error / output set on the success, `WorkflowTerminated`, and `except BaseException` paths, then write the record in the `finally` immediately before `_remove_run_record_for_current_process_safe()`. Wrap in a never-raises guard modelled on that function (`cli/run.py:1892`) — a diagnostic write must not break the dashboard/event-log cleanup that follows. | `src/conductor/cli/run.py` | DONE |
+| E2-T4 | IMPL | Mirror E2-T3 in `resume_workflow_async` (`:3018`), per the Run/Resume Parity rule in `AGENTS.md`. A resumed run reuses its predecessor's `run_id`, so the write **replaces** the earlier terminal record rather than creating a second one — assert it rather than assuming it. | `src/conductor/cli/run.py` | DONE |
+| E2-T5 | IMPL | Populate token/cost totals from `engine.get_execution_summary()["usage"]` (`engine/workflow.py:7188`), which already exposes `total_tokens`, `total_cost_usd` and `unpriced_agent_count`. Read it unconditionally rather than only when `cost.show_summary` is set — the existing call site is gated on that flag, and a terminal record that silently omits cost for half of all runs is worse than one that omits it never. | `src/conductor/cli/run.py` | DONE |
+| E2-T6 | TEST | Round-trip; a record written under `terminal/` is invisible to `read_run_records()`, `scan_run_records()` **and** `remove_run_record_for_current_process()` (all three glob non-recursively — assert each, since the design only names two); a corrupt terminal record is skipped, not raised; `write_terminal_record` never raises on a read-only directory; `read_terminal_records()` honours its limit and newest-first order. | `tests/test_fleet/test_terminal_records.py` | DONE |
+| E2-T7 | TEST | Wiring: a terminal record appears after a clean run, after `WorkflowTerminated`, and after an unexpected exception, with the right `status` in each case, the rendered `output:` on success, and `error_type`/`error_message` on failure. A resumed run replaces rather than duplicates. Assert explicitly that a `kill -9`-style exit leaves **no** terminal record — this is the ⚠️ limitation in *Key Components → 4* and must be a documented, tested boundary rather than a surprise. | `tests/test_fleet/test_run_record_wiring.py` | DONE |
 
 **Acceptance criteria**
-- [ ] `read_terminal_record(run_id)` returns status, rendered output, error, and usage totals for a run whose process has exited.
-- [ ] `conductor stop`'s semantics for **live** runs are unchanged (NFR5) — its tests pass untouched.
-- [ ] A crashed run produces no terminal record, and a test says so.
-- [ ] The write path never raises.
+- [x] `read_terminal_record(run_id)` returns status, rendered output, error, and usage totals for a run whose process has exited.
+- [x] `conductor stop`'s semantics for **live** runs are unchanged (NFR5) — its tests pass untouched.
+- [x] A crashed run produces no terminal record, and a test says so.
+- [x] The write path never raises.
 
 ---
 

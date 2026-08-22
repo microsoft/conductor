@@ -38,6 +38,21 @@ Design points this module implements:
   from ``conductor.run_id``) purely for backward compatibility with
   ``cli.bg_runner`` and the existing test suite, which import it from this
   module.
+
+Also implements the **terminal run record** (MCP server plan E2 — see
+``docs/projects/mcp-server/conductor-mcp.design.md``'s *Key Components → 4*
+and *Why a subdirectory, not a sibling file*). A completed run's ``finally``
+block writes a :class:`TerminalRunRecord` companion to
+``run_records_dir()/"terminal"/<run_id>.json``, carrying the run's
+identifying fields plus its terminal status, rendered output, error, and
+usage totals — so `conductor status` / `fleet list` / a future MCP
+`conductor_run_status` tool can resolve a run by ``run_id`` *after* its
+process has exited, not only while it is alive. The subdirectory placement
+is deliberate: ``run_records_dir().glob("*.json")`` (used non-recursively by
+``read_run_records()``, ``scan_run_records()``, and
+``remove_run_record_for_current_process()``) never lists anything under
+``terminal/``, so a terminal record can never be mistaken for — or race
+against — a live one.
 """
 
 from __future__ import annotations
@@ -238,6 +253,49 @@ def _coerce_optional_int(value: Any, field: str) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an int or null")
+    return value
+
+
+def _coerce_optional_float(value: Any, field: str) -> float | None:
+    """Coerce a nullable numeric field (e.g. ``total_cost_usd``), keeping ``None`` as-is.
+
+    Accepts a plain ``int`` too (widened to ``float``), since JSON has no
+    separate integer/float distinction and a whole-dollar cost or token
+    total may round-trip through ``json.dumps``/``json.loads`` as an
+    ``int``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number or null")
+    if isinstance(value, int):
+        return float(value)
+    if isinstance(value, float):
+        return value
+    raise ValueError(f"{field} must be a number or null")
+
+
+def _coerce_int_default(value: Any, field: str, default: int) -> int:
+    """Coerce an integer field, defaulting a genuinely *missing* value to ``default``.
+
+    Unlike :func:`_coerce_optional_int`, the field itself is never
+    ``None``-valued in a well-formed record (e.g. ``unpriced_agent_count``
+    is always a count) -- only its *absence* from an older or corrupted
+    payload is tolerated, by substituting ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an int")
+    return value
+
+
+def _coerce_dict(value: Any, field: str) -> dict[str, Any]:
+    """Coerce a JSON-object field (e.g. ``output``), defaulting a missing value to ``{}``."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
     return value
 
 
@@ -1181,3 +1239,341 @@ def remove_run_record_for_current_process() -> bool:
                 logger.debug("Removed run record for current process (PID %s): %s", current_pid, f)
             return removed
     return False
+
+
+# ---------------------------------------------------------------------------
+# Terminal run records (MCP server plan E2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TerminalRunRecord:
+    """A completed run's tombstone, resolvable by ``run_id`` after its process exits.
+
+    Written once, in the same ``finally`` block that removes the *live*
+    :class:`RunRecord`, to ``terminal_records_dir()/<run_id>.json`` — see
+    ``docs/projects/mcp-server/conductor-mcp.design.md``'s *Key Components →
+    4* for the full rationale, including why this lives in a ``terminal/``
+    subdirectory rather than beside the live record.
+
+    Every field tolerates being *absent* from a parsed payload (see
+    :meth:`from_dict`): unlike :class:`RunRecord`, no field here is required
+    for a record to parse, so a tombstone written by a newer Conductor that
+    has since dropped or renamed a field still loads with sensible
+    defaults rather than being rejected outright.
+
+    Attributes:
+        run_id: Unique run identifier, matching the (now-removed) live
+            record's.
+        workflow_path: Path to the workflow YAML file, as given on the CLI.
+        workflow_name: The workflow file's stem.
+        started_at: ISO 8601 timestamp of when the run started.
+        ended_at: ISO 8601 timestamp of when the run's process wrote this
+            tombstone.
+        status: The run's terminal status — ``"success"`` or ``"failed"``
+            for every record this module itself writes; a forward-compat
+            placeholder of ``"unknown"`` is substituted when the field is
+            absent from the parsed payload.
+        output: The rendered ``output:`` dict (or the ``WorkflowTerminated``
+            exception's own ``output``) — ``{}`` on an unexpected failure
+            that never produced one.
+        error_type: The exception's class name on failure, else ``None``.
+        error_message: The exception's message on failure, else ``None``.
+        total_tokens: Total tokens consumed across the run, else ``None``
+            when usage totals could not be read.
+        total_cost_usd: Total USD cost across the run, else ``None``.
+        unpriced_agent_count: Count of agents whose model had no resolvable
+            pricing (see ``engine/pricing.py``); ``0`` when absent.
+        event_log_path: Path to the run's JSONL event log.
+        bg_stderr_log: Path to the ``--web-bg`` child's captured stderr
+            log, or ``None`` for a foreground run (or an unavailable one).
+        bg_stdout_log: Path to the ``--web-bg`` child's captured stdout
+            log, or ``None``.
+    """
+
+    run_id: str
+    workflow_path: str
+    workflow_name: str
+    started_at: str
+    ended_at: str
+    status: str
+    output: dict[str, Any]
+    error_type: str | None
+    error_message: str | None
+    total_tokens: int | None
+    total_cost_usd: float | None
+    unpriced_agent_count: int
+    event_log_path: str
+    bg_stderr_log: str | None
+    bg_stdout_log: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "run_id": self.run_id,
+            "workflow_path": self.workflow_path,
+            "workflow_name": self.workflow_name,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "status": self.status,
+            "output": self.output,
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+            "total_tokens": self.total_tokens,
+            "total_cost_usd": self.total_cost_usd,
+            "unpriced_agent_count": self.unpriced_agent_count,
+            "event_log_path": self.event_log_path,
+            "bg_stderr_log": self.bg_stderr_log,
+            "bg_stdout_log": self.bg_stdout_log,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TerminalRunRecord:
+        """Build a :class:`TerminalRunRecord` from a parsed JSON payload.
+
+        Every field is optional: a missing key falls back to an empty
+        string / ``None`` / ``0`` / ``{}`` as appropriate rather than
+        raising, so a record written by a newer Conductor version (which
+        may have dropped a field this version still expects) still parses.
+        A field that *is* present but the wrong type still raises
+        ``ValueError`` — that is genuinely corrupt content, not a forward-
+        compatible omission.
+
+        Raises:
+            ValueError: If any present field has the wrong type.
+        """
+        workflow_path = _coerce_optional_str(data.get("workflow_path"), "workflow_path")
+        workflow_name = _coerce_optional_str(data.get("workflow_name"), "workflow_name") or (
+            Path(workflow_path).stem if workflow_path else ""
+        )
+        status = _coerce_optional_str(data.get("status"), "status") or "unknown"
+
+        return cls(
+            run_id=_coerce_optional_str(data.get("run_id"), "run_id"),
+            workflow_path=workflow_path,
+            workflow_name=workflow_name,
+            started_at=_coerce_optional_str(data.get("started_at"), "started_at"),
+            ended_at=_coerce_optional_str(data.get("ended_at"), "ended_at"),
+            status=status,
+            output=_coerce_dict(data.get("output"), "output"),
+            error_type=_coerce_optional_str_or_none(data.get("error_type"), "error_type"),
+            error_message=_coerce_optional_str_or_none(data.get("error_message"), "error_message"),
+            total_tokens=_coerce_optional_int(data.get("total_tokens"), "total_tokens"),
+            total_cost_usd=_coerce_optional_float(data.get("total_cost_usd"), "total_cost_usd"),
+            unpriced_agent_count=_coerce_int_default(
+                data.get("unpriced_agent_count"), "unpriced_agent_count", 0
+            ),
+            event_log_path=_coerce_optional_str(data.get("event_log_path"), "event_log_path"),
+            bg_stderr_log=_coerce_optional_str_or_none(data.get("bg_stderr_log"), "bg_stderr_log"),
+            bg_stdout_log=_coerce_optional_str_or_none(data.get("bg_stdout_log"), "bg_stdout_log"),
+        )
+
+
+def terminal_records_dir() -> Path:
+    """Return the directory used for terminal run records, creating it if needed.
+
+    A subdirectory of :func:`run_records_dir`, not a sibling file. This is
+    load-bearing, not cosmetic: :func:`read_run_records`,
+    :func:`scan_run_records`, and
+    :func:`remove_run_record_for_current_process` all glob
+    ``run_records_dir().glob("*.json")`` **non-recursively**, so nothing
+    filed under ``terminal/`` is ever listed, mistaken for a live record, or
+    raced against by those three functions — see
+    ``docs/projects/mcp-server/conductor-mcp.design.md``'s *Why a
+    subdirectory, not a sibling file*.
+
+    Returns:
+        Path to ``<run_records_dir>/terminal/``.
+    """
+    d = run_records_dir() / "terminal"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_terminal_record_file(
+    f: Path,
+) -> tuple[TerminalRunRecord | None, bool, os.stat_result | None]:
+    """Read and parse a single terminal record file.
+
+    Mirrors :func:`_load_record_file`'s classification of a parse failure
+    into "corrupt content" vs. "transient read error" (see that function's
+    docstring for the detailed rationale of each branch), but for
+    :class:`TerminalRunRecord`. There is no liveness to check for a
+    terminal record — the process it describes has, by definition, already
+    exited — so this helper never itself deletes anything; that is left to
+    :func:`remove_terminal_record` and, longer-term, ``fleet.retention``.
+
+    Returns:
+        A ``(record, corrupt, stat)`` tuple with the same meaning as
+        :func:`_load_record_file`'s.
+    """
+    try:
+        stat_before = f.stat()
+    except OSError:
+        return None, False, None
+
+    try:
+        text = f.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, False, None
+    except UnicodeDecodeError:
+        return None, True, stat_before
+    except OSError:
+        logger.warning("Could not read terminal run record file: %s", f, exc_info=True)
+        return None, False, None
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        # See `_load_record_file`'s matching branch: malformed/truncated
+        # JSON and CPython's integer-string conversion guard both surface
+        # as `ValueError` here.
+        return None, True, stat_before
+    except RecursionError:
+        return None, True, stat_before
+
+    if not isinstance(data, dict):
+        return None, True, stat_before
+
+    try:
+        return TerminalRunRecord.from_dict(data), False, stat_before
+    except (ValueError, TypeError):
+        return None, True, stat_before
+
+
+def write_terminal_record(record: TerminalRunRecord) -> Path | None:
+    """Atomically write ``record`` to ``<terminal_records_dir>/<run_id>.json``.
+
+    Unlike :func:`write_run_record`, this function never raises. It is
+    called from ``cli/run.py``'s ``finally`` block, immediately before
+    :func:`remove_run_record_for_current_process` removes the live record,
+    and a failure to persist this diagnostic tombstone — an unsafe
+    ``run_id``, a read-only ``$CONDUCTOR_HOME``, a full disk — must never
+    prevent that cleanup, or the rest of the run's teardown, from
+    completing.
+
+    Args:
+        record: The terminal run record to persist.
+
+    Returns:
+        Path to the written record file, or ``None`` if the write could
+        not be completed.
+    """
+    if not is_valid_run_id(record.run_id):
+        logger.warning(
+            "Refusing to write terminal run record with unsafe run_id: %r", record.run_id
+        )
+        return None
+
+    try:
+        d = terminal_records_dir()
+        filepath = d / f"{record.run_id}.json"
+
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{record.run_id}.", suffix=".tmp", dir=d)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(record.to_dict(), f, indent=2)
+            _replace_with_retry(tmp_name, filepath)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+    except OSError:
+        logger.warning(
+            "Could not write terminal run record for run_id=%s", record.run_id, exc_info=True
+        )
+        return None
+
+    logger.debug("Wrote terminal run record: %s", filepath)
+    return filepath
+
+
+def read_terminal_record(run_id: str) -> TerminalRunRecord | None:
+    """Return the single terminal record keyed by ``run_id``.
+
+    A single-key lookup, mirroring :func:`read_run_record`: never scans the
+    whole directory and never deletes anything, even if the file is
+    corrupt or its own ``run_id`` field doesn't match the requested key —
+    pruning a terminal record is out of scope for this function (and for
+    this epic; see ``fleet.retention``).
+
+    Args:
+        run_id: The run identifier to look up.
+
+    Returns:
+        The parsed :class:`TerminalRunRecord`, or ``None`` if ``run_id``
+        isn't a path-safe run id, the record is absent, it could not be
+        parsed, or the parsed payload's own ``run_id`` field doesn't
+        exactly equal the requested key.
+    """
+    if not _RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    filepath = terminal_records_dir() / f"{run_id}.json"
+    record, _corrupt, _stat = _load_terminal_record_file(filepath)
+    if record is None:
+        return None
+    if record.run_id != run_id:
+        return None
+    return record
+
+
+def read_terminal_records(limit: int | None = None) -> list[TerminalRunRecord]:
+    """Return every terminal run record, sorted newest-first by ``ended_at``.
+
+    Read-only: unlike :func:`read_run_records`, this never prunes anything
+    from disk as a side effect. A corrupt, vanished, or unparseable file is
+    silently skipped rather than raised or deleted — deleting a stale
+    terminal record is ``fleet.retention``'s job (matched to its run's
+    event log lifecycle), not this query path's.
+
+    Args:
+        limit: If given, return at most this many records — the newest
+            ``limit`` by ``ended_at``. A caller such as a future MCP
+            ``runs`` toolset or the TUI History screen renders this list
+            on every invocation and must bound how much it reads.
+
+    Returns:
+        List of :class:`TerminalRunRecord`, newest-first by ``ended_at``.
+    """
+    results: list[TerminalRunRecord] = []
+
+    # Sorted rather than raw glob order, matching `scan_run_records()`:
+    # `Path.glob` order is filesystem-dependent and this listing is
+    # user-facing (indirectly re-sorted by `ended_at` below, but a stable
+    # starting order keeps ties -- e.g. two records with an identical
+    # `ended_at` -- deterministic).
+    for f in sorted(terminal_records_dir().glob("*.json")):
+        record, _corrupt, _stat = _load_terminal_record_file(f)
+        if record is None:
+            continue
+        if record.run_id != f.stem:
+            # Same identity guard `read_run_records` applies: a payload
+            # must not be allowed to claim an identity other than the one
+            # it was filed under.
+            continue
+        results.append(record)
+
+    results.sort(key=lambda r: r.ended_at, reverse=True)
+    if limit is not None:
+        results = results[:limit]
+    return results
+
+
+def remove_terminal_record(run_id: str) -> bool:
+    """Remove the terminal run record file for ``run_id``, if it exists.
+
+    Args:
+        run_id: The run identifier to remove.
+
+    Returns:
+        True only if a record file existed and this call actually removed
+        it. False otherwise — including an unsafe ``run_id`` (which never
+        has a corresponding file by construction) and a removal that was
+        attempted but failed or found nothing to remove.
+    """
+    if not _RUN_ID_PATTERN.fullmatch(run_id):
+        return False
+    filepath = terminal_records_dir() / f"{run_id}.json"
+    removed = _safe_unlink(filepath)
+    if removed:
+        logger.debug("Removed terminal run record: %s", filepath)
+    return removed

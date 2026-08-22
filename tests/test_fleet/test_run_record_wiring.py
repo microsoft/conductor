@@ -32,6 +32,10 @@ agent execution (already covered by ``tests/test_cli/test_e2e.py``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import signal
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -40,7 +44,7 @@ import pytest
 
 from conductor.config.schema import ProviderSettings
 from conductor.exceptions import WorkflowTerminated
-from conductor.fleet.records import read_run_records
+from conductor.fleet.records import read_run_records, read_terminal_record, read_terminal_records
 
 pytestmark = pytest.mark.asyncio
 
@@ -418,6 +422,150 @@ class TestRunWorkflowAsyncRunRecordWiring:
         assert read_run_records() == []
 
 
+class TestRunWorkflowAsyncTerminalRecordWiring:
+    """``run_workflow_async`` writes a *terminal* record (MCP server plan
+    E2) describing the outcome, on every exit path: clean completion, an
+    explicit ``WorkflowTerminated``, and an unexpected exception."""
+
+    async def test_terminal_record_appears_after_clean_run(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        from conductor.cli.run import run_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        mock_config = _mock_config()
+
+        async def _fake_run(inputs: dict[str, Any]) -> dict[str, Any]:
+            return {"result": "done"}
+
+        mock_engine = MagicMock()
+        mock_engine.run = _fake_run
+        mock_engine.get_execution_summary.return_value = {
+            "usage": {"total_tokens": 321, "total_cost_usd": 0.12, "unpriced_agent_count": 2}
+        }
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            result = await run_workflow_async(wf_path, {})
+
+        assert result == {"result": "done"}
+        records = read_terminal_records()
+        assert len(records) == 1
+        record = records[0]
+        assert record.status == "success"
+        assert record.output == {"result": "done"}
+        assert record.error_type is None
+        assert record.error_message is None
+        assert record.total_tokens == 321
+        assert record.total_cost_usd == 0.12
+        assert record.unpriced_agent_count == 2
+        assert record.workflow_path == str(wf_path)
+        assert record.workflow_name == wf_path.stem
+        assert Path(record.event_log_path).exists()
+
+        # The live record is gone (already covered above); the terminal
+        # one is a permanent artifact this epic is responsible for -- its
+        # eventual pruning is `fleet.retention`'s job, not this one's.
+        assert read_run_records() == []
+
+    async def test_terminal_record_appears_after_workflow_terminated(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        from conductor.cli.run import run_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        mock_config = _mock_config()
+
+        terminate_exc = WorkflowTerminated(
+            "bye now",
+            output={"reason_code": "done"},
+            reason="bye now",
+            terminated_by="term",
+        )
+
+        async def _fake_run(inputs: dict[str, Any]) -> dict[str, Any]:
+            raise terminate_exc
+
+        mock_engine = MagicMock()
+        mock_engine.run = _fake_run
+        mock_engine.get_execution_summary.return_value = {}
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pytest.raises(WorkflowTerminated),
+        ):
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            await run_workflow_async(wf_path, {})
+
+        records = read_terminal_records()
+        assert len(records) == 1
+        record = records[0]
+        assert record.status == "failed"
+        assert record.error_type == "WorkflowTerminated"
+        assert record.error_message == "bye now"
+        assert record.output == {"reason_code": "done"}
+
+    async def test_terminal_record_appears_after_unexpected_exception(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        from conductor.cli.run import run_workflow_async
+
+        wf_path = _write_workflow(tmp_path)
+        mock_config = _mock_config()
+
+        async def _fake_run(inputs: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+        mock_engine = MagicMock()
+        mock_engine.run = _fake_run
+        mock_engine.get_execution_summary.return_value = {}
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            await run_workflow_async(wf_path, {})
+
+        records = read_terminal_records()
+        assert len(records) == 1
+        record = records[0]
+        assert record.status == "failed"
+        assert record.error_type == "RuntimeError"
+        assert record.error_message == "boom"
+        # No `output:` was ever rendered on this path.
+        assert record.output == {}
+
+
 # ---------------------------------------------------------------------------
 # resume_workflow_async: mirrors run_workflow_async's wiring
 # ---------------------------------------------------------------------------
@@ -745,3 +893,194 @@ class TestResumeWorkflowAsyncRunRecordWiring:
         assert record.mode == "bg"
         assert record.port == 8224
         assert read_run_records() == []
+
+
+# ---------------------------------------------------------------------------
+# resume_workflow_async: terminal record replaces rather than duplicates
+# ---------------------------------------------------------------------------
+
+
+class TestResumeWorkflowAsyncTerminalRecordWiring:
+    """``resume_workflow_async`` writes a terminal record too, replacing a
+    prior generation's for the same ``run_id`` rather than duplicating it
+    (MCP server plan E2 — mirrors the live-record replacement behavior
+    already covered by ``TestResumeWorkflowAsyncRunRecordWiring``)."""
+
+    async def test_resume_terminal_record_replaces_rather_than_duplicates(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        from conductor.cli.run import resume_workflow_async
+        from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+        wf_path, cp_path = _write_checkpoint_and_config(tmp_path)
+        mock_config = _mock_config(agent_names=["a"])
+
+        # A stale terminal record for this same run_id, e.g. left over from
+        # an earlier resume generation that also eventually failed.
+        write_terminal_record(
+            TerminalRunRecord(
+                run_id="deadbeef",
+                workflow_path=str(wf_path),
+                workflow_name="wf",
+                started_at="2020-01-01T00:00:00+00:00",
+                ended_at="2020-01-01T00:05:00+00:00",
+                status="failed",
+                output={},
+                error_type="RuntimeError",
+                error_message="prior failure",
+                total_tokens=None,
+                total_cost_usd=None,
+                unpriced_agent_count=0,
+                event_log_path="/tmp/old.jsonl",
+                bg_stderr_log=None,
+                bg_stdout_log=None,
+            )
+        )
+
+        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+            return {"result": "resumed"}
+
+        mock_engine = MagicMock()
+        mock_engine.resume = _fake_resume
+        mock_engine.set_context = MagicMock()
+        mock_engine.set_limits = MagicMock()
+        mock_engine.get_execution_summary.return_value = {
+            "usage": {"total_tokens": 55, "total_cost_usd": 0.01, "unpriced_agent_count": 0}
+        }
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            result = await resume_workflow_async(workflow_path=wf_path)
+
+        assert result == {"result": "resumed"}
+        records = read_terminal_records()
+        # Replaced, not duplicated: still exactly one terminal record for
+        # this run_id, reflecting the new (successful) outcome.
+        assert len(records) == 1
+        record = records[0]
+        assert record.run_id == "deadbeef"
+        assert record.status == "success"
+        assert record.output == {"result": "resumed"}
+        assert record.error_type is None
+        assert record.total_tokens == 55
+
+
+# ---------------------------------------------------------------------------
+# The documented boundary: a kill -9-style exit leaves no terminal record
+# ---------------------------------------------------------------------------
+
+
+class TestKillStyleExitLeavesNoTerminalRecord:
+    """Documents and asserts the limitation called out in the MCP server
+    design's *Key Components → 4*: the terminal record is written in
+    ``cli/run.py``'s ``finally`` block, so a process that is ``kill -9``'d
+    (or otherwise dies before that ``finally`` runs) leaves no terminal
+    record behind — only the live record, later prunable as any dead-``pid``
+    record already is.
+
+    A real ``SIGKILL`` cannot be observed by any Python-level exception
+    handler, so the only faithful way to exercise this is to actually fork
+    a child process, let it reach the point of writing its own *live* run
+    record (proving it genuinely started), and kill it with ``SIGKILL``
+    from the parent — a synchronous (non-``asyncio``) test, since forking
+    from inside a running event loop is unsafe.
+    """
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+    @pytest.mark.skipif(os.name == "nt", reason="os.fork()/SIGKILL is POSIX-only")
+    def test_kill_minus_9_leaves_no_terminal_record(
+        self, tmp_path: Path, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wf_path = _write_workflow(tmp_path)
+        mock_config = _mock_config()
+        # Pin the run_id so the parent can look it up after the kill,
+        # mirroring how `cli.bg_runner` propagates a chosen run_id to a
+        # detached child (see `engine/event_log.py`).
+        monkeypatch.setenv("CONDUCTOR_RUN_ID", "deadbeef")
+
+        async def _fake_run(inputs: dict[str, Any]) -> dict[str, Any]:
+            # Blocks forever: the parent SIGKILLs this process before this
+            # coroutine -- and therefore `run_workflow_async`'s `finally`,
+            # where the terminal record would be written -- ever resumes.
+            await asyncio.Event().wait()
+            return {"result": "unreachable"}  # pragma: no cover
+
+        mock_engine = MagicMock()
+        mock_engine.run = _fake_run
+        mock_engine.get_execution_summary.return_value = {}
+
+        pid: int | None = None
+        try:
+            with (
+                patch("conductor.cli.run.load_config", return_value=mock_config),
+                patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+                patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+                patch(
+                    "conductor.cli.run._build_mcp_servers",
+                    new_callable=AsyncMock,
+                    return_value=None,
+                ),
+            ):
+                mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+                mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                pid = os.fork()
+                if pid == 0:
+                    # Child process: run the (mocked) workflow, which
+                    # blocks forever in `_fake_run` above. `os._exit` (not
+                    # `sys.exit`) below skips the `with` block's own
+                    # `__exit__`/unpatching and any other Python-level
+                    # cleanup -- this branch is expected to be reached
+                    # only if `asyncio.run` unexpectedly returns/raises,
+                    # since the parent kills this process first.
+                    from conductor.cli.run import run_workflow_async
+
+                    try:
+                        asyncio.run(run_workflow_async(wf_path, {}))
+                    finally:
+                        os._exit(1)
+
+            # Parent: wait (bounded) for the child to reach the point of
+            # writing its own live run record -- proving it is genuinely
+            # mid-execution -- before killing it.
+            deadline = time.time() + 10
+            child_started = False
+            while time.time() < deadline:
+                if any(r.run_id == "deadbeef" for r in read_run_records()):
+                    child_started = True
+                    break
+                time.sleep(0.02)
+
+            assert pid is not None
+            os.kill(pid, signal.SIGKILL)
+            _, status = os.waitpid(pid, 0)
+
+            assert child_started, "forked child never wrote its live run record"
+            assert os.WIFSIGNALED(status)
+            assert os.WTERMSIG(status) == signal.SIGKILL
+        finally:
+            # Best-effort: make sure no child is left behind even if an
+            # assertion above failed before the kill/reap. The child may
+            # already have been killed and reaped by the code above, in
+            # which case a second kill/waitpid legitimately raises either
+            # of these.
+            if pid:
+                with contextlib.suppress(ProcessLookupError, ChildProcessError):
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+
+        # The one artifact this epic adds is written only in `finally` --
+        # which a real SIGKILL never reaches -- so no terminal record
+        # exists for this run, even though it was genuinely mid-execution.
+        assert read_terminal_record("deadbeef") is None
