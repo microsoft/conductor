@@ -14,6 +14,7 @@ workflow:
   runtime:
     provider: copilot            # copilot (default), openai, claude, claude-agent-sdk, hermes (experimental)
     default_model: gpt-5.2       # Default model for agents
+    log_file: auto               # Full debug log: "auto" or a file path (optional; CLI --log-file wins)
     temperature: 0.7             # 0.0-1.0 (optional)
     max_tokens: 4096             # Max output tokens per response (optional)
     timeout: 600                 # Per-request timeout in seconds (optional)

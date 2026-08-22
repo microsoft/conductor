@@ -15,6 +15,7 @@ workflow:
     default_model: gpt-5.2
     temperature: 0.7
     max_tokens: 4096
+    log_file: auto  # Optional: "auto" or a file path; disabled when omitted
     default_reasoning_effort: medium  # low | medium | high | xhigh | max (optional)
     default_context_tier: default  # default | long_context (optional, Copilot only)
     # Provider-specific settings...
@@ -389,6 +390,24 @@ workflow:
 - `0.0 - 0.3`: Factual, deterministic (data extraction, classification)
 - `0.4 - 0.7`: Balanced (general Q&A, analysis)
 - `0.8 - 1.0`: Creative (brainstorming, content generation)
+
+### Debug File Logging
+
+Use `runtime.log_file` to enable debug file logging by default for both
+`conductor run` and `conductor resume`:
+
+```yaml
+workflow:
+  runtime:
+    log_file: auto  # Or ./logs/run.log
+```
+
+`auto` creates a timestamped `.log` file in the `conductor/` subdirectory of
+the OS temporary directory. Relative paths are resolved from the Conductor
+process's current working directory. An explicit CLI `--log-file` value takes
+precedence; if both settings are omitted, file logging remains disabled. See
+[Workflow Syntax](workflow-syntax.md) and the
+[CLI reference](cli-reference.md#file-logging).
 
 ## Claude-Specific Configuration
 

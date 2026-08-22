@@ -680,6 +680,23 @@ class TestRuntimeConfig:
         assert config.max_tokens is None
         assert config.timeout is None
 
+    def test_log_file_field(self) -> None:
+        """Test runtime.log_file field: default, 'auto', and explicit path."""
+        assert RuntimeConfig().log_file is None
+
+        config = RuntimeConfig(log_file="auto")
+        assert config.log_file == "auto"
+
+        config = RuntimeConfig(log_file="/tmp/my-workflow.log")
+        assert config.log_file == "/tmp/my-workflow.log"
+
+        original = RuntimeConfig(log_file="auto")
+        restored = RuntimeConfig(**original.model_dump())
+        assert restored.log_file == "auto"
+
+        serialized = RuntimeConfig().model_dump(exclude_none=True)
+        assert "log_file" not in serialized
+
     def test_custom_provider(self) -> None:
         """Test custom provider setting."""
         config = RuntimeConfig(provider="openai", default_model="gpt-4")
