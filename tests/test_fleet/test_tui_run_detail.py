@@ -33,7 +33,7 @@ from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.run_detail import RunDetailScreen, _collect_detail
 from conductor.fleet.tui.screens.runs import RunsScreen
 from conductor.fleet.tui.screens.step_detail import StepDetailScreen
-from tests.test_fleet.conftest import settle
+from tests.test_fleet.conftest import settle, wait_for
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -587,8 +587,11 @@ class TestRunDetailPolling:
 
             # Wait out several poll intervals (real time -- set_interval is
             # a real asyncio timer, not something pilot.pause() advances).
-            await asyncio.sleep(0.3)
-            await settle(pilot)
+            await wait_for(
+                pilot,
+                lambda: "completed" in str(table.get_row_at(0)[2]).lower(),
+                message="the poll tick never picked up the appended agent_completed event",
+            )
 
             row = table.get_row_at(0)
             assert "completed" in str(row[2]).lower()
@@ -620,8 +623,11 @@ class TestRunDetailPolling:
 
             _write_jsonl(log_path, [_workflow_started_event(["researcher"])])
 
-            await asyncio.sleep(0.3)
-            await settle(pilot)
+            await wait_for(
+                pilot,
+                lambda: table.display is True,
+                message="the placeholder never recovered once workflow_started arrived",
+            )
 
             assert table.display is True
             assert placeholder.display is False
@@ -761,6 +767,14 @@ class TestRunDetailWorkerThreading:
             async with app.run_test() as pilot:
                 await settle(pilot)
                 await pilot.press("enter")
+
+                # "No *second* call" only means something once the first
+                # one has happened -- see the Runs-screen twin of this test.
+                await wait_for(
+                    pilot,
+                    lambda: call_count >= 1,
+                    message="the mount refresh never entered the collector",
+                )
 
                 # Several poll intervals elapse while the collector is
                 # blocked -- none of them may start a second worker.

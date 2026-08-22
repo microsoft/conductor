@@ -31,7 +31,7 @@ from conductor.fleet.tui.anim import FRAME_INTERVAL
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens import runs as runs_module
 from conductor.fleet.tui.screens.runs import RunScan, RunsScreen, _collect_runs
-from tests.test_fleet.conftest import settle
+from tests.test_fleet.conftest import settle, wait_for
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,32 +70,40 @@ def fleet_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-async def _assert_guard_released(pilot: Any, screen: RunsScreen, *, timeout: float = 5.0) -> None:
-    """Assert ``_refreshing`` *clears*, rather than sampling it once.
+async def _assert_screen_still_refreshes(
+    pilot: Any, screen: RunsScreen, tmp_path: Path, *, run_id: str
+) -> None:
+    """Prove the ``_refreshing`` guard was released, via what a user sees.
 
-    The guard-recovery tests shrink ``POLL_INTERVAL_SECONDS`` so a later
-    tick can be observed unattended, which means the flag legitimately
-    flips back to ``True`` every interval -- including during ``settle()``'s
-    trailing ``pilot.pause()``, where a tick can dispatch a fresh refresh
-    between the last worker finishing and the assertion reading the flag.
-    A single-instant ``assert screen._refreshing is False`` therefore fails
-    at random (it did, on CI and ~20% of local runs) for a reason that has
-    nothing to do with the ``finally`` it is meant to pin.
+    The property under test is that one transient error cannot stop the
+    screen refreshing for the rest of the session. The obvious way to check
+    that -- reading ``screen._refreshing`` and expecting ``False`` -- cannot
+    be made reliable, because the flag is *transient*: these tests shrink
+    ``POLL_INTERVAL_SECONDS`` to 0.05 so a later tick can be observed, so
+    the flag legitimately returns to ``True`` 20 times a second. Sampling it
+    is a coin flip, and a slow machine loads the coin: measured under
+    ``coverage`` (how CI runs), the flag is ``True`` ~35% of the time while
+    ``pilot.pause()`` costs ~1s a call, so a 5s sampling loop gets only ~4
+    looks and can legitimately see ``True`` on every one. That is how this
+    passed locally and failed on CI three times.
 
-    What that ``finally`` actually guarantees is that the flag *clears*.
-    Without it the flag latches ``True`` for the rest of the session and
-    every subsequent tick is dropped, so this wait times out -- the
-    regression is still caught, just not by a coin flip.
+    So assert the *consequence* instead. A new record is written and the
+    table is expected to grow to include it. That condition is monotonic --
+    once true it stays true, so no sampling rate can miss it -- and it is
+    unreachable if the guard latched, because then every subsequent poll
+    tick is dropped and no scan ever runs again. It is also strictly
+    stronger than reading the flag: it proves the screen recovered all the
+    way to rendering, not merely that a boolean flipped.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if screen._refreshing is False:
-            return
-        await pilot.pause()
-        await asyncio.sleep(0.01)
-    raise AssertionError(
-        "_refreshing never cleared -- a transient failure wedged the screen, "
-        "so no later refresh can run"
+    before = screen.query_one(DataTable).row_count
+    _write_record(tmp_path, run_id, workflow_name=run_id)
+    await wait_for(
+        pilot,
+        lambda: screen.query_one(DataTable).row_count == before + 1,
+        message=(
+            "the screen never refreshed again after a transient failure -- the "
+            "_refreshing guard was not released, so every later poll tick is dropped"
+        ),
     )
 
 
@@ -349,12 +357,12 @@ class TestRunsScreenPolling:
 
             _write_record(tmp_path, "run-new", workflow_name="newwf")
 
-            # Wait out several poll intervals (real time -- set_interval is
-            # a real asyncio timer, not something pilot.pause() advances).
-            await asyncio.sleep(0.3)
-            await settle(pilot)
+            await wait_for(
+                pilot,
+                lambda: table.row_count == 1,
+                message="the poll tick never picked up the newly written record",
+            )
 
-            assert table.row_count == 1
             row = table.get_row_at(0)
             assert "newwf" in row[0]
 
@@ -377,10 +385,11 @@ class TestRunsScreenPolling:
 
             remove_run_record("run-a")
 
-            await asyncio.sleep(0.3)
-            await settle(pilot)
-
-            assert table.row_count == 0
+            await wait_for(
+                pilot,
+                lambda: table.row_count == 0,
+                message="the poll tick never dropped the removed run from the table",
+            )
 
 
 class TestCollectRuns:
@@ -504,6 +513,17 @@ class TestRunsScreenWorkerThreading:
         with patch("conductor.fleet.tui.screens.runs._collect_runs", side_effect=_blocking_collect):
             app = FleetApp()
             async with app.run_test() as pilot:
+                # "No *second* call" only means something once the first
+                # one has happened; asserting both at a fixed deadline
+                # conflates "the tick was skipped" with "the mount refresh
+                # had not started yet", which is what a slow CI runner
+                # produces.
+                await wait_for(
+                    pilot,
+                    lambda: call_count >= 1,
+                    message="the mount refresh never entered the collector",
+                )
+
                 # Several poll intervals elapse while the collector is
                 # blocked -- none of them may start a second worker.
                 await asyncio.sleep(0.3)
@@ -741,14 +761,33 @@ class TestRunsScreenCursorPreservation:
         app = FleetApp()
         async with app.run_test() as pilot:
             await settle(pilot)
-            table = app.screen.query_one(DataTable)
+            screen = app.screen
+            assert isinstance(screen, RunsScreen)
+            table = screen.query_one(DataTable)
             assert table.row_count == 2
 
             table.move_cursor(row=1)
             selected_row = table.get_row_at(table.cursor_row)
 
-            await asyncio.sleep(0.3)
-            await settle(pilot)
+            # Wait for a tick to actually rebuild the table. Sleeping a
+            # fixed 0.3s instead would pass *vacuously* on a machine slow
+            # enough that no tick landed -- the test would stop exercising
+            # the rebuild precisely on the runs where it is slowest, which
+            # is where a regression is most likely to show.
+            rebuilds = 0
+            real_render = type(screen)._render_runs
+
+            def _counting_render(self_, scan):
+                nonlocal rebuilds
+                rebuilds += 1
+                return real_render(self_, scan)
+
+            with patch.object(type(screen), "_render_runs", _counting_render):
+                await wait_for(
+                    pilot,
+                    lambda: rebuilds >= 1,
+                    message="no poll tick rebuilt the table, so the selection was never at risk",
+                )
 
             # Compared on the workflow cell rather than the whole row: the
             # Burn sparkline legitimately changes between polls (that is
@@ -971,16 +1010,25 @@ class TestRunsScreenGuardRecovery:
             with patch(
                 "conductor.fleet.tui.screens.runs.read_run_records",
                 side_effect=OSError("transient failure"),
-            ):
+            ) as failing_read:
                 screen.refresh_runs()
+                # Wait for the injected failure to actually be hit rather
+                # than assuming the dispatch above did it: a poll tick may
+                # legitimately already be in flight, in which case that
+                # explicit request is dropped by the very guard under test
+                # and it is the *next* tick that fails.
+                await wait_for(
+                    pilot,
+                    lambda: failing_read.call_count >= 1,
+                    message=(
+                        "no scan ran while the failure was injected -- the screen was "
+                        "already wedged before this test injected anything"
+                    ),
+                    timeout=5.0,
+                )
                 await settle(pilot)
 
-            await _assert_guard_released(pilot, screen)
-
-            # And it genuinely recovers on a later tick.
-            await asyncio.sleep(0.3)
-            await settle(pilot)
-            assert screen.query_one(DataTable).row_count == 1
+            await _assert_screen_still_refreshes(pilot, screen, tmp_path, run_id="run-b")
 
     async def test_a_render_failure_does_not_wedge_the_screen_or_exit_the_app(
         self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -997,18 +1045,24 @@ class TestRunsScreenGuardRecovery:
             screen = app.screen
             assert isinstance(screen, RunsScreen)
 
-            with patch.object(type(screen), "_render_runs", side_effect=RuntimeError("render bug")):
+            with patch.object(
+                type(screen), "_render_runs", side_effect=RuntimeError("render bug")
+            ) as failing_render:
                 screen.refresh_runs()
-                await settle(pilot)
-                await asyncio.sleep(0.2)
+                await wait_for(
+                    pilot,
+                    lambda: failing_render.call_count >= 1,
+                    message=(
+                        "no render ran while the failure was injected -- the screen was "
+                        "already wedged before this test injected anything"
+                    ),
+                    timeout=5.0,
+                )
                 await settle(pilot)
 
             assert app.is_running
-            await _assert_guard_released(pilot, screen)
 
-            await asyncio.sleep(0.2)
-            await settle(pilot)
-            assert screen.query_one(DataTable).row_count == 1
+            await _assert_screen_still_refreshes(pilot, screen, tmp_path, run_id="run-b")
 
     async def test_two_dispatches_on_one_turn_start_only_one_worker(
         self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

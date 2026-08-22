@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -77,3 +79,64 @@ async def settle(pilot: Any) -> None:
     with contextlib.suppress(WorkerCancelled, WorkerFailed):
         await asyncio.wait_for(pilot.app.workers.wait_for_complete(), timeout=30)
     await pilot.pause()
+
+
+async def wait_for(
+    pilot: Any,
+    predicate: Callable[[], bool],
+    *,
+    message: str,
+    timeout: float = 20.0,
+) -> None:
+    """Pump the app until ``predicate`` holds, instead of sleeping a fixed time.
+
+    The screens these tests drive refresh on a **real** ``set_interval``
+    timer (shrunk to 0.05s by the tests that exercise polling), and each
+    tick hops through ``asyncio.to_thread`` before rendering. How long a
+    tick-plus-scan actually takes is a property of the machine, not of the
+    test: on CI it runs under ``coverage`` tracing on a small shared
+    runner, where a measured scan is several times slower than on a
+    developer box. A fixed ``await asyncio.sleep(0.3)`` followed by an
+    assertion therefore encodes a guess about machine speed, and asserts
+    against pre-tick state whenever the guess is wrong -- which is exactly
+    how ``test_poll_tick_removes_completed_run`` failed on Windows CI while
+    passing everywhere else.
+
+    Waiting on the *condition* removes the guess: a fast machine returns on
+    the first sample, a slow one takes longer, and only a genuinely wedged
+    screen reaches the deadline and fails -- with ``message`` naming the
+    regression rather than an opaque ``assert 1 == 0``.
+
+    Samples with a plain ``asyncio.sleep`` rather than ``pilot.pause()``.
+    That is deliberate and load-bearing: ``pilot.pause()`` waits for the
+    app to go *idle*, which under a 20Hz poll timer takes ~1 second per
+    call (measured), so a ``pause``-driven loop gets only a handful of
+    samples however long its deadline is. Yielding to the event loop is
+    all that is actually required for a worker to finish and render, since
+    the render half runs on that loop. A single ``pilot.pause()`` is done
+    once the predicate holds, so anything asserted about *painted* output
+    afterwards sees a settled screen.
+
+    Args:
+        pilot: The Textual ``Pilot`` driving the app under test.
+        predicate: Called on each sample; must be cheap and side-effect
+            free. Should describe a **monotonic** condition ("the row
+            appeared") rather than a transient one ("a refresh is in
+            flight"), since a transient condition can switch back between
+            two samples however fast the loop runs.
+        message: Assertion message describing the regression a timeout
+            implies.
+        timeout: Seconds before giving up. Generous by default because it
+            is only ever reached on failure.
+
+    Raises:
+        AssertionError: If ``predicate`` never held before the deadline.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            await pilot.pause()
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{message} (waited {timeout:g}s)")
+        await asyncio.sleep(0.01)
