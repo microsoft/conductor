@@ -1,4 +1,4 @@
-"""Tests for ``conductor.fleet.retention`` (Fleet Manager E5 — D3).
+"""Tests for ``conductor.fleet.retention`` (Fleet Manager E5 — D3, MCP plan E3).
 
 Covers:
 - ``keep_last`` retains the newest N event logs by mtime, deleting the rest.
@@ -14,11 +14,17 @@ Covers:
 - ``maybe_prune_event_logs()`` (the settings-driven wrapper) sweeps nothing
   when ``[fleet.retention].enabled`` is false, and never raises on
   malformed settings.
+- Terminal run records (MCP plan E3, DD13) are a fourth companion of the
+  events log they belong to: deleted or kept alongside it, matched by
+  ``run_id``. A run still referenced by a live run record keeps its
+  terminal record regardless of age. An orphan sweep separately bounds
+  terminal records whose events log has already disappeared.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -26,7 +32,14 @@ from typing import Any
 
 import pytest
 
-from conductor.fleet.records import RunRecord, write_run_record
+from conductor.fleet.records import (
+    RunRecord,
+    TerminalRunRecord,
+    read_terminal_record,
+    terminal_records_dir,
+    write_run_record,
+    write_terminal_record,
+)
 from conductor.fleet.retention import (
     PruneResult,
     event_log_root,
@@ -93,6 +106,28 @@ def _make_record(**overrides: object) -> RunRecord:
     }
     defaults.update(overrides)
     return RunRecord(**defaults)  # type: ignore[arg-type]
+
+
+def _make_terminal_record(**overrides: object) -> TerminalRunRecord:
+    defaults: dict[str, object] = {
+        "run_id": "abcd1234",
+        "workflow_path": "/tmp/workflow.yaml",
+        "workflow_name": "workflow",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "ended_at": "2026-01-01T00:05:00+00:00",
+        "status": "success",
+        "output": {},
+        "error_type": None,
+        "error_message": None,
+        "total_tokens": None,
+        "total_cost_usd": None,
+        "unpriced_agent_count": 0,
+        "event_log_path": "/tmp/conductor/workflow.events.jsonl",
+        "bg_stderr_log": None,
+        "bg_stdout_log": None,
+    }
+    defaults.update(overrides)
+    return TerminalRunRecord(**defaults)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +352,282 @@ class TestExclusions:
         assert newest_log.exists()
         assert stderr_log.exists()
         assert stdout_log.exists()
+
+
+# ---------------------------------------------------------------------------
+# Terminal run records (MCP plan E3, DD13)
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalRecordCompanion:
+    """A terminal record is a fourth companion of its events log, matched
+    by the `run_id` embedded in the events log's filename -- pruned or
+    kept alongside it exactly like the `.bg.stderr.log`/`.bg.stdout.log`
+    companions."""
+
+    def test_terminal_record_pruned_with_its_event_log(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        old_log = _make_event_log(
+            temp_root, "conductor-bgrun-20260101-000000-abcd1234.events.jsonl", age_seconds=1000
+        )
+        write_terminal_record(_make_terminal_record(run_id="abcd1234", event_log_path=str(old_log)))
+        terminal_path = terminal_records_dir() / "abcd1234.json"
+        assert terminal_path.exists()
+
+        newest = _make_event_log(temp_root, "conductor-newest.events.jsonl", age_seconds=0)
+
+        result = prune_event_logs(keep_last=1)
+
+        assert not old_log.exists()
+        assert not terminal_path.exists()
+        assert newest.exists()
+        assert terminal_path in result.deleted
+
+    def test_terminal_record_survives_with_non_hex_run_id(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        """A `run_id` containing hyphens/underscores (valid per
+        `records.py::_RUN_ID_PATTERN`, not just the hex `secrets.token_hex(4)`
+        default) must be extracted in full, not truncated to its last
+        hyphen-delimited segment -- otherwise the terminal record is
+        misclassified as orphaned and pruned despite its retained log."""
+        run_id = "custom-run_ID-42"
+        log = _make_event_log(
+            temp_root,
+            f"conductor-bgrun-20260101-000000-{run_id}.events.jsonl",
+            age_seconds=0,
+        )
+        write_terminal_record(_make_terminal_record(run_id=run_id, event_log_path=str(log)))
+        terminal_path = terminal_records_dir() / f"{run_id}.json"
+
+        result = prune_event_logs(keep_last=1)
+
+        assert log.exists()
+        assert terminal_path.exists()
+        assert terminal_path not in result.deleted
+
+    def test_terminal_record_of_retained_log_survives(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        log = _make_event_log(
+            temp_root, "conductor-bgrun-20260101-000000-abcd1234.events.jsonl", age_seconds=0
+        )
+        write_terminal_record(_make_terminal_record(run_id="abcd1234", event_log_path=str(log)))
+        terminal_path = terminal_records_dir() / "abcd1234.json"
+
+        result = prune_event_logs(keep_last=1)
+
+        assert log.exists()
+        assert terminal_path.exists()
+        assert terminal_path not in result.deleted
+
+    def test_terminal_record_of_live_event_log_survives_regardless_of_age(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        """A resumed run reuses its `run_id`; its previous leg's terminal
+        record must not be deleted out from under the still-live run."""
+        live_log = _make_event_log(
+            temp_root,
+            "conductor-bgrun-20260101-000000-abcd1234.events.jsonl",
+            age_seconds=1000,
+        )
+        write_terminal_record(
+            _make_terminal_record(run_id="abcd1234", event_log_path=str(live_log))
+        )
+        terminal_path = terminal_records_dir() / "abcd1234.json"
+        write_run_record(
+            _make_record(run_id="abcd1234", pid=os.getpid(), event_log_path=str(live_log))
+        )
+        newest = _make_event_log(temp_root, "conductor-newest.events.jsonl", age_seconds=0)
+
+        result = prune_event_logs(keep_last=1)
+
+        assert live_log.exists()
+        assert terminal_path.exists()
+        assert newest.exists()
+        assert live_log in result.skipped_live
+
+    def test_terminal_record_survives_when_older_log_shares_live_run_id(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        """A resumed run's *new* leg is live, but an *older* prunable events
+        log can still share its `run_id`. Pruning that stale log must not
+        delete the shared terminal record out from under the live run."""
+        stale_log = _make_event_log(
+            temp_root,
+            "conductor-bgrun-20260101-000000-abcd1234.events.jsonl",
+            age_seconds=2000,
+        )
+        live_log = _make_event_log(
+            temp_root,
+            "conductor-bgrun-20260102-000000-abcd1234.events.jsonl",
+            age_seconds=0,
+        )
+        write_terminal_record(
+            _make_terminal_record(run_id="abcd1234", event_log_path=str(live_log))
+        )
+        terminal_path = terminal_records_dir() / "abcd1234.json"
+        write_run_record(
+            _make_record(run_id="abcd1234", pid=os.getpid(), event_log_path=str(live_log))
+        )
+
+        result = prune_event_logs(keep_last=1)
+
+        assert not stale_log.exists()
+        assert live_log.exists()
+        assert terminal_path.exists()
+        assert terminal_path not in result.deleted
+
+    def test_terminal_record_survives_when_older_log_shares_non_live_run_id(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        """Two *completed* (non-live) event logs can share a `run_id` from a
+        resumed run whose dashboard has since stopped. `keep_last` retains
+        the newer log while pruning the older one; the shared terminal
+        record must survive because the retained log still needs it."""
+        stale_log = _make_event_log(
+            temp_root,
+            "conductor-bgrun-20260101-000000-abcd1234.events.jsonl",
+            age_seconds=2000,
+        )
+        retained_log = _make_event_log(
+            temp_root,
+            "conductor-bgrun-20260102-000000-abcd1234.events.jsonl",
+            age_seconds=0,
+        )
+        write_terminal_record(
+            _make_terminal_record(run_id="abcd1234", event_log_path=str(retained_log))
+        )
+        terminal_path = terminal_records_dir() / "abcd1234.json"
+
+        result = prune_event_logs(keep_last=1)
+
+        assert not stale_log.exists()
+        assert retained_log.exists()
+        assert terminal_path.exists()
+        assert terminal_path not in result.deleted
+
+    def test_dry_run_includes_terminal_record(self, temp_root: Path, fleet_env: Path) -> None:
+        old_log = _make_event_log(
+            temp_root, "conductor-bgrun-20260101-000000-abcd1234.events.jsonl", age_seconds=1000
+        )
+        write_terminal_record(_make_terminal_record(run_id="abcd1234", event_log_path=str(old_log)))
+        terminal_path = terminal_records_dir() / "abcd1234.json"
+        _make_event_log(temp_root, "conductor-newest.events.jsonl", age_seconds=0)
+
+        result = prune_event_logs(keep_last=1, dry_run=True)
+
+        assert old_log.exists()
+        assert terminal_path.exists()
+        assert terminal_path in result.deleted
+
+
+class TestOrphanedTerminalRecords:
+    """Terminal records whose events log has already disappeared (pruned
+    earlier, or reaped independently) are bounded by their own sweep,
+    newest-first by `ended_at`, using the same `keep_last`."""
+
+    def test_orphan_records_bounded_by_keep_last(self, temp_root: Path, fleet_env: Path) -> None:
+        oldest = _make_terminal_record(run_id="aaaaaaaa", ended_at="2026-01-01T00:00:00+00:00")
+        middle = _make_terminal_record(run_id="bbbbbbbb", ended_at="2026-01-02T00:00:00+00:00")
+        newest = _make_terminal_record(run_id="cccccccc", ended_at="2026-01-03T00:00:00+00:00")
+        for record in (oldest, middle, newest):
+            write_terminal_record(record)
+
+        result = prune_event_logs(keep_last=2)
+
+        assert read_terminal_record("cccccccc") is not None
+        assert read_terminal_record("bbbbbbbb") is not None
+        assert read_terminal_record("aaaaaaaa") is None
+        assert terminal_records_dir() / "aaaaaaaa.json" in result.deleted
+
+    def test_orphan_record_of_live_run_survives_regardless_of_age(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        """The event log itself is gone, but the run_id is still live
+        (sourced from the same `_live_event_log_paths()` call, not a
+        second `read_run_records()`) so the record must survive."""
+        live_log_path = str(temp_root / "conductor-bgrun-20260101-000000-abcd1234.events.jsonl")
+        write_terminal_record(
+            _make_terminal_record(
+                run_id="abcd1234",
+                ended_at="2020-01-01T00:00:00+00:00",
+                event_log_path=live_log_path,
+            )
+        )
+        write_run_record(
+            _make_record(run_id="abcd1234", pid=os.getpid(), event_log_path=live_log_path)
+        )
+        newer = _make_terminal_record(run_id="eeeeeeee", ended_at="2026-01-01T00:00:00+00:00")
+        write_terminal_record(newer)
+
+        result = prune_event_logs(keep_last=1)
+
+        assert read_terminal_record("abcd1234") is not None
+        assert terminal_records_dir() / "abcd1234.json" not in result.deleted
+
+    def test_keep_last_zero_prunes_no_orphaned_records(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        write_terminal_record(
+            _make_terminal_record(run_id="aaaaaaaa", ended_at="2020-01-01T00:00:00+00:00")
+        )
+        write_terminal_record(
+            _make_terminal_record(run_id="bbbbbbbb", ended_at="2026-01-01T00:00:00+00:00")
+        )
+
+        result = prune_event_logs(keep_last=0)
+
+        assert read_terminal_record("aaaaaaaa") is not None
+        assert read_terminal_record("bbbbbbbb") is not None
+        assert result.deleted == []
+
+    def test_negative_keep_last_prunes_no_orphaned_records(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        write_terminal_record(
+            _make_terminal_record(run_id="aaaaaaaa", ended_at="2020-01-01T00:00:00+00:00")
+        )
+
+        result = prune_event_logs(keep_last=-3)
+
+        assert read_terminal_record("aaaaaaaa") is not None
+        assert result.deleted == []
+
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="Read-only directory permissions aren't meaningfully enforced "
+        "for the current user on Windows, or when running as root.",
+    )
+    def test_read_only_directory_produces_failed_not_exception(
+        self, temp_root: Path, fleet_env: Path
+    ) -> None:
+        """A `terminal/` directory that can't be written to (so `unlink()`
+        fails with `PermissionError`) is reported via `result.failed`
+        rather than raising or aborting the rest of the sweep."""
+        d = terminal_records_dir()
+        write_terminal_record(
+            _make_terminal_record(run_id="aaaaaaaa", ended_at="2020-01-01T00:00:00+00:00")
+        )
+        write_terminal_record(
+            _make_terminal_record(run_id="bbbbbbbb", ended_at="2026-01-01T00:00:00+00:00")
+        )
+        old_path = d / "aaaaaaaa.json"
+
+        # Removing a file requires write permission on its *parent*
+        # directory, not the file itself -- so it's `d`, not the file,
+        # that must be made read-only.
+        d.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            result = prune_event_logs(keep_last=1)
+        finally:
+            # Restore write permission so tmp_path cleanup can proceed.
+            d.chmod(stat.S_IRWXU)
+
+        assert old_path.exists()
+        assert any(path == old_path for path, _reason in result.failed)
+        assert result.deleted == []
 
 
 # ---------------------------------------------------------------------------

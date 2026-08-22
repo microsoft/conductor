@@ -863,6 +863,16 @@ Retention never deletes:
   `--web-bg` run's event log — the three artefacts of one run are always
   kept or removed together.
 
+`keep_last` also bounds a run's **terminal record** — the small JSON
+tombstone at `~/.conductor/runs/terminal/<run_id>.json` that lets a
+completed run's outcome still be looked up by `run_id` after its process
+has exited (see [Fleet Manager: Terminal records](fleet.md#terminal-records)).
+A terminal record is pruned or kept in the same sweep pass as its event
+log, matched by `run_id`, so the two never drift apart — a record can't
+outlive the log it points at. A terminal record whose event log has
+already disappeared is bounded separately, by the same `keep_last`,
+newest-first by when its run actually ended.
+
 > **Consequence:** pruning an event log makes that run's history
 > unavailable to `conductor replay` — `replay` reads the JSONL event log
 > directly, so once it is deleted there is nothing left to replay. Set

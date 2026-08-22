@@ -17,6 +17,7 @@ same run-discovery mechanism.
 - [Status vocabulary](#status-vocabulary)
 - [Gates: display vs. resolve](#gates-display-vs-resolve)
 - [Division of labor: TUI vs. dashboard](#division-of-labor-tui-vs-dashboard)
+- [Terminal records](#terminal-records)
 - [Retention](#retention)
 - [See Also](#see-also)
 
@@ -410,6 +411,38 @@ output. The run-detail screen shows discrete per-agent steps (status,
 elapsed, tokens, cost), never a graph; the History screen delegates replay
 to `conductor replay <log>` rather than embedding a viewer.
 
+## Terminal records
+
+A run record (the JSON file backing `conductor stop` / `fleet list`
+discovery above) is removed the moment its process exits — that's what
+makes it a *live*-run primitive. To let a completed run's outcome still be
+looked up by `run_id` afterward, `cli/run.py`'s `finally` block writes one
+more small JSON file, a **terminal record**, to
+`~/.conductor/runs/terminal/<run_id>.json` (or `$CONDUCTOR_HOME/runs/terminal/`
+when that's set) immediately before removing the live record. It carries
+the run's identifying fields plus its terminal status (`success` /
+`failed`), rendered output, error type/message on failure, usage totals,
+and the paths to its event log and (for a `--web-bg` run) captured
+stderr/stdout logs — enough for `conductor status`, `conductor fleet
+list`, and a future MCP `conductor_run_status` tool to answer "how did
+that run finish" without the process still being alive to ask.
+
+The `terminal/` subdirectory placement is deliberate, not cosmetic: the
+live-record listing/removal functions in `fleet/records.py` glob
+`run_records_dir()/*.json` non-recursively, so nothing filed a directory
+down is ever mistaken for, or raced against, a live record.
+
+⚠️ **A crashed or `kill -9`'d run produces no terminal record.** The
+tombstone is written by the same graceful-shutdown path that would also
+have written a final `workflow_completed`/`workflow_failed` event — a
+process that never reaches its `finally` block leaves nothing behind.
+`conductor_run_status`-style lookups for such a run will report it as
+simply unknown, the same as a `run_id` that never existed.
+
+Terminal records are pruned by the exact same `[fleet.retention]` sweep
+described below, in the same pass as the event log they point at — see
+[Retention](#retention) for the mechanics and `keep_last` semantics.
+
 ## Retention
 
 `$TMPDIR/conductor/` accumulates one JSONL event log per run indefinitely
@@ -418,7 +451,14 @@ controls an opportunistic sweep that runs at the start of every
 `conductor run`/`resume`, keeping only the most-recent `keep_last` event
 logs (default `200`) and never touching a log a live (or currently
 resuming) run still references, nor the `checkpoints/` subdirectory that
-also lives under the same root. See
+also lives under the same root. The same `keep_last` also bounds
+[terminal records](#terminal-records): a run's terminal record is pruned
+or kept in the same pass as its event log, matched by `run_id`, so a
+`run_id` resolves completely or not at all rather than a stale record
+outliving the log it points at. A terminal record whose event log has
+*already* disappeared (pruned by an earlier sweep, or reaped
+independently) is bounded by a second pass over `terminal/` using that
+same `keep_last`, newest-first by when the run actually ended. See
 [Machine-Wide Settings](configuration.md#machine-wide-settings-conductorconfigtoml)
 for the full settings reference, and `conductor fleet prune`
 (documented in the [CLI reference](cli-reference.md#conductor-fleet-prune))

@@ -432,7 +432,7 @@ protects all three.
 
 ---
 
-### E3 — Terminal-record retention (DD13, FR12)
+### E3 — Terminal-record retention (DD13, FR12) — DONE
 
 **Goal.** Bound terminal records by the existing `[fleet.retention].keep_last`,
 pruned in the same sweep as the event log they point at, so "a `run_id`
@@ -451,16 +451,16 @@ extra directory rather than a wider glob.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E3-T1 | IMPL | Extend `_companion_paths` (or add a sibling resolver, so the events-log-directory glob stays as-is) to also yield `terminal_records_dir()/<run_id>.json` for the `run_id` extracted from the event log's filename. Deleted and retained sets both follow the events log, unchanged in policy language. | `src/conductor/fleet/retention.py` | TO DO |
-| E3-T2 | IMPL | Add a bounded orphan sweep for terminal records whose event log is already gone (pruned earlier, or reaped by the OS). Without it the directory still grows without limit for exactly the runs whose logs disappeared first, which is the accumulation risk the design's own risk table names. Bound it by the same `keep_last`, newest-first by `ended_at`, and inherit the `keep_last < 1` guard. | `src/conductor/fleet/retention.py` | TO DO |
-| E3-T3 | IMPL | Never delete a terminal record for a run that still has a **live** run record (a resumed run reuses its `run_id`, so the terminal record of its previous leg is about to be replaced). Source liveness from the same `_live_event_log_paths()` call rather than a second `read_run_records()`. | `src/conductor/fleet/retention.py` | TO DO |
-| E3-T4 | TEST | A terminal record is deleted with its event log and kept with it; a live run's record survives regardless of age; `keep_last=0`/negative prunes nothing; the orphan sweep bounds records whose log is already absent; a read-only directory produces `failed` entries rather than an exception. | `tests/test_fleet/test_retention.py` | TO DO |
-| E3-T5 | IMPL | Document terminal records in the fleet guide (what they hold, where they live, that `[fleet.retention]` prunes them with the event log, and that a crashed run has none) and note in the configuration reference that `keep_last` now bounds them too. | `docs/fleet.md`, `docs/configuration.md` | TO DO |
+| E3-T1 | IMPL | Extend `_companion_paths` (or add a sibling resolver, so the events-log-directory glob stays as-is) to also yield `terminal_records_dir()/<run_id>.json` for the `run_id` extracted from the event log's filename. Deleted and retained sets both follow the events log, unchanged in policy language. | `src/conductor/fleet/retention.py` | DONE |
+| E3-T2 | IMPL | Add a bounded orphan sweep for terminal records whose event log is already gone (pruned earlier, or reaped by the OS). Without it the directory still grows without limit for exactly the runs whose logs disappeared first, which is the accumulation risk the design's own risk table names. Bound it by the same `keep_last`, newest-first by `ended_at`, and inherit the `keep_last < 1` guard. | `src/conductor/fleet/retention.py` | DONE |
+| E3-T3 | IMPL | Never delete a terminal record for a run that still has a **live** run record (a resumed run reuses its `run_id`, so the terminal record of its previous leg is about to be replaced). Source liveness from the same `_live_event_log_paths()` call rather than a second `read_run_records()`. | `src/conductor/fleet/retention.py` | DONE |
+| E3-T4 | TEST | A terminal record is deleted with its event log and kept with it; a live run's record survives regardless of age; `keep_last=0`/negative prunes nothing; the orphan sweep bounds records whose log is already absent; a read-only directory produces `failed` entries rather than an exception. | `tests/test_fleet/test_retention.py` | DONE |
+| E3-T5 | IMPL | Document terminal records in the fleet guide (what they hold, where they live, that `[fleet.retention]` prunes them with the event log, and that a crashed run has none) and note in the configuration reference that `keep_last` now bounds them too. | `docs/fleet.md`, `docs/configuration.md` | DONE |
 
 **Acceptance criteria**
-- [ ] Record and log are deleted in the same sweep, never split.
-- [ ] `conductor fleet prune` covers terminal records with no new verb or setting.
-- [ ] The opportunistic startup sweep (`cli/run.py`, via `maybe_prune_event_logs()`) still never raises.
+- [x] Record and log are deleted in the same sweep, never split.
+- [x] `conductor fleet prune` covers terminal records with no new verb or setting.
+- [x] The opportunistic startup sweep (`cli/run.py`, via `maybe_prune_event_logs()`) still never raises.
 
 ---
 

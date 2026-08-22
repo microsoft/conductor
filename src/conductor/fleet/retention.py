@@ -30,6 +30,22 @@ prefix: the events log's ``ts`` segment (written by the workflow child,
 independently by the parent, ``cli/bg_runner.py::_open_bg_log_files``)
 can differ by a second or more when the two processes cross a clock
 tick, so only ``run_id`` is guaranteed to match.
+
+The terminal run record (``conductor.fleet.records.TerminalRunRecord``,
+MCP server plan E2/DD13) is a **fourth companion**, matched the same way by
+``run_id`` but living at ``terminal_records_dir()/<run_id>.json`` — a
+subdirectory of the run-records directory, not ``event_log_root()`` — so it
+disappears or survives with its events log rather than outliving it: a
+record that outlives its log would advertise a run whose detail is already
+unfetchable. A second, orphan-only sweep separately bounds terminal records
+whose events log has already disappeared (pruned before this feature
+existed, or reaped independently), using the same ``keep_last`` and
+``keep_last < 1`` guard, sorted newest-first by the record's own
+``ended_at`` rather than mtime. Neither sweep deletes a terminal record for
+a ``run_id`` that still has a live run record — sourced from the same
+``_live_event_log_paths()`` call, not a second ``read_run_records()`` — since
+a resumed run reuses its ``run_id`` and its previous leg's terminal record
+is about to be replaced.
 """
 
 from __future__ import annotations
@@ -91,7 +107,8 @@ class PruneResult:
     deleted: list[Path] = field(default_factory=list)
     """Files actually removed (or, for ``dry_run=True``, that *would* have
     been removed). Includes any ``.bg.stderr.log`` / ``.bg.stdout.log``
-    companions of a deleted events log."""
+    companions of a deleted events log, its terminal run record (if any),
+    and any orphaned terminal record pruned by the separate orphan sweep."""
 
     skipped_live: list[Path] = field(default_factory=list)
     """Event logs that were past ``keep_last`` by age but were retained
@@ -113,8 +130,8 @@ class PruneResult:
     nothing to do"."""
 
 
-def _companion_paths(event_log: Path) -> list[Path]:
-    """Return the ``.bg.stderr.log`` / ``.bg.stdout.log`` companions of ``event_log``.
+def _companion_paths(event_log: Path, *, live_run_ids: set[str] | None = None) -> list[Path]:
+    """Return the companions of ``event_log``: bg logs plus its terminal record.
 
     Bg log companions share the events log's ``run_id`` (see
     ``cli/bg_runner.py::_open_bg_log_files`` and
@@ -126,11 +143,22 @@ def _companion_paths(event_log: Path) -> list[Path]:
     log's filename and globbing for companions ending in that same
     ``run_id``. Only paths that actually exist are returned — a
     foreground or foreground+web run has no such companions.
+
+    The terminal run record (MCP plan E3/DD13) is a fourth companion,
+    matched by the same ``run_id`` but resolved directly at
+    ``terminal_records_dir()/<run_id>.json`` rather than by globbing,
+    since it lives in its own subdirectory rather than beside
+    ``event_log``. It is excluded here when ``run_id`` is in
+    ``live_run_ids``: a resumed run reuses its ``run_id`` across event
+    logs, so an *older*, prunable events log can share a ``run_id`` with a
+    still-live one, and its terminal record must survive alongside the
+    live run rather than being deleted with the stale log.
     """
     match = _RUN_ID_FROM_EVENT_LOG.search(event_log.name)
     if match is None:
         return []
     run_id = match.group(1)
+    live_run_ids = live_run_ids or set()
     parent = event_log.parent
     patterns = [
         f"conductor-*-{run_id}{_BG_STDERR_SUFFIX}",
@@ -145,6 +173,18 @@ def _companion_paths(event_log: Path) -> list[Path]:
     companions: list[Path] = []
     for pattern in patterns:
         companions.extend(p for p in parent.glob(pattern) if p.is_file() and boundary.match(p.name))
+
+    if run_id not in live_run_ids:
+        # Local import mirrors `_live_event_log_paths()`'s own lazy import
+        # of `conductor.fleet.records` below -- avoids a module-level
+        # dependency from this module onto `records.py` for what is
+        # otherwise a leaf retention module.
+        from conductor.fleet.records import terminal_records_dir
+
+        terminal_record = terminal_records_dir() / f"{run_id}.json"
+        if terminal_record.is_file():
+            companions.append(terminal_record)
+
     return companions
 
 
@@ -167,6 +207,23 @@ def _live_event_log_paths() -> set[Path] | None:
         logger.warning("Failed to read run records for retention liveness check", exc_info=True)
         return None
     return {Path(r.event_log_path) for r in records if r.event_log_path}
+
+
+def _live_run_ids(live_paths: set[Path]) -> set[str]:
+    """Extract the ``run_id`` embedded in each live event log's filename.
+
+    Reused so the orphan terminal-record sweep (:func:`_prune_orphaned_terminal_records`)
+    sources liveness from the same ``_live_event_log_paths()`` call the main
+    sweep already made, rather than a second ``read_run_records()`` call — a
+    resumed run reuses its ``run_id``, so its previous leg's terminal record
+    must not be deleted out from under it.
+    """
+    run_ids: set[str] = set()
+    for path in live_paths:
+        match = _RUN_ID_FROM_EVENT_LOG.search(path.name)
+        if match is not None:
+            run_ids.add(match.group(1))
+    return run_ids
 
 
 def _safe_mtime(path: Path) -> float:
@@ -202,6 +259,76 @@ def _safe_unlink(path: Path) -> tuple[bool, str | None]:
     return True, None
 
 
+def _prune_orphaned_terminal_records(
+    *, keep_last: int, known_run_ids: set[str], live_run_ids: set[str], dry_run: bool
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Bound terminal records whose events log has already disappeared.
+
+    A terminal record's own events log is normally pruned or kept *with*
+    it via :func:`_companion_paths` (MCP plan E3/DD13's "fourth
+    companion"). But a record whose log vanished before this feature
+    existed, or was reaped independently of Conductor's own sweep, is
+    never visited by that path — left unbounded, the ``terminal/``
+    directory would grow without limit for exactly the runs whose logs
+    disappeared first. This second, orphan-only sweep closes that gap:
+    same ``keep_last``, sorted newest-first by the record's own
+    ``ended_at`` (not mtime, since a record's on-disk mtime has no
+    necessary relationship to when its run actually ended).
+
+    Args:
+        keep_last: Number of most-recent orphaned terminal records to
+            retain. Callers are expected to have already applied the
+            ``keep_last < 1`` "prune nothing" guard before calling this.
+        known_run_ids: ``run_id``s with an events log file currently
+            present under ``event_log_root()`` — these are excluded here
+            because :func:`_companion_paths` already accounts for them
+            (kept or deleted alongside their log) in the main sweep.
+        live_run_ids: ``run_id``s belonging to a currently-live run
+            record, sourced from the same ``_live_event_log_paths()`` call
+            the main sweep already made — a resumed run reuses its
+            ``run_id``, so its previous leg's terminal record must survive
+            regardless of age.
+        dry_run: When True, compute what would be deleted without actually
+            deleting anything.
+
+    Returns:
+        ``(deleted, failed)`` — the same shapes :func:`_prune_event_logs_impl`
+        folds into its own :class:`PruneResult`.
+    """
+    from conductor.fleet.records import read_terminal_record, terminal_records_dir
+
+    orphans: list[tuple[Path, str]] = []
+    for path in terminal_records_dir().glob("*.json"):
+        run_id = path.stem
+        if run_id in known_run_ids or run_id in live_run_ids:
+            continue
+        # A corrupt or unreadable record (including a directory colliding
+        # with the glob pattern, which `read_terminal_record` treats as
+        # unparseable rather than raising) sorts as "" -- oldest, per
+        # `ended_at`'s ISO 8601 lexicographic ordering -- so it is bounded
+        # like any other orphan instead of accumulating forever.
+        record = read_terminal_record(run_id)
+        ended_at = record.ended_at if record is not None else ""
+        orphans.append((path, ended_at))
+
+    orphans.sort(key=lambda item: item[1], reverse=True)
+    prune_candidates = orphans[keep_last:]
+
+    deleted: list[Path] = []
+    failed: list[tuple[Path, str]] = []
+    for path, _ended_at in prune_candidates:
+        if dry_run:
+            deleted.append(path)
+            continue
+        removed, reason = _safe_unlink(path)
+        if removed:
+            deleted.append(path)
+        elif reason is not None:
+            failed.append((path, reason))
+
+    return deleted, failed
+
+
 def prune_event_logs(*, keep_last: int, dry_run: bool = False) -> PruneResult:
     """Delete event logs under ``event_log_root()`` beyond the newest ``keep_last``.
 
@@ -213,7 +340,11 @@ def prune_event_logs(*, keep_last: int, dry_run: bool = False) -> PruneResult:
     exactly the files it was meant to delete). An event log still
     referenced by a live run record is never deleted regardless of age,
     and a retained/live events log's ``.bg.stderr.log`` /
-    ``.bg.stdout.log`` companions are always kept alongside it.
+    ``.bg.stdout.log`` companions, plus its terminal run record (MCP plan
+    E3/DD13), are always kept alongside it. A separate, ``keep_last``-bounded
+    sweep also prunes any terminal record whose events log has already
+    disappeared, so the ``terminal/`` directory can't grow unbounded for
+    exactly the records the main sweep never revisits.
 
     Best-effort: this function never raises. Any unexpected failure
     during the sweep is logged and treated as "nothing was pruned" —
@@ -264,6 +395,20 @@ def _prune_event_logs_impl(*, keep_last: int, dry_run: bool) -> PruneResult:
     )
 
     prune_candidates = candidates[keep_last:]
+    retained_candidates = candidates[:keep_last]
+
+    # Computed once, before the main loop, so a candidate log that shares a
+    # run_id with a still-live one (a resumed run reuses its run_id across
+    # event logs) never has its terminal-record companion deleted -- see
+    # `_companion_paths`'s `live_run_ids` exclusion below. A pruned log can
+    # also share a run_id with a *retained* (non-live) log -- e.g. two
+    # completed event logs from the same resumed run, where keep_last keeps
+    # the newer one -- so `retained_run_ids` protects those too; otherwise
+    # the shared terminal record would be deleted alongside the older log,
+    # splitting it from the log that is still being kept.
+    live_run_ids = _live_run_ids(live_paths)
+    retained_run_ids = _live_run_ids(set(retained_candidates))
+    protected_run_ids = live_run_ids | retained_run_ids
 
     deleted: list[Path] = []
     skipped_live: list[Path] = []
@@ -274,7 +419,7 @@ def _prune_event_logs_impl(*, keep_last: int, dry_run: bool) -> PruneResult:
             skipped_live.append(event_log)
             continue
 
-        companions = _companion_paths(event_log)
+        companions = _companion_paths(event_log, live_run_ids=protected_run_ids)
         if dry_run:
             deleted.append(event_log)
             deleted.extend(companions)
@@ -286,6 +431,24 @@ def _prune_event_logs_impl(*, keep_last: int, dry_run: bool) -> PruneResult:
                 deleted.append(target)
             elif reason is not None:
                 failed.append((target, reason))
+
+    # Every run_id with an events log file currently present is already
+    # accounted for above (kept or deleted alongside its log via
+    # `_companion_paths`), so the orphan sweep below only ever considers a
+    # terminal record whose events log is *not* in this set.
+    known_run_ids = {
+        match.group(1)
+        for p in candidates
+        if (match := _RUN_ID_FROM_EVENT_LOG.search(p.name)) is not None
+    }
+    orphan_deleted, orphan_failed = _prune_orphaned_terminal_records(
+        keep_last=keep_last,
+        known_run_ids=known_run_ids,
+        live_run_ids=live_run_ids,
+        dry_run=dry_run,
+    )
+    deleted.extend(orphan_deleted)
+    failed.extend(orphan_failed)
 
     return PruneResult(deleted=deleted, skipped_live=skipped_live, failed=failed)
 
