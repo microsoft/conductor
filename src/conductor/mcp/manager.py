@@ -45,6 +45,17 @@ except ImportError:
 MCP_SDK_AVAILABLE = ClientSession is not None
 
 
+_MISSING: Any = object()
+
+
+def _mcp_field(model: Any, current_name: str, legacy_name: str) -> Any:
+    """Read a model field renamed between MCP 1.x and 2.x."""
+    value = getattr(model, current_name, _MISSING)
+    if value is _MISSING:
+        value = getattr(model, legacy_name)
+    return value
+
+
 # Marker constants. The generic hint is embedded by the manager and replaced
 # with the fs hint by Claude's agentic loop when filesystem-like tools are
 # available. No placeholder mechanism is used; callers replace the exact
@@ -204,7 +215,9 @@ class MCPManager:
                             {
                                 "name": prefixed_name,
                                 "description": tool.description or "",
-                                "input_schema": tool.inputSchema,
+                                # model_dump(by_alias=True) works for Tool, but the
+                                # helper keeps both rename sites in one idiom.
+                                "input_schema": _mcp_field(tool, "input_schema", "inputSchema"),
                                 "server": name,
                                 "original_name": tool.name,
                             }
@@ -327,8 +340,9 @@ class MCPManager:
             response_text = "\n".join(text_parts) if text_parts else ""
 
             # If no text content, try structured content
-            if not response_text and result.structuredContent:
-                response_text = str(result.structuredContent)
+            structured = _mcp_field(result, "structured_content", "structuredContent")
+            if not response_text and structured:
+                response_text = str(structured)
 
             try:
                 response_text = self._maybe_truncate_response(

@@ -17,6 +17,53 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import pytest
+from pydantic import BaseModel, Field
+
+
+class MCP2Tool(BaseModel):
+    """MCP 2.x-shaped stand-in for Tool with snake-case field names."""
+
+    name: str
+    description: str | None = None
+    input_schema: dict[str, Any] = Field(alias="inputSchema")
+
+
+class MCP2CallToolResult(BaseModel):
+    """MCP 2.x-shaped stand-in for CallToolResult with snake-case fields."""
+
+    content: list[Any] = []
+    structured_content: Any | None = Field(alias="structuredContent", default=None)
+    isError: bool = False
+
+
+def _make_mcp1_tool() -> Any:
+    """Build a real mcp.types.Tool using its 1.x field name."""
+    from mcp.types import Tool
+
+    return Tool.model_validate(
+        {
+            "name": "search",
+            "description": "Search the web",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        }
+    )
+
+
+def _make_mcp2_tool() -> MCP2Tool:
+    """Build an MCP 2.x-shaped Tool stand-in."""
+    return MCP2Tool.model_validate(
+        {
+            "name": "search",
+            "description": "Search the web",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        }
+    )
 
 
 class _TaskAffineMCP:
@@ -261,6 +308,37 @@ class TestMCPManagerCallTool:
         assert result == "Tool result"
         mock_session.call_tool.assert_called_once_with("my-tool", arguments={"arg": "value"})
 
+    async def test_call_tool_structured_content_both_shapes(self, manager: Any) -> None:
+        """Requirement: call_tool reads structuredContent from both MCP 1.x and 2.x results."""
+        from mcp.types import CallToolResult
+
+        async def _run_case(result: Any) -> str:
+            mock_session = AsyncMock()
+            mock_session.call_tool.return_value = result
+
+            manager.tool_to_server["test-server__my-tool"] = "test-server"
+            manager.sessions["test-server"] = mock_session
+
+            return await manager.call_tool("test-server__my-tool", {"arg": "value"})
+
+        real_result = CallToolResult.model_validate(
+            {
+                "content": [],
+                "structuredContent": {"answer": 42},
+                "isError": False,
+            }
+        )
+        assert await _run_case(real_result) == str({"answer": 42})
+
+        mcp2_result = MCP2CallToolResult.model_validate(
+            {
+                "content": [],
+                "structuredContent": {"answer": 42},
+                "isError": False,
+            }
+        )
+        assert await _run_case(mcp2_result) == str({"answer": 42})
+
 
 class TestMCPManagerConnectServer:
     """Tests for MCPManager.connect_server method (with mocked MCP client)."""
@@ -274,13 +352,16 @@ class TestMCPManagerConnectServer:
             mgr = MCPManager()
             return mgr
 
-    async def test_connect_server_mocked(self, manager: Any) -> None:
-        """Test connect_server with fully mocked MCP client."""
-        # Create mock tool
-        mock_tool = MagicMock()
-        mock_tool.name = "search"
-        mock_tool.description = "Search the web"
-        mock_tool.inputSchema = {"type": "object", "properties": {"query": {"type": "string"}}}
+    @pytest.mark.parametrize(
+        "make_tool",
+        [
+            pytest.param(_make_mcp1_tool, id="mcp1-real"),
+            pytest.param(_make_mcp2_tool, id="mcp2-standin"),
+        ],
+    )
+    async def test_connect_server_mocked(self, manager: Any, make_tool: Any) -> None:
+        """Requirement: tool discovery reads both MCP 1.x and 2.x Tool field names."""
+        mock_tool = make_tool()
 
         # Create mock list_tools response
         mock_list_tools_response = MagicMock()
@@ -335,6 +416,10 @@ class TestMCPManagerConnectServer:
             assert tools[0]["original_name"] == "search"
             assert tools[0]["server"] == "web-search"
             assert tools[0]["description"] == "Search the web"
+            assert tools[0]["input_schema"] == {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }
 
             # Verify internal state
             assert "web-search" in manager.sessions

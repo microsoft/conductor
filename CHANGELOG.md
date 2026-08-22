@@ -40,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as fatal.
 - `runtime.default_reasoning_effort` was silently dropped at run time for every
   provider and is now forwarded through `ProviderRegistry`.
+- **MCP tool discovery and structured tool results no longer break with MCP
+  2.0** (#419). MCP 2.0 renamed the Python field on `mcp.types.Tool` from
+  `inputSchema` to `input_schema` and on `mcp.types.CallToolResult` from
+  `structuredContent` to `structured_content`, retaining the camelCase name as
+  the serialization alias in both cases. The second rename failed quietly: a
+  tool returning only structured content raised `AttributeError`, which was
+  wrapped into a `RuntimeError` the model read as an ordinary tool failure.
+  Conductor now reads both fields through a shared helper that tries the 2.x
+  name and falls back to the 1.x one, preserving compatibility with both MCP
+  1.x and 2.x.
 
 ## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 
