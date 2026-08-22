@@ -1848,8 +1848,6 @@ def _build_bg_env(
     web_port: int,
     stderr_log: Path,
     stdout_log: Path,
-    *,
-    cwd: Path | None = None,
 ) -> dict[str, str]:
     """Compose the child's environment with the bg-diagnostics env vars.
 
@@ -1860,15 +1858,6 @@ def _build_bg_env(
         web_port: The TCP port the child should listen on.
         stderr_log: Path to the child's captured stderr log file.
         stdout_log: Path to the child's captured stdout log file.
-        cwd: The child's working directory, if one was explicitly chosen
-            (issue #477). When set, ``PYTHONSAFEPATH=1`` is also set so
-            ``python -m conductor`` does not put the child's cwd on
-            ``sys.path[0]`` -- a chosen directory containing a stray
-            ``conductor/`` package or ``conductor.py`` would otherwise
-            shadow the installed one. Scoped to this case only (rather than
-            set unconditionally) so every existing CLI ``--web-bg`` path is
-            untouched; conductor never imports user code, so nothing
-            legitimate depends on the cwd being importable.
 
     Returns:
         The new environment dict for ``subprocess.Popen``.
@@ -1879,8 +1868,6 @@ def _build_bg_env(
     env["CONDUCTOR_RUN_ID"] = run_id
     env["CONDUCTOR_BG_STDERR_LOG"] = str(stderr_log)
     env["CONDUCTOR_BG_STDOUT_LOG"] = str(stdout_log)
-    if cwd is not None:
-        env["PYTHONSAFEPATH"] = "1"
     return env
 
 
@@ -1946,8 +1933,15 @@ def _spawn_bg_child(
             ``_finalize_background_launch`` reporting success and this
             function's own final liveness check.
     """
-    if cwd is not None and not cwd.is_dir():
-        raise RuntimeError(f"Working directory does not exist: {cwd}")
+    if cwd is not None:
+        try:
+            ok = cwd.is_dir()
+        except OSError as exc:
+            raise RuntimeError(f"Working directory is not accessible: {cwd} ({exc})") from exc
+        if not ok:
+            if cwd.exists():
+                raise RuntimeError(f"Working directory is not a directory: {cwd}")
+            raise RuntimeError(f"Working directory does not exist: {cwd}")
 
     try:
         run_id, stderr_path, stdout_path, stderr_handle, stdout_handle = _open_bg_log_files(
@@ -1971,7 +1965,7 @@ def _spawn_bg_child(
             launched_at = datetime.now(UTC)
             proc = _spawn_detached(
                 cmd,
-                _build_bg_env(run_id, web_port, stderr_path, stdout_path, cwd=cwd),
+                _build_bg_env(run_id, web_port, stderr_path, stdout_path),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 cwd=cwd,
@@ -2101,6 +2095,7 @@ def launch_background(
     # enabled (see issue #196).
     cmd: list[str] = [
         sys.executable,
+        "-P",
         "-m",
         "conductor",
         "run",
@@ -2278,6 +2273,7 @@ def launch_background_resume(
     # enabled (see issue #196).
     cmd: list[str] = [
         sys.executable,
+        "-P",
         "-m",
         "conductor",
         "resume",

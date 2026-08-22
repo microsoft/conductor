@@ -191,6 +191,22 @@ class TestResolveWorkflowBaseDir:
         with pytest.raises(LaunchError, match="not found"):
             resolve_workflow("does-not-exist.yaml", base_dir=base_dir)
 
+    def test_absolute_missing_reference_with_base_dir_does_not_claim_it_was_resolved(
+        self, tmp_path: Path
+    ) -> None:
+        """Recommendation 5 (issue #477 review): an absolute reference is
+        never joined onto ``base_dir`` (``workflow_path.is_absolute()`` is
+        ``True``), so the not-found error must not claim it was resolved
+        against it."""
+        base_dir = tmp_path / "project"
+        base_dir.mkdir()
+        missing_absolute = tmp_path / "nope" / "missing.yaml"
+
+        with pytest.raises(LaunchError, match="not found") as exc_info:
+            resolve_workflow(str(missing_absolute), base_dir=base_dir)
+
+        assert str(base_dir) not in str(exc_info.value)
+
     def test_registry_reference_ignores_base_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

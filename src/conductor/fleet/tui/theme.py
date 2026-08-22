@@ -145,12 +145,18 @@ def loading_text() -> Text:
 def shorten_home(path: str | Path) -> str:
     """Render ``path`` with the user's home directory shortened to ``~``.
 
-    One presentation vocabulary shared by three consumers (issue #477): the
-    Runs screen's Directory column (previously inlined in
+    One presentation vocabulary shared across five call sites (issue
+    #477): the Runs screen's Directory column (previously inlined in
     ``runs.py::_directory_cell``), its sub-title, and the New Run screen's
-    launch-directory hint. Falls back to ``path`` unchanged when it isn't
-    rooted under the home directory.
+    launch-directory hint and sub-title (two spots). Falls back to
+    ``path`` unchanged when it isn't rooted under the home directory --
+    compared by path component (``Path.is_relative_to``), not a bare
+    string prefix, so a sibling directory that merely shares the home
+    directory's string prefix (e.g. ``/home/jasonx`` under
+    ``HOME=/home/jason``) is not mangled into ``~x``.
     """
-    text = str(path)
-    home = str(Path.home())
-    return f"~{text[len(home) :]}" if text.startswith(home) else text
+    candidate = Path(path)
+    home = Path.home()
+    if not candidate.is_relative_to(home):
+        return str(candidate)
+    return str(Path("~", candidate.relative_to(home)))

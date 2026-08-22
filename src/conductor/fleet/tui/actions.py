@@ -855,9 +855,19 @@ class DirectoryPickerModal(ModalScreen[Path | None]):
         ``.resolve()`` -- matching this repo's "normpath, not resolve"
         convention (``_resolve_agent_working_dir``, ``skills/registry.py``)
         so a symlinked project directory stays the alias the user typed.
+        A relative ``text`` is anchored on the tree's root (the parent of
+        ``self._current``) rather than the process cwd, so typing a bare
+        sibling name means the directory the tree is displaying.
         """
         try:
-            candidate = Path(os.path.abspath(os.path.expanduser(raw)))
+            text = raw.strip()
+            if not text:
+                self._reject("Enter a directory path, or press esc to cancel.")
+                return
+            expanded = Path(os.path.expanduser(text))
+            if not expanded.is_absolute():
+                expanded = self._tree_root(self._current) / expanded
+            candidate = Path(os.path.normpath(expanded))
             is_dir = candidate.is_dir()
         except OSError as e:
             self._reject(f"Cannot access {raw!r}: {e}")

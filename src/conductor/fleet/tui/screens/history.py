@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -466,8 +467,12 @@ class HistoryScreen(Screen):
             markup=False,
         )
 
+        cwd = cast("FleetApp", self.app).launch_dir
+
         try:
-            launch = await asyncio.to_thread(launch_resume, target.checkpoint_path)
+            launch = await asyncio.to_thread(
+                partial(launch_resume, target.checkpoint_path, cwd=cwd)
+            )
         except LaunchError as e:
             logger.warning("Failed to resume checkpoint %s", target.checkpoint_path, exc_info=True)
             self.notify(str(e), severity="error", markup=False)

@@ -1329,6 +1329,31 @@ class TestDirectoryPickerModal:
             await settle(pilot)
             assert result_holder["result"] is None
 
+    async def test_empty_input_is_rejected_in_place(self, fleet_env: Path, tmp_path: Path) -> None:
+        """Blocking finding 3 (issue #477 review): clearing the pre-filled
+        input and pressing Enter must not silently dismiss with the
+        *process* cwd (``os.path.abspath("")`` -- what an empty string
+        maps to)."""
+        from textual.widgets import Input
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            modal.query_one("#dir-path", Input).value = ""
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # Rejected in place: still on the stack, dismiss not called.
+            assert app.screen is modal
+            assert "result" not in result_holder
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert result_holder["result"] is None
+
     async def test_path_naming_a_file_is_rejected_in_place(
         self, fleet_env: Path, tmp_path: Path
     ) -> None:
@@ -1377,6 +1402,35 @@ class TestDirectoryPickerModal:
             await settle(pilot)
 
         assert result_holder["result"] == Path(os.path.abspath(sub))
+
+    async def test_relative_input_resolves_against_current_directory(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Recommendation 2 (issue #477 review): a relative path typed into
+        the picker must anchor on the directory the picker is currently
+        showing (``self._current``), not the process cwd -- otherwise a
+        sibling name typed while browsing ``/work/a`` resolves against
+        wherever ``conductor fleet`` happened to be started from."""
+        from textual.widgets import Input
+
+        work = tmp_path / "work"
+        work.mkdir()
+        sibling_a = work / "a"
+        sibling_a.mkdir()
+        sibling_b = work / "b"
+        sibling_b.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            result_holder = await self._push(app, sibling_a)
+            await pilot.pause()
+
+            modal = app.screen
+            modal.query_one("#dir-path", Input).value = "b"
+            await pilot.press("enter")
+            await settle(pilot)
+
+        assert result_holder["result"] == Path(os.path.abspath(sibling_b))
 
     async def test_valid_directory_dismisses_with_absolute_path(
         self, fleet_env: Path, tmp_path: Path

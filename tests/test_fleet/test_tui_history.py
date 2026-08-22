@@ -713,6 +713,45 @@ class TestHistoryResume:
         assert kwargs["workflow_path"] is None
         assert kwargs["checkpoint_path"] == cp_path
 
+    async def test_pressing_r_forwards_app_launch_dir_as_cwd(
+        self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
+    ) -> None:
+        """Blocking finding 1 (issue #477 review): ``launch_resume``'s
+        ``cwd`` parameter is only useful if the History screen actually
+        supplies it -- assert the app's current ``launch_dir`` reaches the
+        detached child's spawn call."""
+        log_path = _write_log(
+            event_log_dir,
+            name="resumable-workflow",
+            run_id="00002222",
+            lines=[_event("workflow_started", {"name": "resumable-workflow"}, ts=1000.0)],
+        )
+        _write_checkpoint(resume_workflow_file, event_log_path=str(log_path), run_id="00002222")
+
+        launch = BackgroundLaunch(
+            url="http://127.0.0.1:8080",
+            stderr_log=event_log_dir / "00002222.bg.stderr.log",
+            stdout_log=event_log_dir / "00002222.bg.stdout.log",
+            run_id="00002222",
+        )
+        fake_launch = Mock(return_value=launch)
+        launch_dir = resume_workflow_file.parent
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            with patch("conductor.cli.bg_runner.launch_background_resume", fake_launch):
+                app.set_launch_dir(launch_dir)
+                await _goto_history(pilot)
+                table = app.screen.query_one(DataTable)
+                table.move_cursor(row=0)
+
+                await pilot.press("r")
+                await settle(pilot)
+
+        fake_launch.assert_called_once()
+        _args, kwargs = fake_launch.call_args
+        assert kwargs["cwd"] == launch_dir
+
     async def test_pressing_r_resumes_the_highlighted_rows_checkpoint(
         self, fleet_env: Path, event_log_dir: Path, resume_workflow_file: Path
     ) -> None:

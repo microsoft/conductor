@@ -535,8 +535,9 @@ class TestLaunchBackgroundRoutesThroughSpawnDetached:
 
 class TestLaunchBackgroundCwd:
     """``launch_background``/``launch_background_resume(cwd=...)`` reach
-    ``_spawn_detached`` and ``PYTHONSAFEPATH`` is set only when a ``cwd``
-    was actually supplied."""
+    ``_spawn_detached``, and the child is always launched with ``-P`` so
+    the interpreter never puts the child's cwd on ``sys.path[0]``
+    (issue #477)."""
 
     def test_launch_background_forwards_cwd_to_spawn_detached(self, tmp_path: Path) -> None:
         wf_path = tmp_path / "wf.yaml"
@@ -565,13 +566,10 @@ class TestLaunchBackgroundCwd:
 
         mock_spawn.assert_called_once()
         assert mock_spawn.call_args.kwargs["cwd"] == launch_dir
-        env = mock_spawn.call_args.args[1]
-        assert env["PYTHONSAFEPATH"] == "1"
+        cmd = mock_spawn.call_args.args[0]
+        assert "-P" in cmd
 
-    def test_launch_background_without_cwd_leaves_pythonsafepath_unset(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    def test_launch_background_without_cwd_still_uses_dash_p(self, tmp_path: Path) -> None:
         wf_path = tmp_path / "wf.yaml"
         wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
 
@@ -594,8 +592,8 @@ class TestLaunchBackgroundCwd:
             )
 
         assert mock_spawn.call_args.kwargs["cwd"] is None
-        env = mock_spawn.call_args.args[1]
-        assert "PYTHONSAFEPATH" not in env
+        cmd = mock_spawn.call_args.args[0]
+        assert "-P" in cmd
 
     def test_launch_background_resume_forwards_cwd_to_spawn_detached(self, tmp_path: Path) -> None:
         wf_path = tmp_path / "wf.yaml"
@@ -624,8 +622,8 @@ class TestLaunchBackgroundCwd:
 
         mock_spawn.assert_called_once()
         assert mock_spawn.call_args.kwargs["cwd"] == launch_dir
-        env = mock_spawn.call_args.args[1]
-        assert env["PYTHONSAFEPATH"] == "1"
+        cmd = mock_spawn.call_args.args[0]
+        assert "-P" in cmd
 
     def test_bad_cwd_raises_before_any_spawn_is_attempted(self, tmp_path: Path) -> None:
         """A ``cwd`` that is not a directory is rejected *before* the bg log
@@ -657,13 +655,36 @@ class TestLaunchBackgroundCwd:
 
         with (
             patch.object(bg_runner, "_spawn_detached") as mock_spawn,
-            pytest.raises(RuntimeError, match=re.escape(str(file_cwd))),
+            pytest.raises(RuntimeError, match="is not a directory"),
         ):
             bg_runner.launch_background(
                 workflow_path=wf_path,
                 inputs={},
                 web_port=9315,
                 cwd=file_cwd,
+            )
+
+        mock_spawn.assert_not_called()
+
+    def test_cwd_is_dir_raising_permission_error_is_wrapped(self, tmp_path: Path) -> None:
+        """Recommendation 3 (issue #477 review): ``Path.is_dir()`` can raise
+        ``PermissionError`` (an unsearchable ancestor directory) rather
+        than returning ``False`` -- that must surface as the documented
+        ``RuntimeError``, not an undocumented ``OSError`` subclass."""
+        wf_path = tmp_path / "wf.yaml"
+        wf_path.write_text("workflow: {name: x, entry_point: a}\nagents: []\n")
+        bad_cwd = tmp_path / "unreachable"
+
+        with (
+            patch.object(Path, "is_dir", side_effect=PermissionError(13, "Permission denied")),
+            patch.object(bg_runner, "_spawn_detached") as mock_spawn,
+            pytest.raises(RuntimeError, match="is not accessible"),
+        ):
+            bg_runner.launch_background(
+                workflow_path=wf_path,
+                inputs={},
+                web_port=9316,
+                cwd=bad_cwd,
             )
 
         mock_spawn.assert_not_called()

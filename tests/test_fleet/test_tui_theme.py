@@ -8,6 +8,7 @@ of truth rather than any particular glyph.
 
 from __future__ import annotations
 
+import pytest
 from rich.text import Text
 
 from conductor.fleet.tui.theme import (
@@ -16,6 +17,7 @@ from conductor.fleet.tui.theme import (
     empty_cell,
     mode_label,
     muted,
+    shorten_home,
     status_badge,
     status_label,
     status_style,
@@ -91,3 +93,24 @@ class TestRenderers:
         codebase-wide rule these screens have to honour."""
         for value in (status_badge("failed"), status_label("failed"), mode_label("bg"), muted("x")):
             assert isinstance(value, Text)
+
+
+class TestShortenHome:
+    """Recommendation 9 (issue #477 review): ``shorten_home`` must compare
+    by path component, not a bare string prefix -- a string-prefix test
+    mangles a sibling home directory that merely shares a prefix (e.g.
+    ``/home/jasonx`` under ``HOME=/home/jason``) into ``~x``."""
+
+    def test_path_under_home_is_shortened(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", "/home/jason")
+        assert shorten_home("/home/jason/src/proj") == "~/src/proj"
+
+    def test_path_outside_home_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", "/home/jason")
+        assert shorten_home("/tmp/a") == "/tmp/a"
+
+    def test_sibling_directory_sharing_home_prefix_is_not_mangled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", "/home/jason")
+        assert shorten_home("/home/jasonx/proj") == "/home/jasonx/proj"

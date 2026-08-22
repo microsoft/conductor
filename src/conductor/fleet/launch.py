@@ -120,11 +120,7 @@ def resolve_workflow(ref: str, *, base_dir: Path | None = None) -> ResolvedWorkf
             if base_dir is not None and not workflow_path.is_absolute():
                 workflow_path = base_dir / workflow_path
             if not workflow_path.exists():
-                if base_dir is not None:
-                    raise LaunchError(
-                        f"Workflow file not found: {ref} (resolved against {base_dir})"
-                    )
-                raise LaunchError(f"Workflow file not found: {ref}")
+                raise LaunchError(f"Workflow file not found: {ref} (looked for {workflow_path})")
         else:
             workflow_path = resolve_and_fetch(resolved)
     except RegistryError as e:
