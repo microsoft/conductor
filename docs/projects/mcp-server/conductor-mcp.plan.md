@@ -363,6 +363,8 @@ change allows.
 
 ### E1 — Bound the `mcp` SDK dependency (DD0)
 
+**Status: DONE** (completed 2026-08-22)
+
 **Goal.** Close the live hazard the design calls "the highest-priority item in
 the document and independent of everything else in it": a lock refresh pulling
 `mcp` 2.x silently breaks the *existing* MCP client, because
@@ -374,17 +376,17 @@ the `except ImportError` guard at `mcp/manager.py:39` cannot catch.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E1-T1 | IMPL | Change `mcp>=1.28.1` to `mcp>=1.28.1,<2` (NFR7). Comment the bound in place with the reason, matching the existing commented bounds in this file (`claude-agent-sdk`, `textual`, `regex` all carry one). | `pyproject.toml` | TO DO |
-| E1-T2 | IMPL | Re-resolve with `uv lock` and confirm `mcp` still resolves to `1.28.1` and that no transitive `httpx2` / `mcp-types` / `opentelemetry-api` entry appears. | `uv.lock` | TO DO |
-| E1-T3 | TEST | Smoke test asserting the surface the bound protects: `mcp.types.Tool` exposes `inputSchema` (not `input_schema`), `mcp.types.CallToolResult` exposes `isError`, and both `mcp.server.fastmcp` and `mcp.server.lowlevel.Server` import. Assert against the *attribute*, not the version string, so the test fails for the reason that actually matters. | `tests/test_mcp/test_sdk_bound.py` | TO DO |
-| E1-T4 | TEST | Parse the declared bound out of `pyproject.toml` and assert it excludes `2.0.0`, so a future widening of the specifier fails here rather than in a user's lockfile. | `tests/test_mcp/test_sdk_bound.py` | TO DO |
-| E1-T5 | IMPL | Changelog entry under Unreleased, stating that an installation whose lock already floated to 2.x had non-functional MCP tools and that this restores them (*Impact Analysis → Backward compatibility*, ⚠️ row). | `CHANGELOG.md` | TO DO |
+| E1-T1 | IMPL | Change `mcp>=1.28.1` to `mcp>=1.28.1,<2` (NFR7). Comment the bound in place with the reason, matching the existing commented bounds in this file (`claude-agent-sdk`, `textual`, `regex` all carry one). | `pyproject.toml` | DONE |
+| E1-T2 | IMPL | Re-resolve with `uv lock` and confirm `mcp` still resolves to `1.28.1` and that no transitive `httpx2` / `mcp-types` / `opentelemetry-api` entry appears. | `uv.lock` | DONE |
+| E1-T3 | TEST | Smoke test asserting the surface the bound protects: `mcp.types.Tool` exposes `inputSchema` (not `input_schema`), `mcp.types.CallToolResult` exposes `isError`, and both `mcp.server.fastmcp` and `mcp.server.lowlevel.Server` import. Assert against the *attribute*, not the version string, so the test fails for the reason that actually matters. | `tests/test_mcp/test_sdk_bound.py` | DONE |
+| E1-T4 | TEST | Parse the declared bound out of `pyproject.toml` and assert it excludes `2.0.0`, so a future widening of the specifier fails here rather than in a user's lockfile. | `tests/test_mcp/test_sdk_bound.py` | DONE |
+| E1-T5 | IMPL | Changelog entry under Unreleased, stating that an installation whose lock already floated to 2.x had non-functional MCP tools and that this restores them (*Impact Analysis → Backward compatibility*, ⚠️ row). | `CHANGELOG.md` | DONE |
 
 **Acceptance criteria**
-- [ ] `mcp` is bounded `>=1.28.1,<2` in `pyproject.toml` and the lock still pins `1.28.1`.
-- [ ] `tests/test_mcp/test_sdk_bound.py` fails if `Tool.inputSchema` stops resolving.
-- [ ] `make check && make test` green.
-- [ ] The change is mergeable on its own, with no dependency on any other epic.
+- [x] `mcp` is bounded `>=1.28.1,<2` in `pyproject.toml` and the lock still pins `1.28.1`.
+- [x] `tests/test_mcp/test_sdk_bound.py` fails if `Tool.inputSchema` stops resolving.
+- [x] `make check && make test` green.
+- [x] The change is mergeable on its own, with no dependency on any other epic.
 
 ---
 

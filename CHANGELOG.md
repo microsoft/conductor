@@ -510,6 +510,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (rejecting one this package does not declare, which uv would otherwise
   accept with a warning and a zero exit status), and `--no-preserve-extras` /
   `CONDUCTOR_INSTALL_NO_PRESERVE_EXTRAS` drops back to a bare install.
+- **The `mcp` SDK dependency is now bounded below its breaking 2.0 release**
+  (`mcp>=1.28.1,<2`). `mcp` 2.0.0 renamed the camelCase attributes the
+  existing MCP client reads (`Tool.inputSchema` -> `input_schema`), so an
+  installation whose lock had already floated to `mcp` 2.x had a client
+  that connected to a server and then raised `AttributeError` on every
+  tool listing — MCP tools were silently non-functional. Re-locking with
+  this bound restores them; the pin does not change behavior for anyone
+  already on `mcp` 1.x.
 - **Fleet Manager History no longer accumulates an entire retained event log
   into memory to build one entry** (#436). `_read_full_log` now streams
   parsed events one at a time instead of materializing them into a list

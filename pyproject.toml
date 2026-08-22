@@ -41,7 +41,11 @@ dependencies = [
     "anthropic>=0.77.0,<1.0.0",
     "pydantic-ai-slim[anthropic,openai]>=1.44.0",
     "openai>=2.48.0,<3.0.0",
-    "mcp>=1.28.1",
+    # Upper-bounded below 2.0.0: 2.0.0 renamed the camelCase attributes
+    # (e.g. `Tool.inputSchema` -> `input_schema`) that the existing MCP
+    # client (`mcp/manager.py:207`) reads, which would raise AttributeError
+    # on every server connection with no ImportError to catch it.
+    "mcp>=1.28.1,<2",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "websockets>=12.0",
