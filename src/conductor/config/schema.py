@@ -96,13 +96,11 @@ class InputDef(BaseModel):
 class McpConfig(BaseModel):
     """Per-workflow configuration for exposure as an MCP tool.
 
-    Minimal model added ahead of the full ``E6`` epic
-    (``docs/projects/mcp-server/conductor-mcp.plan.md``) solely so
-    :class:`conductor.registry.index.WorkflowInfo` (E5-T1) has a concrete
-    type to import for its optional cached ``mcp:`` field. Wiring this
-    onto ``WorkflowDef``, the validator cross-checks, CLI reporting, and
-    docs/examples are E6's responsibility and are intentionally not
-    implemented here.
+    Backs ``WorkflowDef.mcp`` (E6, DD4, FR11): a typed, validated block so a
+    typo (``expse: false``) is a schema error rather than silently ignored
+    ``metadata``. Every workflow is a candidate for exposure by default
+    (``expose: True``); ``conductor mcp serve``'s ``--allow``/``--deny``
+    flags outrank this block, which in turn outranks the default.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3716,6 +3714,14 @@ class WorkflowDef(BaseModel):
 
     cost: CostConfig = Field(default_factory=CostConfig)
     """Cost tracking configuration."""
+
+    mcp: McpConfig = Field(default_factory=McpConfig)
+    """Exposure settings for ``conductor mcp serve``.
+
+    Absent from the YAML behaves identically to an explicit default block
+    (``expose: true``), so no existing workflow needs editing to keep its
+    current behavior once MCP exposure defaults on (DD4).
+    """
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     """Arbitrary key-value metadata for external tooling (dashboards, trackers, etc.).

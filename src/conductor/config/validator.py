@@ -432,6 +432,10 @@ def validate_workflow_config(
     errors.extend(cap_errors)
     warnings.extend(cap_warnings)
 
+    # Cross-check the workflow against the MCP exposure ladder (DD4, E6).
+    # Unconditional: default-on exposure means every workflow is a candidate.
+    errors.extend(_validate_mcp_exposure(config))
+
     if errors:
         raise ConfigurationError(
             "Workflow configuration validation failed:\n  - " + "\n  - ".join(errors),
@@ -582,6 +586,70 @@ def _validate_tool_references(
                 f"Agent '{agent_name}' references unknown tool '{tool}'. "
                 f"Available tools: {', '.join(sorted(workflow_tools))}"
             )
+
+    return errors
+
+
+# The reserved parameter the MCP tool generator (E7) injects into every
+# generated tool's inputSchema (FR5). A workflow input of this name would be
+# silently shadowed by it, so it is rejected here rather than at build time.
+MCP_RESERVED_WAIT_SECONDS_INPUT = "_wait_seconds"
+
+# MCP `2026-07-28` recommends tool names 1-128 characters drawn from
+# `A-Za-z0-9_-.`. This matches every character *not* in that set.
+_MCP_TOOL_NAME_DISALLOWED_CHARS = re.compile(r"[^a-z0-9_.\-]")
+
+_MCP_TOOL_NAME_MIN_LENGTH = 1
+_MCP_TOOL_NAME_MAX_LENGTH = 128
+
+
+def slugify_workflow_name(name: str) -> str:
+    """Slugify a workflow name into the MCP tool-name charset.
+
+    Mirrors the tool generator's rule
+    (``docs/projects/mcp-server/conductor-mcp.design.md``, API Contracts →
+    Workflow tool): lowercase the name, map every character outside
+    ``A-Za-z0-9_-.`` to ``_``, then additionally fold ``-`` to ``_`` so the
+    result matches Conductor's own snake_case convention. Substitution
+    replaces one character with one character, so the slug's length never
+    exceeds the source name's length after lowercasing (Unicode lowercasing
+    can itself expand a string's length, e.g. ``"İ"`` -> ``"i̇"``); see
+    :func:`_validate_mcp_exposure` for how that bounds the slug's length
+    check against the source name.
+    """
+    lowered = name.lower()
+    replaced = _MCP_TOOL_NAME_DISALLOWED_CHARS.sub("_", lowered)
+    return replaced.replace("-", "_")
+
+
+def _validate_mcp_exposure(config: WorkflowConfig) -> list[str]:
+    """Cross-check the workflow against the always-on MCP exposure ladder (DD4).
+
+    Both checks fire regardless of whether the workflow declares an ``mcp:``
+    block: default-on exposure means every workflow is a candidate for
+    ``conductor mcp serve``, so a workflow that would fail at tool-generation
+    time must fail here first.
+
+    Returns:
+        List of error messages.
+    """
+    errors: list[str] = []
+
+    if MCP_RESERVED_WAIT_SECONDS_INPUT in config.workflow.input:
+        errors.append(
+            f"Workflow input '{MCP_RESERVED_WAIT_SECONDS_INPUT}' collides with "
+            "the reserved parameter the MCP tool generator injects into every "
+            "generated tool's schema (FR5). Rename this input."
+        )
+
+    slug = slugify_workflow_name(config.workflow.name)
+    if not _MCP_TOOL_NAME_MIN_LENGTH <= len(slug) <= _MCP_TOOL_NAME_MAX_LENGTH:
+        errors.append(
+            f"Workflow name {config.workflow.name!r} cannot be slugified into a "
+            f"legal MCP tool name ({_MCP_TOOL_NAME_MIN_LENGTH}-"
+            f"{_MCP_TOOL_NAME_MAX_LENGTH} characters drawn from 'A-Za-z0-9_-.'); "
+            "rename the workflow."
+        )
 
     return errors
 

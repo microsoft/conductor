@@ -1730,6 +1730,54 @@ agents:
 
 For full MCP configuration details, see the [MCP Tools guide](mcp-tools.md).
 
+## MCP Exposure (`workflow.mcp:`)
+
+The `workflow.mcp:` block is unrelated to the `runtime.mcp_servers` section
+above. That section configures MCP **servers** this workflow calls as a
+*client*; this block configures how `conductor mcp serve` exposes *this
+workflow itself* as an MCP **tool** to a connected host.
+
+Every field is optional and defaults to exposing the workflow:
+
+```yaml
+workflow:
+  name: review-pr
+  mcp:
+    expose: true # default true — a candidate for MCP tool exposure
+    mode: async # async (default) | sync | auto
+    read_only: false # this workflow has no side effects
+    destructive: true # this workflow can destroy or irreversibly modify state
+    estimated_minutes: 8 # client-side hint for typical run duration
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | boolean | `true` | Whether this workflow is a candidate for MCP tool exposure. `conductor mcp serve`'s `--allow`/`--deny` flags outrank this field, which in turn outranks the default. |
+| `mode` | `async` \| `sync` \| `auto` | `async` | The invocation mode `conductor mcp serve` should use by default for this workflow. A hint, not a mandate — the caller's own `_wait_seconds` parameter can always override it per call. |
+| `read_only` | boolean | `false` | Whether this workflow only reads state, with no side effects. Surfaced to the MCP host as a tool annotation. |
+| `destructive` | boolean | `false` | Whether this workflow can destroy or irreversibly modify state. Surfaced to the MCP host as a tool annotation. |
+| `estimated_minutes` | integer \| `null` | `null` | Estimated wall-clock runtime in minutes, for client-side hints. Must be positive when present. |
+
+Because `workflow.mcp:` (like every other `WorkflowDef` field) rejects
+unknown keys, a typo such as `expse: false` is a `conductor validate` error
+rather than a silently ignored no-op — the reason this is a real schema
+block instead of riding the untyped `workflow.metadata:` bag.
+
+An absent `mcp:` block behaves identically to an explicit default one, so no
+existing workflow needs editing. `conductor validate` always reports the
+effective block and the tool name the workflow would publish (the slugified
+`workflow.name` — lowercased, with every character outside `A-Za-z0-9_-.`
+folded to `_`, and then `-` itself additionally folded to `_` to match
+Conductor's snake_case convention, so `review-pr` publishes as `review_pr`),
+so the generated name is inspectable without ever attaching
+an MCP host. Two things fail validation regardless of whether `mcp:` is
+declared, since every workflow is a candidate for exposure by default: a
+`workflow.input` named `_wait_seconds` (it collides with the parameter the
+tool generator reserves on every generated tool), and a `workflow.name` that
+cannot slugify to a legal 1–128-character tool name.
+
+See `examples/mcp-serve.yaml` for a complete example.
+
 ## Skills
 
 A **skill** is a directory of reusable knowledge an agent can opt into: a

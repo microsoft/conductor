@@ -1,0 +1,52 @@
+# MCP Exposure Metadata (workflow.mcp:)
+#
+# This example demonstrates the `workflow.mcp:` block (E6, DD4, FR11), which
+# `conductor mcp serve` reads to decide how this workflow should be exposed
+# as an MCP tool. It carries no MCP servers of its own — that is the
+# unrelated `runtime.mcp_servers` client-side config documented under
+# "MCP Servers" in docs/workflow-syntax.md.
+#
+# The block is fully optional: every field defaults on (`expose: true`), so
+# an existing workflow with no `mcp:` block at all is exposed identically to
+# one that declares the defaults explicitly.
+#
+# Usage:
+#   conductor validate examples/mcp-serve.yaml
+#   conductor run examples/mcp-serve.yaml --input topic="the git index"
+
+workflow:
+  name: mcp-serve-demo
+  description: Summarizes a topic in a couple of sentences.
+  version: "1.0.0"
+  entry_point: summarizer
+
+  mcp:
+    expose: true # candidate for `conductor mcp serve` exposure (the default)
+    mode: async # async (default) | sync | auto — a default, not a mandate
+    read_only: true # this workflow only reads/summarizes; no side effects
+    destructive: false
+    estimated_minutes: 1 # client-side hint for how long a run typically takes
+
+  input:
+    topic:
+      type: string
+      required: true
+      description: The topic to summarize
+
+agents:
+  - name: summarizer
+    description: Summarizes the given topic in two or three sentences
+    model: claude-haiku-4.5
+    prompt: |
+      Summarize the following topic in two or three sentences:
+
+      Topic: {{ workflow.input.topic }}
+    output:
+      summary:
+        type: string
+        description: A short summary of the topic
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ summarizer.output.summary }}"

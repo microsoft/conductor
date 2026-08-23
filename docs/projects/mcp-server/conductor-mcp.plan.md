@@ -543,15 +543,16 @@ per its own prerequisite on E6. Rather than block on the full E6 epic, a
 minimal `McpConfig` model (the `E6-T1` field set: `expose`, `mode`,
 `read_only`, `destructive`, `estimated_minutes`, `extra="forbid"`) was added
 to `config/schema.py` as a shared prerequisite so E5-T1 has a concrete type
-to import. **E6 remains otherwise unimplemented**: `WorkflowDef.mcp` is not
-wired up, there are no validator cross-checks (`_wait_seconds` collision,
-unslugifiable name), no `_report_mcp` CLI reporting, and no docs/examples —
-all of E6-T2 through E6-T6 are still `TO DO` and belong to a dedicated E6
-implementation pass.
+to import. The full E6 epic (below) has since landed: `WorkflowDef.mcp` is
+wired up, the validator cross-checks (`_wait_seconds` collision,
+unslugifiable name) and `_report_mcp` CLI reporting exist, and docs/examples
+were added.
 
 ---
 
 ### E6 — The `mcp:` workflow block (DD4, FR11)
+
+**Status: DONE** (completed 2026-08-22)
 
 **Goal.** A typed, validated `workflow.mcp:` block, so a typo is an error
 rather than silence — the reason the design rejected riding the untyped
@@ -566,17 +567,17 @@ reporting pattern to copy (`_report_plugins`, `_report_skill_discovery`).
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E6-T1 | IMPL | `McpConfig` with `extra="forbid"`: `expose: bool = True`, `mode: Literal["async","sync","auto"] = "async"`, `read_only: bool = False`, `destructive: bool = False`, `estimated_minutes: int \| None = None` (positive when present). Add `WorkflowDef.mcp: McpConfig = Field(default_factory=McpConfig)` so an absent block behaves identically to a default one and no existing workflow needs editing. | `src/conductor/config/schema.py` | TO DO |
-| E6-T2 | IMPL | Cross-checks in the workflow validator: an input named `_wait_seconds` collides with the reserved parameter (Tool generator ⚠️) and is an error; a `workflow.name` that cannot slugify to a legal 1–128-character tool name is an error naming the rule. Both must fire regardless of whether the workflow declares an `mcp:` block, since default-on exposure (DD4) means every workflow is a candidate. | `src/conductor/config/validator.py` | TO DO |
-| E6-T3 | IMPL | `_report_mcp(...)` in the validate CLI, printing the effective block and the tool name the workflow would publish — modelled on `_report_plugins` (`cli/validate.py:77`). Making the generated name inspectable without attaching a host is the point (FR11). | `src/conductor/cli/validate.py` | TO DO |
-| E6-T4 | TEST | Defaults; `extra="forbid"` rejects `expse: false`; `mode` rejects an unknown value; `estimated_minutes` rejects zero and negatives; an absent block equals a default block. | `tests/test_config/test_mcp_block.py` | TO DO |
-| E6-T5 | TEST | `conductor validate` reports the block, errors on a `_wait_seconds` input, and errors on an unslugifiable workflow name. | `tests/test_cli/test_validate.py` | TO DO |
-| E6-T6 | IMPL | Document the block in the workflow-syntax reference, and add `examples/mcp-serve.yaml` carrying a populated one so `make validate-examples` exercises it. | `docs/workflow-syntax.md`, `examples/mcp-serve.yaml` | TO DO |
+| E6-T1 | IMPL | `McpConfig` with `extra="forbid"`: `expose: bool = True`, `mode: Literal["async","sync","auto"] = "async"`, `read_only: bool = False`, `destructive: bool = False`, `estimated_minutes: int \| None = None` (positive when present). Add `WorkflowDef.mcp: McpConfig = Field(default_factory=McpConfig)` so an absent block behaves identically to a default one and no existing workflow needs editing. | `src/conductor/config/schema.py` | DONE |
+| E6-T2 | IMPL | Cross-checks in the workflow validator: an input named `_wait_seconds` collides with the reserved parameter (Tool generator ⚠️) and is an error; a `workflow.name` that cannot slugify to a legal 1–128-character tool name is an error naming the rule. Both must fire regardless of whether the workflow declares an `mcp:` block, since default-on exposure (DD4) means every workflow is a candidate. | `src/conductor/config/validator.py` | DONE |
+| E6-T3 | IMPL | `_report_mcp(...)` in the validate CLI, printing the effective block and the tool name the workflow would publish — modelled on `_report_plugins` (`cli/validate.py:77`). Making the generated name inspectable without attaching a host is the point (FR11). | `src/conductor/cli/validate.py` | DONE |
+| E6-T4 | TEST | Defaults; `extra="forbid"` rejects `expse: false`; `mode` rejects an unknown value; `estimated_minutes` rejects zero and negatives; an absent block equals a default block. | `tests/test_config/test_mcp_block.py` | DONE |
+| E6-T5 | TEST | `conductor validate` reports the block, errors on a `_wait_seconds` input, and errors on an unslugifiable workflow name. | `tests/test_cli/test_validate.py` | DONE |
+| E6-T6 | IMPL | Document the block in the workflow-syntax reference, and add `examples/mcp-serve.yaml` carrying a populated one so `make validate-examples` exercises it. | `docs/workflow-syntax.md`, `examples/mcp-serve.yaml` | DONE |
 
 **Acceptance criteria**
-- [ ] `workflow.mcp:` parses, validates, and appears in `conductor validate` output.
-- [ ] A misspelled key is a validation error.
-- [ ] Every existing example and workflow still validates.
+- [x] `workflow.mcp:` parses, validates, and appears in `conductor validate` output.
+- [x] A misspelled key is a validation error.
+- [x] Every existing example and workflow still validates.
 
 ---
 

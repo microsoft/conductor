@@ -413,3 +413,174 @@ agents:
         assert result.exit_code != 0
         assert "Validation Failed" in result.output
         assert "ghost" in result.output
+
+
+class TestMcpBlockReporting:
+    """E6-T5: `conductor validate` reports the `mcp:` block (E6, DD4, FR11)."""
+
+    def _write(self, path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+
+    def test_reports_the_default_block_and_tool_name(self, tmp_path: Path) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "wf.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: review-pr
+  entry_point: writer
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+""",
+        )
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=200)
+
+        is_valid, config = validate_workflow(workflow_file, console=console)
+        assert is_valid is True
+        assert config is not None
+        out = output.getvalue()
+        assert "review_pr" in out
+        assert "expose=True" in out
+        assert "mode=async" in out
+
+    def test_reports_a_populated_block(self, tmp_path: Path) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "wf.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: review-pr
+  entry_point: writer
+  mcp:
+    expose: true
+    mode: sync
+    read_only: false
+    destructive: true
+    estimated_minutes: 8
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+""",
+        )
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=200)
+
+        is_valid, config = validate_workflow(workflow_file, console=console)
+        assert is_valid is True
+        assert config is not None
+        out = output.getvalue()
+        assert "mode=sync" in out
+        assert "destructive=True" in out
+        assert "estimated_minutes=8" in out
+
+    def test_wait_seconds_input_is_a_validation_error(self, tmp_path: Path) -> None:
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "wf.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: has-reserved-input
+  entry_point: writer
+  input:
+    _wait_seconds: { type: number }
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+""",
+        )
+        is_valid, config = validate_workflow(workflow_file)
+        assert is_valid is False
+        assert config is None
+
+    def test_wait_seconds_input_error_names_the_rule(self, tmp_path: Path) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "wf.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: has-reserved-input
+  entry_point: writer
+  input:
+    _wait_seconds: { type: number }
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+""",
+        )
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=200)
+
+        is_valid, config = validate_workflow(workflow_file, console=console)
+        assert is_valid is False
+        assert config is None
+        out = output.getvalue()
+        assert "_wait_seconds" in out
+        assert "reserved parameter" in out
+
+    def test_unslugifiable_workflow_name_is_a_validation_error(self, tmp_path: Path) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.validate import validate_workflow
+
+        workflow_file = tmp_path / "wf.yaml"
+        # A workflow name over 128 characters cannot slugify to a legal
+        # (1-128 char) MCP tool name.
+        long_name = "x" * 129
+        self._write(
+            workflow_file,
+            f"""
+workflow:
+  name: "{long_name}"
+  entry_point: writer
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+""",
+        )
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=200)
+
+        is_valid, config = validate_workflow(workflow_file, console=console)
+        assert is_valid is False
+        assert config is None
+        out = output.getvalue()
+        assert "cannot be slugified" in out

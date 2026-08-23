@@ -70,6 +70,7 @@ def validate_workflow(
 
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
     _report_plugins(config, workflow_path, output_console)
+    _report_mcp(config, output_console)
 
     return True, config
 
@@ -204,6 +205,39 @@ def _report_plugins(
             console.print(
                 styled("      [dim]disabled by this workflow: {}[/dim]", ", ".join(plugin.disabled))
             )
+
+
+def _report_mcp(
+    config: WorkflowConfig,
+    console: MarkupFreeConsole,
+) -> None:
+    """Print the effective ``mcp:`` block and the tool name it would publish.
+
+    Unlike ``_report_plugins``/``_report_skill_discovery``, this always
+    prints: default-on exposure (DD4) means every workflow is a candidate for
+    ``conductor mcp serve``, so there is no "nothing enabled" case to skip.
+    Making the generated tool name inspectable without attaching an MCP host
+    at all is the point (FR11) — a rename that silently changes (or breaks)
+    the published name should be visible at ``conductor validate`` time.
+
+    Args:
+        config: The validated workflow configuration.
+        console: Rich console for output.
+    """
+    from conductor.config.validator import slugify_workflow_name
+
+    mcp = config.workflow.mcp
+    tool_name = slugify_workflow_name(config.workflow.name)
+
+    console.print(styled("  [dim]MCP: tool name would be '{}'[/dim]", tool_name))
+    detail = [
+        f"expose={mcp.expose}",
+        f"mode={mcp.mode}",
+        f"read_only={mcp.read_only}",
+        f"destructive={mcp.destructive}",
+        f"estimated_minutes={mcp.estimated_minutes}",
+    ]
+    console.print(styled("    [dim]{}[/dim]", ", ".join(detail)))
 
 
 def _report_skill_discovery(
