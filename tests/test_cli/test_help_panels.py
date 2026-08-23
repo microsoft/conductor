@@ -54,7 +54,7 @@ class TestHelpPanels:
     def test_noun_groups_listed(self) -> None:
         result = runner.invoke(app, ["--help"], env=_WIDE)
         assert result.exit_code == 0
-        for group in ("gate", "checkpoint", "registry", "fleet"):
+        for group in ("gate", "checkpoint", "registry", "fleet", "mcp"):
             assert group in result.output
 
     def test_commands_mapped_to_correct_panels(self) -> None:
@@ -80,6 +80,7 @@ class TestHelpPanels:
             "checkpoint": "State",
             "registry": "Environment",
             "plugin": "Environment",
+            "mcp": "Environment",
             "update": "Environment",
             "doctor": "Environment",
         }
@@ -107,6 +108,11 @@ class TestNounGroupBareInvocation:
         assert result.exit_code == 2
         assert "Usage" in result.output
 
+    def test_mcp_bare_invocation_shows_usage(self) -> None:
+        result = runner.invoke(app, ["mcp"], env=_WIDE)
+        assert result.exit_code == 2
+        assert "Usage" in result.output
+
 
 class TestNounGroupHelp:
     """Each noun group's own ``--help`` renders its description and subcommands."""
@@ -122,6 +128,12 @@ class TestNounGroupHelp:
         assert result.exit_code == 0
         assert "Inspect workflow checkpoints." in result.output
         assert "list" in result.output
+
+    def test_mcp_group_help(self) -> None:
+        result = runner.invoke(app, ["mcp", "--help"], env=_WIDE)
+        assert result.exit_code == 0
+        assert "Expose Conductor workflows as MCP tools over stdio." in result.output
+        assert "serve" in result.output
 
 
 class TestDeprecatedAliasesHidden:

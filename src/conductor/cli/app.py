@@ -54,11 +54,13 @@ app = typer.Typer(
 from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
 from conductor.cli.fleet import fleet_app  # noqa: E402
 from conductor.cli.gate import gate_app  # noqa: E402
+from conductor.cli.mcp import mcp_app  # noqa: E402
 from conductor.cli.plugin import plugin_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
 
 app.add_typer(registry_app, rich_help_panel="Environment")
 app.add_typer(plugin_app, rich_help_panel="Environment")
+app.add_typer(mcp_app, rich_help_panel="Environment")
 app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 app.add_typer(fleet_app, rich_help_panel="Run & Recover")
@@ -511,12 +513,16 @@ def main(
     if console.is_terminal and verbosity != ConsoleVerbosity.SILENT:
         import sys
 
-        # Skip when the subcommand is 'update' or 'doctor' — both surface
-        # update status in their own output (doctor in its env section), so
-        # the startup hint would be redundant noise.
+        # Skip when the subcommand is 'update', 'doctor' or 'mcp' -- 'update'/
+        # 'doctor' surface update status in their own output (doctor in its
+        # env section), so the startup hint would be redundant noise; 'mcp'
+        # (conductor mcp serve) treats stderr as a structured log stream for
+        # the MCP host (FR10's startup summary), so this hint would be noise
+        # mixed into it even though it is not itself a stdout-protocol risk
+        # (E8-T3).
         args = sys.argv[1:]
         subcommand = next((a for a in args if not a.startswith("-")), None)
-        if subcommand not in ("update", "doctor"):
+        if subcommand not in ("update", "doctor", "mcp"):
             from conductor.cli.update import check_for_update_hint
 
             check_for_update_hint(console)

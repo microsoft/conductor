@@ -614,6 +614,8 @@ process launching.
 
 ### E8 — The server: CLI, stdio transport, `tools/list` (FR1, FR10, DD3, DD9)
 
+**Status: DONE** (completed 2026-08-22)
+
 **Goal.** A running MCP server over stdio that publishes the frozen catalogue.
 
 **Prerequisites.** E1, E7.
@@ -630,18 +632,18 @@ use would corrupt the stream.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E8-T1 | IMPL | `mcp` Typer sub-app with a `serve` command, following `cli/checkpoint.py` / `cli/gate.py` (`no_args_is_help=True` — this group has no default action, so it is *not* the `fleet` deviation). Flags: `--registry`, `--allow`, `--deny`, `--workflow-dir` (all repeatable), `--toolsets`, `--max-direct-tools` (default 25), `--max-wait-seconds` (default 300), `--tool-prefix`, `--max-concurrent-runs` (default 0, R3), `--introspect-full` (R4). Escape brackets in every `help=` string per the markup convention (`AGENTS.md`, rule G). | `src/conductor/cli/mcp.py` | TO DO |
-| E8-T2 | IMPL | Register with `app.add_typer(mcp_app, rich_help_panel="Environment")`, matching `registry` and `plugin` — the panel for commands that configure how Conductor reaches the outside world. | `src/conductor/cli/app.py` | TO DO |
-| E8-T3 | IMPL | Keep stdout protocol-pure: suppress the startup update hint for this subcommand (extend the `subcommand not in ("update", "doctor")` guard at `cli/app.py:391`), and route every server-side message through a stderr console built with `make_console(stderr=True)`. Import the MCP SDK lazily inside `serve` so `conductor --help` does not pay for it. | `src/conductor/cli/mcp.py`, `src/conductor/cli/app.py` | TO DO |
-| E8-T4 | IMPL | Wire the catalogue onto the low-level `Server`: `list_tools` returns the frozen list, byte-identical on every call and every connection (DD3). Run it over `stdio_server()`. | `src/conductor/mcp/serve/server.py` | TO DO |
-| E8-T5 | IMPL | Startup summary on stderr (FR10): exposed count, direct-vs-discovery mode, and per tool its name, source registry and pinned identity; every collision it qualified, at warning level naming both registries; every workflow exposed with a degraded schema and why. This is the only channel a stdio server has, and hosts surface it in their MCP logs. | `src/conductor/mcp/serve/server.py` | TO DO |
-| E8-T6 | TEST | Drive the server over an in-memory stream pair: `initialize` succeeds, `tools/list` returns the expected names and schemas, and two sequential connections return an identical list (DD3's "MUST NOT vary per-connection"). | `tests/test_mcp/test_serve_server.py` | TO DO |
-| E8-T7 | TEST | CLI: `--help` renders (brackets escaped), flags parse and reach `ServeOptions`, the startup summary lands on stderr, stdout carries only protocol bytes, and `mcp` appears in the noun-group and panel assertions. | `tests/test_cli/test_mcp_serve.py`, `tests/test_cli/test_help_panels.py` | TO DO |
+| E8-T1 | IMPL | `mcp` Typer sub-app with a `serve` command, following `cli/checkpoint.py` / `cli/gate.py` (`no_args_is_help=True` — this group has no default action, so it is *not* the `fleet` deviation). Flags: `--registry`, `--allow`, `--deny`, `--workflow-dir` (all repeatable), `--toolsets`, `--max-direct-tools` (default 25), `--max-wait-seconds` (default 300), `--tool-prefix`, `--max-concurrent-runs` (default 0, R3), `--introspect-full` (R4). Escape brackets in every `help=` string per the markup convention (`AGENTS.md`, rule G). | `src/conductor/cli/mcp.py` | DONE |
+| E8-T2 | IMPL | Register with `app.add_typer(mcp_app, rich_help_panel="Environment")`, matching `registry` and `plugin` — the panel for commands that configure how Conductor reaches the outside world. | `src/conductor/cli/app.py` | DONE |
+| E8-T3 | IMPL | Keep stdout protocol-pure: suppress the startup update hint for this subcommand (extend the `subcommand not in ("update", "doctor")` guard at `cli/app.py:391`), and route every server-side message through a stderr console built with `make_console(stderr=True)`. Import the MCP SDK lazily inside `serve` so `conductor --help` does not pay for it. | `src/conductor/cli/mcp.py`, `src/conductor/cli/app.py` | DONE |
+| E8-T4 | IMPL | Wire the catalogue onto the low-level `Server`: `list_tools` returns the frozen list, byte-identical on every call and every connection (DD3). Run it over `stdio_server()`. | `src/conductor/mcp/serve/server.py` | DONE |
+| E8-T5 | IMPL | Startup summary on stderr (FR10): exposed count, direct-vs-discovery mode, and per tool its name, source registry and pinned identity; every collision it qualified, at warning level naming both registries; every workflow exposed with a degraded schema and why. This is the only channel a stdio server has, and hosts surface it in their MCP logs. | `src/conductor/mcp/serve/server.py` | DONE |
+| E8-T6 | TEST | Drive the server over an in-memory stream pair: `initialize` succeeds, `tools/list` returns the expected names and schemas, and two sequential connections return an identical list (DD3's "MUST NOT vary per-connection"). | `tests/test_mcp/test_serve_server.py` | DONE |
+| E8-T7 | TEST | CLI: `--help` renders (brackets escaped), flags parse and reach `ServeOptions`, the startup summary lands on stderr, stdout carries only protocol bytes, and `mcp` appears in the noun-group and panel assertions. | `tests/test_cli/test_mcp_serve.py`, `tests/test_cli/test_help_panels.py` | DONE |
 
 **Acceptance criteria**
-- [ ] A host can connect over stdio and list the workflows in a configured registry.
-- [ ] Nothing but JSON-RPC reaches stdout.
-- [ ] The tool list is fixed at startup and identical across connections.
+- [x] A host can connect over stdio and list the workflows in a configured registry.
+- [x] Nothing but JSON-RPC reaches stdout.
+- [x] The tool list is fixed at startup and identical across connections.
 
 ---
 
