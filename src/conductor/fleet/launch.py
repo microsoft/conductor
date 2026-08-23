@@ -238,6 +238,54 @@ def build_launch_inputs(
     return result
 
 
+def build_typed_launch_inputs(
+    values: dict[str, Any], input_defs: dict[str, InputDef]
+) -> dict[str, Any]:
+    """Validate required inputs and fill defaults for already JSON-typed values.
+
+    The MCP invocation layer's counterpart to :func:`build_launch_inputs`
+    (``mcp/serve/invoke.py``, E9-T2): an MCP host's tool-call arguments arrive
+    already JSON-typed, per the tool's generated ``inputSchema`` (and are
+    validated against it by the SDK before dispatch), so there is nothing to
+    coerce *from a string* the way a TUI form field needs. This is the
+    required-input/default-filling half of :func:`build_launch_inputs`,
+    factored out so both callers share one definition of "what counts as a
+    valid input set" for a workflow's declared ``input:`` rather than each
+    growing its own notion of it.
+
+    A value that is missing or explicitly ``None`` is treated as "not
+    provided" (mirroring :func:`build_launch_inputs`'s blank-string
+    treatment): a required input with no default rejects the launch
+    outright, while an optional input either falls back to its (already
+    type-validated) default or is omitted entirely, leaving the workflow's
+    own handling of a missing input untouched.
+
+    Args:
+        values: Input name -> already-typed value (e.g. an MCP tool call's
+            arguments, with the reserved ``_wait_seconds`` parameter already
+            removed).
+        input_defs: The workflow's declared inputs (name -> ``InputDef``).
+
+    Returns:
+        Coerced input values ready for ``launch_background(inputs=...)``.
+
+    Raises:
+        LaunchError: On a missing required input.
+    """
+    result: dict[str, Any] = {}
+    for name, input_def in input_defs.items():
+        value = values.get(name)
+        if value is None:
+            if input_def.default is not None:
+                result[name] = input_def.default
+                continue
+            if input_def.required:
+                raise LaunchError(f"Missing required input: {name}")
+            continue
+        result[name] = value
+    return result
+
+
 def launch_workflow(
     workflow_path: Path,
     raw_values: dict[str, str],

@@ -74,7 +74,11 @@ class ServeOptions:
             (DD10).
         max_concurrent_runs: Bounds how many runs launched by *this server
             process* may be live at once; ``0`` (default) is unbounded so
-            behavior is unchanged unless an operator opts in (R3).
+            behavior is unchanged unless an operator opts in (R3). Tracked
+            in-process only (``mcp/serve/invoke.py::LaunchTracker``), so
+            restarting the server resets the count to zero -- a consequence
+            of the design's "the MCP server owns no execution state"
+            principle, not a lapse from it.
         introspect_full: Restores full tool-call arguments/results on
             ``conductor_run_events`` instead of the default
             ``{name, status, byte_size}`` reduction (R4).
