@@ -689,6 +689,8 @@ caveat DD2 states).
 
 ### E10 — Run lifecycle tools (FR6, FR7, DD11)
 
+**Status: DONE**
+
 **Goal.** `conductor_run_status` / `conductor_await_run` / `conductor_cancel_run`
 / `conductor_list_runs` over live *and* completed runs — data flows C and D.
 
@@ -704,17 +706,17 @@ is the shared stop implementation with a verify-then-report contract and a
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E10-T1 | IMPL | The three-source resolver from *Key Components → 4*: `read_run_record(run_id)` → `derive_run_summary` for a live run (enriched from `GET /api/info`); else `read_terminal_record(run_id)`; else `find_event_log_for_run(run_id, started_at)` for a crashed run. Return a single shape from all three, with a field naming which source answered — a caller must be able to tell "completed cleanly" from "process vanished". | `src/conductor/mcp/serve/runs.py` | TO DO |
-| E10-T2 | IMPL | `conductor_run_status(run_id)`: the resolver's output plus, at a gate, the gate's prompt, options, `option_details` and the dashboard approval URL (FR7). Every MCP-launched run has a port by construction (DD2), so `gate_resolvable` is always true here — state that in the result rather than leaving the caller to infer it. | `src/conductor/mcp/serve/runs.py` | TO DO |
-| E10-T3 | IMPL | `conductor_await_run(run_id, wait_seconds=60)`: bounded by `--max-wait-seconds`, emitting progress, returning on terminal **or** `at-gate`, and naming the approval URL as the next action in its timeout text (DD11's second bullet). | `src/conductor/mcp/serve/runs.py` | TO DO |
-| E10-T4 | IMPL | `conductor_cancel_run(run_id, force=false)`: reuse `cli/app.py::stop_records` with `confirm=None` and a silent console, so the graceful `POST /api/stop` rung (the only one that writes a checkpoint via `handle_dashboard_stop`) is tried first and the verify-then-report contract is inherited. Report `stopped` / `failed` honestly; a run that is already terminal is a distinct, non-error outcome. | `src/conductor/mcp/serve/runs.py` | TO DO |
-| E10-T5 | IMPL | `conductor_list_runs(status?, workflow?, limit=20)` over live records ∪ terminal records, deduplicated by `run_id` with the live record winning. `status="at-gate"` is the query that surfaces parked runs (DD11's third bullet). | `src/conductor/mcp/serve/runs.py` | TO DO |
-| E10-T6 | TEST | Status for a live run, a run at a gate (prompt/options/URL present), a cleanly-finished run (from the terminal record, with no process, port or event log needed), and a crashed run (event-log fallback, with the source named). Await returns early at a gate and on terminal status, and its timeout text names the URL. Cancel routes through `stop_records` and reports an already-terminal run distinctly. List filters by status and workflow and dedupes a `run_id` present in both sources. | `tests/test_mcp/test_serve_runs.py` | TO DO |
+| E10-T1 | IMPL | The three-source resolver from *Key Components → 4*: `read_run_record(run_id)` → `derive_run_summary` for a live run (enriched from `GET /api/info`); else `read_terminal_record(run_id)`; else `find_event_log_for_run(run_id, started_at)` for a crashed run. Return a single shape from all three, with a field naming which source answered — a caller must be able to tell "completed cleanly" from "process vanished". | `src/conductor/mcp/serve/runs.py` | DONE |
+| E10-T2 | IMPL | `conductor_run_status(run_id)`: the resolver's output plus, at a gate, the gate's prompt, options, `option_details` and the dashboard approval URL (FR7). Every MCP-launched run has a port by construction (DD2), so `gate_resolvable` is always true here — state that in the result rather than leaving the caller to infer it. | `src/conductor/mcp/serve/runs.py` | DONE |
+| E10-T3 | IMPL | `conductor_await_run(run_id, wait_seconds=60)`: bounded by `--max-wait-seconds`, emitting progress, returning on terminal **or** `at-gate`, and naming the approval URL as the next action in its timeout text (DD11's second bullet). | `src/conductor/mcp/serve/runs.py` | DONE |
+| E10-T4 | IMPL | `conductor_cancel_run(run_id, force=false)`: reuse `cli/app.py::stop_records` with `confirm=None` and a silent console, so the graceful `POST /api/stop` rung (the only one that writes a checkpoint via `handle_dashboard_stop`) is tried first and the verify-then-report contract is inherited. Report `stopped` / `failed` honestly; a run that is already terminal is a distinct, non-error outcome. | `src/conductor/mcp/serve/runs.py` | DONE |
+| E10-T5 | IMPL | `conductor_list_runs(status?, workflow?, limit=20)` over live records ∪ terminal records, deduplicated by `run_id` with the live record winning. `status="at-gate"` is the query that surfaces parked runs (DD11's third bullet). | `src/conductor/mcp/serve/runs.py` | DONE |
+| E10-T6 | TEST | Status for a live run, a run at a gate (prompt/options/URL present), a cleanly-finished run (from the terminal record, with no process, port or event log needed), and a crashed run (event-log fallback, with the source named). Await returns early at a gate and on terminal status, and its timeout text names the URL. Cancel routes through `stop_records` and reports an already-terminal run distinctly. List filters by status and workflow and dedupes a `run_id` present in both sources. | `tests/test_mcp/test_serve_runs.py` | DONE |
 
 **Acceptance criteria**
-- [ ] A `run_id` is answerable before, during, at a gate, and after the run.
-- [ ] Cancel writes a checkpoint via the graceful rung when it can.
-- [ ] Nothing here re-implements the stop ladder or the status derivation.
+- [x] A `run_id` is answerable before, during, at a gate, and after the run.
+- [x] Cancel writes a checkpoint via the graceful rung when it can.
+- [x] Nothing here re-implements the stop ladder or the status derivation.
 
 ---
 
