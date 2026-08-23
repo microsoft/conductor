@@ -312,12 +312,17 @@ class HistoryScreen(Screen):
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Offer ``conductor replay <log>`` for the selected row (mouse click).
+        """Offer ``conductor replay <log>``, plus the outcome detail the
+        design says this screen "currently cannot show" (E14-T3, E4-T5).
 
-        Depth is delegated for viewing: this never opens a replay
-        dashboard itself -- it surfaces the exact command via a
-        notification so the operator can run it in a terminal (per the
-        design's *Division of labor*, TUI = breadth). A key not present in
+        Depth is still delegated, not re-implemented: this never opens a
+        replay dashboard or a separate output viewer -- it surfaces the
+        failure reason (for a failed run) or the rendered output (for a
+        completed one), alongside the exact replay command, via a single
+        notification so the operator can inspect further in a terminal.
+        This keeps the table's five columns unchanged and is the only
+        place the E4-T4 enrichment (`HistoryEntry.output`/`error_type`/
+        `error_message`) surfaces in this screen. A key not present in
         :attr:`_displayed_entries` (e.g. a row selected in the narrow
         window between a refresh and this handler running) is silently
         ignored, mirroring ``runs.py``'s identical guard for its own
@@ -369,14 +374,22 @@ class HistoryScreen(Screen):
         entry = self._displayed_entries.get(key)
         if entry is None:
             return
-        message = f"Replay with: conductor replay {entry.path}"
+        lines = [f"Replay with: conductor replay {entry.path}"]
         checkpoint = self._resumable.get(entry.path)
         if checkpoint is not None:
-            message += (
+            lines[0] += (
                 f"  ·  Press r to resume {checkpoint.workflow_path.name} from the "
                 f"checkpoint saved {checkpoint.created_at} at {checkpoint.current_agent}."
             )
-        self.notify(message, markup=False)
+        if entry.outcome == "failed" and (entry.error_type or entry.error_message):
+            reason = entry.error_message or "no message recorded"
+            if entry.error_type:
+                reason = f"{entry.error_type}: {reason}"
+            lines.insert(0, f"Failed: {reason}")
+        elif entry.outcome == "completed" and entry.output:
+            lines.insert(0, f"Output: {entry.output}")
+
+        self.notify("\n".join(lines), markup=False)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         """Refresh the footer as the cursor moves (issues #459, #460).

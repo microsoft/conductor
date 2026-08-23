@@ -24,6 +24,7 @@ path (issue #441).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -33,6 +34,8 @@ from rich.text import Text
 
 from conductor.console import make_console, styled
 from conductor.install_hint import install_command
+
+logger = logging.getLogger(__name__)
 
 # `textual` is an optional dependency (the `tui` extra) — this module is
 # imported unconditionally at every `conductor` invocation (via
@@ -92,24 +95,48 @@ def fleet_main(ctx: typer.Context) -> None:
 
 
 @fleet_app.command("list")
-def list_runs() -> None:
-    """List every live Conductor run.
+def list_runs(
+    live_only: Annotated[
+        bool,
+        typer.Option(
+            "--live",
+            help=(
+                "List only currently-running workflows, reproducing this command's "
+                "pre-completed-runs scope exactly."
+            ),
+        ),
+    ] = False,
+) -> None:
+    r"""List every live Conductor run, plus recently-completed ones.
 
     Shows each run's workflow, mode (foreground, foreground+web, or
     background), status, PID, dashboard port, and start time. Discovers
-    runs the same way `conductor stop` does — via the Fleet Manager run
-    record (`~/.conductor/runs/`) — so foreground runs show up here too,
-    not just `--web-bg` ones.
+    live runs the same way `conductor stop` does — via the Fleet Manager run
+    record (`~/.conductor/runs/`) — so foreground runs show up here too, not
+    just `--web-bg` ones.
+
+    Also lists recently-completed runs (`completed`/`failed`, bounded by
+    \[fleet.retention].keep_last) — pass `--live` to see only currently-
+    running workflows, matching this command's scope before completed runs
+    were added.
 
     \b
     Examples:
         conductor fleet list
+        conductor fleet list --live
     """
-    from conductor.fleet.records import read_run_records
+    from conductor.fleet.records import TerminalRunRecord, read_run_records
 
     records = read_run_records()
 
-    if not records:
+    completed: list[TerminalRunRecord] = []
+    if not live_only:
+        from conductor.fleet.records import read_terminal_records
+
+        keep_last = _resolve_completed_keep_last()
+        completed = read_terminal_records(limit=keep_last if keep_last >= 1 else None)
+
+    if not records and not completed:
         output_console.print(Text.from_markup("[dim]No runs found.[/dim]"))
         return
 
@@ -134,13 +161,63 @@ def list_runs() -> None:
             # computes for the TUI's Runs screen, which also requires a
             # streamed event-log scan per row; use `conductor fleet`'s
             # TUI (or `--web`) for the finer-grained status.
+            # A completed row, added below, carries its real terminal
+            # status instead.
             "running",
             str(record.pid),
             str(record.port) if record.port is not None else "—",
             record.started_at or "?",
         )
 
+    for terminal in completed:
+        table.add_row(
+            terminal.workflow_name or Path(terminal.workflow_path or "unknown").stem or "unknown",
+            "—",
+            _terminal_status_label(terminal.status),
+            "—",
+            "—",
+            terminal.started_at or "?",
+        )
+
     output_console.print(table)
+
+
+def _resolve_completed_keep_last() -> int:
+    """Return the configured retention ``keep_last`` bound for completed rows.
+
+    Mirrors ``conductor.fleet.history._resolve_keep_last``'s own
+    never-break-on-bad-settings contract: a malformed
+    ``~/.conductor/config.toml`` (or any other failure loading settings)
+    must not break `fleet list`, so a failure loading settings falls back
+    to ``FleetRetentionSettings.keep_last``'s own default rather than
+    raising.
+    """
+    from conductor.settings import load_settings
+
+    try:
+        return load_settings().fleet.retention.keep_last
+    except Exception:
+        logger.warning(
+            "Failed to load Conductor settings for fleet list's retention bound; using default",
+            exc_info=True,
+        )
+        return 200
+
+
+def _terminal_status_label(status: str) -> str:
+    """Map a raw status value to this table's Status cell text.
+
+    ``"running"`` passes through unchanged (every live record's coarse
+    status, per `list_runs`'s own comment). A completed row's
+    :class:`~conductor.fleet.records.TerminalRunRecord.status` is written as
+    ``"success"``/``"failed"`` by ``cli/run.py`` (a forward-compat
+    ``"unknown"`` substitutes for an absent field on load) -- this renders
+    ``"success"`` as ``"completed"`` to match the vocabulary the rest of the
+    Fleet Manager already uses (``fleet/tui/theme.py``, ``fleet/history.py``'s
+    ``HistoryOutcome``) rather than introducing a second word for the same
+    outcome.
+    """
+    return "completed" if status == "success" else status
 
 
 @fleet_app.command("prune")

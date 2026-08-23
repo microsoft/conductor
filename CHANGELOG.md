@@ -92,6 +92,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema, factory, registry and diagnostics. Workflows that named it now fail at
   schema load time rather than at the first agent execution.
 
+### Changed
+
+- **`conductor status` and `conductor fleet list` now also list
+  recently-completed runs, not just currently-running ones — a contract
+  change to what these commands mean.** Previously both meant "runs alive
+  right now"; a finished run disappeared the moment its process exited.
+  Each command now renders (or, for `status --json`, returns in an
+  additive `completed` array) a bounded set of recently-completed runs
+  with their terminal status (`completed`/`failed`), when they ended,
+  duration, tokens/cost, and error type for a failure — sourced from the
+  terminal run record every run now writes on exit. `conductor fleet
+  list`'s completed rows are bounded by `[fleet.retention].keep_last`.
+  Both commands remain read-only: listing a completed run never removes
+  its terminal record. Pass `--live` to either command to restore the
+  exact previous scope (`status --json --live` also drops the
+  `completed` key from the payload entirely, so an existing scripted
+  consumer of `payload["running"]` is otherwise unaffected by this
+  change). The Fleet Manager TUI's History screen also gained a failed
+  run's error message and a completed run's rendered output, reachable
+  by selecting a row, without adding a new column to its table.
+
 ### Fixed
 
 - **The Copilot idle watchdog no longer fires during long-running tool

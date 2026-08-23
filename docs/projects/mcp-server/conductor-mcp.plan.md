@@ -464,7 +464,7 @@ extra directory rather than a wider glob.
 
 ---
 
-### E4 — Surface completed runs in `status`, `fleet list`, and History (R1, DD1)
+### E4 — Surface completed runs in `status`, `fleet list`, and History (R1, DD1) — DONE
 
 **Goal.** Deliver the standalone value DD1 claims for the terminal record: a
 finished run stops being invisible. This is a **user-facing contract change** —
@@ -488,22 +488,22 @@ single-forward-pass constraint is untouched.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E4-T1 | IMPL | `conductor status`: render a second section listing recently-completed runs from `read_terminal_records(limit=…)`, with terminal status, ended-at, duration, tokens/cost, and error type for failures. Keep the live section sourced from `scan_run_records()` and keep it non-destructive — this command's whole reason for existing is that it never prunes. Add `--live` to restore the previous scope exactly. | `src/conductor/cli/app.py` | TO DO |
-| E4-T2 | IMPL | `conductor status --json`: **keep the existing `running` array byte-compatible** and add a sibling `completed` array, so a machine consumer reading `payload["running"]` is unaffected by the contract change. `--live` emits `running` only. | `src/conductor/cli/app.py` | TO DO |
-| E4-T3 | IMPL | `fleet list`: add completed rows and replace the hard-coded `"running"` Status cell (`cli/fleet.py:124`) with the row's real status — live rows keep the coarse `running` (deriving the richer vocabulary needs a per-row event-log read, which that comment correctly rules out for this table), completed rows carry their terminal `completed` / `failed`. Bound the completed set by `[fleet.retention].keep_last`. Add `--live`. Update the stale comment rather than leaving it contradicting the code. | `src/conductor/cli/fleet.py` | TO DO |
-| E4-T4 | IMPL | `HistoryEntry` gains `output`, `error_type` and `error_message`, enriched from `read_terminal_record(entry.run_id)` after the log scan completes. An entry whose `run_id` is `None` (an unrecognized filename) or whose record is absent (a pre-upgrade or crashed run) keeps working with the fields `None` — enrichment must never turn a displayable row into a dropped one, and `build_history_entries`'s never-raises contract is inherited. | `src/conductor/fleet/history.py` | TO DO |
-| E4-T5 | IMPL | History screen: surface the failure reason for a failed run and the rendered output for a completed one — the outcome data the design says the screen "currently cannot show". Keep the existing five columns intact and put the new detail where a row selection can reach it, so the table stays readable at the existing width. | `src/conductor/fleet/tui/screens/history.py` | TO DO |
-| E4-T6 | TEST | `status`: existing assertions updated for the two-section output; a completed run appears with its terminal status and error; `--live` reproduces the old output exactly; the `--json` `running` array is unchanged and `completed` is additive; the command still prunes nothing (assert the record files survive the call). | `tests/test_cli/test_status.py` | TO DO |
-| E4-T7 | TEST | `fleet list`: completed rows show real terminal status; live rows still show `running`; `--live` restores the old scope; both-empty and one-empty cases render without error; the completed set honours `keep_last`. | `tests/test_cli/test_fleet_list.py` | TO DO |
-| E4-T8 | TEST | History: an entry with a matching terminal record carries output and error; one without keeps working with `None`s; a corrupt terminal record does not drop the row or raise; the TUI screen renders the failure reason. | `tests/test_fleet/test_history.py`, `tests/test_fleet/test_tui_history.py` | TO DO |
-| E4-T9 | IMPL | Update the `conductor status` and `conductor fleet list` sections of the CLI reference, which currently describe them as listing running workflows only, and document `--live`. Note the change in the changelog as a contract change, not a feature bullet. | `docs/cli-reference.md`, `CHANGELOG.md` | TO DO |
+| E4-T1 | IMPL | `conductor status`: render a second section listing recently-completed runs from `read_terminal_records(limit=…)`, with terminal status, ended-at, duration, tokens/cost, and error type for failures. Keep the live section sourced from `scan_run_records()` and keep it non-destructive — this command's whole reason for existing is that it never prunes. Add `--live` to restore the previous scope exactly. | `src/conductor/cli/app.py` | DONE |
+| E4-T2 | IMPL | `conductor status --json`: **keep the existing `running` array byte-compatible** and add a sibling `completed` array, so a machine consumer reading `payload["running"]` is unaffected by the contract change. `--live` emits `running` only. | `src/conductor/cli/app.py` | DONE |
+| E4-T3 | IMPL | `fleet list`: add completed rows and replace the hard-coded `"running"` Status cell (`cli/fleet.py:124`) with the row's real status — live rows keep the coarse `running` (deriving the richer vocabulary needs a per-row event-log read, which that comment correctly rules out for this table), completed rows carry their terminal `completed` / `failed`. Bound the completed set by `[fleet.retention].keep_last`. Add `--live`. Update the stale comment rather than leaving it contradicting the code. | `src/conductor/cli/fleet.py` | DONE |
+| E4-T4 | IMPL | `HistoryEntry` gains `output`, `error_type` and `error_message`, enriched from `read_terminal_record(entry.run_id)` after the log scan completes. An entry whose `run_id` is `None` (an unrecognized filename) or whose record is absent (a pre-upgrade or crashed run) keeps working with the fields `None` — enrichment must never turn a displayable row into a dropped one, and `build_history_entries`'s never-raises contract is inherited. | `src/conductor/fleet/history.py` | DONE |
+| E4-T5 | IMPL | History screen: surface the failure reason for a failed run and the rendered output for a completed one — the outcome data the design says the screen "currently cannot show". Keep the existing five columns intact and put the new detail where a row selection can reach it, so the table stays readable at the existing width. | `src/conductor/fleet/tui/screens/history.py` | DONE |
+| E4-T6 | TEST | `status`: existing assertions updated for the two-section output; a completed run appears with its terminal status and error; `--live` reproduces the old output exactly; the `--json` `running` array is unchanged and `completed` is additive; the command still prunes nothing (assert the record files survive the call). | `tests/test_cli/test_status.py` | DONE |
+| E4-T7 | TEST | `fleet list`: completed rows show real terminal status; live rows still show `running`; `--live` restores the old scope; both-empty and one-empty cases render without error; the completed set honours `keep_last`. | `tests/test_cli/test_fleet_list.py` | DONE |
+| E4-T8 | TEST | History: an entry with a matching terminal record carries output and error; one without keeps working with `None`s; a corrupt terminal record does not drop the row or raise; the TUI screen renders the failure reason. | `tests/test_fleet/test_history.py`, `tests/test_fleet/test_tui_history.py` | DONE |
+| E4-T9 | IMPL | Update the `conductor status` and `conductor fleet list` sections of the CLI reference, which currently describe them as listing running workflows only, and document `--live`. Note the change in the changelog as a contract change, not a feature bullet. | `docs/cli-reference.md`, `CHANGELOG.md` | DONE |
 
 **Acceptance criteria**
-- [ ] A run that finished five minutes ago is visible in `conductor status`, `conductor fleet list`, and History.
-- [ ] History shows a failed run's error message and a completed run's rendered output.
-- [ ] `--live` reproduces the pre-change output for both commands.
-- [ ] `conductor status` still prunes nothing.
-- [ ] The `status --json` `running` array is unchanged.
+- [x] A run that finished five minutes ago is visible in `conductor status`, `conductor fleet list`, and History.
+- [x] History shows a failed run's error message and a completed run's rendered output.
+- [x] `--live` reproduces the pre-change output for both commands.
+- [x] `conductor status` still prunes nothing.
+- [x] The `status --json` `running` array is unchanged.
 
 ---
 

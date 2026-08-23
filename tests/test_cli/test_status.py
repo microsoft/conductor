@@ -10,6 +10,13 @@ terminate anything, in any configuration.**
 
 It also surfaces the dashboard URL, which is otherwise unrecoverable once the
 launching terminal is gone.
+
+As of the MCP server plan's E4, this command also lists recently-completed
+runs (from ``read_terminal_records``) in a second section below the live
+one — a user-facing contract change accepted at stakeholder review (R1),
+since ``status``/``fleet list`` previously meant "runs alive right now."
+``--live`` restores the pre-E4 scope exactly, and the underlying "never
+terminates, never prunes" property above is unaffected by any of it.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import _format_started_at, _print_running_list, app
-from conductor.fleet.records import RunRecord
+from conductor.fleet.records import RunRecord, TerminalRunRecord
 
 runner = CliRunner()
 
@@ -117,6 +124,48 @@ def _write_pid(
     )
     assert pid_dir.exists()
     return filepath
+
+
+def _write_terminal(
+    pid_tmpdir: Path,
+    *,
+    run_id: str = "deadbeef",
+    status: str = "success",
+    workflow: str = "/tmp/completed-wf.yaml",
+    error_type: str | None = None,
+    error_message: str | None = None,
+    output: dict | None = None,
+    total_tokens: int | None = None,
+    total_cost_usd: float | None = None,
+) -> TerminalRunRecord:
+    """Write a terminal run record via the real ``write_terminal_record`` (E4).
+
+    Mirrors ``_write_pid``'s own "go through the real writer, not a
+    hand-built fixture" rationale. ``pid_tmpdir`` is unused directly but
+    required so the fixture that redirects ``CONDUCTOR_HOME`` (and thus
+    ``terminal_records_dir()``) has already run.
+    """
+    from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+    record = TerminalRunRecord(
+        run_id=run_id,
+        workflow_path=workflow,
+        workflow_name=Path(workflow).stem,
+        started_at="2026-03-03T00:00:00+00:00",
+        ended_at="2026-03-03T00:05:00+00:00",
+        status=status,
+        output=output or {},
+        error_type=error_type,
+        error_message=error_message,
+        total_tokens=total_tokens,
+        total_cost_usd=total_cost_usd,
+        unpriced_agent_count=0,
+        event_log_path="/tmp/conductor/completed-wf.events.jsonl",
+        bg_stderr_log=None,
+        bg_stdout_log=None,
+    )
+    write_terminal_record(record)
+    return record
 
 
 class TestStatusNeverStops:
@@ -277,6 +326,12 @@ class TestStatusJson:
 
     def test_json_empty_when_nothing_runs(self, pid_tmpdir: Path) -> None:
         result = runner.invoke(app, ["status", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"running": [], "completed": []}
+
+    def test_json_live_empty_when_nothing_runs(self, pid_tmpdir: Path) -> None:
+        """``--live`` restores the exact pre-E4 payload shape (no ``completed`` key)."""
+        result = runner.invoke(app, ["status", "--json", "--live"])
         assert result.exit_code == 0
         assert json.loads(result.stdout) == {"running": []}
 
@@ -568,3 +623,138 @@ class TestStartedColumnFormatting:
 
     def test_non_string_becomes_a_question_mark(self) -> None:
         assert _format_started_at(12345) == "?"
+
+
+class TestStatusCompletedRuns:
+    """E4-T1/E4-T2: a second, completed-runs section (R1's contract change)."""
+
+    def test_completed_run_appears_with_terminal_status(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir, status="success", workflow="/tmp/compwf.yaml")
+
+        result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert "compwf" in result.output
+        assert "completed" in result.output.lower()
+
+    def test_failed_run_shows_terminal_status_and_error_type(self, pid_tmpdir: Path) -> None:
+        _write_terminal(
+            pid_tmpdir,
+            run_id="badbeef1",
+            status="failed",
+            workflow="/tmp/broke.yaml",
+            error_type="ValueError",
+            error_message="something went wrong",
+        )
+
+        result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert "broke" in result.output
+        assert "failed" in result.output.lower()
+        assert "ValueError" in result.output
+
+    def test_no_completed_runs_reports_dim_message(self, pid_tmpdir: Path) -> None:
+        result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert "No recently completed runs." in result.output
+
+    def test_completed_section_appears_even_when_nothing_is_running(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir)
+
+        result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert "No background workflows are currently running." in result.output
+        assert "completed" in result.output.lower()
+
+    def test_live_flag_reproduces_the_old_output_exactly(self, pid_tmpdir: Path) -> None:
+        """``--live`` must byte-for-byte match this command's behavior
+        before completed runs were added: no completed section, no extra
+        trailing blank line, running section unchanged."""
+        _write_terminal(pid_tmpdir)
+        _write_pid(pid_tmpdir, 4242, 8080)
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
+            live_result = runner.invoke(app, ["status", "--live"])
+            default_result = runner.invoke(app, ["status"])
+
+        assert live_result.exit_code == 0
+        assert "8080" in live_result.output
+        assert "completed" not in live_result.output.lower()
+        assert "Recently completed" not in live_result.output
+        # The default (non---live) invocation must differ -- it renders the
+        # additional completed section this flag exists to omit.
+        assert default_result.output != live_result.output
+        assert "Recently completed" in default_result.output
+
+    def test_status_still_prunes_no_terminal_records(self, pid_tmpdir: Path) -> None:
+        """The read-only contract extends to the new completed section too:
+        listing completed runs must not remove their terminal records."""
+        from conductor.fleet.records import terminal_records_dir
+
+        record = _write_terminal(pid_tmpdir, run_id="keepme01")
+        filepath = terminal_records_dir() / f"{record.run_id}.json"
+        assert filepath.exists()
+
+        result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert filepath.exists(), "status deleted a terminal run record — must stay read-only"
+
+
+class TestStatusJsonCompletedRuns:
+    """E4-T2: ``--json``'s ``running`` array stays byte-compatible; ``completed`` is additive."""
+
+    def test_running_array_is_unaffected_by_completed_runs(self, pid_tmpdir: Path) -> None:
+        _write_pid(pid_tmpdir, 4242, 8080, run_id=_RUN_ID)
+        _write_terminal(pid_tmpdir)
+
+        with patch("conductor.cli.pid.is_process_alive", return_value=True):
+            result = runner.invoke(app, ["status", "--json"])
+
+        payload = json.loads(result.stdout)
+        assert len(payload["running"]) == 1
+        assert payload["running"][0]["run_id"] == _RUN_ID
+        assert payload["running"][0]["port"] == 8080
+
+    def test_completed_array_is_additive(self, pid_tmpdir: Path) -> None:
+        _write_terminal(
+            pid_tmpdir,
+            run_id="jsoncompleted",
+            status="failed",
+            workflow="/tmp/jsonwf.yaml",
+            error_type="RuntimeError",
+            error_message="boom",
+            total_tokens=100,
+            total_cost_usd=0.02,
+        )
+
+        result = runner.invoke(app, ["status", "--json"])
+
+        payload = json.loads(result.stdout)
+        assert payload["running"] == []
+        assert len(payload["completed"]) == 1
+        entry = payload["completed"][0]
+        assert entry["run_id"] == "jsoncompleted"
+        assert entry["status"] == "failed"
+        assert entry["error_type"] == "RuntimeError"
+        assert entry["error_message"] == "boom"
+        assert entry["total_tokens"] == 100
+        assert entry["total_cost_usd"] == 0.02
+
+    def test_live_flag_omits_the_completed_key_entirely(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir)
+
+        result = runner.invoke(app, ["status", "--json", "--live"])
+
+        payload = json.loads(result.stdout)
+        assert payload == {"running": []}
+        assert "completed" not in payload
+
+    def test_completed_empty_list_when_none_exist(self, pid_tmpdir: Path) -> None:
+        result = runner.invoke(app, ["status", "--json"])
+
+        payload = json.loads(result.stdout)
+        assert payload["completed"] == []

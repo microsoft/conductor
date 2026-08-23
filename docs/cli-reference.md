@@ -290,7 +290,9 @@ Line 3"
 
 ## `conductor status`
 
-List background workflows launched with `--web-bg`, without stopping any of them.
+List background workflows launched with `--web-bg`, without stopping any of
+them — plus a handful of recently-completed runs (their terminal status,
+when they ended, duration, tokens/cost, and error type for a failure).
 
 ```bash
 conductor status [OPTIONS]
@@ -301,14 +303,21 @@ conductor status [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--json` | Emit machine-readable output instead of a table |
+| `--live` | List only currently-running workflows (the pre-completed-runs scope) |
 
 ### Why This Exists
 
 `conductor stop` with no arguments also lists running workflows — but it *stops* one when exactly one is running, so the natural "what's running?" reflex is destructive precisely when there is a single run to lose. `conductor status` never terminates anything.
 
-It is also read-only on disk: unlike `stop`, it never removes a run record, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
+It is also read-only on disk: unlike `stop`, it never removes a run record, so a run stays discoverable even if its liveness cannot be confirmed at that moment. That read-only guarantee extends to the completed-runs section below: listing a recently-completed run never removes its terminal record either.
 
 The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone. The table renders `Started` to minute precision in UTC, and the dashboard URL wraps onto a second line rather than being cropped on a narrow terminal. `--json` reports the exact recorded `started_at` value regardless.
+
+> **Contract change:** this command used to mean "runs alive right now."
+> It now also lists recently-completed runs in a second section below the
+> live one. Pass `--live` to restore the exact previous scope (no
+> completed-runs section, and `--json`'s payload has no `completed` key at
+> all — see below).
 
 ### `--json` Payload
 
@@ -325,6 +334,21 @@ The dashboard URL is included because there is otherwise no supported way to rec
       "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log",
       "url": "http://127.0.0.1:8080"
     }
+  ],
+  "completed": [
+    {
+      "run_id": "b2c3d4e5",
+      "workflow": "/tmp/other-workflow.yaml",
+      "status": "completed",
+      "started_at": "2026-03-03T12:00:00+00:00",
+      "ended_at": "2026-03-03T12:05:00+00:00",
+      "duration_seconds": 300.0,
+      "total_tokens": 1234,
+      "total_cost_usd": 0.05,
+      "error_type": null,
+      "error_message": null,
+      "event_log": "/tmp/conductor/conductor-other-workflow-20260303-120000-b2c3d4e5.events.jsonl"
+    }
   ]
 }
 ```
@@ -337,6 +361,15 @@ All three are `null` — never `""` — for a PID file written before this field
 existed. A resumed run whose checkpoint carried no usable run id still gets
 a freshly-minted `run_id` (and matching log paths), not `null`.
 
+The `running` array is **unchanged** from before this command listed
+completed runs — a script reading `payload["running"]` is unaffected by the
+addition of `completed`, which is purely additive. Each `completed` entry's
+`status` is `"completed"` or `"failed"` (the same vocabulary `conductor
+fleet list` and the Fleet Manager TUI's History screen use); `error_type`/
+`error_message` are `null` on success. Passing `--live` emits
+`{"running": [...]}` only, with no `completed` key at all — byte-identical
+to this command's payload before completed runs were added.
+
 ### Exit Codes
 
 | Code | Meaning |
@@ -346,11 +379,14 @@ a freshly-minted `run_id` (and matching log paths), not `null`.
 ### Examples
 
 ```bash
-# What is running right now?
+# What is running right now, plus recently-completed runs
 conductor status
 
 # Machine-readable, for scripts
 conductor status --json
+
+# Only what's running right now (the pre-completed-runs scope)
+conductor status --live
 ```
 
 ## `conductor stop`
@@ -597,27 +633,46 @@ conductor fleet
 ## `conductor fleet list`
 
 List every live Conductor run — foreground, foreground+web, or
-`--web-bg` — as a non-interactive Rich table. Discovers runs the same way
-`conductor stop` does, via the Fleet Manager run record
-(`~/.conductor/runs/`), so foreground runs show up here too, not just
-`--web-bg` ones. This is core functionality with no optional dependency —
-unlike the interactive `conductor fleet` TUI above, which requires the
-`tui` extra.
+`--web-bg` — plus recently-completed ones, as a non-interactive Rich table.
+Discovers live runs the same way `conductor stop` does, via the Fleet
+Manager run record (`~/.conductor/runs/`), so foreground runs show up here
+too, not just `--web-bg` ones. This is core functionality with no optional
+dependency — unlike the interactive `conductor fleet` TUI above, which
+requires the `tui` extra.
 
 ```bash
-conductor fleet list
+conductor fleet list [OPTIONS]
 ```
 
-Each row shows the workflow name, mode (`fg`, `fg-web`, or `bg`), status,
-PID, dashboard port (`—` for a foreground run with no dashboard), and start
-time. When no runs are active, it prints a dim "No runs found." line and
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--live` | List only currently-running workflows (the pre-completed-runs scope) |
+
+Each row shows the workflow name, mode (`fg`, `fg-web`, or `bg` for a live
+run, `—` for a completed one), status, PID, dashboard port (`—` for a
+foreground run with no dashboard, or a completed one), and start time. A
+live row's status is the coarse `running` (a live run can still be blocked
+at a human gate; use the TUI or `--web` for the finer-grained status); a
+completed row carries its real terminal status, `completed` or `failed`.
+The completed set is bounded by `[fleet.retention].keep_last` (see
+[`~/.conductor/config.toml`](configuration.md#machine-wide-settings-conductorconfigtoml)).
+When there is nothing to show, it prints a dim "No runs found." line and
 exits `0` — an empty fleet is a normal state, not an error.
+
+> **Contract change:** this command used to mean "runs alive right now." It
+> now also lists recently-completed runs. Pass `--live` to restore the
+> exact previous scope.
 
 ### Examples
 
 ```bash
-# List every live run
+# List every live run, plus recently-completed ones
 conductor fleet list
+
+# Only what's running right now (the pre-completed-runs scope)
+conductor fleet list --live
 ```
 
 ## `conductor fleet prune`

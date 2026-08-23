@@ -36,11 +36,12 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
 from conductor.fleet import summary
+from conductor.fleet.records import read_terminal_record
 from conductor.fleet.retention import event_log_root
 from conductor.run_id import RUN_ID_PATTERN_SOURCE
 
@@ -141,6 +142,26 @@ class HistoryEntry:
     """Count of completed agents that consumed tokens but had no cost
     data -- mirrors ``RunSummary.unpriced_agent_count`` / issue #265's
     convention rather than silently summing a null into a confident total."""
+
+    output: dict[str, Any] = field(default_factory=dict)
+    """The run's rendered ``output:`` dict, enriched from a matching
+    :class:`~conductor.fleet.records.TerminalRunRecord` (E4-T4) --
+    ``{}`` when there is no matching terminal record (``run_id`` is
+    ``None``, a pre-upgrade run, or the record has already been pruned).
+    This is an **enrichment joined onto** the log-derived entry above,
+    never a replacement for it -- see the module docstring's ``outcome``
+    vs. terminal-record distinction; ``outcome`` continues to come from
+    the event log alone."""
+
+    error_type: str | None = None
+    """The failing run's exception class name, enriched from the matching
+    terminal record; ``None`` when the run succeeded or no terminal
+    record is available."""
+
+    error_message: str | None = None
+    """The failing run's exception message, enriched from the matching
+    terminal record; ``None`` when the run succeeded or no terminal
+    record is available."""
 
     @property
     def has_unpriced(self) -> bool:
@@ -436,6 +457,52 @@ def _resolve_keep_last() -> int:
         return _DEFAULT_KEEP_LAST
 
 
+def _enrich_with_terminal_record(entry: HistoryEntry) -> HistoryEntry:
+    """Join a matching :class:`~conductor.fleet.records.TerminalRunRecord`
+    onto ``entry`` (E4-T4).
+
+    An **enrichment joined onto** the log-derived entry, not a replacement
+    for it (see the module docstring's DD1 grounding): only `output`/
+    `error_type`/`error_message` are added here, and `entry.outcome`
+    (derived from the event log alone, by :func:`_scan_history_events`)
+    is left untouched. Called after :func:`_build_entry` has already
+    completed its single-pass scan, so this never re-reads or re-scans
+    the log itself -- issue #436's single-forward-pass constraint on
+    `_scan_history_events` is unaffected.
+
+    Args:
+        entry: A `HistoryEntry` already built from a full log scan.
+
+    Returns:
+        `entry` unchanged when `entry.run_id` is `None` (an unrecognized
+        filename), when no terminal record exists for it (a pre-upgrade
+        run, a crash before one was ever written, or one already pruned
+        by `fleet.retention`), or when reading the record fails for any
+        reason -- enrichment must never turn a displayable row into a
+        dropped one, so any failure here is swallowed and logged rather
+        than propagated.
+    """
+    if entry.run_id is None:
+        return entry
+    try:
+        record = read_terminal_record(entry.run_id)
+    except Exception:
+        logger.warning(
+            "Failed to read terminal record for run_id=%s; history row unenriched",
+            entry.run_id,
+            exc_info=True,
+        )
+        return entry
+    if record is None:
+        return entry
+    return replace(
+        entry,
+        output=record.output,
+        error_type=record.error_type,
+        error_message=record.error_message,
+    )
+
+
 def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]:
     """Enumerate completed runs from retained event logs (E14-T1).
 
@@ -477,7 +544,7 @@ def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]
     entries: list[HistoryEntry] = []
     for path in candidates:
         try:
-            entries.append(_build_entry(path))
+            entry = _build_entry(path)
         except (OSError, _CorruptEventLogError):
             logger.warning("Skipping unreadable/corrupt event log %s", path, exc_info=True)
             continue
@@ -486,4 +553,5 @@ def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]
                 "Unexpected failure building history entry for %s; skipping", path, exc_info=True
             )
             continue
+        entries.append(_enrich_with_terminal_record(entry))
     return entries

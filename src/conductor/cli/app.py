@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     # Typing-only: ``stop()`` imports ``conductor.cli.self_run`` lazily at
     # runtime, matching the existing lazy import of ``conductor.cli.pid``.
     from conductor.cli.self_run import OwnRunPartition
-    from conductor.fleet.records import RunRecord
+    from conductor.fleet.records import RunRecord, TerminalRunRecord
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +244,101 @@ def _optional_str(value: object) -> str | None:
         ``value`` if it is a non-empty string, otherwise ``None``.
     """
     return value if isinstance(value, str) and value else None
+
+
+_STATUS_COMPLETED_LIMIT = 10
+"""How many recently-completed runs ``conductor status`` renders (E4-T1).
+
+``status`` is a glance command, not an audit log -- ``conductor fleet``'s
+History screen (bounded by ``[fleet.retention].keep_last``) is where the
+full retained history lives.
+"""
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp to an aware UTC ``datetime``, or ``None``.
+
+    Mirrors ``_format_started_at``'s own naive-defaults-to-UTC treatment, but
+    returns the parsed value rather than a formatted string -- used for
+    duration arithmetic against a :class:`TerminalRunRecord`'s
+    ``started_at``/``ended_at`` pair, either of which may independently be
+    missing, unparseable, or naive.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    try:
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except OverflowError:
+        return None
+
+
+def _terminal_duration_seconds(record: TerminalRunRecord) -> float | None:
+    """Return a terminal record's wall-clock duration, or ``None`` when
+    either endpoint is missing or unparseable."""
+    started = _parse_iso_utc(record.started_at)
+    ended = _parse_iso_utc(record.ended_at)
+    if started is None or ended is None:
+        return None
+    return max(0.0, (ended - started).total_seconds())
+
+
+def _format_duration_compact(seconds: float | None) -> str:
+    """Render an elapsed duration compactly (``1h04``, ``18m``, ``42s``).
+
+    Duplicated from ``fleet/tui/screens/runs.py``'s identical helper,
+    matching that module's own precedent of keeping each display surface
+    self-contained rather than importing across the CLI/TUI boundary.
+    """
+    if seconds is None:
+        return "—"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def _format_terminal_status(status: str) -> str:
+    """Map a :class:`TerminalRunRecord`'s raw ``status`` to its display word.
+
+    ``TerminalRunRecord.status`` is written as ``"success"``/``"failed"`` by
+    ``cli/run.py`` (a forward-compat ``"unknown"`` substitutes for an absent
+    field on load). This renders ``"success"`` as ``"completed"`` to match
+    the vocabulary the rest of the Fleet Manager already uses (``fleet/tui/
+    theme.py``, ``fleet/history.py``'s ``HistoryOutcome``) rather than
+    introducing a second word for the same outcome.
+    """
+    return "completed" if status == "success" else status
+
+
+def _format_terminal_tokens(tokens: int | None) -> str:
+    """Render a terminal record's token total, or ``"—"`` when unknown/zero."""
+    if not tokens:
+        return "—"
+    if tokens >= 1000:
+        return f"{tokens / 1000:.0f}k tok"
+    return f"{tokens} tok"
+
+
+def _format_terminal_cost(record: TerminalRunRecord) -> str:
+    """Render a terminal record's cost cell, never presenting a partial
+    total as a complete one (issue #265's ``~$X (N unpriced)`` convention,
+    mirrored from ``fleet/tui/screens/history.py``'s ``_format_cost``).
+    """
+    if record.total_cost_usd is None:
+        if record.unpriced_agent_count > 0:
+            return f"({record.unpriced_agent_count} unpriced)"
+        return "—"
+    if record.unpriced_agent_count > 0:
+        return f"~${record.total_cost_usd:.2f} ({record.unpriced_agent_count} unpriced)"
+    return f"~${record.total_cost_usd:.2f}"
 
 
 def _workflow_has_human_gate(workflow_path: Path) -> bool:
@@ -1408,6 +1503,16 @@ def status(
             help="Emit machine-readable output instead of a table.",
         ),
     ] = False,
+    live_only: Annotated[
+        bool,
+        typer.Option(
+            "--live",
+            help=(
+                "List only currently-running workflows, reproducing this command's "
+                "pre-completed-runs scope exactly."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """List background workflows without stopping any of them.
 
@@ -1421,6 +1526,12 @@ def status(
     to recover it once the launching terminal is gone.
 
     \b
+    Also lists a handful of recently-completed runs (their terminal status,
+    when they ended, duration, tokens/cost, and error type for a failure) --
+    pass `--live` to see only currently-running workflows, matching this
+    command's scope before completed runs were added.
+
+    \b
     Exit codes:
         0  listed successfully (including when nothing is running)
 
@@ -1428,6 +1539,7 @@ def status(
     Examples:
         conductor status
         conductor status --json
+        conductor status --live
     """
     import json
 
@@ -1437,6 +1549,12 @@ def status(
     # would make the read-only command destructive — the exact trap this
     # command exists to give people an alternative to.
     running = scan_run_records()
+
+    completed: list[TerminalRunRecord] = []
+    if not live_only:
+        from conductor.fleet.records import read_terminal_records
+
+        completed = read_terminal_records(limit=_STATUS_COMPLETED_LIMIT)
 
     if json_output:
         payload = []
@@ -1456,19 +1574,59 @@ def status(
                     "url": (f"http://127.0.0.1:{e.port}" if e.port is not None else None),
                 }
             )
-        output_console.print_json(json.dumps({"running": payload}), ensure_ascii=True)
+        # ``running`` stays byte-compatible with the pre-completed-runs shape
+        # (E4-T2) -- a machine consumer reading `payload["running"]` is
+        # unaffected by this command's scope growing. `--live` stops here,
+        # matching the exact old payload; otherwise `completed` is added as
+        # a sibling array, additive rather than replacing anything.
+        if live_only:
+            output_console.print_json(json.dumps({"running": payload}), ensure_ascii=True)
+            return
+
+        completed_payload = []
+        for t in completed:
+            completed_payload.append(
+                {
+                    "run_id": t.run_id,
+                    "workflow": t.workflow_path,
+                    "status": _format_terminal_status(t.status),
+                    "started_at": t.started_at,
+                    "ended_at": t.ended_at,
+                    "duration_seconds": _terminal_duration_seconds(t),
+                    "total_tokens": t.total_tokens,
+                    "total_cost_usd": t.total_cost_usd,
+                    "error_type": t.error_type,
+                    "error_message": t.error_message,
+                    "event_log": t.event_log_path or None,
+                }
+            )
+        output_console.print_json(
+            json.dumps({"running": payload, "completed": completed_payload}),
+            ensure_ascii=True,
+        )
         return
 
     if not running:
         console.print(Text.from_markup("[dim]No background workflows are currently running.[/dim]"))
+    else:
+        _print_running_list(running, console, show_url=True)
+        console.print(
+            styled(
+                "\n[dim]{} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]",
+                len(running),
+            )
+        )
+
+    if live_only:
         return
 
-    _print_running_list(running, console, show_url=True)
-    console.print(
-        styled(
-            "\n[dim]{} running. Use 'conductor stop --port <PORT>' to stop one.[/dim]", len(running)
-        )
-    )
+    console.print()
+    if not completed:
+        console.print(Text.from_markup("[dim]No recently completed runs.[/dim]"))
+        return
+
+    console.print(Text.from_markup("[bold]Recently completed:[/bold]"))
+    _print_completed_list(completed, console)
 
 
 def _discover_running_records() -> list[RunRecord]:
@@ -2647,6 +2805,44 @@ def _print_running_list(entries: list[RunRecord], con: Console, show_url: bool =
         if show_url:
             row.append(f"http://127.0.0.1:{e.port}" if e.port is not None else "—")
         table.add_row(*row)
+
+    con.print(table)
+
+
+def _print_completed_list(entries: list[TerminalRunRecord], con: Console) -> None:
+    """Print a table of recently-completed runs (E4-T1).
+
+    ``Ended`` reuses ``_format_started_at``'s ISO-to-minute-precision-UTC
+    rendering -- that helper is not actually PID-specific despite its name,
+    it just formats an ISO 8601 timestamp the same way regardless of which
+    field it came from. ``Error`` shows only the error type (not the full
+    message, which can be long); ``--json`` reports both in full.
+
+    Args:
+        entries: List of terminal run records, newest-first.
+        con: Rich Console for output.
+    """
+    from rich.table import Table
+
+    table = Table(show_lines=False)
+    table.add_column("Workflow", style="white")
+    table.add_column("Status", style="magenta")
+    table.add_column("Ended", style="dim", overflow="fold")
+    table.add_column("Duration", style="cyan")
+    table.add_column("Tokens", style="yellow")
+    table.add_column("Cost", style="green")
+    table.add_column("Error", style="red")
+
+    for t in entries:
+        table.add_row(
+            t.workflow_name or Path(str(t.workflow_path or "unknown")).stem,
+            _format_terminal_status(t.status),
+            _format_started_at(t.ended_at),
+            _format_duration_compact(_terminal_duration_seconds(t)),
+            _format_terminal_tokens(t.total_tokens),
+            _format_terminal_cost(t),
+            t.error_type or "—",
+        )
 
     con.print(table)
 

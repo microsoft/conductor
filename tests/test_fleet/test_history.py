@@ -57,6 +57,54 @@ def temp_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return event_log_root()
 
 
+@pytest.fixture()
+def terminal_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the run-record directory (and thus ``terminal_records_dir()``)
+    to an isolated location, mirroring ``tests/test_fleet/test_records.py``'s
+    own fixture -- so E4-T4's enrichment tests never touch the developer's
+    real ``~/.conductor/``.
+    """
+    home = tmp_path / "conductor_home"
+    home.mkdir()
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+    return home
+
+
+def _write_terminal_record(
+    run_id: str,
+    *,
+    status: str = "success",
+    workflow: str = "/tmp/my-workflow.yaml",
+    output: dict[str, Any] | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Write a terminal run record via the real ``write_terminal_record``,
+    matching E2's ``TerminalRunRecord``/``write_terminal_record`` contract
+    (see ``tests/test_fleet/test_terminal_records.py``)."""
+    from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+    write_terminal_record(
+        TerminalRunRecord(
+            run_id=run_id,
+            workflow_path=workflow,
+            workflow_name=Path(workflow).stem,
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:05:00+00:00",
+            status=status,
+            output=output or {},
+            error_type=error_type,
+            error_message=error_message,
+            total_tokens=None,
+            total_cost_usd=None,
+            unpriced_agent_count=0,
+            event_log_path=f"/tmp/conductor/{run_id}.events.jsonl",
+            bg_stderr_log=None,
+            bg_stdout_log=None,
+        )
+    )
+
+
 def _event(etype: str, data: dict[str, Any] | None = None, *, ts: float | None = None) -> str:
     """Serialize a single JSONL event line matching WorkflowEvent.to_dict()'s shape."""
     return json.dumps(
@@ -769,6 +817,142 @@ class TestHistoryEntryShape:
 
         assert isinstance(entries[0], HistoryEntry)
         assert entries[0].path == path
+
+
+# ---------------------------------------------------------------------------
+# Terminal-record enrichment (MCP server plan E4-T4): output/error_type/
+# error_message are joined onto the log-derived entry by run_id, never
+# replacing the outcome the log scan already produced.
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalRecordEnrichment:
+    def test_matching_record_enriches_output_never_replaces_outcome(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        _write_log(
+            temp_root,
+            run_id="cafe0001",
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+        _write_terminal_record("cafe0001", status="success", output={"answer": "42"})
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].output == {"answer": "42"}
+        assert entries[0].error_type is None
+        assert entries[0].error_message is None
+        # The join is additive -- outcome still comes from the event log,
+        # not the terminal record's own status field.
+        assert entries[0].outcome == "completed"
+
+    def test_failed_run_carries_error_type_and_message(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        _write_log(
+            temp_root,
+            run_id="cafe0002",
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=1010.0),
+            ],
+        )
+        _write_terminal_record(
+            "cafe0002", status="failed", error_type="ValueError", error_message="boom"
+        )
+
+        entries = build_history_entries()
+
+        assert entries[0].outcome == "failed"
+        assert entries[0].error_type == "ValueError"
+        assert entries[0].error_message == "boom"
+
+    def test_no_matching_terminal_record_keeps_fields_none(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        """A pre-upgrade or crashed run has no terminal record at all --
+        the row must keep working with the new fields at their defaults."""
+        _write_log(
+            temp_root,
+            run_id="cafe0003",
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].output == {}
+        assert entries[0].error_type is None
+        assert entries[0].error_message is None
+
+    def test_unrecognized_filename_never_attempts_the_lookup(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        """An entry whose ``run_id`` is ``None`` (an unrecognized filename)
+        must not be dropped -- enrichment is skipped, not fatal."""
+        path = temp_root / "conductor-not-the-expected-shape.events.jsonl"
+        path.write_text("")
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].run_id is None
+        assert entries[0].output == {}
+        assert entries[0].error_type is None
+
+    def test_corrupt_terminal_record_does_not_drop_the_row(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        """A terminal record that fails to parse must not turn a
+        displayable history row into a dropped one."""
+        _write_log(
+            temp_root,
+            run_id="cafe0004",
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+        from conductor.fleet.records import terminal_records_dir
+
+        (terminal_records_dir() / "cafe0004.json").write_text("{not json")
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].output == {}
+        assert entries[0].error_type is None
+
+    def test_terminal_record_read_failure_does_not_raise(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        """Any unexpected failure reading the terminal record is swallowed
+        -- the row `_build_entry` already produced must survive."""
+        _write_log(
+            temp_root,
+            run_id="cafe0005",
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+
+        with patch(
+            "conductor.fleet.history.read_terminal_record",
+            side_effect=RuntimeError("boom"),
+        ):
+            entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].output == {}
+        assert entries[0].error_type is None
 
 
 # ---------------------------------------------------------------------------

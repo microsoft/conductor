@@ -160,6 +160,42 @@ def _write_checkpoint(
     return path
 
 
+def _write_terminal_record(
+    run_id: str,
+    *,
+    status: str = "success",
+    workflow: str = "/tmp/my-workflow.yaml",
+    output: dict[str, Any] | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Write a terminal run record via the real ``write_terminal_record``
+    (E4-T4/E4-T5), mirroring ``tests/test_fleet/test_history.py``'s own
+    helper. Requires ``CONDUCTOR_HOME`` already redirected (``fleet_env``).
+    """
+    from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+    write_terminal_record(
+        TerminalRunRecord(
+            run_id=run_id,
+            workflow_path=workflow,
+            workflow_name=Path(workflow).stem,
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:05:00+00:00",
+            status=status,
+            output=output or {},
+            error_type=error_type,
+            error_message=error_message,
+            total_tokens=None,
+            total_cost_usd=None,
+            unpriced_agent_count=0,
+            event_log_path=f"/tmp/conductor/{run_id}.events.jsonl",
+            bg_stderr_log=None,
+            bg_stdout_log=None,
+        )
+    )
+
+
 async def _goto_history(pilot) -> None:
     """Navigate from the (already-mounted) Runs screen to History."""
     await settle(pilot)
@@ -1356,3 +1392,136 @@ class TestReplayCommandFooter:
         message = mock_notify.call_args.args[0]
         assert "conductor replay" in message
         assert str(log_path) in message
+
+
+# ---------------------------------------------------------------------------
+# Outcome detail surfaced on row selection (E4-T5)
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryOutcomeDetail:
+    """The design says this screen "currently cannot show" a failed run's
+    error message or a completed run's rendered output -- E4-T5 surfaces
+    both where a row selection can reach them, without adding a sixth
+    column to the table."""
+
+    async def test_selecting_a_failed_row_surfaces_the_error_message(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _write_log(
+            event_log_dir,
+            name="failed-wf",
+            run_id="00000002",
+            lines=[
+                _event("workflow_started", {"name": "failed-wf"}, ts=2000.0),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=2010.0),
+            ],
+        )
+        _write_terminal_record(
+            "00000002",
+            status="failed",
+            workflow="/tmp/failed-wf.yaml",
+            error_type="ValueError",
+            error_message="something went wrong",
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await pilot.pause()
+
+        mock_notify.assert_called_once()
+        message = mock_notify.call_args.args[0]
+        assert "ValueError" in message
+        assert "something went wrong" in message
+        # The replay hint must still be present alongside the new detail.
+        assert "conductor replay" in message
+
+    async def test_selecting_a_completed_row_surfaces_the_output(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _write_log(
+            event_log_dir,
+            name="completed-wf",
+            run_id="00000001",
+            lines=[
+                _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+            ],
+        )
+        _write_terminal_record(
+            "00000001",
+            status="success",
+            workflow="/tmp/completed-wf.yaml",
+            output={"answer": "42"},
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await pilot.pause()
+
+        mock_notify.assert_called_once()
+        message = mock_notify.call_args.args[0]
+        assert "42" in message
+        assert "conductor replay" in message
+
+    async def test_a_row_with_no_terminal_record_still_offers_replay_only(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """No matching terminal record (e.g. a pre-upgrade run) must not
+        crash the row-selection handler -- it just falls back to the
+        replay-only notification."""
+        _write_log(
+            event_log_dir,
+            name="no-record-wf",
+            run_id="00000003",
+            lines=[
+                _event("workflow_started", {"name": "no-record-wf"}, ts=3000.0),
+                _event("workflow_completed", {"elapsed": 1.0}, ts=3001.0),
+            ],
+        )
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+            table.move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await pilot.pause()
+
+        mock_notify.assert_called_once()
+        message = mock_notify.call_args.args[0]
+        assert "conductor replay" in message
+
+    async def test_the_five_columns_are_unchanged(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """The table itself must stay exactly as wide as before -- the new
+        detail is reachable only via row selection, not a sixth column."""
+        _write_log(
+            event_log_dir,
+            name="completed-wf",
+            run_id="00000001",
+            lines=[
+                _event("workflow_started", {"name": "completed-wf"}, ts=1000.0),
+                _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+            ],
+        )
+        _write_terminal_record("00000001", status="success", output={"answer": "42"})
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            table = app.screen.query_one(DataTable)
+
+        assert len(table.columns) == 5
