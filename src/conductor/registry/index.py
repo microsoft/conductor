@@ -12,6 +12,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from ruamel.yaml import YAML, YAMLError
 
+from conductor.config.schema import InputDef, McpConfig
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError, RegistryNotFoundError
 
@@ -29,6 +30,26 @@ class WorkflowInfo(BaseModel):
     description: str = ""
     path: str
     """Relative path from registry root to the workflow YAML."""
+
+    input: dict[str, InputDef] | None = None
+    """Optional input schema for this workflow, authored directly in the
+    registry index.
+
+    This is schema-ladder tier 1 for the MCP catalogue builder (see
+    ``docs/projects/mcp-server/conductor-mcp.design.md``, Key Components
+    → 1): when a registry maintainer declares this inline, the catalogue
+    never needs to fetch and parse the workflow YAML to learn its input
+    shape. ``None`` when the index does not declare it — distinct from an
+    empty dict, which would mean "no inputs". Absent from every existing
+    index, so existing indexes parse identically to before this field
+    existed.
+    """
+
+    mcp: McpConfig | None = None
+    """Optional ``workflow.mcp:`` block for this workflow, authored
+    directly in the registry index (the same tier-1 shortcut as
+    ``input``). ``None`` when the index does not declare it.
+    """
 
 
 class RegistryIndex(BaseModel):

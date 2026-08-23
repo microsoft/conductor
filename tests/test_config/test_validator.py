@@ -2143,7 +2143,7 @@ class TestSubWorkflowRefValidation:
         # right registry name, workflow name, and ref.
         captured_args: dict[str, object] = {}
 
-        def capture_fetch(registry_name, registry_entry, workflow_name, ref):
+        def capture_fetch(registry_name, registry_entry, workflow_name, ref, **_kwargs):
             captured_args["registry_name"] = registry_name
             captured_args["workflow_name"] = workflow_name
             captured_args["ref"] = ref
@@ -2567,7 +2567,7 @@ class TestSubWorkflowRefValidation:
         # Capture fetch_workflow_adhoc args to verify the right owner/repo/workflow/ref
         captured_args: dict[str, object] = {}
 
-        def capture_adhoc_fetch(owner, repo, workflow_name, ref):
+        def capture_adhoc_fetch(owner, repo, workflow_name, ref, **_kwargs):
             captured_args["owner"] = owner
             captured_args["repo"] = repo
             captured_args["workflow_name"] = workflow_name

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import BaseModel
 from ruamel.yaml import YAML
 
 from conductor.registry.config import RegistryEntry, RegistryType
@@ -426,6 +427,114 @@ class TestLegacySchema:
         assert "wf" in idx.workflows
         assert idx.workflows["wf"].path == "workflows/wf.yaml"
         assert not hasattr(idx.workflows["wf"], "versions")
+
+
+# ---------------------------------------------------------------------------
+# Tests: E5-T1 optional input/mcp fields
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowInfoInputMcpFields:
+    """Tests for the optional ``input``/``mcp`` fields added to ``WorkflowInfo``."""
+
+    def test_defaults_to_none_when_absent(self) -> None:
+        """A WorkflowInfo built without input/mcp leaves both as None."""
+        info = WorkflowInfo(description="desc", path="wf.yaml")
+        assert info.input is None
+        assert info.mcp is None
+
+    def test_old_index_without_new_fields_loads_unchanged(self) -> None:
+        """An index with only description+path (the pre-E5 shape) is unaffected."""
+        idx = RegistryIndex.model_validate(_SAMPLE_INDEX)
+        assert idx.workflows["qa-bot"].description == "Simple Q&A workflow"
+        assert idx.workflows["qa-bot"].path == "workflows/qa-bot.yaml"
+        assert idx.workflows["qa-bot"].input is None
+        assert idx.workflows["qa-bot"].mcp is None
+
+    def test_index_with_input_and_mcp_parses(self) -> None:
+        """A new-style index declaring input/mcp inline parses both fields."""
+        raw = {
+            "workflows": {
+                "qa-bot": {
+                    "description": "Simple Q&A",
+                    "path": "workflows/qa-bot.yaml",
+                    "input": {
+                        "question": {
+                            "type": "string",
+                            "required": True,
+                            "description": "The question to ask",
+                        }
+                    },
+                    "mcp": {
+                        "expose": True,
+                        "mode": "sync",
+                        "read_only": True,
+                        "destructive": False,
+                        "estimated_minutes": 2,
+                    },
+                }
+            }
+        }
+        idx = RegistryIndex.model_validate(raw)
+        info = idx.workflows["qa-bot"]
+        assert info.input is not None
+        assert info.input["question"].type == "string"
+        assert info.input["question"].required is True
+        assert info.mcp is not None
+        assert info.mcp.mode == "sync"
+        assert info.mcp.read_only is True
+        assert info.mcp.estimated_minutes == 2
+
+    def test_a_build_that_ignores_the_fields_still_loads(self) -> None:
+        """A pre-E5 build (a ``WorkflowInfo`` that only knows about
+        ``description``/``path``) loading a real index.yaml with raw
+        ``input``/``mcp`` fields does not choke on them — it simply ignores
+        the fields it doesn't recognize, which is what makes rolling out
+        the new index fields backward compatible with older Conductor
+        installs reading the same registry.
+        """
+
+        class LegacyWorkflowInfo(BaseModel):
+            """Stand-in for the pre-E5 ``WorkflowInfo`` model."""
+
+            description: str = ""
+            path: str
+
+        class LegacyRegistryIndex(BaseModel):
+            workflows: dict[str, LegacyWorkflowInfo] = {}
+
+        raw_data = {
+            "workflows": {
+                "wf": {
+                    "description": "desc",
+                    "path": "wf.yaml",
+                    "input": {"name": {"type": "string", "required": False}},
+                    "mcp": {"mode": "auto"},
+                }
+            }
+        }
+
+        idx = LegacyRegistryIndex.model_validate(raw_data)
+        assert idx.workflows["wf"].path == "wf.yaml"
+        assert idx.workflows["wf"].description == "desc"
+        assert not hasattr(idx.workflows["wf"], "input")
+        assert not hasattr(idx.workflows["wf"], "mcp")
+
+    def test_round_trip_via_model_dump_and_validate(self) -> None:
+        """A WorkflowInfo with input/mcp round-trips through dump/validate."""
+        from conductor.config.schema import InputDef, McpConfig
+
+        info = WorkflowInfo(
+            description="desc",
+            path="wf.yaml",
+            input={"name": InputDef(type="string", required=False, default="world")},
+            mcp=McpConfig(mode="auto", destructive=True),
+        )
+        dumped = info.model_dump(mode="json")
+        restored = WorkflowInfo.model_validate(dumped)
+        assert restored.input["name"].default == "world"
+        assert restored.mcp.mode == "auto"
+        assert restored.mcp.destructive is True
 
 
 # ---------------------------------------------------------------------------

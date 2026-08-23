@@ -22,6 +22,9 @@ just as they do at the source.
     <base>/<registry>/_meta/<sha[:12]>/source.json      # cache metadata
     <base>/<registry>/_meta/<sha[:12]>/index.yaml       # cached registry index
     <base>/<registry>/_meta/<sha[:12]>/<workflow>.complete  # readiness sentinel
+    <base>/<registry>/_meta/<sha[:12]>/tools.json       # SHA-keyed parse cache
+    <base>/<registry>/_meta/<sha[:12]>/tools.complete   # parse-cache sentinel
+    <base>/<registry>/_meta/_refs/<ref-slug>.json       # last SHA a floating ref had
 
 For ad-hoc references (``workflow@owner/repo#ref``) the registry namespace
 is ``_adhoc/<owner>/<repo>`` so adhoc caches are isolated from named
@@ -38,12 +41,36 @@ source repo.
 A workflow is considered "fully cached" only when its readiness sentinel
 file exists (written **last** during a fetch). This prevents readers from
 observing a partially populated workflow during a concurrent fetch.
+
+Offline resolution and the parse cache
+=======================================
+
+Two additions make the catalogue answerable from a warm cache with zero
+network I/O (MCP server plan E5 — see
+``docs/projects/mcp-server/conductor-mcp.plan.md``):
+
+* ``_meta/_refs/<ref-slug>.json`` records the SHA a floating ref (``latest``,
+  a branch, a tag) last resolved to, written on every successful online
+  resolution. It is modelled directly on ``plugins/fetch.py``'s own
+  ``_refs/<slug>.json`` pointer, which exists for exactly this reason: without
+  a record of what a floating ref last meant, an offline caller has no
+  checkout to choose. ``fetch_workflow(..., allow_network=False)`` reads this
+  pointer instead of calling the GitHub API, and raises :class:`RegistryError`
+  when no pointer has been recorded yet.
+* ``_meta/<sha>/tools.json`` (guarded by the ``tools.complete`` sentinel,
+  written last, same as every other sentinel here) caches a normalized,
+  already-resolved tool definition per workflow — its description, resolved
+  input schema, and ``mcp:`` block — via :func:`save_parsed_tools` /
+  :func:`load_parsed_tools`. A SHA-keyed entry is immutable, which is what
+  makes reuse safe without re-verification.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -52,26 +79,36 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
+from conductor.config.schema import InputDef, McpConfig
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
 from conductor.registry.github import fetch_file, list_directory, parse_github_source
-from conductor.registry.index import RegistryIndex, load_index, parse_index_text
+from conductor.registry.index import RegistryIndex, WorkflowInfo, load_index, parse_index_text
 from conductor.registry.version_resolver import materialize_to_sha, resolve_ref
 
 if TYPE_CHECKING:
     from conductor.registry.resolver import ResolvedRef
+
+logger = logging.getLogger(__name__)
 
 # Reserved cache namespaces. Cannot collide with named registries because
 # configured registry names are not allowed to contain '/' and these names
 # start with '_'.
 _ADHOC_NAMESPACE = "_adhoc"
 _META_NAMESPACE = "_meta"
+_REFS_NAMESPACE = "_refs"
 
 # Current on-disk cache layout version. Bumping this invalidates all existing
 # caches (their source.json will fail validation and the entries are re-fetched).
 CACHE_LAYOUT_VERSION = 2
 
 _SHA_DIR_RE = re.compile(r"^[0-9a-f]{12}$")
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+# Characters kept when turning a ref into a filename. A ref may contain '/'
+# (e.g. "release/1.x"), which would otherwise create directories inside
+# _refs. Mirrors plugins/fetch.py's _REF_SLUG_UNSAFE.
+_REF_SLUG_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +150,79 @@ def _sentinel_path(registry_name: str, sha: str, workflow_name: str) -> Path:
     # workflow_name is a registry index key; sanitize for filesystem use.
     safe = workflow_name.replace("/", "_").replace("\\", "_")
     return _meta_dir(registry_name, sha) / f"{safe}.complete"
+
+
+def _tools_cache_path(registry_name: str, sha: str) -> Path:
+    """Return the SHA-keyed parse-cache file for a registry."""
+    return _meta_dir(registry_name, sha) / "tools.json"
+
+
+def _tools_cache_sentinel(registry_name: str, sha: str) -> Path:
+    """Return the readiness sentinel for the SHA-keyed parse cache."""
+    return _meta_dir(registry_name, sha) / "tools.complete"
+
+
+def _refs_dir(registry_name: str) -> Path:
+    """Return the directory holding ref→SHA pointers for a registry."""
+    return _registry_root(registry_name) / _META_NAMESPACE / _REFS_NAMESPACE
+
+
+def _ref_slug(ref: str | None) -> str:
+    """Turn a ref into a filename-safe, collision-free slug.
+
+    Mirrors ``plugins/fetch.py``'s ``_ref_slug``: the sanitised name alone is
+    lossy (``release/1.x`` and ``release_1.x`` would collide, and a branch
+    literally named ``_default`` would collide with the no-ref case), so a
+    short hash of the original is appended.
+
+    ``None`` and ``"latest"`` (case-insensitively) both mean "the registry's
+    default branch" per :func:`~conductor.registry.version_resolver.resolve_ref`,
+    so they are normalized to the same slug — a single pointer file serves
+    both spellings rather than two files that could disagree.
+    """
+    normalized = None if ref is None or ref.lower() == "latest" else ref
+    if not normalized:
+        return "_default"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"{_REF_SLUG_UNSAFE.sub('_', normalized)}-{digest}"
+
+
+def _ref_pointer_path(registry_name: str, ref: str | None) -> Path:
+    """Return the file recording the last SHA a floating ref resolved to."""
+    return _refs_dir(registry_name) / f"{_ref_slug(ref)}.json"
+
+
+def _read_ref_pointer(registry_name: str, ref: str | None) -> str | None:
+    """Return the SHA a floating ref last resolved to, if a pointer exists.
+
+    Returns ``None`` when there is no pointer, it cannot be parsed, or its
+    recorded SHA is not a well-formed 40-character hex string.
+    """
+    pointer = _ref_pointer_path(registry_name, ref)
+    try:
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+    except (FileNotFoundError, NotADirectoryError, json.JSONDecodeError, OSError):
+        return None
+    sha = payload.get("sha") if isinstance(payload, dict) else None
+    if not isinstance(sha, str) or not _FULL_SHA_RE.match(sha):
+        return None
+    return sha.lower()
+
+
+def _write_ref_pointer(registry_name: str, ref: str | None, sha: str) -> None:
+    """Record which SHA a ref resolved to, for the offline fallback.
+
+    Best-effort: an unwritable cache costs a future offline run its fallback,
+    which is not worth failing a working online fetch over. Uses the same
+    atomic temp-file-plus-rename convention as the rest of this module so a
+    concurrent reader never observes a half-written pointer.
+    """
+    pointer = _ref_pointer_path(registry_name, ref)
+    try:
+        payload = json.dumps({"ref": ref, "sha": sha}, sort_keys=True)
+        _atomic_write_text(pointer, payload)
+    except OSError as exc:
+        logger.debug("Could not record ref pointer %s: %s", pointer, exc)
 
 
 def _safe_repo_path(repo_path: str) -> PurePosixPath:
@@ -276,6 +386,99 @@ def _save_cached_index(meta_dir: Path, raw_yaml_text: str) -> None:
     _atomic_write_text(meta_dir / "index.yaml", raw_yaml_text)
 
 
+# ---------------------------------------------------------------------------
+# SHA-keyed parse cache
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParsedToolInfo:
+    """A normalized, already-resolved tool definition, cached per SHA.
+
+    Captures exactly what the MCP catalogue builder needs to publish a
+    workflow as a tool without re-parsing its YAML: its description,
+    resolved input schema, and ``mcp:`` block. Keyed by workflow name and
+    persisted under ``_meta/<sha[:12]>/tools.json`` (schema-ladder tier 2;
+    see ``docs/projects/mcp-server/conductor-mcp.design.md``, Key
+    Components → 1). Immutable because the SHA it is cached under is
+    immutable — that is what makes reuse safe without re-verification.
+    """
+
+    description: str
+    input: dict[str, InputDef]
+    mcp: McpConfig
+
+
+def save_parsed_tools(registry_name: str, sha: str, tools: dict[str, ParsedToolInfo]) -> None:
+    """Atomically persist the SHA-keyed parse cache for a registry.
+
+    Writes ``tools.json`` and then the ``tools.complete`` sentinel **last**,
+    matching the readiness-sentinel convention used everywhere else in this
+    module, so a concurrent reader never observes a half-written cache.
+
+    Args:
+        registry_name: Name of the registry the SHA belongs to.
+        sha: Full immutable commit SHA (only the first 12 chars are used as
+            the on-disk directory name, same as elsewhere in this module).
+        tools: Parsed tool definitions, keyed by workflow name.
+    """
+    meta_dir = _meta_dir(registry_name, sha)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "cache_layout_version": CACHE_LAYOUT_VERSION,
+        "tools": {
+            name: {
+                "description": info.description,
+                "input": {key: value.model_dump(mode="json") for key, value in info.input.items()},
+                "mcp": info.mcp.model_dump(mode="json"),
+            }
+            for name, info in tools.items()
+        },
+    }
+    _atomic_write_text(_tools_cache_path(registry_name, sha), json.dumps(payload, sort_keys=True))
+    _atomic_write_text(_tools_cache_sentinel(registry_name, sha), "")
+
+
+def load_parsed_tools(registry_name: str, sha: str) -> dict[str, ParsedToolInfo] | None:
+    """Load the SHA-keyed parse cache for a registry.
+
+    Returns ``None`` when the readiness sentinel is missing (a write is in
+    progress, was interrupted, or never happened), the cache layout version
+    does not match :data:`CACHE_LAYOUT_VERSION`, or the file cannot be
+    parsed — callers fall back to fetching and parsing the workflow file
+    directly (schema-ladder tier 3).
+
+    A single malformed entry is skipped rather than discarding the whole
+    cache, so one bad row does not cost every other workflow its warm-cache
+    hit.
+    """
+    if not _tools_cache_sentinel(registry_name, sha).is_file():
+        return None
+    try:
+        raw_text = _tools_cache_path(registry_name, sha).read_text(encoding="utf-8")
+        data = json.loads(raw_text)
+    except (FileNotFoundError, NotADirectoryError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or data.get("cache_layout_version") != CACHE_LAYOUT_VERSION:
+        return None
+    raw_tools = data.get("tools")
+    if not isinstance(raw_tools, dict):
+        return None
+
+    result: dict[str, ParsedToolInfo] = {}
+    for name, raw in raw_tools.items():
+        try:
+            result[name] = ParsedToolInfo(
+                description=str(raw["description"]),
+                input={key: InputDef.model_validate(value) for key, value in raw["input"].items()},
+                mcp=McpConfig.model_validate(raw["mcp"]),
+            )
+        except Exception as exc:
+            logger.debug("Skipping malformed parse-cache entry %r for %s: %s", name, sha, exc)
+            continue
+    return result
+
+
 def _atomic_write_text(target: Path, text: str) -> None:
     """Atomically write text to ``target`` via tempfile + ``os.replace``."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -374,11 +577,44 @@ def get_cached_workflow_path(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_sha_offline(registry_name: str, ref: str | None) -> str:
+    """Resolve a github ref to a SHA without touching the network.
+
+    An already-fully-qualified 40-character SHA is normalized to lowercase
+    and used directly — it is already immutable, so there is nothing to
+    look up. Anything else (``None``, ``"latest"``, a branch, or a tag) is a
+    floating ref and can only be resolved via a pointer
+    :func:`_write_ref_pointer` recorded during a prior online call.
+
+    Raises:
+        RegistryError: If ``ref`` is not already a SHA and no ref pointer
+            has been recorded for it.
+    """
+    if ref is not None and _FULL_SHA_RE.match(ref):
+        return ref.lower()
+
+    cached_sha = _read_ref_pointer(registry_name, ref)
+    if cached_sha is not None:
+        return cached_sha
+
+    ref_label = ref if ref else "the default branch"
+    raise RegistryError(
+        f"Ref {ref_label!r} for registry '{registry_name}' has not been resolved on this "
+        "machine and network access is not permitted.",
+        suggestion=(
+            "Fetch this workflow once with network access (e.g. via 'conductor run' or "
+            "'conductor validate') to record the ref, or pin to an explicit commit SHA."
+        ),
+    )
+
+
 def fetch_workflow(
     registry_name: str,
     registry_entry: RegistryEntry,
     workflow_name: str,
     ref: str | None = None,
+    *,
+    allow_network: bool = True,
 ) -> Path:
     """Fetch a workflow from a registry and cache it locally.
 
@@ -403,18 +639,31 @@ def fetch_workflow(
         workflow_name: Workflow key as listed in the registry index.
         ref: Explicit git ref (tag, branch, or SHA), or ``None`` for the
             registry's default (default branch HEAD).
+        allow_network: When ``False``, resolve entirely from the local
+            cache — no GitHub API calls. A floating ``ref`` (``None``,
+            ``"latest"``, a branch, or a tag) resolves through the ref
+            pointer recorded by a previous online call
+            (:func:`_write_ref_pointer`); an already-fully-qualified 40-char
+            SHA is used verbatim. A cache miss at any point (no recorded
+            pointer, or the workflow is not fully cached at the resolved
+            SHA) is a typed :class:`RegistryError` naming the fetch path,
+            rather than a silent HTTP call. This is the same posture
+            ``plugins/resolution.py`` takes between ``conductor run`` and
+            ``conductor validate``. Ignored for path registries, which
+            never touch the network.
 
     Returns:
         Path to the cached workflow YAML file.
 
     Raises:
-        RegistryError: On fetch failure, missing workflow, or I/O errors.
-            Failures fetching sibling files in the same directory are
-            silently swallowed (best-effort) — only the workflow file
-            itself must succeed.
+        RegistryError: On fetch failure, missing workflow, cache miss while
+            ``allow_network=False``, or I/O errors. Failures fetching
+            sibling files in the same directory are silently swallowed
+            (best-effort) — only the workflow file itself must succeed.
     """
     # Path registries: read directly from source. resolve_ref raises if a
-    # ref was supplied, propagating a clear error to the caller.
+    # ref was supplied, propagating a clear error to the caller. No network
+    # is ever involved, so allow_network is a no-op here.
     if registry_entry.type == RegistryType.path:
         resolve_ref(registry_entry, ref)
         index = load_index(registry_entry)
@@ -439,8 +688,14 @@ def fetch_workflow(
         return source_path
 
     # GitHub registry: resolve ref → SHA, then attempt cache hit.
-    resolved_ref = resolve_ref(registry_entry, ref)
-    sha = materialize_to_sha(registry_entry, resolved_ref)
+    if allow_network:
+        resolved_ref = resolve_ref(registry_entry, ref)
+        sha = materialize_to_sha(registry_entry, resolved_ref)
+        # Record what this ref resolved to, so a later cache-only caller can
+        # resolve the same floating ref without touching the network.
+        _write_ref_pointer(registry_name, ref, sha)
+    else:
+        sha = _resolve_sha_offline(registry_name, ref)
 
     meta = _meta_dir(registry_name, sha)
     metadata = _read_source_metadata(meta)
@@ -459,12 +714,24 @@ def fetch_workflow(
             )
             if cached is not None:
                 return cached
-    else:
+    elif allow_network:
         # Stale or missing metadata — clear the meta dir to avoid serving an
         # inconsistent index/source on a subsequent miss. Don't touch the SHA
         # mirror itself; new fetches will overwrite content-addressed files.
+        # Left untouched when offline: there is nothing else to try, and an
+        # offline caller should not be able to destroy cache state.
         if metadata is not None:
             shutil.rmtree(meta, ignore_errors=True)
+
+    if not allow_network:
+        raise RegistryError(
+            f"Workflow '{workflow_name}' in registry '{registry_name}' at {sha[:12]} is not "
+            "available in the local cache and network access is not permitted.",
+            suggestion=(
+                f"Run 'conductor run'/'conductor validate' against registry '{registry_name}' "
+                "with network access once to prime the cache for this workflow."
+            ),
+        )
 
     # Fetch the index from the upstream registry (pinned to SHA) and persist it.
     index = load_index(registry_entry, ref=sha)
@@ -512,6 +779,8 @@ def fetch_workflow_adhoc(
     repo: str,
     workflow_name: str,
     ref: str | None = None,
+    *,
+    allow_network: bool = True,
 ) -> Path:
     """Fetch an ad-hoc workflow from a GitHub repo without registry config.
 
@@ -526,12 +795,15 @@ def fetch_workflow_adhoc(
         workflow_name: Workflow key as listed in the repo's ``index.yaml``.
         ref: Optional git ref (tag, branch, or SHA). ``None`` resolves to
             the repository's default branch HEAD.
+        allow_network: When ``False``, resolve entirely from the local
+            cache. See :func:`fetch_workflow` for the full contract.
 
     Returns:
         Path to the cached workflow YAML file.
 
     Raises:
-        RegistryError: On fetch failure, missing workflow, or I/O errors.
+        RegistryError: On fetch failure, missing workflow, cache miss while
+            ``allow_network=False``, or I/O errors.
     """
     synthetic_entry = RegistryEntry(
         type=RegistryType.github,
@@ -543,10 +815,11 @@ def fetch_workflow_adhoc(
         registry_entry=synthetic_entry,
         workflow_name=workflow_name,
         ref=ref,
+        allow_network=allow_network,
     )
 
 
-def resolve_and_fetch(resolved: ResolvedRef) -> Path:
+def resolve_and_fetch(resolved: ResolvedRef, *, allow_network: bool = True) -> Path:
     """Return a local filesystem path for any kind of resolved reference.
 
     Single dispatcher used by the CLI, engine, and validator so each call
@@ -562,6 +835,10 @@ def resolve_and_fetch(resolved: ResolvedRef) -> Path:
     Args:
         resolved: A :class:`~conductor.registry.resolver.ResolvedRef` from
             :func:`~conductor.registry.resolver.resolve_ref`.
+        allow_network: When ``False``, resolve entirely from the local
+            cache for ``registry``/``adhoc`` kinds — see
+            :func:`fetch_workflow` for the full contract. Has no effect on
+            the ``file`` kind, which never touches the network.
 
     Returns:
         A local ``Path`` to the workflow YAML file.
@@ -590,6 +867,7 @@ def resolve_and_fetch(resolved: ResolvedRef) -> Path:
             registry_entry=resolved.registry_entry,
             workflow_name=resolved.workflow,
             ref=resolved.ref,
+            allow_network=allow_network,
         )
 
     if resolved.kind == "adhoc":
@@ -602,6 +880,7 @@ def resolve_and_fetch(resolved: ResolvedRef) -> Path:
             repo=resolved.adhoc_repo,
             workflow_name=resolved.workflow,
             ref=resolved.ref,
+            allow_network=allow_network,
         )
 
     raise ValueError(f"Unknown ResolvedRef kind: {resolved.kind!r}")
@@ -832,7 +1111,13 @@ def _promote_staged_files(tmp_dir: Path, sha_root: Path) -> None:
 
 
 def _index_to_yaml(index: RegistryIndex) -> str:
-    """Render a RegistryIndex back to YAML for persistence in the meta dir."""
+    """Render a RegistryIndex back to YAML for persistence in the meta dir.
+
+    Round-trips the optional ``input``/``mcp`` fields (E5-T1) too — omitting
+    them here would silently drop a registry's tier-1 schema declarations
+    the moment the index is served from the cached copy on a subsequent
+    warm run.
+    """
     from io import StringIO
 
     from ruamel.yaml import YAML
@@ -840,14 +1125,30 @@ def _index_to_yaml(index: RegistryIndex) -> str:
     yaml = YAML()
     yaml.default_flow_style = False
     data = {
-        "workflows": {
-            name: {"description": info.description, "path": info.path}
-            for name, info in index.workflows.items()
-        }
+        "workflows": {name: _workflow_info_to_dict(info) for name, info in index.workflows.items()}
     }
     buf = StringIO()
     yaml.dump(data, buf)
     return buf.getvalue()
+
+
+def _workflow_info_to_dict(info: WorkflowInfo) -> dict:
+    """Render a single ``WorkflowInfo`` to a plain, YAML-safe dict.
+
+    Omits ``input``/``mcp`` entirely when unset (``None``) rather than
+    writing an explicit ``null``, so a cached index for a workflow that
+    never declared them round-trips byte-for-byte in shape to one that
+    never had the fields at all.
+    """
+    result: dict = {"description": info.description, "path": info.path}
+    if info.input is not None:
+        result["input"] = {
+            key: value.model_dump(mode="json", exclude_none=True)
+            for key, value in info.input.items()
+        }
+    if info.mcp is not None:
+        result["mcp"] = info.mcp.model_dump(mode="json")
+    return result
 
 
 # ---------------------------------------------------------------------------

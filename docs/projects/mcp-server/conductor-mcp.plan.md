@@ -507,7 +507,7 @@ single-forward-pass constraint is untouched.
 
 ---
 
-### E5 — Registry index fields, offline ref pointer, and parse cache (P4, NFR1, G9, R2)
+### E5 — Registry index fields, offline ref pointer, and parse cache (P4, NFR1, G9, R2) — DONE (completed 2026-08-22)
 
 **Goal.** Make the catalogue answerable from a warm cache with zero network
 I/O — the three-tier schema ladder's first two tiers (*Key Components → 1*) —
@@ -527,16 +527,27 @@ API, so a floating ref cannot be resolved offline — the gap R2 closes.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E5-T1 | IMPL | Add optional `input: dict[str, InputDef] \| None = None` and `mcp: McpConfig \| None = None` to `WorkflowInfo`. Import both from `config/schema.py`; verify no import cycle (`registry/` does not currently import `config/`, so check this explicitly and use a `TYPE_CHECKING` guard plus a string annotation if one appears). Absent fields must leave every existing `index.yaml` loading identically. | `src/conductor/registry/index.py` | TO DO |
-| E5-T2 | IMPL | SHA-keyed parse cache: store a normalized, already-resolved tool definition (name, description, input schema, `mcp:` block) under the existing `_meta/<sha[:12]>/` directory, guarded by the same `.complete`-style sentinel written last and invalidated by `CACHE_LAYOUT_VERSION`. A SHA-keyed entry is immutable, which is what makes reuse safe. | `src/conductor/registry/cache.py` | TO DO |
-| E5-T3 | IMPL | **R2:** a `_meta/_refs/<ref-slug>.json` pointer recording what a floating ref (`latest`, branch, tag) last resolved to, written on every successful online resolution and read when the caller declares network access is not permitted. Modelled directly on `plugins/fetch.py`'s `_refs/<slug>.json`, which exists for exactly this reason. Slugify the ref so a `/`-bearing branch name cannot escape the directory, and reuse the atomic temp-file-plus-rename convention the cache already uses so a concurrent reader never sees a half-written pointer. | `src/conductor/registry/cache.py` | TO DO |
-| E5-T4 | IMPL | An `allow_network: bool` seam on the cache read path so a caller can demand cache-only resolution and get a typed failure rather than a silent HTTP call — the same posture `plugins/resolution.py` takes between `conductor run` and `conductor validate`. With `allow_network=False`, a floating ref resolves through the E5-T3 pointer, and a cold pointer is a typed error naming the fetch path. | `src/conductor/registry/cache.py` | TO DO |
-| E5-T5 | TEST | Index round-trip with and without the new fields; an old index loads unchanged; a new index loads on a build that ignores the fields. Ref pointer write/read, slug safety, and atomicity. Parse-cache hit avoids re-parse; `CACHE_LAYOUT_VERSION` bump invalidates. **The load-bearing test:** with every function in `registry/github.py` patched to raise, a warm cache still resolves a GitHub registry's workflows to schemas and SHAs (NFR1, G9, R2). | `tests/test_registry/test_index.py`, `tests/test_registry/test_cache.py` | TO DO |
+| E5-T1 | IMPL | Add optional `input: dict[str, InputDef] \| None = None` and `mcp: McpConfig \| None = None` to `WorkflowInfo`. Import both from `config/schema.py`; verify no import cycle (`registry/` does not currently import `config/`, so check this explicitly and use a `TYPE_CHECKING` guard plus a string annotation if one appears). Absent fields must leave every existing `index.yaml` loading identically. | `src/conductor/registry/index.py` | DONE |
+| E5-T2 | IMPL | SHA-keyed parse cache: store a normalized, already-resolved tool definition (name, description, input schema, `mcp:` block) under the existing `_meta/<sha[:12]>/` directory, guarded by the same `.complete`-style sentinel written last and invalidated by `CACHE_LAYOUT_VERSION`. A SHA-keyed entry is immutable, which is what makes reuse safe. | `src/conductor/registry/cache.py` | DONE |
+| E5-T3 | IMPL | **R2:** a `_meta/_refs/<ref-slug>.json` pointer recording what a floating ref (`latest`, branch, tag) last resolved to, written on every successful online resolution and read when the caller declares network access is not permitted. Modelled directly on `plugins/fetch.py`'s `_refs/<slug>.json`, which exists for exactly this reason. Slugify the ref so a `/`-bearing branch name cannot escape the directory, and reuse the atomic temp-file-plus-rename convention the cache already uses so a concurrent reader never sees a half-written pointer. | `src/conductor/registry/cache.py` | DONE |
+| E5-T4 | IMPL | An `allow_network: bool` seam on the cache read path so a caller can demand cache-only resolution and get a typed failure rather than a silent HTTP call — the same posture `plugins/resolution.py` takes between `conductor run` and `conductor validate`. With `allow_network=False`, a floating ref resolves through the E5-T3 pointer, and a cold pointer is a typed error naming the fetch path. | `src/conductor/registry/cache.py` | DONE |
+| E5-T5 | TEST | Index round-trip with and without the new fields; an old index loads unchanged; a new index loads on a build that ignores the fields. Ref pointer write/read, slug safety, and atomicity. Parse-cache hit avoids re-parse; `CACHE_LAYOUT_VERSION` bump invalidates. **The load-bearing test:** with every function in `registry/github.py` patched to raise, a warm cache still resolves a GitHub registry's workflows to schemas and SHAs (NFR1, G9, R2). | `tests/test_registry/test_index.py`, `tests/test_registry/test_cache.py` | DONE |
 
 **Acceptance criteria**
-- [ ] A warm cache answers "input schema + `mcp:` block + pinned SHA" for every workflow with the network patched to raise, including for a floating ref.
-- [ ] Existing registries and indexes work unchanged.
-- [ ] A cold cache still resolves online exactly as today, and writes the pointer as a side effect.
+- [x] A warm cache answers "input schema + `mcp:` block + pinned SHA" for every workflow with the network patched to raise, including for a floating ref.
+- [x] Existing registries and indexes work unchanged.
+- [x] A cold cache still resolves online exactly as today, and writes the pointer as a side effect.
+
+**Implementation note.** E5-T1 imports `McpConfig` from `config/schema.py`
+per its own prerequisite on E6. Rather than block on the full E6 epic, a
+minimal `McpConfig` model (the `E6-T1` field set: `expose`, `mode`,
+`read_only`, `destructive`, `estimated_minutes`, `extra="forbid"`) was added
+to `config/schema.py` as a shared prerequisite so E5-T1 has a concrete type
+to import. **E6 remains otherwise unimplemented**: `WorkflowDef.mcp` is not
+wired up, there are no validator cross-checks (`_wait_seconds` collision,
+unslugifiable name), no `_report_mcp` CLI reporting, and no docs/examples —
+all of E6-T2 through E6-T6 are still `TO DO` and belong to a dedicated E6
+implementation pass.
 
 ---
 

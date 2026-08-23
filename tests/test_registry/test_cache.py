@@ -11,14 +11,19 @@ import pytest
 
 from conductor.registry.cache import (
     CACHE_LAYOUT_VERSION,
+    ParsedToolInfo,
+    _ref_slug,
     _safe_repo_path,
+    _write_ref_pointer,
     auto_fetch_relative_workflow,
     clear_cache,
     fetch_workflow,
     find_registry_cache_location,
     get_cache_base,
     get_cached_workflow_path,
+    load_parsed_tools,
     prune_temp_dirs,
+    save_parsed_tools,
 )
 from conductor.registry.config import RegistryEntry, RegistryType
 from conductor.registry.errors import RegistryError
@@ -1011,6 +1016,7 @@ class TestResolveAndFetch:
             registry_entry=entry,
             workflow_name="qa-bot",
             ref="v1.0.0",
+            allow_network=True,
         )
 
     @patch("conductor.registry.cache.fetch_workflow_adhoc")
@@ -1039,6 +1045,7 @@ class TestResolveAndFetch:
             repo="workflows",
             workflow_name="qa-bot",
             ref="v1.0.0",
+            allow_network=True,
         )
 
     def test_adhoc_kind_missing_fields_raises(self) -> None:
@@ -1291,3 +1298,573 @@ class TestAutoFetchRelativeWorkflow:
         sha_root = home / "cache" / "registries" / "official" / _SHA_DIR
         candidate = sha_root / "parent" / "wf.yaml"
         assert auto_fetch_relative_workflow(candidate) is None
+
+
+# ---------------------------------------------------------------------------
+# E5-T2: SHA-keyed parse cache
+# ---------------------------------------------------------------------------
+
+
+class TestParsedToolsCache:
+    """Tests for save_parsed_tools / load_parsed_tools (E5-T2)."""
+
+    def _make_tools(self) -> dict[str, ParsedToolInfo]:
+        from conductor.config.schema import InputDef, McpConfig
+
+        return {
+            "qa-bot": ParsedToolInfo(
+                description="Simple Q&A",
+                input={"question": InputDef(type="string", required=True)},
+                mcp=McpConfig(mode="sync", read_only=True),
+            ),
+        }
+
+    def test_round_trips(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _setup_conductor_home(tmp_path, monkeypatch)
+        tools = self._make_tools()
+
+        save_parsed_tools("official", _FAKE_SHA, tools)
+        loaded = load_parsed_tools("official", _FAKE_SHA)
+
+        assert loaded is not None
+        assert loaded["qa-bot"].description == "Simple Q&A"
+        assert loaded["qa-bot"].input["question"].type == "string"
+        assert loaded["qa-bot"].mcp.mode == "sync"
+        assert loaded["qa-bot"].mcp.read_only is True
+
+    def test_sentinel_written_last(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The tools.json file exists before the tools.complete sentinel does."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        write_order: list[str] = []
+
+        original_atomic_write = __import__(
+            "conductor.registry.cache", fromlist=["_atomic_write_text"]
+        )._atomic_write_text
+
+        def _tracking_write(target: Path, text: str) -> None:
+            write_order.append(target.name)
+            original_atomic_write(target, text)
+
+        monkeypatch.setattr("conductor.registry.cache._atomic_write_text", _tracking_write)
+
+        save_parsed_tools("official", _FAKE_SHA, self._make_tools())
+
+        assert write_order == ["tools.json", "tools.complete"]
+        meta = home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR
+        assert (meta / "tools.json").is_file()
+        assert (meta / "tools.complete").is_file()
+
+    def test_missing_sentinel_is_a_miss(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """tools.json present without the sentinel is treated as no cache."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        meta = home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR
+        meta.mkdir(parents=True)
+        (meta / "tools.json").write_text(
+            json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION, "tools": {}}),
+            encoding="utf-8",
+        )
+        assert load_parsed_tools("official", _FAKE_SHA) is None
+
+    def test_missing_entirely_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_conductor_home(tmp_path, monkeypatch)
+        assert load_parsed_tools("official", _FAKE_SHA) is None
+
+    def test_cache_layout_version_bump_invalidates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stored cache written under an older layout version is rejected."""
+        _setup_conductor_home(tmp_path, monkeypatch)
+        save_parsed_tools("official", _FAKE_SHA, self._make_tools())
+
+        with patch("conductor.registry.cache.CACHE_LAYOUT_VERSION", CACHE_LAYOUT_VERSION + 1):
+            assert load_parsed_tools("official", _FAKE_SHA) is None
+
+    def test_malformed_single_entry_is_skipped_not_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single corrupt tool entry doesn't discard the rest of the cache."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        meta = home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR
+        meta.mkdir(parents=True)
+        (meta / "tools.json").write_text(
+            json.dumps(
+                {
+                    "cache_layout_version": CACHE_LAYOUT_VERSION,
+                    "tools": {
+                        "good": {
+                            "description": "fine",
+                            "input": {},
+                            "mcp": {},
+                        },
+                        "bad": {"description": "broken"},  # missing "input"/"mcp" keys
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (meta / "tools.complete").write_text("", encoding="utf-8")
+
+        loaded = load_parsed_tools("official", _FAKE_SHA)
+        assert loaded is not None
+        assert "good" in loaded
+        assert "bad" not in loaded
+
+    def test_different_shas_are_independent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_conductor_home(tmp_path, monkeypatch)
+        save_parsed_tools("official", _FAKE_SHA, self._make_tools())
+        assert load_parsed_tools("official", _FAKE_SHA2) is None
+
+
+# ---------------------------------------------------------------------------
+# E5-T3: offline ref pointer
+# ---------------------------------------------------------------------------
+
+
+class TestRefPointer:
+    """Tests for the _refs/<slug>.json pointer (E5-T3, R2)."""
+
+    def test_write_then_read_round_trips(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.registry.cache import _read_ref_pointer
+
+        _setup_conductor_home(tmp_path, monkeypatch)
+        _write_ref_pointer("official", "main", _FAKE_SHA)
+        assert _read_ref_pointer("official", "main") == _FAKE_SHA
+
+    def test_read_normalizes_stored_uppercase_sha_to_lowercase(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pointer file recorded with an uppercase SHA still reads lowercase."""
+        from conductor.registry.cache import _read_ref_pointer, _ref_pointer_path
+
+        _setup_conductor_home(tmp_path, monkeypatch)
+        pointer = _ref_pointer_path("official", "main")
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(json.dumps({"ref": "main", "sha": _FAKE_SHA.upper()}), encoding="utf-8")
+        assert _read_ref_pointer("official", "main") == _FAKE_SHA
+
+    def test_none_and_latest_share_one_pointer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """None and 'latest' both mean 'the default branch' and share a slug."""
+        from conductor.registry.cache import _read_ref_pointer
+
+        _setup_conductor_home(tmp_path, monkeypatch)
+        _write_ref_pointer("official", None, _FAKE_SHA)
+        assert _read_ref_pointer("official", "latest") == _FAKE_SHA
+        assert _read_ref_pointer("official", None) == _FAKE_SHA
+        assert _ref_slug(None) == _ref_slug("latest") == _ref_slug("LATEST")
+
+    def test_missing_pointer_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.registry.cache import _read_ref_pointer
+
+        _setup_conductor_home(tmp_path, monkeypatch)
+        assert _read_ref_pointer("official", "main") is None
+
+    def test_malformed_pointer_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.registry.cache import _read_ref_pointer, _ref_pointer_path
+
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        pointer = _ref_pointer_path("official", "main")
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text("not json", encoding="utf-8")
+        assert _read_ref_pointer("official", "main") is None
+
+        pointer.write_text(json.dumps({"ref": "main", "sha": "not-a-sha"}), encoding="utf-8")
+        assert _read_ref_pointer("official", "main") is None
+        assert home  # keep home referenced
+
+    @pytest.mark.parametrize(
+        "ref",
+        ["release/1.x", "feature/foo/bar", "a/b/c", "weird\\slashes\\ref"],
+    )
+    def test_slug_is_safe_for_slash_bearing_refs(self, ref: str) -> None:
+        """A '/'-bearing ref cannot escape the _refs directory."""
+        slug = _ref_slug(ref)
+        assert "/" not in slug
+        assert "\\" not in slug
+        assert ".." not in slug
+
+    def test_slug_disambiguates_similar_names(self) -> None:
+        """Two distinct refs that sanitize to the same characters get distinct slugs."""
+        assert _ref_slug("release/1.x") != _ref_slug("release_1.x")
+
+    def test_write_is_atomic_via_tempfile_rename(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pointer is written via the shared atomic tempfile+rename helper."""
+        _setup_conductor_home(tmp_path, monkeypatch)
+        calls: list[Path] = []
+        original = __import__(
+            "conductor.registry.cache", fromlist=["_atomic_write_text"]
+        )._atomic_write_text
+
+        def _tracking(target: Path, text: str) -> None:
+            calls.append(target)
+            original(target, text)
+
+        monkeypatch.setattr("conductor.registry.cache._atomic_write_text", _tracking)
+        _write_ref_pointer("official", "main", _FAKE_SHA)
+        assert len(calls) == 1
+        assert calls[0].name.endswith(".json")
+
+    def test_write_failure_is_best_effort_and_does_not_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_conductor_home(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "conductor.registry.cache._atomic_write_text",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        # Must not raise.
+        _write_ref_pointer("official", "main", _FAKE_SHA)
+
+
+# ---------------------------------------------------------------------------
+# E5-T4: allow_network seam
+# ---------------------------------------------------------------------------
+
+
+def _patch_all_github_functions_to_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch every function in registry/github.py to raise, everywhere it is
+    bound — github.py itself, and the copies cache.py / version_resolver.py
+    imported into their own namespaces via ``from ... import ...`` at their
+    own module load time. Patching only the source module would leave those
+    already-bound names untouched.
+    """
+    import conductor.registry.cache as cache_module
+    import conductor.registry.github as github_module
+    import conductor.registry.version_resolver as version_resolver_module
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("registry/github.py function called during offline resolution")
+
+    function_names = [
+        "fetch_file",
+        "fetch_file_text",
+        "list_tags",
+        "get_default_branch",
+        "resolve_ref_to_sha",
+        "list_directory",
+        "parse_github_source",
+    ]
+    for module in (github_module, cache_module, version_resolver_module):
+        for name in function_names:
+            if hasattr(module, name):
+                monkeypatch.setattr(module, name, _boom)
+
+
+class TestFetchWorkflowAllowNetwork:
+    """Tests for the allow_network seam on fetch_workflow (E5-T4)."""
+
+    def test_offline_with_pinned_sha_ref_never_touches_network(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ref that is already a full SHA resolves without any network call."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref=_FAKE_SHA, allow_network=False)
+        assert result == wf_path
+
+    def test_offline_with_uppercase_sha_ref_normalizes_to_lowercase(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An uppercase SHA ref resolves against the lowercase on-disk cache."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow(
+            "official", entry, "qa-bot", ref=_FAKE_SHA.upper(), allow_network=False
+        )
+        assert result == wf_path
+
+    def test_offline_with_floating_ref_uses_pointer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A floating ref resolves through the ref pointer recorded earlier."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        _write_ref_pointer("official", "main", _FAKE_SHA)
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref="main", allow_network=False)
+        assert result == wf_path
+
+    def test_offline_with_no_pointer_raises_typed_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cold pointer is a typed RegistryError naming the fetch path."""
+        _setup_conductor_home(tmp_path, monkeypatch)
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        with pytest.raises(RegistryError, match="network access is not permitted"):
+            fetch_workflow("official", entry, "qa-bot", ref="main", allow_network=False)
+
+    def test_offline_with_matching_sha_but_uncached_workflow_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SHA resolves offline, but the specific workflow was never cached."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        with pytest.raises(RegistryError, match="not available in the local cache"):
+            fetch_workflow("official", entry, "other-workflow", ref=_FAKE_SHA, allow_network=False)
+
+    @patch("conductor.registry.cache._fetch_github")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_online_path_unchanged_and_writes_pointer(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_github: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Acceptance: a cold cache still resolves online exactly as today,
+        and additionally writes the ref pointer as a side effect."""
+        from conductor.registry.cache import _read_ref_pointer
+
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_fetch_github.side_effect = (  # type: ignore[union-attr]
+            lambda entry, path, sha, dest_dir: _write_workflow_into_staging(dest_dir, path)
+        )
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+
+        assert result.exists()
+        assert home  # keep home referenced
+        # Side effect: the ref pointer now resolves offline too.
+        assert _read_ref_pointer("official", "v1.0.0") == _FAKE_SHA
+
+    def test_path_registry_ignores_allow_network(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path registries never touch the network regardless of the flag."""
+        _setup_conductor_home(tmp_path, monkeypatch)
+        registry_dir = _create_path_registry(tmp_path)
+        entry = RegistryEntry(type=RegistryType.path, source=str(registry_dir))
+
+        result = fetch_workflow("my-registry", entry, "qa-bot", ref=None, allow_network=False)
+        assert result.exists()
+
+
+# ---------------------------------------------------------------------------
+# E5-T5 load-bearing test: warm cache resolves with github.py fully patched
+# ---------------------------------------------------------------------------
+
+
+class TestWarmCacheZeroNetworkIO:
+    """The load-bearing E5 test (NFR1, G9, R2).
+
+    With every function in ``registry/github.py`` patched to raise, a warm
+    cache must still resolve a GitHub registry's workflow to its schema
+    (input + mcp block) and its pinned SHA — for both an explicit SHA ref
+    and a floating ref recorded via the E5-T3 pointer.
+    """
+
+    def _populate_warm_cache_with_schema(
+        self, home: Path, *, registry_name: str, sha: str, registry_source: str
+    ) -> Path:
+        from conductor.config.schema import InputDef, McpConfig
+        from conductor.registry.cache import _index_to_yaml
+
+        wf_path = _pre_populate_cache(
+            home,
+            registry_name=registry_name,
+            workflow_name="qa-bot",
+            sha=sha,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source=registry_source,
+        )
+        # Overwrite the cached index with a tier-1 schema: input + mcp block,
+        # serialized through the real _index_to_yaml (the same function
+        # fetch_workflow uses to cache a fetched index) rather than
+        # handwritten YAML, so the serializer itself is exercised.
+        index = RegistryIndex(
+            workflows={
+                "qa-bot": WorkflowInfo(
+                    description="Simple Q&A",
+                    path="workflows/qa-bot.yaml",
+                    input={
+                        "question": InputDef(
+                            type="string", required=True, description="The question to ask"
+                        )
+                    },
+                    mcp=McpConfig(expose=True, mode="sync", read_only=True),
+                )
+            }
+        )
+        meta = home / "cache" / "registries" / registry_name / "_meta" / sha[:12]
+        (meta / "index.yaml").write_text(_index_to_yaml(index), encoding="utf-8")
+        return wf_path
+
+    def test_resolves_schema_and_sha_for_pinned_ref(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = self._populate_warm_cache_with_schema(
+            home, registry_name="official", sha=_FAKE_SHA, registry_source="myorg/workflows"
+        )
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref=_FAKE_SHA, allow_network=False)
+        assert result == wf_path
+
+        # The schema is answerable from the warm cache alone.
+        from conductor.registry.cache import _load_cached_index, _meta_dir
+
+        idx = _load_cached_index(_meta_dir("official", _FAKE_SHA))
+        assert idx is not None
+        info = idx.workflows["qa-bot"]
+        assert info.input["question"].type == "string"
+        assert info.mcp.mode == "sync"
+        assert info.mcp.read_only is True
+
+    def test_resolves_schema_and_sha_for_floating_ref(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same as above, but for a floating ref resolved via the pointer."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = self._populate_warm_cache_with_schema(
+            home, registry_name="official", sha=_FAKE_SHA, registry_source="myorg/workflows"
+        )
+        _write_ref_pointer("official", "latest", _FAKE_SHA)
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref=None, allow_network=False)
+        assert result == wf_path
+
+        from conductor.registry.cache import _load_cached_index, _meta_dir
+
+        idx = _load_cached_index(_meta_dir("official", _FAKE_SHA))
+        assert idx is not None
+        info = idx.workflows["qa-bot"]
+        assert info.input["question"].required is True
+        assert info.mcp.expose is True
+
+    def test_resolves_schema_via_parse_cache_when_index_lacks_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tier-2 (parse cache) hit: the cached index has no input/mcp (a
+        pre-E5 index, or one the source repo simply never declared), so the
+        schema can only come from the SHA-keyed parse cache written by
+        :func:`save_parsed_tools`. Workflow YAML parsing must never happen —
+        ``conductor.config.loader.load_config_string`` is patched to raise,
+        proving the schema was served from ``tools.json`` alone.
+        """
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        # Tier-1 miss: the cached index has no input/mcp for this workflow.
+        from conductor.registry.cache import _index_to_yaml
+
+        meta = home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR
+        plain_index = RegistryIndex(
+            workflows={
+                "qa-bot": WorkflowInfo(description="Simple Q&A", path="workflows/qa-bot.yaml")
+            }
+        )
+        (meta / "index.yaml").write_text(_index_to_yaml(plain_index), encoding="utf-8")
+
+        # Tier-2 hit: the SHA-keyed parse cache carries the schema instead.
+        from conductor.config.schema import InputDef, McpConfig
+
+        save_parsed_tools(
+            "official",
+            _FAKE_SHA,
+            {
+                "qa-bot": ParsedToolInfo(
+                    description="Simple Q&A",
+                    input={"question": InputDef(type="string", required=True)},
+                    mcp=McpConfig(mode="sync", read_only=True),
+                )
+            },
+        )
+
+        _patch_all_github_functions_to_raise(monkeypatch)
+        monkeypatch.setattr(
+            "conductor.config.loader.load_config_string",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("workflow YAML must not be parsed on a tier-2 cache hit")
+            ),
+        )
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref=_FAKE_SHA, allow_network=False)
+        assert result == wf_path
+
+        from conductor.registry.cache import _load_cached_index, _meta_dir
+
+        idx = _load_cached_index(_meta_dir("official", _FAKE_SHA))
+        assert idx is not None
+        assert idx.workflows["qa-bot"].input is None
+        assert idx.workflows["qa-bot"].mcp is None
+
+        loaded = load_parsed_tools("official", _FAKE_SHA)
+        assert loaded is not None
+        assert loaded["qa-bot"].input["question"].type == "string"
+        assert loaded["qa-bot"].mcp.mode == "sync"
+        assert loaded["qa-bot"].mcp.read_only is True

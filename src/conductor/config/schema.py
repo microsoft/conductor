@@ -93,6 +93,44 @@ class InputDef(BaseModel):
         return v
 
 
+class McpConfig(BaseModel):
+    """Per-workflow configuration for exposure as an MCP tool.
+
+    Minimal model added ahead of the full ``E6`` epic
+    (``docs/projects/mcp-server/conductor-mcp.plan.md``) solely so
+    :class:`conductor.registry.index.WorkflowInfo` (E5-T1) has a concrete
+    type to import for its optional cached ``mcp:`` field. Wiring this
+    onto ``WorkflowDef``, the validator cross-checks, CLI reporting, and
+    docs/examples are E6's responsibility and are intentionally not
+    implemented here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expose: bool = True
+    """Whether this workflow is a candidate for MCP tool exposure."""
+
+    mode: Literal["async", "sync", "auto"] = "async"
+    """Invocation mode the MCP server should use for this workflow."""
+
+    read_only: bool = False
+    """Whether this workflow only reads state (no side effects)."""
+
+    destructive: bool = False
+    """Whether this workflow can destroy or irreversibly modify state."""
+
+    estimated_minutes: int | None = None
+    """Estimated wall-clock runtime in minutes, for client-side hints."""
+
+    @field_validator("estimated_minutes")
+    @classmethod
+    def validate_estimated_minutes(cls, v: int | None) -> int | None:
+        """Reject a non-positive estimate rather than silently accepting one."""
+        if v is not None and v <= 0:
+            raise ValueError("estimated_minutes must be positive when present")
+        return v
+
+
 class OutputField(BaseModel):
     """Schema for a single output field from an agent."""
 
