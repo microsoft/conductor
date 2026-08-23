@@ -100,7 +100,9 @@ _REFS_NAMESPACE = "_refs"
 
 # Current on-disk cache layout version. Bumping this invalidates all existing
 # caches (their source.json will fail validation and the entries are re-fetched).
-CACHE_LAYOUT_VERSION = 2
+# v3: ParsedToolInfo (tools.json) gained a `name` field carrying the workflow's
+# declared WorkflowDef.name, so a tier-2 cache hit doesn't lose FR3 naming.
+CACHE_LAYOUT_VERSION = 3
 
 _SHA_DIR_RE = re.compile(r"^[0-9a-f]{12}$")
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -397,9 +399,12 @@ class ParsedToolInfo:
 
     Captures exactly what the MCP catalogue builder needs to publish a
     workflow as a tool without re-parsing its YAML: its description,
-    resolved input schema, and ``mcp:`` block. Keyed by workflow name and
-    persisted under ``_meta/<sha[:12]>/tools.json`` (schema-ladder tier 2;
-    see ``docs/projects/mcp-server/conductor-mcp.design.md``, Key
+    resolved input schema, ``mcp:`` block, and declared ``WorkflowDef.name``
+    (FR3 — without it, a tier-2 cache hit would fall back to the registry
+    index key/workflow filename stem for naming, silently disagreeing with
+    the tier-3 parse that first populated the cache). Keyed by workflow name
+    and persisted under ``_meta/<sha[:12]>/tools.json`` (schema-ladder tier
+    2; see ``docs/projects/mcp-server/conductor-mcp.design.md``, Key
     Components → 1). Immutable because the SHA it is cached under is
     immutable — that is what makes reuse safe without re-verification.
     """
@@ -407,6 +412,7 @@ class ParsedToolInfo:
     description: str
     input: dict[str, InputDef]
     mcp: McpConfig
+    name: str | None = None
 
 
 def save_parsed_tools(registry_name: str, sha: str, tools: dict[str, ParsedToolInfo]) -> None:
@@ -431,6 +437,7 @@ def save_parsed_tools(registry_name: str, sha: str, tools: dict[str, ParsedToolI
                 "description": info.description,
                 "input": {key: value.model_dump(mode="json") for key, value in info.input.items()},
                 "mcp": info.mcp.model_dump(mode="json"),
+                "name": info.name,
             }
             for name, info in tools.items()
         },
@@ -468,10 +475,12 @@ def load_parsed_tools(registry_name: str, sha: str) -> dict[str, ParsedToolInfo]
     result: dict[str, ParsedToolInfo] = {}
     for name, raw in raw_tools.items():
         try:
+            raw_name = raw.get("name")
             result[name] = ParsedToolInfo(
                 description=str(raw["description"]),
                 input={key: InputDef.model_validate(value) for key, value in raw["input"].items()},
                 mcp=McpConfig.model_validate(raw["mcp"]),
+                name=str(raw_name) if raw_name is not None else None,
             )
         except Exception as exc:
             logger.debug("Skipping malformed parse-cache entry %r for %s: %s", name, sha, exc)

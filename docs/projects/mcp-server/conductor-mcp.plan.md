@@ -583,6 +583,8 @@ reporting pattern to copy (`_report_plugins`, `_report_skill_discovery`).
 
 ### E7 — Catalogue builder: exposure, schema ladder, naming, pinning (FR2, FR3, NFR1, NFR2, NFR4, DD4, DD6, DD10)
 
+**Status: DONE** (completed 2026-08-22)
+
 **Goal.** The design's *Key Components → 1 and 2*: turn configuration into a
 frozen, immutable list of tool definitions at startup — no protocol, no
 process launching.
@@ -591,22 +593,22 @@ process launching.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E7-T1 | IMPL | `ServeOptions` — a frozen dataclass holding every startup argument, including `max_concurrent_runs` (R3) and `introspect_full` (R4). Existing as a single artifact is what makes NFR3 checkable: any value not on it did not come from the operator. | `src/conductor/mcp/serve/options.py` | TO DO |
-| E7-T2 | IMPL | Naming: slugify to the spec's `A-Za-z0-9_-.` set, fold `-`→`_`, enforce 1–128 characters and within-server uniqueness, apply `--tool-prefix`, and on collision qualify **all** colliding tools with their registry (never only the loser). Keep the reverse `tool name → (registry, workflow)` map the invocation layer needs (DD10). | `src/conductor/mcp/serve/naming.py` | TO DO |
-| E7-T3 | IMPL | Sanitize YAML-authored description text: strip control characters and instruction-shaped markers, hard length-cap, and do it before the text reaches a tool schema (NFR4, *Security → Tool descriptions are attack surface*). | `src/conductor/mcp/serve/sanitize.py` | TO DO |
-| E7-T4 | IMPL | Tool generation: `InputDef` → JSON Schema property for all five types with `required` / `default` / `description` preserved; inject the reserved `_wait_seconds`; map the `mcp:` block onto `annotations`. Publish **no** `outputSchema` (DD5). Document the `enum`/`integer`/`items` fidelity gap in the module docstring rather than inventing structure the author did not declare. | `src/conductor/mcp/serve/toolgen.py` | TO DO |
-| E7-T5 | IMPL | Pinning: commit SHA for GitHub registries (via E5-T3's pointer when offline), content hash of the YAML for path registries and `--workflow-dir` — `version_resolver` raises for a ref on a path registry, so a hash is the only available identity there. Include the pin in every invocation result and expose a re-check that reports drift **without** mutating the live catalogue (DD6; the spec forbids per-connection variation, DD3). | `src/conductor/mcp/serve/pinning.py` | TO DO |
-| E7-T6 | IMPL | `build_catalogue(...)`: enumerate → filter by the four-rung ladder (`--deny` > `--allow` > `mcp.expose` > default-on, with `--registry` selecting the candidate set one level above it) → resolve schemas through the three-tier ladder under a startup deadline → pin → sanitize → qualify collisions → decide direct-tools vs discovery. Return an immutable `Catalogue`. Reject a workflow whose `input:` collides with `_wait_seconds`, logging the reason per FR10. On any parse failure — including the `${VAR}`-missing and parent-directory `!file` cases from P4 — expose with `{"type": "object"}` and an explanatory description (NFR2). | `src/conductor/mcp/serve/catalogue.py` | TO DO |
-| E7-T7 | TEST | Naming and sanitizing: slug charset and length, prefixing, both-sides collision qualification, control-character stripping, length cap. | `tests/test_mcp/test_serve_naming.py` | TO DO |
-| E7-T8 | TEST | Tool generation: all five input types; `required`/`default`/`description` survive; `_wait_seconds` present and documented; no `outputSchema`; a workflow declaring `_wait_seconds` is rejected. | `tests/test_mcp/test_serve_toolgen.py` | TO DO |
-| E7-T9 | TEST | Catalogue: every ladder ordering that distinguishes a rung (`--deny` beats `--allow`; `--allow` overrides `mcp.expose: false`; `--registry` excludes non-candidates entirely); the schema ladder's three tiers; NFR1 (network patched to raise, warm cache, under 2s); NFR2 for both parse-failure modes; the discovery threshold decision. | `tests/test_mcp/test_serve_catalogue.py` | TO DO |
-| E7-T10 | TEST | Pinning: SHA for GitHub, content hash for path, drift detected and reported without the catalogue changing. | `tests/test_mcp/test_serve_pinning.py` | TO DO |
+| E7-T1 | IMPL | `ServeOptions` — a frozen dataclass holding every startup argument, including `max_concurrent_runs` (R3) and `introspect_full` (R4). Existing as a single artifact is what makes NFR3 checkable: any value not on it did not come from the operator. | `src/conductor/mcp/serve/options.py` | DONE |
+| E7-T2 | IMPL | Naming: slugify to the spec's `A-Za-z0-9_-.` set, fold `-`→`_`, enforce 1–128 characters and within-server uniqueness, apply `--tool-prefix`, and on collision qualify **all** colliding tools with their registry (never only the loser). Keep the reverse `tool name → (registry, workflow)` map the invocation layer needs (DD10). | `src/conductor/mcp/serve/naming.py` | DONE |
+| E7-T3 | IMPL | Sanitize YAML-authored description text: strip control characters and instruction-shaped markers, hard length-cap, and do it before the text reaches a tool schema (NFR4, *Security → Tool descriptions are attack surface*). | `src/conductor/mcp/serve/sanitize.py` | DONE |
+| E7-T4 | IMPL | Tool generation: `InputDef` → JSON Schema property for all five types with `required` / `default` / `description` preserved; inject the reserved `_wait_seconds`; map the `mcp:` block onto `annotations`. Publish **no** `outputSchema` (DD5). Document the `enum`/`integer`/`items` fidelity gap in the module docstring rather than inventing structure the author did not declare. | `src/conductor/mcp/serve/toolgen.py` | DONE |
+| E7-T5 | IMPL | Pinning: commit SHA for GitHub registries (via E5-T3's pointer when offline), content hash of the YAML for path registries and `--workflow-dir` — `version_resolver` raises for a ref on a path registry, so a hash is the only available identity there. Include the pin in every invocation result and expose a re-check that reports drift **without** mutating the live catalogue (DD6; the spec forbids per-connection variation, DD3). | `src/conductor/mcp/serve/pinning.py` | DONE |
+| E7-T6 | IMPL | `build_catalogue(...)`: enumerate → filter by the four-rung ladder (`--deny` > `--allow` > `mcp.expose` > default-on, with `--registry` selecting the candidate set one level above it) → resolve schemas through the three-tier ladder under a startup deadline → pin → sanitize → qualify collisions → decide direct-tools vs discovery. Return an immutable `Catalogue`. Reject a workflow whose `input:` collides with `_wait_seconds`, logging the reason per FR10. On any parse failure — including the `${VAR}`-missing and parent-directory `!file` cases from P4 — expose with `{"type": "object"}` and an explanatory description (NFR2). | `src/conductor/mcp/serve/catalogue.py` | DONE |
+| E7-T7 | TEST | Naming and sanitizing: slug charset and length, prefixing, both-sides collision qualification, control-character stripping, length cap. | `tests/test_mcp/test_serve_naming.py` | DONE |
+| E7-T8 | TEST | Tool generation: all five input types; `required`/`default`/`description` survive; `_wait_seconds` present and documented; no `outputSchema`; a workflow declaring `_wait_seconds` is rejected. | `tests/test_mcp/test_serve_toolgen.py` | DONE |
+| E7-T9 | TEST | Catalogue: every ladder ordering that distinguishes a rung (`--deny` beats `--allow`; `--allow` overrides `mcp.expose: false`; `--registry` excludes non-candidates entirely); the schema ladder's three tiers; NFR1 (network patched to raise, warm cache, under 2s); NFR2 for both parse-failure modes; the discovery threshold decision. | `tests/test_mcp/test_serve_catalogue.py` | DONE |
+| E7-T10 | TEST | Pinning: SHA for GitHub, content hash for path, drift detected and reported without the catalogue changing. | `tests/test_mcp/test_serve_pinning.py` | DONE |
 
 **Acceptance criteria**
-- [ ] A frozen catalogue is built from a fixture registry with zero network I/O.
-- [ ] The exposure ladder behaves exactly as FR2 specifies in every distinguishing case.
-- [ ] No workflow is ever silently dropped for an environmental reason.
-- [ ] Two registries publishing one slug yield two qualified names.
+- [x] A frozen catalogue is built from a fixture registry with zero network I/O.
+- [x] The exposure ladder behaves exactly as FR2 specifies in every distinguishing case.
+- [x] No workflow is ever silently dropped for an environmental reason.
+- [x] Two registries publishing one slug yield two qualified names.
 
 ---
 
