@@ -148,9 +148,7 @@ def _try_init_file_logging(log_path: Path | None) -> bool:
         init_file_logging(log_path)
     except OSError as e:
         _verbose_console.print(
-            styled(
-                "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_path, e
-            )
+            styled("[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_path, e)
         )
         return False
 
