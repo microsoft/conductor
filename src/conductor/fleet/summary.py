@@ -1,15 +1,29 @@
-"""``RunSummary`` derivation from a run record plus its event-log tail.
+"""``RunSummary`` derivation from a run record plus its event log.
 
 Fleet Manager E6 (see ``docs/projects/fleet-manager/fleet-manager.design.md``,
 *Implementation* → ``summary.py``): given a live :class:`~conductor.fleet.records.RunRecord`
 (as returned by :func:`conductor.fleet.records.read_run_records`), derive a
 :class:`RunSummary` — the status vocabulary, current step, elapsed-on-step,
-token/cost totals, and any open human gate — from a **bounded tail** of the
-run's JSONL event log rather than the whole file, so this can be called once
-per row on a ~2-second poll loop (E7's Runs screen) without the cost of a
-whole-file load growing with the run's lifetime (contrast
-``web/replay.py::_load_events``, which loads the entire file and is the wrong
-tool for this).
+token/cost totals, and any open human gate — from the run's JSONL event log,
+so this can be called once per row on a ~2-second poll loop (E7's Runs
+screen) without silently dropping state a long or resumed run has already
+outgrown a bounded read window (issue #485).
+
+This module used to bound its reads to a 512 KiB tail (list screen), a
+512 KiB head (topology recovery for a run whose ``workflow_started`` had
+aged out of that tail), and an 8 MiB cap (run-detail/step-detail screens).
+Every one of those windows was sized against logs that reality then
+outgrew: a run long enough to be interesting silently lost its current
+step, its token/cost totals, and (on a resumed run) reported a stale
+*prior* generation's terminal status. :func:`stream_event_log` replaces
+all three with one **streaming, uncapped** reader — the same choice
+:mod:`conductor.fleet.history`'s ``_read_full_log`` already made for the
+same reason (an accepted-then-exceeded cap silently truncating live data
+is worse than an unbounded read that costs proportionally more CPU).
+Memory is bounded by the longest single line, not by the file's size or
+event count; a 12.5 ms scan of a real 9.72 MB / 20,361-line log (with the
+prefilter below) is comfortably inside the Runs screen's worker-thread
+poll budget.
 
 **Liveness is not re-derived here.** The design's own measurement found
 inferring "is this run still running" from the event stream alone unreliable
@@ -29,8 +43,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,29 +59,6 @@ logger = logging.getLogger(__name__)
 RunStatus = Literal["running", "at-gate", "paused", "completed", "failed"]
 
 AgentDetailStatus = Literal["pending", "running", "at-gate", "completed", "failed"]
-
-# Bounded read windows. Neither grows with the file's size, satisfying the
-# "bounded, not whole-file" requirement even for a very long-running
-# workflow's log. 512 KB comfortably covers a typical run's entire event
-# history (events are small JSON lines), so token/cost totals and current-step
-# tracking are correct in the common case; for an unusually long run whose
-# log has grown past this window, older completed-agent totals age out of the
-# tail and are undercounted — an accepted, documented limitation consistent
-# with this project's other "known data gaps" (see the module docstring's
-# liveness note and D5 in the plan).
-_DEFAULT_TAIL_BYTES = 512 * 1024
-
-# Bound for the run-detail screen's *full*-log read (E9-T3). Unlike the tail
-# reader above, this reads from the start of the file so every agent's
-# history (not just the most recent window) is available for the per-agent
-# rows the detail screen renders. 8 MB is comfortably larger than any
-# realistic single-run event log (the design's own directory-wide
-# measurement was 12 MB across 1522 files) while still bounding memory use
-# against a pathological log; a log that exceeds this bound has its
-# *trailing* history (including, in the worst case, the run's own
-# `workflow_completed`/`workflow_failed`) silently truncated rather than
-# read in full -- an accepted, documented limitation, not a crash.
-_DEFAULT_FULL_LOG_MAX_BYTES = 8 * 1024 * 1024
 
 _STEP_ACTIVITY_LIMIT = 200
 """How many activity lines the step drill-down keeps. A long agentic loop
@@ -156,19 +149,19 @@ class AgentDetail:
 @dataclass(frozen=True)
 class RunDetail:
     """Full per-agent detail for the run-detail screen (E9), derived from a
-    bounded **full** log read (:func:`read_event_log_full`) rather than the
-    tail window :class:`RunSummary` uses -- the list screen's ~2s poll stays
-    on the cheaper tail path; only opening the detail screen pays for a
-    fuller read, and only once per open (not on every poll tick)."""
+    streamed, uncapped read of the run's event log (:func:`stream_event_log`)
+    -- the same reader :class:`RunSummary` uses, over every event rather
+    than a tail window. Only opening the detail screen pays for the
+    (slightly more expensive, unfiltered) full scan, and only once per
+    open (not on every poll tick)."""
 
     run_id: str
     workflow_name: str
     topology: RunTopology | None
 
-    """``None`` when the log is missing/unreadable, empty, or its
-    ``workflow_started`` event fell outside the (bounded) read window --
-    the detail screen renders a placeholder in this case rather than an
-    empty table (E9-T5)."""
+    """``None`` when the log is missing/unreadable, empty, or has not
+    (yet) written a ``workflow_started`` event -- the detail screen
+    renders a placeholder in this case rather than an empty table (E9-T5)."""
 
     agents: list[AgentDetail]
     """One row per :attr:`topology`'s agent, in the same (declared) order.
@@ -196,7 +189,7 @@ class RunSummary:
 
     current_step: str | None
     """Name of the agent, parallel group, or for_each group most recently
-    started without a matching completion event seen in the tail. ``None``
+    started without a matching completion event seen in the log. ``None``
     when nothing is open (e.g. a log with no events yet, or a terminal
     status)."""
 
@@ -205,16 +198,21 @@ class RunSummary:
     """Unix timestamp of the current step's start event, or ``None``."""
 
     total_tokens: int
-    """Sum of ``tokens`` across every ``agent_completed`` event seen in the
-    tail. Per D5, this is **completed-agent tokens only** — there is no
+    """Sum of ``tokens`` across every ``agent_completed`` event in the log.
+    Per D5, this is **completed-agent tokens only** — there is no
     mid-flight usage event, so the agent currently running never
-    contributes here until it finishes."""
+    contributes here until it finishes. A **lifetime total across every
+    generation** in the log (issue #485): a resumed run's totals include
+    whatever the prior, terminated generation(s) already accumulated, not
+    just the current one -- only the *status*/*current step*/*gate* reset
+    at a resume boundary, not the usage totals."""
 
     total_cost_usd: float | None
     """Sum of ``cost_usd`` across priced ``agent_completed`` events in the
-    tail, or ``None`` if none were priced. Mirrors
-    ``WorkflowUsage.total_cost_usd``: never a confident total when
-    :attr:`has_unpriced` is true — see that attribute."""
+    log (every generation -- see :attr:`total_tokens`), or ``None`` if none
+    were priced. Mirrors ``WorkflowUsage.total_cost_usd``: never a
+    confident total when :attr:`has_unpriced` is true — see that
+    attribute."""
 
     unpriced_agent_count: int
     """Count of completed agents that consumed tokens but had no cost data
@@ -236,21 +234,24 @@ class RunSummary:
     from the record's ``port`` — not re-derived per-screen."""
 
     topology: RunTopology | None
-    """Run topology from ``workflow_started``, if that event happened to
-    fall within the read window (E6-T5). ``workflow_started`` is always
-    the first line of the log, so this is populated for a just-started run;
-    for an older run whose log has grown past the tail window, this is
-    ``None`` until a dedicated full-log read is added (E9-T3) for the
-    run-detail screen. A head read now recovers it for a long run, whose
-    log has always outgrown the tail window by definition."""
+    """Run topology from the log's **latest** root ``workflow_started``
+    event (E6-T5). ``workflow_started`` is always the first line of a
+    fresh log, and a resume always writes a second one into the same file
+    (the engine's own re-emit, or the dashboard-seeding path's synthesized
+    copy) -- so on a resumed run this is the *current* generation's
+    topology, not a stale earlier one (issue #485). ``None`` only when the
+    log has no root ``workflow_started`` at all (missing/unreadable log,
+    or one that hasn't written it yet)."""
 
     cwd: str | None = None
     """Directory conductor was launched from (``workflow_started``'s
     ``system`` block). Not on the run record, and what distinguishes two
-    runs of the same workflow started from different checkouts."""
+    runs of the same workflow started from different checkouts. Like
+    :attr:`topology`, taken from the latest generation."""
 
     inputs: dict[str, Any] | None = None
-    """The values this run was launched with, when the log records them."""
+    """The values this run was launched with, when the log records them.
+    Like :attr:`topology`, taken from the latest generation."""
 
     @property
     def has_unpriced(self) -> bool:
@@ -287,143 +288,88 @@ def _parse_iso_timestamp(value: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Bounded JSONL reading (E6-T1)
+# Streaming JSONL reading (issue #485)
 # ---------------------------------------------------------------------------
 
-
-def _parse_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
-    """Parse ``raw`` as newline-delimited JSON objects, tolerating bad lines.
-
-    Each line is decoded and parsed independently, so a single malformed
-    line (a truncated write caught mid-flush, invalid UTF-8, or a line cut
-    off by a bounded read's window boundary) is silently skipped rather
-    than aborting the whole parse — this is what lets the tail/head readers
-    tolerate a file being appended to concurrently.
-    """
-    events: list[dict[str, Any]] = []
-    for raw_line in raw.split(b"\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            continue
-        if isinstance(obj, dict):
-            events.append(obj)
-    return events
+# Whitespace-tolerant, anchored match of a JSONL event line's leading
+# `"type"` key -- lets `stream_event_log`'s prefilter skip an uninteresting
+# line without JSON-parsing it. Anchored (`.match`, not `.search`) so a
+# `"type"` key appearing later in the object (e.g. inside `data`) can never
+# be mistaken for the event's own type. Whitespace-tolerant because
+# production log lines are written with `json.dumps(..., separators=(",",
+# ":"))` (`engine/event_log.py`) -- no spaces at all -- while test fixtures
+# typically use plain `json.dumps`, which inserts a space after each colon;
+# a regex anchored to one exact spacing would make the fast path silently
+# dead in tests while live in production.
+_TYPE_PREFIX_RE = re.compile(rb'\{\s*"type"\s*:\s*"([A-Za-z0-9_]+)"')
 
 
-_HEAD_BYTES = 512 * 1024
-"""How much of a log's *start* is read for topology.
+def stream_event_log(
+    path: Path, *, keep_types: frozenset[str] | None = None
+) -> Iterator[dict[str, Any]]:
+    """Stream-parse a JSONL event log, oldest first, yielding one parsed
+    event dict at a time.
 
-``workflow_started`` is the first event a run writes, so on any log longer
-than the tail window it is the one event guaranteed to be outside it -- which
-is why a long-running workflow's step list silently disappeared while a young
-one still showed it.
+    Replaces this module's former bounded tail/head/full-log readers
+    (issue #485): none of the three windows they used was actually safe
+    against a run outliving it, and every one of them did, in production,
+    silently and repeatedly. Memory here is bounded by the longest single
+    line in the file, not by the file's size or event count -- retained
+    state beyond that one line/dict is nothing. This mirrors
+    :mod:`conductor.fleet.history`'s ``_read_full_log``, which made the
+    same choice first, for the same reason: a byte-capped read can drop an
+    early token/cost event or discard an oversized terminal event outside
+    its window, silently corrupting the very state callers rely on.
 
-Sized to hold that one line, which is far larger than "one event" suggests:
-it carries the whole workflow definition (every step, route, parallel and
-for-each group, plus provider and metadata blocks), and a real 23-step
-workflow measured **77 KB**. A window smaller than the line truncates it
-mid-JSON, and a truncated line is discarded like any other malformed one --
-so an under-sized window does not degrade the result, it removes it
-entirely, which is exactly the bug this constant exists to fix.
-"""
+    With ``keep_types``, a whitespace-tolerant anchored regex
+    (:data:`_TYPE_PREFIX_RE`) reads the ``type`` key off the raw bytes and
+    skips a line whose type is not in the set *without* JSON-decoding it --
+    this is what keeps a per-row scan on the Runs screen's ~2s poll cheap
+    even against a very large log (12.5 ms measured against a real 9.72 MB
+    / 20,361-line log, versus 65 ms unfiltered). A line whose ``type`` key
+    is not first (so the regex fails to match) is always parsed rather
+    than skipped -- the prefilter is only ever an optimization, never a
+    second opinion about what a line means, so it can never silently drop
+    an event the writer happens to serialize with a different key order.
 
+    This function is a generator: it holds the file handle open (inside
+    its own ``with``) only while being consumed, and none of its side
+    effects -- including ``open()`` and any ``OSError`` it raises (a
+    missing file, a permission error, or any other read failure) -- happen
+    until the returned iterator's first ``next()``. Unlike this module's
+    former bounded readers, this does **not** swallow ``OSError``; it
+    propagates, so a caller that wants the old "never raise" behavior must
+    wrap the *consumption* (e.g. inside :func:`_scan_events`'s ``for``
+    loop), not just the call to this function -- see :func:`derive_run_summary`.
 
-def read_event_log_head(path: Path, *, head_bytes: int = _HEAD_BYTES) -> list[dict[str, Any]]:
-    """Read the first ``head_bytes`` of a JSONL event log, parsed into events.
-
-    The mirror of :func:`read_event_log_tail`, and bounded the same way: a
-    trailing line cut off by the byte limit fails to parse and is skipped
-    like any other malformed line.
-    """
-    try:
-        with open(path, "rb") as f:
-            chunk = f.read(head_bytes)
-    except OSError:
-        logger.debug("Could not read head of event log %s", path, exc_info=True)
-        return []
-    return _parse_jsonl_bytes(chunk)
-
-
-def read_event_log_tail(
-    path: Path, *, tail_bytes: int = _DEFAULT_TAIL_BYTES
-) -> list[dict[str, Any]]:
-    """Read the last ``tail_bytes`` of a JSONL event log, parsed into event dicts.
-
-    Seeks from the end of the file rather than loading it whole (E6-T1):
-    when the file is larger than ``tail_bytes``, seeks to
-    ``size - tail_bytes`` and discards the (likely partial) leading line
-    before parsing the rest, so a line straddling the seek boundary never
-    surfaces as a corrupt/garbled event. A trailing line cut short by a
-    concurrent in-progress write is tolerated the same way every other
-    malformed line is — it fails to parse and is silently skipped (see
-    :func:`_parse_jsonl_bytes`).
-
-    Never raises: a missing file, a permission error, or any other
-    ``OSError`` while reading yields an empty event list rather than
-    propagating — a diagnostic read must not be able to crash a poll loop.
+    A malformed individual line (bad JSON, a truncated write caught
+    mid-flush, invalid UTF-8) is tolerated the same way a concurrent
+    in-progress write always has been here: skipped rather than aborting
+    the whole read.
 
     Args:
         path: Path to the JSONL event log.
-        tail_bytes: Maximum number of bytes to read from the end of the
-            file, regardless of the file's actual size.
+        keep_types: When given, only lines whose ``type`` is in this set
+            are parsed and yielded (see above). ``None`` parses every line.
 
-    Returns:
-        Parsed event dicts, oldest first, from (at most) the last
-        ``tail_bytes`` of the file.
+    Yields:
+        Parsed event dicts, oldest first.
     """
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            if size > tail_bytes:
-                f.seek(size - tail_bytes)
-                f.readline()  # Discard the partial line at the seek boundary.
-            else:
-                f.seek(0)
-            raw = f.read()
-    except OSError:
-        return []
-    return _parse_jsonl_bytes(raw)
-
-
-def read_event_log_full(
-    path: Path, *, max_bytes: int = _DEFAULT_FULL_LOG_MAX_BYTES
-) -> list[dict[str, Any]]:
-    """Read up to ``max_bytes`` from the *start* of a JSONL event log (E9-T3).
-
-    Unlike :func:`read_event_log_tail` (which the Runs list screen's ~2s
-    poll uses so per-row reads stay cheap and bounded regardless of the
-    run's age), this is the **full**-log read used only by the run-detail
-    screen: it needs every agent's complete history -- including agents
-    that finished and aged out of a tail window -- not just the most
-    recent events. It is still bounded (not a literal whole-file read) so
-    a pathologically large log can't exhaust memory when a user opens the
-    detail screen; see :data:`_DEFAULT_FULL_LOG_MAX_BYTES` for the bound
-    and its trade-off.
-
-    Never raises: mirrors :func:`read_event_log_tail`'s contract -- a
-    missing file, a permission error, or any other ``OSError`` yields an
-    empty event list rather than propagating.
-
-    Args:
-        path: Path to the JSONL event log.
-        max_bytes: Maximum number of bytes to read from the start of the
-            file, regardless of the file's actual size.
-
-    Returns:
-        Parsed event dicts, oldest first, from (at most) the first
-        ``max_bytes`` of the file.
-    """
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(max_bytes)
-    except OSError:
-        return []
-    return _parse_jsonl_bytes(raw)
+    with open(path, "rb") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if keep_types is not None:
+                match = _TYPE_PREFIX_RE.match(line)
+                if match is not None and match.group(1).decode("ascii") not in keep_types:
+                    continue
+            try:
+                obj = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                continue
+            if isinstance(obj, dict):
+                yield obj
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +427,37 @@ _AGENT_FAILED_EVENT_TYPES = frozenset(
     }
 )
 
+# Every event type `_scan_events` actually branches on -- the `keep_types`
+# prefilter passed to `stream_event_log` for the Runs screen's per-row scan
+# (issue #485). Derived from the two frozensets above (not restated) so
+# adding a new close/failure event type to either one keeps this prefilter
+# correct automatically, without a second edit anyone could forget. This
+# set and `_scan_events` move together: a type the scanner branches on but
+# this set omits would be silently dropped from every derived summary --
+# the exact failure class issue #485 is about -- so `TestStreamEventLog`'s
+# prefilter-equivalence test compares a filtered scan against an unfiltered
+# one over a log exercising every branch, to catch that drift here rather
+# than in production.
+_SUMMARY_EVENT_TYPES: frozenset[str] = (
+    _AGENT_CLOSE_EVENT_TYPES
+    | _AGENT_FAILED_EVENT_TYPES
+    | frozenset(
+        {
+            "workflow_started",
+            "workflow_completed",
+            "workflow_failed",
+            "agent_started",
+            "parallel_agent_started",
+            "parallel_started",
+            "parallel_completed",
+            "for_each_started",
+            "for_each_completed",
+            "gate_presented",
+            "agent_paused",
+        }
+    )
+)
+
 
 @dataclass
 class _ScanResult:
@@ -521,13 +498,32 @@ def _extract_topology(data: dict[str, Any]) -> RunTopology:
     return RunTopology(entry_point=data.get("entry_point"), agents=agents)
 
 
-def _scan_events(events: list[dict[str, Any]]) -> _ScanResult:
+def _scan_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
     """Single pass over event dicts deriving status, gate, current step, and totals.
 
     Events are assumed oldest-first (the natural order of a JSONL log and
-    of :func:`read_event_log_tail`'s output), so later events in the list
-    override earlier ones for state that only has one current value
-    (``status``, ``gate``).
+    of :func:`stream_event_log`'s output), so later events override earlier
+    ones for state that only has one current value (``status``, ``gate``,
+    ``topology``, ``workflow_name``, ``cwd``, ``inputs``).
+
+    Accepts any one-shot iterable and makes exactly one forward pass over
+    it -- no indexing, no ``len()``, no re-iteration (mirrors
+    ``fleet.history._scan_history_events``'s identical issue-#436
+    constraint) -- which is what lets :func:`derive_run_summary` stream
+    straight from :func:`stream_event_log` instead of materializing a list.
+
+    **Generation-aware (issue #485):** every *root* ``workflow_started``
+    marks the start of a new execution generation of this run -- a resumed
+    run always writes a second one into the same log, whether or not a
+    dashboard was attached (see the module docstring). Reaching one resets
+    the per-generation state a fresh run starts with -- ``status`` back to
+    ``"running"``, any open gate cleared, every open step closed -- and
+    *overwrites* (not merges) ``topology``/``workflow_name``/``cwd``/
+    ``inputs`` with this generation's own, so a resumed run's current step
+    and topology reflect what is actually running now, not a stale earlier
+    generation. Token/cost totals are the one exception: they are **not**
+    reset here, and keep accumulating across every generation in the log --
+    a resumed run's lifetime usage, not just its latest attempt's.
     """
     result = _ScanResult()
 
@@ -540,35 +536,42 @@ def _scan_events(events: list[dict[str, Any]]) -> _ScanResult:
         # originate from a nested sub-workflow engine, not the root run.
         # A nested agent can share a root agent's name, so scanning these
         # would corrupt the root agent's status/timing/usage -- skip
-        # anything outside the root context.
+        # anything outside the root context. This is also what keeps a
+        # nested sub-workflow's own `workflow_started` from being mistaken
+        # for a resume boundary.
         if data.get("subworkflow_path"):
             continue
         ts = evt.get("timestamp")
 
-        if etype == "workflow_started" and result.workflow_name is None:
+        if etype == "workflow_started":
             # The workflow's *declared* name (`workflow.name`), which is not
             # the file stem the run record carries: a repo that stores each
             # workflow as `<name>/workflow.yaml` makes every run show up as
             # "workflow". History reads this same declared name out of the
             # log filename, which is why the two screens disagreed.
             declared = data.get("name")
-            if isinstance(declared, str) and declared:
-                result.workflow_name = declared
+            result.workflow_name = declared if isinstance(declared, str) and declared else None
 
             # Where conductor was launched from, and what it was launched
             # with -- neither is on the run record, and both are what tells
             # two runs of the same workflow apart.
             system = data.get("system")
-            if isinstance(system, dict):
-                cwd = system.get("cwd")
-                if isinstance(cwd, str) and cwd:
-                    result.cwd = cwd
+            cwd = system.get("cwd") if isinstance(system, dict) else None
+            result.cwd = cwd if isinstance(cwd, str) and cwd else None
             inputs = data.get("inputs")
-            if isinstance(inputs, dict):
-                result.inputs = inputs
+            result.inputs = inputs if isinstance(inputs, dict) else None
 
-        if etype == "workflow_started" and result.topology is None:
             result.topology = _extract_topology(data)
+
+            # A new generation starts clean: nothing from a dead prior
+            # attempt (its terminal status, an unresolved gate, a step
+            # that never got its own closing event before the process
+            # exited) may leak into how this generation reads. Totals are
+            # deliberately untouched -- see the docstring.
+            result.status = "running"
+            result.gate = None
+            result.open_steps = []
+            continue
 
         elif etype in ("agent_started", "parallel_agent_started"):
             # A plain agent opens via `agent_started`; a parallel-group
@@ -680,9 +683,9 @@ def _scan_events(events: list[dict[str, Any]]) -> _ScanResult:
 
 
 def _scan_agent_details(
-    events: list[dict[str, Any]], topology: RunTopology | None
-) -> tuple[list[AgentDetail], str | None]:
-    """Single pass over **full**-log events building per-agent detail rows (E9-T3).
+    events: Iterable[dict[str, Any]],
+) -> tuple[RunTopology | None, str | None, list[AgentDetail], str | None]:
+    """Single pass over the full event stream building per-agent detail rows (E9-T3).
 
     Unlike :func:`_scan_events` (which only tracks aggregate totals for the
     Runs list), this tracks each agent's own completion payload
@@ -690,21 +693,35 @@ def _scan_agent_details(
     ``agent_name`` -- the per-agent history the detail screen needs that the
     list screen's aggregate totals do not carry.
 
+    Topology (and the run's declared workflow name) extraction is folded
+    into this same pass -- required once the log is read as a one-shot
+    stream (issue #485): :func:`derive_run_detail` used to iterate the
+    event list twice, once to find the topology and once here, which a
+    one-shot iterator cannot support. The **latest** root
+    ``workflow_started`` wins (last generation wins, mirroring
+    :func:`_scan_events`'s identical resume-boundary handling), so a
+    resumed run's detail screen reflects the current generation's topology,
+    not a stale earlier one. Per-agent status/usage tracking is otherwise
+    unchanged: an agent's cumulative tokens/cost keep accumulating across
+    every restart they already did (a loop-back or a resume look the same
+    to this loop -- a fresh ``agent_started`` always means "running now",
+    regardless of why the process is executing it again), consistent with
+    :func:`_scan_events`'s Q1 totals-accumulate-across-generations rule.
+
     Args:
-        events: Full-log event dicts, oldest first (see
-            :func:`read_event_log_full`).
-        topology: The run's topology (agent order/definitions), or ``None``
-            if unavailable -- in which case there is nothing to build rows
-            for.
+        events: Event dicts, oldest first (see :func:`stream_event_log`).
 
     Returns:
-        A ``(agents, current_step)`` tuple: one :class:`AgentDetail` per
-        ``topology.agents`` entry (same order), and the name of the
-        currently open step (agent, parallel group, or for_each group), or
-        ``None`` if nothing is open.
+        A ``(topology, workflow_name, agents, current_step)`` tuple: the
+        run's topology from its latest ``workflow_started`` (``None`` if
+        the log never had one), that event's declared workflow name
+        (``None`` if undeclared or no such event), one :class:`AgentDetail`
+        per ``topology.agents`` entry (same order, empty when ``topology``
+        is ``None``), and the name of the currently open step (agent,
+        parallel group, or for_each group), or ``None`` if nothing is open.
     """
-    if topology is None:
-        return [], None
+    topology: RunTopology | None = None
+    workflow_name: str | None = None
 
     open_steps: list[tuple[str, str, float]] = []
     # agent_name -> (status, started_at, reported_elapsed) for the latest
@@ -737,7 +754,13 @@ def _scan_agent_details(
             continue
         ts = evt.get("timestamp")
 
-        if etype in ("agent_started", "parallel_agent_started"):
+        if etype == "workflow_started":
+            topology = _extract_topology(data)
+            declared = data.get("name")
+            workflow_name = declared if isinstance(declared, str) and declared else None
+            continue
+
+        elif etype in ("agent_started", "parallel_agent_started"):
             # A plain agent opens via `agent_started`; a parallel-group
             # member instead opens via its own `parallel_agent_started` --
             # it never gets a plain `agent_started` at all.
@@ -845,6 +868,9 @@ def _scan_agent_details(
     open_agent_names = {name for (kind, name, _ts) in open_steps if kind == "agent"}
     current_step = open_steps[-1][1] if open_steps else None
 
+    if topology is None:
+        return None, workflow_name, [], None
+
     agent_details: list[AgentDetail] = []
     for ta in topology.agents:
         cum_tokens = cumulative_tokens.get(ta.name)
@@ -898,7 +924,7 @@ def _scan_agent_details(
             )
         )
 
-    return agent_details, current_step
+    return topology, workflow_name, agent_details, current_step
 
 
 # ---------------------------------------------------------------------------
@@ -906,49 +932,37 @@ def _scan_agent_details(
 # ---------------------------------------------------------------------------
 
 
-def derive_run_summary(
-    record: RunRecord,
-    *,
-    tail_bytes: int = _DEFAULT_TAIL_BYTES,
-) -> RunSummary:
-    """Derive a :class:`RunSummary` for ``record`` from its event log's tail.
+def derive_run_summary(record: RunRecord) -> RunSummary:
+    """Derive a :class:`RunSummary` for ``record`` from its event log.
 
     ``record`` is assumed to already be known-live (e.g. sourced from
     :func:`conductor.fleet.records.read_run_records`) — this function does
     not re-check liveness; see the module docstring for why. When
-    ``record.event_log_path`` is empty or unreadable, this still returns a
-    usable summary (``status="running"``, no current step, zero totals)
-    rather than raising, so a run whose log hasn't been created yet (or
-    whose path is stale) never crashes the caller's poll loop.
+    ``record.event_log_path`` is empty, unreadable, or any other
+    ``OSError`` occurs while streaming it, this still returns a usable
+    summary (``status="running"``, no current step, zero totals) rather
+    than raising, so a run whose log hasn't been created yet (or whose
+    path is stale) never crashes the caller's poll loop -- the
+    :func:`stream_event_log` generator raises on its first ``next()``, not
+    at construction, so the ``try``/``except`` here wraps the *consumption*
+    (:func:`_scan_events`'s draining loop), not just the call.
 
     Args:
         record: The run record to summarize.
-        tail_bytes: Passed through to :func:`read_event_log_tail`.
 
     Returns:
         A :class:`RunSummary` reflecting the run's state as of the last
-        event visible within the tail window.
+        event in the log (see :attr:`RunSummary.total_tokens` for how a
+        resumed run's multiple generations are combined).
     """
-    events: list[dict[str, Any]] = []
-    log_path: Path | None = None
+    scan = _ScanResult()
     if record.event_log_path:
         log_path = Path(record.event_log_path)
-        events = read_event_log_tail(log_path, tail_bytes=tail_bytes)
-
-    scan = _scan_events(events)
-    # `workflow_started` is the log's first event, so on a run long enough to
-    # outgrow the tail window it is always outside it -- the topology (and
-    # with it the preview's step list) disappeared exactly when a run got
-    # interesting enough to want it. Read lazily: for any log under the tail
-    # window -- the common case, and every young run -- the tail already
-    # contained `workflow_started`, and this runs once per row on the Runs
-    # screen's ~2s poll, on the UI thread.
-    if log_path is not None and (scan.topology is None or scan.workflow_name is None):
-        head_scan = _scan_events(read_event_log_head(log_path))
-        scan.topology = scan.topology or head_scan.topology
-        scan.workflow_name = scan.workflow_name or head_scan.workflow_name
-        scan.cwd = scan.cwd or head_scan.cwd
-        scan.inputs = scan.inputs if scan.inputs is not None else head_scan.inputs
+        try:
+            scan = _scan_events(stream_event_log(log_path, keep_types=_SUMMARY_EVENT_TYPES))
+        except OSError:
+            logger.debug("Could not read event log %s", log_path, exc_info=True)
+            scan = _ScanResult()
 
     if scan.open_steps:
         current_step_type, current_step, current_step_started_at = scan.open_steps[-1]
@@ -1007,65 +1021,81 @@ class StepDetail:
     """The run's declared name, not the workflow file's stem."""
 
 
-def derive_step_detail(
-    record: RunRecord, agent_name: str, *, max_bytes: int = _DEFAULT_FULL_LOG_MAX_BYTES
-) -> StepDetail:
+def derive_step_detail(record: RunRecord, agent_name: str) -> StepDetail:
     """Extract one step's input/output/activity from a run's event log.
 
-    Reads the **full** (bounded) log rather than the tail, for the same
-    reason :func:`derive_run_detail` does: a step's prompt is emitted once,
-    when it started, which on a long run is far outside the tail window.
+    Streams the whole (uncapped) log -- a step's prompt is emitted once,
+    when it started, which on a long run the old bounded tail window
+    always missed. When ``record.event_log_path`` is empty, or any
+    ``OSError`` occurs while streaming it, this still returns a usable
+    (``status="pending"``, no prompt/output/activity) :class:`StepDetail`
+    rather than raising, mirroring :func:`derive_run_summary` /
+    :func:`derive_run_detail`'s never-raise contract.
 
     Activity is bounded to the most recent :data:`_STEP_ACTIVITY_LIMIT`
     entries -- a long agentic loop emits hundreds of tool calls, and this is
     a drill-down, not a log viewer.
     """
-    events: list[dict[str, Any]] = []
-    if record.event_log_path:
-        events = read_event_log_full(Path(record.event_log_path), max_bytes=max_bytes)
-
     prompt: str | None = None
     output: Any | None = None
     status = "pending"
     activity: deque[ActivityLine] = deque(maxlen=_STEP_ACTIVITY_LIMIT)
+    # The run's declared workflow name, captured from the same pass (last
+    # generation wins) rather than a second scan over the same log -- see
+    # `_scan_agent_details`'s identical reasoning.
+    workflow_name: str | None = None
 
-    for evt in events:
-        data = evt.get("data")
-        if not isinstance(data, dict) or data.get("subworkflow_path"):
-            continue
-        if data.get("agent_name") != agent_name:
-            continue
-        etype = evt.get("type")
+    if record.event_log_path:
+        log_path = Path(record.event_log_path)
+        try:
+            events = stream_event_log(log_path)
+            for evt in events:
+                data = evt.get("data")
+                if not isinstance(data, dict) or data.get("subworkflow_path"):
+                    continue
+                etype = evt.get("type")
 
-        if etype in ("agent_started", "parallel_agent_started"):
-            status = "running"
-            # A re-run (loop-back) supersedes the previous attempt's result.
-            output = None
-            activity.clear()
-        elif etype == "agent_prompt_rendered":
-            rendered = data.get("rendered_prompt")
-            if isinstance(rendered, str):
-                prompt = rendered
-        elif etype in ("agent_completed", "parallel_agent_completed"):
-            status = "completed"
-            output = data.get("output")
-        elif etype == "questions_completed" or etype in _AGENT_CLOSE_EVENT_TYPES:
-            status = "completed"
-        elif etype in _AGENT_FAILED_EVENT_TYPES:
-            status = "failed"
+                if etype == "workflow_started":
+                    declared = data.get("name")
+                    workflow_name = declared if isinstance(declared, str) and declared else None
+                    continue
 
-        if etype == "agent_message":
-            content = data.get("content")
-            if isinstance(content, str) and content.strip():
-                activity.append(ActivityLine("message", content.strip()))
-        elif etype == "agent_reasoning":
-            content = data.get("content")
-            if isinstance(content, str) and content.strip():
-                activity.append(ActivityLine("reasoning", content.strip()))
-        elif etype == "agent_tool_start":
-            activity.append(ActivityLine("tool", str(data.get("tool_name") or "tool")))
-        elif etype == "agent_tool_complete":
-            activity.append(ActivityLine("tool_result", str(data.get("tool_name") or "tool")))
+                if data.get("agent_name") != agent_name:
+                    continue
+
+                if etype in ("agent_started", "parallel_agent_started"):
+                    status = "running"
+                    # A re-run (loop-back) supersedes the previous attempt's result.
+                    output = None
+                    activity.clear()
+                elif etype == "agent_prompt_rendered":
+                    rendered = data.get("rendered_prompt")
+                    if isinstance(rendered, str):
+                        prompt = rendered
+                elif etype in ("agent_completed", "parallel_agent_completed"):
+                    status = "completed"
+                    output = data.get("output")
+                elif etype == "questions_completed" or etype in _AGENT_CLOSE_EVENT_TYPES:
+                    status = "completed"
+                elif etype in _AGENT_FAILED_EVENT_TYPES:
+                    status = "failed"
+
+                if etype == "agent_message":
+                    content = data.get("content")
+                    if isinstance(content, str) and content.strip():
+                        activity.append(ActivityLine("message", content.strip()))
+                elif etype == "agent_reasoning":
+                    content = data.get("content")
+                    if isinstance(content, str) and content.strip():
+                        activity.append(ActivityLine("reasoning", content.strip()))
+                elif etype == "agent_tool_start":
+                    activity.append(ActivityLine("tool", str(data.get("tool_name") or "tool")))
+                elif etype == "agent_tool_complete":
+                    activity.append(
+                        ActivityLine("tool_result", str(data.get("tool_name") or "tool"))
+                    )
+        except OSError:
+            logger.debug("Could not read event log %s", log_path, exc_info=True)
 
     return StepDetail(
         agent_name=agent_name,
@@ -1073,82 +1103,43 @@ def derive_step_detail(
         prompt=prompt,
         output=output,
         activity=list(activity),
-        workflow_name=_declared_workflow_name(events) or record.workflow_name,
+        workflow_name=workflow_name or record.workflow_name,
     )
 
 
-def _declared_workflow_name(events: list[dict[str, Any]]) -> str | None:
-    """Return the root run's *declared* workflow name, if the log has it.
+def derive_run_detail(record: RunRecord) -> RunDetail:
+    """Derive a :class:`RunDetail` for ``record`` from its event log's full
+    (streamed) contents -- the run-detail screen's data source (E9-T3),
+    distinct from :func:`derive_run_summary`'s aggregate-only scan the
+    polled Runs list uses.
 
-    The run record carries the workflow file's stem, so a repo that stores
-    each workflow as ``<name>/workflow.yaml`` labels every run "workflow".
-    The declared name is in the log, and it is what the Runs and History
-    screens already show -- the drill-downs read it here so all four agree.
-
-    Args:
-        events: Parsed event dicts from the run's log.
-
-    Returns:
-        The declared name, or ``None`` when no root ``workflow_started``
-        carries one.
-    """
-    for evt in events:
-        if evt.get("type") != "workflow_started":
-            continue
-        data = evt.get("data")
-        if not isinstance(data, dict) or data.get("subworkflow_path"):
-            continue
-        declared = data.get("name")
-        if isinstance(declared, str) and declared:
-            return declared
-    return None
-
-
-def derive_run_detail(
-    record: RunRecord, *, max_bytes: int = _DEFAULT_FULL_LOG_MAX_BYTES
-) -> RunDetail:
-    """Derive a :class:`RunDetail` for ``record`` from its event log's **full**
-    (bounded) contents -- the run-detail screen's data source (E9-T3),
-    distinct from :func:`derive_run_summary`'s tail-based read the polled
-    Runs list uses.
-
-    When ``record.event_log_path`` is empty or unreadable, or the log has
-    no (or no yet-visible) ``workflow_started`` event, this returns a
-    :class:`RunDetail` with ``topology=None`` and an empty ``agents`` list
-    rather than raising -- the detail screen renders a placeholder for this
-    case (E9-T5) instead of crashing or showing an empty table.
-
-    Args:
-        record: The run record to derive detail for.
-        max_bytes: Passed through to :func:`read_event_log_full`.
+    When ``record.event_log_path`` is empty, unreadable, or the log has no
+    ``workflow_started`` event, this returns a :class:`RunDetail` with
+    ``topology=None`` and an empty ``agents`` list rather than raising --
+    the detail screen renders a placeholder for this case (E9-T5) instead
+    of crashing or showing an empty table.
 
     Returns:
         A :class:`RunDetail` with one row per topology agent (in the
         topology's own order) and the name of the currently open step.
     """
-    events: list[dict[str, Any]] = []
-    if record.event_log_path:
-        events = read_event_log_full(Path(record.event_log_path), max_bytes=max_bytes)
-
     topology: RunTopology | None = None
-    for evt in events:
-        if evt.get("type") == "workflow_started":
-            data = evt.get("data")
-            if not isinstance(data, dict):
-                continue
-            # Skip a nested sub-workflow's own workflow_started (stamped
-            # with subworkflow_path) -- only the root run's topology
-            # belongs on this screen.
-            if data.get("subworkflow_path"):
-                continue
-            topology = _extract_topology(data)
-            break
+    workflow_name: str | None = None
+    agents: list[AgentDetail] = []
+    current_step: str | None = None
 
-    agents, current_step = _scan_agent_details(events, topology)
+    if record.event_log_path:
+        log_path = Path(record.event_log_path)
+        try:
+            topology, workflow_name, agents, current_step = _scan_agent_details(
+                stream_event_log(log_path)
+            )
+        except OSError:
+            logger.debug("Could not read event log %s", log_path, exc_info=True)
 
     return RunDetail(
         run_id=record.run_id,
-        workflow_name=_declared_workflow_name(events) or record.workflow_name,
+        workflow_name=workflow_name or record.workflow_name,
         topology=topology,
         agents=agents,
         current_step=current_step,

@@ -8,7 +8,8 @@ when nothing is running, rather than an empty table (E7-T5).
 
 Refreshed on a ~2s poll timer (:data:`RunsScreen.POLL_INTERVAL_SECONDS`) via
 Textual's ``set_interval`` — a full rescan of the run-record directory plus
-a bounded event-log tail seek per live run (:mod:`conductor.fleet.summary`).
+a streamed, prefiltered event-log scan per live run
+(:mod:`conductor.fleet.summary`).
 Per the design's *Refresh model*, there is deliberately no file watcher.
 
 That scan runs in a worker thread (:func:`asyncio.to_thread`), not on the

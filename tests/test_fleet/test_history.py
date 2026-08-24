@@ -30,6 +30,7 @@ from unittest.mock import patch
 import pytest
 
 import conductor.fleet.history as history_module
+import conductor.fleet.summary as summary_module
 from conductor.fleet.history import (
     HistoryEntry,
     _CorruptEventLogError,
@@ -673,6 +674,55 @@ class TestResumedRunResetsTerminalState:
         assert entries[0].outcome == "completed"
         assert entries[0].duration_seconds == 55.0
 
+    def test_started_at_is_the_latest_generations_not_the_first(self, temp_root: Path) -> None:
+        """Issue #485, Q2: `started_at` is not itself a displayed column,
+        but it feeds `duration_seconds`'s fallback, so a resumed run's
+        entry must not span the idle gap between the original attempt
+        and its resume."""
+        _write_log(
+            temp_root,
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=1010.0),
+                _event("workflow_started", {"name": "my-workflow"}, ts=2000.0),
+                _event("workflow_completed", {"elapsed": 55.0}, ts=2055.0),
+            ],
+        )
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].started_at == 2000.0
+
+    def test_resumed_then_failed_duration_measures_the_latest_generation_only(
+        self, temp_root: Path
+    ) -> None:
+        """A resumed-then-failed run has no engine-reported `elapsed`
+        (`workflow_failed` carries none), so `duration_seconds` falls back
+        to `ended_at - started_at` -- which must not span the idle gap
+        between the original attempt (far in the past) and the resume
+        that actually failed (issue #485, Q2)."""
+        _write_log(
+            temp_root,
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=1010.0),
+                # A long idle gap before the resume -- if `started_at`
+                # were still the first generation's, duration_seconds
+                # would (wrongly) include this gap.
+                _event("workflow_started", {"name": "my-workflow"}, ts=100_000.0),
+                _event("workflow_failed", {"error_type": "RuntimeError"}, ts=100_005.0),
+            ],
+        )
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].outcome == "failed"
+        assert entries[0].started_at == 100_000.0
+        assert entries[0].ended_at == 100_005.0
+        assert entries[0].duration_seconds == pytest.approx(5.0)
+
 
 # ---------------------------------------------------------------------------
 # HistoryEntry shape
@@ -718,7 +768,10 @@ class TestFullLogStreamsWithoutMaterializing:
     def test_read_full_log_parses_lazily(self, temp_root: Path) -> None:
         """Direct, deterministic proof that memory no longer scales with
         log length: taking a single `next()` off the generator parses
-        exactly one line, not the whole file."""
+        exactly one line, not the whole file. `_read_full_log` now
+        delegates the actual parsing to
+        `conductor.fleet.summary.stream_event_log` (issue #485), so the
+        call is observed there rather than on `history_module.json`."""
         path = _write_log(
             temp_root,
             lines=[
@@ -729,7 +782,7 @@ class TestFullLogStreamsWithoutMaterializing:
         )
 
         with (
-            patch.object(history_module.json, "loads", wraps=json.loads) as loads,
+            patch.object(summary_module.json, "loads", wraps=json.loads) as loads,
             contextlib.closing(_read_full_log(path)) as gen,
         ):
             assert inspect.isgenerator(gen)

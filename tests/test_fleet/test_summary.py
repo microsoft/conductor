@@ -2,9 +2,10 @@
 RunDetail derivation).
 
 Covers:
-- Bounded JSONL tail reading: whole small file, seek-and-discard-partial-line
-  for a file larger than the tail window, tolerance of a mid-line truncation,
-  an empty file, and a missing file.
+- Streaming JSONL reading (issue #485): whole small file, tolerance of a
+  mid-line truncation, an empty file, a missing file, and the
+  ``keep_types`` prefilter (including its "not first" fallback and its
+  equivalence with an unfiltered scan).
 - Every status in the design's vocabulary (`running`, `at-gate`, `paused`,
   `completed`, `failed`), including a gate opened then resolved returning to
   `running`.
@@ -16,10 +17,13 @@ Covers:
 - Topology extraction from `workflow_started`.
 - The gate payload carried onto the summary, and `gate_resolvable` per D4
   (true for `fg-web`/`bg`, false for `fg`).
-- (E9-T3) The bounded *full*-log reader and per-agent `RunDetail` derivation
-  used only by the run-detail screen: per-agent pending/running/completed/
-  failed status, elapsed/tokens/cost per agent, and graceful degradation
-  when the log or its `workflow_started` event is missing.
+- A resumed run's generation-aware reset: status/gate/current-step reset at
+  each root `workflow_started`, while token/cost totals accumulate across
+  every generation (issue #485, Q1).
+- Per-agent `RunDetail` derivation used only by the run-detail screen:
+  per-agent pending/running/completed/failed status, elapsed/tokens/cost per
+  agent, and graceful degradation when the log or its `workflow_started`
+  event is missing.
 """
 
 from __future__ import annotations
@@ -30,14 +34,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import (
+    _SUMMARY_EVENT_TYPES,
     RunDetail,
     RunSummary,
+    _scan_events,
     derive_run_detail,
     derive_run_summary,
-    read_event_log_full,
-    read_event_log_tail,
+    stream_event_log,
 )
 
 # ---------------------------------------------------------------------------
@@ -77,8 +84,8 @@ def _make_record(tmp_path: Path, **overrides: object) -> RunRecord:
 # ---------------------------------------------------------------------------
 
 
-class TestReadEventLogTail:
-    def test_reads_all_events_when_file_smaller_than_window(self, tmp_path: Path) -> None:
+class TestStreamEventLog:
+    def test_reads_all_events_oldest_first(self, tmp_path: Path) -> None:
         path = tmp_path / "small.events.jsonl"
         _write_jsonl(
             path,
@@ -88,45 +95,27 @@ class TestReadEventLogTail:
             ],
         )
 
-        events = read_event_log_tail(path, tail_bytes=1024)
+        events = list(stream_event_log(path))
 
         assert len(events) == 2
         assert events[0]["type"] == "agent_started"
         assert events[1]["type"] == "agent_completed"
 
-    def test_bounded_read_discards_older_events(self, tmp_path: Path) -> None:
-        """A file much larger than the tail window only yields the newest events --
-        confirming the read is bounded, not whole-file."""
+    def test_reads_a_log_far_larger_than_the_old_bounded_windows(self, tmp_path: Path) -> None:
+        """No cap at all (issue #485): every event in a log much larger
+        than the old 512 KiB tail/head windows or the 8 MiB full-log cap
+        is still read, including the very first line."""
         path = tmp_path / "large.events.jsonl"
-        lines = [_event("agent_started", {"agent_name": f"agent-{i}"}) for i in range(500)]
+        lines = [_event("workflow_started", {"name": "wf"})]
+        lines += [_event("agent_started", {"agent_name": f"agent-{i}"}) for i in range(20000)]
         _write_jsonl(path, lines)
+        assert path.stat().st_size > 512 * 1024
 
-        events = read_event_log_tail(path, tail_bytes=200)
+        events = list(stream_event_log(path))
 
-        assert 0 < len(events) < 500
-        # Only the newest (highest-index) agents survive in the tail window.
-        names = [e["data"]["agent_name"] for e in events]
-        assert names[-1] == "agent-499"
-        assert "agent-0" not in names
-
-    def test_discards_partial_leading_line_at_seek_boundary(self, tmp_path: Path) -> None:
-        """The line straddling the seek point must never surface as a garbled event."""
-        path = tmp_path / "boundary.events.jsonl"
-        lines = [_event("agent_started", {"agent_name": f"agent-{i}"}) for i in range(50)]
-        _write_jsonl(path, lines)
-
-        # Pick a range of tail_bytes that lands mid-line at various boundaries.
-        saw_at_least_one_event = False
-        for tail_bytes in range(10, 200, 7):
-            events = read_event_log_tail(path, tail_bytes=tail_bytes)
-            if events:
-                saw_at_least_one_event = True
-            for e in events:
-                assert e["type"] == "agent_started"
-                assert e["data"]["agent_name"].startswith("agent-")
-        # Confirms the loop above actually exercised parsed events, not just
-        # a vacuously-true "no garbled events" over consistently-empty results.
-        assert saw_at_least_one_event
+        assert len(events) == 20001
+        assert events[0]["type"] == "workflow_started"
+        assert events[-1]["data"]["agent_name"] == "agent-19999"
 
     def test_tolerates_truncated_mid_line(self, tmp_path: Path) -> None:
         path = tmp_path / "truncated.events.jsonl"
@@ -135,7 +124,7 @@ class TestReadEventLogTail:
         good2 = _event("workflow_completed", {})
         path.write_text(f"{good1}\n{bad}\n{good2}\n")
 
-        events = read_event_log_tail(path, tail_bytes=4096)
+        events = list(stream_event_log(path))
 
         types = [e["type"] for e in events]
         assert types == ["agent_started", "workflow_completed"]
@@ -144,16 +133,163 @@ class TestReadEventLogTail:
         path = tmp_path / "empty.events.jsonl"
         path.write_text("")
 
-        events = read_event_log_tail(path)
+        assert list(stream_event_log(path)) == []
 
-        assert events == []
-
-    def test_missing_file_yields_no_events(self, tmp_path: Path) -> None:
+    def test_missing_file_raises_oserror_on_first_next(self, tmp_path: Path) -> None:
+        """Unlike the bounded readers this replaces, a read failure is not
+        swallowed -- it propagates on the generator's first `next()`, not
+        at construction (issue #485). `derive_run_summary` is the caller
+        that must wrap the *consumption*, not just this call, to keep its
+        own never-raise contract -- see `TestStatusVocabulary`'s
+        `test_missing_event_log_path_never_raises` and the sibling test
+        for a genuinely missing (but declared) path below."""
         path = tmp_path / "does-not-exist.events.jsonl"
 
-        events = read_event_log_tail(path)
+        gen = stream_event_log(path)
 
-        assert events == []
+        with pytest.raises(OSError):
+            next(gen)
+
+    def test_missing_log_path_still_yields_a_usable_summary(self, tmp_path: Path) -> None:
+        """`stream_event_log` raises for a missing file, but
+        `derive_run_summary` must not -- it wraps the consumption."""
+        record = _make_record(
+            tmp_path, event_log_path=str(tmp_path / "does-not-exist.events.jsonl")
+        )
+
+        summary = derive_run_summary(record)
+
+        assert summary.status == "running"
+        assert summary.current_step is None
+        assert summary.total_tokens == 0
+
+    def test_keep_types_skips_uninteresting_lines_without_parsing_them(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("agent_started", {"agent_name": "a"}),
+                _event("agent_message", {"agent_name": "a", "content": "thinking..."}),
+                _event("agent_completed", {"agent_name": "a", "tokens": 5}),
+            ],
+        )
+
+        events = list(stream_event_log(path, keep_types=frozenset({"agent_started"})))
+
+        assert [e["type"] for e in events] == ["agent_started"]
+
+    def test_keep_types_none_parses_every_line(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("agent_started", {"agent_name": "a"}),
+                _event("agent_message", {"agent_name": "a", "content": "thinking..."}),
+            ],
+        )
+
+        events = list(stream_event_log(path, keep_types=None))
+
+        assert [e["type"] for e in events] == ["agent_started", "agent_message"]
+
+    def test_a_type_key_not_first_is_parsed_regardless_of_keep_types(self, tmp_path: Path) -> None:
+        """The prefilter is only ever an optimization: a line whose `type`
+        key isn't first fails the anchored regex, so it falls through to
+        being parsed (and yielded) unconditionally, regardless of
+        `keep_types` -- it can never silently drop an event just because
+        the writer happened to serialize it with a different key order.
+        The accepted trade-off is the mirror image: such a line is *not*
+        re-checked against `keep_types` after parsing either, so it can
+        also survive a filter that would otherwise have excluded it."""
+        path = tmp_path / "run.events.jsonl"
+        reordered = json.dumps(
+            {"timestamp": 1.0, "type": "agent_started", "data": {"agent_name": "a"}}
+        )
+        path.write_text(reordered + "\n")
+
+        kept = list(stream_event_log(path, keep_types=frozenset({"agent_started"})))
+        not_excluded = list(stream_event_log(path, keep_types=frozenset({"workflow_completed"})))
+
+        assert [e["type"] for e in kept] == ["agent_started"]
+        assert [e["type"] for e in not_excluded] == ["agent_started"]
+
+    def test_prefilter_matches_an_unfiltered_scan(self, tmp_path: Path) -> None:
+        """The strongest guard against prefilter drift (issue #485): build
+        a log exercising every branch `_scan_events` handles, then assert
+        a `keep_types=_SUMMARY_EVENT_TYPES` scan produces the identical
+        `_ScanResult` as an unfiltered one. A future event type handled by
+        the scanner but missing from `_SUMMARY_EVENT_TYPES` fails here
+        instead of silently vanishing from the Runs screen."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event(
+                    "workflow_started",
+                    {
+                        "name": "wf",
+                        "entry_point": "a",
+                        "agents": [{"name": "a", "type": "agent"}],
+                        "system": {"cwd": "/tmp/proj"},
+                        "inputs": {"question": "hi"},
+                    },
+                ),
+                _event("agent_started", {"agent_name": "a"}, ts=1.0),
+                _event(
+                    "gate_presented",
+                    {"agent_name": "a", "prompt": "OK?", "options": ["yes"]},
+                    ts=2.0,
+                ),
+                _event("gate_resolved", {"agent_name": "a"}, ts=3.0),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "a", "tokens": 10, "cost_usd": 0.01},
+                    ts=4.0,
+                ),
+                _event("agent_started", {"agent_name": "b"}, ts=5.0),
+                _event("agent_paused", {"agent_name": "b"}, ts=6.0),
+                _event("agent_started", {"agent_name": "b"}, ts=7.0),
+                _event("parallel_started", {"group_name": "fanout"}, ts=8.0),
+                _event(
+                    "parallel_agent_started",
+                    {"group_name": "fanout", "agent_name": "c"},
+                    ts=9.0,
+                ),
+                _event(
+                    "parallel_agent_completed",
+                    {"group_name": "fanout", "agent_name": "c", "tokens": 3},
+                    ts=10.0,
+                ),
+                _event("parallel_agent_failed", {"group_name": "fanout", "agent_name": "d"}),
+                _event("parallel_completed", {"group_name": "fanout"}),
+                _event("for_each_started", {"group_name": "triage"}, ts=11.0),
+                _event("for_each_completed", {"group_name": "triage"}),
+                _event("script_completed", {"agent_name": "e"}),
+                _event("wait_completed", {"agent_name": "f"}),
+                _event("set_completed", {"agent_name": "g"}),
+                _event("subworkflow_completed", {"agent_name": "h"}),
+                _event("questions_completed", {"agent_name": "i"}),
+                _event("script_failed", {"agent_name": "j"}),
+                _event("wait_failed", {"agent_name": "k"}),
+                _event("set_failed", {"agent_name": "l"}),
+                _event("subworkflow_failed", {"agent_name": "m"}),
+                _event("agent_failed", {"agent_name": "n"}),
+                _event(
+                    "workflow_started",
+                    {"name": "wf", "agents": [{"name": "z", "type": "agent"}]},
+                    ts=12.0,
+                ),
+                _event("agent_started", {"agent_name": "z"}, ts=13.0),
+                _event("workflow_completed", {}),
+            ],
+        )
+
+        filtered = _scan_events(stream_event_log(path, keep_types=_SUMMARY_EVENT_TYPES))
+        unfiltered = _scan_events(stream_event_log(path))
+
+        assert filtered == unfiltered
 
 
 # ---------------------------------------------------------------------------
@@ -749,8 +885,8 @@ def _workflow_started_event(agent_names: list[str], *, ts: float | None = None) 
     )
 
 
-class TestReadEventLogFull:
-    def test_reads_all_events_when_file_smaller_than_bound(self, tmp_path: Path) -> None:
+class TestDeriveRunDetailNoCap:
+    def test_reads_all_events_regardless_of_size(self, tmp_path: Path) -> None:
         path = tmp_path / "small.events.jsonl"
         _write_jsonl(
             path,
@@ -760,51 +896,101 @@ class TestReadEventLogFull:
                 _event("agent_completed", {"agent_name": "a", "tokens": 5, "cost_usd": 0.01}),
             ],
         )
+        record = _make_record(tmp_path, event_log_path=str(path))
 
-        events = read_event_log_full(path)
+        detail = derive_run_detail(record)
 
-        assert len(events) == 3
-        assert events[0]["type"] == "workflow_started"
-        assert events[-1]["type"] == "agent_completed"
+        assert detail.topology is not None
+        assert detail.agents[0].tokens == 5
+        assert detail.agents[0].cost_usd == 0.01
 
-    def test_bounded_read_truncates_a_pathologically_large_log(self, tmp_path: Path) -> None:
-        """A log far larger than max_bytes is truncated (from the start
-        forward, unlike the tail reader) rather than loaded in full."""
+    def test_trailing_events_survive_a_log_larger_than_the_old_8mib_cap(
+        self, tmp_path: Path
+    ) -> None:
+        """A log far larger than the old 8 MiB full-log cap (issue #485)
+        must still surface its trailing state -- including, in the worst
+        case, the run's own terminal event -- rather than being silently
+        truncated from the start forward."""
         path = tmp_path / "huge.events.jsonl"
         lines = [_workflow_started_event(["a"])]
-        lines += [_event("agent_started", {"agent_name": f"agent-{i}"}) for i in range(5000)]
+        # Padding well past the old 8 MiB bound.
+        lines += [
+            _event("agent_message", {"agent_name": "a", "content": "x" * 900}) for _ in range(9500)
+        ]
+        lines += [
+            _event("agent_started", {"agent_name": "a"}, ts=1000.0),
+            _event(
+                "agent_completed",
+                {"agent_name": "a", "elapsed": 5.0, "tokens": 42, "cost_usd": 0.02},
+                ts=1005.0,
+            ),
+        ]
         _write_jsonl(path, lines)
-        full_size = path.stat().st_size
+        assert path.stat().st_size > 8 * 1024 * 1024
+        record = _make_record(tmp_path, event_log_path=str(path))
 
-        events = read_event_log_full(path, max_bytes=200)
+        detail = derive_run_detail(record)
 
-        assert 0 < len(events) < len(lines)
-        # First event (workflow_started) still present -- confirms this
-        # reads from the start, the opposite end from read_event_log_tail.
-        assert events[0]["type"] == "workflow_started"
-        assert full_size > 200
+        agent = detail.agents[0]
+        assert agent.status == "completed"
+        assert agent.tokens == 42
+        assert agent.cost_usd == 0.02
 
-    def test_empty_file_yields_no_events(self, tmp_path: Path) -> None:
+    def test_empty_file_yields_empty_detail(self, tmp_path: Path) -> None:
         path = tmp_path / "empty.events.jsonl"
         path.write_text("")
+        record = _make_record(tmp_path, event_log_path=str(path))
 
-        assert read_event_log_full(path) == []
+        detail = derive_run_detail(record)
 
-    def test_missing_file_yields_no_events(self, tmp_path: Path) -> None:
-        path = tmp_path / "does-not-exist.events.jsonl"
+        assert detail.topology is None
+        assert detail.agents == []
 
-        assert read_event_log_full(path) == []
+    def test_missing_file_yields_empty_detail_never_raises(self, tmp_path: Path) -> None:
+        record = _make_record(
+            tmp_path, event_log_path=str(tmp_path / "does-not-exist.events.jsonl")
+        )
+
+        detail = derive_run_detail(record)
+
+        assert detail.topology is None
+        assert detail.agents == []
 
     def test_tolerates_truncated_mid_line(self, tmp_path: Path) -> None:
         path = tmp_path / "truncated.events.jsonl"
         good = _workflow_started_event(["a"])
         bad = '{"type": "agent_started", "data": {"agent_nam'
         path.write_text(f"{good}\n{bad}\n")
+        record = _make_record(tmp_path, event_log_path=str(path))
 
-        events = read_event_log_full(path)
+        detail = derive_run_detail(record)
 
-        assert len(events) == 1
-        assert events[0]["type"] == "workflow_started"
+        assert detail.topology is not None
+        assert [a.name for a in detail.agents] == ["a"]
+        assert detail.agents[0].status == "pending"
+
+    def test_topology_comes_from_the_last_workflow_started(self, tmp_path: Path) -> None:
+        """A resumed run's detail screen must reflect the current
+        generation's topology, not a stale earlier one (issue #485) --
+        `_scan_agent_details` can no longer make two passes to find the
+        *first* `workflow_started` once the log is a one-shot stream, and
+        "last generation wins" is also the correct answer."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _workflow_started_event(["first-gen-agent"]),
+                _event("agent_started", {"agent_name": "first-gen-agent"}),
+                _event("workflow_failed", {"error_type": "ValueError"}),
+                _workflow_started_event(["second-gen-agent"]),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        detail = derive_run_detail(record)
+
+        assert detail.topology is not None
+        assert [a.name for a in detail.agents] == ["second-gen-agent"]
 
 
 # ---------------------------------------------------------------------------
@@ -1539,24 +1725,221 @@ class TestDeclaredWorkflowName:
 
 
 class TestTopologySurvivesALongLog:
-    """`workflow_started` is the log's first event, so on any run long enough
-    to outgrow the tail window it is the one event guaranteed to be outside
-    it -- the step list disappeared exactly when a run got interesting."""
+    """`workflow_started` is the log's first event; before issue #485, on
+    any run long enough to outgrow the (now-removed) tail window it was
+    the one event guaranteed to be outside it, so the step list
+    disappeared exactly when a run got interesting enough to want it.
+    There is no window to outgrow now -- `stream_event_log` is uncapped."""
 
-    def test_topology_read_from_the_head_when_the_tail_misses_it(self, tmp_path: Path) -> None:
+    def test_topology_survives_a_log_far_larger_than_the_old_tail_window(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "run.events.jsonl"
         lines = [
             _event(
                 "workflow_started",
-                {"workflow_name": "wf", "agents": [{"name": "first", "type": "agent"}]},
+                {"name": "wf", "agents": [{"name": "first", "type": "agent"}]},
             )
         ]
-        # Push it well outside a deliberately tiny tail window.
+        # Push the log well past the old (now-removed) 512 KiB tail window.
         lines += [
-            _event("agent_message", {"agent_name": "a", "text": "x" * 200}) for _ in range(80)
+            _event("agent_message", {"agent_name": "a", "content": "x" * 2000}) for _ in range(500)
         ]
         _write_jsonl(path, lines)
+        assert path.stat().st_size > 512 * 1024
 
-        summary = derive_run_summary(_make_record(tmp_path), tail_bytes=2048)
+        summary = derive_run_summary(_make_record(tmp_path))
+
         assert summary.topology is not None
         assert [a.name for a in summary.topology.agents] == ["first"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #485 regression: current step / tokens / cost survive a log whose
+# most recent agent_started sits far beyond the old 512 KiB tail window.
+# ---------------------------------------------------------------------------
+
+
+class TestIssue485CurrentStepTokensCostSurviveALongLog:
+    def test_current_step_tokens_cost_and_topology_all_populated(self, tmp_path: Path) -> None:
+        """The screenshot, reduced: a run whose most recent `agent_started`
+        is padded well beyond the old bounded tail window used to report
+        `current_step=None`, `total_tokens=0` -- and no topology, since the
+        run was long enough for the old head-recovery path to matter too.
+        None of that is bounded any more."""
+        path = tmp_path / "run.events.jsonl"
+        lines = [
+            _event(
+                "workflow_started",
+                {"name": "implement", "agents": [{"name": "epic_reviewer", "type": "agent"}]},
+            ),
+            _event(
+                "agent_completed",
+                {"agent_name": "earlier", "tokens": 537_391_756, "cost_usd": 175.14},
+            ),
+        ]
+        # Pad the log with realistic in-between activity -- tool calls and
+        # message chunks -- until it is comfortably past the old 512 KiB
+        # tail window, mirroring the real log that produced the issue.
+        padding = [
+            _event("agent_tool_start", {"agent_name": "epic_reviewer", "tool_name": "read"}),
+            _event("agent_message", {"agent_name": "epic_reviewer", "content": "working..." * 50}),
+        ]
+        while sum(len(line) for line in lines) < 600 * 1024:
+            lines.extend(padding)
+        lines.append(_event("agent_started", {"agent_name": "epic_reviewer"}))
+        _write_jsonl(path, lines)
+        assert path.stat().st_size > 512 * 1024
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.current_step == "epic_reviewer"
+        assert summary.total_tokens == 537_391_756
+        assert summary.total_cost_usd == pytest.approx(175.14)
+        assert summary.topology is not None
+        assert [a.name for a in summary.topology.agents] == ["epic_reviewer"]
+        assert summary.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Resumed runs: generation-aware reset (issue #485, Q1/Q2)
+# ---------------------------------------------------------------------------
+
+
+class TestResumedRunGenerations:
+    def test_status_resets_but_totals_accumulate_across_generations(self, tmp_path: Path) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event(
+                    "workflow_started",
+                    {
+                        "name": "wf",
+                        "agents": [{"name": "a", "type": "agent"}],
+                        "system": {"cwd": "/tmp/first"},
+                        "inputs": {"question": "first"},
+                    },
+                    ts=1000.0,
+                ),
+                _event("agent_started", {"agent_name": "a"}, ts=1001.0),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "a", "tokens": 100, "cost_usd": 0.01},
+                    ts=1002.0,
+                ),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=1003.0),
+                _event(
+                    "workflow_started",
+                    {
+                        "name": "wf",
+                        "agents": [{"name": "b", "type": "agent"}],
+                        "system": {"cwd": "/tmp/second"},
+                        "inputs": {"question": "second"},
+                    },
+                    ts=2000.0,
+                ),
+                _event("agent_started", {"agent_name": "b"}, ts=2001.0),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        # Status/current-step reflect the *current* (resumed) generation --
+        # not the dead one's "failed" outcome (issue #485).
+        assert summary.status == "running"
+        assert summary.current_step == "b"
+        # Totals are a lifetime sum across every generation (Q1) -- the
+        # first generation's usage is not lost on resume.
+        assert summary.total_tokens == 100
+        assert summary.total_cost_usd == pytest.approx(0.01)
+        # Topology/cwd/inputs come from the *second* workflow_started
+        # (differing agent lists prove which one won).
+        assert summary.topology is not None
+        assert [a.name for a in summary.topology.agents] == ["b"]
+        assert summary.cwd == "/tmp/second"
+        assert summary.inputs == {"question": "second"}
+
+    def test_an_unresolved_gate_from_a_dead_generation_does_not_survive_a_resume(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"name": "wf"}, ts=1000.0),
+                _event("agent_started", {"agent_name": "ask"}, ts=1001.0),
+                _event("gate_presented", {"agent_name": "ask", "prompt": "OK?"}, ts=1002.0),
+                # The process died with the gate still open -- no
+                # gate_resolved, no workflow_failed even. A resume still
+                # writes a fresh workflow_started.
+                _event("workflow_started", {"name": "wf"}, ts=2000.0),
+                _event("agent_started", {"agent_name": "next"}, ts=2001.0),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.gate is None
+        assert summary.status == "running"
+        assert summary.current_step == "next"
+
+    def test_open_steps_from_a_dead_generation_do_not_survive_a_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """An open parallel group from a dead generation must not leak
+        into the resumed generation's current-step tracking."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("workflow_started", {"name": "wf"}, ts=1000.0),
+                _event("parallel_started", {"group_name": "fanout"}, ts=1001.0),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=1002.0),
+                _event("workflow_started", {"name": "wf"}, ts=2000.0),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.current_step is None
+        assert summary.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Single-pass consumption (mirrors fleet.history's identical issue-#436 test)
+# ---------------------------------------------------------------------------
+
+
+class TestScanEventsAcceptsAOneShotIterator:
+    def test_scan_events_consumes_a_one_shot_generator_exactly_once(self) -> None:
+        consumed = 0
+
+        def _events() -> Any:
+            nonlocal consumed
+            for evt in (
+                {"type": "workflow_started", "timestamp": 1000.0, "data": {"name": "wf"}},
+                {
+                    "type": "agent_started",
+                    "timestamp": 1001.0,
+                    "data": {"agent_name": "a"},
+                },
+                {
+                    "type": "agent_completed",
+                    "timestamp": 1002.0,
+                    "data": {"agent_name": "a", "tokens": 10, "cost_usd": 0.01},
+                },
+            ):
+                consumed += 1
+                yield evt
+
+        scan = _scan_events(_events())
+
+        assert consumed == 3
+        assert scan.workflow_name == "wf"
+        assert scan.total_tokens == 10
+        assert scan.total_cost_usd == pytest.approx(0.01)

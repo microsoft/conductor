@@ -9,15 +9,16 @@ prior art*, discrete steps rather than scrolling text, and explicitly
 no DAG rendering, no agent messages, no tool output — only status, elapsed,
 tokens, and cost per agent, with the current step highlighted (E9-T2)).
 
-Unlike the Runs screen (which stays on the bounded tail-window read so its
-~2s poll never grows with a run's age), this screen uses the bounded
-**full**-log read (:func:`conductor.fleet.summary.derive_run_detail`,
-E9-T3) so every agent's complete history is available, not just whichever
-agents happen to still be inside the tail window.
+Unlike the Runs screen (which prefilters its streamed scan to a small set
+of event types so its ~2s poll stays cheap regardless of a run's age),
+this screen uses the unfiltered streamed read
+(:func:`conductor.fleet.summary.derive_run_detail`, E9-T3) so every
+agent's complete history is available, not just whichever event types the
+Runs screen's aggregate totals need.
 
 Both derivations run in a single worker thread (:func:`asyncio.to_thread`),
-not on the event loop, so the ~2s poll's larger read (a full-log scan on
-top of the Runs screen's bounded tail read) never blocks keypresses or the
+not on the event loop, so the ~2s poll's larger read (an unfiltered scan on
+top of the Runs screen's prefiltered one) never blocks keypresses or the
 footer repaint (issue #437); a tick that overruns the poll interval is
 dropped rather than queued.
 """

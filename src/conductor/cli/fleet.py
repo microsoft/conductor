@@ -132,7 +132,7 @@ def list_runs() -> None:
             # stays coarse-grained ("running") rather than deriving the
             # richer gate/status vocabulary `derive_run_summary` (E6)
             # computes for the TUI's Runs screen, which also requires a
-            # bounded event-log tail read per row; use `conductor fleet`'s
+            # streamed event-log scan per row; use `conductor fleet`'s
             # TUI (or `--web`) for the finer-grained status.
             "running",
             str(record.pid),

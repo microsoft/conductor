@@ -33,7 +33,6 @@ no pagination.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import re
@@ -42,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from conductor.fleet import summary
 from conductor.fleet.retention import event_log_root
 from conductor.run_id import RUN_ID_PATTERN_SOURCE
 
@@ -110,11 +110,15 @@ class HistoryEntry:
     to still be alive (see the module docstring)."""
 
     started_at: float | None
-    """Unix timestamp of the ``workflow_started`` event, or ``None`` if
-    the log has no such event at all (an unrecognized/garbled file, or
-    one that hasn't recorded it yet) -- the full log is always read
-    (:func:`_read_full_log`), so this is never unknown merely because
-    the event was far from the end of the file."""
+    """Unix timestamp of the **latest** ``workflow_started`` event, or
+    ``None`` if the log has no such event at all (an unrecognized/garbled
+    file, or one that hasn't recorded it yet) -- the full log is always
+    read (:func:`_read_full_log`), so this is never unknown merely because
+    the event was far from the end of the file. On a resumed run this is
+    the current attempt's start time, not the original one (issue #485,
+    Q2): since this field isn't itself a displayed column, the effect is
+    on :attr:`duration_seconds`'s fallback, which stops spanning the idle
+    gap between a resume's generations."""
 
     ended_at: float | None
     """Unix timestamp of the terminal event, or ``None`` if there is none."""
@@ -215,7 +219,12 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
     ``reported_elapsed`` are reset back to their "no terminal event yet"
     defaults, so an in-progress resumed attempt reads as ``"unknown"``
     (never the stale prior attempt's outcome) until *its own* terminal
-    event is seen (E14 review round 1).
+    event is seen (E14 review round 1). ``started_at`` is likewise taken
+    from the **latest** ``workflow_started`` (issue #485, Q2): a resumed
+    run's :attr:`HistoryEntry.duration_seconds` fallback (``ended_at -
+    started_at``, used when no engine-reported ``elapsed`` is available --
+    e.g. a resumed-then-failed run) should measure the current attempt,
+    not span the idle gap since the very first one.
     """
     result = _ScanResult()
     seen_workflow_started = False
@@ -243,8 +252,8 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
                 result.reported_elapsed = None
             else:
                 seen_workflow_started = True
-                if ts is not None:
-                    result.started_at = ts
+            if ts is not None:
+                result.started_at = ts
 
         elif etype == "workflow_completed":
             result.outcome = "completed"
@@ -289,89 +298,71 @@ def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
     """Stream-parse every line of a retained event log, oldest first,
     yielding one parsed event dict at a time.
 
-    Unlike ``fleet.summary``'s bounded tail/head readers -- built for a
-    *live* run's cheap, repeated ~2s poll, or a bounded detail view --
-    History only ever reads a log once, after the run is already done, so
-    there is no reason to accept a bounded reader's truncation trade-off
-    here. A byte-capped read can silently omit an early token/cost event
-    or discard an oversized terminal event that falls outside the window,
-    presenting a genuinely completed run as ``"unknown"`` with an
-    incomplete total (E14 review round 1). This function is a generator:
-    neither the raw bytes nor the parsed events are ever fully
-    materialised into a list, so memory is proportional to the largest
-    single line, not to the log's size (retained state beyond that one
-    line/dict is just two booleans). Contrast
-    ``conductor.fleet.summary.read_event_log_full``, which caps its read
-    at 8 MiB and therefore trades coverage for a bounded (but nonzero)
-    memory footprint; streaming gives History unbounded coverage and
-    bounds memory against event *count*, so it needs no equivalent
-    count-based cap -- but a single oversized line is still read and
-    parsed whole (``for raw_line in f`` reads up to the next newline), so
-    this is not an unconditional memory bound. The two readers' differing
-    bounds are a deliberate consequence of their differing consumers (a
-    live-run detail view vs. a done-run, read-once history), not an
-    oversight.
+    Delegates the actual line-reading and JSON-parsing to
+    :func:`conductor.fleet.summary.stream_event_log` (issue #485), which
+    made this exact choice -- an uncapped, streamed read bounded by the
+    longest single line rather than by file size or event count -- for
+    History first and generalized it for the Runs/run-detail screens'
+    former bounded tail/head/full-log readers to share. History still
+    reads a log once, after the run is already done, so there is no
+    reason to accept a bounded reader's truncation trade-off: a byte-capped
+    read can silently omit an early token/cost event or discard an
+    oversized terminal event outside its window, presenting a genuinely
+    completed run as ``"unknown"`` with an incomplete total (E14 review
+    round 1).
 
-    The generator holds the file handle open (inside its ``with``) until
-    it is exhausted, closed, or garbage collected -- that ``with`` block,
-    not any particular caller, owns the handle's lifetime. The sole
-    consumer in production, :func:`_build_entry`, drains it to completion
-    via :func:`_scan_history_events`; tests may consume it directly and
-    abandon it early, which is exactly why the handle's release does not
-    depend on caller behavior.
+    The generator holds the file handle open (inside ``stream_event_log``'s
+    own ``with``) until it is exhausted, closed, or garbage collected --
+    that ``with`` block, not any particular caller, owns the handle's
+    lifetime. The sole consumer in production, :func:`_build_entry`, drains
+    it to completion via :func:`_scan_history_events`; tests may consume it
+    directly and abandon it early, which is exactly why the handle's
+    release does not depend on caller behavior.
 
     Because this is a generator, none of its side effects happen when
     ``_read_full_log(path)`` is called -- they happen while the returned
-    iterator is being **consumed**. In particular, ``open()`` and any
-    ``OSError`` it raises (permission denied, the file vanishing
-    mid-scan, or any other read failure) surface on the first
-    ``next()``, not at call time. Unlike ``read_event_log_tail``'s
-    never-raise contract, such a failure is deliberately **not**
-    swallowed: it propagates so :func:`build_history_entries`'s
-    per-file guard can tell "genuinely no events" apart from "couldn't
-    read this file at all" and skip the latter, rather than presenting a
-    fabricated ``"unknown"`` entry for a log it never actually read
-    (E14-T4 / E14 review round 1).
+    iterator is being **consumed**. In particular, ``open()`` (and any
+    ``OSError`` it raises: permission denied, the file vanishing mid-scan,
+    or any other read failure) surfaces on the first ``next()``, not at
+    call time -- the delegated-to ``stream_event_log`` is always the
+    *first* thing this generator's body does, before any size check, so a
+    failure opening the file is never masked by an empty-file fast path.
+    Unlike ``fleet.summary``'s former bounded readers' never-raise
+    contract, such a failure is deliberately **not** swallowed: it
+    propagates so :func:`build_history_entries`'s per-file guard can tell
+    "genuinely no events" apart from "couldn't read this file at all" and
+    skip the latter, rather than presenting a fabricated ``"unknown"``
+    entry for a log it never actually read (E14-T4 / E14 review round 1).
 
     A malformed individual line (bad JSON, a truncated write caught
-    mid-flush) is tolerated the same way the bounded readers already do
-    -- skipped rather than aborting the whole read, with a single
-    aggregate warning logged if any lines were skipped (partial
-    corruption still produces an entry, but not silently). But a
-    **non-empty** file (at least one non-blank line) that yields **zero**
-    parseable events is corrupt, not "legitimately empty" -- E14-T4
-    requires a corrupt log to be skipped, not shown as an ordinary
-    ``"unknown"`` entry (E14 review round 2). Raises
-    :class:`_CorruptEventLogError` in that case, once the stream is
-    exhausted; a genuinely empty file (no non-blank lines at all) still
-    yields nothing and raises nothing, which :func:`_build_entry`
-    legitimately turns into an ``"unknown"`` entry.
+    mid-flush) is tolerated by the shared reader the same way it always
+    has been here -- skipped rather than aborting the whole read. But a
+    **non-empty** file that yields **zero** parseable events is corrupt,
+    not "legitimately empty" -- E14-T4 requires a corrupt log to be
+    skipped, not shown as an ordinary ``"unknown"`` entry (E14 review
+    round 2). Raises :class:`_CorruptEventLogError` in that case, once the
+    stream is exhausted; a genuinely empty (zero-byte) file still yields
+    nothing and raises nothing, which :func:`_build_entry` legitimately
+    turns into an ``"unknown"`` entry. Distinguishing the two now checks
+    ``path.stat().st_size`` **after** the read completes with nothing
+    yielded (rather than "at least one non-blank raw line", this
+    function's own former signal) -- deliberately after, not before,
+    because checking size first would let a permission error on a
+    zero-byte file skip the read (and the ``OSError`` it should raise)
+    entirely. The shared reader has no reason to track skipped-line
+    counts for a live run's cheap, repeated poll, so this function no
+    longer can either. A file containing only blank/whitespace lines --
+    untested, and not known to occur in practice, since every write here
+    is a single JSON object per line -- would now read as "corrupt" rather
+    than "empty"; a zero-byte file (the only shape a genuinely fresh or
+    truncated-at-creation log actually takes) is unaffected.
     """
-    saw_nonblank_line = False
     yielded_any = False
-    skipped_lines = 0
-    with open(path, "rb") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            saw_nonblank_line = True
-            try:
-                obj = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError, RecursionError):
-                skipped_lines += 1
-                continue
-            if isinstance(obj, dict):
-                yielded_any = True
-                yield obj
-    if saw_nonblank_line and not yielded_any:
+    for evt in summary.stream_event_log(path):
+        yielded_any = True
+        yield evt
+    if not yielded_any and path.stat().st_size > 0:
         raise _CorruptEventLogError(f"{path}: non-empty log with no parseable events")
-    if skipped_lines:
-        logger.warning(
-            "%s: skipped %d unparseable line(s); this run's totals may be incomplete",
-            path,
-            skipped_lines,
-        )
 
 
 def _build_entry(path: Path) -> HistoryEntry:
