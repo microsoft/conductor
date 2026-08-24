@@ -37,6 +37,7 @@ from conductor.cli import pid as cli_pid
 from conductor.fleet import records
 from conductor.fleet.records import (
     RunRecord,
+    find_event_log_for_run,
     is_valid_run_id,
     read_run_record,
     read_run_records,
@@ -559,6 +560,18 @@ class TestPathTraversalRejected:
 
         assert remove_run_record("../target") is False
         assert outside_target.exists()
+
+    def test_find_event_log_for_run_rejects_a_glob_wildcard_run_id(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``run_id`` is interpolated directly into a glob pattern; a value
+        like ``"*"`` must never be allowed to match another run's event log."""
+        log_dir = tmp_path / "tmp" / "conductor"
+        log_dir.mkdir(parents=True)
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path / "tmp"))
+        (log_dir / "conductor-wf-20260101-120000-victim003.events.jsonl").write_text("\n")
+
+        assert find_event_log_for_run("*") is None
 
 
 class TestRemoveRunRecord:

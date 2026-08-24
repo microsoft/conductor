@@ -234,6 +234,27 @@ class TestResolveRun:
         assert lookup.terminal is None
         assert lookup.event_log_path is None
 
+    def test_wildcard_run_id_is_rejected_before_any_lookup(
+        self, conductor_home: Path, event_log_dir: Path
+    ) -> None:
+        """A ``run_id`` such as ``"*"`` must never be interpolated into a
+        glob pattern -- rejected up front rather than reaching
+        :func:`conductor.fleet.records.find_event_log_for_run`."""
+        (event_log_dir / "conductor-wf-20260101-120000-victim002.events.jsonl").write_text("\n")
+
+        lookup = resolve_run("*")
+
+        assert lookup.source == "not_found"
+        assert lookup.event_log_path is None
+
+    def test_path_traversal_run_id_is_rejected_before_any_lookup(
+        self, conductor_home: Path, event_log_dir: Path
+    ) -> None:
+        lookup = resolve_run("../../etc/passwd")
+
+        assert lookup.source == "not_found"
+        assert lookup.event_log_path is None
+
 
 # ---------------------------------------------------------------------------
 # E10-T2: conductor_run_status

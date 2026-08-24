@@ -101,6 +101,14 @@ class CatalogueEntry:
     tool: Tool
     pin: Pin
     resolution_tier: ResolutionTier
+    source: str = ""
+    """The candidate's own disambiguator (``_Candidate.source`` / ``ToolIdentity.source``)
+    -- e.g. a ``--workflow-dir`` file's resolved path. ``registry``/``workflow`` alone
+    (what ``Catalogue.reverse`` exposes) can be shared by two distinct directories with
+    the same basename and a same-named file; a path-resolution caller that already has
+    the exact entry for a tool name (rather than only its reduced ``(registry, workflow)``
+    pair) must use this to resolve the file that was actually scanned, not re-derive one
+    that happens to match by name."""
 
 
 @dataclass(frozen=True)
@@ -155,6 +163,7 @@ class Catalogue:
                 tool=entry.tool.model_copy(deep=True),
                 pin=entry.pin,
                 resolution_tier=entry.resolution_tier,
+                source=entry.source,
             )
             for entry in self._entries
         )
@@ -347,6 +356,7 @@ def build_catalogue(
                 tool=tool,
                 pin=candidate.pin,
                 resolution_tier=candidate.tier,
+                source=candidate.source,
             )
         )
     entries.sort(key=lambda entry: entry.tool_name)

@@ -75,7 +75,7 @@ class TestServerToolsList:
         self, tmp_path: Path
     ) -> None:
         catalogue = _two_tool_catalogue(tmp_path)
-        server = build_server(catalogue)
+        server = build_server(catalogue, ServeOptions())
 
         async with create_connected_server_and_client_session(server) as client:
             # `create_connected_server_and_client_session` already drove
@@ -88,7 +88,7 @@ class TestServerToolsList:
     @pytest.mark.asyncio
     async def test_tools_list_schemas_match_the_catalogue(self, tmp_path: Path) -> None:
         catalogue = _two_tool_catalogue(tmp_path)
-        server = build_server(catalogue)
+        server = build_server(catalogue, ServeOptions())
 
         async with create_connected_server_and_client_session(server) as client:
             result = await client.list_tools()
@@ -104,7 +104,7 @@ class TestServerToolsList:
     ) -> None:
         """DD3: the tool list "MUST NOT vary per-connection"."""
         catalogue = _two_tool_catalogue(tmp_path)
-        server = build_server(catalogue)
+        server = build_server(catalogue, ServeOptions())
 
         async with create_connected_server_and_client_session(server) as first_client:
             first = await first_client.list_tools()
@@ -119,7 +119,7 @@ class TestServerToolsList:
         self, tmp_path: Path
     ) -> None:
         catalogue = _two_tool_catalogue(tmp_path)
-        server = build_server(catalogue)
+        server = build_server(catalogue, ServeOptions())
 
         async with create_connected_server_and_client_session(server) as client:
             first = await client.list_tools()
@@ -132,7 +132,7 @@ class TestServerToolsList:
         empty = build_catalogue(
             ServeOptions(), registries_config=RegistriesConfig(), allow_network=False
         )
-        server = build_server(empty)
+        server = build_server(empty, ServeOptions())
 
         async with create_connected_server_and_client_session(server) as client:
             result = await client.list_tools()
@@ -145,7 +145,7 @@ class TestServerToolsList:
         own version, not the MCP SDK's (the SDK falls back to the latter when
         no version is passed to `Server(...)`)."""
         catalogue = _two_tool_catalogue(tmp_path)
-        server = build_server(catalogue)
+        server = build_server(catalogue, ServeOptions())
 
         async with create_connected_server_and_client_session(server) as client:
             result = await client.initialize()

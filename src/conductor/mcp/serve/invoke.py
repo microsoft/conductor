@@ -209,18 +209,49 @@ _WORKFLOW_DIR_PREFIX = "dir:"
 _WORKFLOW_DIR_EXTENSIONS = (".yaml", ".yml")
 
 
-def _resolve_workflow_dir_path(registry: str, workflow: str, options: ServeOptions) -> Path:
+def _resolve_workflow_dir_path(
+    registry: str, workflow: str, options: ServeOptions, *, source: str = ""
+) -> Path:
     """Resolve a ``--workflow-dir`` candidate's on-disk path.
 
-    Mirrors ``catalogue.py``'s own ``"dir:<directory name>"`` labeling
-    convention (DD10) in reverse: find the configured directory whose name
-    matches, then the workflow file directly under it.
+    ``source`` -- the exact file path recorded on the entry's
+    :class:`~conductor.mcp.serve.catalogue.CatalogueEntry` at catalogue-build
+    time -- is tried first and, when it still exists, returned directly.
+    This is what makes the resolution unambiguous: ``registry``/``workflow``
+    alone (a ``"dir:<directory name>"`` label plus a filename stem) can be
+    shared by two distinct ``--workflow-dir`` directories with the same
+    basename and a same-named file in each, and a directory-name rescan
+    below has no way to tell them apart -- it would always resolve to
+    whichever configured directory happens to come first, regardless of
+    which one the published tool name actually names.
+
+    Falls back to the rescan (mirroring ``catalogue.py``'s own
+    ``"dir:<directory name>"`` labeling convention (DD10) in reverse: find
+    the configured directory whose name matches, then the workflow file
+    directly under it) only when ``source`` is absent -- e.g. a legacy
+    entry built before this field existed. When ``source`` is present but
+    no longer on disk, the rescan is refused outright rather than
+    attempted: two distinct ``--workflow-dir`` directories can share a
+    basename and a same-named file, so a rescan in that case would
+    silently resolve the tool to the *other* directory's workflow instead
+    of reporting that the one it actually names is gone.
 
     Raises:
-        UnknownToolError: If no configured ``--workflow-dir`` (or file
-            within it) matches any more -- e.g. it was moved or removed
-            since the catalogue was built at startup.
+        UnknownToolError: If ``source`` is present but no longer on disk,
+            or (when ``source`` is absent) no configured
+            ``--workflow-dir``/file matches any more -- e.g. it was moved
+            or removed since the catalogue was built at startup.
     """
+    if source:
+        pinned = Path(source)
+        if pinned.is_file():
+            return pinned
+        raise UnknownToolError(
+            f"Workflow {workflow!r} under {registry!r} was resolved to {source!r} at "
+            "startup, but that file no longer exists; refusing to guess which other "
+            "directory it might mean."
+        )
+
     dir_name = registry[len(_WORKFLOW_DIR_PREFIX) :]
     for directory in options.workflow_dirs:
         if directory.name != dir_name:
@@ -242,6 +273,7 @@ def _resolve_workflow_path(
     *,
     options: ServeOptions,
     registries_config: RegistriesConfig,
+    source: str = "",
 ) -> Path:
     """Resolve ``(registry, workflow)`` to a local workflow file.
 
@@ -252,6 +284,12 @@ def _resolve_workflow_path(
     SHA (DD6), so the content actually launched is guaranteed to match the
     content whose schema was scanned and published at startup.
 
+    ``source`` -- the entry's own recorded file path -- disambiguates a
+    ``--workflow-dir`` candidate the same ``(registry, workflow)`` pair
+    alone cannot (see :func:`_resolve_workflow_dir_path`); it has no effect
+    on a registry-index workflow, which is already uniquely resolved by
+    ``registry`` + ``workflow`` + the pinned ref.
+
     Raises:
         UnknownToolError: If ``registry`` is no longer configured (e.g. a
             ``--registry`` change since startup would require a restart to
@@ -259,7 +297,7 @@ def _resolve_workflow_path(
         RegistryError: On a fetch failure (network, missing workflow, etc.).
     """
     if registry.startswith(_WORKFLOW_DIR_PREFIX):
-        return _resolve_workflow_dir_path(registry, workflow, options)
+        return _resolve_workflow_dir_path(registry, workflow, options, source=source)
 
     entry = registries_config.registries.get(registry)
     if entry is None:
@@ -677,7 +715,12 @@ async def invoke_workflow_tool(
         registries_config = load_registries_config()
 
     workflow_path = _resolve_workflow_path(
-        registry, workflow, entry.pin, options=options, registries_config=registries_config
+        registry,
+        workflow,
+        entry.pin,
+        options=options,
+        registries_config=registries_config,
+        source=entry.source,
     )
     config = load_config(workflow_path)
     inputs = build_typed_launch_inputs(values, config.workflow.input)

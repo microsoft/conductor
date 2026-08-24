@@ -1017,7 +1017,7 @@ def find_event_log_for_run(run_id: str, started_at: str | None = None) -> Path |
         match cannot be resolved unambiguously, or the directory cannot be
         listed.
     """
-    if not run_id:
+    if not is_valid_run_id(run_id):
         return None
     try:
         # Not `retention.event_log_root()`: that one *creates* the directory

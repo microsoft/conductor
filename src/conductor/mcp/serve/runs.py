@@ -54,6 +54,7 @@ from conductor.fleet.records import (
     RunRecord,
     TerminalRunRecord,
     find_event_log_for_run,
+    is_valid_run_id,
     read_run_record,
     read_terminal_record,
     read_terminal_records,
@@ -132,8 +133,14 @@ def resolve_run(run_id: str) -> RunLookup:
           ⚠️ note -- this is the one case a terminal record can never
           cover).
         - ``"not_found"`` -- none of the three sources knows this
-          ``run_id`` at all.
+          ``run_id`` at all, including a ``run_id`` that is not
+          path-safe (e.g. ``"*"`` or ``"../x"``) -- rejected before any
+          lookup is attempted so it can never be interpolated into a
+          glob pattern and match another run's files.
     """
+    if not is_valid_run_id(run_id):
+        return RunLookup(run_id=run_id, source="not_found")
+
     record = read_run_record(run_id)
     if record is not None and is_process_alive(record.pid):
         return RunLookup(

@@ -722,6 +722,8 @@ is the shared stop implementation with a verify-then-report contract and a
 
 ### E11 — `introspect` and `diagnose` toolsets (FR8, DD12, NFR6, R4)
 
+**Status: DONE** (completed 2026-08-23)
+
 **Goal.** Absorb #135 as the error path of #432 — thin adapters over
 `fleet/summary.py` and `providers/diagnostics.py`, adding **zero** tools to the
 default footprint (both toolsets are off by default, DD3) — with R4's field
@@ -748,18 +750,18 @@ satisfies R4 by construction — which E11-T2 asserts rather than assumes.
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E11-T1 | IMPL | Toolset gating: `--toolsets` enables `introspect` / `diagnose`, both off by default, decided at startup and never per request (DD3). Follow the GitHub MCP server's `--toolsets` vocabulary the design cites. | `src/conductor/mcp/serve/server.py`, `src/conductor/mcp/serve/options.py` | TO DO |
-| E11-T2 | IMPL | `conductor_run_events(run_id, ...)` over `read_event_log_full`, with filtering and a hard result bound. **R4:** replace `agent_tool_start.arguments` and `agent_tool_complete.result` with `{name, status, byte_size}` unless `--introspect-full` is set, computing `byte_size` from the serialized original so the caller learns the size it is not being shown. `conductor_node_detail(run_id, agent)` over `derive_step_detail` returns prompt and output **in full** (R4) — add a test asserting its activity lines still carry no payload, so a future change to `ActivityLine` cannot silently reopen the exposure. `conductor_plan_tree(...)` from the parsed `WorkflowConfig`. | `src/conductor/mcp/serve/introspect.py` | TO DO |
-| E11-T3 | IMPL | `conductor_doctor()` over `providers/diagnostics.gather()` and `conductor_validate_workflow(name)` over `cli/validate.validate_workflow` with a silent console. Both return structured reports the server generated itself, so DD12's link-only rule does not apply to them — say so in the module docstring so a later reader does not "fix" it. `conductor_validate_workflow` takes a **catalogue tool name**, never a path (NFR3). | `src/conductor/mcp/serve/diagnose.py` | TO DO |
-| E11-T4 | IMPL | `conductor_run_logs(run_id)`: `ResourceLink` content blocks for `.bg.stderr.log` / `.bg.stdout.log` / `.events.jsonl` plus `structuredContent` carrying status, the terminal record's error type and message, and per-file `size` / `modified_at` / `exists`. **Never** file contents, regardless of size (NFR6). A path that no longer exists reports `exists: false` with the same path. Include the "read these with your own file tools" note the design specifies. | `src/conductor/mcp/serve/diagnose.py` | TO DO |
-| E11-T5 | TEST | Introspect: events query bounded and filtered; **R4** — a tool event's `arguments` / `result` are absent by default and present under `--introspect-full`, with `byte_size` reported in both the reduced and full shapes; node detail returns prompt and output in full and no tool payload either way; plan tree matches the YAML; both tools are absent unless enabled. | `tests/test_mcp/test_serve_introspect.py` | TO DO |
-| E11-T6 | TEST | Diagnose: `conductor_run_logs` returns links and never bytes (assert no log line appears anywhere in the serialized result); a pruned path reports `exists: false`; the error type/message come from the terminal record; doctor and validate return structured reports; validate refuses a path-shaped argument. | `tests/test_mcp/test_serve_diagnose.py` | TO DO |
+| E11-T1 | IMPL | Toolset gating: `--toolsets` enables `introspect` / `diagnose`, both off by default, decided at startup and never per request (DD3). Follow the GitHub MCP server's `--toolsets` vocabulary the design cites. | `src/conductor/mcp/serve/server.py`, `src/conductor/mcp/serve/options.py` | DONE |
+| E11-T2 | IMPL | `conductor_run_events(run_id, ...)` over `read_event_log_full`, with filtering and a hard result bound. **R4:** replace `agent_tool_start.arguments` and `agent_tool_complete.result` with `{name, status, byte_size}` unless `--introspect-full` is set, computing `byte_size` from the serialized original so the caller learns the size it is not being shown. `conductor_node_detail(run_id, agent)` over `derive_step_detail` returns prompt and output **in full** (R4) — add a test asserting its activity lines still carry no payload, so a future change to `ActivityLine` cannot silently reopen the exposure. `conductor_plan_tree(...)` from the parsed `WorkflowConfig`. | `src/conductor/mcp/serve/introspect.py` | DONE |
+| E11-T3 | IMPL | `conductor_doctor()` over `providers/diagnostics.gather()` and `conductor_validate_workflow(name)` over `cli/validate.validate_workflow` with a silent console. Both return structured reports the server generated itself, so DD12's link-only rule does not apply to them — say so in the module docstring so a later reader does not "fix" it. `conductor_validate_workflow` takes a **catalogue tool name**, never a path (NFR3). | `src/conductor/mcp/serve/diagnose.py` | DONE |
+| E11-T4 | IMPL | `conductor_run_logs(run_id)`: `ResourceLink` content blocks for `.bg.stderr.log` / `.bg.stdout.log` / `.events.jsonl` plus `structuredContent` carrying status, the terminal record's error type and message, and per-file `size` / `modified_at` / `exists`. **Never** file contents, regardless of size (NFR6). A path that no longer exists reports `exists: false` with the same path. Include the "read these with your own file tools" note the design specifies. | `src/conductor/mcp/serve/diagnose.py` | DONE |
+| E11-T5 | TEST | Introspect: events query bounded and filtered; **R4** — a tool event's `arguments` / `result` are absent by default and present under `--introspect-full`, with `byte_size` reported in both the reduced and full shapes; node detail returns prompt and output in full and no tool payload either way; plan tree matches the YAML; both tools are absent unless enabled. | `tests/test_mcp/test_serve_introspect.py` | DONE |
+| E11-T6 | TEST | Diagnose: `conductor_run_logs` returns links and never bytes (assert no log line appears anywhere in the serialized result); a pruned path reports `exists: false`; the error type/message come from the terminal record; doctor and validate return structured reports; validate refuses a path-shaped argument. | `tests/test_mcp/test_serve_diagnose.py` | DONE |
 
 **Acceptance criteria**
-- [ ] Default tool footprint is unchanged by this epic (N + 4).
-- [ ] No log or event-log file contents cross the protocol boundary.
-- [ ] Tool arguments and results are withheld by default and restored only by an explicit operator flag.
-- [ ] A failed run is diagnosable from the same connection that started it.
+- [x] Default tool footprint is unchanged by this epic (N + 4).
+- [x] No log or event-log file contents cross the protocol boundary.
+- [x] Tool arguments and results are withheld by default and restored only by an explicit operator flag.
+- [x] A failed run is diagnosable from the same connection that started it.
 
 ---
 

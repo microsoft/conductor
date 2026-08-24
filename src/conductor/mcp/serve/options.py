@@ -29,6 +29,15 @@ from pathlib import Path
 # does not appear here.
 DEFAULT_TOOLSETS: tuple[str, ...] = ("workflows", "runs")
 
+# Every toolset name an operator may pass to `--toolsets` (E11-T1), following
+# the GitHub MCP server's own `--toolsets` vocabulary the design cites.
+# `discovery` is deliberately absent: it is never operator-selectable -- the
+# catalogue builder decides it at startup, once the exposed workflow count
+# crosses `--max-direct-tools` (FR9) -- so admitting it here would let an
+# operator ask for a "toolset" that can never actually be requested, in
+# direct contradiction of DD3's "fixed at startup, never a runtime switch".
+ALL_TOOLSETS: tuple[str, ...] = ("workflows", "runs", "introspect", "diagnose")
+
 # Mirrors the CLI defaults named in the plan's E8-T1 (`cli/mcp.py`) so a
 # directly-constructed `ServeOptions` (as tests and any future embedding do)
 # behaves identically to the CLI's own defaults.
@@ -94,3 +103,28 @@ class ServeOptions:
     tool_prefix: str | None = None
     max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS
     introspect_full: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate ``toolsets`` once, at construction (E11-T1, DD3).
+
+        An unrecognized toolset name fails the server at startup rather
+        than being silently ignored for the connection's whole lifetime --
+        the same "decided once, never per request" property DD3 requires
+        of the tool list itself.
+        """
+        unknown = sorted(set(self.toolsets) - set(ALL_TOOLSETS))
+        if unknown:
+            raise ValueError(
+                f"Unknown toolset(s): {', '.join(unknown)}. Recognized toolsets: "
+                f"{', '.join(ALL_TOOLSETS)}."
+            )
+
+
+def is_toolset_enabled(options: ServeOptions, name: str) -> bool:
+    """Whether toolset ``name`` is enabled by ``options.toolsets`` (E11-T1).
+
+    A pure lookup against the frozen ``options.toolsets`` -- toolset
+    membership is fixed at startup (DD3) and never re-evaluated per
+    request, so there is nothing here for a caller to invalidate or cache.
+    """
+    return name in options.toolsets
