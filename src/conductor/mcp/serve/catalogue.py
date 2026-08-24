@@ -122,6 +122,18 @@ class RejectedWorkflow:
 
 
 @dataclass(frozen=True)
+class FailedRegistry:
+    """A whole registry whose index could not be resolved and was
+    skipped. Always logged -- never a silent drop (mirrors
+    :class:`RejectedWorkflow`, one rung up: a whole registry rather than
+    one workflow within it) -- and captured here so a caller that cannot
+    rely on log output (e.g. ``conductor doctor``) still learns about it."""
+
+    registry: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Catalogue:
     """The frozen result of :func:`build_catalogue` (DD3): immutable for
     the server process's lifetime.
@@ -143,6 +155,11 @@ class Catalogue:
 
     collisions: tuple[NameCollision, ...]
     rejected: tuple[RejectedWorkflow, ...]
+    failed_registries: tuple[FailedRegistry, ...]
+    """Whole registries whose index could not be resolved and were
+    skipped entirely (e.g. no warm cache under ``allow_network=False``, or
+    an unreachable remote). Distinct from :attr:`rejected`, which covers
+    individual workflows within a registry that *did* resolve."""
     mode: Literal["direct", "discovery"]
     """Whether per-workflow tools are served directly, or the
     ``discovery`` toolset pair replaces them because the exposed count
@@ -279,6 +296,7 @@ def build_catalogue(
 
     candidates: list[_Candidate] = []
     rejected: list[RejectedWorkflow] = []
+    failed_registries: list[FailedRegistry] = []
 
     for registry_name in sorted(_select_registries(options, registries_config)):
         entry = registries_config.registries[registry_name]
@@ -289,6 +307,7 @@ def build_catalogue(
             allow_network=allow_network,
             deadline=deadline,
             candidates=candidates,
+            failed_registries=failed_registries,
         )
 
     for workflow_dir in options.workflow_dirs:
@@ -381,6 +400,7 @@ def build_catalogue(
         ),
         collisions=naming_result.collisions,
         rejected=tuple(rejected),
+        failed_registries=tuple(failed_registries),
         mode=mode,
     )
 
@@ -434,14 +454,18 @@ def _collect_registry_candidates(
     allow_network: bool,
     deadline: float,
     candidates: list[_Candidate],
+    failed_registries: list[FailedRegistry],
 ) -> None:
     try:
         index, sha = _resolve_registry_index(registry_name, entry, allow_network=allow_network)
     except RegistryError as exc:
         # A whole registry being unreachable is an environmental failure
         # like any single workflow's parse failure -- log and skip rather
-        # than aborting the entire catalogue build.
+        # than aborting the entire catalogue build. Captured structurally
+        # (not just logged) so a caller like `conductor doctor` still
+        # learns about it even with logging suppressed.
         logger.warning("Skipping registry %r: could not resolve its index: %s", registry_name, exc)
+        failed_registries.append(FailedRegistry(registry_name, str(exc)))
         return
 
     parsed_cache: dict[str, ParsedToolInfo] = {}

@@ -23,6 +23,7 @@ from conductor.providers.diagnostics import (
     ALL_SECTIONS,
     DoctorReport,
     EnvDiagnostic,
+    McpServeDiagnostic,
     ModelDiagnostic,
     ProviderDiagnostic,
     RegistryDiagnostic,
@@ -173,6 +174,8 @@ def run_doctor(
             _render_models(report.providers, console, glyphs)
     if report.registries is not None:
         _render_registries(report.registries, console, glyphs)
+    if report.mcp_serve is not None:
+        _render_mcp_serve(report.mcp_serve, console, glyphs)
 
     return _compute_exit_code(report.providers, check=check, provider=provider)
 
@@ -492,3 +495,99 @@ def _render_registries(registries: RegistryDiagnostic, console: Console, glyphs:
         )
 
     console.print(table)
+
+
+def _resolution_tier_cell(tier: str) -> Text:
+    """Format the schema-resolution-tier cell, flagging a degraded fallback."""
+    if tier == "degraded":
+        return Text.from_markup("[yellow]degraded[/yellow]")
+    return Text(tier)
+
+
+def _render_mcp_serve(mcp: McpServeDiagnostic, console: MarkupFreeConsole, glyphs: _Glyphs) -> None:
+    """Render the ``mcp`` section: what ``conductor mcp serve`` would
+    expose, built without a host attached (issue #432, E13).
+
+    A failure to build the catalogue at all (e.g. a malformed
+    ``registries.toml``) is surfaced as a reported problem, never a crash
+    — mirroring :func:`_render_registries`'s ``error`` handling.
+    """
+    if mcp.error is not None:
+        console.print(
+            styled("{} [dim]failed to build the MCP catalogue: {}[/dim]", glyphs.cross, mcp.error)
+        )
+        return
+
+    if not mcp.registries:
+        console.print(
+            Text.from_markup(
+                "[dim]No registries configured; `conductor mcp serve` would expose no tools.[/dim]"
+            )
+        )
+        return
+
+    if not mcp.tools:
+        console.print(
+            styled(
+                "[dim]No workflows would be exposed as MCP tools from {} configured "
+                "registr{}.[/dim]",
+                len(mcp.registries),
+                "y" if len(mcp.registries) == 1 else "ies",
+            )
+        )
+    else:
+        table = Table(title="MCP Serve", show_lines=False)
+        table.add_column("Tool", style="cyan", no_wrap=True)
+        table.add_column("Registry")
+        table.add_column("Workflow")
+        table.add_column("Schema")
+        table.add_column("Pin")
+
+        for tool in mcp.tools:
+            table.add_row(
+                tool.tool_name,
+                tool.registry,
+                tool.workflow,
+                _resolution_tier_cell(tool.resolution_tier),
+                tool.pin,
+            )
+
+        console.print(table)
+        console.print(styled("Mode: {}", mcp.mode))
+
+    if mcp.collisions:
+        lines = [
+            styled(
+                "{} name collision on {!r}: qualified as {}",
+                glyphs.warn,
+                collision.base_slug,
+                ", ".join(collision.qualified_names),
+            )
+            for collision in mcp.collisions
+        ]
+        console.print(join("\n", lines))
+
+    if mcp.rejected:
+        lines = [
+            styled(
+                "{} [dim]{}/{} excluded: {}[/dim]",
+                glyphs.cross,
+                rejected.registry,
+                rejected.workflow,
+                rejected.reason,
+            )
+            for rejected in mcp.rejected
+        ]
+        console.print(join("\n", lines))
+
+    if mcp.failed_registries:
+        lines = [
+            styled(
+                "{} [dim]registry {!r} could not be resolved: {}[/dim]",
+                glyphs.cross,
+                failed.registry,
+                failed.reason,
+            )
+            for failed in mcp.failed_registries
+        ]
+        console.print(join("\n", lines))

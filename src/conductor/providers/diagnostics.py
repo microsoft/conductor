@@ -41,10 +41,10 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-Section = Literal["env", "providers", "registries"]
+Section = Literal["env", "providers", "registries", "mcp"]
 """A ``conductor doctor`` output section."""
 
-ALL_SECTIONS: tuple[Section, ...] = ("env", "providers", "registries")
+ALL_SECTIONS: tuple[Section, ...] = ("env", "providers", "registries", "mcp")
 """Default set of sections rendered when no positional ``SECTION`` is given."""
 
 PricingSource = Literal["provider", "table", "none"]
@@ -282,6 +282,144 @@ class RegistryDiagnostic:
         }
 
 
+@dataclass(frozen=True)
+class McpServeToolInfo:
+    """One workflow that would be published as an MCP tool by
+    ``conductor mcp serve`` (issue #432, E13) — a diagnostic-layer mirror of
+    ``mcp.serve.catalogue.CatalogueEntry``, reduced to what an operator needs
+    to sanity-check exposure without a host attached."""
+
+    tool_name: str
+    registry: str
+    workflow: str
+    resolution_tier: str
+    """Which rung of the three-tier schema ladder resolved this workflow's
+    parameters (``"index"`` / ``"cache"`` / ``"parsed"`` / ``"degraded"``).
+    ``"degraded"`` means the schema fell back to a permissive
+    ``{"type": "object"}`` placeholder (NFR2) rather than the workflow's
+    own declared inputs."""
+    pin: str
+    """The workflow's immutable identity, rendered via ``Pin.as_str()``
+    (e.g. ``"sha:<commit>"`` / ``"hash:<content-hash>"``, DD6)."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "tool_name": self.tool_name,
+            "registry": self.registry,
+            "workflow": self.workflow,
+            "resolution_tier": self.resolution_tier,
+            "pin": self.pin,
+        }
+
+
+@dataclass(frozen=True)
+class McpServeCollision:
+    """One tool name shared by more than one workflow, and how it was
+    qualified — a diagnostic-layer mirror of ``mcp.serve.naming.NameCollision``
+    (DD10)."""
+
+    base_slug: str
+    identities: list[str]
+    """Every colliding workflow, rendered as ``"<registry>/<workflow>"``."""
+    qualified_names: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "base_slug": self.base_slug,
+            "identities": list(self.identities),
+            "qualified_names": list(self.qualified_names),
+        }
+
+
+@dataclass(frozen=True)
+class McpServeRejectedWorkflow:
+    """A workflow the catalogue builder considered but did not expose, and
+    why — a diagnostic-layer mirror of ``mcp.serve.catalogue.RejectedWorkflow``."""
+
+    registry: str
+    workflow: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {"registry": self.registry, "workflow": self.workflow, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class McpServeFailedRegistry:
+    """A whole registry that could not be resolved and was skipped — a
+    diagnostic-layer mirror of ``mcp.serve.catalogue.FailedRegistry``.
+    Captured structurally (not just logged) so it is still visible even
+    when logging is suppressed."""
+
+    registry: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {"registry": self.registry, "reason": self.reason}
+
+
+@dataclass
+class McpServeDiagnostic:
+    """Diagnostic snapshot of what ``conductor mcp serve`` would expose,
+    built without starting a server or attaching a host (issue #432, E13).
+
+    Give the operator an out-of-band way to see what a stdio server *would*
+    publish — a misconfiguration there otherwise presents only as "the
+    tools aren't there", with no console to inspect. Wraps
+    :func:`conductor.mcp.serve.catalogue.build_catalogue`, the same
+    catalogue-building pipeline the real server runs at startup, entirely
+    offline (``allow_network=False``) — matching this module's
+    offline-by-default posture (see module docstring) and NFR1's warm-cache
+    contract: a registry with no warm cache degrades to contributing zero
+    workflows (logged, never raised) rather than a diagnostic command
+    reaching the network.
+    """
+
+    registries: list[str] = field(default_factory=list)
+    """Every configured registry name considered for catalogue building."""
+    tools: list[McpServeToolInfo] = field(default_factory=list)
+    """Every workflow that would be exposed as an MCP tool."""
+    mode: str | None = None
+    """``"direct"`` or ``"discovery"`` (FR9) — ``None`` only when ``error``
+    is set, since no catalogue was built at all."""
+    collisions: list[McpServeCollision] = field(default_factory=list)
+    degraded: list[str] = field(default_factory=list)
+    """Tool names whose schema fell back to a permissive placeholder
+    (``resolution_tier == "degraded"``) rather than being dropped (NFR2)."""
+    rejected: list[McpServeRejectedWorkflow] = field(default_factory=list)
+    """Workflows excluded entirely (e.g. an illegal tool name, or a
+    reserved-parameter collision, FR10) — never a silent drop."""
+    failed_registries: list[McpServeFailedRegistry] = field(default_factory=list)
+    """Whole registries whose index could not be resolved and were
+    skipped (e.g. no warm cache under the offline ``allow_network=False``
+    build, or an unreachable remote) — distinct from a genuinely empty,
+    healthy registry that just has no exposable workflows."""
+    error: str | None = None
+    """Set when the catalogue could not be built at all (e.g. a malformed
+    ``registries.toml``, or an unexpected failure inside the catalogue
+    builder). Distinguishes a total failure from a genuinely empty/healthy
+    catalogue — mirrors :attr:`RegistryDiagnostic.error`. A single broken
+    *registry* among several does not set this: it is skipped by the
+    catalogue builder itself and simply contributes no tools."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "registries": list(self.registries),
+            "tools": [t.to_dict() for t in self.tools],
+            "mode": self.mode,
+            "collisions": [c.to_dict() for c in self.collisions],
+            "degraded": list(self.degraded),
+            "rejected": [r.to_dict() for r in self.rejected],
+            "failed_registries": [f.to_dict() for f in self.failed_registries],
+            "error": self.error,
+        }
+
+
 @dataclass
 class DoctorReport:
     """Aggregated diagnostics. Sections not requested are left as ``None``."""
@@ -289,6 +427,7 @@ class DoctorReport:
     env: EnvDiagnostic | None = None
     providers: list[ProviderDiagnostic] | None = None
     registries: RegistryDiagnostic | None = None
+    mcp_serve: McpServeDiagnostic | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation, omitting sections not gathered."""
@@ -299,6 +438,8 @@ class DoctorReport:
             out["providers"] = [p.to_dict() for p in self.providers]
         if self.registries is not None:
             out["registries"] = self.registries.to_dict()
+        if self.mcp_serve is not None:
+            out["mcp_serve"] = self.mcp_serve.to_dict()
         return out
 
 
@@ -442,6 +583,73 @@ def gather_registries() -> RegistryDiagnostic:
         for reg_name, entry in config.registries.items()
     ]
     return RegistryDiagnostic(default=config.default, registries=registries)
+
+
+def gather_mcp_serve() -> McpServeDiagnostic:
+    """Gather a diagnostic snapshot of what ``conductor mcp serve`` would
+    expose (issue #432, E13). Never raises — ``doctor`` reports problems,
+    it does not have them (see module docstring).
+
+    Builds the real tool catalogue (:func:`conductor.mcp.serve.catalogue.build_catalogue`)
+    against the configured registries with ``allow_network=False``: a
+    registry with no warm cache (or otherwise unreachable) is skipped by
+    the catalogue builder itself — logged, never raised — and simply
+    contributes no tools, exactly like any other environmental failure the
+    builder already tolerates (NFR1, NFR2). ``error`` is reserved for a
+    total failure to even attempt catalogue building (e.g. a malformed
+    ``registries.toml``, or an unexpected exception from the builder
+    itself) — the diagnostic-layer counterpart of
+    :attr:`RegistryDiagnostic.error`.
+    """
+    try:
+        from conductor.mcp.serve.catalogue import build_catalogue
+        from conductor.mcp.serve.options import ServeOptions
+        from conductor.registry.config import load_config as load_registries_config
+
+        registries_config = load_registries_config()
+        catalogue = build_catalogue(
+            ServeOptions(), registries_config=registries_config, allow_network=False
+        )
+    except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+        return McpServeDiagnostic(error=_format_error(e))
+
+    tools = [
+        McpServeToolInfo(
+            tool_name=entry.tool_name,
+            registry=entry.registry,
+            workflow=entry.workflow,
+            resolution_tier=entry.resolution_tier,
+            pin=entry.pin.as_str(),
+        )
+        for entry in catalogue.entries
+    ]
+    degraded = [tool.tool_name for tool in tools if tool.resolution_tier == "degraded"]
+    collisions = [
+        McpServeCollision(
+            base_slug=collision.base_slug,
+            identities=[f"{i.registry}/{i.workflow}" for i in collision.identities],
+            qualified_names=list(collision.qualified_names),
+        )
+        for collision in catalogue.collisions
+    ]
+    rejected = [
+        McpServeRejectedWorkflow(registry=r.registry, workflow=r.workflow, reason=r.reason)
+        for r in catalogue.rejected
+    ]
+    failed_registries = [
+        McpServeFailedRegistry(registry=f.registry, reason=f.reason)
+        for f in catalogue.failed_registries
+    ]
+
+    return McpServeDiagnostic(
+        registries=sorted(registries_config.registries),
+        tools=tools,
+        mode=catalogue.mode,
+        collisions=collisions,
+        degraded=degraded,
+        rejected=rejected,
+        failed_registries=failed_registries,
+    )
 
 
 async def _resolve_model_pricing(
@@ -683,6 +891,9 @@ async def gather(
     if "registries" in sections:
         report.registries = gather_registries()
 
+    if "mcp" in sections:
+        report.mcp_serve = gather_mcp_serve()
+
     return report
 
 
@@ -691,6 +902,11 @@ __all__ = [
     "CredentialEnvVar",
     "DoctorReport",
     "EnvDiagnostic",
+    "McpServeCollision",
+    "McpServeDiagnostic",
+    "McpServeFailedRegistry",
+    "McpServeRejectedWorkflow",
+    "McpServeToolInfo",
     "ModelDiagnostic",
     "ProviderDiagnostic",
     "RegistryDiagnostic",
@@ -698,6 +914,7 @@ __all__ = [
     "Section",
     "gather",
     "gather_env",
+    "gather_mcp_serve",
     "gather_provider",
     "gather_registries",
 ]

@@ -258,7 +258,7 @@ The first phase with an observable end-to-end result.
 **Exit criteria**
 - [ ] A registry above `--max-direct-tools` serves the two-tool discovery pair
       instead of per-workflow tools, decided at startup and logged (FR9, DD3).
-- [ ] `conductor doctor` reports what a server *would* expose without a host
+- [x] `conductor doctor` reports what a server *would* expose without a host
       attached (Impact Analysis → Operational).
 - [ ] `docs/mcp-server.md` exists, `docs/mcp-tools.md` disambiguates client
       from server, `AGENTS.md` documents the new package and CLI group.
@@ -784,7 +784,7 @@ satisfies R4 by construction — which E11-T2 asserts rather than assumes.
 
 ---
 
-### E13 — `conductor doctor` MCP section (Impact Analysis → Operational)
+### E13 — `conductor doctor` MCP section (Impact Analysis → Operational) — DONE
 
 **Goal.** Give the operator an out-of-band way to see what a server *would*
 expose, since a stdio server has no console and a misconfiguration otherwise
@@ -794,13 +794,13 @@ presents as "the tools aren't there".
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E13-T1 | IMPL | `McpServeDiagnostic` + `gather_mcp_serve()` following the existing `RegistryDiagnostic` / `to_dict()` shape: registries enumerated, workflows exposed, mode, collisions qualified, schemas that fell back, and pins. Must never raise — `doctor` reports problems, it does not have them. | `src/conductor/providers/diagnostics.py` | TO DO |
-| E13-T2 | IMPL | Render the section in the doctor CLI, following the existing thin-renderer convention. | `src/conductor/cli/doctor.py` | TO DO |
-| E13-T3 | TEST | The section renders with no registries, with one, and with a collision; a broken registry degrades to a reported problem rather than an exception. | `tests/test_cli/test_doctor.py` | TO DO |
+| E13-T1 | IMPL | `McpServeDiagnostic` + `gather_mcp_serve()` following the existing `RegistryDiagnostic` / `to_dict()` shape: registries enumerated, workflows exposed, mode, collisions qualified, schemas that fell back, and pins. Must never raise — `doctor` reports problems, it does not have them. | `src/conductor/providers/diagnostics.py` | DONE |
+| E13-T2 | IMPL | Render the section in the doctor CLI, following the existing thin-renderer convention. | `src/conductor/cli/doctor.py` | DONE |
+| E13-T3 | TEST | The section renders with no registries, with one, and with a collision; a broken registry degrades to a reported problem rather than an exception. | `tests/test_cli/test_doctor.py` | DONE |
 
 **Acceptance criteria**
-- [ ] `conductor doctor` shows the would-be exposed set without a host attached.
-- [ ] It never raises on a broken registry.
+- [x] `conductor doctor` shows the would-be exposed set without a host attached.
+- [x] It never raises on a broken registry.
 
 ---
 

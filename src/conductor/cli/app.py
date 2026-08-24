@@ -2949,7 +2949,7 @@ def doctor(
     section: Annotated[
         str | None,
         typer.Argument(
-            help="Section to show: providers | registries | env. Default: all sections.",
+            help="Section to show: providers | registries | env | mcp. Default: all sections.",
         ),
     ] = None,
     check: Annotated[
@@ -2987,18 +2987,22 @@ def doctor(
     A safe, read-only health check for your Conductor setup: which providers
     are installed, their stability tier, which credential environment
     variables are detected (presence only — values are never printed), plus
-    Conductor version / update status and configured registries.
+    Conductor version / update status, configured registries, and what
+    `conductor mcp serve` would expose as MCP tools.
 
     Offline by default — no providers are instantiated and no credentials are
     required. (The default env section does a cache-first GitHub update check;
-    set CONDUCTOR_NO_UPDATE_CHECK to disable it.) Use --check to actually test
-    provider connections, and --models to list each provider's available
-    models.
+    set CONDUCTOR_NO_UPDATE_CHECK to disable it. The mcp section builds the
+    tool catalogue entirely from local/cached data — a registry with no warm
+    cache simply contributes no tools rather than reaching the network.) Use
+    --check to actually test provider connections, and --models to list each
+    provider's available models.
 
     \b
     Examples:
         conductor doctor                     # all sections
         conductor doctor providers           # providers section only
+        conductor doctor mcp                 # what `mcp serve` would expose
         conductor doctor --check             # test provider connections
         conductor doctor --models -p claude  # list Claude's models
         conductor doctor --json              # machine-readable output
