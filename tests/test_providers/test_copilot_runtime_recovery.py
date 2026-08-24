@@ -52,10 +52,11 @@ class _FakeClient:
     """Minimal stand-in for the Copilot SDK client.
 
     Deliberately a plain class (not a bare ``MagicMock``/``AsyncMock``) so
-    attribute access on it does not auto-vivify a truthy ``_cli_process`` --
-    the pitfall that made unconfigured mocks in other test files look like a
-    live spawned runtime before the ``isinstance(..., subprocess.Popen)``
-    guard was added.
+    attribute access on it does not auto-vivify ``_cli_process`` into a
+    truthy child mock whose ``poll()`` returns non-``None`` -- the pitfall
+    that made an unconfigured mock in other test files read as a *dead*
+    spawned runtime (triggering a spurious rebuild) before the
+    ``isinstance(..., subprocess.Popen)`` guard was added.
     """
 
     def __init__(self, cli_process: MagicMock | None = None) -> None:
@@ -140,7 +141,7 @@ class TestRuntimeIsDead:
 
     def test_false_when_cli_process_is_not_a_real_popen(self) -> None:
         """A generic Mock (as used by many pre-existing test doubles) must
-        not be mistaken for a live spawned runtime."""
+        not be mistaken for a dead spawned runtime."""
         provider = CopilotProvider()
         provider._client = _FakeClient(cli_process=MagicMock())
         assert provider._runtime_is_dead() is False
@@ -213,6 +214,38 @@ class TestEnsureClientStartedRebuildsOnDeath:
         build_client.assert_called_once_with()
         new_client.start.assert_awaited_once()
         assert provider._consecutive_runtime_restarts == 1
+
+    @pytest.mark.asyncio
+    async def test_started_flag_cleared_when_rebuilt_client_start_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the rebuilt client's start() raises (e.g. OOM at spawn), the
+        provider must not be left believing a never-started client is
+        started -- otherwise the next _ensure_client_started() silently
+        skips recovery (matches none of its three branches)."""
+        old_client = _FakeClient(cli_process=_fake_popen(1))
+        failing_client = _FakeClient(cli_process=_fake_popen(None))
+        failing_client.start = AsyncMock(side_effect=RuntimeError("spawn failed"))
+
+        provider = CopilotProvider()
+        provider._client = old_client
+        provider._started = True
+
+        monkeypatch.setattr(provider, "_build_client", MagicMock(return_value=failing_client))
+
+        with pytest.raises(RuntimeError, match="spawn failed"):
+            await provider._ensure_client_started()
+
+        assert provider._started is False
+
+        # A subsequent call must re-attempt start() rather than silently
+        # skipping recovery (or calling start() on the never-started client).
+        recovered_client = _FakeClient(cli_process=_fake_popen(None))
+        monkeypatch.setattr(provider, "_build_client", MagicMock(return_value=recovered_client))
+        await provider._ensure_client_started()
+        assert provider._client is recovered_client
+        assert provider._started is True
+        recovered_client.start.assert_awaited_once()
 
 
 class TestRuntimeUnavailableErrorClassification:
@@ -291,11 +324,11 @@ class TestRuntimeUnavailableErrorClassification:
         with pytest.raises(ProviderError) as exc_info:
             await provider.execute(agent=agent, context={}, rendered_prompt="p")
 
-        assert "died" in str(exc_info.value)
+        assert "broke" in str(exc_info.value)
         assert "installed and authenticated" not in str(exc_info.value)
         assert len(provider._retry_history) == 1
         assert provider._retry_history[0]["is_retryable"] is True
-        assert "died" in provider._retry_history[0]["error"]
+        assert "broke" in provider._retry_history[0]["error"]
 
 
 class TestEndToEndRecovery:
@@ -365,9 +398,12 @@ class TestConsecutiveRestartCap:
             await provider._restart_spawned_runtime()
 
         assert exc_info.value.is_retryable is False
-        assert str(_MAX_CONSECUTIVE_RUNTIME_RESTARTS) in str(
+        assert f"restarted {_MAX_CONSECUTIVE_RUNTIME_RESTARTS} times in a row" in str(
             exc_info.value
-        ) or f"{_MAX_CONSECUTIVE_RUNTIME_RESTARTS}" in str(exc_info.value)
+        )
+        # The cap must actually PREVENT the next rebuild, not merely raise
+        # after performing it.
+        assert provider._build_client.call_count == _MAX_CONSECUTIVE_RUNTIME_RESTARTS
 
     @pytest.mark.asyncio
     async def test_successful_call_resets_counter_so_later_death_still_restarts(

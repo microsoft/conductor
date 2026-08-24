@@ -339,13 +339,18 @@ conductor run review.yaml                 # connects; spawns no nested runtime
 - Closing the provider does **not** terminate the external runtime — the
   SDK only shuts down runtimes it spawned itself, so the orchestrator-owned
   server keeps running. The orchestrator is also responsible for runtime
-  health checks and restarts: a broken connection to an external runtime
-  fails the affected agent immediately (`is_retryable=false`) and is never
+  health checks and restarts: a **lost connection** to an external runtime
+  (a `BrokenPipeError` or `ConnectionResetError` at the SDK boundary) fails
+  the affected agent immediately (`is_retryable=false`) and is never
   retried or respawned by Conductor. This differs from the default spawned
   runtime, which Conductor restarts automatically after a detected crash
   (a dead child process, or a `BrokenPipeError`/`ConnectionResetError` at
-  the SDK boundary) and retries against, up to a small consecutive-failure
-  cap.
+  the SDK boundary) and retries against, up to a fixed cap of 2 consecutive
+  restarts without an intervening successful call (not configurable via
+  YAML or an environment variable). Note this covers a *lost* connection
+  only; a *failed initial connect* to an external runtime (e.g. it is not
+  reachable at all) is not classified by this mechanism and surfaces as a
+  generic SDK error instead.
 - Runtime-spawn-only options (custom CLI path, injected env, etc.) do not
   apply when connecting to an existing runtime.
 

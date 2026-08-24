@@ -65,23 +65,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths now use the same bounded retry that `write_run_record` already used
   for its own `os.replace`.
 - **The Copilot provider now recovers automatically when its nested runtime
-  process dies** (#483), instead of endlessly retrying against a dead
-  process and reporting a misleading "Check that copilot CLI is installed
-  and authenticated" error. A dead spawned runtime is now detected via
+  process dies** (#483), instead of retrying against a dead process with
+  a misleading "Check that copilot CLI is installed and authenticated"
+  error. A dead spawned runtime is now detected via
   `subprocess.Popen.poll()` on the SDK's own child handle and via explicit
-  recognition of `BrokenPipeError` / `ConnectionResetError` at the SDK
-  boundary (including during idle-recovery "continue" prompts, which
-  previously burned every recovery attempt and were reported as a stuck
-  *agent* rather than a dead *process*). Recovery rebuilds the SDK client
-  the next time it is needed, so the existing retry loop lands its next
-  attempt on a fresh runtime with no change to retry-loop shape; a runtime
-  that keeps dying without a single successful call in between fails fast
-  after a small number of consecutive restarts rather than looping forever,
-  while a long-running, otherwise-healthy workflow can restart it as many
-  times as needed. A broken connection to an **externally-owned** runtime
-  (`runtime_url` / `COPILOT_PROVIDER_RUNTIME_URL`) is treated differently:
-  it is never retried or respawned, since the orchestrator that owns that
-  runtime is responsible for its health checks and restarts.
+  recognition of `BrokenPipeError` / `ConnectionResetError` at the
+  agent-execution SDK boundary (including during idle-recovery "continue"
+  prompts, which previously burned every recovery attempt and were
+  reported as a stuck *agent* rather than a dead *process*). Recovery
+  rebuilds the SDK client the next time it is needed, so the existing
+  retry loop lands its next attempt on a fresh runtime with no change to
+  retry-loop shape; a runtime that keeps dying without a single
+  successful call in between fails fast after 2 consecutive restarts
+  (a fixed, non-configurable cap — with the default `max_attempts` of 3,
+  a single agent execution can only trigger 2 restarts on its own, so the
+  cap mainly bites across agents in the same workflow) rather than
+  looping forever, while a long-running, otherwise-healthy workflow can
+  restart it as many times as needed. A broken connection to an
+  **externally-owned** runtime (`runtime_url` /
+  `COPILOT_PROVIDER_RUNTIME_URL`) is treated differently: it is never
+  retried or respawned, since the orchestrator that owns that runtime is
+  responsible for its health checks and restarts.
 
 ## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 
