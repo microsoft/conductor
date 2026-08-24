@@ -740,8 +740,12 @@ class DirectoryPickerModal(ModalScreen[Path | None]):
     launch directory and focused on mount, or browsing
     ``DirectoryTree#dir-tree`` -- but exactly **one** way to accept: pressing
     Enter in the input. The tree's highlighted node is mirrored into the
-    input rather than accepted directly, so the input stays the single
-    source of truth for what Enter will submit.
+    input, but only *while the tree has focus* -- rather than accepted
+    directly, so the input stays the single source of truth for what Enter
+    will submit. Textual posts a ``NodeHighlighted`` for the tree's own root
+    as soon as the background ``DirectoryTree`` load lands, with no user
+    involved; without the focus gate that automatic highlight overwrote the
+    prefilled launch directory with its *parent* (issue #486).
 
     A bad path -- one that does not exist, or names a file rather than a
     directory -- is rejected *in place*: a red message line appears and the
@@ -833,7 +837,26 @@ class DirectoryPickerModal(ModalScreen[Path | None]):
 
         The input remains the single source of truth for what Enter
         accepts -- the tree is a browsing aid, not a second accept path.
+
+        Gated on the tree actually having focus (issue #486): Textual posts
+        a ``NodeHighlighted`` for the tree's own root as soon as the
+        background ``DirectoryTree`` load lands (``Tree.watch_cursor_line``),
+        with no user interaction at all, and that root already carries a
+        ``DirEntry`` from construction -- so an ungated mirror silently
+        replaced the prefilled launch directory with its *parent* before the
+        user ever touched the tree. Focus is the actual discriminator
+        between "the tree loaded" and "the user browsed it": the input is
+        focused on mount, so the automatic highlight is ignored, while both
+        mouse clicks and keyboard navigation into the tree focus it first
+        (``Screen._forward_event`` focuses on ``MouseDown`` before delivery;
+        ``Tree`` is ``can_focus=True``), so genuine browsing still mirrors.
+        Do not narrow this to "ignore only the root node" -- that would also
+        ignore a genuine keyboard highlight of the root and would not
+        generalise to any other automatically-highlighted node (e.g. a
+        lazily-loaded subdirectory).
         """
+        if not event.node.tree.has_focus:
+            return
         data = event.node.data
         if data is not None:
             self.query_one("#dir-path", Input).value = str(data.path)

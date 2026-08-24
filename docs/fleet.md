@@ -314,7 +314,9 @@ policy, two presentations, sharing the same underlying implementation).
 `d` (Runs) / `ctrl+d` (New run) opens a directory picker — type a path, or
 browse a tree rooted at the current directory's parent (so a sibling
 checkout is one keypress away) — and sets the TUI's **launch directory**
-for the rest of this `conductor fleet` session.
+for the rest of this `conductor fleet` session. The input is pre-filled
+with the current launch directory; browsing the tree updates it as you go,
+but pressing Enter in the input is what actually accepts a directory.
 
 The launch directory affects two things:
 

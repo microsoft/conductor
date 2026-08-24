@@ -383,7 +383,7 @@ class TestRunsScreenPolling:
             table = app.screen.query_one(DataTable)
             assert table.row_count == 1
 
-            remove_run_record("run-a")
+            assert remove_run_record("run-a") is True
 
             await wait_for(
                 pilot,

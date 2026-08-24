@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from textual.widgets._directory_tree import DirEntry
 
 from conductor.cli.app import Identity
 from conductor.cli.app import stop_records as cli_stop_records
@@ -33,7 +34,7 @@ from conductor.fleet.records import RunRecord, read_run_record, write_run_record
 from conductor.fleet.tui import actions as tui_actions
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.runs import RunsScreen
-from tests.test_fleet.conftest import settle
+from tests.test_fleet.conftest import settle, wait_for
 
 # ---------------------------------------------------------------------------
 # Helpers (mirroring tests/test_cli/test_stop.py's established patterns)
@@ -1390,6 +1391,11 @@ class TestDirectoryPickerModal:
         sub = home / "project"
         sub.mkdir()
         monkeypatch.setenv("HOME", str(home))
+        # `_accept` expands via `os.path.expanduser`, and `ntpath.expanduser`
+        # reads `USERPROFILE` (falling back to `HOMEDRIVE`+`HOMEPATH`) rather
+        # than `HOME` on Windows -- both must be set for `~` to actually
+        # expand into `tmp_path` there (issue #486).
+        monkeypatch.setenv("USERPROFILE", str(home))
 
         app = FleetApp()
         async with app.run_test() as pilot:
@@ -1402,6 +1408,103 @@ class TestDirectoryPickerModal:
             await settle(pilot)
 
         assert result_holder["result"] == Path(os.path.abspath(sub))
+
+    async def test_tree_highlight_while_unfocused_leaves_the_input_alone(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The regression itself (issue #486): Textual posts a
+        ``NodeHighlighted`` for the tree's own root as soon as the
+        background ``DirectoryTree`` load lands, with no user interaction
+        at all. Posting the message directly (rather than waiting for the
+        real load) exercises the same bubbling path
+        ``on_tree_node_highlighted`` handles, deterministically."""
+        from textual.widgets import Input, Tree
+
+        other = tmp_path / "other"
+        other.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            tree = modal.query_one("#dir-tree", Tree)
+            assert not tree.has_focus
+
+            tree.root.data = DirEntry(path=other)
+            tree.post_message(Tree.NodeHighlighted(tree.root))
+            await pilot.pause()
+
+            assert modal.query_one("#dir-path", Input).value == str(tmp_path)
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+    async def test_tree_highlight_while_focused_mirrors_into_the_input(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The other half of the fix: a genuine highlight while the user is
+        actually browsing the tree must still mirror -- otherwise the fix
+        would just be "delete the handler."""
+        from textual.widgets import Input, Tree
+
+        other = tmp_path / "other"
+        other.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await self._push(app, tmp_path)
+            await pilot.pause()
+
+            modal = app.screen
+            tree = modal.query_one("#dir-tree", Tree)
+            tree.focus()
+            await pilot.pause()
+            assert tree.has_focus
+
+            tree.root.data = DirEntry(path=other)
+            tree.post_message(Tree.NodeHighlighted(tree.root))
+            await pilot.pause()
+
+            assert modal.query_one("#dir-path", Input).value == str(other)
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+    async def test_prefilled_input_survives_the_tree_loading(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The real-world reproduction of issue #486: wait for the
+        background ``DirectoryTree`` load to actually land (rather than
+        posting the message synthetically, as the two tests above do) and
+        confirm the prefilled launch directory is still there afterwards."""
+        from textual.widgets import Input, Tree
+
+        # `current`'s parent must have children for the tree (rooted at the
+        # parent) to load anything and post the automatic root highlight.
+        current = tmp_path / "current"
+        current.mkdir()
+        (tmp_path / "sibling").mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await self._push(app, current)
+            await pilot.pause()
+
+            modal = app.screen
+            tree = modal.query_one("#dir-tree", Tree)
+            await wait_for(
+                pilot,
+                lambda: bool(tree.root.children),
+                message="tree never finished its background directory load",
+            )
+            await pilot.pause()
+
+            assert modal.query_one("#dir-path", Input).value == str(current)
+
+            await pilot.press("escape")
+            await settle(pilot)
 
     async def test_relative_input_resolves_against_current_directory(
         self, fleet_env: Path, tmp_path: Path

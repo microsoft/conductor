@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Conductor now reads both fields through a shared helper that tries the 2.x
   name and falls back to the 1.x one, preserving compatibility with both MCP
   1.x and 2.x.
+- **The Fleet Manager TUI's launch-directory picker no longer clobbers its
+  own prefill** (#486). Textual posts a `NodeHighlighted` event for the
+  directory tree's own root as soon as its background load lands, with no
+  user interaction involved; `DirectoryPickerModal` mirrored every such
+  event into the input, silently replacing the prefilled launch directory
+  with its parent before the user ever touched the tree. The mirror now
+  fires only while the tree actually has focus.
+- **A run record could silently fail to be removed on Windows** (#486).
+  `remove_run_record` and `remove_run_record_for_current_process` each made
+  a single, unretried filesystem call to delete a run's record; on Windows,
+  a concurrent reader (`conductor status`, `fleet list`, the TUI's poll)
+  can make that call fail with a sharing violation, leaving a stale record
+  behind. Both paths now share the same bounded retry `write_run_record`
+  already used for its own `os.replace`.
 
 ## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 

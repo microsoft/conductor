@@ -8,6 +8,8 @@ of truth rather than any particular glyph.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from rich.text import Text
 
@@ -99,18 +101,28 @@ class TestShortenHome:
     """Recommendation 9 (issue #477 review): ``shorten_home`` must compare
     by path component, not a bare string prefix -- a string-prefix test
     mangles a sibling home directory that merely shares a prefix (e.g.
-    ``/home/jasonx`` under ``HOME=/home/jason``) into ``~x``."""
+    ``/home/jasonx`` under ``HOME=/home/jason``) into ``~x``.
+
+    Patches ``Path.home`` rather than the ``HOME`` env var: that is the
+    exact call ``shorten_home`` makes, and ``HOME`` is inert on Windows
+    (``ntpath.expanduser`` reads ``USERPROFILE``/``HOMEDRIVE``+``HOMEPATH``
+    instead), which made these tests pass locally while failing on Windows
+    CI (issue #486). Expectations are built via ``str(Path(...))`` rather
+    than hard-coded ``/``-separated literals for the same reason -- a
+    literal ``"~/src/proj"`` is not what ``Path("~", "src", "proj")``
+    renders to on Windows.
+    """
 
     def test_path_under_home_is_shortened(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HOME", "/home/jason")
-        assert shorten_home("/home/jason/src/proj") == "~/src/proj"
+        monkeypatch.setattr(Path, "home", lambda: Path("/home/jason"))
+        assert shorten_home("/home/jason/src/proj") == str(Path("~", "src", "proj"))
 
     def test_path_outside_home_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HOME", "/home/jason")
-        assert shorten_home("/tmp/a") == "/tmp/a"
+        monkeypatch.setattr(Path, "home", lambda: Path("/home/jason"))
+        assert shorten_home("/tmp/a") == str(Path("/tmp/a"))
 
     def test_sibling_directory_sharing_home_prefix_is_not_mangled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("HOME", "/home/jason")
-        assert shorten_home("/home/jasonx/proj") == "/home/jasonx/proj"
+        monkeypatch.setattr(Path, "home", lambda: Path("/home/jason"))
+        assert shorten_home("/home/jasonx/proj") == str(Path("/home/jasonx/proj"))

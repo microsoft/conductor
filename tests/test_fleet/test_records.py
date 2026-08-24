@@ -451,17 +451,17 @@ class TestBulkScanUnlinkFailureDoesNotRaise:
     ) -> None:
         write_run_record(_make_record(pid=99999999))  # stale -> would be pruned
 
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
 
-        def _deny_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        def _deny_unlink(path: object, *args: object, **kwargs: object) -> None:
             # The record is renamed into a private quarantine path (e.g.
             # ``.abc123.json.prune-<hex>``) before the final unlink, so
             # match on the original stem rather than the exact filename.
-            if "abc123" in self.name:
-                raise PermissionError(self)
-            return real_unlink(self, *args, **kwargs)
+            if "abc123" in Path(path).name:
+                raise PermissionError(path)
+            return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", _deny_unlink)
+        monkeypatch.setattr(os, "unlink", _deny_unlink)
 
         records = read_run_records()
 
@@ -478,14 +478,14 @@ class TestBulkScanUnlinkFailureDoesNotRaise:
         bad_path = run_records_dir() / "bad.json"
         bad_path.write_text("not json{{{")
 
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
 
-        def _deny_unlink(self: Path, *args: object, **kwargs: object) -> None:
-            if "bad" in self.name:
-                raise PermissionError(self)
-            return real_unlink(self, *args, **kwargs)
+        def _deny_unlink(path: object, *args: object, **kwargs: object) -> None:
+            if "bad" in Path(path).name:
+                raise PermissionError(path)
+            return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", _deny_unlink)
+        monkeypatch.setattr(os, "unlink", _deny_unlink)
 
         records = read_run_records()
 
@@ -604,14 +604,14 @@ class TestRemoveRunRecordPropagatesDeletionStatus:
         filepath = run_records_dir() / "abc123.json"
         assert filepath.exists()
 
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
 
-        def _deny_unlink(self: Path, *args: object, **kwargs: object) -> None:
-            if self.name == "abc123.json":
-                raise PermissionError(self)
-            return real_unlink(self, *args, **kwargs)
+        def _deny_unlink(path: object, *args: object, **kwargs: object) -> None:
+            if Path(path).name == "abc123.json":
+                raise PermissionError(path)
+            return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", _deny_unlink)
+        monkeypatch.setattr(os, "unlink", _deny_unlink)
 
         # The file existed, but the removal itself failed -- this must not
         # be reported as a successful removal.
@@ -624,14 +624,14 @@ class TestRemoveRunRecordPropagatesDeletionStatus:
         write_run_record(_make_record(pid=os.getpid()))
         filepath = run_records_dir() / "abc123.json"
 
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
 
-        def _deny_unlink(self: Path, *args: object, **kwargs: object) -> None:
-            if "abc123" in self.name:
-                raise PermissionError(self)
-            return real_unlink(self, *args, **kwargs)
+        def _deny_unlink(path: object, *args: object, **kwargs: object) -> None:
+            if "abc123" in Path(path).name:
+                raise PermissionError(path)
+            return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", _deny_unlink)
+        monkeypatch.setattr(os, "unlink", _deny_unlink)
 
         assert remove_run_record_for_current_process() is False
         # Restored to its original path after the failed deletion -- not
@@ -1178,14 +1178,14 @@ class TestRestoreNeverClobbersWriteLandingAfterQuarantine:
         content must not clobber it."""
         write_run_record(_make_record(run_id="raceuf", pid=99999999))  # stale
 
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
 
-        def _deny_unlink(self: Path, *a: object, **kw: object) -> None:
-            if "raceuf" in self.name:
-                raise PermissionError(self)
-            return real_unlink(self, *a, **kw)
+        def _deny_unlink(path: object, *a: object, **kw: object) -> None:
+            if "raceuf" in Path(path).name:
+                raise PermissionError(path)
+            return real_unlink(path, *a, **kw)
 
-        monkeypatch.setattr(Path, "unlink", _deny_unlink)
+        monkeypatch.setattr(os, "unlink", _deny_unlink)
 
         real_link = os.link
         landed = {"done": False}
@@ -1541,3 +1541,138 @@ class TestWindowsReplaceRetry:
             write_run_record(_make_record(run_id="retry003"))
 
         assert calls["n"] == 1
+
+
+class TestWindowsDeleteRetry:
+    """Neither removal path is reader-proof on Windows either (issue #486).
+
+    ``write_run_record`` already retries an ``os.replace`` sharing violation
+    (see ``TestWindowsReplaceRetry`` above) via the same
+    ``_retry_on_windows_sharing_violation`` helper this class exercises
+    through the two removal paths: ``remove_run_record`` (``_safe_unlink``'s
+    ``os.unlink``) and ``remove_run_record_for_current_process``
+    (``_delete_if_unchanged``'s quarantine ``os.rename``). Without the
+    retry, a concurrent reader (``conductor status``, ``fleet list``, the
+    TUI's ~2s poll) makes a delete silently fail on Windows and leaves a
+    stale record behind.
+    """
+
+    def test_remove_run_record_retries_a_sharing_violation_and_succeeds(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+        write_run_record(_make_record())
+        filepath = run_records_dir() / "abc123.json"
+
+        real_unlink = os.unlink
+        calls = {"n": 0}
+
+        def _flaky(path: object, *a: object, **kw: object) -> None:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(13, "Access is denied")
+            real_unlink(path, *a, **kw)
+
+        monkeypatch.setattr(records.os, "unlink", _flaky)
+
+        assert remove_run_record("abc123") is True
+        assert calls["n"] == 3
+        assert not filepath.exists()
+
+    def test_a_persistent_sharing_violation_reports_failure_without_raising(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+        write_run_record(_make_record())
+        filepath = run_records_dir() / "abc123.json"
+
+        monkeypatch.setattr(
+            records.os,
+            "unlink",
+            lambda *_a, **_kw: (_ for _ in ()).throw(PermissionError(13, "Access is denied")),
+        )
+
+        # The tolerant-scan contract: a real, persistent failure must be
+        # reported as `False`, never raised.
+        assert remove_run_record("abc123") is False
+        assert filepath.exists()
+
+    def test_a_missing_file_is_not_retried(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+        write_run_record(_make_record())
+
+        calls = {"n": 0}
+
+        def _missing(*_a: object, **_kw: object) -> None:
+            calls["n"] += 1
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(records.os, "unlink", _missing)
+
+        assert remove_run_record("abc123") is False
+        # The ordinary "already gone" case must not pay the retry cost.
+        assert calls["n"] == 1
+
+    def test_posix_does_not_retry_unlink(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "linux")
+        write_run_record(_make_record())
+
+        calls = {"n": 0}
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            calls["n"] += 1
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(records.os, "unlink", _boom)
+
+        assert remove_run_record("abc123") is False
+        assert calls["n"] == 1
+
+    def test_self_cleanup_retries_a_quarantine_rename_sharing_violation(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+        write_run_record(_make_record(pid=os.getpid()))
+        filepath = run_records_dir() / "abc123.json"
+
+        real_rename = os.rename
+        calls = {"n": 0}
+
+        def _flaky(src: object, dst: object, *a: object, **kw: object) -> None:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(13, "Access is denied")
+            real_rename(src, dst, *a, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(records.os, "rename", _flaky)
+
+        assert remove_run_record_for_current_process() is True
+        assert calls["n"] == 3
+        assert not filepath.exists()
+
+    def test_self_cleanup_reports_failure_on_a_persistent_rename_violation(
+        self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(records.sys, "platform", "win32")
+        monkeypatch.setattr(records.time, "sleep", lambda _s: None)
+        write_run_record(_make_record(pid=os.getpid()))
+        filepath = run_records_dir() / "abc123.json"
+
+        monkeypatch.setattr(
+            records.os,
+            "rename",
+            lambda *_a, **_kw: (_ for _ in ()).throw(PermissionError(13, "Access is denied")),
+        )
+
+        assert remove_run_record_for_current_process() is False
+        # Nothing quarantined or orphaned -- the record is left intact.
+        assert filepath.exists()
+        assert not list(run_records_dir().glob(".*.prune-*"))
