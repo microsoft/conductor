@@ -36,8 +36,10 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+import jsonschema
 from mcp.types import ResourceLink, TextContent
 
+from conductor.fleet.launch import LaunchError
 from conductor.mcp.serve.invoke import LaunchTracker, invoke_workflow_tool
 from conductor.mcp.serve.toolgen import WAIT_SECONDS_PARAM
 
@@ -50,6 +52,51 @@ if TYPE_CHECKING:
 # (rather than importing that private alias) since this module's only use
 # of it is forwarding straight through to `invoke_workflow_tool`.
 _ProgressSender = Callable[[str | int, float, float | None, str | None], Awaitable[None]]
+
+# NFR6: hard bound on the number of workflows `conductor_find_workflow` ever
+# returns in one call, regardless of how many entries match. A 1,000-workflow
+# catalogue with an empty (match-everything) query would otherwise return
+# every workflow's full description and input schema in a single result --
+# unbounded and mirrored by the SDK as text. Matches how the rest of this
+# toolset bounds a per-call result (`introspect.py`'s own `_MAX_INLINE_RESULT_BYTES`
+# posture) -- a count bound here rather than a byte bound, since the shape
+# that grows unboundedly is "how many workflows", not one payload's size.
+_MAX_RESULTS = 25
+
+
+def _validate_inputs_against_entry_schema(
+    name: str, inputs: dict[str, Any], *, catalogue: Catalogue
+) -> None:
+    """Validate the flattened ``inputs`` against the *selected* workflow's own
+    ``inputSchema`` (review round 1).
+
+    The discovery pair's own fixed ``inputSchema`` (``server.py::_DISCOVERY_TOOLS``)
+    can only assert that ``inputs`` is an object -- the SDK has no way to know
+    which workflow's schema applies until ``name`` is read at call time, so it
+    cannot type-check ``inputs`` the way it type-checks a direct-mode tool's
+    flattened arguments (``jsonschema.validate(instance=arguments,
+    schema=tool.inputSchema)``, ``mcp.server.lowlevel.server.Server.call_tool``).
+    This performs that exact same check against the resolved entry's schema, so
+    a wrongly-typed value (e.g. a string for a numeric input) is rejected here
+    exactly as it would be at the protocol layer in direct mode, instead of
+    reaching :func:`~conductor.fleet.launch.build_typed_launch_inputs`, which
+    assumes SDK-equivalent validation already happened.
+
+    A ``name`` this catalogue does not publish is left alone here --
+    :func:`~conductor.mcp.serve.invoke.invoke_workflow_tool` already raises
+    ``UnknownToolError`` for it.
+
+    Raises:
+        LaunchError: If ``inputs`` does not conform to the resolved entry's
+            ``inputSchema``.
+    """
+    for entry in catalogue.entries:
+        if entry.tool_name == name:
+            try:
+                jsonschema.validate(instance=inputs, schema=entry.tool.inputSchema)
+            except jsonschema.ValidationError as exc:
+                raise LaunchError(f"Invalid input for {name!r}: {exc.message}") from exc
+            return
 
 
 def conductor_find_workflow(query: str = "", *, catalogue: Catalogue) -> dict[str, Any]:
@@ -69,29 +116,40 @@ def conductor_find_workflow(query: str = "", *, catalogue: Catalogue) -> dict[st
         catalogue: The frozen catalogue built at startup.
 
     Returns:
-        ``{"query", "count", "workflows"}`` where each ``workflows`` entry
-        is ``{"name", "description", "input_schema", "registry", "workflow"}``
-        -- ``name`` is the exact catalogue tool name
-        :func:`conductor_run_workflow` accepts (NFR3).
+        ``{"query", "count", "workflows", "truncated"}`` where each
+        ``workflows`` entry is ``{"name", "description", "input_schema",
+        "registry", "workflow"}`` -- ``name`` is the exact catalogue tool
+        name :func:`conductor_run_workflow` accepts (NFR3). ``count`` is the
+        total number of matches; ``workflows`` is capped at
+        :data:`_MAX_RESULTS` (NFR6), with ``truncated`` set when ``count``
+        exceeds that cap -- narrow the ``query`` to see the rest.
     """
     needle = query.strip().lower()
     matches: list[dict[str, Any]] = []
+    count = 0
     for entry in catalogue.entries:
         haystack = " ".join(
             (entry.tool_name, entry.workflow, entry.registry, entry.tool.description or "")
         ).lower()
         if needle and needle not in haystack:
             continue
-        matches.append(
-            {
-                "name": entry.tool_name,
-                "description": entry.tool.description,
-                "input_schema": entry.tool.inputSchema,
-                "registry": entry.registry,
-                "workflow": entry.workflow,
-            }
-        )
-    return {"query": query, "count": len(matches), "workflows": matches}
+        count += 1
+        if len(matches) < _MAX_RESULTS:
+            matches.append(
+                {
+                    "name": entry.tool_name,
+                    "description": entry.tool.description,
+                    "input_schema": entry.tool.inputSchema,
+                    "registry": entry.registry,
+                    "workflow": entry.workflow,
+                }
+            )
+    return {
+        "query": query,
+        "count": count,
+        "workflows": matches,
+        "truncated": count > len(matches),
+    }
 
 
 async def conductor_run_workflow(
@@ -143,10 +201,19 @@ async def conductor_run_workflow(
             string, none of which is ever a catalogue key (NFR3).
         ConcurrentRunLimitError: If ``--max-concurrent-runs`` is set and
             already reached (R3).
-        LaunchError: If a required input is missing, or the underlying
-            launch itself fails.
+        LaunchError: If ``inputs`` does not conform to the resolved
+            workflow's own ``inputSchema``, a required input is missing, or
+            the underlying launch itself fails.
     """
     arguments: dict[str, Any] = dict(inputs) if inputs else {}
+    # The fixed discovery schema (`server.py::_DISCOVERY_TOOLS`) only asserts
+    # that `inputs` is an object -- it cannot know which workflow's schema
+    # applies until `name` is read here. Validate against the *resolved*
+    # entry's own schema so a wrongly-typed value is rejected the same way it
+    # would be at the protocol layer in direct mode, before it ever reaches
+    # `build_typed_launch_inputs`, which assumes that validation already
+    # happened.
+    _validate_inputs_against_entry_schema(name, arguments, catalogue=catalogue)
     if _wait_seconds is not None:
         arguments[WAIT_SECONDS_PARAM] = _wait_seconds
 

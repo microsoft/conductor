@@ -290,12 +290,23 @@ async def _dispatch_discovery_tool(
     catalogue: Catalogue,
     options: ServeOptions,
     tracker: LaunchTracker,
+    progress_token: str | int | None = None,
+    send_progress: Any = None,
 ) -> dict[str, Any] | tuple[list[TextContent | ResourceLink], dict[str, Any]]:
     """Dispatch one ``tools/call`` for the ``discovery`` pair (E12-T2).
 
     Only ever invoked when ``catalogue.mode == "discovery"`` -- see
     ``_call_tool``'s own gate -- since the pair is never published, and
     therefore never callable, in direct mode.
+
+    Args:
+        progress_token: The live request's ``progressToken``, if the caller
+            supplied one (``request_context.meta.progressToken``). Forwarded
+            to ``conductor_run_workflow`` so a bounded wait can emit
+            ``notifications/progress`` (E9-T5); ``conductor_find_workflow``
+            never blocks, so it is unused there.
+        send_progress: The live session's ``send_progress_notification``
+            bound method, forwarded unchanged.
 
     Raises:
         ValueError: If ``name`` names neither discovery tool.
@@ -310,6 +321,8 @@ async def _dispatch_discovery_tool(
             catalogue=catalogue,
             options=options,
             tracker=tracker,
+            progress_token=progress_token,
+            send_progress=send_progress,
         )
     raise ValueError(f"Unknown tool: {name!r}.")
 
@@ -344,12 +357,17 @@ def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
 
     Raises:
         ValueError: If an enabled ``introspect``/``diagnose`` tool name, or
-            (in discovery mode) a discovery-pair tool name, collides with a
-            published workflow tool name (e.g. a workflow named
-            ``conductor_run_events`` in direct mode, or ``conductor_find_workflow``
-            in discovery mode) -- publishing both would leave ``call_tool``
-            always resolving to the fixed tool's adapter, silently shadowing
-            the workflow tool.
+            (in discovery mode) a discovery-pair tool name, collides with
+            another tool published *simultaneously* -- e.g. a workflow named
+            ``conductor_run_events`` in direct mode (where per-workflow tools
+            and the ``introspect``/``diagnose`` pair are both published). In
+            discovery mode, per-workflow tools are hidden outright (FR9), so a
+            catalogue key that merely happens to match a discovery/extra-tool
+            name -- e.g. a workflow named ``conductor_find_workflow`` -- is
+            not a real protocol-level collision and is not checked here;
+            publishing both would leave ``call_tool`` always resolving to the
+            fixed tool's adapter, silently shadowing the workflow tool, which
+            can only happen when both are actually published together.
     """
     server = Server(SERVER_NAME, version=__version__)
     extra_tools = _extra_tools_for(options)
@@ -361,8 +379,16 @@ def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
     # every generated workflow tool's own invocations.
     tracker = LaunchTracker()
 
+    # Only check collisions among tools this server will actually publish
+    # *together* -- in discovery mode the catalogue's per-workflow tools are
+    # hidden outright, so a catalogue key that happens to match a discovery
+    # or extra-tool name is unambiguous and not a real collision (review
+    # round 1: `conductor_run_workflow(name="conductor_find_workflow")` is
+    # perfectly resolvable, since only the discovery pair is ever published
+    # in that mode).
+    published_workflow_names = set() if discovery_mode else set(catalogue.reverse)
     reserved_names = {tool.name for tool in extra_tools} | {tool.name for tool in discovery_tools}
-    colliding = sorted(reserved_names & set(catalogue.reverse))
+    colliding = sorted(reserved_names & published_workflow_names)
     if colliding:
         raise ValueError(
             f"Tool name(s) {', '.join(colliding)} are reserved by the "
@@ -380,8 +406,23 @@ def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any]):
         if discovery_mode and name in _DISCOVERY_TOOL_NAMES:
+            # E9-T5: thread the live request's `progressToken` and the
+            # session's `send_progress_notification` through so a bounded
+            # `conductor_run_workflow` wait can emit `notifications/progress`
+            # the same way a generated tool's own dispatch would (review
+            # round 1) -- without this, `_run_workflow` always received its
+            # `None` defaults and progress notifications were unreachable
+            # from the live server.
+            request_ctx = server.request_context
+            progress_token = request_ctx.meta.progressToken if request_ctx.meta else None
             return await _dispatch_discovery_tool(
-                name, arguments, catalogue=catalogue, options=options, tracker=tracker
+                name,
+                arguments,
+                catalogue=catalogue,
+                options=options,
+                tracker=tracker,
+                progress_token=progress_token,
+                send_progress=request_ctx.session.send_progress_notification,
             )
         return await _dispatch_extra_tool(name, arguments, catalogue=catalogue, options=options)
 

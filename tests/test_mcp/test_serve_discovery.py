@@ -21,12 +21,14 @@ import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from conductor.cli.bg_runner import BackgroundLaunch
+from conductor.fleet.launch import LaunchError
 from conductor.fleet.records import RunRecord, write_run_record
+from conductor.fleet.summary import RunSummary
 from conductor.mcp.serve.catalogue import build_catalogue
 from conductor.mcp.serve.discovery import conductor_find_workflow, conductor_run_workflow
 from conductor.mcp.serve.invoke import LaunchTracker, UnknownToolError
 from conductor.mcp.serve.options import ServeOptions
-from conductor.mcp.serve.server import build_server, log_startup_summary
+from conductor.mcp.serve.server import _DISCOVERY_TOOLS, build_server, log_startup_summary
 from conductor.registry.config import RegistriesConfig
 from tests.test_mcp.conftest import write_path_registry
 
@@ -218,7 +220,12 @@ class TestConductorFindWorkflow:
 
         result = conductor_find_workflow("no-such-workflow", catalogue=catalogue)
 
-        assert result == {"query": "no-such-workflow", "count": 0, "workflows": []}
+        assert result == {
+            "query": "no-such-workflow",
+            "count": 0,
+            "workflows": [],
+            "truncated": False,
+        }
 
     def test_result_carries_description_and_input_schema(self, tmp_path: Path) -> None:
         catalogue, _ = _two_tool_catalogue(tmp_path)
@@ -241,6 +248,27 @@ class TestConductorFindWorkflow:
 
         assert result["count"] == 0
         assert result["workflows"] == []
+
+    def test_a_large_catalogue_is_bounded_rather_than_returned_in_full(
+        self, tmp_path: Path
+    ) -> None:
+        """NFR6: an unbounded match set (e.g. a 1,000-workflow catalogue with
+        an empty query) must not return every workflow's full description and
+        input schema in one result -- ``workflows`` is capped and ``count``/
+        ``truncated`` report the rest rather than silently dropping it."""
+        workflows = {f"workflow-{i}": _simple_yaml(f"workflow-{i}") for i in range(1000)}
+        entry = write_path_registry(tmp_path, name="official", workflows=workflows)
+        config = RegistriesConfig(registries={"official": entry})
+        catalogue = build_catalogue(
+            ServeOptions(max_direct_tools=1), registries_config=config, allow_network=False
+        )
+        assert catalogue.mode == "discovery"
+
+        result = conductor_find_workflow("", catalogue=catalogue)
+
+        assert result["count"] == 1000
+        assert len(result["workflows"]) < 1000
+        assert result["truncated"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +384,32 @@ class TestConductorRunWorkflow:
                 tracker=LaunchTracker(),
                 registries_config=registries_config,
             )
+
+    async def test_refuses_a_wrongly_typed_input(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review round 1: a string given for a numeric workflow input must
+        be rejected here, exactly as the SDK's own ``jsonschema.validate``
+        would reject it against a direct-mode tool's flattened arguments --
+        not silently launched with a value ``build_typed_launch_inputs``
+        never type-checks."""
+        catalogue, registries_config = _two_tool_catalogue(tmp_path)
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+
+        with pytest.raises(LaunchError):
+            await conductor_run_workflow(
+                "review_pr",
+                {"pr_number": "not-a-number"},
+                catalogue=catalogue,
+                options=ServeOptions(),
+                tracker=LaunchTracker(),
+                registries_config=registries_config,
+            )
+
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +533,40 @@ class TestDiscoveryToolsAreCallableOnlyInDiscoveryMode:
 
         assert result.isError is True
 
+    @pytest.mark.asyncio
+    async def test_wrongly_typed_input_is_rejected_through_the_live_server(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review round 1: a string given for a numeric workflow input must
+        be rejected by the live ``tools/call`` dispatch (not just the
+        directly-called function) -- a client that ignores the ``inputs``
+        object's declared property types must still be refused, not
+        launched, in discovery mode."""
+        workflows = {f"workflow-{i}": _simple_yaml(f"workflow-{i}") for i in range(4)}
+        workflows["review-pr"] = _REVIEW_PR_YAML
+        entry = write_path_registry(tmp_path, name="official", workflows=workflows)
+        registries_config = RegistriesConfig(registries={"official": entry})
+        options = ServeOptions(max_direct_tools=3)
+        catalogue = build_catalogue(
+            options, registries_config=registries_config, allow_network=False
+        )
+        assert catalogue.mode == "discovery"
+        server = build_server(catalogue, options)
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+        _patch_registries_config(monkeypatch, registries_config)
+
+        async with create_connected_server_and_client_session(server) as client:
+            result = await client.call_tool(
+                "conductor_run_workflow",
+                {"name": "review_pr", "inputs": {"pr_number": "not-a-number"}},
+            )
+
+        assert result.isError is True
+        assert calls == []
+
 
 # ---------------------------------------------------------------------------
 # E12-T3: the startup log names the count and threshold
@@ -510,3 +598,117 @@ class TestStartupLogNamesCountAndThreshold:
         assert "2" in err
         assert f"--max-direct-tools={options.max_direct_tools}" in err
         assert "direct" in err
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: collision check scoped to simultaneously-published tools
+# ---------------------------------------------------------------------------
+
+
+class TestCollisionCheckIsScopedToSimultaneouslyPublishedTools:
+    def test_a_workflow_named_like_a_discovery_tool_does_not_block_startup(
+        self, tmp_path: Path
+    ) -> None:
+        """A catalogue key matching a discovery-pair name (e.g. a workflow
+        that slugifies to ``conductor_find_workflow``) is not a real
+        protocol-level collision in discovery mode: per-workflow tools are
+        hidden from `tools/list`/`tools/call` outright, so the name is only
+        ever seen as a `conductor_run_workflow(name=...)` argument value --
+        `conductor_run_workflow(name="conductor_find_workflow")` resolves
+        unambiguously to the workflow, never to the search tool itself."""
+        workflows = {f"workflow-{i}": _simple_yaml(f"workflow-{i}") for i in range(4)}
+        workflows["conductor-find-workflow"] = _simple_yaml("conductor-find-workflow")
+        entry = write_path_registry(tmp_path, name="official", workflows=workflows)
+        config = RegistriesConfig(registries={"official": entry})
+        options = ServeOptions(max_direct_tools=3)
+        catalogue = build_catalogue(options, registries_config=config, allow_network=False)
+        assert catalogue.mode == "discovery"
+        assert "conductor_find_workflow" in catalogue.reverse
+
+        server = build_server(catalogue, options)  # must not raise ValueError
+
+        names = {tool.name for tool in _DISCOVERY_TOOLS} | {"conductor_find_workflow"}
+        assert server is not None
+        assert "conductor_find_workflow" in names  # sanity: the name really is shared
+
+    def test_the_same_name_still_collides_in_direct_mode(self, tmp_path: Path) -> None:
+        """Below the cap, per-workflow tools *are* published alongside any
+        enabled extra toolset, so a genuine name collision there must still
+        be refused -- this fix narrows the check to what is simultaneously
+        published, it does not remove it."""
+        entry = write_path_registry(
+            tmp_path,
+            name="official",
+            workflows={"conductor-run-events": _simple_yaml("conductor-run-events")},
+        )
+        config = RegistriesConfig(registries={"official": entry})
+        options = ServeOptions(toolsets=("workflows", "runs", "introspect"))
+        catalogue = build_catalogue(options, registries_config=config, allow_network=False)
+        assert catalogue.mode == "direct"
+        assert "conductor_run_events" in catalogue.reverse
+
+        with pytest.raises(ValueError, match="conductor_run_events"):
+            build_server(catalogue, options)
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: live progress notifications during a bounded wait
+# ---------------------------------------------------------------------------
+
+
+class TestLiveDiscoveryProgressNotifications:
+    @pytest.mark.asyncio
+    async def test_progress_token_and_sender_reach_the_bounded_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The request's `progressToken` and the session's
+        `send_progress_notification` must reach `_run_workflow`'s bounded
+        wait -- without this wiring, `_run_workflow` always receives its
+        `None` defaults and E9-T5 progress notifications are unreachable
+        from a live server, regardless of what the caller requests."""
+        catalogue, options, registries_config = _over_cap_catalogue(tmp_path)
+        server = build_server(catalogue, options)
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.derive_run_summary",
+            lambda record: RunSummary(
+                run_id=record.run_id,
+                workflow_name=record.workflow_name,
+                mode="bg",
+                port=record.port,
+                started_at=record.started_at,
+                status="running",
+                current_step=None,
+                current_step_type=None,
+                current_step_started_at=None,
+                total_tokens=0,
+                total_cost_usd=None,
+                unpriced_agent_count=0,
+                gate=None,
+                gate_resolvable=True,
+                topology=None,
+            ),
+        )
+        _patch_registries_config(monkeypatch, registries_config)
+        tool_name = catalogue.entries[0].tool_name
+
+        progress_calls: list[tuple[Any, ...]] = []
+
+        async def _record_progress(
+            progress: float, total: float | None, message: str | None
+        ) -> None:
+            progress_calls.append((progress, total, message))
+
+        async with create_connected_server_and_client_session(server) as client:
+            result = await client.call_tool(
+                "conductor_run_workflow",
+                {"name": tool_name, "_wait_seconds": 0.1},
+                progress_callback=_record_progress,
+            )
+
+        assert result.isError is not True
+        assert len(calls) == 1
+        assert progress_calls, "expected at least one progress notification"
