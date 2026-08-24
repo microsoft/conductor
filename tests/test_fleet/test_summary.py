@@ -36,14 +36,17 @@ from typing import Any
 
 import pytest
 
+from conductor.fleet import summary as summary_module
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import (
     _SUMMARY_EVENT_TYPES,
     RunDetail,
     RunSummary,
+    _scan_agent_details,
     _scan_events,
     derive_run_detail,
     derive_run_summary,
+    derive_step_detail,
     stream_event_log,
 )
 
@@ -221,7 +224,12 @@ class TestStreamEventLog:
         a `keep_types=_SUMMARY_EVENT_TYPES` scan produces the identical
         `_ScanResult` as an unfiltered one. A future event type handled by
         the scanner but missing from `_SUMMARY_EVENT_TYPES` fails here
-        instead of silently vanishing from the Runs screen."""
+        instead of silently vanishing from the Runs screen. A
+        self-policing assertion pins the fixture itself to
+        `_SUMMARY_EVENT_TYPES` so forgetting to add a fixture line for a
+        newly-added type (the same act of forgetting that would defeat
+        this test) fails loudly instead of the two scans trivially
+        agreeing on a type neither ever saw."""
         path = tmp_path / "run.events.jsonl"
         _write_jsonl(
             path,
@@ -282,9 +290,15 @@ class TestStreamEventLog:
                     ts=12.0,
                 ),
                 _event("agent_started", {"agent_name": "z"}, ts=13.0),
+                _event("workflow_failed", {"agent_name": "z"}, ts=14.0),
                 _event("workflow_completed", {}),
             ],
         )
+
+        fixture_types = {
+            json.loads(line)["type"] for line in path.read_text().splitlines() if line.strip()
+        }
+        assert fixture_types >= _SUMMARY_EVENT_TYPES
 
         filtered = _scan_events(stream_event_log(path, keep_types=_SUMMARY_EVENT_TYPES))
         unfiltered = _scan_events(stream_event_log(path))
@@ -715,6 +729,33 @@ class TestTokenAndCostTotals:
         assert summary.total_tokens == 0
         assert summary.total_cost_usd is None
         assert summary.has_unpriced is False
+
+    def test_nan_or_infinite_tokens_and_cost_are_ignored_not_summed(self, tmp_path: Path) -> None:
+        """`NaN`/`Infinity` are valid JSON (Python's `json` module accepts
+        them by default) but are not legitimate token counts or costs --
+        this must not crash the poll loop or silently poison the running
+        total (`int(nan)` raises `ValueError`, `int(inf)` raises
+        `OverflowError`)."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event(
+                    "agent_completed",
+                    {"agent_name": "good", "tokens": 100, "cost_usd": 0.01},
+                ),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "bad", "tokens": float("nan"), "cost_usd": float("inf")},
+                ),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.total_tokens == 100
+        assert summary.total_cost_usd == pytest.approx(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -1515,6 +1556,59 @@ class TestDeriveRunDetailPerAgentStatus:
         assert reviewer.elapsed_seconds(now=1010.0 + 4.0) == 4.0
 
 
+class TestScanAgentDetailsPrefilterEquivalence:
+    def test_scan_agent_details_prefilter_matches_an_unfiltered_scan(self, tmp_path: Path) -> None:
+        """Mirrors `TestStreamEventLog.test_prefilter_matches_an_unfiltered_scan`
+        for `_scan_agent_details`, which now also reads with
+        `keep_types=_SUMMARY_EVENT_TYPES` (issue #485 review): every branch
+        `_scan_agent_details` handles is a strict subset of
+        `_SUMMARY_EVENT_TYPES`, so a filtered and an unfiltered scan must
+        agree exactly."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event(
+                    "workflow_started",
+                    {"name": "wf", "agents": [{"name": "a"}, {"name": "b"}, {"name": "c"}]},
+                    ts=0.0,
+                ),
+                _event("agent_started", {"agent_name": "a"}, ts=1.0),
+                _event("gate_presented", {"agent_name": "a", "prompt": "OK?"}, ts=2.0),
+                _event("gate_resolved", {"agent_name": "a"}, ts=3.0),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "a", "tokens": 10, "cost_usd": 0.01, "elapsed": 5.0},
+                    ts=4.0,
+                ),
+                _event("agent_started", {"agent_name": "b"}, ts=5.0),
+                _event("agent_failed", {"agent_name": "b", "elapsed": 1.0}, ts=6.0),
+                _event("parallel_started", {"group_name": "fanout"}, ts=7.0),
+                _event(
+                    "parallel_agent_started",
+                    {"group_name": "fanout", "agent_name": "c"},
+                    ts=8.0,
+                ),
+                _event(
+                    "parallel_agent_completed",
+                    {"group_name": "fanout", "agent_name": "c", "tokens": 3, "elapsed": 1.0},
+                    ts=9.0,
+                ),
+                _event("parallel_completed", {"group_name": "fanout"}),
+                _event("for_each_started", {"group_name": "triage"}, ts=10.0),
+                _event("for_each_completed", {"group_name": "triage"}),
+                _event("script_completed", {"agent_name": "d"}),
+                _event("script_failed", {"agent_name": "e"}),
+                _event("workflow_failed", {"agent_name": "a"}),
+            ],
+        )
+
+        filtered = _scan_agent_details(stream_event_log(path, keep_types=_SUMMARY_EVENT_TYPES))
+        unfiltered = _scan_agent_details(stream_event_log(path))
+
+        assert filtered == unfiltered
+
+
 class TestDeriveRunDetailGracefulDegradation:
     def test_missing_event_log_path_yields_empty_detail(self, tmp_path: Path) -> None:
         record = _make_record(tmp_path, event_log_path="")
@@ -1841,6 +1935,11 @@ class TestResumedRunGenerations:
                     ts=2000.0,
                 ),
                 _event("agent_started", {"agent_name": "b"}, ts=2001.0),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "c", "tokens": 50, "cost_usd": 0.02},
+                    ts=2002.0,
+                ),
             ],
         )
         record = _make_record(tmp_path, event_log_path=str(path))
@@ -1852,9 +1951,13 @@ class TestResumedRunGenerations:
         assert summary.status == "running"
         assert summary.current_step == "b"
         # Totals are a lifetime sum across every generation (Q1) -- the
-        # first generation's usage is not lost on resume.
-        assert summary.total_tokens == 100
-        assert summary.total_cost_usd == pytest.approx(0.01)
+        # first generation's usage is not lost on resume, AND the second
+        # generation's own usage is added on top of it (a bug that
+        # preserved the first generation's total but stopped accumulating
+        # thereafter would satisfy a `total_tokens == 100`-only assertion).
+        assert summary.total_tokens == 150
+        assert summary.total_cost_usd == pytest.approx(0.03)
+        assert summary.unpriced_agent_count == 0
         # Topology/cwd/inputs come from the *second* workflow_started
         # (differing agent lists prove which one won).
         assert summary.topology is not None
@@ -1909,6 +2012,83 @@ class TestResumedRunGenerations:
         assert summary.current_step is None
         assert summary.status == "running"
 
+    def test_run_detail_does_not_report_a_dead_generations_open_gate(self, tmp_path: Path) -> None:
+        """`derive_run_detail` (the run-detail screen) must reset the same
+        way `derive_run_summary` (the Runs screen) already does at a resume
+        boundary -- otherwise the two screens disagree about the same run:
+        Runs correctly says "running, nothing open" while run-detail keeps
+        reporting the dead generation's step as still at-gate, with an
+        elapsed clock spanning the idle gap (issue #485)."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _workflow_started_event(["a"]),
+                _event("agent_started", {"agent_name": "a"}, ts=101.0),
+                _event("gate_presented", {"agent_name": "a", "prompt": "OK?"}, ts=102.0),
+                # Generation 1 dies with the gate still open -- no
+                # gate_resolved, no workflow_failed. A resume still writes a
+                # fresh workflow_started.
+                _workflow_started_event(["a"], ts=5000.0),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+        detail = derive_run_detail(record)
+
+        assert summary.status == "running"
+        assert summary.current_step is None
+        assert summary.gate is None
+
+        assert detail.current_step is None
+        assert [a.name for a in detail.agents] == ["a"]
+        row = detail.agents[0]
+        assert row.status != "at-gate"
+        assert row.status != "running"
+
+    def test_a_nested_subworkflow_start_is_not_a_resume_boundary(self, tmp_path: Path) -> None:
+        """A nested sub-workflow's own `workflow_started` (`subworkflow_path`
+        stamped) must not be mistaken for a root resume boundary -- both
+        `_scan_events` (the Runs screen) and `_scan_agent_details` (the
+        run-detail screen) guard against this, and this PR widened what
+        their failure would cost: `_scan_events` now resets
+        status/gate/open_steps at every `workflow_started` it sees, and
+        `_scan_agent_details` now also resets topology, so an unguarded
+        nested start would wipe out the root generation's real state."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _workflow_started_event(["a"]),
+                _event("agent_started", {"agent_name": "a"}, ts=1001.0),
+                _event("gate_presented", {"agent_name": "a", "prompt": "OK?"}, ts=1002.0),
+                # A nested sub-workflow starts (and completes) while the
+                # root is still sitting at its gate.
+                _event(
+                    "workflow_started",
+                    {"name": "sub", "agents": [{"name": "z"}], "subworkflow_path": ["sub"]},
+                    ts=1003.0,
+                ),
+                _event(
+                    "workflow_completed",
+                    {"subworkflow_path": ["sub"]},
+                    ts=1004.0,
+                ),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+        detail = derive_run_detail(record)
+
+        assert summary.status == "at-gate"
+        assert summary.gate is not None
+        assert summary.current_step == "a"
+
+        assert detail.current_step == "a"
+        assert [a.name for a in detail.agents] == ["a"]
+
 
 # ---------------------------------------------------------------------------
 # Single-pass consumption (mirrors fleet.history's identical issue-#436 test)
@@ -1943,3 +2123,59 @@ class TestScanEventsAcceptsAOneShotIterator:
         assert scan.workflow_name == "wf"
         assert scan.total_tokens == 10
         assert scan.total_cost_usd == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------------------
+# derive_step_detail: a mid-stream OSError must not surface a partial scan
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveStepDetailMidStreamReadFailure:
+    def test_an_os_error_after_a_completed_step_does_not_report_partial_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On `main`, `derive_step_detail` read the whole log in one shot
+        (`read_event_log_full`), so an I/O failure was structurally
+        all-or-nothing. Streaming introduced a `try` around the
+        consumption loop whose locals (`status`, `output`, `activity`)
+        survive an exception raised mid-iteration -- a step that actually
+        completed with output must not render as `status="running"`,
+        `output=None` just because the stream failed partway through
+        something unrelated afterwards (issue #485 regression)."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _workflow_started_event(["a"]),
+                _event("agent_started", {"agent_name": "a"}, ts=1001.0),
+                _event(
+                    "agent_completed",
+                    {"agent_name": "a", "output": {"answer": "done"}},
+                    ts=1002.0,
+                ),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        real_stream = summary_module.stream_event_log
+
+        def _flaky_stream(*args: Any, **kwargs: Any) -> Any:
+            events = list(real_stream(*args, **kwargs))
+
+            def _generator() -> Any:
+                yield from events
+                raise OSError("simulated mid-stream I/O failure")
+
+            return _generator()
+
+        monkeypatch.setattr(summary_module, "stream_event_log", _flaky_stream)
+
+        detail = derive_step_detail(record, "a")
+
+        # The pristine, pre-scan defaults -- never a scan that completed
+        # (correctly deriving status="completed"/output={"answer": "done"})
+        # but was discarded partway through being assigned.
+        assert detail.status == "pending"
+        assert detail.prompt is None
+        assert detail.output is None
+        assert detail.activity == []

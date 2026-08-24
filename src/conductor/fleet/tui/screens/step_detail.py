@@ -222,10 +222,10 @@ class StepDetailScreen(Screen):
     async def load_step(self) -> None:
         """Read this step's detail from the log, off the event loop.
 
-        ``derive_step_detail`` does a bounded **full**-log read (a step's
-        prompt is emitted once, at its start, so the tail window misses it on
-        any long run) -- large enough to be worth a thread rather than
-        blocking the UI while it parses.
+        ``derive_step_detail`` streams the whole (uncapped) log -- a
+        step's prompt is emitted once, at its start, which a bounded tail
+        window would miss on any long run -- large enough to be worth a
+        thread rather than blocking the UI while it parses.
         """
         status = self.query_one("#step-status", Static)
         input_content = self.query_one("#input-content", Static)

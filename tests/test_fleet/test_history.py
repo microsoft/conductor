@@ -723,6 +723,38 @@ class TestResumedRunResetsTerminalState:
         assert entries[0].ended_at == 100_005.0
         assert entries[0].duration_seconds == pytest.approx(5.0)
 
+    def test_a_nested_subworkflow_start_is_not_mistaken_for_a_resume(self, temp_root: Path) -> None:
+        """A nested sub-workflow's own `workflow_started` (`subworkflow_path`
+        stamped) must not be treated as a root resume boundary -- it would
+        otherwise wrongly reset `started_at` (Q2) and, before this guard
+        moved `started_at`'s assignment out of the `else` branch, could
+        overwrite it where first-wins previously made that impossible."""
+        _write_log(
+            temp_root,
+            lines=[
+                _event("workflow_started", {"name": "my-workflow"}, ts=1000.0),
+                _event("agent_started", {"agent_name": "a"}, ts=1001.0),
+                _event(
+                    "workflow_started",
+                    {"name": "sub", "subworkflow_path": ["sub"]},
+                    ts=1500.0,
+                ),
+                _event(
+                    "workflow_completed",
+                    {"subworkflow_path": ["sub"]},
+                    ts=1800.0,
+                ),
+                _event("workflow_failed", {"error_type": "ValueError"}, ts=2000.0),
+            ],
+        )
+
+        entries = build_history_entries()
+
+        assert len(entries) == 1
+        assert entries[0].outcome == "failed"
+        assert entries[0].started_at == 1000.0
+        assert entries[0].ended_at == 2000.0
+
 
 # ---------------------------------------------------------------------------
 # HistoryEntry shape

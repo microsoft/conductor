@@ -34,7 +34,6 @@ no pagination.
 from __future__ import annotations
 
 import logging
-import math
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -166,18 +165,13 @@ def _parse_filename(path: Path) -> tuple[str, str | None]:
 def _finite_float(value: Any) -> float | None:
     """Return ``value`` as a ``float`` iff it is a finite ``int``/``float``.
 
-    ``NaN``/``Infinity``/``-Infinity`` are valid JSON values (Python's
-    ``json`` module accepts them by default) but are not legitimate
-    timestamps, durations, token counts, or costs -- letting one through
-    would silently poison a sum or crash the History screen's duration
-    formatting (``int(nan)``/``int(inf)`` both raise) downstream (E14
-    review round 1). Rejected the same way a wrong-shaped value already
-    is: silently ignored, not raised.
+    Delegates to :func:`conductor.fleet.summary._finite_float`, which
+    enforces the identical rule (``NaN``/``Infinity`` are valid JSON but
+    not legitimate timestamps/durations/token counts/costs) over the same
+    engine-written event payloads -- hosted there since this module
+    already imports :mod:`conductor.fleet.summary`.
     """
-    if not isinstance(value, int | float):
-        return None
-    value = float(value)
-    return value if math.isfinite(value) else None
+    return summary._finite_float(value)
 
 
 @dataclass
@@ -208,14 +202,17 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
     :func:`_read_full_log` stream rather than materialise a list. A
     future edit must not break this by, say, iterating ``events`` twice.
 
-    A **resumed** run appends a fresh ``workflow_started`` after an
-    earlier terminal event without a dashboard attached (the engine only
-    suppresses that re-emit when seeding a dashboard on resume --
-    ``cli/run.py``), so a log can legitimately contain
-    ``workflow_started`` -> ... -> ``workflow_failed`` -> a *second*
-    ``workflow_started`` -> more activity. Any ``workflow_started`` past
-    the first is therefore treated as the start of a new root execution
-    generation: the previously recorded terminal ``outcome``/``ended_at``/
+    A **resumed** run always appends a fresh ``workflow_started`` after an
+    earlier terminal event, whether or not a dashboard is attached --
+    ``cli/run.py`` suppresses only the *engine's own re-emit* (so a live
+    dashboard does not double-count nested-workflow depth), then writes
+    the same payload directly to the event-log subscriber, bypassing the
+    emitter, so the persisted JSONL always records the generation boundary
+    either way. So a log can legitimately contain ``workflow_started`` ->
+    ... -> ``workflow_failed`` -> a *second* ``workflow_started`` -> more
+    activity. Any ``workflow_started`` past the first is therefore treated
+    as the start of a new root execution generation: the previously
+    recorded terminal ``outcome``/``ended_at``/
     ``reported_elapsed`` are reset back to their "no terminal event yet"
     defaults, so an in-progress resumed attempt reads as ``"unknown"``
     (never the stale prior attempt's outcome) until *its own* terminal

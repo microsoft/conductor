@@ -155,10 +155,11 @@ def _append_more(out: Text, remaining: int, line_width: int, width: int) -> None
 def step_statuses(agent_names: list[str], current_step: str | None) -> dict[str, str]:
     """Infer per-step statuses from position alone.
 
-    The Runs screen's bounded tail read knows the current step but not the
-    per-step history the run-detail screen derives from a full log read.
-    Position is a sound stand-in *for a linear run*: everything before the
-    current step has been passed through, everything after has not.
+    The Runs screen's streamed, prefiltered scan knows the current step
+    but not the per-step history the run-detail screen derives from its
+    own streamed, unfiltered scan of the same log. Position is a sound
+    stand-in *for a linear run*: everything before the current step has
+    been passed through, everything after has not.
 
     It is deliberately only a stand-in. A workflow that loops back, or one
     whose current step is unknown, gets no invented history -- callers with

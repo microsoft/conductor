@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from collections import deque
@@ -63,6 +64,24 @@ AgentDetailStatus = Literal["pending", "running", "at-gate", "completed", "faile
 _STEP_ACTIVITY_LIMIT = 200
 """How many activity lines the step drill-down keeps. A long agentic loop
 emits hundreds of tool calls; this is a drill-down, not a log viewer."""
+
+
+def _finite_float(value: Any) -> float | None:
+    """Return ``value`` as a ``float`` iff it is a finite ``int``/``float``.
+
+    ``NaN``/``Infinity``/``-Infinity`` are valid JSON values (Python's
+    ``json`` module accepts them by default) but are not legitimate token
+    counts or costs -- letting one through would silently poison a sum or
+    crash downstream formatting (``int(nan)``/``int(inf)`` both raise).
+    Rejected the same way a wrong-shaped value already is: silently
+    ignored, not raised. Shared with :mod:`conductor.fleet.history`, which
+    already imports this module and enforces the identical rule over the
+    same engine-written event payloads.
+    """
+    if not isinstance(value, int | float):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 @dataclass(frozen=True)
@@ -151,9 +170,15 @@ class RunDetail:
     """Full per-agent detail for the run-detail screen (E9), derived from a
     streamed, uncapped read of the run's event log (:func:`stream_event_log`)
     -- the same reader :class:`RunSummary` uses, over every event rather
-    than a tail window. Only opening the detail screen pays for the
-    (slightly more expensive, unfiltered) full scan, and only once per
-    open (not on every poll tick)."""
+    than a tail window. The distinction from :class:`RunSummary` is not
+    frequency but filtering: :func:`derive_run_summary` passes
+    ``keep_types=_SUMMARY_EVENT_TYPES`` (12.5 ms measured against a real
+    9.72 MB / 20,361-line log) while this class's unfiltered scan costs
+    roughly 5x that (65 ms on the same log) because it also needs
+    per-agent event types the Runs screen's aggregate totals do not. The
+    scan runs on every ~2s poll tick for as long as the run-detail screen
+    is open, not once per open -- kept off the event loop in a worker for
+    that reason."""
 
     run_id: str
     workflow_name: str
@@ -205,7 +230,9 @@ class RunSummary:
     generation** in the log (issue #485): a resumed run's totals include
     whatever the prior, terminated generation(s) already accumulated, not
     just the current one -- only the *status*/*current step*/*gate* reset
-    at a resume boundary, not the usage totals."""
+    at a resume boundary, not the usage totals (:attr:`total_tokens`,
+    :attr:`total_cost_usd`, and :attr:`unpriced_agent_count` alike -- all
+    three accumulate through the same event-handling code path)."""
 
     total_cost_usd: float | None
     """Sum of ``cost_usd`` across priced ``agent_completed`` events in the
@@ -349,11 +376,20 @@ def stream_event_log(
 
     Args:
         path: Path to the JSONL event log.
-        keep_types: When given, only lines whose ``type`` is in this set
-            are parsed and yielded (see above). ``None`` parses every line.
+        keep_types: A best-effort prefilter, not an exact one: a line
+            whose leading ``type`` key matches :data:`_TYPE_PREFIX_RE` and
+            is not in this set is skipped without being JSON-parsed. A
+            line the regex cannot read (e.g. ``type`` is not the first
+            key) is always parsed and yielded regardless of this set --
+            callers must still branch on ``type`` rather than assume the
+            filter was exact. ``None`` parses every line.
 
     Yields:
         Parsed event dicts, oldest first.
+
+    Raises:
+        OSError: On the returned iterator's first ``next()`` (not at call
+            time) if ``path`` cannot be opened or read -- see above.
     """
     with open(path, "rb") as f:
         for raw_line in f:
@@ -611,13 +647,13 @@ def _scan_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
                 if result.status == "at-gate":
                     result.status = "running"
             elif etype in ("agent_completed", "parallel_agent_completed"):
-                tokens = data.get("tokens")
-                if isinstance(tokens, int | float):
+                tokens = _finite_float(data.get("tokens"))
+                if tokens is not None:
                     result.total_tokens += int(tokens)
-                cost = data.get("cost_usd")
-                if isinstance(cost, int | float):
-                    result.total_cost_usd = (result.total_cost_usd or 0.0) + float(cost)
-                elif isinstance(tokens, int | float) and tokens > 0:
+                cost = _finite_float(data.get("cost_usd"))
+                if cost is not None:
+                    result.total_cost_usd = (result.total_cost_usd or 0.0) + cost
+                elif tokens is not None and tokens > 0:
                     result.unpriced_agent_count += 1
 
         elif etype in _AGENT_FAILED_EVENT_TYPES:
@@ -698,15 +734,19 @@ def _scan_agent_details(
     stream (issue #485): :func:`derive_run_detail` used to iterate the
     event list twice, once to find the topology and once here, which a
     one-shot iterator cannot support. The **latest** root
-    ``workflow_started`` wins (last generation wins, mirroring
-    :func:`_scan_events`'s identical resume-boundary handling), so a
-    resumed run's detail screen reflects the current generation's topology,
-    not a stale earlier one. Per-agent status/usage tracking is otherwise
-    unchanged: an agent's cumulative tokens/cost keep accumulating across
-    every restart they already did (a loop-back or a resume look the same
-    to this loop -- a fresh ``agent_started`` always means "running now",
-    regardless of why the process is executing it again), consistent with
-    :func:`_scan_events`'s Q1 totals-accumulate-across-generations rule.
+    ``workflow_started`` wins (last generation wins), so a resumed run's
+    detail screen reflects the current generation's topology, not a stale
+    earlier one. That ``workflow_started`` branch also resets ``open_steps``,
+    ``gated`` and ``started_at_by_name`` -- the same resume-boundary reset
+    :func:`_scan_events` does -- so a generation killed mid-step (its open
+    steps and any unresolved gate never getting a closing event) cannot
+    leak into how the next generation reads. Per-agent status/usage
+    tracking is otherwise unchanged: an agent's cumulative tokens/cost keep
+    accumulating across every restart they already did (a loop-back or a
+    resume look the same to this loop -- a fresh ``agent_started`` always
+    means "running now", regardless of why the process is executing it
+    again), consistent with :func:`_scan_events`'s Q1
+    totals-accumulate-across-generations rule.
 
     Args:
         events: Event dicts, oldest first (see :func:`stream_event_log`).
@@ -758,6 +798,16 @@ def _scan_agent_details(
             topology = _extract_topology(data)
             declared = data.get("name")
             workflow_name = declared if isinstance(declared, str) and declared else None
+            # A new generation starts clean: an open step or unresolved
+            # gate from a dead prior attempt (which got no closing event
+            # before the process exited) must not leak into this
+            # generation's reading -- the same reset `_scan_events` does at
+            # its own `workflow_started` branch. `closed`,
+            # `cumulative_tokens` and `cumulative_cost` are deliberately
+            # left untouched -- see the docstring.
+            open_steps.clear()
+            gated.clear()
+            started_at_by_name.clear()
             continue
 
         elif etype in ("agent_started", "parallel_agent_started"):
@@ -790,12 +840,12 @@ def _scan_agent_details(
                 gated.discard(name)
                 elapsed = data.get("elapsed")
                 if etype in ("agent_completed", "parallel_agent_completed"):
-                    tokens = data.get("tokens")
-                    cost = data.get("cost_usd")
-                    if isinstance(tokens, int | float):
+                    tokens = _finite_float(data.get("tokens"))
+                    cost = _finite_float(data.get("cost_usd"))
+                    if tokens is not None:
                         cumulative_tokens[name] = cumulative_tokens.get(name, 0) + int(tokens)
-                    if isinstance(cost, int | float):
-                        cumulative_cost[name] = (cumulative_cost.get(name) or 0.0) + float(cost)
+                    if cost is not None:
+                        cumulative_cost[name] = (cumulative_cost.get(name) or 0.0) + cost
                     closed[name] = (
                         "completed",
                         started_at_by_name.get(name),
@@ -1021,20 +1071,28 @@ class StepDetail:
     """The run's declared name, not the workflow file's stem."""
 
 
-def derive_step_detail(record: RunRecord, agent_name: str) -> StepDetail:
-    """Extract one step's input/output/activity from a run's event log.
+def _scan_step_events(
+    events: Iterable[dict[str, Any]], agent_name: str
+) -> tuple[str, str | None, Any | None, deque[ActivityLine], str | None]:
+    """Single pass over the full event stream extracting one step's detail.
 
-    Streams the whole (uncapped) log -- a step's prompt is emitted once,
-    when it started, which on a long run the old bounded tail window
-    always missed. When ``record.event_log_path`` is empty, or any
-    ``OSError`` occurs while streaming it, this still returns a usable
-    (``status="pending"``, no prompt/output/activity) :class:`StepDetail`
-    rather than raising, mirroring :func:`derive_run_summary` /
-    :func:`derive_run_detail`'s never-raise contract.
+    Returns ``(status, prompt, output, activity, workflow_name)`` only
+    after the stream drains -- callers must assign the whole tuple in one
+    statement inside their own ``try``/``except OSError`` so a mid-stream
+    read failure (propagating out of the ``events`` iterator) can never
+    leave a caller holding a partial scan: an exception here means the
+    assignment in :func:`derive_step_detail` never happens at all, and its
+    pristine defaults are returned instead.
 
-    Activity is bounded to the most recent :data:`_STEP_ACTIVITY_LIMIT`
-    entries -- a long agentic loop emits hundreds of tool calls, and this is
-    a drill-down, not a log viewer.
+    Args:
+        events: Event dicts, oldest first (see :func:`stream_event_log`).
+        agent_name: The step whose prompt/output/activity to extract.
+
+    Returns:
+        The five-tuple described above. ``status`` defaults to
+        ``"pending"``; ``prompt``/``output``/``workflow_name`` default to
+        ``None``; ``activity`` defaults to an empty, capacity-bounded
+        deque.
     """
     prompt: str | None = None
     output: Any | None = None
@@ -1045,55 +1103,99 @@ def derive_step_detail(record: RunRecord, agent_name: str) -> StepDetail:
     # `_scan_agent_details`'s identical reasoning.
     workflow_name: str | None = None
 
+    for evt in events:
+        data = evt.get("data")
+        if not isinstance(data, dict) or data.get("subworkflow_path"):
+            continue
+        etype = evt.get("type")
+
+        if etype == "workflow_started":
+            declared = data.get("name")
+            workflow_name = declared if isinstance(declared, str) and declared else None
+            # A new generation starts clean: an agent that was mid-flight
+            # when a prior generation died (and never got a closing event)
+            # cannot still be "running" across a resume boundary -- but a
+            # genuine `completed`/`failed` status is real history and is
+            # left alone.
+            if status == "running":
+                status = "pending"
+            continue
+
+        if data.get("agent_name") != agent_name:
+            continue
+
+        if etype in ("agent_started", "parallel_agent_started"):
+            status = "running"
+            # A re-run (loop-back) supersedes the previous attempt's result.
+            prompt = None
+            output = None
+            activity.clear()
+        elif etype == "agent_prompt_rendered":
+            rendered = data.get("rendered_prompt")
+            if isinstance(rendered, str):
+                prompt = rendered
+        elif etype in ("agent_completed", "parallel_agent_completed"):
+            status = "completed"
+            output = data.get("output")
+        elif etype == "questions_completed" or etype in _AGENT_CLOSE_EVENT_TYPES:
+            status = "completed"
+        elif etype in _AGENT_FAILED_EVENT_TYPES:
+            status = "failed"
+
+        if etype == "agent_message":
+            content = data.get("content")
+            if isinstance(content, str) and content.strip():
+                activity.append(ActivityLine("message", content.strip()))
+        elif etype == "agent_reasoning":
+            content = data.get("content")
+            if isinstance(content, str) and content.strip():
+                activity.append(ActivityLine("reasoning", content.strip()))
+        elif etype == "agent_tool_start":
+            activity.append(ActivityLine("tool", str(data.get("tool_name") or "tool")))
+        elif etype == "agent_tool_complete":
+            activity.append(ActivityLine("tool_result", str(data.get("tool_name") or "tool")))
+
+    return status, prompt, output, activity, workflow_name
+
+
+def derive_step_detail(record: RunRecord, agent_name: str) -> StepDetail:
+    """Extract one step's input/output/activity from a run's event log.
+
+    Streams the whole (uncapped) log -- a step's prompt is emitted once,
+    when it started, which on a long run the old bounded tail window
+    always missed. When ``record.event_log_path`` is empty, or any
+    ``OSError`` occurs while streaming it, this still returns a usable
+    (``status="pending"``, no prompt/output/activity) :class:`StepDetail`
+    rather than raising, mirroring :func:`derive_run_summary` /
+    :func:`derive_run_detail`'s never-raise contract. The scan itself lives
+    in :func:`_scan_step_events` and is assigned here in one statement so a
+    mid-stream ``OSError`` can never leave this function holding (and
+    returning) a partial scan as if it were authoritative.
+
+    Activity is bounded to the most recent :data:`_STEP_ACTIVITY_LIMIT`
+    entries -- a long agentic loop emits hundreds of tool calls, and this is
+    a drill-down, not a log viewer.
+
+    Args:
+        record: The run record whose event log to read.
+        agent_name: The step (agent, parallel-group member, or non-LLM
+            step type) to extract input/output/activity for.
+
+    Returns:
+        A :class:`StepDetail` for ``agent_name``.
+    """
+    prompt: str | None = None
+    output: Any | None = None
+    status = "pending"
+    activity: deque[ActivityLine] = deque(maxlen=_STEP_ACTIVITY_LIMIT)
+    workflow_name: str | None = None
+
     if record.event_log_path:
         log_path = Path(record.event_log_path)
         try:
-            events = stream_event_log(log_path)
-            for evt in events:
-                data = evt.get("data")
-                if not isinstance(data, dict) or data.get("subworkflow_path"):
-                    continue
-                etype = evt.get("type")
-
-                if etype == "workflow_started":
-                    declared = data.get("name")
-                    workflow_name = declared if isinstance(declared, str) and declared else None
-                    continue
-
-                if data.get("agent_name") != agent_name:
-                    continue
-
-                if etype in ("agent_started", "parallel_agent_started"):
-                    status = "running"
-                    # A re-run (loop-back) supersedes the previous attempt's result.
-                    output = None
-                    activity.clear()
-                elif etype == "agent_prompt_rendered":
-                    rendered = data.get("rendered_prompt")
-                    if isinstance(rendered, str):
-                        prompt = rendered
-                elif etype in ("agent_completed", "parallel_agent_completed"):
-                    status = "completed"
-                    output = data.get("output")
-                elif etype == "questions_completed" or etype in _AGENT_CLOSE_EVENT_TYPES:
-                    status = "completed"
-                elif etype in _AGENT_FAILED_EVENT_TYPES:
-                    status = "failed"
-
-                if etype == "agent_message":
-                    content = data.get("content")
-                    if isinstance(content, str) and content.strip():
-                        activity.append(ActivityLine("message", content.strip()))
-                elif etype == "agent_reasoning":
-                    content = data.get("content")
-                    if isinstance(content, str) and content.strip():
-                        activity.append(ActivityLine("reasoning", content.strip()))
-                elif etype == "agent_tool_start":
-                    activity.append(ActivityLine("tool", str(data.get("tool_name") or "tool")))
-                elif etype == "agent_tool_complete":
-                    activity.append(
-                        ActivityLine("tool_result", str(data.get("tool_name") or "tool"))
-                    )
+            status, prompt, output, activity, workflow_name = _scan_step_events(
+                stream_event_log(log_path), agent_name
+            )
         except OSError:
             logger.debug("Could not read event log %s", log_path, exc_info=True)
 
@@ -1132,7 +1234,7 @@ def derive_run_detail(record: RunRecord) -> RunDetail:
         log_path = Path(record.event_log_path)
         try:
             topology, workflow_name, agents, current_step = _scan_agent_details(
-                stream_event_log(log_path)
+                stream_event_log(log_path, keep_types=_SUMMARY_EVENT_TYPES)
             )
         except OSError:
             logger.debug("Could not read event log %s", log_path, exc_info=True)
