@@ -59,6 +59,8 @@ async def create_provider(
     timeout: float | None = None,
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
+    idle_timeout_seconds: float | None = None,
+    max_idle_recovery_attempts: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
     default_context_tier: ContextTier | None = None,
     provider_settings: ProviderSettings | None = None,
@@ -83,6 +85,12 @@ async def create_provider(
         timeout: Request timeout in seconds.
         max_session_seconds: Maximum wall-clock duration for agent sessions.
         max_agent_iterations: Maximum tool-use iterations per agent execution.
+        idle_timeout_seconds: Time without SDK events before a Copilot session
+            is treated as idle. Copilot only; ``None`` uses the provider's
+            built-in default (90s).
+        max_idle_recovery_attempts: Maximum number of "please continue"
+            prompts sent to an idle Copilot session before failing. Copilot
+            only; ``None`` uses the provider's built-in default (5).
         default_reasoning_effort: Workflow-wide default reasoning effort
             (``low`` / ``medium`` / ``high`` / ``xhigh`` / ``max``) applied
             when an agent does not specify its own ``reasoning.effort``.
@@ -113,9 +121,28 @@ async def create_provider(
     match provider_type:
         case "copilot":
             idle_recovery_config = None
-            if max_session_seconds is not None:
+            if (
+                max_session_seconds is not None
+                or idle_timeout_seconds is not None
+                or max_idle_recovery_attempts is not None
+            ):
+                idle_recovery_defaults = IdleRecoveryConfig()
                 idle_recovery_config = IdleRecoveryConfig(
-                    max_session_seconds=max_session_seconds,
+                    idle_timeout_seconds=(
+                        idle_timeout_seconds
+                        if idle_timeout_seconds is not None
+                        else idle_recovery_defaults.idle_timeout_seconds
+                    ),
+                    max_recovery_attempts=(
+                        max_idle_recovery_attempts
+                        if max_idle_recovery_attempts is not None
+                        else idle_recovery_defaults.max_recovery_attempts
+                    ),
+                    max_session_seconds=(
+                        max_session_seconds
+                        if max_session_seconds is not None
+                        else idle_recovery_defaults.max_session_seconds
+                    ),
                 )
             provider = CopilotProvider(
                 mcp_servers=mcp_servers,
@@ -334,6 +361,8 @@ class ProviderFactory:
         timeout = getattr(runtime_config, "timeout", None)
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
+        idle_timeout_seconds = getattr(runtime_config, "idle_timeout_seconds", None)
+        max_idle_recovery_attempts = getattr(runtime_config, "max_idle_recovery_attempts", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
         default_context_tier = getattr(runtime_config, "default_context_tier", None)
         tool_output = getattr(runtime_config, "tool_output", None)
@@ -349,6 +378,8 @@ class ProviderFactory:
             timeout=timeout,
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
+            idle_timeout_seconds=idle_timeout_seconds,
+            max_idle_recovery_attempts=max_idle_recovery_attempts,
             default_reasoning_effort=default_reasoning_effort,
             default_context_tier=default_context_tier,
             provider_settings=provider_settings,

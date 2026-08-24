@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A custom `base_url` requires an explicit `api_key`: an ambient `OPENAI_API_KEY`
   is never forwarded to a non-OpenAI endpoint.
 
+- **`runtime.idle_timeout_seconds` / `runtime.max_idle_recovery_attempts`**
+  (#488) — Copilot-only knobs to tune the idle watchdog for workflows with
+  legitimately long tool calls. `idle_timeout_seconds` sets the time without
+  SDK events before a session is treated as idle (default 90s);
+  `max_idle_recovery_attempts` caps the number of "please continue" prompts
+  sent before failing (default 5; `0` fails on the first genuine idle
+  without ever injecting a prompt). See `docs/configuration.md` and
+  `docs/workflow-syntax.md`.
+
 ### Changed
 
 - The Pydantic AI dependency was narrowed from the full `pydantic-ai` package to
@@ -34,6 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Copilot idle watchdog no longer fires during long-running tool
+  calls** (#488). The SDK emits no events between `tool.execution_start` and
+  `tool.execution_complete`, so a stale idle clock while a tool was still
+  executing was previously indistinguishable from a genuinely stuck
+  session — triggering a spurious "please continue" recovery prompt mid
+  tool-call. That prompt's conversational reply then overwrote the agent's
+  eventual structured output (`response_content` is last-message-wins),
+  turning a healthy run into a non-retryable failure. In-flight tool calls
+  (tracked by `tool_call_id`) now suppress idle recovery entirely while any
+  remain outstanding; `max_session_seconds` / `max_agent_iterations` remain
+  the backstop for a genuinely wedged tool. Recovery-prompt and
+  stuck-session messages also no longer misattribute the failure to a tool
+  that has already completed — `last_activity_ref`'s tool name is now
+  cleared (or rolled to another still-in-flight tool) on
+  `tool.execution_complete` instead of only ever being set.
 - Retry classification now covers the `ModelHTTPError` and `ModelAPIError` types
   pydantic-ai actually raises, so `408`, `429` and `5xx` responses are retried on
   the Claude provider as well as the new OpenAI one. Previously they were treated

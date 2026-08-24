@@ -3419,6 +3419,26 @@ class RuntimeConfig(BaseModel):
     (Claude: 50, Copilot: unlimited).
     """
 
+    idle_timeout_seconds: float | None = Field(None, ge=1.0)
+    """Time without SDK events before a Copilot session is treated as idle.
+
+    Copilot provider only; other providers ignore this field. Default is
+    None, which uses the provider's built-in default (90s). A session is
+    only considered idle when no SDK events at all have arrived within the
+    window — an in-flight tool call (between ``tool.execution_start`` and
+    ``tool.execution_complete``) suppresses the check entirely, since the
+    SDK emits no events while a tool is running.
+    """
+
+    max_idle_recovery_attempts: int | None = Field(None, ge=0)
+    """Maximum number of "please continue" prompts sent to an idle Copilot session.
+
+    Copilot provider only; other providers ignore this field. Default is
+    None, which uses the provider's built-in default (5). ``0`` means the
+    session fails on the first genuine idle timeout without ever injecting
+    a recovery prompt.
+    """
+
     default_reasoning_effort: ReasoningEffort | None = None
     """Workflow-wide default reasoning effort applied to provider-backed agents.
 

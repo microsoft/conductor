@@ -17,6 +17,8 @@ workflow:
     max_tokens: 4096
     default_reasoning_effort: medium  # low | medium | high | xhigh | max (optional)
     default_context_tier: default  # default | long_context (optional, Copilot only)
+    idle_timeout_seconds: 90  # Copilot only (optional)
+    max_idle_recovery_attempts: 5  # Copilot only (optional)
     # Provider-specific settings...
 ```
 
@@ -30,6 +32,16 @@ The `default_context_tier` field sets a workflow-wide default for the model's
 context-window tier that every provider-backed agent inherits unless it
 declares its own `context_tier` override. See [Context Tier](#context-tier)
 for details. This is a Copilot-only capability.
+
+The `idle_timeout_seconds` and `max_idle_recovery_attempts` fields tune the
+Copilot provider's idle watchdog: when a session stops emitting SDK events
+for `idle_timeout_seconds` (default 90s), Conductor sends a "please continue"
+recovery prompt, up to `max_idle_recovery_attempts` times (default 5) before
+failing the session. A tool call that is still executing suppresses the
+watchdog entirely — the SDK emits no events between the start and completion
+of a tool call, so a stale idle clock during a long-running tool means the
+tool is still running, not that the session is stuck. Both fields are
+Copilot-only; other providers ignore them.
 
 ## Provider Selection
 
@@ -47,6 +59,8 @@ workflow:
         command: npx
         args: ["-y", "open-websearch@latest"]
         tools: ["*"]
+    idle_timeout_seconds: 90
+    max_idle_recovery_attempts: 5
 ```
 
 **Features**:

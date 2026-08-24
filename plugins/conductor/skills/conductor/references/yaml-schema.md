@@ -35,6 +35,8 @@ workflow:
     timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
     max_agent_iterations: integer   # Max tool-use roundtrips per agent (1-500, optional)
     max_session_seconds: float      # Wall-clock timeout per agent session in seconds (optional)
+    idle_timeout_seconds: float     # Seconds without SDK events before session is idle (optional, Copilot only, default 90)
+    max_idle_recovery_attempts: integer # "please continue" prompts before failing idle session (optional, Copilot only, default 5)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh, max (optional)
     skills: [string]                # Skills enabled for every provider-backed agent (default: [])
                                     # Each entry is a built-in NAME or a filesystem PATH.

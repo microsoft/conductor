@@ -426,6 +426,62 @@ class TestMaxSessionSeconds:
         assert provider._idle_recovery_config.max_recovery_attempts == 5
         await provider.close()
 
+    @pytest.mark.asyncio
+    async def test_idle_timeout_seconds_alone_preserves_other_defaults(self) -> None:
+        """Setting only idle_timeout_seconds leaves the other two fields default."""
+        provider = await create_provider("copilot", validate=False, idle_timeout_seconds=45.0)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.idle_timeout_seconds == 45.0
+        assert provider._idle_recovery_config.max_recovery_attempts == 5
+        assert provider._idle_recovery_config.max_session_seconds == 1800.0
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_max_idle_recovery_attempts_alone_preserves_other_defaults(self) -> None:
+        """Setting only max_idle_recovery_attempts leaves the other two fields default."""
+        provider = await create_provider("copilot", validate=False, max_idle_recovery_attempts=2)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.max_recovery_attempts == 2
+        assert provider._idle_recovery_config.idle_timeout_seconds == 90.0
+        assert provider._idle_recovery_config.max_session_seconds == 1800.0
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_max_idle_recovery_attempts_zero_is_honored(self) -> None:
+        """0 means fail on first genuine idle without ever sending a recovery prompt."""
+        provider = await create_provider("copilot", validate=False, max_idle_recovery_attempts=0)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.max_recovery_attempts == 0
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_all_three_idle_recovery_fields_together(self) -> None:
+        """All three fields set together are all forwarded."""
+        provider = await create_provider(
+            "copilot",
+            validate=False,
+            max_session_seconds=60.0,
+            idle_timeout_seconds=15.0,
+            max_idle_recovery_attempts=3,
+        )
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.max_session_seconds == 60.0
+        assert provider._idle_recovery_config.idle_timeout_seconds == 15.0
+        assert provider._idle_recovery_config.max_recovery_attempts == 3
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_none_of_the_three_leaves_idle_recovery_config_at_provider_default(
+        self,
+    ) -> None:
+        """None of the three set leaves idle_recovery_config unset (provider builds its own)."""
+        provider = await create_provider("copilot", validate=False)
+        assert isinstance(provider, CopilotProvider)
+        assert provider._idle_recovery_config.idle_timeout_seconds == 90.0
+        assert provider._idle_recovery_config.max_recovery_attempts == 5
+        assert provider._idle_recovery_config.max_session_seconds == 1800.0
+        await provider.close()
+
 
 class TestClaudeAgentSdkFactoryRejections:
     """Factory rejects workflow features claude-agent-sdk does not honor (#241 / A2).

@@ -885,6 +885,67 @@ class TestRuntimeConfigMaxSessionSeconds:
         assert serialized["max_session_seconds"] == 90.0
 
 
+class TestRuntimeConfigIdleWatchdog:
+    """Tests for idle_timeout_seconds / max_idle_recovery_attempts on RuntimeConfig (#488)."""
+
+    def test_idle_timeout_seconds_defaults_to_none(self) -> None:
+        """Test that idle_timeout_seconds defaults to None (provider default applies)."""
+        config = RuntimeConfig()
+        assert config.idle_timeout_seconds is None
+
+    def test_idle_timeout_seconds_accepts_valid_value(self) -> None:
+        """Test that idle_timeout_seconds accepts a valid float value."""
+        config = RuntimeConfig(idle_timeout_seconds=45.0)
+        assert config.idle_timeout_seconds == 45.0
+
+    def test_idle_timeout_seconds_rejects_below_minimum(self) -> None:
+        """Test that idle_timeout_seconds rejects values below 1.0."""
+        with pytest.raises(ValidationError) as exc_info:
+            RuntimeConfig(idle_timeout_seconds=0.5)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_idle_timeout_seconds_rejects_zero(self) -> None:
+        """Test that idle_timeout_seconds rejects zero."""
+        with pytest.raises(ValidationError) as exc_info:
+            RuntimeConfig(idle_timeout_seconds=0)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_max_idle_recovery_attempts_defaults_to_none(self) -> None:
+        """Test that max_idle_recovery_attempts defaults to None (provider default applies)."""
+        config = RuntimeConfig()
+        assert config.max_idle_recovery_attempts is None
+
+    def test_max_idle_recovery_attempts_accepts_zero(self) -> None:
+        """Test that max_idle_recovery_attempts accepts 0 (fail on first idle timeout)."""
+        config = RuntimeConfig(max_idle_recovery_attempts=0)
+        assert config.max_idle_recovery_attempts == 0
+
+    def test_max_idle_recovery_attempts_accepts_positive_value(self) -> None:
+        """Test that max_idle_recovery_attempts accepts a positive int value."""
+        config = RuntimeConfig(max_idle_recovery_attempts=10)
+        assert config.max_idle_recovery_attempts == 10
+
+    def test_max_idle_recovery_attempts_rejects_negative(self) -> None:
+        """Test that max_idle_recovery_attempts rejects negative values."""
+        with pytest.raises(ValidationError) as exc_info:
+            RuntimeConfig(max_idle_recovery_attempts=-1)
+        assert "greater than or equal to 0" in str(exc_info.value)
+
+    def test_serialization_excludes_both_when_none(self) -> None:
+        """Test that both new fields are excluded from serialization when None."""
+        config = RuntimeConfig()
+        serialized = config.model_dump(exclude_none=True)
+        assert "idle_timeout_seconds" not in serialized
+        assert "max_idle_recovery_attempts" not in serialized
+
+    def test_serialization_includes_both_when_set(self) -> None:
+        """Test that both new fields are included in serialization when set."""
+        config = RuntimeConfig(idle_timeout_seconds=30.0, max_idle_recovery_attempts=1)
+        serialized = config.model_dump(exclude_none=True)
+        assert serialized["idle_timeout_seconds"] == 30.0
+        assert serialized["max_idle_recovery_attempts"] == 1
+
+
 class TestWorkflowDef:
     """Tests for WorkflowDef model."""
 

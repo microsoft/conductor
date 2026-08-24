@@ -153,7 +153,14 @@ class IdleRecoveryConfig:
 
     Attributes:
         idle_timeout_seconds: Time without any SDK events before considering session idle.
+            Settable via ``runtime.idle_timeout_seconds`` in workflow YAML (Copilot only).
+            The clock is suppressed entirely while a tool call is in flight (#488) — the
+            SDK emits no events between ``tool.execution_start`` and
+            ``tool.execution_complete``, so a stale clock there means the tool is still
+            running, not that the session is stuck.
         max_recovery_attempts: Maximum number of "continue" messages to send before failing.
+            Settable via ``runtime.max_idle_recovery_attempts`` in workflow YAML
+            (Copilot only).
         max_session_seconds: Hard wall-clock limit on total session duration. Prevents
             sessions from hanging indefinitely even if non-idle events keep flowing.
         recovery_prompt: Template for the recovery message sent to stuck sessions.
@@ -1573,6 +1580,13 @@ class CopilotProvider(AgentProvider):
         # Mutable container for tool iteration counting
         tool_iteration_ref: list[int] = [0]
 
+        # In-flight tool calls, keyed by tool_call_id (falling back to the
+        # tool name when no id is available). The SDK emits no events
+        # between tool.execution_start and tool.execution_complete, so a
+        # non-empty dict here means a tool is genuinely still running, not
+        # that the session is stuck (#488).
+        active_tools: dict[str, str] = {}
+
         def on_event(event: Any) -> None:
             nonlocal response_content, error_message
             event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
@@ -1654,6 +1668,26 @@ class CopilotProvider(AgentProvider):
                 last_activity_ref[1] = tool_name
                 # Count tool-use iterations
                 tool_iteration_ref[0] += 1
+                # Record the in-flight call so idle detection can tell "the
+                # tool is still running" from "the session is stuck" (#488).
+                # tool_call_id is a required field on real SDK events, but
+                # tests exercise this with Mock objects where getattr always
+                # succeeds without returning a string — guard with isinstance
+                # rather than trusting the attribute is present and usable.
+                tool_call_id = getattr(event.data, "tool_call_id", None)
+                key = tool_call_id if isinstance(tool_call_id, str) else str(tool_name)
+                active_tools[key] = str(tool_name)
+            elif event_type == "tool.execution_complete":
+                tool_call_id = getattr(event.data, "tool_call_id", None)
+                key = tool_call_id if isinstance(tool_call_id, str) else None
+                if key is not None and key in active_tools:
+                    active_tools.pop(key, None)
+                elif active_tools:
+                    # Unresolvable key (mismatched/mocked id) — pop the
+                    # oldest in-flight entry so the set can still drain.
+                    oldest_key = next(iter(active_tools))
+                    active_tools.pop(oldest_key, None)
+                last_activity_ref[1] = next(iter(active_tools.values()), None)
 
             # Forward structured events upstream via event_callback
             if event_callback is not None:
@@ -1686,6 +1720,7 @@ class CopilotProvider(AgentProvider):
             max_agent_iterations=max_agent_iterations,
             interrupt_signal=interrupt_signal,
             agent_name=agent_name,
+            active_tools_ref=active_tools,
         )
         if was_interrupted:
             # Return partial content (don't check error_message for partial)
@@ -2120,6 +2155,7 @@ class CopilotProvider(AgentProvider):
         elif last_event_type:
             activity_map = {
                 "tool.execution_start": "starting a tool call",
+                "tool.execution_complete": "finishing a tool call",
                 "assistant.reasoning": "reasoning about the problem",
                 "assistant.turn_start": "beginning a response",
                 "assistant.message": "sending a message",
@@ -2202,6 +2238,7 @@ class CopilotProvider(AgentProvider):
         max_agent_iterations: int | None = None,
         interrupt_signal: asyncio.Event | None = None,
         agent_name: str | None = None,
+        active_tools_ref: dict[str, str] | None = None,
     ) -> bool:
         """Wait for session completion with idle detection, recovery, and optional interrupt.
 
@@ -2209,8 +2246,12 @@ class CopilotProvider(AgentProvider):
         with interrupt support (aborting on user request). When the model is
         actively working (SDK events flowing), the idle timer continuously
         resets — so stuck-detection is suppressed while the model is actively
-        working. The interrupt signal, however, is always raced regardless of
-        activity.
+        working. It is also suppressed while any tool call is in flight
+        (``active_tools_ref`` non-empty): the SDK emits no events between
+        ``tool.execution_start`` and ``tool.execution_complete``, so a stale
+        idle clock during a long-running tool call means the tool is still
+        running, not that the session is stuck (#488). The interrupt signal,
+        however, is always raced regardless of activity.
 
         Args:
             done: Event that signals session completion.
@@ -2230,6 +2271,11 @@ class CopilotProvider(AgentProvider):
                 logging so that idle-recovery messages emitted from concurrent
                 for-each or parallel iterations can be attributed to a specific
                 agent. ``None`` means no attribution tag.
+            active_tools_ref: Mutable dict of in-flight tool calls (id -> tool
+                name). A non-empty dict suppresses idle recovery entirely,
+                since the SDK emits no events while a tool is executing.
+                ``None`` (the default) preserves the pre-#488 behaviour of
+                every existing caller.
 
         Returns:
             True if interrupted, False if completed normally.
@@ -2330,6 +2376,25 @@ class CopilotProvider(AgentProvider):
                     return False  # Completed successfully
 
             except TimeoutError as e:
+                # Timeout fired — but check if a tool call is still in
+                # flight first. The SDK emits no events between
+                # tool.execution_start and tool.execution_complete, so a
+                # stale idle clock here means the tool is still running
+                # (#488), not that the session is stuck. max_session_seconds
+                # / max_agent_iterations (checked at the top of this loop)
+                # remain the backstop for a genuinely wedged tool.
+                if active_tools_ref:
+                    logger.debug(
+                        "Idle timeout reached while tool(s) in flight%s: %s — suppressing "
+                        "idle recovery",
+                        f" agent={agent_name}" if agent_name else "",
+                        ", ".join(active_tools_ref.values()),
+                    )
+                    recovery_attempts = 0
+                    if not done.is_set():
+                        done.clear()
+                    continue
+
                 # Timeout fired — but check if events were recently received.
                 # The agent may be actively working (tool calls, reasoning) without
                 # having reached session.idle yet. Only consider it stuck if no

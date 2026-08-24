@@ -75,6 +75,14 @@ workflow:
                                       # its own `context_tier`.
                                       # See docs/configuration.md#context-tier.
 
+    idle_timeout_seconds: 90          # Optional: seconds without SDK events before a
+                                      # Copilot session is treated as idle (Copilot only).
+                                      # Default: 90. Suppressed entirely while a tool
+                                      # call is in flight.
+    max_idle_recovery_attempts: 5     # Optional: "please continue" prompts sent before
+                                      # failing an idle Copilot session (Copilot only).
+                                      # Default: 5. 0 means fail on first genuine idle.
+
     working_dir: "/path/to/cwd"       # Optional: global default working directory for LLM agents
                                       # and their MCP servers. Relative paths resolve against the
                                       # parent directory of the workflow YAML file.

@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import unittest.mock
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,6 +14,7 @@ from conductor.providers.copilot import (
     _IDLE_IGNORED_EVENTS,
     CopilotProvider,
     IdleRecoveryConfig,
+    RetryConfig,
 )
 
 
@@ -850,3 +852,289 @@ class TestPerAgentMaxSessionSeconds:
 
         # Should have sent at least one recovery message via idle detection
         assert mock_session.send.call_count >= 1
+
+
+class TestToolCallSuppression:
+    """Tests for #488: in-flight tool calls suppress idle recovery."""
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_while_tool_in_flight(self) -> None:
+        """A non-empty active_tools_ref suppresses idle recovery entirely.
+
+        The SDK emits no events between tool.execution_start and
+        tool.execution_complete, so a stale idle clock during a long-running
+        tool call must not trigger a recovery prompt.
+        """
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=2,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        # Deliberately stale — no activity update at all while the tool runs.
+        last_activity_ref: list[Any] = ["tool.execution_start", "read_agent", time.monotonic()]
+        active_tools_ref: dict[str, str] = {"call-1": "read_agent"}
+
+        async def finish_after_in_flight_window() -> None:
+            # Stay in-flight for several multiples of the idle timeout, then
+            # signal completion while still in-flight (a tool call can
+            # legitimately finish and emit session.idle without an explicit
+            # tool.execution_complete order dependency in this test).
+            await asyncio.sleep(0.05 * 4)
+            done.set()
+
+        await asyncio.gather(
+            provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                active_tools_ref=active_tools_ref,
+            ),
+            finish_after_in_flight_window(),
+        )
+
+        assert mock_session.send.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_recovery_fires_once_tool_dict_drains(self) -> None:
+        """Suppression is not a permanent disable — once the dict empties and
+        the clock is still stale, idle recovery resumes normally."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = ["tool.execution_start", "read_agent", time.monotonic()]
+        active_tools_ref: dict[str, str] = {"call-1": "read_agent"}
+
+        async def drain_then_wait_for_recovery() -> None:
+            # Let a couple of idle windows pass while suppressed.
+            await asyncio.sleep(0.05 * 2)
+            assert mock_session.send.call_count == 0
+            active_tools_ref.clear()
+            # Wait for a recovery attempt to actually fire, then finish.
+            while mock_session.send.call_count == 0:
+                await asyncio.sleep(0.01)
+            done.set()
+
+        await asyncio.gather(
+            provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                active_tools_ref=active_tools_ref,
+            ),
+            drain_then_wait_for_recovery(),
+        )
+
+        assert mock_session.send.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_max_session_seconds_still_raises_while_tool_in_flight(self) -> None:
+        """max_session_seconds remains the backstop even while a tool call
+        is in flight — the suppression only applies to idle recovery."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+            max_session_seconds=0.1,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()  # Never set
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = ["tool.execution_start", "read_agent", time.monotonic()]
+        active_tools_ref: dict[str, str] = {"call-1": "read_agent"}
+
+        with pytest.raises(ProviderError) as exc_info:
+            await provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                active_tools_ref=active_tools_ref,
+            )
+
+        assert "exceeded maximum duration" in str(exc_info.value)
+        # No idle-recovery prompts were sent — only the wall-clock cap fired.
+        assert mock_session.send.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_none_active_tools_ref_preserves_existing_behavior(self) -> None:
+        """active_tools_ref=None (the default) behaves exactly like before #488."""
+        config = IdleRecoveryConfig(
+            idle_timeout_seconds=0.05,
+            max_recovery_attempts=10,
+        )
+        provider = CopilotProvider(
+            mock_handler=stub_handler,
+            idle_recovery_config=config,
+        )
+
+        done = asyncio.Event()
+        mock_session = MagicMock()
+        mock_session.send = AsyncMock()
+
+        last_activity_ref: list[Any] = ["tool.execution_start", "read_agent", time.monotonic()]
+
+        async def finish_after_first_recovery() -> None:
+            while mock_session.send.call_count == 0:
+                await asyncio.sleep(0.01)
+            done.set()
+
+        await asyncio.gather(
+            provider._wait_with_idle_detection(
+                done=done,
+                session=mock_session,
+                verbose_enabled=False,
+                full_enabled=False,
+                last_activity_ref=last_activity_ref,
+                active_tools_ref=None,
+            ),
+            finish_after_first_recovery(),
+        )
+
+        assert mock_session.send.call_count >= 1
+
+
+class TestOnEventActiveTools:
+    """Tests for the on_event tracking of in-flight tool calls in _send_and_wait."""
+
+    @pytest.mark.asyncio
+    async def test_matching_start_and_complete_clears_last_tool_call(self) -> None:
+        """A tool.execution_start followed by its matching complete leaves
+        last_activity_ref[1] as None (no tool in flight)."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+        captured_active_tools: dict[str, dict[str, str]] = {}
+
+        start_ev = _Mock()
+        start_ev.type.value = "tool.execution_start"
+        start_ev.data.tool_name = "read_agent"
+        start_ev.data.tool_call_id = "call-1"
+
+        complete_ev = _Mock()
+        complete_ev.type.value = "tool.execution_complete"
+        complete_ev.data.tool_call_id = "call-1"
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (start_ev, complete_ev, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        # Patch _wait_with_idle_detection to capture active_tools_ref before
+        # returning, since _send_and_wait doesn't expose it directly.
+        original_wait = provider._wait_with_idle_detection
+
+        async def spy_wait(*args: Any, **kwargs: Any) -> Any:
+            captured_active_tools["snapshot"] = dict(kwargs.get("active_tools_ref") or {})
+            return await original_wait(*args, **kwargs)
+
+        with unittest.mock.patch.object(provider, "_wait_with_idle_detection", spy_wait):
+            await provider._send_and_wait(
+                session=session,
+                prompt="hello",
+                verbose_enabled=False,
+                full_enabled=False,
+            )
+
+        # By the time _wait_with_idle_detection was invoked, send() had
+        # already fired every event synchronously, so the dict is empty.
+        assert captured_active_tools["snapshot"] == {}
+
+    @pytest.mark.asyncio
+    async def test_second_tool_name_survives_first_complete(self) -> None:
+        """With two concurrent tool calls, completing one leaves the other's
+        name as last_activity_ref[1]."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        start_ev_1 = _Mock()
+        start_ev_1.type.value = "tool.execution_start"
+        start_ev_1.data.tool_name = "read_agent"
+        start_ev_1.data.tool_call_id = "call-1"
+
+        start_ev_2 = _Mock()
+        start_ev_2.type.value = "tool.execution_start"
+        start_ev_2.data.tool_name = "bash"
+        start_ev_2.data.tool_call_id = "call-2"
+
+        complete_ev_1 = _Mock()
+        complete_ev_1.type.value = "tool.execution_complete"
+        complete_ev_1.data.tool_call_id = "call-1"
+
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            callback = captured_cb[0]
+            for ev in (start_ev_1, start_ev_2, complete_ev_1):
+                callback(ev)
+            callback(idle_ev)
+
+        session.send = fake_send
+
+        original_wait = provider._wait_with_idle_detection
+        captured_ref: dict[str, Any] = {}
+
+        async def spy_wait(*args: Any, **kwargs: Any) -> Any:
+            captured_ref["last_activity_ref"] = kwargs.get("last_activity_ref") or (
+                args[4] if len(args) > 4 else None
+            )
+            return await original_wait(*args, **kwargs)
+
+        with unittest.mock.patch.object(provider, "_wait_with_idle_detection", spy_wait):
+            await provider._send_and_wait(
+                session=session,
+                prompt="hello",
+                verbose_enabled=False,
+                full_enabled=False,
+            )
+
+        last_activity_ref = captured_ref["last_activity_ref"]
+        assert last_activity_ref[1] == "bash"
