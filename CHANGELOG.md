@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.34...HEAD)
+
+## [0.1.34](https://github.com/microsoft/conductor/compare/v0.1.33...v0.1.34) - 2026-08-24
 
 ### Added
 
@@ -21,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A custom `base_url` requires an explicit `api_key`: an ambient `OPENAI_API_KEY`
   is never forwarded to a non-OpenAI endpoint.
+
+- **Fleet TUI launch directory** (#477) — `conductor fleet` can now start runs
+  in a directory other than the one it was itself launched from. `d` on the
+  Runs screen (or `ctrl+d` on New run) opens a directory picker; the chosen
+  directory is the base a relative workflow reference on the New Run screen
+  resolves against, and the working directory that a launched or resumed run's
+  detached child inherits. It is process-lifetime only — there is no
+  `config.toml` key and no state file, and it resets when `conductor fleet`
+  exits. It does not affect `runtime.working_dir` / `agent.working_dir`, and it
+  is not a filter: Runs and History still show the whole fleet. See
+  `docs/fleet.md`.
 
 - **`runtime.idle_timeout_seconds` / `runtime.max_idle_recovery_attempts`**
   (#488) — Copilot-only knobs to tune the idle watchdog for workflows with
@@ -87,6 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event into the input, silently replacing the prefilled launch directory
   with its parent before the user ever touched the tree. The mirror now
   fires only while the tree actually has focus.
+- **The Fleet Manager no longer loses data from large event logs** (#485).
+  The Runs, History, and run-detail screens read a run's JSONL event log
+  through three separate bounded windows — a 512 KiB tail, a 512 KiB head
+  recovery read, and an 8 MiB whole-log cap — that a long-lived or resumed run
+  outgrows. On a real 9.72 MB / 20,361-line log this lost the current step and
+  the token/cost totals, and a resumed run's second `workflow_started` fell
+  outside the head window, so the wrong workflow topology was reported. All
+  three windows are replaced by one streamed reader bounded only by the longest
+  individual line, and a resumed run's totals now accumulate across generations
+  while its status, gate, and topology reflect the current attempt. The Runs
+  screen's ~2s poll prefilters lines by event type before parsing them, so the
+  uncapped read is also faster than the capped one it replaces.
 - **A run record could silently fail to be removed on Windows** (#486).
   `remove_run_record` deleted a record with a single unretried `unlink`, and
   `remove_run_record_for_current_process` renamed it into a quarantine path
