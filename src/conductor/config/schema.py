@@ -3426,8 +3426,10 @@ class RuntimeConfig(BaseModel):
     None, which uses the provider's built-in default (90s). A session is
     only considered idle when no SDK events at all have arrived within the
     window — an in-flight tool call (between ``tool.execution_start`` and
-    ``tool.execution_complete``) suppresses the check entirely, since the
-    SDK emits no events while a tool is running.
+    ``tool.execution_complete``) suppresses the check entirely, since most
+    tools emit nothing during execution (see
+    ``IdleRecoveryConfig.idle_timeout_seconds`` in ``providers/copilot.py``
+    for the full rationale).
     """
 
     max_idle_recovery_attempts: int | None = Field(None, ge=0)

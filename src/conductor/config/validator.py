@@ -1821,6 +1821,8 @@ def _validate_provider_capabilities(
     # no matter where future call sites are added.
     runtime_default_effort = config.workflow.runtime.default_reasoning_effort
     runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
+    runtime_idle_timeout_seconds = config.workflow.runtime.idle_timeout_seconds
+    runtime_max_idle_recovery_attempts = config.workflow.runtime.max_idle_recovery_attempts
     runtime_working_dir = config.workflow.runtime.working_dir
     runtime_skills = config.workflow.runtime.skills
     skill_limits = config.workflow.runtime.skill_injection
@@ -2464,6 +2466,36 @@ def _validate_provider_capabilities(
                     f"agent(s): {sorted(agent_names)!r}. Override these agents "
                     f"to a timeout-aware provider, or remove the workflow-level "
                     f"max_session_seconds."
+                )
+
+    # ----- Workflow-level: idle_recovery tuning knobs -----
+    # runtime.idle_timeout_seconds / runtime.max_idle_recovery_attempts are
+    # Copilot-only tuning knobs (#488). Unlike max_session_seconds, these are
+    # not safety bounds — a provider that ignores them just runs its own
+    # idle-detection defaults (or none at all) rather than violating an
+    # operational guarantee — so a mismatch is a warning, not an error.
+    if runtime_idle_timeout_seconds is not None or runtime_max_idle_recovery_attempts is not None:
+        providers_using_idle_recovery: dict[str, list[str]] = {}
+        for agent in all_llm_agents:
+            pname = _resolved_provider_name(agent, default_provider)
+            providers_using_idle_recovery.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_using_idle_recovery.items():
+            pcaps = _caps_for(pname)
+            if pcaps is not None and not pcaps.idle_recovery:
+                set_fields = [
+                    name
+                    for name, value in (
+                        ("idle_timeout_seconds", runtime_idle_timeout_seconds),
+                        ("max_idle_recovery_attempts", runtime_max_idle_recovery_attempts),
+                    )
+                    if value is not None
+                ]
+                warnings.append(
+                    f"Workflow declares 'runtime.{'/'.join(set_fields)}' but provider "
+                    f"'{pname}' does not support idle-recovery tuning "
+                    f"(capabilities.idle_recovery=False) and is used by agent(s): "
+                    f"{sorted(agent_names)!r}. The setting will be silently ignored "
+                    f"for these agents."
                 )
 
     # ----- Workflow-level: working_dir -----

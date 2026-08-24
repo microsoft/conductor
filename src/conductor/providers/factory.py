@@ -120,30 +120,18 @@ async def create_provider(
 
     match provider_type:
         case "copilot":
-            idle_recovery_config = None
-            if (
-                max_session_seconds is not None
-                or idle_timeout_seconds is not None
-                or max_idle_recovery_attempts is not None
-            ):
-                idle_recovery_defaults = IdleRecoveryConfig()
-                idle_recovery_config = IdleRecoveryConfig(
-                    idle_timeout_seconds=(
-                        idle_timeout_seconds
-                        if idle_timeout_seconds is not None
-                        else idle_recovery_defaults.idle_timeout_seconds
-                    ),
-                    max_recovery_attempts=(
-                        max_idle_recovery_attempts
-                        if max_idle_recovery_attempts is not None
-                        else idle_recovery_defaults.max_recovery_attempts
-                    ),
-                    max_session_seconds=(
-                        max_session_seconds
-                        if max_session_seconds is not None
-                        else idle_recovery_defaults.max_session_seconds
-                    ),
+            idle_recovery_overrides: dict[str, Any] = {
+                k: v
+                for k, v in (
+                    ("idle_timeout_seconds", idle_timeout_seconds),
+                    ("max_recovery_attempts", max_idle_recovery_attempts),
+                    ("max_session_seconds", max_session_seconds),
                 )
+                if v is not None
+            }
+            idle_recovery_config = (
+                IdleRecoveryConfig(**idle_recovery_overrides) if idle_recovery_overrides else None
+            )
             provider = CopilotProvider(
                 mcp_servers=mcp_servers,
                 model=default_model,

@@ -192,6 +192,15 @@ class ProviderCapabilities(BaseModel):
     session_continuity: bool = False
     """``True`` when the provider supports per-agent ``session_key``."""
 
+    idle_recovery: bool = False
+    """``True`` when the provider honors ``runtime.idle_timeout_seconds`` /
+    ``runtime.max_idle_recovery_attempts`` (#488). These are Copilot-only
+    tuning knobs for its SDK-event-driven idle watchdog; other providers
+    have no equivalent mechanism and silently ignore both fields. Unlike
+    ``max_session_seconds``, this is a tuning knob rather than a safety
+    bound, so a mismatch is a validate-time **warning**, not an error.
+    Defaults to ``False``."""
+
     max_temperature: float | None = None
     """Highest temperature the provider accepts.
 
@@ -274,6 +283,8 @@ class ProviderCapabilities(BaseModel):
             items.append("no skills support")
         if not self.session_continuity:
             items.append("no session_key continuity")
+        if not self.idle_recovery:
+            items.append("idle_timeout_seconds/max_idle_recovery_attempts ignored")
         return items
 
 

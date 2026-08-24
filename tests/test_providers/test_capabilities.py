@@ -30,6 +30,7 @@ def _stable_capabilities(**overrides: object) -> ProviderCapabilities:
         "concurrent_safe": True,
         "skills": True,
         "session_continuity": True,
+        "idle_recovery": True,
         "upstream_pin": None,
         "maintainer": None,
     }

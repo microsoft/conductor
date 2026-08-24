@@ -38,10 +38,14 @@ Copilot provider's idle watchdog: when a session stops emitting SDK events
 for `idle_timeout_seconds` (default 90s), Conductor sends a "please continue"
 recovery prompt, up to `max_idle_recovery_attempts` times (default 5) before
 failing the session. A tool call that is still executing suppresses the
-watchdog entirely — the SDK emits no events between the start and completion
-of a tool call, so a stale idle clock during a long-running tool means the
-tool is still running, not that the session is stuck. Both fields are
-Copilot-only; other providers ignore them.
+watchdog — most tools emit nothing while running, so a stale idle clock
+during a long-running tool call usually means the tool is still running, not
+that the session is stuck. Suppression is bounded by `max_session_seconds`
+(default 1800s), which is still enforced while a tool is in flight and is the
+only limit that can end a genuinely hung tool call. Raise it alongside
+`idle_timeout_seconds` if your workflow has tool calls that legitimately run
+longer than 30 minutes. Both `idle_timeout_seconds` and
+`max_idle_recovery_attempts` are Copilot-only; other providers ignore them.
 
 ## Provider Selection
 

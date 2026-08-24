@@ -1141,6 +1141,55 @@ class TestWorkflowLevelMaxSessionSeconds:
         validate_workflow_config(config)
 
 
+class TestWorkflowLevelIdleRecovery:
+    """Workflow-level idle_timeout_seconds / max_idle_recovery_attempts (#488)."""
+
+    def test_idle_timeout_against_unsupported_provider_warns(self, patch_caps: Any) -> None:
+        """Unlike max_session_seconds, this is a tuning knob — a warning,
+        not an error."""
+        patch_caps({"copilot": _caps(idle_recovery=False)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", idle_timeout_seconds=30.0),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        warnings = validate_workflow_config(config)
+        assert any("idle_timeout_seconds" in w and "idle_recovery=False" in w for w in warnings)
+
+    def test_max_idle_recovery_attempts_against_unsupported_provider_warns(
+        self, patch_caps: Any
+    ) -> None:
+        patch_caps({"copilot": _caps(idle_recovery=False)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", max_idle_recovery_attempts=3),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        warnings = validate_workflow_config(config)
+        assert any(
+            "max_idle_recovery_attempts" in w and "idle_recovery=False" in w for w in warnings
+        )
+
+    def test_idle_timeout_with_supported_provider_no_warning(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(idle_recovery=True)})
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="copilot", idle_timeout_seconds=30.0),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+        warnings = validate_workflow_config(config)
+        assert not any("idle_recovery=False" in w for w in warnings)
+
+
 class TestForEachProviderRecorded:
     """ForEach inline agent providers appear in workflow_started.providers block (#241 gap)."""
 
