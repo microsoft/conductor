@@ -996,9 +996,7 @@ class TestDoctorMcpServeRendering:
                     )
                 ],
                 mode="direct",
-                failed_registries=[
-                    McpServeFailedRegistry(registry="broken", reason="unreachable")
-                ],
+                failed_registries=[McpServeFailedRegistry(registry="broken", reason="unreachable")],
             )
         )
         _patch_gather(monkeypatch, report)

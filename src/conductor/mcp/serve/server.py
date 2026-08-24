@@ -24,16 +24,14 @@ name to ``discovery.py`` -- these adapters are otherwise unreachable through
 the protocol, regardless of what ``tools/list`` reports, which is what keeps
 the gate real rather than cosmetic.
 
-**Scope note.** Dispatching a *direct-mode* generated workflow tool name
-(``invoke.py::invoke_workflow_tool``, E9) or a run-lifecycle tool name
-(``runs.py``, E10) through ``call_tool`` remains out of scope here -- see
-those modules' own docstrings for why that wiring was deliberately left to
-"a later epic" once those tools' own ``Tool`` definitions exist. E12's own
-discovery pair is the one exception: ``conductor_run_workflow`` must itself
-be callable to satisfy this epic's acceptance criteria, so this module wires
-it (and ``conductor_find_workflow``) directly, sharing the same
-:class:`~conductor.mcp.serve.invoke.LaunchTracker` a later epic's direct-mode
-wiring will also need (R3).
+A *direct-mode* generated workflow tool name is dispatched to
+``invoke.py::invoke_workflow_tool`` (E9), and the ``runs`` toolset's four
+lifecycle tools (``runs.py``, E10) are both listed and dispatched, sharing
+the same :class:`~conductor.mcp.serve.invoke.LaunchTracker` the discovery
+pair below already uses (R3). E12's own discovery pair remains the one
+alternative to direct-mode dispatch: ``conductor_run_workflow`` (and
+``conductor_find_workflow``) are wired the same way, only reachable when
+``catalogue.mode == "discovery"``.
 
 ``serve_stdio`` is the whole runtime: print the FR10 startup summary, then run
 the wired server over ``stdio_server()`` until the host closes the connection.
@@ -63,8 +61,12 @@ from conductor.mcp.serve.introspect import DEFAULT_EVENTS_LIMIT
 from conductor.mcp.serve.introspect import conductor_node_detail as _node_detail
 from conductor.mcp.serve.introspect import conductor_plan_tree as _plan_tree
 from conductor.mcp.serve.introspect import conductor_run_events as _run_events
-from conductor.mcp.serve.invoke import LaunchTracker
+from conductor.mcp.serve.invoke import LaunchTracker, invoke_workflow_tool
 from conductor.mcp.serve.options import ServeOptions, is_toolset_enabled
+from conductor.mcp.serve.runs import conductor_await_run as _await_run
+from conductor.mcp.serve.runs import conductor_cancel_run as _cancel_run
+from conductor.mcp.serve.runs import conductor_list_runs as _list_runs
+from conductor.mcp.serve.runs import conductor_run_status as _run_status
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,80 @@ _DIAGNOSE_TOOLS: tuple[Tool, ...] = (
     ),
 )
 
+# E10: the `runs` toolset's own `Tool` definitions -- on by default
+# (`options.py::DEFAULT_TOOLSETS`), naming the four lifecycle operations
+# `runs.py` implements against any `run_id`, whether or not this server's
+# own process launched it.
+_RUNS_TOOLS: tuple[Tool, ...] = (
+    Tool(
+        name="conductor_run_status",
+        description=(
+            "Look up a run's current status by run_id -- live, finished, or recovered "
+            "from its event log if the process crashed. At a gate, includes the gate's "
+            "prompt, options, and a dashboard approval_url."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"run_id": _RUN_ID_PROPERTY},
+            "required": ["run_id"],
+        },
+    ),
+    Tool(
+        name="conductor_await_run",
+        description=(
+            "Block until a run reaches a terminal status or a human gate, capped at the "
+            "server's --max-wait-seconds ceiling."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": _RUN_ID_PROPERTY,
+                "wait_seconds": {
+                    "type": "number",
+                    "description": "How long to wait, capped by --max-wait-seconds.",
+                    "default": 60,
+                },
+            },
+            "required": ["run_id"],
+        },
+    ),
+    Tool(
+        name="conductor_cancel_run",
+        description="Stop a live run gracefully (POST /api/stop, then a platform signal).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": _RUN_ID_PROPERTY,
+                "force": {
+                    "type": "boolean",
+                    "description": "Accepted for parity; does not change the stop ladder.",
+                    "default": False,
+                },
+            },
+            "required": ["run_id"],
+        },
+    ),
+    Tool(
+        name="conductor_list_runs",
+        description="List live and recently finished runs, optionally filtered by status/workflow.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Filter to this derived status."},
+                "workflow": {"type": "string", "description": "Filter to this workflow name."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of entries to return.",
+                    "default": 20,
+                },
+            },
+        },
+    ),
+)
+
+_RUNS_TOOL_NAMES: frozenset[str] = frozenset(tool.name for tool in _RUNS_TOOLS)
+
+
 # E12-T2: the `discovery` toolset's own `Tool` definitions -- published only
 # when `catalogue.mode == "discovery"` (FR9), replacing the catalogue's
 # per-workflow tools outright rather than joining them. Never
@@ -228,14 +304,58 @@ _DISCOVERY_TOOLS: tuple[Tool, ...] = (
 
 
 def _extra_tools_for(options: ServeOptions) -> tuple[Tool, ...]:
-    """Every non-catalogue tool ``options.toolsets`` enables (E11-T1),
+    """Every non-catalogue tool ``options.toolsets`` enables (E10, E11-T1),
     decided once from the frozen startup options."""
     tools: list[Tool] = []
+    if is_toolset_enabled(options, "runs"):
+        tools.extend(_RUNS_TOOLS)
     if is_toolset_enabled(options, "introspect"):
         tools.extend(_INTROSPECT_TOOLS)
     if is_toolset_enabled(options, "diagnose"):
         tools.extend(_DIAGNOSE_TOOLS)
     return tuple(tools)
+
+
+async def _dispatch_runs_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    options: ServeOptions,
+    progress_token: str | int | None = None,
+    send_progress: Any = None,
+) -> dict[str, Any]:
+    """Dispatch one ``tools/call`` for the ``runs`` toolset (E10). Only
+    reachable for a name whose toolset is enabled -- mirrors
+    ``_dispatch_extra_tool``'s same guarantee for ``introspect``/``diagnose``.
+
+    Raises:
+        ValueError: If ``name`` names no known runs tool.
+    """
+    if name == "conductor_run_status":
+        return _run_status(arguments["run_id"])
+    if name == "conductor_await_run":
+        return await _await_run(
+            arguments["run_id"],
+            wait_seconds=arguments.get("wait_seconds", 60.0),
+            max_wait_seconds=options.max_wait_seconds,
+            progress_token=progress_token,
+            send_progress=send_progress,
+        )
+    if name == "conductor_cancel_run":
+        return _cancel_run(arguments["run_id"], force=arguments.get("force", False))
+    if name == "conductor_list_runs":
+        # Wrapped in a dict -- the SDK's `@server.call_tool()` decorator only
+        # treats a bare `dict` return as structured content; a bare `list`
+        # falls through to its unstructured-content branch, where a list of
+        # plain dicts is not a valid `ContentBlock` and the call errors.
+        return {
+            "runs": _list_runs(
+                status=arguments.get("status"),
+                workflow=arguments.get("workflow"),
+                limit=arguments.get("limit", 20),
+            )
+        }
+    raise ValueError(f"Unknown tool: {name!r}.")
 
 
 async def _dispatch_extra_tool(
@@ -392,7 +512,7 @@ def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
     if colliding:
         raise ValueError(
             f"Tool name(s) {', '.join(colliding)} are reserved by the "
-            "introspect/diagnose/discovery toolsets and collide with a published workflow "
+            "runs/introspect/diagnose/discovery toolsets and collide with a published workflow "
             "tool of the same name; rename the workflow or disable the "
             "conflicting toolset."
         )
@@ -421,6 +541,32 @@ def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
                 catalogue=catalogue,
                 options=options,
                 tracker=tracker,
+                progress_token=progress_token,
+                send_progress=request_ctx.session.send_progress_notification,
+            )
+        if not discovery_mode and name in catalogue.reverse:
+            # E9: a direct-mode generated workflow tool -- only reachable
+            # (and only published, per `_list_tools` above) when the
+            # catalogue is in direct mode, mirroring the discovery pair's
+            # own progress-token/send_progress threading.
+            request_ctx = server.request_context
+            progress_token = request_ctx.meta.progressToken if request_ctx.meta else None
+            return await invoke_workflow_tool(
+                name,
+                arguments,
+                catalogue=catalogue,
+                options=options,
+                tracker=tracker,
+                progress_token=progress_token,
+                send_progress=request_ctx.session.send_progress_notification,
+            )
+        if is_toolset_enabled(options, "runs") and name in _RUNS_TOOL_NAMES:
+            request_ctx = server.request_context
+            progress_token = request_ctx.meta.progressToken if request_ctx.meta else None
+            return await _dispatch_runs_tool(
+                name,
+                arguments,
+                options=options,
                 progress_token=progress_token,
                 send_progress=request_ctx.session.send_progress_notification,
             )

@@ -260,9 +260,11 @@ The first phase with an observable end-to-end result.
       instead of per-workflow tools, decided at startup and logged (FR9, DD3).
 - [x] `conductor doctor` reports what a server *would* expose without a host
       attached (Impact Analysis → Operational).
-- [ ] `docs/mcp-server.md` exists, `docs/mcp-tools.md` disambiguates client
+- [x] `docs/mcp-server.md` exists, `docs/mcp-tools.md` disambiguates client
       from server, `AGENTS.md` documents the new package and CLI group.
-- [ ] `make check && make test` green; `make validate-examples` green.
+- [x] `make check && make test` green; `make validate-examples` green (one
+      pre-existing, environment-dependent test failure unrelated to this
+      epic's doc-only changes — see E14-T6).
 
 ---
 
@@ -806,6 +808,8 @@ presents as "the tools aren't there".
 
 ### E14 — Documentation and release (G1, FR10, Impact Analysis, R1)
 
+**Status: DONE**
+
 **Goal.** Make the feature discoverable and its boundaries explicit — including
 the ones that are deliberate (no log contents, no auto-skipped gates, no
 `outputSchema`) and the one user-facing contract change R1 accepts.
@@ -814,18 +818,18 @@ the ones that are deliberate (no log contents, no auto-skipped gates, no
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E14-T1 | IMPL | `docs/mcp-server.md`: host configuration snippets for Claude Code / VS Code / Cursor, the exposure ladder and its precedence, toolsets, the `mcp:` block, the run lifecycle, and an explicit *Limits* section covering DD5 (no `outputSchema`), DD11 (a gate parks indefinitely), DD12 (links not contents), R4 (tool payloads withheld unless `--introspect-full`), and DD9 (stdio only). | `docs/mcp-server.md` | TO DO |
-| E14-T2 | IMPL | Disambiguate client from server at the top of the existing MCP page and cross-link both ways — `docs/mcp-tools.md` is about Conductor *calling* MCP tools, which is the mirror image of this feature. | `docs/mcp-tools.md` | TO DO |
-| E14-T3 | IMPL | CLI reference entry for `conductor mcp serve`: every flag (including `--max-concurrent-runs` and `--introspect-full`), the environment it inherits, and the note that its summary goes to stderr because stdout is the protocol. | `docs/cli-reference.md` | TO DO |
-| E14-T4 | IMPL | `AGENTS.md`: the `mcp/serve/` package and `cli/mcp.py` in the architecture section; the terminal record under `fleet/`; **R1's** scope change to `conductor status` / `fleet list` / History; the `mcp:` block under Key Patterns; and `tests/test_mcp/` in the test-structure list. | `AGENTS.md` | TO DO |
-| E14-T5 | IMPL | Changelog entries for the terminal record, the completed-run surfacing (called out as a contract change, per R1), the `mcp:` block, and the server. | `CHANGELOG.md` | TO DO |
-| E14-T6 | TEST | `make check`, `make test`, and `make validate-examples` all green, including the new `examples/mcp-serve.yaml`. | — | TO DO |
+| E14-T1 | IMPL | `docs/mcp-server.md`: host configuration snippets for Claude Code / VS Code / Cursor, the exposure ladder and its precedence, toolsets, the `mcp:` block, the run lifecycle, and an explicit *Limits* section covering DD5 (no `outputSchema`), DD11 (a gate parks indefinitely), DD12 (links not contents), R4 (tool payloads withheld unless `--introspect-full`), and DD9 (stdio only). | `docs/mcp-server.md` | DONE |
+| E14-T2 | IMPL | Disambiguate client from server at the top of the existing MCP page and cross-link both ways — `docs/mcp-tools.md` is about Conductor *calling* MCP tools, which is the mirror image of this feature. | `docs/mcp-tools.md` | DONE |
+| E14-T3 | IMPL | CLI reference entry for `conductor mcp serve`: every flag (including `--max-concurrent-runs` and `--introspect-full`), the environment it inherits, and the note that its summary goes to stderr because stdout is the protocol. | `docs/cli-reference.md` | DONE |
+| E14-T4 | IMPL | `AGENTS.md`: the `mcp/serve/` package and `cli/mcp.py` in the architecture section; the terminal record under `fleet/`; **R1's** scope change to `conductor status` / `fleet list` / History; the `mcp:` block under Key Patterns; and `tests/test_mcp/` in the test-structure list. | `AGENTS.md` | DONE |
+| E14-T5 | IMPL | Changelog entries for the terminal record, the completed-run surfacing (called out as a contract change, per R1), the `mcp:` block, and the server. | `CHANGELOG.md` | DONE |
+| E14-T6 | TEST | `make check`, `make test`, and `make validate-examples` all green, including the new `examples/mcp-serve.yaml`. | — | DONE (`make check` and `make validate-examples` green; `make test` is green except one pre-existing, environment-dependent failure — `tests/test_engine/test_event_log.py::test_filenames_unique_for_simultaneous_starts` — reproduced unchanged on the pre-E14 commit, unrelated to this epic's doc-only changes) |
 
 **Acceptance criteria**
-- [ ] A user who has run `conductor registry add` can follow the docs to a working server with no workflow edits (G1).
-- [ ] Every deliberate limitation is documented as a limitation, not omitted.
-- [ ] The `status` / `fleet list` scope change is documented where a user upgrading will see it.
-- [ ] Full check and test suites pass.
+- [x] A user who has run `conductor registry add` can follow the docs to a working server with no workflow edits (G1).
+- [x] Every deliberate limitation is documented as a limitation, not omitted.
+- [x] The `status` / `fleet list` scope change is documented where a user upgrading will see it.
+- [x] Full check and test suites pass (with one pre-existing, unrelated failure noted in E14-T6).
 
 ---
 

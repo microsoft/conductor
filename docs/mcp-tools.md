@@ -4,6 +4,11 @@ Conductor supports [Model Context Protocol (MCP)](https://modelcontextprotocol.i
 
 MCP servers are configured at the workflow level and made available to all agents. Each agent can optionally filter which tools it uses.
 
+> **This page is about Conductor *calling* MCP tools.** For the mirror
+> image — Conductor *being* an MCP server, exposing your workflows as
+> tools to Claude Code, VS Code, Cursor, or any other MCP host — see
+> [MCP Server](mcp-server.md).
+
 ## Quick Start
 
 Add an MCP server to your workflow's `runtime` section:
@@ -435,6 +440,8 @@ agents:
 
 ## See Also
 
+- [MCP Server](mcp-server.md) — the mirror image: exposing Conductor
+  workflows as MCP tools via `conductor mcp serve`
 - [Workflow Syntax Reference](workflow-syntax.md) — agent `tools` field
 - [Configuration Guide](configuration.md) — runtime configuration
 - [Provider Comparison](providers/comparison.md) — feature comparison

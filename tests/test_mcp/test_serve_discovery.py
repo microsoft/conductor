@@ -12,6 +12,7 @@ names the exposed count and the configured threshold (FR10).
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import textwrap
 from pathlib import Path
@@ -423,7 +424,7 @@ class TestModeGatesTheToolList:
         self, tmp_path: Path
     ) -> None:
         catalogue, options, _ = _over_cap_catalogue(tmp_path)
-        server = build_server(catalogue, options)
+        server = build_server(catalogue, dataclasses.replace(options, toolsets=("workflows",)))
 
         async with create_connected_server_and_client_session(server) as client:
             result = await client.list_tools()
@@ -439,7 +440,7 @@ class TestModeGatesTheToolList:
     ) -> None:
         catalogue, _ = _two_tool_catalogue(tmp_path)
         assert catalogue.mode == "direct"
-        server = build_server(catalogue, ServeOptions())
+        server = build_server(catalogue, ServeOptions(toolsets=("workflows",)))
 
         async with create_connected_server_and_client_session(server) as client:
             result = await client.list_tools()

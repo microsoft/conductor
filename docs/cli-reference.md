@@ -17,6 +17,7 @@ Complete command-line reference for Conductor.
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
+- [`conductor mcp serve`](#conductor-mcp-serve)
 - [Deprecated command aliases](#deprecated-command-aliases)
 
 ## Root-Level Options
@@ -1152,6 +1153,71 @@ that includes one.
 
 See [design/registry.md](./design/registry.md) for the full design.
 
+## `conductor mcp serve`
+
+Start an [MCP](https://modelcontextprotocol.io/) server over stdio,
+exposing every workflow in every configured registry as a callable tool.
+See [`docs/mcp-server.md`](mcp-server.md) for the full guide — host
+configuration snippets, the exposure ladder, toolsets, the `mcp:` block,
+and the run lifecycle. This section is the flag reference.
+
+```bash
+conductor mcp serve [OPTIONS]
+```
+
+The tool list is fixed at startup and never varies across calls or
+connections. Nothing but JSON-RPC reaches stdout — the server's one
+operator-facing channel is **stderr**, where it prints a startup summary
+(exposed count, direct-vs-discovery mode, every tool's source registry
+and pinned identity, every degraded schema, and every name collision it
+qualified) and logs anomalies at warning level, since a stdio server has
+no console of its own and hosts surface stderr in their own MCP logs.
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--registry` | every configured registry | Glob pattern selecting which configured registries to expose (repeatable). |
+| `--allow` | none | Glob pattern for the allow-list rung of the exposure ladder (repeatable). A match overrides a workflow's own `mcp.expose: false`. |
+| `--deny` | none | Glob pattern for the deny rung of the exposure ladder (repeatable) — the highest-precedence rung; a match excludes a workflow unconditionally. |
+| `--workflow-dir` | none | Local directory whose workflow files are exposed in addition to (or instead of) any registry (repeatable, non-recursive). |
+| `--toolsets` | `workflows`, `runs` | Toolset names to enable: `workflows`, `runs`, `introspect`, `diagnose` (repeatable). `introspect`/`diagnose` add zero tools unless named explicitly. |
+| `--max-direct-tools` | `25` | Above this many exposed workflows, serve the two-tool discovery pair instead of one tool per workflow. |
+| `--max-wait-seconds` | `300` | Hard ceiling, in seconds, on how long a blocking tool call (`_wait_seconds`, or `conductor_await_run`) may wait for a terminal run state. |
+| `--tool-prefix` | none | Optional prefix prepended to every generated workflow tool name. |
+| `--max-concurrent-runs` | `0` (unbounded) | Bound how many runs launched by *this server process* may be live at once. Over the cap, a launch is rejected with an instructive message, never queued. Restarting the server resets the count. |
+| `--introspect-full` | `False` | Restore full tool-call arguments and results on `conductor_run_events` instead of the default `{name, status, byte_size}` reduction. Has no effect unless the `introspect` toolset is also enabled. |
+
+### Environment
+
+The server itself reads no MCP-specific environment variables. It inherits
+the **full process environment** it was started with (provider
+credentials such as `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`, `CONDUCTOR_HOME`,
+`CONDUCTOR_LOG_LEVEL`, etc.) and passes that same environment through to
+every workflow it launches — exactly as `conductor run --web-bg` already
+does, since every invocation forks a detached `conductor run` child. Set
+credentials in the environment your MCP host spawns `conductor mcp serve`
+in, the same way you would for any other `conductor run`.
+
+### Examples
+
+```bash
+# Expose every workflow in every configured registry
+conductor mcp serve
+
+# Narrow to one registry, then further to a naming convention
+conductor mcp serve --registry official --allow 'release-*'
+
+# Expose a local directory of workflows instead of (or alongside) a registry
+conductor mcp serve --workflow-dir ./workflows --max-direct-tools 10
+
+# Enable failure-diagnosis tools, and see full tool call payloads in them
+conductor mcp serve --toolsets workflows --toolsets runs --toolsets introspect --toolsets diagnose --introspect-full
+
+# Prefix generated tool names and bound concurrent launches
+conductor mcp serve --tool-prefix conductor_ --max-concurrent-runs 5
+```
+
 ## Deprecated command aliases
 
 The command surface groups related subcommands under nouns (`checkpoint`,
@@ -1191,6 +1257,7 @@ are hidden from `--help` and are slated for removal in a future release.
 ## See Also
 
 - [Fleet Manager](./fleet.md) - The `conductor fleet` TUI: screens, key bindings, gate resolvability, retention
+- [MCP Server](./mcp-server.md) - Exposing workflows as MCP tools via `conductor mcp serve`
 - [Workflow Syntax Reference](./workflow-syntax.md) - Complete YAML syntax
 - [Examples](../examples/) - Example workflows
 - [Providers](./providers/) - Provider-specific documentation

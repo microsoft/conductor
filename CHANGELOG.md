@@ -92,6 +92,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema, factory, registry and diagnostics. Workflows that named it now fail at
   schema load time rather than at the first agent execution.
 
+### Added
+
+- **`conductor mcp serve`** (#432) — exposes your registered Conductor
+  workflows as [MCP](https://modelcontextprotocol.io/) tools to any
+  MCP-compatible host (Claude Code, VS Code, Cursor, etc.) over stdio,
+  with no workflow edits required: every workflow in every configured
+  registry is exposed by default, with a typed `inputSchema` derived from
+  its own `input:` block. A tool call always forks a real detached
+  `conductor run` — the server never executes a workflow in-process —
+  waiting up to a bounded per-call timeout (`_wait_seconds`, capped by
+  `--max-wait-seconds`) before returning: a run that has not completed
+  (immediate, at-gate, failed, or timed-out) returns a handle with the
+  dashboard `url` and `run_id`; a run that completes within the wait
+  returns its output inline, or — once serialized `output:` exceeds 50 KB
+  — spilled to a file with a `resource_link` and no dashboard `url`. New
+  `conductor_run_status` / `conductor_await_run` / `conductor_cancel_run`
+  / `conductor_list_runs` tools answer for a `run_id` before, during, at a
+  human gate, and after a run has finished — the human gate is never
+  auto-skipped; a run that reaches one parks and reports its dashboard
+  approval URL until a person resolves it. Optional `introspect`/`diagnose`
+  toolsets (off by default; enable with `--toolsets`) add event-query,
+  per-step detail, `conductor doctor`/`conductor validate` equivalents, and
+  links (never file contents) to a run's raw logs. `--allow`/`--deny`
+  narrow or force the exposed set; a registry above `--max-direct-tools`
+  (default 25) degrades to a two-tool discovery pair instead of failing or
+  overflowing a host's tool-count limit. See
+  [`docs/mcp-server.md`](docs/mcp-server.md) for the full guide, including
+  a dedicated *Limits* section for what this release deliberately does not
+  do (no `outputSchema`, no Streamable HTTP transport, tool call payloads
+  withheld unless `--introspect-full`).
+- **`workflow.mcp:` block** — per-workflow configuration read by
+  `conductor mcp serve` to decide how a workflow is exposed as an MCP
+  tool: `expose` (default `true`), `mode` (`async`/`sync`/`auto`),
+  `read_only`, `destructive`, and `estimated_minutes`. Every field
+  defaults to the value that keeps an existing workflow with no `mcp:`
+  block at all exposed identically to one that declares the defaults
+  explicitly, so no existing workflow needs editing. An unknown key
+  inside the block is a `conductor validate` schema error, not a silently
+  ignored typo. See `examples/mcp-serve.yaml`.
+
 ### Changed
 
 - **`conductor status` and `conductor fleet list` now also list
