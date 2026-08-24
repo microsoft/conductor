@@ -738,13 +738,22 @@ class DirectoryPickerModal(ModalScreen[Path | None]):
     binding that cancels. Two controls that stay in sync -- typing (or
     editing) a path in ``Input#dir-path``, pre-filled with the current
     launch directory and focused on mount, or browsing
-    ``DirectoryTree#dir-tree`` -- but exactly **one** way to accept: pressing
-    Enter in the input. The tree's highlighted node is mirrored into the
-    input, but only *while the tree has focus* -- rather than accepted
-    directly, so the input stays the single source of truth for what Enter
-    will submit. Textual posts a ``NodeHighlighted`` for the tree's own root
-    as soon as the background ``DirectoryTree`` load lands, with no user
-    involved; without the focus gate that automatic highlight overwrote the
+    ``DirectoryTree#dir-tree``. There are two ways to accept: pressing
+    Enter in the input, or pressing Enter or clicking a node in the tree --
+    a single click on a node's label runs ``Tree.select_cursor``, which
+    Textual turns into a ``NodeSelected`` -> ``DirectoryTree
+    .DirectorySelected`` that this modal accepts directly (see
+    ``on_directory_tree_directory_selected``). The tree's *highlighted*
+    node (moving the cursor, distinct from selecting it) is separately
+    mirrored into the input, but only *while the tree has focus* -- so
+    browsing without selecting keeps the input showing what a subsequent
+    Enter-in-the-input would submit. Textual posts a ``NodeHighlighted``
+    for the tree's own root at *mount*, with no user interaction at all --
+    reactive initialisation runs ``Tree.watch_show_root``, which assigns
+    ``cursor_line = -1``; ``validate_cursor_line`` clamps it to ``0``;
+    ``watch_cursor_line`` then posts ``NodeHighlighted`` for line 0. This is
+    plain ``Tree`` behaviour, independent of ``DirectoryTree``'s directory
+    load; without the focus gate that automatic highlight overwrote the
     prefilled launch directory with its *parent* (issue #486).
 
     A bad path -- one that does not exist, or names a file rather than a
@@ -835,25 +844,32 @@ class DirectoryPickerModal(ModalScreen[Path | None]):
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted[DirEntry]) -> None:
         """Mirror the highlighted tree node's path into the input.
 
-        The input remains the single source of truth for what Enter
-        accepts -- the tree is a browsing aid, not a second accept path.
+        Highlighting (moving the cursor) is distinct from selecting: a
+        single click, or Enter, on a tree node fires ``NodeSelected`` and
+        accepts that directory directly via
+        ``on_directory_tree_directory_selected`` -- that is a second accept
+        path, not merely a browsing aid. This handler only mirrors the
+        *highlighted* node so the input reflects what browsing (without
+        selecting) would submit if Enter were pressed in the input instead.
 
         Gated on the tree actually having focus (issue #486): Textual posts
-        a ``NodeHighlighted`` for the tree's own root as soon as the
-        background ``DirectoryTree`` load lands (``Tree.watch_cursor_line``),
-        with no user interaction at all, and that root already carries a
-        ``DirEntry`` from construction -- so an ungated mirror silently
-        replaced the prefilled launch directory with its *parent* before the
-        user ever touched the tree. Focus is the actual discriminator
-        between "the tree loaded" and "the user browsed it": the input is
-        focused on mount, so the automatic highlight is ignored, while both
-        mouse clicks and keyboard navigation into the tree focus it first
-        (``Screen._forward_event`` focuses on ``MouseDown`` before delivery;
-        ``Tree`` is ``can_focus=True``), so genuine browsing still mirrors.
-        Do not narrow this to "ignore only the root node" -- that would also
-        ignore a genuine keyboard highlight of the root and would not
-        generalise to any other automatically-highlighted node (e.g. a
-        lazily-loaded subdirectory).
+        a ``NodeHighlighted`` for the tree's own root at *mount*, with no
+        user interaction at all -- reactive initialisation runs
+        ``Tree.watch_show_root``, which assigns ``cursor_line = -1``;
+        ``validate_cursor_line`` clamps it to ``0``; ``watch_cursor_line``
+        then posts ``NodeHighlighted`` for line 0. This is plain ``Tree``
+        behaviour, independent of ``DirectoryTree``'s directory load, and
+        the root already carries a ``DirEntry`` from construction -- so an
+        ungated mirror silently replaced the prefilled launch directory
+        with its *parent* before the user ever touched the tree. Focus is
+        the actual discriminator between "the tree loaded" and "the user
+        browsed it": the input is focused on mount, so the automatic
+        highlight is ignored, while both mouse clicks and keyboard
+        navigation into the tree focus it first (``Screen._forward_event``
+        focuses on ``MouseDown`` before delivery; ``Tree`` is
+        ``can_focus=True``), so genuine browsing still mirrors. Do not
+        narrow this to "ignore only the root node" -- that would also
+        ignore a genuine keyboard highlight of the root.
         """
         if not event.node.tree.has_focus:
             return
@@ -862,7 +878,10 @@ class DirectoryPickerModal(ModalScreen[Path | None]):
             self.query_one("#dir-path", Input).value = str(data.path)
 
     def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
-        """Double-click / Enter-on-the-tree accepts that directory directly."""
+        """A single click on a tree node's label, or Enter while the tree is
+        focused, accepts that directory directly (``Tree._on_click`` ->
+        ``select_cursor`` -> ``NodeSelected`` -> ``DirectoryTree
+        .DirectorySelected``)."""
         self._accept(str(event.path))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:

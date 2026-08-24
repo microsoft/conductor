@@ -316,7 +316,8 @@ browse a tree rooted at the current directory's parent (so a sibling
 checkout is one keypress away) — and sets the TUI's **launch directory**
 for the rest of this `conductor fleet` session. The input is pre-filled
 with the current launch directory; browsing the tree updates it as you go,
-but pressing Enter in the input is what actually accepts a directory.
+and either pressing Enter in the input, or pressing Enter or clicking a
+directory in the tree, accepts it.
 
 The launch directory affects two things:
 

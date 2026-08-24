@@ -1475,10 +1475,9 @@ class TestDirectoryPickerModal:
     async def test_prefilled_input_survives_the_tree_loading(
         self, fleet_env: Path, tmp_path: Path
     ) -> None:
-        """The real-world reproduction of issue #486: wait for the
-        background ``DirectoryTree`` load to actually land (rather than
-        posting the message synthetically, as the two tests above do) and
-        confirm the prefilled launch directory is still there afterwards."""
+        """Give the tree's root a child so this exercises a realistic load
+        rather than an empty directory; the automatic root highlight fires
+        either way."""
         from textual.widgets import Input, Tree
 
         # `current`'s parent must have children for the tree (rooted at the

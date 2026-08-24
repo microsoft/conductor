@@ -54,7 +54,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, cast, get_args
+from typing import Any, Final, Literal, cast, get_args
 
 from conductor.cli import pid as cli_pid
 from conductor.run_id import RUN_ID_PATTERN_SOURCE
@@ -77,7 +77,7 @@ _VALID_MODES: frozenset[str] = frozenset(get_args(RunMode))
 # short: the contended window is a single small-file read, and a genuine
 # permission problem must still surface rather than being hidden behind a
 # long stall.
-_SHARING_VIOLATION_RETRIES = 10
+_SHARING_VIOLATION_RETRIES: Final[int] = 10
 _SHARING_VIOLATION_RETRY_DELAY_SECONDS = 0.02
 
 # The path-safe run-id contract itself now lives in ``conductor.run_id`` (the
@@ -435,20 +435,24 @@ def run_records_dir() -> Path:
 def _retry_on_windows_sharing_violation(op: Callable[[], None]) -> None:
     """Run ``op``, retrying briefly on Windows if it raises ``PermissionError``.
 
-    CPython opens files without ``FILE_SHARE_DELETE``, so on Windows a
-    concurrent reader — ``conductor status``, ``fleet list``, the TUI's ~2s
-    poll, or the ``--web-bg`` launch gate — makes ``os.replace``/``os.unlink``/
-    ``os.rename`` on that same file fail with ``PermissionError``
-    (``ERROR_ACCESS_DENIED``/``ERROR_SHARING_VIOLATION``). POSIX ``rename``/
-    ``unlink`` are unaffected by a concurrent reader and never fail this way.
+    On Windows, a concurrent reader — ``conductor status``, ``fleet list``,
+    the TUI's ~2s poll, or the ``--web-bg`` launch gate — can make
+    ``os.replace``/``os.unlink``/``os.rename`` fail with ``PermissionError``
+    (``ERROR_ACCESS_DENIED``/``ERROR_SHARING_VIOLATION``): ``os.replace``
+    contends on its *destination* (the file being written), while
+    ``os.unlink``/``os.rename`` contend on their *source* (the file being
+    read). CPython opening files without ``FILE_SHARE_DELETE`` is one
+    contributor; antivirus and indexer handles routinely hold the same kind
+    of lock. POSIX ``rename``/``unlink`` are unaffected by a concurrent
+    reader and never fail this way.
 
     ``op`` is called with no arguments and is expected to raise on failure
     (never return a status code) -- callers close over whatever arguments
     the real syscall needs.
 
     ``FileNotFoundError`` is deliberately *not* retried: it means the target
-    is already gone, which is the common case and must not cost a 200ms
-    stall on every "already gone" call site.
+    is already gone, which is the common case and must not cost a stall on
+    every "already gone" call site.
 
     On non-Windows platforms this is a plain passthrough -- ``op()`` runs
     once, with no retry loop and no ``time.sleep`` overhead.
@@ -458,9 +462,13 @@ def _retry_on_windows_sharing_violation(op: Callable[[], None]) -> None:
             Raises on failure; returns nothing meaningful on success.
 
     Raises:
-        PermissionError: If every retry attempt still raised it (Windows),
-            or if the platform's own single attempt raised it (POSIX).
-        OSError: Any other filesystem error from ``op``, unretried.
+        PermissionError: On Windows, if every attempt in the retry budget
+            raised it. On other platforms, if the single call to ``op``
+            raised it.
+        BaseException: Anything else ``op`` raises propagates unchanged and
+            unretried -- only ``PermissionError``, and only on Windows, is
+            retried. ``FileNotFoundError`` in particular surfaces
+            immediately.
     """
     if sys.platform != "win32":
         op()
@@ -470,10 +478,20 @@ def _retry_on_windows_sharing_violation(op: Callable[[], None]) -> None:
         try:
             op()
             return
+        # Deliberately NOT `except OSError`: `FileNotFoundError` must fall
+        # straight through unretried (see the docstring above).
         except PermissionError:
             if attempt == _SHARING_VIOLATION_RETRIES - 1:
                 raise
             time.sleep(_SHARING_VIOLATION_RETRY_DELAY_SECONDS)
+
+    # Unreachable when `_SHARING_VIOLATION_RETRIES >= 1`: the last loop
+    # iteration either returns (success) or raises (final failure). Guards
+    # against a mistuned (or test-patched) constant silently reporting
+    # success without ever calling `op` -- see the docstring's `Raises:`.
+    raise AssertionError(
+        f"_SHARING_VIOLATION_RETRIES must be >= 1, got {_SHARING_VIOLATION_RETRIES}"
+    )
 
 
 def _replace_with_retry(tmp_name: str, filepath: Path) -> None:
@@ -537,10 +555,10 @@ def _safe_unlink(f: Path) -> bool:
     On Windows, a bounded retry (:func:`_retry_on_windows_sharing_violation`)
     absorbs a transient sharing violation from a concurrent reader (e.g.
     ``conductor status``, ``fleet list``, the TUI's ~2s poll) before giving
-    up. Uses ``os.unlink`` rather than ``Path.unlink`` -- semantically
-    identical, but it makes the operation patchable as ``records.os.unlink``,
-    the same seam the existing Windows-retry tests already patch on
-    ``records.os.replace``.
+    up. Uses ``os.unlink`` rather than ``Path.unlink()`` for symmetry with
+    the other two operations routed through the same helper (``os.replace``
+    on write, ``os.rename`` into quarantine); the two are otherwise
+    equivalent.
 
     Args:
         f: Path to delete.
@@ -558,8 +576,13 @@ def _safe_unlink(f: Path) -> bool:
         _retry_on_windows_sharing_violation(lambda: os.unlink(f))
     except FileNotFoundError:
         return False
-    except OSError:
-        logger.warning("Could not remove run record file: %s", f, exc_info=True)
+    except OSError as e:
+        logger.warning(
+            "Could not remove run record file %s (%s); it will be retried on the "
+            "next scan and may linger in `conductor status` / `fleet list`",
+            f,
+            e,
+        )
         return False
     return True
 
@@ -581,8 +604,9 @@ def _restore_if_absent(src: Path, dst: Path) -> None:
     place in the interim and the quarantine copy is no longer needed. If
     ``src`` itself is already gone (e.g. the caller's own earlier ``stat()``
     of it failed), this is a silent no-op -- there is nothing to restore.
-    Any other failure (permission denied, read-only filesystem, etc.) is
-    logged and ``src`` is left in place; a subsequent scan may retry.
+    Any other failure (permission denied, read-only filesystem, a Windows
+    sharing violation that outlasted the retry budget, etc.) is logged and
+    ``src`` is left in place; a subsequent scan may retry.
 
     Never raises.
 
@@ -591,7 +615,7 @@ def _restore_if_absent(src: Path, dst: Path) -> None:
         dst: The original path to restore it to, iff still absent.
     """
     try:
-        os.link(src, dst)
+        _retry_on_windows_sharing_violation(lambda: os.link(src, dst))
     except FileNotFoundError:
         # `src` no longer exists -- nothing to restore.
         return
@@ -601,12 +625,14 @@ def _restore_if_absent(src: Path, dst: Path) -> None:
         # it doesn't linger as an orphaned `.prune-*` artifact.
         _safe_unlink(src)
         return
-    except OSError:
+    except OSError as e:
         logger.warning(
-            "Could not restore quarantined run record to %s; leaving %s in place",
-            dst,
+            "Could not restore quarantined run record %s to %s (%s); it will be "
+            "retried on the next scan and may linger in `conductor status` / "
+            "`fleet list`",
             src,
-            exc_info=True,
+            dst,
+            e,
         )
         return
     # `src` and `dst` now both point at the same inode (two names for one
@@ -676,8 +702,14 @@ def _delete_if_unchanged(f: Path, stat_before: os.stat_result | None) -> bool:
         _retry_on_windows_sharing_violation(lambda: os.rename(f, quarantine))
     except FileNotFoundError:
         return False  # Already gone -- nothing to prune.
-    except OSError:
-        logger.warning("Could not quarantine run record for deletion: %s", f, exc_info=True)
+    except OSError as e:
+        logger.warning(
+            "Could not quarantine run record %s for deletion (%s); it will be "
+            "retried on the next scan and may linger in `conductor status` / "
+            "`fleet list`",
+            f,
+            e,
+        )
         return False
 
     try:
