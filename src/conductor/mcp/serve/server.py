@@ -1,10 +1,16 @@
 """Wire the frozen catalogue onto the low-level MCP ``Server`` and run it
-over stdio (FR1, FR8, FR10, DD3, DD9, E8-T4, E8-T5, E11-T1).
+over stdio (FR1, FR8, FR9, FR10, DD3, DD9, E8-T4, E8-T5, E11-T1, E12-T2).
 
 ``build_server`` registers two handlers: ``list_tools`` and ``call_tool``.
-``list_tools`` always returns the catalogue's workflow tools built once at
-startup, plus (E11-T1) whichever of the ``introspect``/``diagnose`` toolset's
-tools ``options.toolsets`` enables -- decided once, here, from the frozen
+In **direct** mode (``catalogue.mode == "direct"``), ``list_tools`` returns
+the catalogue's workflow tools built once at startup. In **discovery** mode
+(``catalogue.mode == "discovery"`` -- the exposed count exceeded
+``--max-direct-tools``, FR9), the catalogue's per-workflow tools are replaced
+outright by the fixed two-tool ``discovery.py`` pair -- never both at once,
+and never re-decided after startup, since ``catalogue.mode`` was itself fixed
+once by the catalogue builder (E7/E12-T2). Either way, ``list_tools`` also
+returns (E11-T1) whichever of the ``introspect``/``diagnose`` toolset's tools
+``options.toolsets`` enables -- decided once, here, from the frozen
 ``ServeOptions``, never re-evaluated per call or per connection. That is what
 makes the server DD3-compliant: there is no code path here that rebuilds,
 filters, or otherwise varies the tool list per call or per connection.
@@ -12,18 +18,22 @@ filters, or otherwise varies the tool list per call or per connection.
 neither this module nor the SDK's own tool cache can mutate the catalogue's
 canonical data), but the *content* returned is always byte-identical.
 ``call_tool`` dispatches an ``introspect``/``diagnose`` tool name to its
-adapter in ``introspect.py``/``diagnose.py`` when its toolset is enabled --
-the six adapters are otherwise unreachable through the protocol, regardless
-of what ``tools/list`` reports, which is what keeps the gate real rather than
-cosmetic.
+adapter in ``introspect.py``/``diagnose.py`` when its toolset is enabled, and
+(only in discovery mode) a ``conductor_find_workflow``/``conductor_run_workflow``
+name to ``discovery.py`` -- these adapters are otherwise unreachable through
+the protocol, regardless of what ``tools/list`` reports, which is what keeps
+the gate real rather than cosmetic.
 
-**Scope note.** Dispatching a *workflow* tool name (``invoke.py::invoke_workflow_tool``,
-E9) or a run-lifecycle tool name (``runs.py``, E10) through ``call_tool`` is
-out of scope here -- see those modules' own docstrings for why the wiring
-was deliberately left to "a later epic" once those tools' own ``Tool``
-definitions exist. This module only adds the dispatch this epic's own
-acceptance criteria require: an ``introspect``/``diagnose`` tool must be
-callable from the same connection that launched a run, when enabled.
+**Scope note.** Dispatching a *direct-mode* generated workflow tool name
+(``invoke.py::invoke_workflow_tool``, E9) or a run-lifecycle tool name
+(``runs.py``, E10) through ``call_tool`` remains out of scope here -- see
+those modules' own docstrings for why that wiring was deliberately left to
+"a later epic" once those tools' own ``Tool`` definitions exist. E12's own
+discovery pair is the one exception: ``conductor_run_workflow`` must itself
+be callable to satisfy this epic's acceptance criteria, so this module wires
+it (and ``conductor_find_workflow``) directly, sharing the same
+:class:`~conductor.mcp.serve.invoke.LaunchTracker` a later epic's direct-mode
+wiring will also need (R3).
 
 ``serve_stdio`` is the whole runtime: print the FR10 startup summary, then run
 the wired server over ``stdio_server()`` until the host closes the connection.
@@ -40,17 +50,20 @@ from typing import Any
 
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import ResourceLink, Tool
+from mcp.types import ResourceLink, TextContent, Tool
 
 from conductor import __version__
 from conductor.console import make_console, styled
 from conductor.mcp.serve.catalogue import Catalogue
 from conductor.mcp.serve.diagnose import conductor_doctor, conductor_run_logs
 from conductor.mcp.serve.diagnose import conductor_validate_workflow as _validate_workflow
+from conductor.mcp.serve.discovery import conductor_find_workflow as _find_workflow
+from conductor.mcp.serve.discovery import conductor_run_workflow as _run_workflow
 from conductor.mcp.serve.introspect import DEFAULT_EVENTS_LIMIT
 from conductor.mcp.serve.introspect import conductor_node_detail as _node_detail
 from conductor.mcp.serve.introspect import conductor_plan_tree as _plan_tree
 from conductor.mcp.serve.introspect import conductor_run_events as _run_events
+from conductor.mcp.serve.invoke import LaunchTracker
 from conductor.mcp.serve.options import ServeOptions, is_toolset_enabled
 
 logger = logging.getLogger(__name__)
@@ -150,6 +163,69 @@ _DIAGNOSE_TOOLS: tuple[Tool, ...] = (
     ),
 )
 
+# E12-T2: the `discovery` toolset's own `Tool` definitions -- published only
+# when `catalogue.mode == "discovery"` (FR9), replacing the catalogue's
+# per-workflow tools outright rather than joining them. Never
+# operator-selectable via `--toolsets` (see `options.py::ALL_TOOLSETS`), so
+# there is no `is_toolset_enabled` gate for this pair -- `catalogue.mode` is
+# the only switch, and it was decided once, at startup, by the catalogue
+# builder (DD3).
+_DISCOVERY_TOOLS: tuple[Tool, ...] = (
+    Tool(
+        name="conductor_find_workflow",
+        description=(
+            "Search the published workflow catalogue by name, description, or registry. "
+            "This server is running in discovery mode: its exposed workflow count exceeds "
+            "--max-direct-tools, so individual workflow tools are not published directly -- "
+            "use this tool (and conductor_run_workflow) instead."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Case-insensitive substring to match against a workflow's name, "
+                        "description, or registry. Omit or pass an empty string to list "
+                        "every published workflow."
+                    ),
+                },
+            },
+        },
+    ),
+    Tool(
+        name="conductor_run_workflow",
+        description=(
+            "Launch a published workflow found via conductor_find_workflow. `name` must be "
+            "the exact catalogue tool name conductor_find_workflow reported -- never a "
+            "filesystem path, URL, or registry source (NFR3)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The catalogue tool name, from conductor_find_workflow.",
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "The workflow's own declared input parameters.",
+                },
+                "_wait_seconds": {
+                    "type": "number",
+                    "description": (
+                        "0 = return immediately; >0 = wait up to N seconds for a terminal "
+                        "run state (capped by the server's --max-wait-seconds ceiling "
+                        "regardless of the value requested); omitted defers to this "
+                        "workflow's declared mcp.mode."
+                    ),
+                },
+            },
+            "required": ["name"],
+        },
+    ),
+)
+
 
 def _extra_tools_for(options: ServeOptions) -> tuple[Tool, ...]:
     """Every non-catalogue tool ``options.toolsets`` enables (E11-T1),
@@ -199,17 +275,62 @@ async def _dispatch_extra_tool(
     raise ValueError(f"Unknown tool: {name!r}.")
 
 
-def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
-    """Wire a frozen :class:`Catalogue` onto a low-level ``Server`` (E8-T4, E11-T1).
+# E12-T2: the discovery pair's own tool names -- checked against `name`
+# by `_call_tool` before falling back to `_dispatch_extra_tool`, and never
+# just against `catalogue.mode` alone, so a stray call for one of these two
+# names cannot be misrouted to `_dispatch_extra_tool`'s `Unknown tool` path
+# in discovery mode.
+_DISCOVERY_TOOL_NAMES: frozenset[str] = frozenset(tool.name for tool in _DISCOVERY_TOOLS)
 
-    The returned server answers ``tools/list`` with the catalogue's own
-    workflow tools plus whichever ``introspect``/``diagnose`` tools
-    ``options.toolsets`` enables, in a stable order, on every call — the
-    same list for the lifetime of the server process, satisfying MCP
+
+async def _dispatch_discovery_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    catalogue: Catalogue,
+    options: ServeOptions,
+    tracker: LaunchTracker,
+) -> dict[str, Any] | tuple[list[TextContent | ResourceLink], dict[str, Any]]:
+    """Dispatch one ``tools/call`` for the ``discovery`` pair (E12-T2).
+
+    Only ever invoked when ``catalogue.mode == "discovery"`` -- see
+    ``_call_tool``'s own gate -- since the pair is never published, and
+    therefore never callable, in direct mode.
+
+    Raises:
+        ValueError: If ``name`` names neither discovery tool.
+    """
+    if name == "conductor_find_workflow":
+        return _find_workflow(arguments.get("query", ""), catalogue=catalogue)
+    if name == "conductor_run_workflow":
+        return await _run_workflow(
+            arguments["name"],
+            arguments.get("inputs"),
+            arguments.get("_wait_seconds"),
+            catalogue=catalogue,
+            options=options,
+            tracker=tracker,
+        )
+    raise ValueError(f"Unknown tool: {name!r}.")
+
+
+def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
+    """Wire a frozen :class:`Catalogue` onto a low-level ``Server`` (E8-T4,
+    E11-T1, E12-T2).
+
+    In direct mode, the returned server answers ``tools/list`` with the
+    catalogue's own workflow tools; in discovery mode (FR9), it answers with
+    the fixed ``conductor_find_workflow``/``conductor_run_workflow`` pair
+    instead -- never both -- since ``catalogue.mode`` was decided once, at
+    startup, by the catalogue builder and is never re-evaluated here. Either
+    way, ``list_tools`` also returns whichever ``introspect``/``diagnose``
+    tools ``options.toolsets`` enables, in a stable order, on every call —
+    the same list for the lifetime of the server process, satisfying MCP
     ``2026-07-28``'s "MUST NOT vary per-connection or as a side effect of
     other requests on the connection" (DD3). ``tools/call`` for an
     ``introspect``/``diagnose`` tool is dispatched to its adapter only when
-    its toolset is enabled.
+    its toolset is enabled; a discovery-pair name is dispatched only when
+    ``catalogue.mode == "discovery"``.
 
     Args:
         catalogue: The catalogue built once at startup by
@@ -222,30 +343,46 @@ def build_server(catalogue: Catalogue, options: ServeOptions) -> Server:
         A ``Server`` ready to run over any transport (``server.run(...)``).
 
     Raises:
-        ValueError: If an enabled ``introspect``/``diagnose`` tool name
-            collides with a published workflow tool name (e.g. a workflow
-            named ``conductor_run_events``) -- publishing both would leave
-            ``call_tool`` always resolving to the introspection/diagnose
-            adapter, silently shadowing the workflow tool.
+        ValueError: If an enabled ``introspect``/``diagnose`` tool name, or
+            (in discovery mode) a discovery-pair tool name, collides with a
+            published workflow tool name (e.g. a workflow named
+            ``conductor_run_events`` in direct mode, or ``conductor_find_workflow``
+            in discovery mode) -- publishing both would leave ``call_tool``
+            always resolving to the fixed tool's adapter, silently shadowing
+            the workflow tool.
     """
     server = Server(SERVER_NAME, version=__version__)
     extra_tools = _extra_tools_for(options)
+    discovery_mode = catalogue.mode == "discovery"
+    discovery_tools = _DISCOVERY_TOOLS if discovery_mode else ()
+    # One tracker per server process (R3) -- shared by every
+    # `conductor_run_workflow` call this server dispatches, mirroring how a
+    # later epoch's direct-mode wiring will share the same tracker across
+    # every generated workflow tool's own invocations.
+    tracker = LaunchTracker()
 
-    colliding = sorted({tool.name for tool in extra_tools} & set(catalogue.reverse))
+    reserved_names = {tool.name for tool in extra_tools} | {tool.name for tool in discovery_tools}
+    colliding = sorted(reserved_names & set(catalogue.reverse))
     if colliding:
         raise ValueError(
             f"Tool name(s) {', '.join(colliding)} are reserved by the "
-            "introspect/diagnose toolsets and collide with a published workflow "
+            "introspect/diagnose/discovery toolsets and collide with a published workflow "
             "tool of the same name; rename the workflow or disable the "
             "conflicting toolset."
         )
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
+        if discovery_mode:
+            return [*discovery_tools, *extra_tools]
         return [*catalogue.tools(), *extra_tools]
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any]):
+        if discovery_mode and name in _DISCOVERY_TOOL_NAMES:
+            return await _dispatch_discovery_tool(
+                name, arguments, catalogue=catalogue, options=options, tracker=tracker
+            )
         return await _dispatch_extra_tool(name, arguments, catalogue=catalogue, options=options)
 
     return server

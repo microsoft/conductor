@@ -765,22 +765,22 @@ satisfies R4 by construction — which E11-T2 asserts rather than assumes.
 
 ---
 
-### E12 — Discovery fallback above the tool cap (FR9, DD3, G7)
+### E12 — Discovery fallback above the tool cap (FR9, DD3, G7) — DONE
 
 **Goal.** Degrade predictably rather than silently when a registry is large.
 
-**Prerequisites.** E9.
+**Prerequisites.** E9 (DONE).
 
 | Task ID | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E12-T1 | IMPL | `conductor_find_workflow(query)` returning catalogue entries with their descriptions and input schemas, and `conductor_run_workflow(name, inputs, _wait_seconds?)` dispatching through the same invocation layer as a generated tool. `name` is a catalogue key, never a path or registry source (NFR3). | `src/conductor/mcp/serve/discovery.py` | TO DO |
-| E12-T2 | IMPL | Decide direct-vs-discovery **at startup from the exposed count** and log which mode was chosen and why (FR9, FR10). It can never be a runtime switch — the spec forbids a tool list that varies as a side effect of another request (DD3). | `src/conductor/mcp/serve/catalogue.py`, `src/conductor/mcp/serve/server.py` | TO DO |
-| E12-T3 | TEST | Above the cap the per-workflow tools are absent and the pair is present; below it, the reverse; the mode does not change mid-connection; `conductor_run_workflow` refuses a path-shaped `name`; the startup log names the count and threshold. | `tests/test_mcp/test_serve_discovery.py` | TO DO |
+| E12-T1 | IMPL | `conductor_find_workflow(query)` returning catalogue entries with their descriptions and input schemas, and `conductor_run_workflow(name, inputs, _wait_seconds?)` dispatching through the same invocation layer as a generated tool. `name` is a catalogue key, never a path or registry source (NFR3). | `src/conductor/mcp/serve/discovery.py` | DONE |
+| E12-T2 | IMPL | Decide direct-vs-discovery **at startup from the exposed count** and log which mode was chosen and why (FR9, FR10). It can never be a runtime switch — the spec forbids a tool list that varies as a side effect of another request (DD3). | `src/conductor/mcp/serve/catalogue.py`, `src/conductor/mcp/serve/server.py` | DONE |
+| E12-T3 | TEST | Above the cap the per-workflow tools are absent and the pair is present; below it, the reverse; the mode does not change mid-connection; `conductor_run_workflow` refuses a path-shaped `name`; the startup log names the count and threshold. | `tests/test_mcp/test_serve_discovery.py` | DONE |
 
 **Acceptance criteria**
-- [ ] A registry above `--max-direct-tools` serves exactly two workflow tools.
-- [ ] The choice is visible in the startup summary.
-- [ ] No tool anywhere accepts a filesystem path, URL, or registry source.
+- [x] A registry above `--max-direct-tools` serves exactly two workflow tools.
+- [x] The choice is visible in the startup summary.
+- [x] No tool anywhere accepts a filesystem path, URL, or registry source.
 
 ---
 
