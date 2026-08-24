@@ -113,6 +113,20 @@ def generate_log_path(workflow_name: str) -> Path:
     return path
 
 
+def _resolve_event_log_dir(
+    event_log_dir: str | None,
+    workflow_path: Path,
+) -> Path | None:
+    """Resolve an event-log directory relative to its workflow file."""
+    if not event_log_dir:
+        return None
+
+    path = Path(event_log_dir)
+    if not path.is_absolute():
+        path = workflow_path.resolve().parent / path
+    return path.resolve()
+
+
 def init_file_logging(log_path: Path) -> None:
     """Initialize file logging to the given path.
 
@@ -2054,8 +2068,10 @@ async def run_workflow_async(
         # Start JSONL event log subscriber (always-on structured diagnostics)
         from conductor.engine.event_log import EventLogSubscriber
 
-        _eld = config.workflow.runtime.event_log_dir
-        _event_log_dir = Path(_eld).resolve() if _eld else None
+        _event_log_dir = _resolve_event_log_dir(
+            config.workflow.runtime.event_log_dir,
+            workflow_path,
+        )
 
         event_log_subscriber = EventLogSubscriber(
             config.workflow.name,
@@ -2771,8 +2787,10 @@ async def resume_workflow_async(
             # appends to it and reuses run_id; otherwise it generates fresh.
             from conductor.engine.event_log import EventLogSubscriber
 
-            _eld = config.workflow.runtime.event_log_dir
-            _event_log_dir = Path(_eld).resolve() if _eld else None
+            _event_log_dir = _resolve_event_log_dir(
+                config.workflow.runtime.event_log_dir,
+                resolved_workflow_path,
+            )
 
             event_log_subscriber = EventLogSubscriber(
                 config.workflow.name,
