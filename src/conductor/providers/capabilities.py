@@ -118,6 +118,13 @@ class ProviderCapabilities(BaseModel):
     ``max_session_seconds`` wall-clock timeout. False means the setting
     is silently ignored — workflows that set it fail validation."""
 
+    max_tokens: bool = False
+    """``True`` when the provider applies an agent's per-agent
+    ``max_tokens`` output cap.
+
+    ``False`` means the value would be silently ignored, so workflows that
+    set it fail validation instead. Defaults to ``False`` (conservative)."""
+
     checkpoint_resume: bool
     """``True`` when provider session state survives ``conductor resume``
     cleanly (re-establishes session_id, tool state, etc.)."""
@@ -320,6 +327,7 @@ def _build_unimplemented_placeholder() -> ProviderCapabilities:
         structured_output="native",
         interrupt=True,
         max_session_seconds=True,
+        max_tokens=True,
         checkpoint_resume=True,
         usage_tracking=True,
         concurrent_safe=True,

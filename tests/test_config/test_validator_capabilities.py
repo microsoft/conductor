@@ -34,6 +34,7 @@ def _caps(**overrides: object) -> ProviderCapabilities:
         "structured_output": "native",
         "interrupt": True,
         "max_session_seconds": True,
+        "max_tokens": True,
         "checkpoint_resume": True,
         "usage_tracking": True,
         "concurrent_safe": True,
@@ -573,6 +574,80 @@ class TestMaxSessionSecondsCrossCheck:
     def test_omitted_against_unsupported_provider_passes(self, patch_caps: Any) -> None:
         patch_caps({"copilot": _caps(max_session_seconds=False)})
         config = _build_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)
+
+
+class TestMaxTokensCrossCheck:
+    def test_explicit_setting_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(max_tokens=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", max_tokens=1024)],
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+
+        message = str(exc_info.value)
+        assert "Agent 'a' sets max_tokens=1024" in message
+        assert "provider 'copilot' does not apply per-agent output token caps" in message
+        assert "capabilities.max_tokens=False" in message
+
+    def test_explicit_setting_against_supported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(max_tokens=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", max_tokens=1024)],
+        )
+        validate_workflow_config(config)
+
+    def test_omitted_against_unsupported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(max_tokens=False)})
+        config = _build_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)
+
+    def test_for_each_inline_agent_is_checked(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(max_tokens=False)})
+        config = _for_each_workflow(
+            inline=AgentDef(name="inner", prompt="{{ item }}", max_tokens=1024),
+        )
+
+        with pytest.raises(ConfigurationError, match="Agent 'inner' sets max_tokens=1024"):
+            validate_workflow_config(config)
+
+
+class TestRealMaxTokensCapabilities:
+    @pytest.mark.parametrize(
+        "provider_name",
+        ["copilot", "hermes", "claude-agent-sdk", "aca"],
+    )
+    def test_unsupported_providers_reject_per_agent_max_tokens(self, provider_name: str) -> None:
+        provider: dict[str, str] = {"name": provider_name}
+        if provider_name == "aca":
+            provider["pool_endpoint"] = "https://example.invalid"
+        config = WorkflowConfig.model_validate(
+            {
+                "workflow": {
+                    "name": "test",
+                    "entry_point": "a",
+                    "runtime": {"provider": provider},
+                },
+                "agents": [{"name": "a", "prompt": "hi", "max_tokens": 1024}],
+            }
+        )
+
+        with pytest.raises(ConfigurationError, match="capabilities.max_tokens=False"):
+            validate_workflow_config(config)
+
+    def test_claude_accepts_per_agent_max_tokens(self) -> None:
+        config = WorkflowConfig.model_validate(
+            {
+                "workflow": {
+                    "name": "test",
+                    "entry_point": "a",
+                    "runtime": {"provider": "claude"},
+                },
+                "agents": [{"name": "a", "prompt": "hi", "max_tokens": 1024}],
+            }
+        )
         validate_workflow_config(config)
 
 

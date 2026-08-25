@@ -164,6 +164,19 @@ class TestSamplingSettings:
         assert pydantic_agent.model_settings["temperature"] == 0.7
         assert pydantic_agent.model_settings["max_tokens"] == 4096
 
+    def test_agent_max_tokens_overrides_runtime_default(self) -> None:
+        """A per-agent max_tokens value takes precedence over the runtime default."""
+        agent_def = AgentDef(name="sampler", max_tokens=1000)
+
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            default_max_tokens=4096,
+        )
+
+        assert pydantic_agent.model_settings["max_tokens"] == 1000
+
 
 class TestReasoningMapping:
     """Tests for mapping reasoning effort to Anthropic extended thinking."""

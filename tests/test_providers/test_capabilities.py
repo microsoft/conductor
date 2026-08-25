@@ -25,6 +25,7 @@ def _stable_capabilities(**overrides: object) -> ProviderCapabilities:
         "structured_output": "native",
         "interrupt": True,
         "max_session_seconds": True,
+        "max_tokens": True,
         "checkpoint_resume": True,
         "usage_tracking": True,
         "concurrent_safe": True,
@@ -231,6 +232,23 @@ class TestResolver:
             pytest.importorskip("claude_agent_sdk")
         caps = get_capabilities(provider_name)
         assert caps.working_dir is expected
+
+    @pytest.mark.parametrize(
+        ("provider_name", "expected"),
+        [
+            ("copilot", False),
+            ("claude", True),
+            ("hermes", False),
+            ("claude-agent-sdk", False),
+            ("aca", False),
+        ],
+    )
+    def test_max_tokens_capability_matrix(self, provider_name: str, expected: bool) -> None:
+        """Only providers that apply a per-agent output cap declare support."""
+        if provider_name == "claude-agent-sdk":
+            pytest.importorskip("claude_agent_sdk")
+        caps = get_capabilities(provider_name)
+        assert caps.max_tokens is expected
 
     def test_working_dir_false_listed_as_limitation(self) -> None:
         """Requirement: the experimental banner surfaces working_dir=False."""

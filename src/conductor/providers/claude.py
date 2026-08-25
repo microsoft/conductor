@@ -132,6 +132,9 @@ class ClaudeProvider(AgentProvider):
         interrupt=True,
         # ``max_session_seconds`` is enforced by the Pydantic AI interrupt helper.
         max_session_seconds=True,
+        # ``AgentDef.max_tokens`` overrides the workflow-level default in
+        # ``_pydantic_ai.agent_builder.build_agent``.
+        max_tokens=True,
         # Anthropic's API is stateless per-request — no session state to
         # persist across ``conductor resume``.
         checkpoint_resume=False,

@@ -2276,9 +2276,10 @@ def _validate_provider_capabilities(
         provider: per-agent MCP provider-override, tools allowlist (via
         :func:`_check_agent_tools`), reasoning effort (per-agent override OR the
         inherited workflow-wide default), structured output schema, and an
-        explicit ``max_session_seconds``. Shared so a ``for_each`` group's inline
-        ``AgentDef`` — which is not in ``config.agents`` but runs identically at
-        runtime — gets the same treatment as a top-level agent (#270).
+        explicit ``max_session_seconds`` or ``max_tokens``. Shared so a
+        ``for_each`` group's inline ``AgentDef`` — which is not in
+        ``config.agents`` but runs identically at runtime — gets the same
+        treatment as a top-level agent (#270).
 
         Reads the workflow-wide ``runtime_default_effort`` from the enclosing
         scope; it is bound at the top of the function, so every call site is safe.
@@ -2362,6 +2363,16 @@ def _validate_provider_capabilities(
                 f"Agent '{agent.name}' sets max_session_seconds={agent.max_session_seconds!r} "
                 f"but provider '{provider_name}' does not enforce session timeouts "
                 f"(capabilities.max_session_seconds=False)."
+            )
+
+        # max_tokens: silently ignoring an explicit response-length cap
+        # violates the workflow author's intent.
+        if agent.max_tokens is not None and not caps.max_tokens:
+            errors.append(
+                f"Agent '{agent.name}' sets max_tokens={agent.max_tokens!r} but provider "
+                f"'{provider_name}' does not apply per-agent output token caps "
+                f"(capabilities.max_tokens=False). Remove it, use runtime.max_tokens where "
+                f"the provider honours it, or override the agent to a provider that does."
             )
 
         # working_dir: a provider that cannot apply the directory would
