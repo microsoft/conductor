@@ -1524,6 +1524,13 @@ class AgentDef(BaseModel):
     max_agent_iterations: 200 instead of using the default limit.
     """
 
+    max_tokens: int | None = Field(None, ge=1, le=200000)
+    """Maximum output tokens per response for this agent.
+
+    Overrides the workflow-level runtime.max_tokens for this agent.
+    Only applies to provider-backed agents (not script or human_gate).
+    """
+
     session_key: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
         None
     )
@@ -2078,6 +2085,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
+            if self.max_tokens is not None:
+                raise ValueError("script agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("script agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2134,6 +2143,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
+            if self.max_tokens is not None:
+                raise ValueError("workflow agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("workflow agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2191,6 +2202,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("wait agents cannot have 'max_agent_iterations'")
+            if self.max_tokens is not None:
+                raise ValueError("wait agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("wait agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2264,6 +2277,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("set agents cannot have 'max_agent_iterations'")
+            if self.max_tokens is not None:
+                raise ValueError("set agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("set agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2334,6 +2349,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("terminate agents cannot have 'max_agent_iterations'")
+            if self.max_tokens is not None:
+                raise ValueError("terminate agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("terminate agents cannot have 'session_key'")
             if self.max_depth is not None:

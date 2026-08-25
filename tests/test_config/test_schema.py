@@ -662,6 +662,73 @@ class TestAgentDefMaxSessionSeconds:
         assert agent.max_session_seconds == 90.0
 
 
+class TestAgentDefMaxTokens:
+    """Tests for max_tokens on AgentDef."""
+
+    def test_default_is_none(self) -> None:
+        """Test that max_tokens defaults to None."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test")
+        assert agent.max_tokens is None
+
+    def test_accepts_valid_value(self) -> None:
+        """Test that max_tokens accepts a valid value."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=8192)
+        assert agent.max_tokens == 8192
+
+    def test_rejects_zero(self) -> None:
+        """Test that max_tokens rejects zero."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=0)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_rejects_negative(self) -> None:
+        """Test that max_tokens rejects negative values."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=-100)
+        assert "greater than or equal to 1" in str(exc_info.value)
+
+    def test_allowed_on_regular_agent(self) -> None:
+        """Test that regular agents can have max_tokens."""
+        agent = AgentDef(name="a", type="agent", model="gpt-4", prompt="test", max_tokens=32768)
+        assert agent.max_tokens == 32768
+
+    def test_rejects_over_200000(self) -> None:
+        """Test that max_tokens rejects values above 200000."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=200001)
+        assert "less than or equal to 200000" in str(exc_info.value)
+
+    def test_rejected_on_script_agent(self) -> None:
+        """Test that script agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="s", type="script", command="echo hi", max_tokens=8192)
+        assert "max_tokens" in str(exc_info.value)
+
+    def test_rejected_on_workflow_agent(self) -> None:
+        """Test that workflow agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="w", type="workflow", workflow="./sub.yaml", max_tokens=8192)
+        assert "max_tokens" in str(exc_info.value)
+
+    def test_rejected_on_wait_agent(self) -> None:
+        """Test that wait agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="w", type="wait", duration="5s", max_tokens=8192)
+        assert "max_tokens" in str(exc_info.value)
+
+    def test_rejected_on_set_agent(self) -> None:
+        """Test that set agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="s", type="set", value="x", max_tokens=8192)
+        assert "max_tokens" in str(exc_info.value)
+
+    def test_rejected_on_terminate_agent(self) -> None:
+        """Test that terminate agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(name="t", type="terminate", status="success", reason="done", max_tokens=8192)
+        assert "max_tokens" in str(exc_info.value)
+
+
 class TestRuntimeConfig:
     """Tests for RuntimeConfig model."""
 
