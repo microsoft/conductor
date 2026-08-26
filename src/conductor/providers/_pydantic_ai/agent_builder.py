@@ -239,6 +239,16 @@ def _coerce_for_thinking(
     budget = int(thinking.get("budget_tokens", 0))
     effective_max_tokens = max_tokens if max_tokens is not None else 0
     required = budget + _ANTHROPIC_THINKING_HEADROOM
+    if max_tokens is not None and effective_max_tokens < required:
+        logger.info(
+            "Raising max_tokens from %s to %s for extended thinking on model %s "
+            "(budget_tokens=%s + headroom=%s)",
+            max_tokens,
+            required,
+            model,
+            budget,
+            _ANTHROPIC_THINKING_HEADROOM,
+        )
     effective_max_tokens = max(effective_max_tokens, required)
     if effective_max_tokens > _ANTHROPIC_THINKING_OUTPUT_CAP:
         logger.info(

@@ -275,6 +275,8 @@ class ProviderCapabilities(BaseModel):
             items.append("working_dir ignored")
         if not self.skills:
             items.append("no skills support")
+        if not self.max_tokens:
+            items.append("per-agent max_tokens ignored")
         if not self.session_continuity:
             items.append("no session_key continuity")
         return items

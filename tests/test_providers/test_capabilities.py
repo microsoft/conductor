@@ -152,6 +152,7 @@ class TestDeclaredLimitations:
             structured_output="none",
             interrupt=False,
             max_session_seconds=False,
+            max_tokens=False,
             checkpoint_resume=False,
             usage_tracking=False,
             concurrent_safe=False,
@@ -172,7 +173,16 @@ class TestDeclaredLimitations:
         assert "no usage tracking" in lims
         assert "not safe to run in parallel" in lims
         assert "no skills support" in lims
+        assert "per-agent max_tokens ignored" in lims
         assert "no session_key continuity" in lims
+
+    def test_max_tokens_false_listed_as_limitation(self) -> None:
+        lims = _stable_capabilities(max_tokens=False).declared_limitations()
+        assert "per-agent max_tokens ignored" in lims
+        assert (
+            "per-agent max_tokens ignored"
+            not in _stable_capabilities(max_tokens=True).declared_limitations()
+        )
 
     def test_prompt_injection_structured_output_listed_as_limitation(self) -> None:
         caps = _stable_capabilities(

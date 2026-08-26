@@ -23,6 +23,7 @@ This guide helps you choose between GitHub Copilot, Anthropic Claude, Claude Age
 | **Structured Output** | Prompt injection | Native | Prompt injection | Prompt injection |
 | **Session Resume** | Yes | No | No | Yes |
 | **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | native CLI env var | N/A |
+| **Per-agent max_tokens** | No | Yes | No | No |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
 > specific capability carve-outs (e.g. no per-agent tools allowlist). `conductor validate`
@@ -167,8 +168,10 @@ package it as a plugin (a `.claude-plugin/plugin.json` with the skill under
 directories directly and accepts the identical skill untouched. See the
 [Skills section of the workflow syntax guide](../workflow-syntax.md#skills).
 
-Separately, `temperature` and `max_tokens` are **rejected at the factory** —
-sampling behavior is controlled by the CLI.
+Separately, `runtime.temperature` and `runtime.max_tokens` are **rejected at
+the factory** — sampling behavior is controlled by the CLI. Per-agent
+`AgentDef.max_tokens` is caught earlier by `conductor validate`
+(`ProviderCapabilities.max_tokens=False`).
 
 ### Example Claude Agent SDK Workflow
 

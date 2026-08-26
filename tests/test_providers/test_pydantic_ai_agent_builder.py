@@ -8,6 +8,7 @@ extended-thinking budgets, and Anthropic API constraint coercion.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -176,6 +177,39 @@ class TestSamplingSettings:
         )
 
         assert pydantic_agent.model_settings["max_tokens"] == 1000
+
+    def test_thinking_max_tokens_bump_logs_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Explicit max_tokens overridden by thinking requirement logs at INFO."""
+        agent_def = AgentDef(
+            name="thinker",
+            model="claude-3-7-sonnet-latest",
+            max_tokens=1000,
+        )
+        with caplog.at_level(logging.INFO):
+            build_agent(
+                agent_def,
+                system_prompt="",
+                rendered_prompt="",
+                default_max_tokens=None,
+                default_reasoning_effort="high",
+            )
+        assert "Raising max_tokens from 1000 to" in caplog.text
+
+    def test_thinking_max_tokens_none_does_not_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Unset max_tokens with thinking does not produce a 'Raising' log."""
+        agent_def = AgentDef(
+            name="thinker",
+            model="claude-3-7-sonnet-latest",
+        )
+        with caplog.at_level(logging.INFO):
+            build_agent(
+                agent_def,
+                system_prompt="",
+                rendered_prompt="",
+                default_max_tokens=None,
+                default_reasoning_effort="high",
+            )
+        assert "Raising max_tokens" not in caplog.text
 
     def test_workflow_default_used_when_agent_max_tokens_unset(self) -> None:
         """With no per-agent override the workflow default still applies."""
