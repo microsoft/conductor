@@ -11,7 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `max_tokens` field on `AgentDef` for per-agent output token cap override (#470).
   Only honoured by the `claude` provider; other providers reject it at
-  validation time via `ProviderCapabilities.max_tokens`.
+  validation time via `ProviderCapabilities.max_tokens`. With Claude extended
+  thinking, compatible explicit caps are preserved and caps at or below the
+  thinking budget are rejected; automatic sizing remains in place when the
+  agent does not set a cap.
 
 ### Fixed
 

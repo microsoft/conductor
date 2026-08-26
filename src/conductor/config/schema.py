@@ -1533,6 +1533,11 @@ class AgentDef(BaseModel):
     """Overrides the workflow-level runtime.max_tokens for this agent. Controls
     response length, not the context window (that budget is context.max_tokens).
 
+    With Claude extended thinking, an explicit value must be greater than the
+    resolved thinking budget and is preserved when it is within the provider's
+    output cap. When omitted, Claude continues to derive a value from the
+    budget plus answer headroom.
+
     Rejected on script, workflow, wait, set, and terminate steps.
     """
 

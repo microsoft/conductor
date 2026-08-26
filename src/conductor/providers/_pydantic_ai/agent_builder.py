@@ -51,8 +51,9 @@ DEFAULT_ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
 # and is used by the temperature/max_tokens coercion helper.
 _ANTHROPIC_THINKING_OUTPUT_CAP: int = 64_000
 
-# Headroom above the thinking budget required by the Anthropic API:
-# ``max_tokens > budget_tokens``. Matches CLAUDE_ANSWER_HEADROOM_TOKENS.
+# Visible-answer headroom Conductor reserves when it derives ``max_tokens``.
+# Anthropic itself only requires ``max_tokens > budget_tokens``. Matches
+# CLAUDE_ANSWER_HEADROOM_TOKENS.
 _ANTHROPIC_THINKING_HEADROOM: int = 4_096
 
 # Pydantic AI v2 splits the ``Agent(retries=...)`` budget into tool retries and
@@ -212,26 +213,34 @@ def _coerce_for_thinking(
     max_tokens: int | None,
     thinking: dict[str, Any] | None,
     model: str,
+    *,
+    explicit_max_tokens: bool = False,
+    agent_name: str | None = None,
 ) -> tuple[float | None, int | None]:
     """Adjust temperature and max_tokens to satisfy Anthropic thinking constraints.
 
     When extended thinking is enabled, the Anthropic API requires
     ``temperature == 1.0`` (or omitted) and ``max_tokens > budget_tokens``.
-    This helper mirrors ``ClaudeProvider._coerce_for_thinking`` by forcing the
-    temperature to 1.0 and bumping ``max_tokens`` to at least the thinking
-    budget plus headroom, clamped to the extended-thinking output cap.
+    This helper forces the temperature to 1.0. When ``max_tokens`` comes from
+    a workflow default (or is unset), it is raised to the thinking budget plus
+    answer headroom. An explicit per-agent cap instead bypasses that headroom
+    adjustment and is rejected when it cannot contain the thinking budget.
 
     Args:
         temperature: User-configured temperature (may be ``None``).
         max_tokens: User-configured max output tokens (may be ``None``).
         thinking: Resolved ``anthropic_thinking`` dict or ``None``.
         model: Resolved model identifier (used only for log messages).
+        explicit_max_tokens: Whether ``max_tokens`` was explicitly configured
+            on the agent rather than inherited from the workflow runtime.
+        agent_name: Agent name used to make explicit-cap errors actionable.
 
     Returns:
         Tuple of ``(effective_temperature, effective_max_tokens)``.
 
     Raises:
-        ValidationError: If the per-model cap cannot satisfy the thinking budget.
+        ValidationError: If an explicit per-agent cap or the per-model cap
+            cannot satisfy the thinking budget.
     """
     if thinking is None:
         return temperature, max_tokens
@@ -239,17 +248,31 @@ def _coerce_for_thinking(
     budget = int(thinking.get("budget_tokens", 0))
     effective_max_tokens = max_tokens if max_tokens is not None else 0
     required = budget + _ANTHROPIC_THINKING_HEADROOM
-    if max_tokens is not None and effective_max_tokens < required:
-        logger.info(
-            "Raising max_tokens from %s to %s for extended thinking on model %s "
-            "(budget_tokens=%s + headroom=%s)",
-            max_tokens,
-            required,
-            model,
-            budget,
-            _ANTHROPIC_THINKING_HEADROOM,
-        )
-    effective_max_tokens = max(effective_max_tokens, required)
+    if explicit_max_tokens:
+        if effective_max_tokens <= budget:
+            subject = f"Agent {agent_name!r}" if agent_name is not None else "Agent"
+            raise ValidationError(
+                f"{subject} sets max_tokens={effective_max_tokens}, but extended "
+                f"thinking on model {model!r} requires max_tokens to be greater "
+                f"than budget_tokens={budget}.",
+                suggestion=(
+                    "Increase the agent's max_tokens, remove it to let Conductor "
+                    "derive max_tokens automatically, or lower reasoning.effort "
+                    "when possible."
+                ),
+            )
+    else:
+        if max_tokens is not None and effective_max_tokens < required:
+            logger.info(
+                "Raising max_tokens from %s to %s for extended thinking on model %s "
+                "(budget_tokens=%s + headroom=%s)",
+                max_tokens,
+                required,
+                model,
+                budget,
+                _ANTHROPIC_THINKING_HEADROOM,
+            )
+        effective_max_tokens = max(effective_max_tokens, required)
     if effective_max_tokens > _ANTHROPIC_THINKING_OUTPUT_CAP:
         logger.info(
             "Clamping max_tokens %s to %s for extended thinking on model %s "
@@ -322,6 +345,8 @@ def _build_model_settings(
         max_tokens,
         thinking,
         model_name,
+        explicit_max_tokens=agent_max_tokens is not None,
+        agent_name=agent.name,
     )
 
     settings: AnthropicModelSettings = AnthropicModelSettings()

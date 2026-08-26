@@ -416,7 +416,7 @@ The unified effort level is translated into Anthropic's
 
 `max` is pinned to `64000 − 4096` — the largest budget that still fits the
 default `+ 4096` answer headroom under the 64000-token cap (see
-[auto-coercion](#auto-coercion-of-temperature-and-max_tokens) below). At `max`,
+[the handling rules](#temperature-and-max_tokens-with-reasoning) below). At `max`,
 the effective `max_tokens` lands exactly on the 64000-token cap.
 
 ### Supported models
@@ -432,20 +432,26 @@ accepts any model whose name starts with one of:
 Requesting `reasoning.effort` on any other model raises a `ValidationError` at
 startup so you fail fast instead of silently dropping the budget.
 
-### Auto-coercion of `temperature` and `max_tokens`
+### `temperature` and `max_tokens` with reasoning
 
 When extended thinking is enabled, the Anthropic API requires `temperature=1.0`
-and a `max_tokens` value large enough to contain both the thinking budget and
-the visible response. The provider handles this for you:
+and `max_tokens` to be greater than the thinking budget. The provider handles
+these constraints as follows:
 
 - **`temperature`**: coerced to `1.0` (logged at INFO if you configured a
   different value).
-- **`max_tokens`**: bumped to `budget + 4096`, capped at `64000` (logged at INFO
-  when clamped).
+- **No per-agent `max_tokens`**: the effective value is derived automatically
+  as at least `budget + 4096`, capped at `64000`. An inherited value that must
+  be raised, or a value that must be clamped, is logged at INFO.
+- **Explicit per-agent `max_tokens`**: a value greater than the thinking budget
+  and within the existing `64000`-token output cap is preserved. A value equal
+  to or below the budget is rejected during validation instead of being
+  silently increased. A value above the output cap is clamped to `64000` and
+  logged at INFO.
 
-This means you don't need to hand-tune `max_tokens` when raising the effort —
-the provider will widen the output budget to fit. If you've explicitly set a
-`max_tokens` higher than `budget + 4096`, your value is preserved.
+Within the provider's supported range, this keeps an explicitly configured
+per-agent value as the actual output cap while retaining automatic sizing when
+the agent does not set one.
 
 ### Reasoning content in events
 

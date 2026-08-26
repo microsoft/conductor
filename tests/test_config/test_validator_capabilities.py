@@ -650,6 +650,79 @@ class TestRealMaxTokensCapabilities:
         )
         validate_workflow_config(config)
 
+    @pytest.mark.parametrize("max_tokens", [1000, 2048])
+    def test_claude_rejects_agent_max_tokens_at_or_below_reasoning_budget(
+        self, max_tokens: int
+    ) -> None:
+        config = WorkflowConfig.model_validate(
+            {
+                "workflow": {
+                    "name": "test",
+                    "entry_point": "a",
+                    "runtime": {"provider": "claude"},
+                },
+                "agents": [
+                    {
+                        "name": "a",
+                        "prompt": "hi",
+                        "max_tokens": max_tokens,
+                        "reasoning": {"effort": "low"},
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+
+        message = str(exc_info.value)
+        assert f"Agent 'a' sets max_tokens={max_tokens}" in message
+        assert "reasoning.effort='low' maps to Claude budget_tokens=2048" in message
+        assert "max_tokens must be greater than budget_tokens" in message
+        assert "remove it to let Conductor derive max_tokens automatically" in message
+
+    def test_claude_preserves_compatible_agent_max_tokens_with_reasoning(self) -> None:
+        config = WorkflowConfig.model_validate(
+            {
+                "workflow": {
+                    "name": "test",
+                    "entry_point": "a",
+                    "runtime": {"provider": "claude"},
+                },
+                "agents": [
+                    {
+                        "name": "a",
+                        "prompt": "hi",
+                        "max_tokens": 2049,
+                        "reasoning": {"effort": "low"},
+                    }
+                ],
+            }
+        )
+
+        validate_workflow_config(config)
+
+    def test_claude_checks_inherited_reasoning_effort_against_agent_cap(self) -> None:
+        config = WorkflowConfig.model_validate(
+            {
+                "workflow": {
+                    "name": "test",
+                    "entry_point": "a",
+                    "runtime": {
+                        "provider": "claude",
+                        "default_reasoning_effort": "high",
+                    },
+                },
+                "agents": [{"name": "a", "prompt": "hi", "max_tokens": 16384}],
+            }
+        )
+
+        with pytest.raises(
+            ConfigurationError,
+            match="runtime.default_reasoning_effort='high'.*budget_tokens=16384",
+        ):
+            validate_workflow_config(config)
+
 
 class TestConcurrencyCrossCheck:
     def test_parallel_group_with_unsafe_provider_errors(self, patch_caps: Any) -> None:

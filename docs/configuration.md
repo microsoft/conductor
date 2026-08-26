@@ -467,8 +467,12 @@ agents (none of which call a model).
   (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); a
   `ValidationError` is raised otherwise. The provider also auto-coerces
   `temperature` to `1.0` (required by the Anthropic API for extended thinking,
-  logged at INFO) and bumps `max_tokens` to fit `budget + 4096`, capped at
-  `64000` (logged at INFO when clamped).
+  logged at INFO). If the agent does not set `max_tokens`, the effective value
+  is derived automatically as at least `budget + 4096`, capped at `64000`.
+  An explicit per-agent value greater than the budget and within the existing
+  `64000`-token output cap is preserved; a value equal to or below the budget
+  is rejected during validation rather than silently increased. A value above
+  the output cap is clamped to `64000` and logged at INFO.
 
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and

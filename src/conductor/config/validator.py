@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import jinja2
 from jinja2 import Environment, meta, nodes
@@ -24,6 +24,7 @@ from conductor.providers.capabilities import (
     requires_plugin_root_for_skills,
     uses_native_skills,
 )
+from conductor.providers.reasoning import ReasoningEffort, effort_to_budget_tokens
 from conductor.skills import (
     BYTES_PER_TOKEN_ESTIMATE,
     SkillError,
@@ -2337,6 +2338,34 @@ def _validate_provider_capabilities(
                 errors.append(
                     f"Agent '{agent.name}' resolves to {source}={requested!r} "
                     f"but provider '{provider_name}' supports only {list(supported)!r}."
+                )
+
+        # Claude extended thinking requires max_tokens > budget_tokens. An
+        # explicit per-agent max_tokens is a real output cap, so reject an
+        # incompatible pair instead of silently raising the configured cap.
+        # Templated efforts are resolved and checked by ClaudeProvider at run
+        # time because their budget is not yet known here.
+        if (
+            provider_name == "claude"
+            and agent.max_tokens is not None
+            and effective_effort is not None
+            and not is_jinja_template(effective_effort)
+        ):
+            effort = cast(ReasoningEffort, effective_effort)
+            budget = effort_to_budget_tokens(effort)
+            if agent.max_tokens <= budget:
+                source = (
+                    "reasoning.effort"
+                    if (agent.reasoning is not None and agent.reasoning.effort is not None)
+                    else "runtime.default_reasoning_effort"
+                )
+                errors.append(
+                    f"Agent '{agent.name}' sets max_tokens={agent.max_tokens}, but "
+                    f"{source}={effort!r} maps to Claude budget_tokens={budget}; "
+                    "max_tokens must be greater than budget_tokens. Increase the "
+                    "agent's max_tokens, remove it to let Conductor derive "
+                    "max_tokens automatically, or lower the reasoning effort when "
+                    "possible."
                 )
 
         # Structured output: hard error when no support, warning when
