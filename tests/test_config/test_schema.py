@@ -680,6 +680,16 @@ class TestAgentDefMaxTokens:
         agent = AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=8192)
         assert agent.max_tokens == 8192
 
+    def test_minimum_boundary(self) -> None:
+        """Test that max_tokens accepts the minimum value of 1."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=1)
+        assert agent.max_tokens == 1
+
+    def test_maximum_boundary(self) -> None:
+        """Test that max_tokens accepts the maximum value of 200000."""
+        agent = AgentDef(name="a", model="gpt-4", prompt="test", max_tokens=200000)
+        assert agent.max_tokens == 200000
+
     def test_rejects_zero(self) -> None:
         """Test that max_tokens rejects zero."""
         with pytest.raises(ValidationError) as exc_info:
@@ -707,31 +717,54 @@ class TestAgentDefMaxTokens:
         """Test that script agents cannot have max_tokens."""
         with pytest.raises(ValidationError) as exc_info:
             AgentDef(name="s", type="script", command="echo hi", max_tokens=8192)
-        assert "max_tokens" in str(exc_info.value)
+        assert "'script' agents cannot have 'max_tokens'" in str(exc_info.value)
 
     def test_rejected_on_workflow_agent(self) -> None:
         """Test that workflow agents cannot have max_tokens."""
         with pytest.raises(ValidationError) as exc_info:
             AgentDef(name="w", type="workflow", workflow="./sub.yaml", max_tokens=8192)
-        assert "max_tokens" in str(exc_info.value)
+        assert "'workflow' agents cannot have 'max_tokens'" in str(exc_info.value)
 
     def test_rejected_on_wait_agent(self) -> None:
         """Test that wait agents cannot have max_tokens."""
         with pytest.raises(ValidationError) as exc_info:
             AgentDef(name="w", type="wait", duration="5s", max_tokens=8192)
-        assert "max_tokens" in str(exc_info.value)
+        assert "'wait' agents cannot have 'max_tokens'" in str(exc_info.value)
 
     def test_rejected_on_set_agent(self) -> None:
         """Test that set agents cannot have max_tokens."""
         with pytest.raises(ValidationError) as exc_info:
             AgentDef(name="s", type="set", value="x", max_tokens=8192)
-        assert "max_tokens" in str(exc_info.value)
+        assert "'set' agents cannot have 'max_tokens'" in str(exc_info.value)
 
     def test_rejected_on_terminate_agent(self) -> None:
         """Test that terminate agents cannot have max_tokens."""
         with pytest.raises(ValidationError) as exc_info:
             AgentDef(name="t", type="terminate", status="success", reason="done", max_tokens=8192)
-        assert "max_tokens" in str(exc_info.value)
+        assert "'terminate' agents cannot have 'max_tokens'" in str(exc_info.value)
+
+    def test_rejected_on_human_gate(self) -> None:
+        """Test that human_gate agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="g",
+                type="human_gate",
+                prompt="Choose:",
+                options=[GateOption(label="Ok", value="ok", route="next")],
+                max_tokens=8192,
+            )
+        assert "'human_gate' agents cannot have 'max_tokens'" in str(exc_info.value)
+
+    def test_rejected_on_questions(self) -> None:
+        """Test that questions agents cannot have max_tokens."""
+        with pytest.raises(ValidationError) as exc_info:
+            AgentDef(
+                name="q",
+                type="questions",
+                questions=[{"text": "Name?"}],
+                max_tokens=8192,
+            )
+        assert "'questions' agents cannot have 'max_tokens'" in str(exc_info.value)
 
 
 class TestRuntimeConfig:

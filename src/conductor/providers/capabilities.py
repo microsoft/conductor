@@ -118,13 +118,6 @@ class ProviderCapabilities(BaseModel):
     ``max_session_seconds`` wall-clock timeout. False means the setting
     is silently ignored — workflows that set it fail validation."""
 
-    max_tokens: bool = False
-    """``True`` when the provider applies an agent's per-agent
-    ``max_tokens`` output cap.
-
-    ``False`` means the value would be silently ignored, so workflows that
-    set it fail validation instead. Defaults to ``False`` (conservative)."""
-
     checkpoint_resume: bool
     """``True`` when provider session state survives ``conductor resume``
     cleanly (re-establishes session_id, tool state, etc.)."""
@@ -203,6 +196,12 @@ class ProviderCapabilities(BaseModel):
     Agents that set ``session_key:`` against a provider with
     ``session_continuity=False`` fail validation, rather than silently losing
     the context the author asked to keep. Defaults to ``False``."""
+
+    max_tokens: bool = False
+    """``True`` when the provider applies a per-agent ``max_tokens`` output cap.
+
+    ``False`` means the value would be silently ignored, so workflows that set it
+    fail validation instead."""
 
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.

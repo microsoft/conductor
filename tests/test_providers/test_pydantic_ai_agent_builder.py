@@ -164,8 +164,8 @@ class TestSamplingSettings:
         assert pydantic_agent.model_settings["temperature"] == 0.7
         assert pydantic_agent.model_settings["max_tokens"] == 4096
 
-    def test_agent_max_tokens_overrides_runtime_default(self) -> None:
-        """A per-agent max_tokens value takes precedence over the runtime default."""
+    def test_agent_max_tokens_overrides_workflow_default(self) -> None:
+        """A per-agent max_tokens must win over the workflow-level default."""
         agent_def = AgentDef(name="sampler", max_tokens=1000)
 
         pydantic_agent = build_agent(
@@ -176,6 +176,34 @@ class TestSamplingSettings:
         )
 
         assert pydantic_agent.model_settings["max_tokens"] == 1000
+
+    def test_workflow_default_used_when_agent_max_tokens_unset(self) -> None:
+        """With no per-agent override the workflow default still applies."""
+        agent_def = AgentDef(name="sampler")
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            default_max_tokens=4096,
+        )
+        assert pydantic_agent.model_settings["max_tokens"] == 4096
+
+    def test_agent_max_tokens_with_reasoning_coerced(self) -> None:
+        """max_tokens=1000 with reasoning.effort=low produces coerced value."""
+        agent_def = AgentDef(
+            name="sampler",
+            model="claude-3-7-sonnet-latest",
+            max_tokens=1000,
+            reasoning=ReasoningConfig(effort="low"),
+        )
+        pydantic_agent = build_agent(
+            agent_def,
+            system_prompt="",
+            rendered_prompt="",
+            default_max_tokens=4096,
+        )
+        # low = budget 2048, required = 2048 + 4096 = 6144
+        assert pydantic_agent.model_settings["max_tokens"] == 6144
 
 
 class TestReasoningMapping:

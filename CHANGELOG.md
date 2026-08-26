@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
 
+### Added
+
+- `max_tokens` field on `AgentDef` for per-agent output token cap override (#470).
+  Only honoured by the `claude` provider; other providers reject it at
+  validation time via `ProviderCapabilities.max_tokens`.
+
 ### Fixed
 
 - **MCP tool discovery and structured tool results no longer break with MCP

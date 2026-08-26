@@ -1530,10 +1530,10 @@ class AgentDef(BaseModel):
     """
 
     max_tokens: int | None = Field(None, ge=1, le=200000)
-    """Maximum output tokens per response for this agent.
+    """Overrides the workflow-level runtime.max_tokens for this agent. Controls
+    response length, not the context window (that budget is context.max_tokens).
 
-    Overrides the workflow-level runtime.max_tokens for this agent.
-    Only applies to provider-backed agents (not script or human_gate).
+    Rejected on script, workflow, wait, set, and terminate steps.
     """
 
     session_key: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
@@ -1947,6 +1947,13 @@ class AgentDef(BaseModel):
                 "(only 'script' agents support this field)"
             )
 
+        # max_tokens is only meaningful on provider-backed agents.
+        if self.type not in (None, "agent") and self.max_tokens is not None:
+            raise ValueError(
+                f"'{self.type}' agents cannot have 'max_tokens' "
+                "(only provider-backed agents support this field)"
+            )
+
         # Fields exclusive to ``type: questions``. A standalone guard, like the
         # terminate/script ones above, so it also covers types with no branch
         # of their own. The nav flags are tri-state (``bool | None``) precisely
@@ -2090,8 +2097,6 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
-            if self.max_tokens is not None:
-                raise ValueError("script agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("script agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2148,8 +2153,6 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
-            if self.max_tokens is not None:
-                raise ValueError("workflow agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("workflow agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2207,8 +2210,6 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("wait agents cannot have 'max_agent_iterations'")
-            if self.max_tokens is not None:
-                raise ValueError("wait agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("wait agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2282,8 +2283,6 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("set agents cannot have 'max_agent_iterations'")
-            if self.max_tokens is not None:
-                raise ValueError("set agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("set agents cannot have 'session_key'")
             if self.retry is not None:
@@ -2354,8 +2353,6 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("terminate agents cannot have 'max_agent_iterations'")
-            if self.max_tokens is not None:
-                raise ValueError("terminate agents cannot have 'max_tokens'")
             if self.session_key is not None:
                 raise ValueError("terminate agents cannot have 'session_key'")
             if self.max_depth is not None:
