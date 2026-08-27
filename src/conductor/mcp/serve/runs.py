@@ -65,11 +65,31 @@ from conductor.fleet.summary import (
     RunSummary,
     _scan_events,  # crash fallback -- mirrors fleet/history.py's own cross-module reuse
     derive_run_summary,
-    read_event_log_full,
+    stream_event_log,
 )
 from conductor.mcp.serve.options import DEFAULT_MAX_WAIT_SECONDS
 
 logger = logging.getLogger(__name__)
+
+
+def read_event_log_events(path: Path) -> list[dict[str, Any]]:
+    """Read a whole JSONL event log into a list, never raising.
+
+    ``stream_event_log`` (issue #485) replaced the bounded full-log reader
+    this module previously used, and deliberately propagates ``OSError``
+    from the returned generator's first ``next()`` rather than swallowing
+    it. Every caller here is an MCP tool handler answering a question
+    about *some other* process's log, where an unreadable or vanished file
+    is an ordinary outcome rather than a server fault -- so the read is
+    materialised here and the old never-raise contract kept, in one place,
+    rather than at each call site.
+    """
+    try:
+        return list(stream_event_log(path))
+    except OSError:
+        logger.debug("Could not read event log %s", path, exc_info=True)
+        return []
+
 
 # ``ServerSession.send_progress_notification``'s signature (mirrors
 # ``mcp/serve/invoke.py``'s identical alias).
@@ -244,7 +264,7 @@ def _event_log_status_payload(lookup: RunLookup) -> dict[str, Any]:
     rather than re-deriving status from the raw events here."""
     path = lookup.event_log_path
     assert path is not None, "resolve_run only sets source='event_log' alongside a path"
-    events = read_event_log_full(path)
+    events = read_event_log_events(path)
     scan = _scan_events(events)
     # The process is confirmed gone (no live record) and never wrote a
     # terminal record either, so any non-terminal status the scan reports

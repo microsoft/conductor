@@ -1505,7 +1505,7 @@ def read_terminal_record(run_id: str) -> TerminalRunRecord | None:
         parsed, or the parsed payload's own ``run_id`` field doesn't
         exactly equal the requested key.
     """
-    if not _RUN_ID_PATTERN.fullmatch(run_id):
+    if not is_valid_run_id(run_id):
         return None
     filepath = terminal_records_dir() / f"{run_id}.json"
     record, _corrupt, _stat = _load_terminal_record_file(filepath)
@@ -1570,7 +1570,7 @@ def remove_terminal_record(run_id: str) -> bool:
         has a corresponding file by construction) and a removal that was
         attempted but failed or found nothing to remove.
     """
-    if not _RUN_ID_PATTERN.fullmatch(run_id):
+    if not is_valid_run_id(run_id):
         return False
     filepath = terminal_records_dir() / f"{run_id}.json"
     removed = _safe_unlink(filepath)

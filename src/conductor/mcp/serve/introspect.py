@@ -3,7 +3,7 @@
 ``server.py``'s startup summary (E11-T1).
 
 Every function here is a thin adapter over machinery the Fleet Manager
-already built: :func:`conductor.fleet.summary.read_event_log_full` for
+already built: :func:`conductor.mcp.serve.runs.read_event_log_events` for
 :func:`conductor_run_events`, :func:`conductor.fleet.summary.derive_step_detail`
 for :func:`conductor_node_detail`, and a parsed
 :class:`conductor.config.schema.WorkflowConfig` for :func:`conductor_plan_tree`.
@@ -17,7 +17,7 @@ None of this module re-derives run status, activity, or topology -- see
 default" posture by construction -- ``tests/test_mcp/test_serve_introspect.py``
 asserts this directly (rather than assuming it) so a future change to
 ``ActivityLine`` cannot silently reopen the exposure. The payloads *do* still
-live in the raw event records :func:`conductor.fleet.summary.read_event_log_full`
+live in the raw event records :func:`conductor.mcp.serve.runs.read_event_log_events`
 returns (``agent_tool_start.arguments`` / ``agent_tool_complete.result``,
 ``providers/copilot.py:2066``, ``:2079``), so :func:`conductor_run_events` is
 where the reduction is actually applied, gated by ``--introspect-full``.
@@ -31,8 +31,8 @@ from typing import TYPE_CHECKING, Any
 
 from conductor.config.loader import load_config
 from conductor.fleet.records import RunRecord
-from conductor.fleet.summary import derive_step_detail, read_event_log_full
-from conductor.mcp.serve.runs import RunLookup, resolve_run
+from conductor.fleet.summary import derive_step_detail
+from conductor.mcp.serve.runs import RunLookup, read_event_log_events, resolve_run
 
 if TYPE_CHECKING:
     from conductor.config.schema import WorkflowConfig
@@ -209,7 +209,7 @@ def _reduce_tool_payload_field(data: dict[str, Any], field: str, *, full: bool) 
 
 def _reduce_event(evt: dict[str, Any], *, full: bool) -> dict[str, Any]:
     """Apply R4's reduction to one parsed event, never mutating the
-    original (``read_event_log_full``'s result may be read again by
+    original (``read_event_log_events``'s result may be read again by
     another caller)."""
     data = evt.get("data")
     if not isinstance(data, dict):
@@ -288,7 +288,7 @@ def conductor_run_events(
             "error": f"No event log is known for run_id {run_id!r}.",
         }
 
-    events = read_event_log_full(path)
+    events = read_event_log_events(path)
     if event_types is not None:
         wanted = set(event_types)
         events = [evt for evt in events if evt.get("type") in wanted]
