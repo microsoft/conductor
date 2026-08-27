@@ -253,6 +253,135 @@ class TestAlwaysDetached:
         }
         assert structured["workflow"]["pinned"].startswith("hash:")
 
+    async def test_handle_carries_the_port_and_observation_commands(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller reporting a background run to a human quotes the port
+        and a terminal command far more often than the whole URL, so both
+        are first-class handle fields rather than something the caller has
+        to parse back out of ``url``."""
+        registries_config, catalogue = _build_catalogue(conductor_home)
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+
+        content, structured = await invoke_workflow_tool(
+            "review_pr",
+            {"pr_number": 1, "_wait_seconds": 0},
+            catalogue=catalogue,
+            options=ServeOptions(),
+            tracker=LaunchTracker(),
+            registries_config=registries_config,
+        )
+
+        port = structured["port"]
+        assert isinstance(port, int)
+        assert structured["url"].endswith(f":{port}")
+        assert structured["observe"]["dashboard"] == structured["url"]
+        assert structured["observe"]["fleet"] == "conductor fleet"
+        assert structured["observe"]["status"] == "conductor status"
+        assert structured["observe"]["stop"] == f"conductor stop --port {port}"
+        assert set(structured["logs"]) == {"stderr", "stdout"}
+        # The human-readable block names the port and the watch command too,
+        # since that is the text a calling agent echoes back verbatim.
+        text = content[0].text  # type: ignore[union-attr]
+        assert f"port {port}" in text
+        assert "conductor fleet" in text
+        assert "background" in text
+
+    async def test_immediate_next_action_does_not_lead_with_a_blocking_call(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: the handle used to open with "call
+        conductor_await_run(...)", which reads as an instruction to block
+        on a run that is already detached. The blocking option is still
+        offered, but only after the non-blocking ones and explicitly
+        conditioned on the user having asked for it."""
+        registries_config, catalogue = _build_catalogue(conductor_home)
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+
+        _, structured = await invoke_workflow_tool(
+            "review_pr",
+            {"pr_number": 1, "_wait_seconds": 0},
+            catalogue=catalogue,
+            options=ServeOptions(),
+            tracker=LaunchTracker(),
+            registries_config=registries_config,
+        )
+
+        next_action = structured["next"]
+        assert not next_action.startswith("Call conductor_await_run")
+        assert next_action.index("conductor fleet") < next_action.index("conductor_await_run")
+        assert "only if the user asked you to block" in next_action
+
+    async def test_every_observe_command_actually_exists_in_the_cli(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``observe`` block is handed to a human to paste into a
+        terminal, so an invented-but-plausible command is worse than no
+        entry at all -- it fails in front of the user, at the exact moment
+        they were told how to watch their run.
+
+        This resolves each command against the real Typer app rather than a
+        hardcoded list, so a command that is later renamed or removed fails
+        here instead of in someone's shell. (``conductor fleet list --json``
+        shipped in a draft of this block and does not exist.)
+        """
+        import shlex
+
+        import typer
+
+        from conductor.cli.app import app
+
+        registries_config, catalogue = _build_catalogue(conductor_home)
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+
+        _, structured = await invoke_workflow_tool(
+            "review_pr",
+            {"pr_number": 1, "_wait_seconds": 0},
+            catalogue=catalogue,
+            options=ServeOptions(),
+            tracker=LaunchTracker(),
+            registries_config=registries_config,
+        )
+
+        root = typer.main.get_command(app)
+        checked = 0
+        for key, value in structured["observe"].items():
+            if key == "dashboard":
+                continue
+            tokens = shlex.split(value)
+            assert tokens[0] == "conductor", f"{key!r} is not a conductor command: {value!r}"
+            command: Any = root
+            expect_value = False
+            for token in tokens[1:]:
+                if token.startswith("-"):
+                    # An option: it must belong to the command resolved so far.
+                    names = {opt for param in command.params for opt in param.opts}
+                    assert token in names, f"{key!r}: {token!r} is not an option of {value!r}"
+                    expect_value = True
+                    continue
+                if expect_value:
+                    # The value of the option we just validated.
+                    expect_value = False
+                    continue
+                lookup = getattr(command, "get_command", None)
+                resolved = lookup(None, token) if lookup is not None else None
+                assert resolved is not None, (
+                    f"{key!r}: {token!r} is not a subcommand of "
+                    f"{' '.join(tokens[: tokens.index(token)])!r} in {value!r}"
+                )
+                command = resolved
+            checked += 1
+        assert checked >= 3, "observe block shrank -- this guard is no longer covering it"
+
 
 # ---------------------------------------------------------------------------
 # FR5/E9-T4: _wait_seconds resolution (pure function, all four cases)
@@ -280,6 +409,16 @@ class TestResolveWaitSeconds:
 
     def test_omitted_defers_to_auto_mode_returns_immediately(self) -> None:
         assert resolve_wait_seconds(None, mcp_mode="auto", max_wait_seconds=300) == 0.0
+
+    def test_zero_ceiling_forces_every_call_non_blocking(self) -> None:
+        """``--max-wait-seconds 0`` is the operator's hard guarantee that no
+        tool call ever blocks, regardless of what a caller requests or what
+        a workflow declares -- the ceiling applies to *every* blocking path,
+        including the ``mode: sync`` branch that would otherwise resolve to
+        it."""
+        assert resolve_wait_seconds(300, mcp_mode="async", max_wait_seconds=0) == 0.0
+        assert resolve_wait_seconds(None, mcp_mode="sync", max_wait_seconds=0) == 0.0
+        assert resolve_wait_seconds(99_999, mcp_mode="sync", max_wait_seconds=0) == 0.0
 
 
 # ---------------------------------------------------------------------------

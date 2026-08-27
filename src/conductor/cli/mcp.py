@@ -111,7 +111,8 @@ def serve(
             "--max-wait-seconds",
             help=(
                 "Hard ceiling, in seconds, on how long a blocking tool call may "
-                "wait for a terminal run state."
+                "wait for a terminal run state. 0 makes every invocation "
+                "non-blocking, whatever a caller requests or a workflow declares."
             ),
         ),
     ] = _DEFAULT_MAX_WAIT_SECONDS,

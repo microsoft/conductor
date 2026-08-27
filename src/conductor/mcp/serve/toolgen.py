@@ -44,10 +44,18 @@ from conductor.mcp.serve.sanitize import sanitize_description
 WAIT_SECONDS_PARAM = MCP_RESERVED_WAIT_SECONDS_INPUT
 
 _WAIT_SECONDS_DESCRIPTION = (
-    "0 = return immediately; >0 = wait up to N seconds for a terminal run "
-    "state (capped by the server's --max-wait-seconds ceiling regardless of "
-    "the value requested); omitted defers to this workflow's declared "
-    "mcp.mode."
+    "Leave this unset unless the user explicitly asked you to wait. The "
+    "workflow always runs detached in the background either way -- this "
+    "parameter changes only whether THIS tool call blocks before returning. "
+    "Omitted (recommended) returns a run handle within seconds carrying the "
+    "run_id, dashboard URL and port, and the commands to watch it; the run "
+    "keeps going and you can report it back to the user immediately. "
+    ">0 blocks for up to N seconds waiting for a terminal run state, capped "
+    "by the server's --max-wait-seconds ceiling regardless of the value "
+    "requested -- a long-running workflow will simply hold your turn open "
+    "for that whole time and still be running afterwards. 0 is an explicit "
+    "return-immediately. When omitted, a workflow declaring mcp.mode: sync "
+    "is the one case that still blocks."
 )
 
 

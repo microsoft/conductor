@@ -100,11 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no workflow edits required: every workflow in every configured
   registry is exposed by default, with a typed `inputSchema` derived from
   its own `input:` block. A tool call always forks a real detached
-  `conductor run` — the server never executes a workflow in-process —
-  waiting up to a bounded per-call timeout (`_wait_seconds`, capped by
-  `--max-wait-seconds`) before returning: a run that has not completed
-  (immediate, at-gate, failed, or timed-out) returns a handle with the
-  dashboard `url` and `run_id`; a run that completes within the wait
+  `conductor run` — the server never executes a workflow in-process — and
+  by default **returns immediately** with a run handle carrying the
+  `run_id`, dashboard `url` and `port`, the captured log paths, and the
+  `conductor fleet` / `conductor status` commands for watching it from a
+  terminal, so the caller can report the run back and move on while it
+  keeps going. A caller may opt into a bounded wait per call
+  (`_wait_seconds`, capped by `--max-wait-seconds`), which changes only
+  whether *that call* blocks — never how the workflow runs; start the
+  server with `--max-wait-seconds 0` to make every invocation
+  non-blocking regardless of what a caller requests. A run that has not
+  completed (immediate, at-gate, failed, or timed-out) returns the handle;
+  a run that completes within a bounded wait
   returns its output inline, or — once serialized `output:` exceeds 50 KB
   — spilled to a file with a `resource_link` and no dashboard `url`. New
   `conductor_run_status` / `conductor_await_run` / `conductor_cancel_run`

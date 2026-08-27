@@ -194,18 +194,34 @@ the startup summary.
 Invoking a workflow tool (in either direct or discovery mode) **never**
 executes the workflow inside the server process. It always forks a
 detached `conductor run ... --web` child, the same launch path
-`conductor run --web-bg` uses, and returns a handle immediately or after a
-bounded wait — the caller chooses per call (G3, G4):
+`conductor run --web-bg` uses. **The run is detached in every mode** — the
+only thing that ever varies is whether the *tool call* waits for it before
+returning (G3, G4):
 
 - **`_wait_seconds`** — every generated workflow tool accepts this reserved
-  parameter. `0` returns immediately; `> 0` blocks up to that many seconds
-  for a terminal state, capped by the server's `--max-wait-seconds`
-  ceiling regardless of the value requested; omitted defers to the
-  workflow's own `mcp.mode`. Reaching a human gate ends a bounded wait
-  early — see [Limits](#limits).
+  parameter, and the intended answer is to **leave it unset**. Omitted, the
+  call returns a run handle within seconds while the workflow keeps going,
+  so the caller can report the run back and move on. `> 0` blocks up to
+  that many seconds for a terminal state, capped by the server's
+  `--max-wait-seconds` ceiling regardless of the value requested; `0` is an
+  explicit return-immediately. Omitted, a workflow declaring
+  `mcp.mode: sync` is the one case that still blocks. Reaching a human gate
+  ends a bounded wait early — see [Limits](#limits).
+
+  Setting `_wait_seconds` does **not** make the workflow "run properly" —
+  it only holds the caller's turn open. A model that reaches for it on a
+  long workflow will block for the full ceiling and find the run still
+  going afterwards. If you want the guarantee rather than the convention,
+  start the server with **`--max-wait-seconds 0`**: the ceiling applies to
+  every blocking path, so no invocation can block at all, whatever a caller
+  requests or a workflow declares.
+
 - Immediately, at a gate, on failure, or when a bounded wait's deadline is
-  reached, the result is a **handle**: it always includes a **dashboard
-  `url`** (G4), the run's pinned workflow identity, and its `run_id`. See
+  reached, the result is a **handle**. It always includes the run's
+  `run_id`, the dashboard **`url`** (G4) and the **`port`** it bound, the
+  pinned workflow identity, and an **`observe`** block of commands for
+  watching the run from a terminal (`conductor fleet`, `conductor status`,
+  `conductor stop --port <port>`). See
   [the result shapes](#no-outputschema-dd5) below for what a *completed*
   run returns instead.
 - **`conductor_run_status(run_id)`** — status, current step, and (at a

@@ -48,6 +48,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp.types import ResourceLink, TextContent
 from pydantic import AnyUrl
@@ -422,6 +423,43 @@ async def _sleep(seconds: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _dashboard_port(url: str) -> int | None:
+    """Extract the dashboard port from a launch URL, or ``None``.
+
+    ``BackgroundLaunch.url`` is always a bound ``http://host:port`` the
+    launcher read back off the child, so this parses rather than guesses.
+    Returned as its own handle field because a caller reporting a run back
+    to a human quotes the port far more often than the whole URL, and
+    every ``conductor`` command that addresses one run takes ``--port``.
+    """
+    try:
+        return urlsplit(url).port
+    except ValueError:
+        return None
+
+
+def _observe_commands(url: str) -> dict[str, Any]:
+    """The shell commands a caller can hand a human to watch this run (G4).
+
+    The dashboard URL alone answers "where is it", but the caller is
+    usually talking to someone in a terminal. These are the same commands
+    ``conductor status``/``conductor fleet`` publish for a run started by
+    hand -- an MCP-launched run is an ordinary detached run, so nothing
+    here is MCP-specific, and nothing here is synthesised: every entry is
+    a command that exists, since a plausible-looking invented one would be
+    worse than no entry at all.
+    """
+    commands: dict[str, Any] = {
+        "dashboard": url,
+        "fleet": "conductor fleet",
+        "status": "conductor status",
+    }
+    port = _dashboard_port(url)
+    if port is not None:
+        commands["stop"] = f"conductor stop --port {port}"
+    return commands
+
+
 def _run_handle(
     *,
     run_id: str,
@@ -433,11 +471,14 @@ def _run_handle(
 ) -> dict[str, Any]:
     """Build the run handle every invocation returns (API Contracts:
     "Run handle (every invocation, every mode)"). A dashboard URL is always
-    present (G4)."""
+    present (G4), alongside the port it was bound on and the commands that
+    observe the run from a terminal."""
     return {
         "run_id": run_id,
         "status": status,
         "url": url,
+        "port": _dashboard_port(url),
+        "observe": _observe_commands(url),
         "workflow": {
             "name": entry.workflow,
             "registry": entry.registry,
@@ -528,8 +569,11 @@ def _immediate_result(
         started_at=started_at,
         status="running",
         next_action=(
-            f"Call conductor_await_run(run_id={launch.run_id!r}) to wait for a terminal "
-            f"state, or open {launch.url} to watch it live."
+            f"The run is going in the background -- report it to the user now rather than "
+            f"waiting. Watch it at {launch.url}, or with `conductor fleet` in a terminal. "
+            f"Call conductor_run_status(run_id={launch.run_id!r}) for a point-in-time check, "
+            f"or conductor_await_run(run_id={launch.run_id!r}) only if the user asked you "
+            f"to block until it finishes."
         ),
     )
     if not launch.workflow_started:
@@ -541,9 +585,22 @@ def _immediate_result(
             "(plugin fetch, MCP server startup, provider connection) -- check the "
             "dashboard URL above."
         )
+    # The detached child's captured stdio, which `AGENTS.md`'s "Debugging
+    # --web-bg failures" names as the first place to look when a background
+    # run misbehaves silently. Only the immediate return carries these: on
+    # any other path the run has produced a status worth reporting instead.
+    handle["logs"] = {"stderr": str(launch.stderr_log), "stdout": str(launch.stdout_log)}
+    port = handle["port"]
+    port_line = f" (port {port})" if port is not None else ""
     text = TextContent(
         type="text",
-        text=f"Started run {launch.run_id} for {entry.tool_name!r}. Dashboard: {launch.url}",
+        text=(
+            f"Started run {launch.run_id} for {entry.tool_name!r}. It is running detached "
+            f"in the background.\n"
+            f"Dashboard: {launch.url}{port_line}\n"
+            f"Watch it: conductor fleet\n"
+            f"Snapshot: conductor status"
+        ),
     )
     return [text], handle
 

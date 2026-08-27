@@ -102,6 +102,45 @@ class TestBuildInputSchema:
             build_input_schema({WAIT_SECONDS_PARAM: InputDef(type="number")})
 
 
+class TestWaitSecondsSteersTowardBackground:
+    """The reserved parameter's description is the only thing standing
+    between a model and a five-minute blocking tool call.
+
+    Observed failure: a calling model read a description that listed three
+    equally-weighted options with no recommendation and picked
+    ``_wait_seconds: 300`` unprompted, holding its turn open for the whole
+    run even though the run itself was detached the entire time. The
+    description must name omission as the recommendation, and say that
+    setting the parameter does not change how the *workflow* runs.
+    """
+
+    def _wait_property(self) -> dict[str, str]:
+        schema = build_input_schema({})
+        return schema["properties"][WAIT_SECONDS_PARAM]
+
+    def test_recommends_omitting_the_parameter(self) -> None:
+        description = self._wait_property()["description"]
+        assert "Leave this unset" in description
+        assert "recommended" in description
+
+    def test_states_the_run_is_detached_either_way(self) -> None:
+        """Without this, "wait" reads as "run it properly" rather than
+        "block my own call for no benefit"."""
+        description = self._wait_property()["description"]
+        assert "detached in the background either way" in description
+
+    def test_discovery_mode_copy_steers_identically(self) -> None:
+        """``server.py::_DISCOVERY_TOOLS`` hand-writes its own schema for
+        the same reserved parameter (it wraps a workflow rather than being
+        generated from one), so the two copies are free to drift apart."""
+        from conductor.mcp.serve.server import _DISCOVERY_TOOLS
+
+        run_workflow = next(t for t in _DISCOVERY_TOOLS if t.name == "conductor_run_workflow")
+        description = run_workflow.inputSchema["properties"][WAIT_SECONDS_PARAM]["description"]
+        assert "Leave this unset" in description
+        assert "detached in the background either way" in description
+
+
 class TestDescribeWithMode:
     def test_appends_mode(self) -> None:
         result = describe_with_mode("Reviews a PR.", McpConfig(mode="async"))
