@@ -70,6 +70,7 @@ def _prov(
     checked: bool = False,
     connection_ok: bool | None = None,
     connection_error: str | None = None,
+    connection_note: str | None = None,
     models: list[str] | list[ModelDiagnostic] | None = None,
     models_error: str | None = None,
     note: str | None = None,
@@ -97,6 +98,7 @@ def _prov(
         checked=checked,
         connection_ok=connection_ok,
         connection_error=connection_error,
+        connection_note=connection_note,
         models=model_diagnostics,
         models_error=models_error,
         note=note,
@@ -877,10 +879,12 @@ class TestDoctorEncodingFallback:
         """Point the CLI's output console at a fresh buffer with *encoding*.
 
         Returns the raw byte buffer rather than relying on ``result.output``:
-        the CLI's real console is bound directly to it, decoded with the same
-        *encoding* it was written with, so a character neither side can
-        represent surfaces as a decode error rather than being silently
-        swallowed by pytest's own UTF-8 capture.
+        Click's ``CliRunner`` captures through a UTF-8 stream that would
+        accept a glyph a real cp1252 console rejects, so a test could pass
+        on output the user never gets. Binding the CLI's console to a
+        ``TextIOWrapper`` in the target *encoding* makes a leaked glyph
+        raise ``UnicodeEncodeError`` at write time, surfacing via
+        ``result.exception``.
         """
         buffer = io.BytesIO()
         stream = io.TextIOWrapper(buffer, encoding=encoding, newline="")
@@ -890,12 +894,34 @@ class TestDoctorEncodingFallback:
         )
         return buffer, stream
 
+    @pytest.mark.parametrize(
+        "shape_kwargs",
+        [
+            pytest.param({}, id="no-connection-data"),
+            pytest.param(
+                {
+                    "checked": True,
+                    "connection_ok": True,
+                    "connection_note": "probe was inconclusive; endpoint may lack /v1/models",
+                },
+                id="connection-note",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("cli_args", [[], ["--check"], ["--models"]])
     def test_cp1252_console_renders_ascii_glyphs_without_crashing(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        shape_kwargs: dict[str, object],
+        cli_args: list[str],
     ) -> None:
+        # The "connection-note" shape crossed with "--check"/"--models" is
+        # what exercises _connection_cell's warning branch: the two flags
+        # that add the Connection column are the only paths that ever touch
+        # the cp1252 stream with this data (#401 follow-up review).
         buffer, stream = self._bind_console(monkeypatch, "cp1252")
         report = DoctorReport(
-            providers=[_prov("copilot", installed=True)],
+            providers=[_prov("copilot", installed=True, **shape_kwargs)],
             registries=RegistryDiagnostic(
                 default="local",
                 registries=[
@@ -904,13 +930,14 @@ class TestDoctorEncodingFallback:
             ),
         )
         _patch_gather(monkeypatch, report)
-        result = runner.invoke(app, ["doctor"])
+        result = runner.invoke(app, ["doctor", *cli_args])
         stream.flush()
         assert result.exception is None
         assert result.exit_code == 0
-        output = buffer.getvalue().decode("cp1252")  # raises if a raw glyph leaked through
+        # Decode is exact, not lossy; a leaked glyph is caught by the
+        # result.exception assertion above, which fails at write time.
+        output = buffer.getvalue().decode("cp1252")
         assert "OK" in output
-        assert "✓" not in output
 
     def test_utf8_console_keeps_unicode_glyphs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         buffer, stream = self._bind_console(monkeypatch, "utf-8")
@@ -950,7 +977,20 @@ class TestDoctorTierAndModelsErrorCells:
     encoding-fallback tests above, exercised on the default UTF-8 path."""
 
     def test_missing_tier_renders_dash(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        report = DoctorReport(providers=[_prov("copilot", tier=None)])
+        # Credentials and note are filled so the tier cell is the only one
+        # that can render a dash; with _prov's defaults both of those cells
+        # dash too, and the assertion holds even without the tier=None
+        # branch under test (caught by review on #469).
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    tier=None,
+                    creds=[CredentialEnvVar(name="COPILOT_TOKEN", present=True)],
+                    note="see docs",
+                )
+            ]
+        )
         _patch_gather(monkeypatch, report)
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0

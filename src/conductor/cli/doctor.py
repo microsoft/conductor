@@ -41,6 +41,7 @@ class _Glyphs(NamedTuple):
     check: Text
     cross: Text
     dash: Text
+    warn: Text
     optional: str
     """Neutral glyph for an absent *optional* credential — deliberately not
     ``cross``, which is reserved for a genuinely missing required credential
@@ -51,23 +52,26 @@ _UNICODE_GLYPHS = _Glyphs(
     check=Text.from_markup("[green]✓[/green]"),
     cross=Text.from_markup("[red]✗[/red]"),
     dash=Text.from_markup("[dim]—[/dim]"),
+    warn=Text.from_markup("[yellow]⚠[/yellow]"),
     optional="○",
 )
 _ASCII_GLYPHS = _Glyphs(
     check=Text.from_markup("[green]OK[/green]"),
     cross=Text.from_markup("[red]X[/red]"),
     dash=Text.from_markup("[dim]-[/dim]"),
+    warn=Text.from_markup("[yellow]![/yellow]"),
     optional="o",
 )
 
 
 def _encodable(text: str, encoding: str | None) -> bool:
-    """Whether *text* survives a round trip through *encoding*.
+    """Whether *text* can be encoded to *encoding*.
 
-    ``encoding`` of ``None`` (the stream has no ``.encoding`` attribute, e.g.
-    an in-memory buffer) is treated as capable: there is nothing to protect
-    against, so it is better to render full-width Unicode than to needlessly
-    downgrade every invocation to ASCII.
+    A falsy ``encoding`` is treated as capable so an in-memory buffer is not
+    needlessly downgraded. ``io.StringIO`` has an ``.encoding`` of ``None``;
+    rich's ``NULL_FILE`` has no such attribute at all. This is a deliberate
+    fail-open: a stream that is lossy *and* silent about its encoding (e.g.
+    ``codecs.getwriter``) will still raise.
     """
     if not encoding:
         return True
@@ -78,21 +82,26 @@ def _encodable(text: str, encoding: str | None) -> bool:
     return True
 
 
-def _resolve_glyphs(console: Console) -> _Glyphs:
+def _resolve_glyphs(console: MarkupFreeConsole) -> _Glyphs:
     """Pick Unicode or ASCII-safe glyphs for *console*'s stream encoding.
 
     Rich hands a rendered line straight to the underlying file's ``write()``;
     it does not check whether the target encoding can represent it. A legacy
-    Windows console (``cp1252``) cannot encode ``✓``/``✗``/``○``, so the table
-    used to die mid-write, part-printed (issue #401). Resolved once per
-    ``run_doctor`` call and passed down, rather than re-checked per cell: the
-    stream's encoding cannot change mid-render.
+    Windows console (``cp1252``) cannot encode ``✓``/``✗``/``○``/``⚠``, so the
+    table dies mid-write, part-printed (issue #401). Resolved once per
+    ``run_doctor`` call and passed down rather than re-checked per cell, so
+    every cell in one report agrees.
+
+    Probed per glyph rather than through rich's ``ConsoleOptions.ascii_only``,
+    which is a ``startswith("utf")`` prefix test: ``gb18030`` encodes all of
+    these and that check would downgrade it for nothing.
     """
-    encoding = getattr(getattr(console, "file", None), "encoding", None)
+    encoding = console.encoding
     return _Glyphs(
         check=_UNICODE_GLYPHS.check if _encodable("✓", encoding) else _ASCII_GLYPHS.check,
         cross=_UNICODE_GLYPHS.cross if _encodable("✗", encoding) else _ASCII_GLYPHS.cross,
         dash=_UNICODE_GLYPHS.dash if _encodable("—", encoding) else _ASCII_GLYPHS.dash,
+        warn=_UNICODE_GLYPHS.warn if _encodable("⚠", encoding) else _ASCII_GLYPHS.warn,
         optional=_UNICODE_GLYPHS.optional if _encodable("○", encoding) else _ASCII_GLYPHS.optional,
     )
 
@@ -322,7 +331,7 @@ def _connection_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
     if not diag.checked or diag.connection_ok is None:
         return glyphs.dash
     if diag.connection_ok and diag.connection_note:
-        return styled("[yellow]⚠[/yellow] {}", diag.connection_note)
+        return styled("{} {}", glyphs.warn, diag.connection_note)
     if diag.connection_ok:
         return styled("{} connected", glyphs.check)
     if diag.connection_error:
@@ -387,9 +396,9 @@ resolution itself failed). Built as module-level constants to avoid
 re-parsing the same markup literal on every table row (matching the
 ``_UNICODE_GLYPHS``/``_ASCII_GLYPHS`` constants above) — each markup argument
 is still a literal template, not an interpolated value, keeping this inside
-the repo's console rules (see AGENTS.md "Console Output"). None of these
-values are drawn from the encoding-sensitive glyph set, so they need no
-ASCII fallback."""
+the repo's console rules (see AGENTS.md "Console Output"). Every value here
+is pure ASCII, so no fallback applies: a property of these four literals,
+not a rule that anything outside :class:`_Glyphs` is safe to print."""
 
 
 def _rate_cell(value: float | None, glyphs: _Glyphs) -> Text:
@@ -430,7 +439,7 @@ def _render_models(providers: list[ProviderDiagnostic], console: Console, glyphs
     for diag in providers:
         if not diag.models:
             continue
-        table = Table(title=f"Models — {diag.name}", show_lines=True)
+        table = Table(title=f"Models {glyphs.dash.plain} {diag.name}", show_lines=True)
         table.add_column("Model", style="cyan", no_wrap=True)
         table.add_column("Reasoning efforts")
         table.add_column("Default")
