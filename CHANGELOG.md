@@ -5,21 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.34...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.35...HEAD)
 
-### Fixed
-
-- **Plugin flavor resolution (Claude vs. Copilot builds)** (#497). A
-  Claude-built plugin's `agents/*.md` subagents (no `.agent.md` suffix) were
-  silently never loaded — the candidate-file rule was hardcoded to the
-  Copilot build's convention. Flavor is now read off the manifest that
-  actually matched and threaded as a tie-break-only axis through plugin
-  resolution, so `provider: copilot` agents using a Claude-built plugin now
-  get its subagents too. Also adds `~/.copilot/settings.json` marketplace
-  resolution as a fallback for `plugin@marketplace` references, and several
-  new non-fatal warnings when a build cannot be determined unambiguously.
-
-## [0.1.34](https://github.com/microsoft/conductor/compare/v0.1.33...v0.1.34) - 2026-08-24
+## [0.1.35](https://github.com/microsoft/conductor/compare/v0.1.34...v0.1.35) - 2026-08-28
 
 ### Removed
 
@@ -35,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   syntax will be designed against a concrete requirement (emitting an event,
   invoking a `type: script` step, or calling a webhook) rather than rendering a
   template and throwing it away.
+
+### Fixed
+
+- **`conductor doctor`'s table output no longer dies part-written on a
+  `cp1252` console** (#401). The Installed/Credentials/Connection/Models
+  columns hardcoded `✓`/`✗`/`○`/`⚠`, none of which cp1252 can encode, so a
+  run on a legacy Windows console raised `UnicodeEncodeError` mid-table,
+  after the Environment section had already printed. `conductor doctor`
+  now resolves each glyph once per invocation against the output console's
+  stream encoding, falling back to `OK`/`X`/`o`/`!` when the Unicode
+  glyphs cannot be encoded; the `--json` path was already safe and is
+  unchanged.
+- **Plugin flavor resolution (Claude vs. Copilot builds)** (#497). A
+  Claude-built plugin's `agents/*.md` subagents (no `.agent.md` suffix) were
+  silently never loaded — the candidate-file rule was hardcoded to the
+  Copilot build's convention. Flavor is now read off the manifest that
+  actually matched and threaded as a tie-break-only axis through plugin
+  resolution, so `provider: copilot` agents using a Claude-built plugin now
+  get its subagents too. Also adds `~/.copilot/settings.json` marketplace
+  resolution as a fallback for `plugin@marketplace` references, and several
+  new non-fatal warnings when a build cannot be determined unambiguously.
+
+## [0.1.34](https://github.com/microsoft/conductor/compare/v0.1.33...v0.1.34) - 2026-08-24
 
 ### Added
 
@@ -110,15 +121,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as fatal.
 - `runtime.default_reasoning_effort` was silently dropped at run time for every
   provider and is now forwarded through `ProviderRegistry`.
-- **`conductor doctor`'s table output no longer dies part-written on a
-  `cp1252` console** (#401). The Installed/Credentials/Connection/Models
-  columns hardcoded `✓`/`✗`/`○`/`⚠`, none of which cp1252 can encode, so a
-  run on a legacy Windows console raised `UnicodeEncodeError` mid-table,
-  after the Environment section had already printed. `conductor doctor`
-  now resolves each glyph once per invocation against the output console's
-  stream encoding, falling back to `OK`/`X`/`o`/`!` when the Unicode
-  glyphs cannot be encoded; the `--json` path was already safe and is
-  unchanged.
 - **MCP tool discovery and structured tool results no longer break with MCP
   2.0** (#419). MCP 2.0 renamed the Python field on `mcp.types.Tool` from
   `inputSchema` to `input_schema` and on `mcp.types.CallToolResult` from
