@@ -171,6 +171,9 @@ def _report_plugins(
                     base_dir=base_dir,
                     marketplaces=marketplaces_from(sources),
                     declared_sources=set(declared) - set(sources),
+                    on_warning=lambda message: console.print(
+                        styled("  [yellow]⚠[/yellow] {}", message)
+                    ),
                     flavor=flavor,
                 )
             )

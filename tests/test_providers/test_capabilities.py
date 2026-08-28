@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from conductor.providers.capabilities import (
     _NOT_YET_IMPLEMENTED_PROVIDERS,
     ProviderCapabilities,
     get_capabilities,
     known_provider_names,
+    plugin_flavor_for,
     uses_native_skills,
 )
 
@@ -377,3 +379,51 @@ class TestDeclaredSkillsSupport:
             f"providers {undetermined} escape static skill-budget checks; "
             "uses_native_skills must resolve without instantiating them"
         )
+
+
+class TestPluginFlavor:
+    """Issue #497: the two-line heart of the flavor fix — which provider
+    expects which build — is otherwise unguarded. Swapping the two
+    provider constants (``copilot.py``'s and ``claude_agent_sdk.py``'s)
+    reintroduces #497 for both providers with the rest of the suite green.
+    """
+
+    @pytest.mark.parametrize(
+        ("provider_type", "expected"),
+        [
+            ("copilot", "copilot"),
+            ("claude-agent-sdk", "claude"),
+        ],
+    )
+    def test_plugin_capable_providers_declare_their_flavor(
+        self, provider_type: str, expected: str
+    ) -> None:
+        assert plugin_flavor_for(provider_type) == expected
+
+    def test_a_provider_with_no_plugin_support_has_no_flavor(self) -> None:
+        assert plugin_flavor_for("hermes") is None
+
+    def test_an_unknown_provider_has_no_flavor(self) -> None:
+        assert plugin_flavor_for("no-such-provider") is None
+
+    def test_plugins_true_without_a_flavor_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="plugin_flavor is required"):
+            _stable_capabilities(plugins=True, plugin_flavor=None)
+
+    def test_plugins_false_needs_no_flavor(self) -> None:
+        # Must not raise: no plugin surface means no build to prefer.
+        _stable_capabilities(plugins=False, plugin_flavor=None)
+
+    def test_every_plugin_capable_provider_declares_a_flavor(self) -> None:
+        """Keeps a FUTURE plugin-capable provider honest — the model
+        validator alone only catches a missing declaration at construction
+        time; this pins that every provider actually reachable through
+        ``conductor validate`` agrees with it."""
+        unflavored = [
+            name
+            for name in known_provider_names()
+            if name not in _NOT_YET_IMPLEMENTED_PROVIDERS
+            and get_capabilities(name).plugins
+            and plugin_flavor_for(name) is None
+        ]
+        assert not unflavored, f"providers {unflavored} declare plugins=True with no plugin_flavor"

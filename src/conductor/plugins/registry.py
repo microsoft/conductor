@@ -28,11 +28,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from conductor.plugins.agents import PluginAgent, is_agent_candidate, read_plugin_agents
-from conductor.plugins.copilot_settings import read_copilot_marketplaces
+from conductor.plugins.copilot_settings import COPILOT_SETTINGS_RELATIVE, read_copilot_marketplaces
 from conductor.plugins.errors import (
-    PluginError,
     PluginManifestError,
     PluginNotFoundError,
+    PluginSourceError,
     PluginSourceUnavailableError,
 )
 from conductor.plugins.manifest import (
@@ -42,6 +42,7 @@ from conductor.plugins.manifest import (
     PLUGIN_SKILLS_DIR,
     PluginFlavor,
     find_manifest,
+    manifest_flavor,
     read_plugin_manifest,
 )
 from conductor.plugins.marketplace import Marketplace, read_marketplace
@@ -227,28 +228,45 @@ def _installed_marketplace_names(home: Path) -> list[str]:
 
 def _copilot_settings_marketplace_root(
     marketplace: str, plugin: str, home: Path, flavor: PluginFlavor | None
-) -> Path | None:
+) -> tuple[Path | None, str | None]:
     """Resolve a plugin against a marketplace registered in Copilot's own settings.
 
     Scoped to ``flavor == "copilot"`` only: ``~/.copilot/settings.json``
     is the Copilot CLI's own registry, and applying it to a Claude-flavored
     agent would resolve a marketplace the Claude CLI was never told about.
 
-    Never raises: an unreadable settings file, a registered directory that
-    is not actually a marketplace, or one that does not ship ``plugin``
-    all degrade to "not found here" so a later fallback (or the final
-    "neither declared nor installed" error) can still fire.
+    Returns:
+        A ``(root, failure_reason)`` pair. ``root`` is ``None`` and
+        ``failure_reason`` is also ``None`` when the marketplace is simply
+        not registered here — a later fallback (or the final "neither
+        declared nor installed" error) fires unremarked, since nothing was
+        found where nothing was expected. When the marketplace *is*
+        registered but its checkout is broken — an unreadable or unusable
+        catalog, or one that does not ship ``plugin`` — ``root`` stays
+        ``None`` but ``failure_reason`` names the settings file, the
+        registered directory, and the underlying error, so a caller can
+        raise that instead of the misleading "neither declared nor
+        installed" message a genuinely broken *registered* marketplace
+        would otherwise get.
     """
     if flavor != "copilot":
-        return None
+        return None, None
     directory = read_copilot_marketplaces(home).get(marketplace)
     if directory is None:
-        return None
+        return None, None
+    settings_path = home / COPILOT_SETTINGS_RELATIVE
     try:
         resolved = read_marketplace(directory, name=marketplace)
-        return resolved.resolve(plugin, flavor=flavor)
-    except (PluginError, OSError):
-        return None
+        return resolved.resolve(plugin, flavor=flavor), None
+    except PluginNotFoundError as exc:
+        return None, (
+            f"Marketplace {marketplace!r} is registered in {settings_path} at {directory}: {exc}"
+        )
+    except (PluginSourceError, PluginManifestError, OSError) as exc:
+        return None, (
+            f"Marketplace {marketplace!r} is registered in {settings_path} at "
+            f"{directory}, but its catalog could not be read: {exc}"
+        )
 
 
 def _resolve_marketplace_entry(
@@ -306,9 +324,12 @@ def _resolve_marketplace_entry(
     """
     resolved = (marketplaces or {}).get(marketplace)
     if resolved is not None:
+        _settings_shadow_root, _settings_shadow_reason = _copilot_settings_marketplace_root(
+            marketplace, plugin, home, flavor
+        )
         if on_warning is not None and (
             _installed_marketplace_root(marketplace, plugin, home) is not None
-            or _copilot_settings_marketplace_root(marketplace, plugin, home, flavor) is not None
+            or _settings_shadow_root is not None
         ):
             on_warning(
                 f"marketplace {marketplace!r} is declared in 'runtime.plugin_sources' "
@@ -329,7 +350,9 @@ def _resolve_marketplace_entry(
             "acquires it automatically)."
         )
 
-    settings_root = _copilot_settings_marketplace_root(marketplace, plugin, home, flavor)
+    settings_root, settings_failure = _copilot_settings_marketplace_root(
+        marketplace, plugin, home, flavor
+    )
     if settings_root is not None:
         if on_warning is not None:
             on_warning(
@@ -341,6 +364,14 @@ def _resolve_marketplace_entry(
                 "for a standalone workflow."
             )
         return settings_root
+
+    if settings_failure is not None:
+        # The marketplace *is* registered in Copilot's own settings, but
+        # its checkout could not be read — a different, more specific
+        # problem than "neither declared nor installed", which would
+        # otherwise be self-contradictory (this marketplace also appears
+        # in the "Known marketplaces" list below).
+        raise PluginNotFoundError(settings_failure)
 
     installed = _installed_marketplace_names(home)
     settings_names = read_copilot_marketplaces(home) if flavor == "copilot" else {}
@@ -377,13 +408,32 @@ def _resolve_name_entry(
             ``flavor``: that is a genuinely different plugin per
             marketplace, and picking one by flavor would be exactly the
             silent per-machine drift this feature exists to prevent.
-        on_warning: Sink for a notice when the tie-break falls back to the
-            first candidate because none of them matched ``flavor``.
+
+            Determined via :func:`~conductor.plugins.manifest.find_manifest`
+            / :func:`~conductor.plugins.manifest.manifest_flavor` — which
+            only need a candidate's manifest *location*, not its
+            contents — rather than the full :func:`read_plugin_manifest`
+            parse (which also validates ``name`` and loads every declared
+            MCP server). A candidate with a corrupt manifest still has a
+            perfectly knowable flavor from where it sits on disk; failing
+            to parse it here previously dropped it from consideration
+            silently, which could pick the *other* candidate even when
+            the corrupt one was the actual flavor match — a genuinely
+            broken manifest still surfaces, just later, when the chosen
+            root's manifest is read for real.
+        on_warning: Accepted for interface parity with the other
+            ``_resolve_*_entry`` helpers; unused here, since a flavor
+            mismatch now raises rather than warning and falling back to
+            an arbitrary candidate (see Raises).
 
     Raises:
-        PluginNotFoundError: If no installed plugin has that name, or if
+        PluginNotFoundError: If no installed plugin has that name, if
             more than one does and either no ``flavor`` was given or the
-            candidates span more than one marketplace name.
+            candidates span more than one marketplace name, or if
+            ``flavor`` was given but none of the candidates under one
+            marketplace name match it. Picking one anyway would reverse
+            the same ambiguity refusal this module already applies across
+            different marketplaces.
     """
     roots = _installed_roots(entry, home)
     if not roots:
@@ -397,19 +447,19 @@ def _resolve_name_entry(
         marketplace_labels = {root.parent.name for root in roots}
         if flavor is not None and len(marketplace_labels) == 1:
             for root in roots:
-                try:
-                    manifest_flavor = read_plugin_manifest(root).flavor
-                except PluginManifestError:
+                manifest_path = find_manifest(root, prefer=flavor)
+                if manifest_path is None:
                     continue
-                if manifest_flavor == flavor:
+                if manifest_flavor(manifest_path, root) == flavor:
                     return root
-            if on_warning is not None:
-                on_warning(
-                    f"Plugin {entry!r} has {len(roots)} builds under marketplace "
-                    f"{next(iter(marketplace_labels))!r}, none matching this agent's "
-                    f"{flavor!r} flavor; using {roots[0]}."
-                )
-            return roots[0]
+            listed = ", ".join(str(root) for root in roots)
+            qualified = next(iter(marketplace_labels))
+            raise PluginNotFoundError(
+                f"Plugin {entry!r} has {len(roots)} builds under marketplace "
+                f"{qualified!r}, none matching this agent's {flavor!r} flavor: "
+                f"{listed}. Qualify it with the marketplace ({entry}@{qualified}), "
+                "or reference the one you want by path."
+            )
 
         listed = ", ".join(str(root) for root in roots)
         marketplaces = sorted(marketplace_labels)

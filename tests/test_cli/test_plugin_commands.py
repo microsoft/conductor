@@ -251,6 +251,68 @@ class TestList:
         assert result.exit_code == 0, result.output
         assert "./tools/mine" in result.output
 
+    def test_two_providers_get_two_flavor_sections(self, tmp_path: Path) -> None:
+        """Issue #497: two agents on different providers sharing one
+        ``plugins:`` entry list against a dual-catalog marketplace resolve
+        to two different builds, and the cache key must not collapse them
+        into one reported section — mutation-proven: replacing the cache
+        key's flavor component with ``None`` keeps the rest of the suite
+        green while silently regressing this to one section.
+        """
+        catalog = tmp_path / "catalog"
+        _plugin(catalog / "dist" / "claude" / "prs", "prs", agents=["claude-agent"])
+        _plugin(catalog / "dist" / "copilot" / "prs", "prs", agents=["copilot-agent"])
+
+        def _catalog_with_root(root: Path, manifest: str, plugin_root: str) -> None:
+            manifest_dir = root / manifest
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            (manifest_dir / "marketplace.json").write_text(
+                json.dumps(
+                    {
+                        "name": "acme",
+                        "metadata": {"pluginRoot": plugin_root},
+                        "plugins": [{"name": "prs", "source": "./prs"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        _catalog_with_root(catalog, ".claude-plugin", "./dist/claude")
+        _catalog_with_root(catalog, ".github/plugin", "./dist/copilot")
+
+        workflow = tmp_path / "wf.yaml"
+        workflow.write_text(
+            "workflow:\n"
+            "  name: demo\n"
+            "  entry_point: copilot_agent\n"
+            "  runtime:\n"
+            "    provider: copilot\n"
+            f"    plugin_sources:\n      acme: {catalog}\n"
+            "agents:\n"
+            "  - name: copilot_agent\n"
+            "    provider: copilot\n"
+            "    plugins:\n      - prs@acme\n"
+            '    prompt: "Do it."\n'
+            "    output:\n      result:\n        type: string\n"
+            "  - name: claude_agent\n"
+            "    provider: claude-agent-sdk\n"
+            "    plugins:\n      - prs@acme\n"
+            '    prompt: "Do it."\n'
+            "    output:\n      result:\n        type: string\n"
+            "output:\n"
+            '  result: "{{ copilot_agent.output.result }}"\n',
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["plugin", "list", str(workflow)])
+
+        assert result.exit_code == 0, result.output
+        assert result.output.count("Agents:") == 2
+        assert "flavor: copilot" in result.output
+        assert "flavor: claude" in result.output
+        assert "prs:copilot-agent" in result.output
+        assert "prs:claude-agent" in result.output
+
 
 class TestRunPrefetch:
     """``conductor run`` acquires sources before the engine starts.

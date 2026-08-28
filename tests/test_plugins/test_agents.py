@@ -203,3 +203,20 @@ class TestReadPluginAgents:
         (root / "agents" / "bad.md").write_text("---\nname: a\ndescription: d\n---\n\n   \n")
         with pytest.raises(PluginManifestError, match="empty body"):
             read_plugin_agents(root, "demo", flavor="claude")
+
+    def test_claude_flavor_warns_and_skips_doc_with_its_own_frontmatter(
+        self, tmp_path: Path
+    ) -> None:
+        # A regression on this PR's own fix: a static-site doc file (a
+        # Docusaurus/Jekyll/Hugo/MkDocs README) can have valid YAML
+        # frontmatter of its own — `title:`/`sidebar_position:` — which
+        # parses fine and previously tripped the missing-'name' check as a
+        # hard PluginManifestError, aborting the whole plugin.
+        root = make_plugin(tmp_path / "p", "demo", agents=["reviewer"], agent_suffix=".md")
+        (root / "agents" / "README.md").write_text(
+            "---\ntitle: How to use these agents\nsidebar_position: 1\n---\n\nSome prose.\n"
+        )
+        warnings: list[str] = []
+        agents = read_plugin_agents(root, "demo", flavor="claude", on_warning=warnings.append)
+        assert [a.name for a in agents] == ["reviewer"]
+        assert any("README.md" in message for message in warnings)

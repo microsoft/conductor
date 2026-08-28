@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.34...HEAD)
 
+### Fixed
+
+- **Plugin flavor resolution (Claude vs. Copilot builds)** (#497). A
+  Claude-built plugin's `agents/*.md` subagents (no `.agent.md` suffix) were
+  silently never loaded — the candidate-file rule was hardcoded to the
+  Copilot build's convention. Flavor is now read off the manifest that
+  actually matched and threaded as a tie-break-only axis through plugin
+  resolution, so `provider: copilot` agents using a Claude-built plugin now
+  get its subagents too. Also adds `~/.copilot/settings.json` marketplace
+  resolution as a fallback for `plugin@marketplace` references, and several
+  new non-fatal warnings when a build cannot be determined unambiguously.
+
 ## [0.1.34](https://github.com/microsoft/conductor/compare/v0.1.33...v0.1.34) - 2026-08-24
 
 ### Removed

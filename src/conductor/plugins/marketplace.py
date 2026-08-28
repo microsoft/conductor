@@ -31,6 +31,7 @@ manifest wins.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -39,6 +40,8 @@ from typing import Any
 
 from conductor.plugins.errors import PluginNotFoundError, PluginSourceError
 from conductor.plugins.manifest import PluginFlavor, find_manifest, is_plugin_root
+
+logger = logging.getLogger(__name__)
 
 # Catalog manifest locations, paired with the flavor each convention
 # identifies — mirroring :data:`conductor.plugins.manifest.MANIFEST_FLAVORS`,
@@ -316,21 +319,44 @@ def _read_all_catalogs(catalogs: list[tuple[Path, PluginFlavor]], root: Path) ->
     count in particular). ``flavored`` additionally carries one table per
     convention actually present.
 
+    The primary convention is fatal on failure — a caller consulting only
+    :attr:`Marketplace.plugins` needs it to exist. Every secondary
+    convention is best-effort: an unreadable, nameless, or ``plugins``-less
+    secondary catalog is logged and skipped rather than failing the whole
+    marketplace, mirroring :func:`_read_catalog`'s own "one unbuilt
+    variant must not make every other plugin unreachable" principle —
+    extended here from one catalog *entry* to one whole catalog
+    *convention*. Without this, a repository shipping a valid primary
+    catalog and a broken or stale secondary one failed outright where
+    ``main`` (which only ever read the first match) worked.
+
     Args:
         catalogs: Non-empty list of ``(manifest_path, flavor)`` pairs, as
             returned by :func:`_find_all_marketplace_manifests`.
         root: The marketplace root the manifests were found under.
     """
+    primary_manifest, primary_flavor = catalogs[0]
     tables: dict[PluginFlavor, Marketplace] = {
-        flavor: _read_catalog(manifest, root) for manifest, flavor in catalogs
+        primary_flavor: _read_catalog(primary_manifest, root)
     }
-    primary = tables[catalogs[0][1]]
+    for manifest, flavor in catalogs[1:]:
+        try:
+            tables[flavor] = _read_catalog(manifest, root)
+        except PluginSourceError as exc:
+            logger.debug(
+                "Secondary marketplace catalog %s (%r) could not be read, skipping it: %s",
+                manifest,
+                flavor,
+                exc,
+            )
+            continue
+    primary = tables[primary_flavor]
     return Marketplace(
         name=primary.name,
         root=root,
         plugins=primary.plugins,
         is_catalog=True,
-        flavored={flavor: table.plugins for flavor, table in tables.items()},
+        flavored={flavor: dict(table.plugins) for flavor, table in tables.items()},
     )
 
 
@@ -400,15 +426,35 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
         # catalog that no longer ships the named plugin should say so.
         resolved = _read_all_catalogs(catalogs, root)
         assert plugin is not None
+        # Preserve the key set across narrowing rather than dropping a
+        # flavor whose table does not list `plugin` — an empty table
+        # still counts as "this convention exists", which is what keeps
+        # `len(flavored) > 1` (and so the flavor-fallback warning) true
+        # for a plugin published in only one of two catalogs. Dropping
+        # the key collapsed `is_multi_flavor` to `False` and silently
+        # suppressed that warning (issue #497's own failure mode
+        # recurring inside its fix).
         narrowed_flavored: dict[PluginFlavor, dict[str, Path]] = {
-            flavor: {plugin: table[plugin]}
+            flavor: ({plugin: table[plugin]} if plugin in table else {})
             for flavor, table in resolved.flavored.items()
-            if plugin in table
         }
+        # `resolved.plugins` is always the primary (Claude-first) table,
+        # so a plugin published only under the secondary convention is
+        # invisible to a plain `resolved.resolve(plugin)`. Fall back
+        # across the narrowed per-flavor tables (in probe order) before
+        # raising the canonical "does not ship a plugin named" error.
+        narrowed_root = resolved.plugins.get(plugin)
+        if narrowed_root is None:
+            for table in narrowed_flavored.values():
+                if plugin in table:
+                    narrowed_root = table[plugin]
+                    break
+        if narrowed_root is None:
+            narrowed_root = resolved.resolve(plugin)
         return Marketplace(
             name=resolved.name,
             root=root,
-            plugins={plugin: resolved.resolve(plugin)},
+            plugins={plugin: narrowed_root},
             is_catalog=True,
             flavored=narrowed_flavored,
         )

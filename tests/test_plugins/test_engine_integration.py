@@ -94,6 +94,12 @@ class _CapturingProvider(AgentProvider, abstract=True):
         return None
 
 
+class _ClaudeFlavorProvider(_CapturingProvider, abstract=True):
+    """Declares the Claude build's plugin flavor (issue #497)."""
+
+    CAPABILITIES = _CAPS.model_copy(update={"plugin_flavor": "claude"})
+
+
 def _config(
     plugins: list[PluginDef],
     agent_plugins: list[PluginDef] | None = None,
@@ -256,6 +262,29 @@ class TestBothEngineProviderModes:
             via_registry=via_registry,
         )
         assert provider.skill_directories == [str(tmp_path / "prs" / "skills" / "review")]
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+    def test_claude_built_plugin_subagents_reach_the_provider(
+        self, tmp_path: Path, via_registry: bool
+    ) -> None:
+        # Mirrors the executor-level regression test at the engine level
+        # (the ``_StubRegistry`` branch is the one ``conductor run`` uses).
+        make_plugin(
+            tmp_path / "prs",
+            "prs",
+            manifest=".claude-plugin",
+            agents=["code-reviewer"],
+            agent_suffix=".md",
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        provider = _ClaudeFlavorProvider()
+        _run(
+            _config([PluginDef(name="./prs")]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=via_registry,
+        )
         assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
         assert list(provider.extra_mcp_servers or {}) == ["srv"]
 

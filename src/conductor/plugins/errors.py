@@ -53,6 +53,25 @@ class PluginAgentFrontmatterError(PluginManifestError):
     """
 
 
+class PluginNotAnAgentError(PluginManifestError):
+    """Raised when a ``*.md`` candidate reads as documentation, not an agent.
+
+    A subclass of :class:`PluginManifestError` so every existing ``except
+    PluginManifestError`` handler still catches it unchanged. Its own
+    class exists so callers can tell "this is a doc file, not a broken
+    agent" apart from every other kind of manifest failure. Under the
+    Claude build's bare-``*.md`` candidate rule, an ordinary documentation
+    file (a README, a Docusaurus/Jekyll/Hugo/MkDocs page) commonly has its
+    *own* YAML frontmatter — a ``title:``, a ``sidebar_position:`` — so it
+    is not distinguishable from a broken agent by "has frontmatter at
+    all" the way :class:`PluginAgentFrontmatterError` distinguishes a
+    file with none. It is distinguishable by declaring *neither* ``name``
+    nor ``description``: a file declaring exactly one of the two has
+    already claimed to be an agent and stays a hard
+    :class:`PluginManifestError`.
+    """
+
+
 class PluginSourceError(PluginError):
     """Raised when a ``plugin_sources:`` entry cannot be understood.
 

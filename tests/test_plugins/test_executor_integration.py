@@ -99,6 +99,12 @@ class _NoPluginProvider(_CapturingProvider, abstract=True):
         return False
 
 
+class _ClaudeFlavorProvider(_CapturingProvider, abstract=True):
+    """Declares the Claude build's plugin flavor (issue #497)."""
+
+    CAPABILITIES = _CAPS.model_copy(update={"plugin_flavor": "claude"})
+
+
 def _agent(**kwargs: Any) -> AgentDef:
     return AgentDef(name="a", model="m", prompt="Hello", **kwargs)
 
@@ -175,6 +181,90 @@ class TestComponentsReachTheProvider:
         _run(executor, _agent())
         assert provider.custom_agents is not None
         assert provider.extra_mcp_servers is None
+
+    def test_claude_built_plugin_subagents_arrive(self, tmp_path: Path) -> None:
+        # The regression at the heart of issue #497: a Claude-built
+        # plugin's ``agents/*.md`` files (no ``.agent.md`` suffix) were
+        # never read because the candidate rule was hardcoded to the
+        # Copilot suffix. This passes on this branch and yields an empty
+        # ``custom_agents`` on `main` — the missing regression test.
+        make_plugin(
+            tmp_path / "prs",
+            "prs",
+            manifest=".claude-plugin",
+            agents=["code-reviewer"],
+            agent_suffix=".md",
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        provider = _ClaudeFlavorProvider()
+        executor = AgentExecutor(
+            provider,
+            workflow_dir=tmp_path,
+            workflow_plugins=[PluginDef(name="./prs")],
+        )
+        _run(executor, _agent())
+
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+    def test_each_provider_receives_its_own_flavor_build(self, tmp_path: Path) -> None:
+        # A dual-catalog marketplace: each provider must receive its OWN
+        # build's components. This is what actually kills the
+        # `flavor = None` mutation on ``executor/agent.py``'s
+        # ``_resolve_plugins`` — with flavor dropped, both providers would
+        # be served the same (Claude-first) build.
+        from conductor.plugins.marketplace import read_marketplace
+
+        from .conftest import make_marketplace
+
+        catalog = tmp_path / "catalog"
+        make_plugin(
+            catalog / "dist" / "claude" / "prs",
+            "prs",
+            manifest=".claude-plugin",
+            mcp={"claude-only": {"command": "npx"}},
+        )
+        make_plugin(
+            catalog / "dist" / "copilot" / "prs",
+            "prs",
+            manifest=".github/plugin",
+            mcp={"copilot-only": {"command": "npx"}},
+        )
+        make_marketplace(
+            catalog,
+            "acme",
+            {"prs": "./dist/claude/prs"},
+            manifest=".claude-plugin",
+            plugin_root="./dist/claude",
+        )
+        make_marketplace(
+            catalog,
+            "acme",
+            {"prs": "./prs"},
+            manifest=".github/plugin",
+            plugin_root="./dist/copilot",
+        )
+        marketplaces = {"acme": read_marketplace(catalog, name="acme")}
+
+        copilot_provider = _CapturingProvider()
+        claude_provider = _ClaudeFlavorProvider()
+        copilot_executor = AgentExecutor(
+            copilot_provider,
+            workflow_dir=tmp_path,
+            workflow_plugins=[PluginDef(name="prs@acme")],
+            plugin_marketplaces=marketplaces,
+        )
+        claude_executor = AgentExecutor(
+            claude_provider,
+            workflow_dir=tmp_path,
+            workflow_plugins=[PluginDef(name="prs@acme")],
+            plugin_marketplaces=marketplaces,
+        )
+        _run(copilot_executor, _agent())
+        _run(claude_executor, _agent())
+
+        assert list(copilot_provider.extra_mcp_servers or {}) == ["copilot-only"]
+        assert list(claude_provider.extra_mcp_servers or {}) == ["claude-only"]
 
 
 class TestTriStateInheritance:

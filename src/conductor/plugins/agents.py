@@ -56,7 +56,11 @@ from conductor.frontmatter import (
     FrontmatterError,
     split_frontmatter,
 )
-from conductor.plugins.errors import PluginAgentFrontmatterError, PluginManifestError
+from conductor.plugins.errors import (
+    PluginAgentFrontmatterError,
+    PluginManifestError,
+    PluginNotAnAgentError,
+)
 from conductor.plugins.manifest import PLUGIN_AGENTS_DIR, SAFE_NAME, PluginFlavor
 
 logger = logging.getLogger(__name__)
@@ -210,11 +214,16 @@ def read_plugin_agent(path: Path, plugin_name: str) -> PluginAgent:
             :func:`read_plugin_agents` can tell "not an agent" apart from
             "a broken agent" for a candidate that never explicitly
             claimed to be one (see its call site).
+        PluginNotAnAgentError: If the frontmatter parses but declares
+            neither ``name`` nor ``description`` — also a subclass of
+            ``PluginManifestError``, for a documentation file (a README,
+            a static-site page) that has its own unrelated frontmatter
+            rather than a broken agent definition.
         PluginManifestError: If the file cannot be read, has unparseable
-            frontmatter, omits ``name`` or ``description``, declares an
-            unusable ``tools`` list, or has an empty body. Each of these
-            would otherwise register an agent the model cannot use, or
-            drop one the workflow asked for — both silent.
+            frontmatter, omits exactly one of ``name``/``description``,
+            declares an unusable ``tools`` list, or has an empty body.
+            Each of these would otherwise register an agent the model
+            cannot use, or drop one the workflow asked for — both silent.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -233,6 +242,17 @@ def read_plugin_agent(path: Path, plugin_name: str) -> PluginAgent:
             f"Agent definition at {path} has no YAML frontmatter. It must begin with "
             "a '---' line declaring 'name' and 'description', followed by a closing "
             "'---' line and the agent's prompt."
+        )
+
+    has_name = isinstance(parsed.get("name"), str) and bool(parsed.get("name", "").strip())
+    has_description = isinstance(parsed.get("description"), str) and bool(
+        parsed.get("description", "").strip()
+    )
+    if not has_name and not has_description:
+        raise PluginNotAnAgentError(
+            f"Agent definition at {path} declares neither 'name' nor 'description' "
+            "in its YAML frontmatter, so it is treated as documentation rather than "
+            "an agent definition."
         )
 
     name = _require_text(parsed.get("name"), "name", path)
@@ -301,12 +321,13 @@ def read_plugin_agents(
             ``code-reviewer.md`` parses under today's frontmatter rules
             with its extra ``model:``/``color:`` keys ignored harmlessly).
         on_warning: Sink for a non-fatal diagnostic: a Claude-flavor
-            candidate that is not an explicit ``*.agent.md`` and has no
-            frontmatter at all is assumed to be a doc file (a README) and
-            skipped with a warning here, rather than failing the whole
-            plugin. A candidate ending in ``AGENT_SUFFIX`` is an explicit
-            claim to be an agent, so the same "no frontmatter" failure
-            for it stays a hard error — see the raise below.
+            candidate that is not an explicit ``*.agent.md`` and either
+            has no frontmatter at all, or has frontmatter naming neither
+            ``name`` nor ``description``, is assumed to be a doc file (a
+            README, a static-site page) and skipped with a warning here,
+            rather than failing the whole plugin. A candidate ending in
+            ``AGENT_SUFFIX`` is an explicit claim to be an agent, so the
+            same failure for it stays a hard error — see the raise below.
 
     Returns:
         One :class:`PluginAgent` per candidate directly inside the
@@ -347,16 +368,16 @@ def read_plugin_agents(
             ) from exc
         try:
             agent = read_plugin_agent(entry, plugin_name)
-        except PluginAgentFrontmatterError:
+        except (PluginAgentFrontmatterError, PluginNotAnAgentError) as exc:
             if entry.name.endswith(AGENT_SUFFIX):
                 # An explicit ".agent.md" claims to be an agent; no
-                # frontmatter there is a broken agent, not a doc file.
+                # frontmatter there, or frontmatter naming neither "name"
+                # nor "description", is a broken agent, not a doc file.
                 raise
             if on_warning is not None:
                 on_warning(
-                    f"Plugin {plugin_name!r} skipped {entry} — it has no YAML "
-                    "frontmatter, so it is treated as documentation rather than "
-                    "an agent definition."
+                    f"Plugin {plugin_name!r} skipped {entry} — treated as "
+                    f"documentation rather than an agent definition: {exc}"
                 )
             continue
         prior = claimed.get(agent.name)

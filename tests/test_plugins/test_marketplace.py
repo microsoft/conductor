@@ -374,3 +374,59 @@ class TestDualCatalogFlavorResolution:
 
         assert root == tmp_path / "dist" / "claude" / "prs"
         assert any("no 'copilot'-flavored build" in message for message in warnings)
+
+    def test_a_secondary_catalog_that_cannot_be_read_does_not_fail_the_marketplace(
+        self, tmp_path: Path
+    ) -> None:
+        # A repository with a valid primary (Claude) catalog and a broken
+        # secondary (Copilot) one used to hard-fail the whole marketplace —
+        # a strict regression against `main`, which only ever read the
+        # first match. The secondary convention must be best-effort.
+        self._build(tmp_path)
+        (tmp_path / ".github" / "plugin" / "marketplace.json").write_text(
+            "not json", encoding="utf-8"
+        )
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+
+        assert marketplace.plugins == {"prs": tmp_path / "dist" / "claude" / "prs"}
+        assert "copilot" not in marketplace.flavored
+
+    def test_plugin_key_narrowing_preserves_the_multi_flavor_signal(self, tmp_path: Path) -> None:
+        # A plugin published in only one of two catalogs must not make
+        # `plugin:` narrowing collapse `flavored` to a single key — that
+        # silently suppressed the flavor-fallback warning below (issue
+        # #497's own failure mode recurring inside its fix).
+        self._build(tmp_path)
+        shutil.rmtree(tmp_path / "dist" / "copilot")
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="prs")
+
+        assert marketplace.flavored["copilot"] == {}
+        warnings: list[str] = []
+        root = marketplace.resolve("prs", flavor="copilot", on_warning=warnings.append)
+        assert root == tmp_path / "dist" / "claude" / "prs"
+        assert any("no 'copilot'-flavored build" in message for message in warnings)
+
+    def test_plugin_key_narrowing_finds_a_plugin_published_only_in_the_secondary_catalog(
+        self, tmp_path: Path
+    ) -> None:
+        # `resolved.resolve(plugin)` with no flavor only ever consults the
+        # primary (Claude-first) table, so a plugin listed only in the
+        # Copilot catalog was unreachable through the narrowed marketplace
+        # even though its own `flavored` table held a perfectly good entry.
+        make_plugin(tmp_path / "dist" / "copilot" / "solo", "solo", manifest=".github/plugin")
+        make_marketplace(
+            tmp_path, "acme", {}, manifest=".claude-plugin", plugin_root="./dist/claude"
+        )
+        make_marketplace(
+            tmp_path,
+            "acme",
+            {"solo": "./solo"},
+            manifest=".github/plugin",
+            plugin_root="./dist/copilot",
+        )
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="solo")
+
+        assert marketplace.plugins == {"solo": tmp_path / "dist" / "copilot" / "solo"}

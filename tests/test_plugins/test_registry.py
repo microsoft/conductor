@@ -111,12 +111,11 @@ class TestFlavorTieBreak:
         with pytest.raises(PluginNotFoundError, match="ambiguous"):
             resolve_plugin("git", home=home, flavor="copilot")
 
-    def test_no_flavor_match_falls_back_to_the_first_candidate_with_a_warning(
-        self, home: Path
-    ) -> None:
+    def test_no_flavor_match_raises_rather_than_picking_a_winner(self, home: Path) -> None:
         # Both builds under one marketplace happen to be Copilot-flavored;
-        # asking for "claude" cannot find a match, so it falls back rather
-        # than erroring, since there genuinely is only one marketplace name.
+        # asking for "claude" cannot find a match. Picking one silently
+        # would reverse the same ambiguity refusal this module already
+        # applies across different marketplaces, so it raises instead.
         make_plugin(
             home / ".copilot" / "installed-plugins" / "jason-tools" / "ado",
             "ado",
@@ -127,11 +126,27 @@ class TestFlavorTieBreak:
             "ado",
             manifest=".github/plugin",
         )
-        warnings: list[str] = []
-        plugin = resolve_plugin("ado", home=home, flavor="claude", on_warning=warnings.append)
+        with pytest.raises(PluginNotFoundError, match="none matching"):
+            resolve_plugin("ado", home=home, flavor="claude")
 
-        assert plugin.name == "ado"
-        assert any("none matching" in message for message in warnings)
+    def test_a_corrupt_candidate_is_still_correctly_flavor_matched(self, home: Path) -> None:
+        # Flavor is determined from a candidate's manifest *location*, not
+        # its contents, so a corrupt manifest does not stop it being
+        # correctly identified as the flavor match — it is not silently
+        # skipped in favour of a candidate that merely happens to parse.
+        # The genuinely broken manifest still surfaces, just later, when
+        # the chosen root is read for real.
+        make_plugin(
+            home / ".copilot" / "installed-plugins" / "jason-tools" / "ado",
+            "ado",
+            manifest=".github/plugin",
+        )
+        broken = home / ".claude" / "plugins" / "jason-tools" / "ado"
+        (broken / ".claude-plugin").mkdir(parents=True)
+        (broken / ".claude-plugin" / "plugin.json").write_text("not json", encoding="utf-8")
+
+        with pytest.raises(PluginManifestError, match="could not be read"):
+            resolve_plugin("ado", home=home, flavor="claude")
 
 
 class TestPathResolution:
@@ -588,3 +603,57 @@ class TestShadowWarning:
         resolve_plugin("prs@acme", home=home, marketplaces=table, on_warning=warnings.append)
 
         assert warnings == []
+
+
+class TestSettingsRegisteredMarketplaceFailures:
+    """A marketplace registered in ``~/.copilot/settings.json`` whose
+    checkout is broken must not be reported as "neither declared nor
+    installed" — that is self-contradictory (the same name appears in
+    "Known marketplaces") and buries the real cause.
+    """
+
+    def _register(self, home: Path, name: str, directory: Path) -> None:
+        import json
+
+        settings_dir = home / ".copilot"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        (settings_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "extraKnownMarketplaces": {
+                        name: {"source": {"source": "directory", "path": str(directory)}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_corrupt_registered_catalog_names_the_real_cause(
+        self, tmp_path: Path, home: Path
+    ) -> None:
+        directory = tmp_path / "acme-checkout"
+        make_marketplace(directory, "acme", {"prs": "./prs"})
+        (directory / ".claude-plugin" / "marketplace.json").write_text("not json", encoding="utf-8")
+        self._register(home, "acme", directory)
+
+        with pytest.raises(PluginNotFoundError) as excinfo:
+            resolve_plugin("prs@acme", home=home, flavor="copilot")
+
+        message = str(excinfo.value)
+        assert "settings.json" in message
+        assert str(directory) in message
+        assert "neither declared" not in message
+
+    def test_a_registered_marketplace_missing_the_plugin_names_the_real_cause(
+        self, tmp_path: Path, home: Path
+    ) -> None:
+        directory = tmp_path / "acme-checkout"
+        make_plugin(directory, "prs")
+        self._register(home, "acme", directory)
+
+        with pytest.raises(PluginNotFoundError) as excinfo:
+            resolve_plugin("ado@acme", home=home, flavor="copilot")
+
+        message = str(excinfo.value)
+        assert "settings.json" in message
+        assert "neither declared" not in message
