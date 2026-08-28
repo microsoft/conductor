@@ -1012,6 +1012,20 @@ class TestDoctorMcpServeRendering:
         ]
 
 
+def _toml_str(value: str) -> str:
+    """Render *value* as a TOML **literal** string (single-quoted).
+
+    A filesystem path interpolated into a TOML *basic* string is parsed for
+    escape sequences, so a Windows path fails to parse: ``C:\\Users\\...``
+    opens an invalid ``\\U`` unicode escape, and ``\\AppData``/``\\Temp`` are
+    unknown escapes. Literal strings perform no escape processing at all,
+    which is TOML's own answer for paths. Only ``registries.toml`` fixtures
+    carrying a real ``tmp_path`` need this — a hardcoded ``owner/repo``
+    source has no backslashes and is unaffected.
+    """
+    return f"'{value}'"
+
+
 class TestGatherMcpServe:
     """Real (unpatched) ``gather_mcp_serve`` / ``conductor doctor mcp`` tests,
     exercising the actual catalogue-building pipeline against on-disk
@@ -1044,7 +1058,7 @@ class TestGatherMcpServe:
             workflows={"review-pr": _SIMPLE_WORKFLOW_YAML.format(name="review-pr")},
         )
         (home / "registries.toml").write_text(
-            f'[registries.official]\ntype = "path"\nsource = "{entry.source}"\n',
+            f'[registries.official]\ntype = "path"\nsource = {_toml_str(entry.source)}\n',
             encoding="utf-8",
         )
 
@@ -1084,10 +1098,10 @@ class TestGatherMcpServe:
         (home / "registries.toml").write_text(
             "[registries.official]\n"
             'type = "path"\n'
-            f'source = "{official.source}"\n'
+            f"source = {_toml_str(official.source)}\n"
             "[registries.team]\n"
             'type = "path"\n'
-            f'source = "{team.source}"\n',
+            f"source = {_toml_str(team.source)}\n",
             encoding="utf-8",
         )
 
