@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,6 +17,24 @@ from conductor.cli.app import app
 from conductor.mcp.serve.options import ServeOptions
 
 runner = CliRunner()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+"""Matches the SGR escapes Rich emits, mirroring ``test_replay_command.py``.
+
+Load-bearing for the help assertions: ``typer.rich_utils`` sets
+``FORCE_TERMINAL`` at *import* time when ``GITHUB_ACTIONS`` is set, so on CI
+Rich styles the help panel even though nothing is a TTY -- and its option
+highlighter emits the leading dash as its own span
+(``\\x1b[1;36m-\\x1b[0m\\x1b[1;36m-registry\\x1b[0m``), so the literal
+``--registry`` never appears in the raw output. Stripping is the only
+reliable fix: the flag is set before any test can patch the environment, and
+pinning ``COLUMNS`` does not disable colour.
+"""
+
+_WIDE = {"COLUMNS": "200"}
+"""Pinned width so a long flag such as ``--max-concurrent-runs`` is not
+wrapped mid-token by Rich's option column, mirroring ``test_help_panels.py``.
+Stripping ANSI alone would not survive that wrap."""
 
 _REVIEW_PR_YAML = """\
 workflow:
@@ -58,8 +77,9 @@ class TestServeHelp:
     """``conductor mcp --help`` / ``conductor mcp serve --help`` render."""
 
     def test_serve_help_renders(self) -> None:
-        result = runner.invoke(app, ["mcp", "serve", "--help"])
+        result = runner.invoke(app, ["mcp", "serve", "--help"], env=_WIDE)
         assert result.exit_code == 0
+        rendered = _ANSI_RE.sub("", result.output)
         for flag in (
             "--registry",
             "--allow",
@@ -72,7 +92,7 @@ class TestServeHelp:
             "--max-concurrent-runs",
             "--introspect-full",
         ):
-            assert flag in result.output
+            assert flag in rendered
 
     def test_mcp_group_help_renders(self) -> None:
         result = runner.invoke(app, ["mcp", "--help"])
