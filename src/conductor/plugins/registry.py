@@ -27,8 +27,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from conductor.plugins.agents import AGENT_SUFFIX, PluginAgent, read_plugin_agents
+from conductor.plugins.agents import PluginAgent, is_agent_candidate, read_plugin_agents
+from conductor.plugins.copilot_settings import read_copilot_marketplaces
 from conductor.plugins.errors import (
+    PluginError,
     PluginManifestError,
     PluginNotFoundError,
     PluginSourceUnavailableError,
@@ -38,10 +40,11 @@ from conductor.plugins.manifest import (
     PLUGIN_DROPPED_DIRS,
     PLUGIN_MANIFESTS,
     PLUGIN_SKILLS_DIR,
+    PluginFlavor,
     find_manifest,
     read_plugin_manifest,
 )
-from conductor.plugins.marketplace import Marketplace
+from conductor.plugins.marketplace import Marketplace, read_marketplace
 from conductor.skills.registry import (
     ResolvedSkill,
     WarningSink,
@@ -222,6 +225,32 @@ def _installed_marketplace_names(home: Path) -> list[str]:
     return sorted(names)
 
 
+def _copilot_settings_marketplace_root(
+    marketplace: str, plugin: str, home: Path, flavor: PluginFlavor | None
+) -> Path | None:
+    """Resolve a plugin against a marketplace registered in Copilot's own settings.
+
+    Scoped to ``flavor == "copilot"`` only: ``~/.copilot/settings.json``
+    is the Copilot CLI's own registry, and applying it to a Claude-flavored
+    agent would resolve a marketplace the Claude CLI was never told about.
+
+    Never raises: an unreadable settings file, a registered directory that
+    is not actually a marketplace, or one that does not ship ``plugin``
+    all degrade to "not found here" so a later fallback (or the final
+    "neither declared nor installed" error) can still fire.
+    """
+    if flavor != "copilot":
+        return None
+    directory = read_copilot_marketplaces(home).get(marketplace)
+    if directory is None:
+        return None
+    try:
+        resolved = read_marketplace(directory, name=marketplace)
+        return resolved.resolve(plugin, flavor=flavor)
+    except (PluginError, OSError):
+        return None
+
+
 def _resolve_marketplace_entry(
     entry: str,
     plugin: str,
@@ -230,14 +259,24 @@ def _resolve_marketplace_entry(
     marketplaces: Mapping[str, Marketplace] | None,
     declared: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
+    *,
+    flavor: PluginFlavor | None = None,
 ) -> Path:
     """Resolve a ``plugin@marketplace`` entry to one plugin root.
 
     Declared sources are consulted first, then the installed
-    marketplaces. Both populate one table on purpose: a reference means
-    the same thing regardless of how the marketplace got there, so
-    declaring a source in the YAML removes a machine dependency rather
-    than adding a second code path.
+    marketplaces, then — for ``flavor == "copilot"`` only — a marketplace
+    registered in ``~/.copilot/settings.json``. All three populate one
+    table on purpose: a reference means the same thing regardless of how
+    the marketplace got there, so declaring a source in the YAML removes
+    a machine dependency rather than adding a second code path.
+
+    The settings.json fallback is deliberately last: it can only turn a
+    hard "no such marketplace" error into a resolution, never change an
+    answer a declared source or an installed root already gave — so it
+    cannot make an existing workflow resolve differently, only make a
+    previously-failing one succeed the way the Copilot CLI itself already
+    does.
 
     Args:
         entry: The entry verbatim, for messages.
@@ -255,22 +294,28 @@ def _resolve_marketplace_entry(
             is exactly the invisible divergence this feature exists to
             remove: the two may ship different subagents or a different
             MCP server, and the agent's capabilities would change with
-            nothing said.
+            nothing said. Also carries the machine-dependence advisory
+            when resolution falls all the way back to settings.json.
+        flavor: Which build to prefer when the marketplace carries more
+            than one, and the gate on the settings.json fallback.
 
     Raises:
-        PluginNotFoundError: If the marketplace is neither declared nor
-            installed, is declared but unresolved, or ships no such
-            plugin.
+        PluginNotFoundError: If the marketplace is neither declared,
+            installed, nor settings-registered, is declared but
+            unresolved, or ships no such plugin.
     """
     resolved = (marketplaces or {}).get(marketplace)
     if resolved is not None:
-        if on_warning is not None and _installed_marketplace_root(marketplace, plugin, home):
+        if on_warning is not None and (
+            _installed_marketplace_root(marketplace, plugin, home) is not None
+            or _copilot_settings_marketplace_root(marketplace, plugin, home, flavor) is not None
+        ):
             on_warning(
                 f"marketplace {marketplace!r} is declared in 'runtime.plugin_sources' "
                 f"and is also installed on this machine; the declared source "
                 f"({resolved.root}) wins. Remove the source to use the installed one."
             )
-        return resolved.resolve(plugin)
+        return resolved.resolve(plugin, flavor=flavor, on_warning=on_warning)
 
     root = _installed_marketplace_root(marketplace, plugin, home)
     if root is not None:
@@ -284,8 +329,24 @@ def _resolve_marketplace_entry(
             "acquires it automatically)."
         )
 
+    settings_root = _copilot_settings_marketplace_root(marketplace, plugin, home, flavor)
+    if settings_root is not None:
+        if on_warning is not None:
+            on_warning(
+                f"marketplace {marketplace!r} was resolved from this machine's "
+                "'~/.copilot/settings.json' rather than a declared "
+                "'runtime.plugin_sources' entry, so this workflow only resolves it "
+                "the same way on a machine with the same Copilot configuration. "
+                f"Declare a source for {marketplace!r} in 'runtime.plugin_sources' "
+                "for a standalone workflow."
+            )
+        return settings_root
+
     installed = _installed_marketplace_names(home)
-    known = sorted(set(marketplaces or {}) | set(declared or ()) | set(installed))
+    settings_names = read_copilot_marketplaces(home) if flavor == "copilot" else {}
+    known = sorted(
+        set(marketplaces or {}) | set(declared or ()) | set(installed) | set(settings_names)
+    )
     listed = ", ".join(known) if known else "none"
     raise PluginNotFoundError(
         f"Plugin entry {entry!r} names marketplace {marketplace!r}, which is neither "
@@ -294,15 +355,35 @@ def _resolve_marketplace_entry(
     )
 
 
-def _resolve_name_entry(entry: str, home: Path) -> Path:
+def _resolve_name_entry(
+    entry: str,
+    home: Path,
+    *,
+    flavor: PluginFlavor | None = None,
+    on_warning: WarningSink | None = None,
+) -> Path:
     """Resolve a bare plugin name to exactly one installed root.
+
+    Args:
+        entry: The plugin name as written.
+        home: Home directory installed names resolve against.
+        flavor: Breaks a tie between installed candidates, but only when
+            every candidate shares one marketplace directory name (issue
+            #497, Q3) — the confirmed real case is a marketplace directory
+            holding a build for each CLI (e.g. a Copilot build symlinked
+            into a ``~/.claude/plugins/`` tree alongside a genuine Claude
+            build under the Copilot tree). Two *different* marketplaces
+            shipping a same-named plugin stay ambiguous regardless of
+            ``flavor``: that is a genuinely different plugin per
+            marketplace, and picking one by flavor would be exactly the
+            silent per-machine drift this feature exists to prevent.
+        on_warning: Sink for a notice when the tie-break falls back to the
+            first candidate because none of them matched ``flavor``.
 
     Raises:
         PluginNotFoundError: If no installed plugin has that name, or if
-            more than one does. Ambiguity is refused rather than resolved
-            by an arbitrary rule: two marketplaces shipping a ``git``
-            plugin are genuinely different plugins, and picking one
-            silently is how a workflow behaves differently per machine.
+            more than one does and either no ``flavor`` was given or the
+            candidates span more than one marketplace name.
     """
     roots = _installed_roots(entry, home)
     if not roots:
@@ -313,8 +394,25 @@ def _resolve_name_entry(entry: str, home: Path) -> Path:
             "point at it with a path (e.g. './tools/my-plugin')."
         )
     if len(roots) > 1:
+        marketplace_labels = {root.parent.name for root in roots}
+        if flavor is not None and len(marketplace_labels) == 1:
+            for root in roots:
+                try:
+                    manifest_flavor = read_plugin_manifest(root).flavor
+                except PluginManifestError:
+                    continue
+                if manifest_flavor == flavor:
+                    return root
+            if on_warning is not None:
+                on_warning(
+                    f"Plugin {entry!r} has {len(roots)} builds under marketplace "
+                    f"{next(iter(marketplace_labels))!r}, none matching this agent's "
+                    f"{flavor!r} flavor; using {roots[0]}."
+                )
+            return roots[0]
+
         listed = ", ".join(str(root) for root in roots)
-        marketplaces = sorted({root.parent.name for root in roots})
+        marketplaces = sorted(marketplace_labels)
         qualified = ", ".join(f"{entry}@{name}" for name in marketplaces)
         raise PluginNotFoundError(
             f"Plugin {entry!r} is ambiguous — {len(roots)} installed plugins share "
@@ -411,20 +509,22 @@ def _plugin_skills(root: Path, source: str, on_warning: WarningSink | None) -> l
     return resolved
 
 
-def _has_agent_definitions(root: Path) -> bool:
-    """Whether a plugin ships any ``*.agent.md``, without parsing them.
+def _has_agent_definitions(root: Path, flavor: PluginFlavor) -> bool:
+    """Whether a plugin ships any agent candidate, without parsing them.
 
-    Used only to decide whether switching agents off was a real omission
-    worth reporting. Deliberately does not call
-    :func:`~conductor.plugins.agents.read_plugin_agents`: that raises on a
-    malformed definition, which would make ``agents: false`` fail over the
-    very files it opted out of.
+    Uses the same :func:`~conductor.plugins.agents.is_agent_candidate`
+    rule :func:`~conductor.plugins.agents.read_plugin_agents` applies, so
+    ``agents: false`` reporting a real omission never drifts from what
+    ``agents: true`` would actually load. Deliberately does not call
+    ``read_plugin_agents`` itself: that raises on a malformed definition,
+    which would make ``agents: false`` fail over the very files it opted
+    out of.
     """
     agents_dir = root / PLUGIN_AGENTS_DIR
     try:
         if not agents_dir.is_dir():
             return False
-        return any(entry.name.endswith(AGENT_SUFFIX) for entry in agents_dir.iterdir())
+        return any(is_agent_candidate(entry.name, flavor) for entry in agents_dir.iterdir())
     except OSError:
         return False
 
@@ -449,6 +549,7 @@ def _resolve_entry_root(
     marketplaces: Mapping[str, Marketplace] | None,
     declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
+    flavor: PluginFlavor | None = None,
 ) -> Path:
     """Classify a ``plugins:`` entry and resolve it to a plugin root.
 
@@ -462,6 +563,11 @@ def _resolve_entry_root(
     :func:`~conductor.skills.registry.is_path_entry` rule ``skills:``
     uses, so a directory whose name happens to contain ``@`` stays a
     path rather than being split into a marketplace reference.
+
+    ``flavor`` only ever affects the latter two forms, and only when a
+    genuine choice exists (a dual-build marketplace, or an ambiguous bare
+    name sharing one marketplace directory) — a path entry names an exact
+    directory and never has a flavor to choose between.
     """
     if is_path_entry(entry):
         return _resolve_path_entry(entry, base_dir)
@@ -469,9 +575,16 @@ def _resolve_entry_root(
     plugin, marketplace = _split_marketplace_entry(entry)
     if marketplace is not None:
         return _resolve_marketplace_entry(
-            entry, plugin, marketplace, home, marketplaces, declared_sources, on_warning
+            entry,
+            plugin,
+            marketplace,
+            home,
+            marketplaces,
+            declared_sources,
+            on_warning,
+            flavor=flavor,
         )
-    return _resolve_name_entry(entry, home)
+    return _resolve_name_entry(entry, home, flavor=flavor, on_warning=on_warning)
 
 
 def _split_marketplace_entry(entry: str) -> tuple[str, str | None]:
@@ -499,6 +612,7 @@ def resolve_plugin(
     marketplaces: Mapping[str, Marketplace] | None = None,
     declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
+    flavor: PluginFlavor | None = None,
 ) -> ResolvedPlugin:
     """Resolve one ``plugins:`` entry to a plugin and its components.
 
@@ -522,6 +636,16 @@ def resolve_plugin(
             resolved or not, so a reference to one that has not been
             fetched is told to fetch rather than told it does not exist.
         on_warning: Optional sink for non-fatal diagnostics.
+        flavor: The requesting agent's provider's plugin flavor (see
+            :attr:`~conductor.providers.capabilities.ProviderCapabilities.plugin_flavor`).
+            Breaks a tie only where a genuine choice exists — a
+            dual-catalog marketplace, or an ambiguous bare name sharing
+            one marketplace directory (issue #497, Q3). It never gates
+            whether a plugin can be *read* at all: agent parsing always
+            follows the manifest that actually matched
+            (:attr:`~conductor.plugins.manifest.PluginManifest.flavor`),
+            so an agent handed the "wrong" build still gets every
+            subagent that build ships.
 
     Returns:
         The resolved plugin, with disabled components left empty and
@@ -541,11 +665,20 @@ def resolve_plugin(
         marketplaces=marketplaces,
         declared_sources=declared_sources,
         on_warning=on_warning,
+        flavor=flavor,
     )
-    manifest = read_plugin_manifest(root)
+    manifest = read_plugin_manifest(root, prefer=flavor)
 
     skills = _plugin_skills(root, entry, on_warning) if want_skills else []
-    agents = read_plugin_agents(root, manifest.name) if want_agents else []
+    # The agent file convention comes from the manifest that actually
+    # matched, never from ``flavor`` directly — a plugin root can hold
+    # only one build, and parsing it under the wrong convention is the
+    # whole defect this feature fixes (issue #497).
+    agents = (
+        read_plugin_agents(root, manifest.name, flavor=manifest.flavor, on_warning=on_warning)
+        if want_agents
+        else []
+    )
     mcp_servers = dict(manifest.mcp_servers) if want_mcp else {}
 
     # Record what was switched off *and actually present*, so validate
@@ -554,7 +687,7 @@ def resolve_plugin(
     disabled: list[str] = []
     if not want_skills and (root / PLUGIN_SKILLS_DIR).is_dir():
         disabled.append("skills")
-    if not want_agents and _has_agent_definitions(root):
+    if not want_agents and _has_agent_definitions(root, manifest.flavor):
         disabled.append("agents")
     if not want_mcp and manifest.mcp_servers:
         disabled.append("mcp")
@@ -624,6 +757,7 @@ def resolve_plugins(
     marketplaces: Mapping[str, Marketplace] | None = None,
     declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
+    flavor: PluginFlavor | None = None,
 ) -> list[ResolvedPlugin]:
     """Resolve a whole ``plugins:`` list.
 
@@ -638,6 +772,8 @@ def resolve_plugins(
         declared_sources: Names present in ``runtime.plugin_sources``,
             resolved or not.
         on_warning: Optional sink for non-fatal diagnostics.
+        flavor: The requesting agent's provider's plugin flavor. See
+            :func:`resolve_plugin` for what this does and does not gate.
 
     Returns:
         One :class:`ResolvedPlugin` per entry, in order, with duplicate
@@ -675,6 +811,7 @@ def resolve_plugins(
             marketplaces=marketplaces,
             declared_sources=declared_sources,
             on_warning=on_warning,
+            flavor=flavor,
         )
         if plugin.root in by_root:
             # The same plugin reached twice — a name and its equivalent path,

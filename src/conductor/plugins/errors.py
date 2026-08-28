@@ -38,6 +38,21 @@ class PluginManifestError(PluginError):
     """
 
 
+class PluginAgentFrontmatterError(PluginManifestError):
+    """Raised when an agent candidate file has no YAML frontmatter at all.
+
+    A subclass of :class:`PluginManifestError` so every existing
+    ``except PluginManifestError`` handler still catches it unchanged.
+    Its own class exists so callers can tell "this file has no
+    frontmatter" apart from every other kind of manifest failure — the
+    one signal that distinguishes a plain-``.md`` doc file (a README, a
+    changelog) from an actual agent definition. Every other failure
+    (unparseable frontmatter, a missing ``name``, an empty body) stays a
+    hard :class:`PluginManifestError`, because those files already
+    claimed to be an agent by having *some* frontmatter.
+    """
+
+
 class PluginSourceError(PluginError):
     """Raised when a ``plugin_sources:`` entry cannot be understood.
 

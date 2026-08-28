@@ -264,7 +264,15 @@ class AgentExecutor:
         self._declared_plugin_sources: frozenset[str] = frozenset(declared_plugin_sources or ())
         # Keyed by the entries *and* the marketplace table: two agents
         # resolving the same entry names against different tables must
-        # not share a cached answer.
+        # not share a cached answer. Deliberately *not* also keyed by
+        # plugin flavor: flavor is derived once from ``self.provider`` (see
+        # ``_resolve_plugins``) and is therefore constant for the lifetime
+        # of this executor instance — the engine builds a fresh
+        # ``AgentExecutor`` per agent in registry mode (multiple providers
+        # per run), and single-provider mode has exactly one flavor
+        # throughout, so no two calls into one executor's cache can ever
+        # disagree on flavor. A future change letting one executor serve
+        # more than one provider would need to add flavor to this key.
         self._plugin_cache: dict[
             tuple[tuple[tuple[str, bool, bool, bool], ...], tuple[tuple[str, str], ...]],
             list[ResolvedPlugin],
@@ -774,7 +782,7 @@ class AgentExecutor:
         """Resolve plugin entries against the workflow file's directory.
 
         Memoized per entry list, because resolving a plugin walks its
-        ``skills/`` tree and parses every ``*.agent.md`` it ships, and
+        ``skills/`` tree and parses every agent definition it ships, and
         this runs once per agent per call.
 
         Each marketplace's *name and root* are part of the key, not just
@@ -792,12 +800,19 @@ class AgentExecutor:
         if cached is not None:
             return list(cached)
 
+        # Derived from the provider's capability descriptor, not stored
+        # separately — see the ``_plugin_cache`` docstring in ``__init__``
+        # for why this is safe to omit from the cache key.
+        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        flavor = getattr(capabilities, "plugin_flavor", None) if capabilities is not None else None
+
         resolved = resolve_plugins(
             entries,
             base_dir=self._workflow_dir,
             marketplaces=self._plugin_marketplaces,
             declared_sources=self._declared_plugin_sources,
             on_warning=lambda message: _verbose_log(f"  Plugins: {message}", style="yellow"),
+            flavor=flavor,
         )
         self._plugin_cache[key] = list(resolved)
         return resolved

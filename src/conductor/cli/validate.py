@@ -114,11 +114,16 @@ def _report_plugins(
     from conductor.plugins.errors import PluginError, PluginFetchError
     from conductor.plugins.registry import resolve_plugins
     from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+    from conductor.providers.capabilities import plugin_flavor_for
     from conductor.skills import SkillError
 
     base_dir = workflow_path.resolve().parent
     declared = config.workflow.runtime.plugin_sources
     sources: dict[str, Any] = {}
+    # The workflow-level default provider's flavor, since this reports the
+    # workflow-level ``runtime.plugins`` list only (see the docstring) —
+    # there is no single per-agent flavor to prefer here.
+    flavor = plugin_flavor_for(config.workflow.runtime.provider.name)
     if declared:
         # Cache-only, like everything else in ``conductor validate``: this
         # is a summary, and a summary must not clone. Resolved one at a
@@ -166,6 +171,7 @@ def _report_plugins(
                     base_dir=base_dir,
                     marketplaces=marketplaces_from(sources),
                     declared_sources=set(declared) - set(sources),
+                    flavor=flavor,
                 )
             )
         except (PluginError, SkillError, OSError) as exc:

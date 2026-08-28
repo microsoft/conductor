@@ -645,6 +645,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``ClaudeAgentOptions.agents``, MCP through the same temp-file
         # config the workflow's own servers use.
         plugins=True,
+        # Reads the Claude build's ``agents/*.md`` convention (issue #497).
+        # Only breaks ties where a genuine choice exists — parsing always
+        # follows whichever manifest convention actually matched.
+        plugin_flavor="claude",
         # ``session_key`` is honored: executions sharing a key resume one
         # Claude session, and the map is persisted across ``conductor resume``.
         session_continuity=True,

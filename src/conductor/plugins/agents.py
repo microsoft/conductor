@@ -1,4 +1,4 @@
-"""Parse a plugin's ``agents/<name>.agent.md`` subagent definitions.
+"""Parse a plugin's ``agents/`` subagent definitions.
 
 A plugin's subagents are the component whose absence started issue #378:
 a skill loads, reads instructions telling it to dispatch to
@@ -6,9 +6,20 @@ a skill loads, reads instructions telling it to dispatch to
 than handing the SDK the whole plugin root — see :mod:`conductor.plugins`
 for why.
 
-The format is the one both agent CLIs write: ``---`` fenced YAML
-declaring ``name``, ``description``, and optionally ``tools``, followed
-by the agent's system prompt as the body.
+The two builds use different filenames and dialects. The Copilot CLI
+writes ``agents/<name>.agent.md``; Claude Code writes ``agents/<name>.md``
+with extra ``model:``/``color:`` keys Conductor ignores. Verified against
+the real trees of one plugin published for both: the Copilot build's
+``code-reviewer.agent.md`` and the Claude build's ``code-reviewer.md``
+declare the same frontmatter fields Conductor reads, plus the ones it
+does not. So the candidate filename rule is picked per
+:class:`~conductor.plugins.manifest.PluginFlavor` (see
+:func:`read_plugin_agents`), never assumed from the location a plugin
+happens to be read from.
+
+Both share the same ``---`` fenced YAML shape: ``name``, ``description``,
+and optionally ``tools``, followed by the agent's system prompt as the
+body.
 
 .. code-block:: text
 
@@ -35,6 +46,7 @@ exists to fix, so every parsed agent is registered with ``infer`` set.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,14 +56,15 @@ from conductor.frontmatter import (
     FrontmatterError,
     split_frontmatter,
 )
-from conductor.plugins.errors import PluginManifestError
-from conductor.plugins.manifest import PLUGIN_AGENTS_DIR, SAFE_NAME
+from conductor.plugins.errors import PluginAgentFrontmatterError, PluginManifestError
+from conductor.plugins.manifest import PLUGIN_AGENTS_DIR, SAFE_NAME, PluginFlavor
 
 logger = logging.getLogger(__name__)
 
-# Suffix identifying an agent definition inside a plugin's ``agents/``
-# directory. Both CLIs use it, and it keeps a stray README from being
-# parsed as an agent.
+# Suffix identifying a Copilot-build agent definition inside a plugin's
+# ``agents/`` directory. It keeps a stray README from being parsed as an
+# agent — the Claude build has no such marker, so its candidate rule is a
+# bare ``*.md`` instead (see :func:`read_plugin_agents`).
 AGENT_SUFFIX: str = ".agent.md"
 
 
@@ -181,7 +194,7 @@ def _parse_tools(value: Any, path: Path) -> list[str] | None:
 
 
 def read_plugin_agent(path: Path, plugin_name: str) -> PluginAgent:
-    """Parse one ``*.agent.md`` file.
+    """Parse one agent definition file.
 
     Args:
         path: Absolute path to the agent definition.
@@ -192,12 +205,16 @@ def read_plugin_agent(path: Path, plugin_name: str) -> PluginAgent:
         The parsed :class:`PluginAgent`.
 
     Raises:
-        PluginManifestError: If the file cannot be read, has no
-            frontmatter, has unparseable frontmatter, omits ``name`` or
-            ``description``, declares an unusable ``tools`` list, or has
-            an empty body. Each of these would otherwise register an
-            agent the model cannot use, or drop one the workflow asked
-            for — both silent.
+        PluginAgentFrontmatterError: If the file has no YAML frontmatter
+            at all — a subclass of ``PluginManifestError``, split out so
+            :func:`read_plugin_agents` can tell "not an agent" apart from
+            "a broken agent" for a candidate that never explicitly
+            claimed to be one (see its call site).
+        PluginManifestError: If the file cannot be read, has unparseable
+            frontmatter, omits ``name`` or ``description``, declares an
+            unusable ``tools`` list, or has an empty body. Each of these
+            would otherwise register an agent the model cannot use, or
+            drop one the workflow asked for — both silent.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -212,7 +229,7 @@ def read_plugin_agent(path: Path, plugin_name: str) -> PluginAgent:
         ) from exc
 
     if parsed is None:
-        raise PluginManifestError(
+        raise PluginAgentFrontmatterError(
             f"Agent definition at {path} has no YAML frontmatter. It must begin with "
             "a '---' line declaring 'name' and 'description', followed by a closing "
             "'---' line and the agent's prompt."
@@ -245,15 +262,54 @@ def read_plugin_agent(path: Path, plugin_name: str) -> PluginAgent:
     )
 
 
-def read_plugin_agents(root: Path, plugin_name: str) -> list[PluginAgent]:
+def _candidate_suffix(flavor: PluginFlavor) -> str | None:
+    """The filename suffix identifying an agent candidate for ``flavor``.
+
+    ``None`` for the Claude build signals "any ``*.md``" rather than a
+    fixed suffix — the Claude CLI's own convention has no marker
+    narrower than the extension, unlike the Copilot build's
+    :data:`AGENT_SUFFIX`. Callers branch on ``None`` rather than being
+    handed a spurious ``".md"`` that would also match nothing named
+    ``.agent.md``, since ``"x.agent.md".endswith(".md")`` is true too.
+    """
+    return AGENT_SUFFIX if flavor == "copilot" else None
+
+
+def is_agent_candidate(name: str, flavor: PluginFlavor) -> bool:
+    """Whether ``name`` is an agent candidate under ``flavor``'s convention."""
+    suffix = _candidate_suffix(flavor)
+    return name.endswith(suffix) if suffix is not None else name.endswith(".md")
+
+
+def read_plugin_agents(
+    root: Path,
+    plugin_name: str,
+    *,
+    flavor: PluginFlavor,
+    on_warning: Callable[[str], None] | None = None,
+) -> list[PluginAgent]:
     """Parse every agent definition a plugin ships.
 
     Args:
         root: Plugin root.
         plugin_name: Name of the plugin, used to namespace each agent.
+        flavor: Which build's ``agents/`` convention to apply — read off
+            the plugin's own manifest by the caller, never guessed from
+            ``root``'s location. The Copilot build only admits
+            ``*.agent.md``; the Claude build admits any ``*.md``, since
+            it has no narrower marker (verified: the real Claude-build
+            ``code-reviewer.md`` parses under today's frontmatter rules
+            with its extra ``model:``/``color:`` keys ignored harmlessly).
+        on_warning: Sink for a non-fatal diagnostic: a Claude-flavor
+            candidate that is not an explicit ``*.agent.md`` and has no
+            frontmatter at all is assumed to be a doc file (a README) and
+            skipped with a warning here, rather than failing the whole
+            plugin. A candidate ending in ``AGENT_SUFFIX`` is an explicit
+            claim to be an agent, so the same "no frontmatter" failure
+            for it stays a hard error — see the raise below.
 
     Returns:
-        One :class:`PluginAgent` per ``*.agent.md`` directly inside the
+        One :class:`PluginAgent` per candidate directly inside the
         plugin's ``agents/`` directory, sorted by file name. Empty when
         the plugin ships no ``agents/`` directory.
 
@@ -280,7 +336,7 @@ def read_plugin_agents(root: Path, plugin_name: str) -> list[PluginAgent]:
     agents: list[PluginAgent] = []
     claimed: dict[str, Path] = {}
     for entry in entries:
-        if not entry.name.endswith(AGENT_SUFFIX):
+        if not is_agent_candidate(entry.name, flavor):
             continue
         try:
             if not entry.is_file():
@@ -289,7 +345,20 @@ def read_plugin_agents(root: Path, plugin_name: str) -> list[PluginAgent]:
             raise PluginManifestError(
                 f"Agent definition at {entry} could not be read: {exc}"
             ) from exc
-        agent = read_plugin_agent(entry, plugin_name)
+        try:
+            agent = read_plugin_agent(entry, plugin_name)
+        except PluginAgentFrontmatterError:
+            if entry.name.endswith(AGENT_SUFFIX):
+                # An explicit ".agent.md" claims to be an agent; no
+                # frontmatter there is a broken agent, not a doc file.
+                raise
+            if on_warning is not None:
+                on_warning(
+                    f"Plugin {plugin_name!r} skipped {entry} — it has no YAML "
+                    "frontmatter, so it is treated as documentation rather than "
+                    "an agent definition."
+                )
+            continue
         prior = claimed.get(agent.name)
         if prior is not None:
             raise PluginManifestError(

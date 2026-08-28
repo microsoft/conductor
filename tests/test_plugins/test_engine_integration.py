@@ -48,6 +48,7 @@ _CAPS = ProviderCapabilities(
     concurrent_safe=True,
     skills=True,
     plugins=True,
+    plugin_flavor="copilot",
 )
 
 

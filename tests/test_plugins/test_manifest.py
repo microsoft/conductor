@@ -16,9 +16,11 @@ import pytest
 
 from conductor.plugins.errors import PluginManifestError
 from conductor.plugins.manifest import (
+    MANIFEST_FLAVORS,
     PLUGIN_MANIFESTS,
     find_manifest,
     is_plugin_root,
+    manifest_flavor,
     read_plugin_manifest,
 )
 
@@ -50,6 +52,57 @@ class TestBothConventionsResolve:
         assert not is_plugin_root(tmp_path / "plain")
         with pytest.raises(PluginManifestError, match="is not a plugin"):
             read_plugin_manifest(tmp_path / "plain")
+
+
+class TestFlavor:
+    """Flavor is read off whichever manifest convention actually matched."""
+
+    @pytest.mark.parametrize(
+        ("convention", "expected"), [(".claude-plugin", "claude"), (".github/plugin", "copilot")]
+    )
+    def test_flavor_matches_convention(
+        self, tmp_path: Path, convention: str, expected: str
+    ) -> None:
+        root = make_plugin(tmp_path / "p", "demo", manifest=convention)
+        assert read_plugin_manifest(root).flavor == expected
+
+    def test_prefer_reorders_the_probe(self, tmp_path: Path) -> None:
+        # A root with both conventions present would normally resolve
+        # Claude-first; asking for "copilot" moves that convention first
+        # instead, without excluding the other one from consideration.
+        root = make_plugin(tmp_path / "p", "claude-name", manifest=".claude-plugin")
+        github = root / ".github" / "plugin"
+        github.mkdir(parents=True)
+        (github / "plugin.json").write_text(json.dumps({"name": "github-name"}))
+        manifest = read_plugin_manifest(root, prefer="copilot")
+        assert manifest.name == "github-name"
+        assert manifest.flavor == "copilot"
+
+    def test_prefer_does_not_exclude_the_other_convention(self, tmp_path: Path) -> None:
+        # A root that only ships the Claude convention still resolves when
+        # "copilot" is preferred — prefer reorders, it never excludes.
+        root = make_plugin(tmp_path / "p", "demo", manifest=".claude-plugin")
+        manifest = read_plugin_manifest(root, prefer="copilot")
+        assert manifest.name == "demo"
+        assert manifest.flavor == "claude"
+
+    def test_manifest_flavor_matches_each_convention(self, tmp_path: Path) -> None:
+        for relative, flavor in MANIFEST_FLAVORS:
+            root = tmp_path / flavor
+            root.mkdir()
+            assert manifest_flavor(root / relative, root) == flavor
+
+    def test_manifest_flavor_rejects_a_path_outside_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        with pytest.raises(PluginManifestError, match="is not under plugin root"):
+            manifest_flavor(tmp_path / "elsewhere" / "plugin.json", root)
+
+    def test_manifest_flavor_rejects_an_unrecognised_relative_path(self, tmp_path: Path) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        with pytest.raises(PluginManifestError, match="does not match any recognised"):
+            manifest_flavor(root / "weird" / "plugin.json", root)
 
 
 class TestManifestName:

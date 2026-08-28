@@ -5,12 +5,24 @@ The single definition of "what a plugin root looks like", shared by
 and :mod:`conductor.skills.registry` (which walks up from a skill
 directory to find the plugin that owns it, for claude-agent-sdk).
 
-Two conventions are recognised. Claude Code writes
-``.claude-plugin/plugin.json``; the Copilot CLI writes
-``.github/plugin/plugin.json``. Both resolve at runtime — verified
-against a live Copilot session with a synthetic plugin under each — so
-recognising only the former is Conductor's own gap, not an upstream one.
-On a fairly ordinary machine that strands 12 of 13 installed plugins.
+Two conventions are recognised, and each names a **flavor** — which CLI's
+*build* of a plugin this is, not which CLI happens to be reading it.
+Claude Code writes ``.claude-plugin/plugin.json`` (flavor ``"claude"``);
+the Copilot CLI writes ``.github/plugin/plugin.json`` (flavor
+``"copilot"``). Both resolve at runtime — verified against a live Copilot
+session with a synthetic plugin under each — so recognising only the
+former is Conductor's own gap, not an upstream one. On a fairly ordinary
+machine that strands 12 of 13 installed plugins.
+
+The flavor matters below the manifest, not just at it: the Claude build's
+``agents/*.md`` and the Copilot build's ``agents/*.agent.md`` are
+different file sets, and a directory is not reliable evidence of either —
+a marketplace-installed plugin can be a Copilot build sitting inside a
+``~/.claude/plugins/`` tree (a real, confirmed configuration; the CLI that
+installed it there does not rebuild the plugin's own manifest). So the
+flavor is read off the manifest that actually matched, once per plugin
+root, and threaded to whatever downstream code needs to pick a
+convention-specific rule (see :mod:`conductor.plugins.agents`).
 
 Kept free of any :mod:`conductor.skills` import so the edge from
 ``skills.registry`` into this module cannot become a cycle — see the
@@ -23,18 +35,28 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from conductor.plugins.errors import PluginManifestError
 
-# Manifest locations, in probe order. Both are recognised because both
-# exist in the wild; no plugin observed ships both, and if one ever does
-# the first match wins rather than the two being merged — a merge would
-# have to invent a precedence rule for every field.
-PLUGIN_MANIFESTS: tuple[Path, ...] = (
-    Path(".claude-plugin") / "plugin.json",
-    Path(".github") / "plugin" / "plugin.json",
+# Which CLI's build of a plugin this is — determined by which manifest
+# convention matched, never by where the plugin happens to live on disk.
+PluginFlavor = Literal["copilot", "claude"]
+
+# Manifest locations, paired with the flavor each convention identifies,
+# in probe order. Both are recognised because both exist in the wild; no
+# plugin observed ships both, and if one ever does the first match wins
+# rather than the two being merged — a merge would have to invent a
+# precedence rule for every field.
+MANIFEST_FLAVORS: tuple[tuple[Path, PluginFlavor], ...] = (
+    (Path(".claude-plugin") / "plugin.json", "claude"),
+    (Path(".github") / "plugin" / "plugin.json", "copilot"),
 )
+
+# Derived so existing importers (``registry.py``'s error text) see no
+# change — this is still every recognised manifest location, in the same
+# order, just no longer the single source of truth for that order.
+PLUGIN_MANIFESTS: tuple[Path, ...] = tuple(relative for relative, _ in MANIFEST_FLAVORS)
 
 # Conventional MCP declaration file at a plugin root, used when the
 # manifest does not name one explicitly.
@@ -95,6 +117,14 @@ class PluginManifest:
     the plugin worth enabling.
     """
 
+    flavor: PluginFlavor
+    """Which CLI's build of this plugin is on disk, determined by which
+    manifest convention actually matched — never by where the plugin
+    lives. This is what lets :func:`conductor.plugins.agents.read_plugin_agents`
+    pick the right ``agents/`` file convention even when the directory
+    itself is misleading (e.g. a Copilot build symlinked into a
+    ``~/.claude/plugins/`` tree)."""
+
     def __post_init__(self) -> None:
         """Enforce the invariants the field docstrings above assert.
 
@@ -121,18 +151,40 @@ class PluginManifest:
             raise PluginManifestError(f"PluginManifest.root must be absolute, got {self.root!s}")
 
 
-def find_manifest(root: Path) -> Path | None:
+def _probe_order(prefer: PluginFlavor | None) -> tuple[Path, ...]:
+    """Order the manifest probe, optionally favouring one flavor.
+
+    ``prefer=None`` keeps :data:`MANIFEST_FLAVORS`' declared order
+    exactly — this is what every existing caller (including
+    :func:`~conductor.skills.registry.resolve_skill_plugin`, which never
+    passes ``prefer``) continues to see. A given flavor's convention is
+    moved to the front, not removed from consideration: a dual-catalog
+    marketplace picks a flavor deliberately, but a plugin root that only
+    ships the *other* convention must still resolve.
+    """
+    if prefer is None:
+        return PLUGIN_MANIFESTS
+    preferred = tuple(relative for relative, flavor in MANIFEST_FLAVORS if flavor == prefer)
+    rest = tuple(relative for relative, flavor in MANIFEST_FLAVORS if flavor != prefer)
+    return preferred + rest
+
+
+def find_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> Path | None:
     """Return the plugin manifest inside ``root``, if there is one.
 
     Args:
         root: Candidate plugin root.
+        prefer: Flavor to probe for first. Reorders which convention is
+            checked first; it never excludes the other one, since a
+            plugin root can only ever hold one manifest anyway. ``None``
+            (the default) keeps the historical Claude-first probe order.
 
     Returns:
-        Path to the first manifest found, probing
-        :data:`PLUGIN_MANIFESTS` in order, or ``None`` when ``root`` is
-        not a plugin root.
+        Path to the first manifest found, probing in the order
+        :func:`_probe_order` gives, or ``None`` when ``root`` is not a
+        plugin root.
     """
-    for relative in PLUGIN_MANIFESTS:
+    for relative in _probe_order(prefer):
         candidate = root / relative
         try:
             if candidate.is_file():
@@ -147,6 +199,39 @@ def find_manifest(root: Path) -> Path | None:
 def is_plugin_root(root: Path) -> bool:
     """Whether ``root`` holds a recognised plugin manifest."""
     return find_manifest(root) is not None
+
+
+def manifest_flavor(manifest: Path, root: Path) -> PluginFlavor:
+    """Which flavor's convention a matched manifest path belongs to.
+
+    Args:
+        manifest: A manifest path returned by :func:`find_manifest` for
+            ``root`` (or otherwise known to sit at one of
+            :data:`MANIFEST_FLAVORS`' relative locations under it).
+        root: The plugin root ``manifest`` was found under.
+
+    Returns:
+        The flavor whose convention matches.
+
+    Raises:
+        PluginManifestError: If ``manifest`` is not one of the recognised
+            relative locations under ``root`` — a caller error, since
+            every manifest reaching here should have come from
+            :func:`find_manifest`.
+    """
+    try:
+        relative = manifest.relative_to(root)
+    except ValueError as exc:
+        raise PluginManifestError(
+            f"Manifest {manifest} is not under plugin root {root}, so its flavor "
+            "cannot be determined."
+        ) from exc
+    for candidate, flavor in MANIFEST_FLAVORS:
+        if relative == candidate:
+            return flavor
+    raise PluginManifestError(
+        f"Manifest {manifest} does not match any recognised convention under {root}."
+    )
 
 
 def _parse_manifest_json(manifest: Path) -> dict[str, Any]:
@@ -323,22 +408,28 @@ def read_manifest_name(manifest: Path) -> str:
     return _read_manifest_name(manifest, _parse_manifest_json(manifest))
 
 
-def read_plugin_manifest(root: Path) -> PluginManifest:
+def read_plugin_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> PluginManifest:
     """Read the manifest of the plugin rooted at ``root``.
 
     Args:
         root: Plugin root — the directory holding ``.claude-plugin/`` or
             ``.github/plugin/``. Must be absolute.
+        prefer: Flavor to probe for first when ``root`` might hold either
+            convention. Only meaningful when both actually exist, which
+            no observed plugin does; passed through to :func:`find_manifest`
+            regardless so the probe order is consistent either way.
 
     Returns:
-        The parsed :class:`PluginManifest`.
+        The parsed :class:`PluginManifest`, with :attr:`PluginManifest.flavor`
+        set to whichever convention actually matched — not necessarily
+        ``prefer``.
 
     Raises:
         PluginManifestError: If ``root`` holds no recognised manifest, or
             the manifest is unreadable, nameless, or declares MCP servers
             that cannot be loaded.
     """
-    manifest = find_manifest(root)
+    manifest = find_manifest(root, prefer=prefer)
     if manifest is None:
         conventions = ", ".join(str(candidate) for candidate in PLUGIN_MANIFESTS)
         raise PluginManifestError(f"{root} is not a plugin: it contains none of {conventions}.")
@@ -348,4 +439,5 @@ def read_plugin_manifest(root: Path) -> PluginManifest:
         root=root,
         path=manifest,
         mcp_servers=_load_mcp_servers(root, parsed, manifest),
+        flavor=manifest_flavor(manifest, root),
     )

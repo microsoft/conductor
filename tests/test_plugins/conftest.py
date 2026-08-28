@@ -61,11 +61,18 @@ def write_agent(
     description: str = "Does a thing.",
     tools: list[str] | None = None,
     prompt: str = "You are a test agent.",
+    suffix: str = ".agent.md",
 ) -> Path:
-    """Create an ``<name>.agent.md`` inside ``directory``."""
+    """Create an agent definition file inside ``directory``.
+
+    Args:
+        suffix: ``".agent.md"`` (Copilot build convention, the default)
+            or ``".md"`` (Claude build convention) — see
+            :mod:`conductor.plugins.agents` for why the two differ.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     extra = f"tools: {json.dumps(tools)}\n" if tools is not None else ""
-    path = directory / f"{name}.agent.md"
+    path = directory / f"{name}{suffix}"
     path.write_text(
         AGENT_DEFINITION.format(name=name, description=description, extra=extra, prompt=prompt),
         encoding="utf-8",
@@ -80,6 +87,7 @@ def make_plugin(
     manifest: str = ".claude-plugin",
     skills: list[str] | None = None,
     agents: list[str] | None = None,
+    agent_suffix: str = ".agent.md",
     mcp: dict | None = None,
     mcp_inline: bool = False,
     hooks: bool = False,
@@ -95,6 +103,15 @@ def make_plugin(
             runtime, which is why both are recognised.
         skills: Skill directory names to create under ``skills/``.
         agents: Agent names to create under ``agents/``.
+        agent_suffix: ``".agent.md"`` (default, Copilot build convention)
+            or ``".md"`` (Claude build convention) for the files
+            ``agents`` creates — lets a test build a *Claude-manifest*
+            plugin whose ``agents/`` directory genuinely matches the
+            Claude build convention, independent of ``manifest`` (a real
+            plugin's manifest convention and its agent-file convention
+            always agree, but exercising them independently is how issue
+            #497's regression — parsing ``agents/*.md`` under a Claude
+            manifest — is covered).
         mcp: Server mapping to declare, or ``None`` for no MCP.
         mcp_inline: Declare ``mcp`` inline in the manifest rather than
             pointing at a ``.mcp.json`` file. Every MCP-shipping plugin
@@ -120,7 +137,7 @@ def make_plugin(
     for skill in skills or []:
         write_skill(root / "skills" / skill)
     for agent in agents or []:
-        write_agent(root / "agents", agent)
+        write_agent(root / "agents", agent, suffix=agent_suffix)
     if hooks:
         (root / "hooks").mkdir(exist_ok=True)
     if commands:
@@ -279,5 +296,6 @@ PLUGIN_CAPABLE_CAPS = ProviderCapabilities(
     concurrent_safe=True,
     skills=True,
     plugins=True,
+    plugin_flavor="copilot",
 )
 """Descriptor for a fake provider that honours the whole plugin contract."""

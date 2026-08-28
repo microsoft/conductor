@@ -32,19 +32,25 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from conductor.plugins.errors import PluginNotFoundError, PluginSourceError
-from conductor.plugins.manifest import find_manifest, is_plugin_root
+from conductor.plugins.manifest import PluginFlavor, find_manifest, is_plugin_root
 
-# Catalog manifest locations, in probe order — the same directories the
-# plugin manifests live in, so a repository is examined once.
-MARKETPLACE_MANIFESTS: tuple[Path, ...] = (
-    Path(".claude-plugin") / "marketplace.json",
-    Path(".github") / "plugin" / "marketplace.json",
+# Catalog manifest locations, paired with the flavor each convention
+# identifies — mirroring :data:`conductor.plugins.manifest.MANIFEST_FLAVORS`,
+# since a catalog convention and its plugin-manifest convention always
+# travel together. In probe order: the same directories the plugin
+# manifests live in, so a repository is examined once.
+MARKETPLACE_FLAVORS: tuple[tuple[Path, PluginFlavor], ...] = (
+    (Path(".claude-plugin") / "marketplace.json", "claude"),
+    (Path(".github") / "plugin" / "marketplace.json", "copilot"),
 )
+
+MARKETPLACE_MANIFESTS: tuple[Path, ...] = tuple(relative for relative, _ in MARKETPLACE_FLAVORS)
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,15 @@ class Marketplace:
     """
 
     plugins: dict[str, Path]
-    """Plugin name to absolute plugin root, for every plugin it lists."""
+    """Plugin name to absolute plugin root, for every plugin it lists.
+
+    Populated from whichever catalog convention is found first (Claude,
+    then Copilot) when both exist — unchanged from before flavor
+    selection existed, so ``len(marketplace.plugins)`` (``cli/plugin.py``'s
+    reported count) does not shift for a repository that ships only one
+    convention, which is every one observed except the dual-catalog case
+    :attr:`flavored` exists for.
+    """
 
     is_catalog: bool
     """Whether this came from a catalog manifest rather than a lone plugin.
@@ -76,12 +90,59 @@ class Marketplace:
     exactly one plugin, so it cannot stand in for "is this empty".
     """
 
-    def resolve(self, plugin: str) -> Path:
+    flavored: dict[PluginFlavor, dict[str, Path]] = field(default_factory=dict)
+    """Per-flavor plugin tables, populated only for the catalog
+    convention(s) actually present under :attr:`root`.
+
+    A dual-catalog repository — verified against a real marketplace that
+    ships both — holds a genuinely different table per flavor: the same
+    plugin name resolves to a different directory (the Claude build vs.
+    the Copilot build) depending which catalog is consulted. A
+    single-catalog repository populates exactly one key here, identical
+    to :attr:`plugins`. Empty for a single-plugin (non-catalog) source,
+    where there is no flavor choice to make.
+    """
+
+    def resolve(
+        self,
+        plugin: str,
+        *,
+        flavor: PluginFlavor | None = None,
+        on_warning: Callable[[str], None] | None = None,
+    ) -> Path:
         """Return the root of ``plugin``, or raise naming what is available.
 
+        Args:
+            plugin: Plugin name to look up.
+            flavor: Prefer this flavor's table when this marketplace
+                carries more than one (a dual-catalog repository). A
+                marketplace with only one build present has nothing to
+                choose between, so this only ever changes the answer for
+                the repository :attr:`flavored`'s docstring describes.
+            on_warning: Sink for a non-fatal notice when this marketplace
+                genuinely offers more than one build but ``flavor``'s own
+                table does not list ``plugin`` — the unflavored
+                :attr:`plugins` table is used instead, and the caller is
+                told which flavor it fell back from, since that plugin
+                may not actually be the build it asked for. Never fires
+                for a single-build marketplace: there, the unflavored
+                table already *is* the only build there is, so using it
+                is not a fallback.
+
         Raises:
-            PluginNotFoundError: If the marketplace lists no such plugin.
+            PluginNotFoundError: If neither the preferred flavor's table
+                nor the unflavored one lists ``plugin``.
         """
+        is_multi_flavor = len(self.flavored) > 1
+        if flavor is not None:
+            flavored_table = self.flavored.get(flavor)
+            if flavored_table is not None and plugin in flavored_table:
+                return flavored_table[plugin]
+            if on_warning is not None and is_multi_flavor:
+                on_warning(
+                    f"Marketplace {self.name!r} has no {flavor!r}-flavored build of "
+                    f"{plugin!r}; resolving it from the default table instead."
+                )
         root = self.plugins.get(plugin)
         if root is not None:
             return root
@@ -92,9 +153,29 @@ class Marketplace:
         )
 
 
-def find_marketplace_manifest(root: Path) -> Path | None:
-    """Return the catalog manifest inside ``root``, if there is one."""
-    for relative in MARKETPLACE_MANIFESTS:
+def _marketplace_probe_order(prefer: PluginFlavor | None) -> tuple[Path, ...]:
+    """Order the catalog probe, optionally favouring one flavor.
+
+    Mirrors :func:`conductor.plugins.manifest._probe_order` exactly, for
+    the same reason: ``prefer=None`` keeps the historical Claude-first
+    order every existing caller relies on.
+    """
+    if prefer is None:
+        return MARKETPLACE_MANIFESTS
+    preferred = tuple(relative for relative, flavor in MARKETPLACE_FLAVORS if flavor == prefer)
+    rest = tuple(relative for relative, flavor in MARKETPLACE_FLAVORS if flavor != prefer)
+    return preferred + rest
+
+
+def find_marketplace_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> Path | None:
+    """Return the catalog manifest inside ``root``, if there is one.
+
+    Args:
+        root: Candidate marketplace root.
+        prefer: Flavor to probe for first. ``None`` keeps the historical
+            Claude-first probe order.
+    """
+    for relative in _marketplace_probe_order(prefer):
         candidate = root / relative
         try:
             if candidate.is_file():
@@ -206,6 +287,53 @@ def _read_catalog(manifest: Path, root: Path) -> Marketplace:
     return Marketplace(name=name.strip(), root=root, plugins=plugins, is_catalog=True)
 
 
+def _find_all_marketplace_manifests(root: Path) -> list[tuple[Path, PluginFlavor]]:
+    """Every catalog convention actually present under ``root``, in probe order.
+
+    Unlike :func:`find_marketplace_manifest`, which stops at the first
+    match, this is what lets :func:`read_marketplace` build a genuinely
+    different table per flavor for the dual-catalog case — a repository
+    that ships both conventions has two catalogs to read, not one.
+    """
+    found: list[tuple[Path, PluginFlavor]] = []
+    for relative, flavor in MARKETPLACE_FLAVORS:
+        candidate = root / relative
+        try:
+            if candidate.is_file():
+                found.append((candidate, flavor))
+        except OSError:
+            continue
+    return found
+
+
+def _read_all_catalogs(catalogs: list[tuple[Path, PluginFlavor]], root: Path) -> Marketplace:
+    """Read every present catalog convention into one :class:`Marketplace`.
+
+    ``plugins`` mirrors pre-flavor behaviour exactly — it is always the
+    *first* convention found in probe order (Claude, then Copilot), so a
+    caller that never asks for a flavor sees the identical table it did
+    before flavor selection existed (``cli/plugin.py``'s reported plugin
+    count in particular). ``flavored`` additionally carries one table per
+    convention actually present.
+
+    Args:
+        catalogs: Non-empty list of ``(manifest_path, flavor)`` pairs, as
+            returned by :func:`_find_all_marketplace_manifests`.
+        root: The marketplace root the manifests were found under.
+    """
+    tables: dict[PluginFlavor, Marketplace] = {
+        flavor: _read_catalog(manifest, root) for manifest, flavor in catalogs
+    }
+    primary = tables[catalogs[0][1]]
+    return Marketplace(
+        name=primary.name,
+        root=root,
+        plugins=primary.plugins,
+        is_catalog=True,
+        flavored={flavor: table.plugins for flavor, table in tables.items()},
+    )
+
+
 def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Marketplace:
     """Read the marketplace rooted at ``root``.
 
@@ -222,14 +350,16 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
             in only one of its two directions would be worse than none.
 
     Returns:
-        The resolved marketplace.
+        The resolved marketplace, with :attr:`Marketplace.flavored`
+        populated for every catalog convention ``root`` actually holds.
 
     Raises:
         PluginSourceError: If ``root`` holds neither a catalog nor a
             plugin manifest, if it holds both and no ``plugin:`` key
             settles it, or if a catalog manifest is unusable.
     """
-    catalog = find_marketplace_manifest(root)
+    catalogs = _find_all_marketplace_manifests(root)
+    catalog = catalogs[0][0] if catalogs else None
     single = find_manifest(root)
 
     if catalog is not None and single is not None and plugin is None:
@@ -241,7 +371,7 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
         )
 
     if catalog is not None and plugin is None:
-        return _read_catalog(catalog, root)
+        return _read_all_catalogs(catalogs, root)
 
     if single is not None:
         # A single-plugin repository. Its manifest name is the plugin's
@@ -268,13 +398,19 @@ def read_marketplace(root: Path, *, name: str, plugin: str | None = None) -> Mar
         # A catalog, with `plugin:` narrowing it to one entry. Narrowing
         # rather than ignoring the key: it is the disambiguator, and a
         # catalog that no longer ships the named plugin should say so.
-        resolved = _read_catalog(catalog, root)
+        resolved = _read_all_catalogs(catalogs, root)
         assert plugin is not None
+        narrowed_flavored: dict[PluginFlavor, dict[str, Path]] = {
+            flavor: {plugin: table[plugin]}
+            for flavor, table in resolved.flavored.items()
+            if plugin in table
+        }
         return Marketplace(
             name=resolved.name,
             root=root,
             plugins={plugin: resolved.resolve(plugin)},
             is_catalog=True,
+            flavored=narrowed_flavored,
         )
 
     conventions = ", ".join(str(candidate) for candidate in MARKETPLACE_MANIFESTS)

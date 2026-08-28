@@ -24,8 +24,9 @@ import inspect
 import logging
 from typing import TYPE_CHECKING, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from conductor.plugins.manifest import PluginFlavor
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
@@ -189,6 +190,29 @@ class ProviderCapabilities(BaseModel):
     against a provider with ``plugins=False`` fail validation. Defaults
     to ``False``."""
 
+    plugin_flavor: PluginFlavor | None = None
+    """Which build a plugin-capable provider expects — see
+    :class:`conductor.plugins.manifest.PluginFlavor`.
+
+    Required (non-``None``) whenever :attr:`plugins` is ``True``, enforced
+    by the model validator below: a provider that can load plugins always
+    has an opinion about which build it wants, since ``copilot`` and
+    ``claude-agent-sdk`` read structurally different ``agents/`` file
+    conventions (see :mod:`conductor.plugins.agents`). ``None`` is only
+    valid alongside ``plugins=False``, where there is no flavor to have an
+    opinion about.
+
+    This governs *tie-breaking only* — which build wins when a genuine
+    choice exists (a dual-catalog marketplace, or an installed name shared
+    by one marketplace directory) — never whether a plugin can be read at
+    all. Parsing a plugin's ``agents/`` always follows the manifest
+    convention that actually matched
+    (:attr:`conductor.plugins.manifest.PluginManifest.flavor`), so a
+    provider handed the "wrong" build still gets every subagent that
+    build ships; issue #497 is exactly a provider that used to get none
+    of them because the candidate-file rule was hardcoded to one flavor
+    regardless of which convention the resolved plugin used."""
+
     session_continuity: bool = False
     """``True`` when the provider supports per-agent ``session_key``."""
 
@@ -244,6 +268,25 @@ class ProviderCapabilities(BaseModel):
                 "supported levels."
             )
         return v
+
+    @model_validator(mode="after")
+    def _plugin_flavor_required_when_plugins_supported(self) -> ProviderCapabilities:
+        """A plugin-capable provider must declare which build it expects.
+
+        Catches the mistake a future plugin-capable provider could
+        otherwise make silently: declaring ``plugins=True`` without
+        picking a flavor would leave :func:`plugin_flavor_for` returning
+        ``None`` for it, which every caller treats as "no preference" —
+        exactly the untagged state that let issue #497 happen in the
+        first place, just moved from ``agents.py``'s hardcoded suffix to
+        a new provider's missing declaration.
+        """
+        if self.plugins and self.plugin_flavor is None:
+            raise ValueError(
+                "plugin_flavor is required when plugins=True — a plugin-capable "
+                "provider must declare which build (PluginFlavor) it expects."
+            )
+        return self
 
     def declared_limitations(self) -> list[str]:
         """Human-readable list of capability fields that read as ``false`` / ``None``.
@@ -491,6 +534,27 @@ def uses_native_plugins(provider_type: str) -> bool | None:
     return _resolve_static_flag(provider_type, "supports_native_plugins")
 
 
+def plugin_flavor_for(provider_type: str) -> PluginFlavor | None:
+    """Which plugin build a provider expects, resolved without instantiating.
+
+    Args:
+        provider_type: Provider name as it appears in workflow YAML.
+
+    Returns:
+        :attr:`ProviderCapabilities.plugin_flavor` for the resolved
+        provider, or ``None`` when the provider declares no plugin
+        support, is unknown, or its capabilities cannot be resolved
+        without constructing it (mirroring :func:`get_capabilities`'s
+        error modes, but returning ``None`` instead of raising — callers
+        here want a flavor to break a tie with, not a hard failure).
+    """
+    try:
+        capabilities = get_capabilities(provider_type)
+    except (KeyError, AttributeError):
+        return None
+    return capabilities.plugin_flavor
+
+
 def requires_plugin_root_for_skills(provider_type: str) -> bool | None:
     """Whether reaching a skill means registering its whole plugin root.
 
@@ -514,6 +578,7 @@ __all__ = [
     "StructuredOutputMode",
     "get_capabilities",
     "known_provider_names",
+    "plugin_flavor_for",
     "requires_plugin_root_for_skills",
     "uses_native_plugins",
     "uses_native_skills",

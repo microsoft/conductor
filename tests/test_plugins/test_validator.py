@@ -17,6 +17,7 @@ from conductor.config.schema import (
     MCPServerDef,
     OutputField,
     PluginDef,
+    RouteDef,
     RuntimeConfig,
     WorkflowConfig,
     WorkflowDef,
@@ -458,3 +459,92 @@ class TestPartialSourceResolution:
             _validate(config, _wf_path(tmp_path))
 
         assert "conductor plugin fetch" not in str(excinfo.value)
+
+
+class TestPluginFlavorCacheKey:
+    """Issue #497: the plugin-resolution cache must be keyed by flavor too.
+
+    Two agents naming the same entry list on different providers can
+    resolve to different builds (a dual-catalog marketplace). Sharing one
+    cache slot between them — keyed only by the entries — served the
+    first agent's provider's resolution to the second, silently.
+    """
+
+    def _dual_build_config(self, tmp_path: Path) -> WorkflowConfig:
+        from .conftest import make_marketplace
+
+        catalog = tmp_path / "catalog"
+        make_plugin(
+            catalog / "dist" / "claude" / "prs",
+            "prs",
+            manifest=".claude-plugin",
+            mcp={"claude-only": {"command": "npx"}},
+        )
+        make_plugin(
+            catalog / "dist" / "copilot" / "prs",
+            "prs",
+            manifest=".github/plugin",
+            mcp={"copilot-only": {"command": "npx"}},
+        )
+        make_marketplace(
+            catalog,
+            "acme",
+            {"prs": "./dist/claude/prs"},
+            manifest=".claude-plugin",
+            plugin_root="./dist/claude",
+        )
+        make_marketplace(
+            catalog,
+            "acme",
+            {"prs": "./prs"},
+            manifest=".github/plugin",
+            plugin_root="./dist/copilot",
+        )
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="wf",
+                entry_point="copilot_agent",
+                runtime=RuntimeConfig(
+                    provider="copilot",
+                    plugin_sources={"acme": str(catalog)},
+                    # Only the Claude build's own server name collides —
+                    # if the cache incorrectly served the Claude agent the
+                    # Copilot-flavored resolution (or vice versa), this
+                    # clash would be reported for the wrong agent, or not
+                    # reported at all.
+                    mcp_servers={"claude-only": {"command": "npx"}},
+                ),
+            ),
+            agents=[
+                AgentDef(
+                    name="copilot_agent",
+                    provider="copilot",
+                    prompt="Do it.",
+                    output={"result": OutputField(type="string")},
+                    plugins=[PluginDef(name="prs@acme")],
+                    routes=[RouteDef(to="claude_agent")],
+                ),
+                AgentDef(
+                    name="claude_agent",
+                    provider="claude-agent-sdk",
+                    prompt="Do it too.",
+                    output={"result": OutputField(type="string")},
+                    plugins=[PluginDef(name="prs@acme")],
+                ),
+            ],
+            output={"result": "{{ claude_agent.output.result }}"},
+        )
+
+    def test_agents_on_different_providers_resolve_different_builds(self, tmp_path: Path) -> None:
+        config = self._dual_build_config(tmp_path)
+
+        with pytest.raises(ConfigurationError) as excinfo:
+            _validate(config, _wf_path(tmp_path))
+
+        # Only the agent that actually resolved the Claude build (whose
+        # plugin declares the colliding "claude-only" server) is named.
+        message = str(excinfo.value)
+        assert "'claude_agent'" in message
+        assert "'copilot_agent'" not in message
+        assert "claude-only" in message

@@ -1997,6 +1997,7 @@ actually install, and it ships up to three things Conductor can use:
   .claude-plugin/plugin.json   or  .github/plugin/plugin.json
   skills/<skill>/SKILL.md      → instructions
   agents/<agent>.agent.md      → subagents the model can dispatch to
+                                  (agents/<agent>.md for a Claude build — see Flavor below)
   .mcp.json                    → MCP servers
 ```
 
@@ -2024,7 +2025,7 @@ overrides.
 | Form | Resolution |
 |---|---|
 | `prs` | An installed plugin, looked up under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`. An error if it is not installed, or if more than one marketplace ships that name |
-| `prs@acme` | The `prs` plugin from marketplace `acme` — declared in `plugin_sources`, or installed under that marketplace |
+| `prs@acme` | The `prs` plugin from marketplace `acme` — declared in `plugin_sources`, installed under that marketplace, or (for a `copilot`-flavored agent only) registered in `~/.copilot/settings.json`'s `extraKnownMarketplaces` |
 | `./tools/my-plugin` | A path, resolved against the workflow file's directory |
 
 Classification is syntactic — a path when the entry starts with `~` or `.`
@@ -2036,6 +2037,38 @@ happens to exist. The path check runs first, so a directory called
 `prs@acme` is also the answer to the ambiguity error above: when two
 marketplaces ship a `git` plugin, qualify it rather than falling back to a
 path.
+
+### Flavor: which build a plugin resolves to
+
+A plugin can be **built for either CLI** — Claude Code writes
+`.claude-plugin/plugin.json` with `agents/<agent>.md`; the Copilot CLI
+writes `.github/plugin/plugin.json` with `agents/<agent>.agent.md`. The
+two agent-file conventions are read off whichever manifest actually
+matched, never assumed from where the plugin happens to live — a
+Copilot-built plugin can sit inside a `~/.claude/plugins/` tree (a real
+configuration: a marketplace directory the Claude CLI manages, holding a
+build meant for Copilot), and it still resolves every subagent it ships
+correctly on a `provider: copilot` agent.
+
+Flavor only ever **breaks a tie**, never gates whether a plugin can be
+read. Two situations actually have a tie to break:
+
+* A marketplace that publishes **both builds** — a `.claude-plugin/marketplace.json`
+  and a `.github/plugin/marketplace.json` in one repository, each pointing
+  at its own build directory. `prs@acme` resolves to whichever build
+  matches the requesting agent's provider.
+* A bare name installed **once per CLI under the same marketplace
+  directory name** — `prs` under both `~/.copilot/installed-plugins/acme/`
+  and `~/.claude/plugins/acme/`. Two *different* marketplace names sharing
+  a plugin name stay an ambiguity error regardless of flavor; that is a
+  genuinely different plugin per marketplace, and picking one silently is
+  exactly the per-machine drift this feature prevents.
+
+Every other case is unaffected: a plugin that ships only one build
+resolves that build for every agent, whichever provider runs it.
+
+`conductor plugin list` prints the flavor it resolved each group of
+agents against, alongside the usual component counts.
 
 ### Declaring where plugins come from
 
@@ -2069,6 +2102,17 @@ The load-bearing property: **`prs@acme` means the same thing** whether
 `acme` was declared here, installed via a CLI, or is a local directory. A
 declared source registers its name into the same table the installed
 marketplaces populate, and wins on a clash.
+
+A `copilot`-flavored agent has one further fallback: a marketplace
+registered in `~/.copilot/settings.json` (the Copilot CLI's own
+`extraKnownMarketplaces`, whatever the `copilot` CLI already has you
+pointed at) resolves too, when nothing declared or installed already
+matches. This is deliberately the last thing consulted — it can only turn
+a hard "no such marketplace" error into a resolution, never change an
+answer a declared source or an installed root already gave — and it comes
+with a printed advisory naming the standalone remedy: declaring the same
+marketplace under `plugin_sources` so the workflow resolves identically on
+a machine that never ran `copilot`'s own marketplace-add flow.
 
 A source may be a **marketplace catalog** (a `marketplace.json` listing
 many plugins) or a **single plugin** (a `plugin.json` at the root). Both

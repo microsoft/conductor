@@ -17,6 +17,7 @@ from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
 from conductor.plugins.errors import PluginError, PluginSourceUnavailableError
+from conductor.plugins.manifest import PluginFlavor
 from conductor.plugins.registry import describe_dropped_components, resolve_plugins
 from conductor.providers.capabilities import (
     ProviderCapabilities,
@@ -1838,10 +1839,14 @@ def _validate_provider_capabilities(
     ] = {}
     runtime_plugins = config.workflow.runtime.plugins
     # Keyed by the entries themselves (name plus the three component
-    # switches), because resolving a plugin walks its skills tree and parses
-    # every agent definition it ships. A ``str`` value is a cached failure.
+    # switches) *and* the requesting provider's plugin flavor: resolving a
+    # plugin walks its skills tree and parses every agent definition it
+    # ships, and two agents on different providers naming the same entry
+    # list can resolve to different builds (issue #497) — sharing one
+    # cache slot between them served the first agent's provider's answer
+    # to the second. A ``str`` value is a cached failure.
     plugin_cache: dict[
-        tuple[tuple[str, bool, bool, bool], ...],
+        tuple[tuple[tuple[str, bool, bool, bool], ...], PluginFlavor | None],
         list[ResolvedPlugin] | str | _DeferredPluginCheck,
     ] = {}
     (
@@ -2108,7 +2113,8 @@ def _validate_provider_capabilities(
                 if not entries:
                     return
 
-        key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
+        flavor = caps.plugin_flavor
+        key = (tuple((e.name, e.skills, e.agents, e.mcp) for e in entries), flavor)
         if key not in plugin_cache:
             try:
                 plugin_cache[key] = resolve_plugins(
@@ -2121,6 +2127,7 @@ def _validate_provider_capabilities(
                     # command that fails on the same input.
                     declared_sources=unavailable_sources,
                     on_warning=warnings.append,
+                    flavor=flavor,
                 )
             except PluginSourceUnavailableError as exc:
                 # The one plugin failure that is not a problem with the

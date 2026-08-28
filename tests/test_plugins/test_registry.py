@@ -67,6 +67,73 @@ class TestNameResolution:
             resolve_plugin("notaplugin", home=home)
 
 
+class TestFlavorTieBreak:
+    """Issue #497, Q3: flavor breaks a tie only within one marketplace name.
+
+    The confirmed real case: ``~/.claude/plugins/<marketplace>/<name>`` can
+    hold a Copilot build (a real symlink observed in the wild), so two
+    installed roots sharing a marketplace *directory* name are not
+    necessarily two different plugins the way two different marketplace
+    names are — they can be the same plugin's two builds.
+    """
+
+    def test_same_marketplace_different_builds_resolved_by_flavor(self, home: Path) -> None:
+        make_plugin(
+            home / ".copilot" / "installed-plugins" / "jason-tools" / "ado",
+            "ado",
+            manifest=".github/plugin",
+            agents=["helper"],
+        )
+        make_plugin(
+            home / ".claude" / "plugins" / "jason-tools" / "ado",
+            "ado",
+            manifest=".claude-plugin",
+            agents=["helper"],
+            agent_suffix=".md",
+        )
+
+        copilot_build = resolve_plugin("ado", home=home, flavor="copilot")
+        claude_build = resolve_plugin("ado", home=home, flavor="claude")
+
+        assert copilot_build.root == home / ".copilot" / "installed-plugins" / "jason-tools" / "ado"
+        assert claude_build.root == home / ".claude" / "plugins" / "jason-tools" / "ado"
+        # Both still resolve their subagent, per flavor's own convention.
+        assert [a.qualified_name for a in copilot_build.agents] == ["ado:helper"]
+        assert [a.qualified_name for a in claude_build.agents] == ["ado:helper"]
+
+    def test_different_marketplaces_stay_ambiguous_even_with_flavor(
+        self, installed, home: Path
+    ) -> None:
+        # Two *different* marketplaces are two different plugins; flavor
+        # must not silently pick a winner between them.
+        installed("git", marketplace="alpha", skills=["a"])
+        installed("git", marketplace="beta", skills=["b"])
+        with pytest.raises(PluginNotFoundError, match="ambiguous"):
+            resolve_plugin("git", home=home, flavor="copilot")
+
+    def test_no_flavor_match_falls_back_to_the_first_candidate_with_a_warning(
+        self, home: Path
+    ) -> None:
+        # Both builds under one marketplace happen to be Copilot-flavored;
+        # asking for "claude" cannot find a match, so it falls back rather
+        # than erroring, since there genuinely is only one marketplace name.
+        make_plugin(
+            home / ".copilot" / "installed-plugins" / "jason-tools" / "ado",
+            "ado",
+            manifest=".github/plugin",
+        )
+        make_plugin(
+            home / ".claude" / "plugins" / "jason-tools" / "ado",
+            "ado",
+            manifest=".github/plugin",
+        )
+        warnings: list[str] = []
+        plugin = resolve_plugin("ado", home=home, flavor="claude", on_warning=warnings.append)
+
+        assert plugin.name == "ado"
+        assert any("none matching" in message for message in warnings)
+
+
 class TestPathResolution:
     def test_relative_path_resolves_against_base_dir(self, tmp_path: Path) -> None:
         make_plugin(tmp_path / "tools" / "mine", "mine", skills=["a"])

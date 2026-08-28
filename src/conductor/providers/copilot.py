@@ -336,6 +336,10 @@ class CopilotProvider(AgentProvider):
         # ``mcp_servers`` for MCP. The SDK's ``plugin_directories`` is
         # deliberately unused — see conductor.plugins for why.
         plugins=True,
+        # Reads the Copilot build's ``agents/*.agent.md`` convention (issue
+        # #497). Only breaks ties where a genuine choice exists — parsing
+        # always follows whichever manifest convention actually matched.
+        plugin_flavor="copilot",
         # ``runtime.idle_timeout_seconds`` / ``runtime.max_idle_recovery_attempts``
         # tune the IdleRecoveryConfig-backed watchdog (#488).
         idle_recovery=True,

@@ -111,23 +111,26 @@ class TestRejections:
 class TestReadPluginAgents:
     def test_no_agents_directory_yields_nothing(self, tmp_path: Path) -> None:
         root = make_plugin(tmp_path / "p", "demo")
-        assert read_plugin_agents(root, "demo") == []
+        assert read_plugin_agents(root, "demo", flavor="copilot") == []
 
     def test_sorted_by_file_name(self, tmp_path: Path) -> None:
         root = make_plugin(tmp_path / "p", "demo", agents=["zeta", "alpha", "mid"])
-        assert [a.name for a in read_plugin_agents(root, "demo")] == ["alpha", "mid", "zeta"]
+        agents = read_plugin_agents(root, "demo", flavor="copilot")
+        assert [a.name for a in agents] == ["alpha", "mid", "zeta"]
 
     def test_non_agent_files_are_ignored(self, tmp_path: Path) -> None:
         root = make_plugin(tmp_path / "p", "demo", agents=["real"])
         (root / "agents" / "README.md").write_text("not an agent")
-        assert [a.name for a in read_plugin_agents(root, "demo")] == ["real"]
+        agents = read_plugin_agents(root, "demo", flavor="copilot")
+        assert [a.name for a in agents] == ["real"]
 
     def test_nested_directories_are_not_descended(self, tmp_path: Path) -> None:
         # Every plugin observed keeps a flat agents/ directory, and a nested
         # file would get a name indistinguishable from a top-level one.
         root = make_plugin(tmp_path / "p", "demo", agents=["flat"])
         write_agent(root / "agents" / "nested", "deep")
-        assert [a.name for a in read_plugin_agents(root, "demo")] == ["flat"]
+        agents = read_plugin_agents(root, "demo", flavor="copilot")
+        assert [a.name for a in agents] == ["flat"]
 
     def test_duplicate_agent_names_are_refused(self, tmp_path: Path) -> None:
         # Two files, one declared name: deduping would drop one silently.
@@ -136,4 +139,67 @@ class TestReadPluginAgents:
         second = root / "agents" / "second.agent.md"
         second.write_text("---\nname: first\ndescription: d\n---\nBody\n")
         with pytest.raises(PluginManifestError, match="two agents named"):
-            read_plugin_agents(root, "demo")
+            read_plugin_agents(root, "demo", flavor="copilot")
+
+    def test_claude_flavor_reads_bare_md_agents(self, tmp_path: Path) -> None:
+        # The regression at the heart of issue #497: a Claude-built plugin's
+        # agents/*.md files were never read because the candidate rule was
+        # hardcoded to the Copilot suffix.
+        root = make_plugin(tmp_path / "p", "demo", agents=["code-reviewer"], agent_suffix=".md")
+        agents = read_plugin_agents(root, "demo", flavor="claude")
+        assert [a.name for a in agents] == ["code-reviewer"]
+
+    def test_copilot_flavor_ignores_bare_md(self, tmp_path: Path) -> None:
+        # The Copilot build's convention is strictly ".agent.md" — a bare
+        # ".md" file is not a candidate under that flavor, even though it
+        # would be under "claude".
+        root = make_plugin(tmp_path / "p", "demo", agents=["code-reviewer"], agent_suffix=".md")
+        assert read_plugin_agents(root, "demo", flavor="copilot") == []
+
+    def test_claude_flavor_warns_and_skips_frontmatterless_bare_md(self, tmp_path: Path) -> None:
+        # A bare ".md" with no frontmatter at all reads as documentation
+        # (a README), not a broken agent — it never explicitly claimed to
+        # be one the way an ".agent.md" extension does.
+        root = make_plugin(tmp_path / "p", "demo", agents=["real"], agent_suffix=".md")
+        (root / "agents" / "README.md").write_text("Just some prose.\n")
+        warnings: list[str] = []
+        agents = read_plugin_agents(root, "demo", flavor="claude", on_warning=warnings.append)
+        assert [a.name for a in agents] == ["real"]
+        assert any(
+            "README.md" in message and "no YAML frontmatter" in message for message in warnings
+        )
+
+    def test_explicit_agent_md_with_no_frontmatter_still_raises(self, tmp_path: Path) -> None:
+        # An ".agent.md" extension is an explicit claim to be an agent, so
+        # the same "no frontmatter" failure stays fatal regardless of
+        # flavor — it never falls into the warn-and-skip path above.
+        root = make_plugin(tmp_path / "p", "demo")
+        (root / "agents").mkdir(parents=True)
+        (root / "agents" / "broken.agent.md").write_text("No frontmatter here.\n")
+        with pytest.raises(PluginManifestError, match="no YAML frontmatter"):
+            read_plugin_agents(root, "demo", flavor="claude")
+        with pytest.raises(PluginManifestError, match="no YAML frontmatter"):
+            read_plugin_agents(root, "demo", flavor="copilot")
+
+    def test_malformed_frontmatter_still_raises_under_both_flavors(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "demo")
+        (root / "agents").mkdir(parents=True)
+        (root / "agents" / "bad.md").write_text(
+            "---\nname: a\ndescription: Does things. Triggers: x, y\n---\nBody\n"
+        )
+        with pytest.raises(PluginManifestError, match="invalid YAML frontmatter"):
+            read_plugin_agents(root, "demo", flavor="claude")
+
+    def test_missing_name_still_raises_under_both_flavors(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "demo")
+        (root / "agents").mkdir(parents=True)
+        (root / "agents" / "bad.md").write_text("---\ndescription: d\n---\nBody\n")
+        with pytest.raises(PluginManifestError, match="no usable 'name'"):
+            read_plugin_agents(root, "demo", flavor="claude")
+
+    def test_empty_body_still_raises_under_both_flavors(self, tmp_path: Path) -> None:
+        root = make_plugin(tmp_path / "p", "demo")
+        (root / "agents").mkdir(parents=True)
+        (root / "agents" / "bad.md").write_text("---\nname: a\ndescription: d\n---\n\n   \n")
+        with pytest.raises(PluginManifestError, match="empty body"):
+            read_plugin_agents(root, "demo", flavor="claude")

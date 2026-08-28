@@ -222,18 +222,29 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
     ``plugins:`` gets a different list from one that inherits
     ``runtime.plugins``, and printing only the workflow default would
     describe a run that is not the one about to happen.
+
+    Grouped by entry list *and* resolved plugin flavor (issue #497): two
+    agents naming the same entries on different providers can resolve to
+    different builds, so they are reported — and their component counts
+    computed — separately rather than one silently standing in for both.
     """
     from conductor.plugins.errors import PluginError
+    from conductor.plugins.manifest import PluginFlavor
     from conductor.plugins.registry import resolve_plugins
     from conductor.plugins.resolution import marketplaces_from
+    from conductor.providers.capabilities import plugin_flavor_for
     from conductor.skills import SkillError
 
     marketplaces = marketplaces_from(sources)
     declared_names = set(config.workflow.runtime.plugin_sources) - set(sources)
+    default_provider = config.workflow.runtime.provider.name
 
-    # Group agents by the entry list they resolve, so a workflow whose
-    # agents all inherit prints one section rather than one per agent.
-    groups: dict[tuple[tuple[str, bool, bool, bool], ...], list[str]] = {}
+    # Group agents by the entry list *and* flavor they resolve, so a
+    # workflow whose agents all inherit prints one section rather than one
+    # per agent — but two providers sharing an entry list still get their
+    # own section when they resolve to different builds.
+    groups: dict[tuple[tuple[tuple[str, bool, bool, bool], ...], PluginFlavor | None], list[str]]
+    groups = {}
 
     def _record(name: str, agent) -> None:  # noqa: ANN001
         if agent.type not in (None, "agent"):
@@ -241,8 +252,10 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
         entries = agent.plugins if agent.plugins is not None else config.workflow.runtime.plugins
         if not entries:
             return
-        key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
-        groups.setdefault(key, []).append(name)
+        entries_key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
+        provider_name = agent.provider or default_provider
+        flavor = plugin_flavor_for(provider_name)
+        groups.setdefault((entries_key, flavor), []).append(name)
 
     for agent in config.agents:
         _record(agent.name, agent)
@@ -261,12 +274,14 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
 
     from conductor.config.schema import PluginDef
 
-    for key, agents in groups.items():
+    for (entries_key, flavor), agents in groups.items():
         entries = [
             PluginDef(name=name, skills=skills, agents=agents_on, mcp=mcp)
-            for name, skills, agents_on, mcp in key
+            for name, skills, agents_on, mcp in entries_key
         ]
         output_console.print(styled("\n[bold]Agents:[/bold] {}", ", ".join(agents)))
+        if flavor is not None:
+            output_console.print(styled("  [dim]flavor: {}[/dim]", flavor))
         try:
             resolved = resolve_plugins(
                 entries,
@@ -274,6 +289,7 @@ def _list_enabled_plugins(config, workflow_path: Path, sources) -> None:  # noqa
                 marketplaces=marketplaces,
                 declared_sources=declared_names,
                 on_warning=lambda message: console.print(styled("[yellow]⚠[/yellow] {}", message)),
+                flavor=flavor,
             )
         except (PluginError, SkillError, OSError) as exc:
             output_console.print(styled("  [yellow]⚠[/yellow] {}", exc))
