@@ -38,8 +38,16 @@ class TestReadCopilotMarketplaces:
 
         assert read_copilot_marketplaces(home) == {"jason-tools": target}
 
-    def test_tilde_paths_are_expanded(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HOME", str(home))
+    def test_tilde_paths_are_expanded(self, home: Path) -> None:
+        """``~`` expands against the passed-in home, not the ambient one.
+
+        The autouse isolation fixture points ``$HOME``/``%USERPROFILE%``
+        at a *different* directory, so this pins that the expansion never
+        reads the environment. Asserting it that way matters: while the
+        expansion did read the environment, this passed on POSIX and
+        failed only on Windows, because ``posixpath.expanduser`` reads
+        ``$HOME`` where ``ntpath.expanduser`` prefers ``%USERPROFILE%``.
+        """
         _write_settings(
             home,
             {"mine": {"source": {"path": "~/src/conductor-workflows", "source": "directory"}}},
@@ -48,6 +56,11 @@ class TestReadCopilotMarketplaces:
         result = read_copilot_marketplaces(home)
 
         assert result == {"mine": home / "src" / "conductor-workflows"}
+
+    def test_bare_tilde_is_the_home_directory(self, home: Path) -> None:
+        _write_settings(home, {"mine": {"source": {"path": "~", "source": "directory"}}})
+
+        assert read_copilot_marketplaces(home) == {"mine": home}
 
     def test_trailing_slash_is_normalised(self, home: Path, tmp_path: Path) -> None:
         target = tmp_path / "repo"

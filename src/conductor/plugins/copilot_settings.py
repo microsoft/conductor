@@ -44,13 +44,41 @@ logger = logging.getLogger(__name__)
 COPILOT_SETTINGS_RELATIVE: Path = Path(".copilot") / "settings.json"
 
 
+def _expand_home(raw: str, home: Path) -> str:
+    """Expand a leading ``~`` against *home* rather than the environment.
+
+    ``os.path.expanduser`` reads ``$HOME`` on POSIX but prefers
+    ``%USERPROFILE%`` on Windows, so it resolves against whichever
+    ambient variable the platform happens to prefer — not the ``home``
+    this settings file was actually read from. That defeats the
+    isolation ``home`` exists to provide, and makes the same settings
+    file expand to two different directories on two platforms whenever
+    the two variables disagree.
+
+    The ``~`` in ``<home>/.copilot/settings.json`` names that same home,
+    so it is expanded against it directly. In production the two are
+    identical, since the caller passes the real home.
+
+    ``~otheruser`` names a different account's home, which is not this
+    home's to rewrite, so it is left to the ambient lookup — the only
+    thing that can resolve it.
+    """
+    if raw == "~":
+        return str(home)
+    # ntpath treats both separators after '~'; posixpath treats only '/'.
+    if raw.startswith("~/") or (os.name == "nt" and raw.startswith("~\\")):
+        return str(home / raw[2:])
+    return os.path.expanduser(raw)
+
+
 def read_copilot_marketplaces(home: Path) -> dict[str, Path]:
     """Parse directory-backed marketplaces out of the Copilot CLI's settings.
 
     Args:
         home: Home directory to read ``.copilot/settings.json`` under. A
             parameter rather than a lookup so tests never read the
-            developer's real ``~``.
+            developer's real ``~``. A leading ``~`` in an entry's path is
+            expanded against this same directory, for the same reason.
 
     Returns:
         Marketplace name to absolute, expanded, normalised directory path,
@@ -99,7 +127,7 @@ def read_copilot_marketplaces(home: Path) -> dict[str, Path]:
         path = source.get("path")
         if not isinstance(path, str) or not path.strip():
             continue
-        resolved[name.strip()] = Path(os.path.normpath(os.path.expanduser(path.strip())))
+        resolved[name.strip()] = Path(os.path.normpath(_expand_home(path.strip(), home)))
     return resolved
 
 
