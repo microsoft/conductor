@@ -105,6 +105,7 @@ def _mock_config(name: str = "wiring-test", agent_names: list[str] | None = None
     mock_config.parallel = []
     mock_config.for_each = []
     mock_config.workflow.runtime.provider = ProviderSettings(name="copilot")
+    mock_config.workflow.runtime.event_log_dir = None
     mock_config.workflow.limits.max_iterations = 50
     mock_config.workflow.limits.timeout_seconds = None
     mock_config.workflow.limits.budget_usd = None
@@ -153,12 +154,16 @@ class TestRunWorkflowAsyncRunRecordWiring:
     """``run_workflow_async`` writes a discoverable record on every path."""
 
     async def test_fg_record_has_no_port_and_is_removed_on_completion(
-        self, tmp_path: Path, fleet_env: Path
+        self, tmp_path: Path, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from conductor.cli.run import run_workflow_async
 
-        wf_path = _write_workflow(tmp_path)
+        workflow_dir = tmp_path / "workflow"
+        workflow_dir.mkdir()
+        monkeypatch.chdir(tmp_path)
+        wf_path = _write_workflow(workflow_dir)
         mock_config = _mock_config()
+        mock_config.workflow.runtime.event_log_dir = "./event-logs"
         seen: dict[str, Any] = {}
 
         async def _fake_run(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -200,6 +205,7 @@ class TestRunWorkflowAsyncRunRecordWiring:
         # so this assertion actually exercises the distinction.
         assert record.workflow_name == wf_path.stem == "wf"
         assert Path(record.event_log_path).exists()
+        assert Path(record.event_log_path).parent == (workflow_dir / "event-logs").resolve()
         assert record.checkpoint_dir is not None
 
         # Removed once the run finishes.
@@ -535,12 +541,18 @@ class TestResumeWorkflowAsyncRunRecordWiring:
         assert read_run_records() == []
 
     async def test_resume_record_removed_on_workflow_terminated(
-        self, tmp_path: Path, fleet_env: Path
+        self, tmp_path: Path, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from conductor.cli.run import resume_workflow_async
 
-        wf_path, cp_path = _write_checkpoint_and_config(tmp_path)
+        workflow_dir = tmp_path / "workflow"
+        workflow_dir.mkdir()
+        monkeypatch.chdir(tmp_path)
+        wf_path, cp_path = _write_checkpoint_and_config(workflow_dir)
+        (workflow_dir / "original.events.jsonl").unlink()
         mock_config = _mock_config(agent_names=["a"])
+        mock_config.workflow.runtime.event_log_dir = "./event-logs"
+        expected_dir = (workflow_dir / "event-logs").resolve()
 
         terminate_exc = WorkflowTerminated(
             "bye",
@@ -550,7 +562,9 @@ class TestResumeWorkflowAsyncRunRecordWiring:
         )
 
         async def _fake_resume(current_agent: str) -> dict[str, Any]:
-            assert len(read_run_records()) == 1
+            records = read_run_records()
+            assert len(records) == 1
+            assert Path(records[0].event_log_path).parent == expected_dir
             raise terminate_exc
 
         mock_engine = MagicMock()
