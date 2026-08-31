@@ -27,12 +27,10 @@ from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.tools import RunContext
 
 from conductor.providers._pydantic_ai.events import (
-    EventCallback,
     emit_compaction_complete,
     emit_compaction_complete_error,
     emit_compaction_start,
 )
-
 
 logger = logging.getLogger(__name__)
 

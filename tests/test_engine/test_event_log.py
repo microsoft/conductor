@@ -1,7 +1,10 @@
 """Tests for the JSONL event log subscriber."""
 
+from __future__ import annotations
+
 import json
 import time
+from typing import Any
 
 import pytest
 
@@ -326,6 +329,80 @@ class TestEventLogSubscriber:
         assert for_each["data"]["agent_name"] == "fan_agent[0]"
         assert for_each["data"]["item_key"] == "0"
         assert for_each["data"]["working_dir"] is None
+
+    def test_writes_compaction_events_verbatim(self, tmp_path, monkeypatch):
+        """Compaction lifecycle events must be written to the JSONL log verbatim.
+
+        Regression guard: an allowlist or handler lookup that omits these
+        event names would silently drop them from the structured log.
+        """
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        sub = EventLogSubscriber("compaction-events")
+
+        cases: list[tuple[str, dict[str, Any]]] = [
+            (
+                "agent_compaction_config",
+                {
+                    "agent_name": "researcher",
+                    "model": "claude-sonnet-5",
+                    "context_window": 200000,
+                    "context_window_source": "provider",
+                    "output_limit": 32000,
+                    "output_limit_source": "default",
+                    "trigger_tokens": 160000,
+                    "target_tokens": 120000,
+                },
+            ),
+            (
+                "agent_compaction_start",
+                {
+                    "agent_name": "researcher",
+                    "strategy": "tiered",
+                    "model": "claude-sonnet-5",
+                    "context_window": 200000,
+                    "context_window_source": "provider",
+                    "output_limit": 32000,
+                    "output_limit_source": "default",
+                    "trigger_tokens": 160000,
+                    "target_tokens": 120000,
+                    "messages_before": 42,
+                    "tokens_before": 180000,
+                },
+            ),
+            (
+                "agent_compaction_complete",
+                {
+                    "agent_name": "researcher",
+                    "strategy": "tiered",
+                    "model": "claude-sonnet-5",
+                    "context_window": 200000,
+                    "context_window_source": "provider",
+                    "messages_before": 42,
+                    "messages_after": 12,
+                    "tokens_before": 180000,
+                    "tokens_after": 65000,
+                    "tokens_saved": 115000,
+                    "elapsed": 1.25,
+                    "errored": False,
+                },
+            ),
+        ]
+        for event_type, payload in cases:
+            sub.on_event(
+                WorkflowEvent(
+                    type=event_type,
+                    timestamp=time.time(),
+                    data=payload,
+                )
+            )
+        sub.close()
+
+        lines = sub.path.read_text().strip().split("\n")
+        assert len(lines) == len(cases)
+        for (event_type, payload), line in zip(cases, lines, strict=True):
+            parsed = json.loads(line)
+            assert parsed["type"] == event_type
+            assert parsed["data"] == payload
 
 
 class TestRunIdContractAgreement:

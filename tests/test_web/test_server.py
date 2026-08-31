@@ -1409,6 +1409,21 @@ class TestReplayEventsFromJsonl:
             WebDashboard._REPLAY_ROOT_SKIP_TYPES
         )
 
+    def test_compaction_events_are_not_skipped(self) -> None:
+        """Compaction lifecycle events must replay unchanged.
+
+        These events carry node-local diagnostic state and do not latch any
+        global interaction flag, so they must not be in either skip set.
+        """
+        compaction_types = {
+            "agent_compaction_config",
+            "agent_compaction_start",
+            "agent_compaction_complete",
+        }
+        for event_type in compaction_types:
+            assert event_type not in WebDashboard._REPLAY_ROOT_SKIP_TYPES
+            assert event_type not in WebDashboard._REPLAY_INTERACTIVE_SKIP_TYPES
+
     @pytest.mark.parametrize("event_type", ["gate_presented", "gate_resolved", "dialog_message"])
     def test_preserves_events_with_only_node_local_state(
         self, tmp_path: Path, event_type: str

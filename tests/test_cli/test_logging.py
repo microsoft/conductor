@@ -2006,6 +2006,191 @@ class TestConsoleEventSubscriberAgentTimeout:
             verbose_mode.reset(token)
 
 
+class TestConsoleEventSubscriberCompaction:
+    """Test ConsoleEventSubscriber handling of compaction lifecycle events."""
+
+    def test_compaction_config_event_renders(self) -> None:
+        """ConsoleEventSubscriber renders agent_compaction_config as a dim note."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_compaction_config",
+                    timestamp=time.time(),
+                    data={
+                        "agent_name": "researcher",
+                        "model": "claude-sonnet-5",
+                        "context_window": 200000,
+                        "context_window_source": "provider",
+                        "output_limit": 32000,
+                        "output_limit_source": "default",
+                        "trigger_tokens": 160000,
+                        "target_tokens": 120000,
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "researcher" in output_text
+                assert "compaction armed" in output_text
+                assert "200000" in output_text
+                assert "32000" in output_text
+                assert "160000" in output_text
+                assert "120000" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_compaction_start_event_renders(self) -> None:
+        """ConsoleEventSubscriber renders agent_compaction_start with percentage."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_compaction_start",
+                    timestamp=time.time(),
+                    data={
+                        "agent_name": "researcher",
+                        "strategy": "tiered",
+                        "model": "claude-sonnet-5",
+                        "context_window": 200000,
+                        "context_window_source": "provider",
+                        "output_limit": 32000,
+                        "output_limit_source": "default",
+                        "trigger_tokens": 160000,
+                        "target_tokens": 120000,
+                        "messages_before": 42,
+                        "tokens_before": 180000,
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "researcher" in output_text
+                assert "compacting context" in output_text
+                assert "180000" in output_text
+                assert "90%" in output_text
+                assert "200000" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_compaction_complete_success_event_renders(self) -> None:
+        """ConsoleEventSubscriber renders a successful agent_compaction_complete note."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_compaction_complete",
+                    timestamp=time.time(),
+                    data={
+                        "agent_name": "researcher",
+                        "strategy": "tiered",
+                        "model": "claude-sonnet-5",
+                        "context_window": 200000,
+                        "context_window_source": "provider",
+                        "messages_before": 42,
+                        "messages_after": 12,
+                        "tokens_before": 180000,
+                        "tokens_after": 65000,
+                        "tokens_saved": 115000,
+                        "elapsed": 1.25,
+                        "errored": False,
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "researcher" in output_text
+                assert "context compacted" in output_text
+                assert "180000" in output_text
+                assert "65000" in output_text
+                assert "42" in output_text
+                assert "12" in output_text
+                assert "1.25" in output_text or "1.25s" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+    def test_compaction_complete_failure_event_renders(self) -> None:
+        """ConsoleEventSubscriber renders an errored agent_compaction_complete warning."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(
+                    type="agent_compaction_complete",
+                    timestamp=time.time(),
+                    data={
+                        "agent_name": "researcher",
+                        "strategy": "tiered",
+                        "model": "claude-sonnet-5",
+                        "errored": True,
+                        "error_type": "RuntimeError",
+                        "message": "summarizer refused",
+                    },
+                )
+                subscriber.on_event(event)
+                output_text = output.getvalue()
+                assert "researcher" in output_text
+                assert "context compaction failed" in output_text
+                assert "RuntimeError" in output_text
+                assert "summarizer" in output_text
+                assert "refused" in output_text
+                assert "continuing without compaction" in output_text
+        finally:
+            verbose_mode.reset(token)
+
+
 class TestSilentAwareConsole:
     """Tests for the ``_SilentAwareConsole`` subclass (issue #209).
 
