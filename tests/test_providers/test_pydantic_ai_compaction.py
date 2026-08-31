@@ -28,6 +28,7 @@ from conductor.config.schema import AgentDef
 from conductor.providers._pydantic_ai.agent_builder import build_agent
 from conductor.providers._pydantic_ai.compaction import (
     CompactionConfig,
+    _FailOpenCompactionWrapper,
     _ThresholdGatedCompaction,
     _TierWrapper,
     build_tiered_compaction,
@@ -62,6 +63,188 @@ def _make_config(
         agent_name=agent_name,
         model_name=model_name,
     )
+
+
+def _build_test_agent(
+    *,
+    output_type: type | None = None,
+    custom_output_text: str | None = None,
+    custom_output_args: dict[str, Any] | None = None,
+    compaction: Any = None,
+) -> Agent[Any, Any]:
+    """Build a Pydantic AI agent backed by TestModel.
+
+    Using TestModel avoids network calls. The agent is built with the default
+    anthropic backend settings but with the test model passed directly, so
+    ``build_agent`` does not need to resolve a real API key or model.
+    """
+    model = TestModel(
+        custom_output_text=custom_output_text,
+        custom_output_args=custom_output_args,
+    )
+    capabilities: list[Any] = []
+    if compaction is not None:
+        capabilities.append(build_tiered_compaction(compaction))
+    return Agent(
+        model=model,
+        output_type=output_type or str,
+        system_prompt="",
+        name="test-agent",
+        capabilities=capabilities,
+    )
+
+
+def _build_agent_fn_for_test(
+    *,
+    output_type: type | None = None,
+    custom_output_text: str | None = None,
+    custom_output_args: dict[str, Any] | None = None,
+) -> Any:
+    """Return a build_agent_fn closure that returns a TestModel-backed agent."""
+
+    def build_agent_fn(
+        toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any = None
+    ) -> Any:
+        return _build_test_agent(
+            output_type=output_type,
+            custom_output_text=custom_output_text,
+            custom_output_args=custom_output_args,
+            compaction=compaction,
+        )
+
+    return build_agent_fn
+
+
+def _streaming_function_model(
+    function: Any,
+) -> Any:
+    """Wrap a synchronous/async model function for both request and stream paths.
+
+    Pydantic AI's ``Agent.run`` may call ``request_stream`` depending on build
+    options, so a ``FunctionModel`` needs a ``stream_function`` that yields the
+    same content as deltas.
+    """
+    from collections.abc import AsyncIterator
+
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+    async def _stream_function(messages: list[Any], info: Any) -> AsyncIterator[Any]:  # type: ignore[return-type]
+        if asyncio.iscoroutinefunction(function):
+            response = await function(messages, info)
+        else:
+            response = function(messages, info)
+        if isinstance(response, ModelResponse):
+            for part in response.parts:
+                if isinstance(part, TextPart):
+                    yield part.content
+                elif isinstance(part, ToolCallPart):
+                    yield DeltaToolCall(
+                        name=part.tool_name,
+                        json_args=part.args_as_json_str(),
+                        tool_call_id=part.tool_call_id,
+                    )
+                else:
+                    yield part
+        else:
+            yield response
+
+    return FunctionModel(function=function, stream_function=_stream_function)
+
+
+def _build_agent_fn_with_tool_call(
+    *,
+    output_type: type | None = None,
+    summarizer_keep_messages: int | None = None,
+) -> Any:
+    """Return a build_agent_fn closure that returns a FunctionModel-backed agent.
+
+    The model returns a tool call on its first request and a text answer on the
+    second. This lets tests exercise multi-request runs and usage-limit
+    accounting without calling a real API.
+
+    Args:
+        output_type: Optional output type for the agent.
+        summarizer_keep_messages: When set, overrides the default
+            ``keep_messages=20`` on the summarizing compaction tier so
+            summarization fires even on a short message history.
+    """
+    from pydantic_ai.tools import Tool
+
+    def noop_tool() -> str:
+        return "ok"
+
+    call_count: list[int] = [0]
+
+    async def _model_func(messages: list[Any], info: Any) -> Any:
+        from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+
+        call_count[0] += 1
+        has_tools = bool(getattr(info, "function_tools", None))
+        if call_count[0] == 1 and has_tools:
+            return ModelResponse(parts=[ToolCallPart(tool_name="noop_tool", args={})])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    def build_agent_fn(
+        toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any = None
+    ) -> Any:
+        capabilities: list[Any] = []
+        if compaction is not None:
+            if summarizer_keep_messages is not None:
+                # Rebuild the tiered stack with a low keep_messages so the
+                # summarizer fires on the short test history.
+                capabilities.append(
+                    _build_tiered_compaction_with_keep(compaction, summarizer_keep_messages)
+                )
+            else:
+                capabilities.append(build_tiered_compaction(compaction))
+        agent = Agent(
+            model=_streaming_function_model(_model_func),
+            output_type=output_type or str,
+            system_prompt="",
+            name="test-agent",
+            tools=[Tool(noop_tool)],
+            capabilities=capabilities,
+        )
+        return agent
+
+    return build_agent_fn
+
+
+def _build_tiered_compaction_with_keep(config: Any, keep_messages: int) -> Any:
+    """Build the tiered compaction stack with a custom summarizer keep_messages."""
+    from pydantic_ai_harness.compaction import (  # type: ignore[import-not-found]
+        ClearToolResults,
+        SlidingWindowCompaction,
+        SummarizingCompaction,
+        TieredCompaction,
+    )
+
+    clear_tier = _TierWrapper(
+        ClearToolResults(max_messages=1, keep_pairs=3),
+        tier_name="clear_tool_results",
+    )
+    summarize_tier = _TierWrapper(
+        SummarizingCompaction(max_messages=1, keep_messages=keep_messages, model=None),
+        tier_name="summarizing",
+    )
+    slide_tier = _TierWrapper(
+        SlidingWindowCompaction(max_messages=1, keep_messages=20),
+        tier_name="sliding_window",
+    )
+
+    tiered = TieredCompaction(
+        tiers=[clear_tier, summarize_tier, slide_tier],
+        target_tokens=config.target_tokens,
+        tokenizer=None,
+    )
+
+    gated = _ThresholdGatedCompaction(
+        tiered,
+        trigger_tokens=config.trigger_tokens,
+    )
+
+    return _FailOpenCompactionWrapper(gated, config=config)
 
 
 def _request_context_with_messages(messages: Any) -> Any:
@@ -338,7 +521,14 @@ class TestBuildAgentWiring:
     def test_build_agent_attaches_capability(self) -> None:
         """When ``compaction`` is passed, ``build_agent`` should construct an
         Agent whose root capability contains the wrapper."""
-        agent_def = AgentDef(name="wired", prompt="hello")
+        agent_def = AgentDef(
+            name="wired",
+            prompt="hello",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
         cfg = _make_config(trigger_tokens=10, target_tokens=5)
         wrapper_class = type(build_tiered_compaction(cfg))
 
@@ -406,7 +596,14 @@ class TestBuildAgentWiring:
     def test_build_agent_without_compaction_has_no_capabilities(self) -> None:
         """When ``compaction`` is omitted, the Agent should have no extra
         capabilities attached beyond the defaults added by pydantic-ai."""
-        agent_def = AgentDef(name="plain", prompt="hello")
+        agent_def = AgentDef(
+            name="plain",
+            prompt="hello",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
         cfg = _make_config(trigger_tokens=10, target_tokens=5)
         wrapper_class = type(build_tiered_compaction(cfg))
 
@@ -444,7 +641,14 @@ class TestRunnerCallbackClosure:
             captured["event_callback"] = compaction.event_callback if compaction else None
             return Agent(TestModel(), output_type=str)
 
-        agent_def = AgentDef(name="callback-test", prompt="hello")
+        agent_def = AgentDef(
+            name="callback-test",
+            prompt="hello",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
         retry_cfg = RetryConfig(
             max_attempts=1,
             base_delay=0.0,
@@ -475,3 +679,515 @@ class TestRunnerCallbackClosure:
 
         assert captured["compaction"] is cfg
         assert captured["event_callback"] is fake_event_callback
+
+
+class TestEventEmission:
+    """Requirement: compaction lifecycle events flow through the callback."""
+
+    @pytest.mark.asyncio
+    async def test_emits_start_and_complete_when_compacting(self) -> None:
+        """A request above the trigger must emit ``agent_compaction_start`` and
+        a success-shaped ``agent_compaction_complete``."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        messages: list[Any] = []
+        for i in range(30):
+            messages.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
+        request_context = _request_context_with_messages(messages)
+
+        result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+
+        assert len(result.messages) < len(messages)
+        types = [e[0] for e in events]
+        assert "agent_compaction_start" in types
+        assert "agent_compaction_complete" in types
+        complete = events[types.index("agent_compaction_complete")][1]
+        assert complete["errored"] is False
+        assert complete["tokens_before"] >= complete["tokens_after"]
+
+    @pytest.mark.asyncio
+    async def test_no_events_when_below_trigger(self) -> None:
+        """A request below the trigger must not emit any compaction lifecycle
+        events because compaction never runs."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10_000, target_tokens=5_000, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="hi")])]
+        )
+        result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+
+        assert result is request_context
+        assert not events
+
+    @pytest.mark.asyncio
+    async def test_outer_failure_emits_errored_complete_and_latches(self) -> None:
+        """An outer failure emits an errored complete event and disables further
+        compaction attempts for this execution."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        gate = capability._inner  # type: ignore[attr-defined]
+        original = gate.before_model_request
+        mock_before = AsyncMock(side_effect=RuntimeError("boom"))
+        gate.before_model_request = mock_before
+
+        try:
+            result1 = await capability.before_model_request(
+                _make_run_context(),
+                _request_context_with_messages(
+                    [ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])]
+                ),  # type: ignore[arg-type]
+            )
+            result2 = await capability.before_model_request(
+                _make_run_context(),
+                _request_context_with_messages(
+                    [ModelRequest(parts=[UserPromptPart(content="y" * 80_000)])]
+                ),  # type: ignore[arg-type]
+            )
+        finally:
+            gate.before_model_request = original
+
+        complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
+        assert len(complete) == 1, "expected exactly one errored complete event"
+        assert complete[0]["errored"] is True
+        assert complete[0]["error_type"] == "RuntimeError"
+        assert result1 is not None
+        assert result2 is not None
+        assert mock_before.call_count == 1, "latch should short-circuit second call"
+
+    @pytest.mark.asyncio
+    async def test_non_final_tier_failure_emits_success_complete_no_latch(self) -> None:
+        """When a non-final tier fails but the sliding-window tier still
+        compacts the history, the complete event is success-shaped and the
+        disable latch is NOT engaged."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        summarizer = capability._inner._inner.tiers[1]  # type: ignore[attr-defined]
+        original_compact = summarizer._inner.compact
+        summarizer._inner.compact = AsyncMock(side_effect=RuntimeError("summarizer boom"))
+
+        messages: list[Any] = []
+        for i in range(40):
+            messages.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
+        request_context = _request_context_with_messages(messages)
+
+        try:
+            result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+        finally:
+            summarizer._inner.compact = original_compact
+
+        assert len(result.messages) < len(messages)
+        complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
+        assert len(complete) == 1
+        assert complete[0]["errored"] is False
+
+        # A subsequent request above the trigger should still compact (latch off).
+        events.clear()
+        messages2: list[Any] = []
+        for i in range(40):
+            messages2.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages2.append(ModelRequest(parts=[UserPromptPart(content="y" * 80_000)]))
+        request_context2 = _request_context_with_messages(messages2)
+        result2 = await capability.before_model_request(_make_run_context(), request_context2)  # type: ignore[arg-type]
+        assert len(result2.messages) < len(messages2)
+        assert any(e[0] == "agent_compaction_complete" for e in events)
+
+
+class TestProviderIntegration:
+    """Requirement: claude/openai execute() resolves compaction and emits config."""
+
+    @pytest.mark.asyncio
+    async def test_claude_execute_emits_compaction_config(self) -> None:
+        """ClaudeProvider.execute() must emit exactly one ``agent_compaction_config``
+        event per execution with the full payload."""
+        from conductor.providers.claude import ClaudeProvider
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        provider = ClaudeProvider(api_key="test-key")
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=Agent(TestModel(custom_output_text="hello"), output_type=str),
+            ) as mock_build_agent,
+            patch(
+                "conductor.providers._pydantic_ai.compaction_window.resolve_compaction_window",
+                return_value=MockResolution(tokens=128_000, source="fallback"),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.compaction_window.resolve_output_limit",
+                return_value=MockResolution(tokens=64_000, source="default"),
+            ),
+        ):
+            agent = AgentDef(
+                name="cfg-test",
+                prompt="hi",
+                model="test",
+                max_depth=None,
+                timeout_seconds=None,
+                max_session_seconds=None,
+                max_agent_iterations=None,
+            )
+            output = await provider.execute(agent, {}, "hi", event_callback=callback)
+
+        assert output.content == {"result": "hello"}
+        config_events = [e for e in events if e[0] == "agent_compaction_config"]
+        assert len(config_events) == 1
+        payload = config_events[0][1]
+        expected_keys = {
+            "agent_name",
+            "model",
+            "context_window",
+            "context_window_source",
+            "output_limit",
+            "output_limit_source",
+            "trigger_tokens",
+            "target_tokens",
+        }
+        assert set(payload.keys()) == expected_keys
+        assert payload["agent_name"] == "cfg-test"
+        assert payload["context_window"] == 128_000
+        assert payload["output_limit"] == 64_000
+        assert mock_build_agent.call_args.kwargs["compaction"] is not None
+
+    @pytest.mark.asyncio
+    async def test_openai_execute_emits_compaction_config(self) -> None:
+        """OpenAIProvider.execute() must emit exactly one ``agent_compaction_config``
+        event per execution with the full payload."""
+        from conductor.providers.openai import OpenAIProvider
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        provider = OpenAIProvider(api_key="test-key")
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=Agent(TestModel(custom_output_text="hello"), output_type=str),
+            ) as mock_build_agent,
+            patch(
+                "conductor.providers._pydantic_ai.compaction_window.resolve_compaction_window",
+                return_value=MockResolution(tokens=128_000, source="fallback"),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.compaction_window.resolve_output_limit",
+                return_value=MockResolution(tokens=64_000, source="default"),
+            ),
+        ):
+            agent = AgentDef(
+                name="cfg-test",
+                prompt="hi",
+                model="test",
+                max_depth=None,
+                timeout_seconds=None,
+                max_session_seconds=None,
+                max_agent_iterations=None,
+            )
+            output = await provider.execute(agent, {}, "hi", event_callback=callback)
+
+        assert output.content == {"result": "hello"}
+        config_events = [e for e in events if e[0] == "agent_compaction_config"]
+        assert len(config_events) == 1
+        payload = config_events[0][1]
+        assert payload["agent_name"] == "cfg-test"
+        assert payload["context_window"] == 128_000
+        assert payload["output_limit"] == 64_000
+        assert mock_build_agent.call_args.kwargs["compaction"] is not None
+
+
+class MockResolution:
+    """Tiny stand-in for WindowResolution / OutputLimitResolution."""
+
+    def __init__(self, tokens: int, source: str) -> None:
+        self.tokens = tokens
+        self.source = source
+
+
+class TestMultiTurnCompaction:
+    """Requirement: a long TestModel run crosses the trigger and compacts."""
+
+    @pytest.mark.asyncio
+    async def test_multi_turn_run_compacts_and_completes(self) -> None:
+        """A large prompt makes the first request exceed the trigger; the run
+        still completes with a valid result."""
+        from conductor.providers._pydantic_ai.retry import RetryConfig
+        from conductor.providers._pydantic_ai.runner import run_agent_pipeline
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        agent_def = AgentDef(
+            name="multi",
+            prompt="go",
+            model="test",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
+        retry_cfg = RetryConfig(
+            max_attempts=1,
+            base_delay=0.0,
+            max_delay=0.0,
+            jitter=False,
+            backoff="exponential",
+            retry_on=None,
+            max_parse_recovery_attempts=0,
+        )
+        cfg = _make_config(
+            trigger_tokens=8_000,
+            target_tokens=4_000,
+            event_callback=callback,
+        )
+        large_prompt = "x" * 40_000
+
+        output = await run_agent_pipeline(
+            agent=agent_def,
+            rendered_prompt=large_prompt,
+            mcp_manager=None,
+            tools=None,
+            tool_output_config=None,  # type: ignore[arg-type]
+            retry_config=retry_cfg,
+            interrupt_signal=None,
+            event_callback=callback,
+            max_agent_iterations=10,
+            max_session_seconds=None,
+            default_model="test",
+            retry_history=[],
+            build_agent_fn=_build_agent_fn_for_test(custom_output_text="done"),
+            compaction=cfg,
+        )
+
+        assert output.content == {"result": "done"}
+        assert any(e[0] == "agent_compaction_start" for e in events)
+        assert any(e[0] == "agent_compaction_complete" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_interrupt_after_compaction(self) -> None:
+        """Setting the interrupt signal after compaction must still yield a
+        partial result without crashing."""
+        import asyncio
+
+        from conductor.providers._pydantic_ai.retry import RetryConfig
+        from conductor.providers._pydantic_ai.runner import run_agent_pipeline
+
+        agent_def = AgentDef(
+            name="interrupt",
+            prompt="go",
+            model="test",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
+        interrupt = asyncio.Event()
+        interrupt.set()
+
+        retry_cfg = RetryConfig(
+            max_attempts=1,
+            base_delay=0.0,
+            max_delay=0.0,
+            jitter=False,
+            backoff="exponential",
+            retry_on=None,
+            max_parse_recovery_attempts=0,
+        )
+        cfg = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+        )
+
+        output = await run_agent_pipeline(
+            agent=agent_def,
+            rendered_prompt="go",
+            mcp_manager=None,
+            tools=None,
+            tool_output_config=None,  # type: ignore[arg-type]
+            retry_config=retry_cfg,
+            interrupt_signal=interrupt,
+            event_callback=None,
+            max_agent_iterations=10,
+            max_session_seconds=None,
+            default_model="test",
+            retry_history=[],
+            build_agent_fn=_build_agent_fn_for_test(custom_output_text="partial"),
+            compaction=cfg,
+        )
+
+        assert output.partial is True
+
+    @pytest.mark.asyncio
+    async def test_parse_recovery_after_compaction(self) -> None:
+        """A malformed first response with history above the trigger must still
+        reach parse recovery and eventually produce valid structured output.
+
+        ``FunctionModel`` returns an invalid response first, then a valid one,
+        exercising the recovery path inside the runner without real API calls.
+        """
+        from pydantic import BaseModel
+
+        from conductor.config.schema import OutputField
+        from conductor.providers._pydantic_ai.retry import RetryConfig
+        from conductor.providers._pydantic_ai.runner import run_agent_pipeline
+
+        class AnswerModel(BaseModel):
+            answer: str
+
+        agent_def = AgentDef(
+            name="recovery",
+            prompt="answer",
+            model="test",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+            output={"answer": OutputField(type="string")},
+        )
+        retry_cfg = RetryConfig(
+            max_attempts=1,
+            base_delay=0.0,
+            max_delay=0.0,
+            jitter=False,
+            backoff="exponential",
+            retry_on=None,
+            max_parse_recovery_attempts=2,
+        )
+        cfg = _make_config(trigger_tokens=10, target_tokens=5)
+        large_prompt = "x" * 40_000
+
+        call_count: list[int] = [0]
+
+        async def _model_func(messages: list[Any], info: Any) -> Any:
+            from pydantic_ai.messages import ModelResponse, TextPart
+
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First response is not valid JSON for AnswerModel, forcing parse
+                # recovery to append a correction prompt and call the model again.
+                return ModelResponse(parts=[TextPart(content="not json")])
+            return ModelResponse(parts=[TextPart(content='{"answer": "Paris"}')])
+
+        def build_agent_fn(
+            toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any = None
+        ) -> Any:
+            capabilities: list[Any] = []
+            if compaction is not None:
+                capabilities.append(build_tiered_compaction(compaction))
+            return Agent(
+                model=_streaming_function_model(_model_func),
+                output_type=AnswerModel,
+                system_prompt="",
+                name="test-agent",
+                capabilities=capabilities,
+            )
+
+        output = await run_agent_pipeline(
+            agent=agent_def,
+            rendered_prompt=large_prompt,
+            mcp_manager=None,
+            tools=None,
+            tool_output_config=None,  # type: ignore[arg-type]
+            retry_config=retry_cfg,
+            interrupt_signal=None,
+            event_callback=None,
+            max_agent_iterations=5,
+            max_session_seconds=None,
+            default_model="test",
+            retry_history=[],
+            build_agent_fn=build_agent_fn,  # type: ignore[arg-type]
+            compaction=cfg,
+        )
+
+        assert output.content == {"answer": "Paris"}
+
+    @pytest.mark.asyncio
+    async def test_usage_limits_interaction(self) -> None:
+        """A compaction summary consumes one request-limit slot.
+
+        A run whose normal agentic loop needs two model requests (tool call,
+        then answer) uses three requests when compaction fires once, because the
+        summarization tier performs an internal model call that shares the same
+        usage budget.
+        """
+        from conductor.providers._pydantic_ai.retry import RetryConfig
+        from conductor.providers._pydantic_ai.runner import run_agent_pipeline
+
+        agent_def = AgentDef(
+            name="limits",
+            prompt="go",
+            model="test",
+            max_depth=None,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
+        retry_cfg = RetryConfig(
+            max_attempts=1,
+            base_delay=0.0,
+            max_delay=0.0,
+            jitter=False,
+            backoff="exponential",
+            retry_on=None,
+            max_parse_recovery_attempts=0,
+        )
+        cfg = _make_config(trigger_tokens=10, target_tokens=5)
+        large_prompt = "x" * 40_000
+
+        output = await run_agent_pipeline(
+            agent=agent_def,
+            rendered_prompt=large_prompt,
+            mcp_manager=None,
+            tools=None,
+            tool_output_config=None,  # type: ignore[arg-type]
+            retry_config=retry_cfg,
+            interrupt_signal=None,
+            event_callback=None,
+            max_agent_iterations=10,
+            max_session_seconds=None,
+            default_model="test",
+            retry_history=[],
+            build_agent_fn=_build_agent_fn_with_tool_call(summarizer_keep_messages=1),
+            compaction=cfg,
+        )
+
+        assert output.content == {"result": "done"}
+        assert output.raw_response.usage.requests == 3, (
+            "compaction summary must consume one request"
+        )
+
+
+import asyncio  # noqa: E402

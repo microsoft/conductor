@@ -10,8 +10,9 @@ wrapper that:
 3. Fails open: any unexpected error in the gate or tier chain is logged and the
    original request context is returned unchanged, so a compaction bug never
    aborts a workflow run.
-
-Event emission hooks are provided but left empty here; todo 5 fills them in.
+4. Emits ``agent_compaction_start`` / ``agent_compaction_complete`` events through
+   the per-execute callback so the console, JSONL log, and dashboard can observe
+   compaction activity.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.tools import RunContext
+
+from conductor.providers._pydantic_ai.events import EventCallback
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,33 @@ def _last_response_input_tokens(messages: list[ModelMessage]) -> int | None:
     return None
 
 
+def _emit_compaction_event(
+    event_callback: EventCallback | None,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """Emit a compaction event, swallowing callback errors."""
+    if event_callback is None:
+        return
+    try:
+        event_callback(event_type, payload)
+    except Exception:
+        logger.debug("Error in event_callback for %s", event_type, exc_info=True)
+
+
+def _build_compaction_config_payload(config: CompactionConfig) -> dict[str, Any]:
+    return {
+        "agent_name": config.agent_name,
+        "model": config.model_name,
+        "context_window": config.window_tokens,
+        "context_window_source": config.window_source,
+        "output_limit": config.output_limit_tokens,
+        "output_limit_source": config.output_limit_source,
+        "trigger_tokens": config.trigger_tokens,
+        "target_tokens": config.target_tokens,
+    }
+
+
 class _TierWrapper(AbstractCapability[Any]):
     """Wrap a single compaction tier so its failure does not stop the chain.
 
@@ -155,9 +185,6 @@ class _ThresholdGatedCompaction(AbstractCapability[Any]):
 
         anchor = _last_response_input_tokens(messages)
         if anchor is not None and anchor <= self._trigger_tokens:
-            # The cheap pre-check says we are below the trigger; do the full
-            # estimate to be sure, because the suffix after the anchor may push
-            # us over.
             estimate = await _estimate_context_tokens(
                 messages,
                 request_context.model_request_parameters,
@@ -183,9 +210,13 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
     or from the final deterministic tier so that a compaction bug can never abort
     a workflow run.
 
-    The wrapper carries event-emission hooks (``_on_before`` / ``_on_after``)
-    so todo 5 can add start/complete events without changing this class's
-    shape.
+    It also emits ``agent_compaction_start`` before delegating to the inner
+    strategy and ``agent_compaction_complete`` after the strategy returns or
+    when an unexpected error escapes.
+
+    A per-execution disable latch is set after an *outer* failure so the
+    wrapper short-circuits on subsequent requests rather than retrying a
+    deterministically broken compaction path.
     """
 
     def __init__(
@@ -196,9 +227,22 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
     ) -> None:
         self._inner = inner
         self._config = config
+        self._disabled = False
 
-    def _on_before(self, messages: list[ModelMessage], estimate: int) -> None:
-        """Hook called before compaction runs.  Todo 5 will emit start events here."""
+    def _on_before(self, estimate: int, messages_before: int) -> None:
+        """Emit ``agent_compaction_start`` through the per-execute callback."""
+        payload = _build_compaction_config_payload(self._config)
+        payload.update(
+            {
+                "messages_before": messages_before,
+                "tokens_before": estimate,
+            }
+        )
+        _emit_compaction_event(
+            self._config.event_callback,
+            "agent_compaction_start",
+            payload,
+        )
 
     def _on_after(
         self,
@@ -209,18 +253,81 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
         after_estimate: int,
         elapsed_seconds: float,
     ) -> None:
-        """Hook called after compaction succeeds.  Todo 5 will emit complete events here."""
+        """Emit a success-shaped ``agent_compaction_complete`` event."""
+        _emit_compaction_event(
+            self._config.event_callback,
+            "agent_compaction_complete",
+            {
+                "agent_name": self._config.agent_name,
+                "strategy": "tiered",
+                "model": self._config.model_name,
+                "messages_before": len(before_messages),
+                "messages_after": len(after_messages),
+                "tokens_before": before_estimate,
+                "tokens_after": after_estimate,
+                "tokens_saved": max(0, before_estimate - after_estimate),
+                "elapsed": elapsed_seconds,
+                "errored": False,
+            },
+        )
 
     def _on_error(self, exc: Exception) -> None:
-        """Hook called when compaction fails.  Todo 5 will emit errored complete events here."""
+        """Emit an errored ``agent_compaction_complete`` event and disable compaction."""
+        self._disabled = True
+        _emit_compaction_event(
+            self._config.event_callback,
+            "agent_compaction_complete",
+            {
+                "agent_name": self._config.agent_name,
+                "strategy": "tiered",
+                "model": self._config.model_name,
+                "errored": True,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
 
     async def before_model_request(
         self,
         ctx: RunContext[Any],
         request_context: ModelRequestContext,
     ) -> ModelRequestContext:
+        if self._disabled:
+            return request_context
+
         try:
-            return await self._inner.before_model_request(ctx, request_context)
+            before_messages = list(request_context.messages)
+            before_estimate = await _estimate_context_tokens(
+                before_messages,
+                request_context.model_request_parameters,
+            )
+
+            result = await self._inner.before_model_request(ctx, request_context)
+
+            # If the estimated context size is still below the trigger, the gate
+            # decided we were under budget and no compaction lifecycle event is
+            # needed.  Use the estimate (not message count) because a single large
+            # prompt can be above the trigger even when the tiered strategy has
+            # nothing to drop.
+            if before_estimate <= self._config.trigger_tokens:
+                return result
+
+            # Compaction is actually going to run: emit the start event now.
+            self._on_before(estimate=before_estimate, messages_before=len(before_messages))
+
+            after_messages = list(result.messages)
+            after_estimate = await _estimate_context_tokens(
+                after_messages,
+                request_context.model_request_parameters,
+            )
+            self._on_after(
+                before_messages=before_messages,
+                after_messages=after_messages,
+                before_estimate=before_estimate,
+                after_estimate=after_estimate,
+                elapsed_seconds=0.0,
+            )
+            return result
         except Exception as exc:  # noqa: BLE001 - compaction must never fail the run
             logger.warning(
                 "Compaction failed for agent %r: %s. Continuing without compaction.",

@@ -704,11 +704,55 @@ class OpenAIProvider(AgentProvider):
                 )
 
         from conductor.providers._pydantic_ai.agent_builder import build_agent
+        from conductor.providers._pydantic_ai.compaction import CompactionConfig
+        from conductor.providers._pydantic_ai.compaction_window import (
+            resolve_compaction_window,
+            resolve_output_limit,
+            target_tokens,
+            trigger_tokens,
+        )
+        from conductor.providers._pydantic_ai.events import emit_compaction_config
         from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
         from conductor.providers._pydantic_ai.runner import run_agent_pipeline
 
         resolved_cwd = agent.working_dir or os.getcwd()
         manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
+
+        effective_model = agent.model or self._default_model
+        window = await resolve_compaction_window(
+            provider=self,
+            model=effective_model,
+            has_custom_base_url=self._base_url is not None,
+        )
+        output_limit = await resolve_output_limit(
+            provider=self,
+            model=effective_model,
+            has_custom_base_url=self._base_url is not None,
+        )
+        trigger = trigger_tokens(window.tokens, output_limit.tokens)
+        target = target_tokens(window.tokens, trigger)
+        compaction_cfg = CompactionConfig(
+            window_tokens=window.tokens,
+            window_source=window.source,
+            output_limit_tokens=output_limit.tokens,
+            output_limit_source=output_limit.source,
+            trigger_tokens=trigger,
+            target_tokens=target,
+            event_callback=event_callback,
+            agent_name=agent.name,
+            model_name=effective_model,
+        )
+        emit_compaction_config(
+            event_callback,
+            agent_name=agent.name,
+            model=effective_model,
+            context_window=window.tokens,
+            context_window_source=window.source,
+            output_limit=output_limit.tokens,
+            output_limit_source=output_limit.source,
+            trigger_tokens=trigger,
+            target_tokens=target,
+        )
 
         def build_agent_fn(
             toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any | None = None
@@ -772,4 +816,5 @@ class OpenAIProvider(AgentProvider):
             default_model=self._default_model,
             retry_history=self._retry_history,
             build_agent_fn=build_agent_fn,
+            compaction=compaction_cfg,
         )
