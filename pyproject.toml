@@ -39,7 +39,8 @@ dependencies = [
     "simpleeval>=1.0.0",
     "github-copilot-sdk>=1.0.9",
     "anthropic>=0.77.0,<1.0.0",
-    "pydantic-ai-slim[anthropic,openai]>=1.44.0",
+    "pydantic-ai-slim[anthropic,openai]>=2.28.0",
+    "pydantic-ai-harness>=0.22.0",
     "openai>=2.48.0,<3.0.0",
     # Upper-bounded below 2.0.0: 2.0.0 renamed the camelCase attributes
     # (e.g. `Tool.inputSchema` -> `input_schema`) that the existing MCP
