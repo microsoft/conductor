@@ -910,7 +910,9 @@ class ClaudeProvider(AgentProvider):
         resolved_cwd = agent.working_dir or os.getcwd()
         manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
-        def build_agent_fn(toolsets: list[Any], *, max_parse_recovery_attempts: int) -> Any:
+        def build_agent_fn(
+            toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any | None = None
+        ) -> Any:
             return build_agent(
                 agent=agent,
                 system_prompt=agent.system_prompt or "",
@@ -925,6 +927,7 @@ class ClaudeProvider(AgentProvider):
                 base_url=self._base_url,
                 timeout=self._timeout,
                 toolsets=toolsets,
+                compaction=compaction,
             )
 
         retry_config = PydanticRetryConfig(

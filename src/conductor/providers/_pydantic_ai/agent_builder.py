@@ -25,6 +25,10 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from conductor.exceptions import ValidationError
+from conductor.providers._pydantic_ai.compaction import (
+    CompactionConfig,
+    build_tiered_compaction,
+)
 from conductor.providers._pydantic_ai.converters import (
     _sanitize_json_schema,
     output_schema_to_pydantic_model,
@@ -477,6 +481,7 @@ def build_agent(
     tools: list[Any] | None = None,
     backend: Literal["anthropic", "openai"] = "anthropic",
     http_client: httpx.AsyncClient | None = None,
+    compaction: CompactionConfig | None = None,
 ) -> Agent[Any, Any]:
     """Build a Pydantic AI Agent from a Conductor agent definition.
 
@@ -502,6 +507,8 @@ def build_agent(
         backend: Which LLM backend to build the agent for.
         http_client: Optional ``httpx.AsyncClient`` shared across model requests
             (openai backend only).
+        compaction: Optional resolved compaction config. When provided, a
+            tiered compaction capability is attached to the agent.
 
     Returns:
         A configured Pydantic AI ``Agent`` ready to run.
@@ -540,6 +547,35 @@ def build_agent(
     if output_type is None:
         output_type = str
 
+    capabilities: list[Any] = []
+    if compaction is not None:
+        try:
+            capabilities.append(build_tiered_compaction(compaction))
+        except Exception as exc:  # noqa: BLE001
+            error_type = type(exc).__name__
+            message = str(exc)
+            logger.warning(
+                "Failed to build tiered compaction capability for agent %s: %s: %s",
+                agent.name,
+                error_type,
+                message,
+            )
+            if compaction.event_callback is not None:
+                try:
+                    compaction.event_callback(
+                        "agent_compaction_complete",
+                        {
+                            "agent_name": compaction.agent_name,
+                            "strategy": "tiered",
+                            "model": compaction.model_name,
+                            "errored": True,
+                            "error_type": error_type,
+                            "message": message,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Error emitting agent_compaction_complete", exc_info=True)
+
     pydantic_agent: Agent[Any, Any] = Agent(
         model=model,
         output_type=output_type,
@@ -550,6 +586,7 @@ def build_agent(
         retries=AgentRetries(tools=0, output=max_parse_recovery_attempts),
         toolsets=toolsets or [],
         tools=tools or [],
+        capabilities=capabilities,
     )
 
     if isinstance(pydantic_agent.output_type, ToolOutput):
