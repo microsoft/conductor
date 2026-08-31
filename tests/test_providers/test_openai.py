@@ -44,9 +44,17 @@ class TestProviderConstruction:
     """Tests for OpenAIProvider construction and validation."""
 
     def test_default_model_is_gpt_5_mini(self) -> None:
-        """The provider defaults to gpt-5-mini when no model is passed."""
+        """Requirement: omitted model and cap use the OpenAI provider defaults."""
         p = OpenAIProvider(api_key="test-key")
         assert p._default_model == "gpt-5-mini"
+        assert p._default_max_tokens == 16_384
+        assert p._max_tokens_user_configured is False
+
+    def test_explicit_max_tokens_records_user_provenance(self) -> None:
+        """Requirement: an explicit cap remains distinguishable from the provider default."""
+        p = OpenAIProvider(api_key="test-key", max_tokens=1024)
+        assert p._default_max_tokens == 1024
+        assert p._max_tokens_user_configured is True
 
     def test_explicit_model_is_used(self) -> None:
         """An explicitly passed model overrides the default."""
@@ -329,6 +337,25 @@ class TestExecute:
 
 class TestExecuteDialogTurn:
     """Tests for execute_dialog_turn()."""
+
+    async def test_dialog_turn_keeps_4096_output_cap(self, provider: OpenAIProvider) -> None:
+        """Requirement: dialog turns retain their dedicated 4096-token output cap."""
+
+        async def fake_run(*args: Any, **kwargs: Any) -> Any:
+            class FakeResult:
+                output = "dialog reply"
+
+            return FakeResult()
+
+        with (
+            patch("conductor.providers._pydantic_ai.agent_builder._resolve_openai_model"),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
+            mock_agent_cls.return_value.run = fake_run
+            await provider.execute_dialog_turn("system prompt", "user message")
+
+        model_settings = mock_agent_cls.call_args.kwargs["model_settings"]
+        assert model_settings["max_tokens"] == 4096
 
     async def test_dialog_turn_returns_text(self, provider: OpenAIProvider) -> None:
         """execute_dialog_turn() returns the Pydantic AI text response."""

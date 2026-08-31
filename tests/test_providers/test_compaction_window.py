@@ -8,8 +8,9 @@ from typing import Any
 
 import pytest
 
+from conductor.config.schema import ToolOutputConfig
 from conductor.providers._pydantic_ai.compaction_window import (
-    DEFAULT_OUTPUT_LIMIT,
+    DEFAULT_MAX_TOKENS,
     ENV_CONTEXT_WINDOW,
     FALLBACK_CONTEXT_WINDOW,
     OutputLimitResolution,
@@ -17,6 +18,7 @@ from conductor.providers._pydantic_ai.compaction_window import (
     resolve_compaction_window,
     resolve_output_limit,
     target_tokens,
+    tool_buffer_tokens,
     trigger_tokens,
 )
 from conductor.providers.base import AgentProvider
@@ -205,91 +207,185 @@ class TestResolveCompactionWindow:
 class TestResolveOutputLimit:
     """Tests for the output-limit resolution cascade."""
 
-    async def test_provider_output_limit_wins(self) -> None:
-        provider = _MockProvider(max_output=32_000)
-
-        result = await resolve_output_limit(
-            provider=provider,
-            model="gpt-5.2",
-            has_custom_base_url=False,
-        )
-
-        assert result == OutputLimitResolution(tokens=32_000, source="provider")
-
-    async def test_provider_output_limit_absent_uses_default(self) -> None:
+    async def test_user_configured_settings_source(self) -> None:
         provider = _MockProvider()
 
         result = await resolve_output_limit(
             provider=provider,
             model="gpt-5.2",
-            has_custom_base_url=False,
+            effective_max_tokens=4096,
+            user_configured=True,
         )
 
-        assert result == OutputLimitResolution(
-            tokens=DEFAULT_OUTPUT_LIMIT,
-            source="default",
-        )
+        assert result == OutputLimitResolution(tokens=4096, source="settings")
 
-    async def test_custom_base_url_skips_registry_to_default(self) -> None:
+    async def test_unconfigured_default_source(self) -> None:
         provider = _MockProvider()
 
         result = await resolve_output_limit(
             provider=provider,
             model="gpt-5.2",
-            has_custom_base_url=True,
+            effective_max_tokens=DEFAULT_MAX_TOKENS,
+            user_configured=False,
         )
 
         assert result == OutputLimitResolution(
-            tokens=DEFAULT_OUTPUT_LIMIT,
+            tokens=DEFAULT_MAX_TOKENS,
             source="default",
         )
 
-    async def test_provider_raises_uses_default(self) -> None:
+    async def test_none_effective_max_tokens_uses_default(self) -> None:
+        provider = _MockProvider()
+
+        result = await resolve_output_limit(
+            provider=provider,
+            model="gpt-5.2",
+            effective_max_tokens=None,
+            user_configured=False,
+        )
+
+        assert result == OutputLimitResolution(
+            tokens=DEFAULT_MAX_TOKENS,
+            source="default",
+        )
+
+    async def test_provider_cap_clamps_settings(self) -> None:
+        provider = _MockProvider(max_output=8192)
+
+        result = await resolve_output_limit(
+            provider=provider,
+            model="gpt-5.2",
+            effective_max_tokens=16_384,
+            user_configured=True,
+        )
+
+        assert result == OutputLimitResolution(tokens=8192, source="provider-cap")
+
+    async def test_provider_cap_clamps_default(self) -> None:
+        provider = _MockProvider(max_output=8192)
+
+        result = await resolve_output_limit(
+            provider=provider,
+            model="gpt-5.2",
+            effective_max_tokens=DEFAULT_MAX_TOKENS,
+            user_configured=False,
+        )
+
+        assert result == OutputLimitResolution(tokens=8192, source="provider-cap")
+
+    async def test_provider_cap_ignored_when_larger(self) -> None:
+        provider = _MockProvider(max_output=128_000)
+
+        result = await resolve_output_limit(
+            provider=provider,
+            model="gpt-5.2",
+            effective_max_tokens=16_384,
+            user_configured=False,
+        )
+
+        assert result == OutputLimitResolution(tokens=16_384, source="default")
+
+    async def test_provider_raises_uses_base(self) -> None:
         provider = _MockProvider(output_raises=True)
 
         result = await resolve_output_limit(
             provider=provider,
             model="gpt-5.2",
-            has_custom_base_url=False,
+            effective_max_tokens=4096,
+            user_configured=True,
         )
 
-        assert result == OutputLimitResolution(
-            tokens=DEFAULT_OUTPUT_LIMIT,
-            source="default",
-        )
+        assert result == OutputLimitResolution(tokens=4096, source="settings")
+
+
+class TestToolBufferTokens:
+    """Tests for the tool-result buffer heuristic."""
+
+    def test_default_max_chars(self) -> None:
+        cfg = ToolOutputConfig(enabled=True, max_chars=50_000)
+        assert tool_buffer_tokens(cfg) == 40_000
+
+    def test_custom_max_chars(self) -> None:
+        cfg = ToolOutputConfig(enabled=True, max_chars=10_000)
+        # 2 * ceil(10000 / 4) + 15000 = 2 * 2500 + 15000
+        assert tool_buffer_tokens(cfg) == 20_000
+
+    def test_uneven_max_chars_rounds_up(self) -> None:
+        cfg = ToolOutputConfig(enabled=True, max_chars=9_999)
+        # ceil(9999 / 4) = 2500; 2 * 2500 + 15000 = 20000
+        assert tool_buffer_tokens(cfg) == 20_000
+
+    def test_disabled_emits_default_buffer_and_warning(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        cfg = ToolOutputConfig(enabled=False, max_chars=9999)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="conductor.providers._pydantic_ai.compaction_window",
+        ):
+            result = tool_buffer_tokens(cfg)
+
+        assert result == 40_000
+        assert "unbounded" in caplog.text.lower()
+
+    def test_none_config_uses_default(self) -> None:
+        assert tool_buffer_tokens(None) == 40_000
+
+    def test_huge_max_chars(self) -> None:
+        cfg = ToolOutputConfig(enabled=True, max_chars=500_000)
+        # 2 * ceil(500000 / 4) + 15000 = 2 * 125000 + 15000
+        assert tool_buffer_tokens(cfg) == 265_000
 
 
 class TestTriggerFormula:
     """Tests for trigger_tokens math."""
 
     def test_worked_examples(self) -> None:
-        assert trigger_tokens(128_000, 64_000) == 64_000
-        assert trigger_tokens(200_000, 32_000) == 160_000
-        assert trigger_tokens(1_000_000, 64_000) == 936_000
-
-    def test_output_limit_below_buffer(self) -> None:
-        # When the output limit is smaller than TRIGGER_BUFFER, the buffer
-        # dominates the reserve.
-        assert trigger_tokens(128_000, 16_000) == 88_000
+        # Default output_limit (16384) + default buffer (40000) on common windows.
+        assert trigger_tokens(128_000, 16_384, 40_000) == 71_616
+        assert trigger_tokens(200_000, 16_384, 40_000) == 143_616
+        assert trigger_tokens(1_000_000, 16_384, 40_000) == 943_616
+        # Larger output limit with default buffer.
+        assert trigger_tokens(128_000, 64_000, 40_000) == 24_000
 
     def test_small_window_floor(self) -> None:
         # Degenerate windows collapse to a minimum trigger of 1.
-        assert trigger_tokens(1, 1) == 1
-        assert trigger_tokens(40_000, 40_000) == 1
+        assert trigger_tokens(1, 1, 1) == 1
+        assert trigger_tokens(40_000, 40_000, 1) == 1
+
+    def test_huge_buffer_degenerates_to_one(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import conductor.providers._pydantic_ai.compaction_window as cw
+
+        cw._trigger_degenerate_warned = False
+        with caplog.at_level(
+            logging.WARNING,
+            logger="conductor.providers._pydantic_ai.compaction_window",
+        ):
+            # 128k window cannot hold 16_384 + 265_000 of reserve.
+            result = trigger_tokens(128_000, 16_384, 265_000)
+
+        assert result == 1
+        assert "degenerated" in caplog.text.lower()
 
 
 class TestTargetFormula:
     """Tests for target_tokens math."""
 
     def test_small_window_clamps_below_trigger(self) -> None:
-        # 128k window + 64k output => trigger 64k, raw 55% ceiling 70.4k.
-        # The clamp pulls it strictly below the trigger.
-        assert target_tokens(128_000, trigger_tokens(128_000, 64_000)) == 63_999
+        # 128k window + default output/buffer => trigger 71_616, raw 55% ceiling 70_400.
+        trigger = trigger_tokens(128_000, 16_384, 40_000)
+        assert trigger == 71_616
+        assert target_tokens(128_000, trigger) == 70_400
 
     def test_large_window_uses_fraction(self) -> None:
-        # 1M window + 64k output => trigger 936k, raw 55% ceiling 550k.
-        # Clamp inactive.
-        assert target_tokens(1_000_000, trigger_tokens(1_000_000, 64_000)) == 550_000
+        # 1M window + default output/buffer => trigger 943_616, raw 55% ceiling 550_000.
+        trigger = trigger_tokens(1_000_000, 16_384, 40_000)
+        assert target_tokens(1_000_000, trigger) == 550_000
 
     def test_floor(self) -> None:
         # Degenerate inputs collapse to a minimum target of 1.
@@ -302,8 +398,8 @@ class TestProxyUnknownModel:
     async def test_proxy_unknown_model_branch(self) -> None:
         """Provider metadata unavailable, registry suppressed, window=128k.
 
-        This pins the under-reserve fix: the resolved output limit is the
-        conservative default (64k), so the trigger is 64k, not 88k.
+        The fallback output limit is the unified default (16384) because the
+        user did not configure max_tokens. The default tool buffer remains 40000.
         """
         provider = _MockProvider()
 
@@ -320,11 +416,12 @@ class TestProxyUnknownModel:
         output_limit = await resolve_output_limit(
             provider=provider,
             model="some-proxy-model",
-            has_custom_base_url=True,
+            effective_max_tokens=DEFAULT_MAX_TOKENS,
+            user_configured=False,
         )
         assert output_limit == OutputLimitResolution(
-            tokens=DEFAULT_OUTPUT_LIMIT,
+            tokens=DEFAULT_MAX_TOKENS,
             source="default",
         )
 
-        assert trigger_tokens(window.tokens, output_limit.tokens) == 64_000
+        assert trigger_tokens(window.tokens, output_limit.tokens, 40_000) == 71_616
