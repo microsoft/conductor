@@ -89,7 +89,8 @@ class TestClaudeProviderInitialization:
         provider = ClaudeProvider()
 
         assert provider._default_model == "claude-3-5-sonnet-latest"
-        assert provider._default_max_tokens == 8192
+        assert provider._default_max_tokens == 16_384
+        assert provider._max_tokens_user_configured is False
         assert provider._timeout == 600.0
         assert provider._sdk_version == "0.77.0"
         mock_anthropic_class.assert_called_once()
@@ -118,6 +119,7 @@ class TestClaudeProviderInitialization:
         assert provider._default_model == "claude-3-opus-20240229"
         assert provider._default_temperature == 0.5
         assert provider._default_max_tokens == 4096
+        assert provider._max_tokens_user_configured is True
         assert provider._timeout == 300.0
 
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
@@ -803,6 +805,28 @@ class TestClaudeExecuteDialogTurn:
     """Tests for Claude provider dialog-turn API via the Pydantic AI seam."""
 
     @pytest.mark.asyncio
+    async def test_dialog_turn_keeps_4096_output_cap(self) -> None:
+        """Requirement: dialog turns retain their dedicated 4096-token output cap."""
+        provider = ClaudeProvider(api_key="test-key")
+
+        async def fake_run(*args: Any, **kwargs: Any) -> Any:
+            class FakeResult:
+                output = "the reply"
+                usage = None
+
+            return FakeResult()
+
+        with (
+            patch("conductor.providers._pydantic_ai.agent_builder._resolve_anthropic_model"),
+            patch("pydantic_ai.Agent") as mock_agent_cls,
+        ):
+            mock_agent_cls.return_value.run = AsyncMock(side_effect=fake_run)
+            await provider.execute_dialog_turn("system", "hello")
+
+        model_settings = mock_agent_cls.call_args.kwargs["model_settings"]
+        assert model_settings["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
     async def test_dialog_turn_empty_history_sends_only_current_message(self) -> None:
         """Empty history -> run is called with only the current user message."""
         provider = ClaudeProvider(api_key="test-key")
@@ -1075,7 +1099,9 @@ class TestClaudeGetModelCapabilities:
     async def test_thinking_model_reports_all_five_levels(self, mock_anthropic_class: Mock) -> None:
         mock_client = Mock()
         mock_client.models.list = AsyncMock(
-            return_value=Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)])
+            return_value=Mock(
+                data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000, max_tokens=None)]
+            )
         )
         mock_anthropic_class.return_value = mock_client
 

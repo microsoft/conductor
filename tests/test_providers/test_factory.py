@@ -553,6 +553,16 @@ class TestClaudeAgentSdkFactoryRejections:
             )
 
     @pytest.mark.asyncio
+    async def test_factory_accepts_none_max_tokens(self) -> None:
+        """Requirement: an omitted cap does not reach claude-agent-sdk as a default."""
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        provider = await create_provider("claude-agent-sdk", validate=False, max_tokens=None)
+        assert isinstance(provider, ClaudeAgentSdkProvider)
+        await provider.close()
+
+    @pytest.mark.asyncio
     async def test_factory_accepts_supported_params(self) -> None:
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider

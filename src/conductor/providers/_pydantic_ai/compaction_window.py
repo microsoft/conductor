@@ -7,21 +7,22 @@ target formula used by the pydantic-ai providers' tiered compaction.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from conductor.config.schema import ToolOutputConfig
 
 from conductor.providers.base import AgentProvider
 
 logger = logging.getLogger(__name__)
 
-#: Reserve the trigger must hold beyond the output limit (~2 worst-case tool
-#: results at the default ``tool_output.max_chars=50000`` plus estimator slop).
-TRIGGER_BUFFER = 40_000
-
-#: Default output-token cap used when neither provider metadata nor the registry
-#: knows the model's real output limit. Conservatively the largest common cap.
-DEFAULT_OUTPUT_LIMIT = 64_000
+#: Unified default ``max_tokens`` applied by the Claude and OpenAI providers
+#: when the user does not configure an explicit value. Also used as the
+#: compaction output-limit fallback when no other source is available.
+DEFAULT_MAX_TOKENS: int = 16_384
 
 #: Escalation ceiling as a fraction of the resolved context window.
 TARGET_FRACTION = 0.55
@@ -32,9 +33,24 @@ FALLBACK_CONTEXT_WINDOW = 128_000
 #: Environment variable override for the compaction context window.
 ENV_CONTEXT_WINDOW = "CONDUCTOR_COMPACTION_CONTEXT_WINDOW"
 
+#: Characters-per-token estimate for tool result payloads. This is an
+#: approximation; actual token counts depend on the model's tokenizer.
+TOOL_RESULT_CHARS_PER_TOKEN = 4
+
+#: Number of worst-case tool results the reserve should hold headroom for.
+#: pydantic-ai may run more than two parallel tool calls per segment, so this
+#: is a sizing heuristic, not a hard bound.
+TOOL_RESULT_COUNT_HEURISTIC = 2
+
+#: Extra token slack for the compaction estimator, tool schemas, and other
+#: non-result overhead. This is a heuristic, not a guarantee.
+ESTIMATOR_SLOP = 15_000
+
 #: One-shot warnings per process.
 _invalid_env_warned = False
 _custom_base_url_warned = False
+_tool_output_disabled_warned = False
+_trigger_degenerate_warned = False
 
 
 def _warn_invalid_env(value: str) -> None:
@@ -64,6 +80,31 @@ def _warn_custom_base_url() -> None:
     )
 
 
+def _warn_tool_output_disabled() -> None:
+    """Log a one-time warning that tool-output limits are disabled."""
+    global _tool_output_disabled_warned
+    if _tool_output_disabled_warned:
+        return
+    _tool_output_disabled_warned = True
+    logger.warning(
+        "runtime.tool_output.enabled is false; tool result sizes are unbounded. "
+        "The compaction reserve is using a heuristic buffer only."
+    )
+
+
+def _warn_trigger_degenerate() -> None:
+    """Log a one-time warning that the compaction trigger has degenerated."""
+    global _trigger_degenerate_warned
+    if _trigger_degenerate_warned:
+        return
+    _trigger_degenerate_warned = True
+    logger.warning(
+        "The compaction trigger has degenerated to 1 token (output_limit + tool_buffer "
+        "reaches the context window). Hysteresis is lost. Lower runtime.max_tokens or "
+        "tool_output.max_chars, or raise CONDUCTOR_COMPACTION_CONTEXT_WINDOW."
+    )
+
+
 def _warn_registry_lookup_failed(model: str, exc: Exception) -> None:
     """Log a one-time debug message when the registry lookup fails."""
     logger.debug("Failed to resolve context window from registry for %r: %s", model, exc)
@@ -87,7 +128,7 @@ class OutputLimitResolution:
     tokens: int
     """Resolved output-token cap in tokens."""
 
-    source: Literal["provider", "registry", "default"]
+    source: Literal["settings", "provider-cap", "default"]
     """Source that supplied the value."""
 
 
@@ -133,18 +174,6 @@ def _resolve_window_from_registry(model: str) -> int | None:
     if window is None or window <= 0:
         return None
     return int(window)
-
-
-def _resolve_output_limit_from_registry(model: str) -> int | None:
-    """Attempt to look up the model's max output tokens in the registry.
-
-    The installed genai-prices version does not expose ``max_output_tokens`` on
-    its ``ModelInfo`` dataclass, so this always returns ``None`` today. It is kept
-    as a well-defined seam so a future registry version that includes the field
-    can be adopted without changing the cascade logic.
-    """
-    del model
-    return None
 
 
 async def resolve_compaction_window(
@@ -200,51 +229,97 @@ async def resolve_output_limit(
     *,
     provider: AgentProvider,
     model: str,
-    has_custom_base_url: bool,
+    effective_max_tokens: int | None,
+    user_configured: bool,
 ) -> OutputLimitResolution:
     """Resolve the compaction output-token limit through the priority cascade.
 
     Priority order, highest first:
 
-    1. ``provider.get_max_output_tokens(model)`` (authoritative provider metadata).
-    2. ``genai-prices`` registry, but only for first-party endpoints
-       (``has_custom_base_url`` is ``False``).
-    3. ``DEFAULT_OUTPUT_LIMIT``.
+    1. The effective ``max_tokens`` the provider will actually send to the API.
+       Source is ``"settings"`` when the user configured ``runtime.max_tokens``
+       (``user_configured=True``), otherwise ``"default"`` (the unified 16384
+       default or a value from Claude's thinking coercion).
+    2. The provider-reported per-model output cap from
+       ``provider.get_max_output_tokens(model)`` when it is smaller than the base
+       value. Source becomes ``"provider-cap"``.
 
     There is no environment override for the output limit by design.
 
     Args:
         provider: Provider instance to query for metadata.
         model: Model identifier as sent to the SDK.
-        has_custom_base_url: Whether the provider is pointed at a custom API
-            proxy. When ``True``, registry lookups are skipped.
+        effective_max_tokens: The output-token cap that will actually be sent
+            to the API, if known.
+        user_configured: Whether ``effective_max_tokens`` came from an explicit
+            user configuration (``runtime.max_tokens``) rather than a default.
 
     Returns:
         An :class:`OutputLimitResolution` with the resolved limit and its source.
         This function never raises.
     """
+    if effective_max_tokens is not None:
+        base = int(effective_max_tokens)
+        source: Literal["settings", "provider-cap", "default"] = (
+            "settings" if user_configured else "default"
+        )
+    else:
+        base = DEFAULT_MAX_TOKENS
+        source = "default"
+
     try:
-        provider_value = await provider.get_max_output_tokens(model)
+        cap = await provider.get_max_output_tokens(model)
     except Exception as exc:  # noqa: BLE001 - metadata is best-effort
         logger.debug("get_max_output_tokens(%r) raised: %s", model, exc)
-        provider_value = None
-    if provider_value is not None and provider_value > 0:
-        return OutputLimitResolution(tokens=int(provider_value), source="provider")
+        cap = None
 
-    if not has_custom_base_url:
-        registry_value = _resolve_output_limit_from_registry(model)
-        if registry_value is not None:
-            return OutputLimitResolution(tokens=registry_value, source="registry")
+    if cap is not None and 0 < cap < base:
+        base = int(cap)
+        source = "provider-cap"
 
-    return OutputLimitResolution(tokens=DEFAULT_OUTPUT_LIMIT, source="default")
+    return OutputLimitResolution(tokens=base, source=source)
 
 
-def trigger_tokens(window: int, output_limit: int) -> int:
+def tool_buffer_tokens(tool_output: ToolOutputConfig | None) -> int:
+    """Return the token buffer reserved for tool-result payloads.
+
+    Formula::
+
+        TOOL_RESULT_COUNT_HEURISTIC * ceil(max_chars / TOOL_RESULT_CHARS_PER_TOKEN) + ESTIMATOR_SLOP
+
+    The default ``max_chars=50_000`` yields exactly 40_000 tokens, preserving
+    the previous hard-coded buffer magnitude.
+
+    When ``tool_output.enabled`` is ``False``, tool result sizes are unbounded,
+    so the same default-magnitude heuristic buffer is returned and a one-time
+    warning is logged.
+
+    Args:
+        tool_output: Runtime tool-output limit configuration.
+
+    Returns:
+        Token buffer to reserve for tool results.
+    """
+    default_max_chars = 50_000
+    if tool_output is None or tool_output.enabled:
+        max_chars = default_max_chars if tool_output is None else tool_output.max_chars
+        return (
+            TOOL_RESULT_COUNT_HEURISTIC * math.ceil(max_chars / TOOL_RESULT_CHARS_PER_TOKEN)
+            + ESTIMATOR_SLOP
+        )
+    _warn_tool_output_disabled()
+    return (
+        TOOL_RESULT_COUNT_HEURISTIC * math.ceil(default_max_chars / TOOL_RESULT_CHARS_PER_TOKEN)
+        + ESTIMATOR_SLOP
+    )
+
+
+def trigger_tokens(window: int, output_limit: int, tool_buffer: int) -> int:
     """Return the reserve-based compaction trigger.
 
     Formula::
 
-        max(1, window - max(output_limit, TRIGGER_BUFFER))
+        max(1, window - output_limit - tool_buffer)
 
     The trigger reserves enough headroom for the model's own maximum answer
     plus a buffer for the largest likely tool results, preventing the provider
@@ -253,11 +328,14 @@ def trigger_tokens(window: int, output_limit: int) -> int:
     Args:
         window: Resolved context-window size in tokens.
         output_limit: Resolved output-token cap in tokens.
+        tool_buffer: Tool-result reserve in tokens.
 
     Returns:
         Token threshold at which compaction should fire.
     """
-    return max(1, window - max(output_limit, TRIGGER_BUFFER))
+    if output_limit + tool_buffer >= window - 1:
+        _warn_trigger_degenerate()
+    return max(1, window - output_limit - tool_buffer)
 
 
 def target_tokens(window: int, trigger: int) -> int:

@@ -30,9 +30,8 @@ from pydantic import BaseModel
 
 from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.mcp.manager import (
-    MCPManager,
-)
+from conductor.mcp.manager import MCPManager
+from conductor.providers._pydantic_ai.compaction_window import DEFAULT_MAX_TOKENS
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -190,7 +189,8 @@ class ClaudeProvider(AgentProvider):
                 deprecation risk. The "-latest" suffix ensures compatibility
                 with model updates without requiring configuration changes.
             temperature: Default temperature (0.0-1.0). SDK enforces range.
-            max_tokens: Maximum output tokens. Defaults to 8192.
+            max_tokens: Maximum output tokens. Defaults to 16384 when not
+                configured, applied uniformly across Claude and OpenAI providers.
             timeout: Request timeout in seconds. Defaults to 600s.
             retry_config: Optional retry configuration. Uses default if not provided.
             mcp_servers: Optional MCP server configurations for tool support.
@@ -230,9 +230,10 @@ class ClaudeProvider(AgentProvider):
         self._default_temperature = temperature
 
         # Validate and store max_tokens (enforce schema bounds at instantiation)
+        self._max_tokens_user_configured = max_tokens is not None
         if max_tokens is not None:
             self._validate_max_tokens(max_tokens)
-        self._default_max_tokens = max_tokens or 8192
+        self._default_max_tokens = max_tokens or DEFAULT_MAX_TOKENS
 
         self._timeout = timeout
         self._sdk_version: str | None = None
@@ -259,11 +260,13 @@ class ClaudeProvider(AgentProvider):
         self._mcp_manager_locks: dict[str, asyncio.Lock] = {}
 
         # Cache of model_id -> max_input_tokens populated lazily on first
-        # get_max_prompt_tokens() call. Guarded by an asyncio.Lock to avoid
-        # racing concurrent first-callers and emitting duplicate models.list()
-        # requests.
+        # get_max_prompt_tokens() call, and model_id -> max_tokens populated
+        # lazily on first get_max_output_tokens() call. Guarded by an
+        # asyncio.Lock to avoid racing concurrent first-callers and emitting
+        # duplicate models.list() requests.
         self._max_input_cache: dict[str, int | None] | None = None
-        self._max_input_cache_lock = asyncio.Lock()
+        self._max_output_cache: dict[str, int | None] | None = None
+        self._model_cache_lock = asyncio.Lock()
 
         # Set when validate_connection()'s models.list() probe is inconclusive
         # (see _connection_probe_verdict) rather than a confirmed success.
@@ -480,14 +483,57 @@ class ClaudeProvider(AgentProvider):
         else:
             logger.debug(f"Default model '{self._default_model}' verified in available models")
 
-        # Seed the metadata cache so get_max_prompt_tokens() is a pure lookup.
-        self._install_max_input_cache(models_page.data)
+        # Seed the metadata caches so get_max_prompt_tokens() and
+        # get_max_output_tokens() are pure lookups.
+        self._install_model_cache(models_page.data)
 
-    def _install_max_input_cache(self, models_data: list[Any]) -> None:
-        """Replace ``_max_input_cache`` with a fresh mapping of id -> max_input."""
+    def _install_model_cache(self, models_data: list[Any]) -> None:
+        """Replace both model metadata caches with fresh mappings."""
         self._max_input_cache = {
             info.id: getattr(info, "max_input_tokens", None) for info in models_data
         }
+        self._max_output_cache = {
+            info.id: getattr(info, "max_tokens", None) for info in models_data
+        }
+
+    def _resolve_model_cache_value(
+        self,
+        model: str,
+        cache: dict[str, int | None] | None,
+    ) -> int | None:
+        """Resolve ``model`` against ``cache`` using alias matching.
+
+        Returns ``None`` when the cache is empty or no alias matches.
+        """
+        if cache is None:
+            return None
+        matched_id = match_model_id(model, cache.keys())
+        if matched_id is None:
+            return None
+        return cache.get(matched_id)
+
+    async def _ensure_model_cache(self) -> None:
+        """Populate model metadata caches if not already filled.
+
+        Fetches ``client.models.list()`` outside the lock so concurrent callers
+        don't queue behind a slow round-trip; the lock only guards the install.
+        """
+        if self._max_input_cache is not None or self._max_output_cache is not None:
+            return
+
+        if self._client is None:
+            return
+
+        try:
+            page = await self._client.models.list()
+        except (TimeoutError, AnthropicError, OSError) as e:
+            # Don't cache the failure — let the next call retry.
+            logger.debug("Failed to list Anthropic models: %s", e)
+            return
+
+        async with self._model_cache_lock:
+            if self._max_input_cache is None and self._max_output_cache is None:
+                self._install_model_cache(page.data)
 
     def _log_model_listing_unavailable(self) -> None:
         """Log that model listing is unavailable, once at warning then at debug.
@@ -535,25 +581,32 @@ class ClaudeProvider(AgentProvider):
             self._log_model_listing_unavailable()
             return None
 
-        if self._max_input_cache is None:
-            # Fetch outside the lock so concurrent callers don't all queue
-            # behind a slow round-trip; the lock only guards the install.
-            try:
-                page = await self._client.models.list()
-            except (TimeoutError, AnthropicError, OSError) as e:
-                # Don't cache the failure — let the next call retry.
-                logger.debug("Failed to list Anthropic models: %s", e)
-                return None
-            async with self._max_input_cache_lock:
-                if self._max_input_cache is None:
-                    self._install_max_input_cache(page.data)
+        await self._ensure_model_cache()
+        return self._resolve_model_cache_value(model, self._max_input_cache)
 
-        # The block above either returned early on failure or installed the
-        # cache, so it's guaranteed non-None here.
-        cache = self._max_input_cache
-        assert cache is not None
-        matched_id = match_model_id(model, cache.keys())
-        return cache.get(matched_id) if matched_id is not None else None
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the Anthropic SDK's ``max_tokens`` for ``model``.
+
+        On first call, populates a per-instance cache by enumerating
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache when the
+        probe succeeds. Alias resolution uses :func:`match_model_id` so
+        ``-latest`` and dated suffixes resolve to the cached entry.
+
+        Returns ``None`` when the SDK is unavailable, the model can't be
+        resolved, the listing call fails, or the API reports no output cap
+        for the model. Output metadata is best-effort and must never block
+        workflow execution.
+        """
+        if not ANTHROPIC_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
+
+        await self._ensure_model_cache()
+        return self._resolve_model_cache_value(model, self._max_output_cache)
 
     async def list_models(self) -> list[str] | None:
         """Return the model ids advertised by the Anthropic API.
@@ -591,9 +644,9 @@ class ClaudeProvider(AgentProvider):
         so ``default_reasoning_effort`` is always ``None``.
 
         ``max_prompt_tokens`` reuses :meth:`get_max_prompt_tokens` (the
-        Anthropic SDK's ``max_input_tokens``). ``max_output_tokens`` and
-        ``max_context_window_tokens`` are always ``None`` — the Anthropic
-        SDK's ``models.list()`` exposes no output/total-context split.
+        Anthropic SDK's ``max_input_tokens``). ``max_output_tokens`` reuses
+        :meth:`get_max_output_tokens` (the Anthropic SDK's ``max_tokens``),
+        when available. ``max_context_window_tokens`` is always ``None``.
 
         Unlike :meth:`get_max_prompt_tokens` (which only catches its
         documented ``(TimeoutError, AnthropicError, OSError)`` tuple and lets
@@ -620,11 +673,16 @@ class ClaudeProvider(AgentProvider):
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to resolve max_prompt_tokens for %r: %s", model, e)
             max_prompt_tokens = None
+        try:
+            max_output_tokens = await self.get_max_output_tokens(model)
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to resolve max_output_tokens for %r: %s", model, e)
+            max_output_tokens = None
         return ModelCapabilityInfo(
             supported_reasoning_efforts=supported_reasoning_efforts,
             default_reasoning_effort=None,
             max_prompt_tokens=max_prompt_tokens,
-            max_output_tokens=None,
+            max_output_tokens=max_output_tokens,
             max_context_window_tokens=None,
         )
 
@@ -748,6 +806,7 @@ class ClaudeProvider(AgentProvider):
 
             # Drop cached metadata so a re-initialized provider re-fetches.
             self._max_input_cache = None
+            self._max_output_cache = None
 
     async def execute_dialog_turn(
         self,
@@ -903,12 +962,16 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories  # Claude relies on eager preamble injection (see docstring).
-        from conductor.providers._pydantic_ai.agent_builder import build_agent
+        from conductor.providers._pydantic_ai.agent_builder import (
+            build_agent,
+            resolve_anthropic_effective_max_tokens,
+        )
         from conductor.providers._pydantic_ai.compaction import CompactionConfig
         from conductor.providers._pydantic_ai.compaction_window import (
             resolve_compaction_window,
             resolve_output_limit,
             target_tokens,
+            tool_buffer_tokens,
             trigger_tokens,
         )
         from conductor.providers._pydantic_ai.events import emit_compaction_config
@@ -919,6 +982,12 @@ class ClaudeProvider(AgentProvider):
         manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
         effective_model = agent.model or self._default_model
+        effective_max_tokens = resolve_anthropic_effective_max_tokens(
+            agent,
+            default_max_tokens=self._default_max_tokens,
+            default_reasoning_effort=self._default_reasoning_effort,
+            default_model=self._default_model,
+        )
         window = await resolve_compaction_window(
             provider=self,
             model=effective_model,
@@ -927,9 +996,11 @@ class ClaudeProvider(AgentProvider):
         output_limit = await resolve_output_limit(
             provider=self,
             model=effective_model,
-            has_custom_base_url=self._base_url is not None,
+            effective_max_tokens=effective_max_tokens,
+            user_configured=self._max_tokens_user_configured,
         )
-        trigger = trigger_tokens(window.tokens, output_limit.tokens)
+        tool_buffer = tool_buffer_tokens(self._tool_output_config)
+        trigger = trigger_tokens(window.tokens, output_limit.tokens, tool_buffer)
         target = target_tokens(window.tokens, trigger)
         compaction_cfg = CompactionConfig(
             window_tokens=window.tokens,

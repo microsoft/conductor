@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.mcp.manager import MCPManager
+from conductor.providers._pydantic_ai.compaction_window import DEFAULT_MAX_TOKENS
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
@@ -178,8 +179,8 @@ class OpenAIProvider(AgentProvider):
                 explicitly.
             model: Default model to use. Defaults to ``gpt-5-mini``.
             temperature: Default temperature (0.0-2.0).
-            max_tokens: Maximum output tokens. ``None`` leaves the parameter unset so
-                the server applies its own default.
+            max_tokens: Maximum output tokens. Defaults to 16384 when not
+                configured, applied uniformly across Claude and OpenAI providers.
             timeout: Request timeout in seconds. Defaults to 600s.
             retry_config: Optional retry configuration. Uses default if not provided.
             mcp_servers: Optional MCP server configurations for tool support.
@@ -212,9 +213,11 @@ class OpenAIProvider(AgentProvider):
             self._validate_temperature(temperature)
         self._default_temperature = temperature
 
+        # Validate and store max_tokens (enforce schema bounds at instantiation)
+        self._max_tokens_user_configured = max_tokens is not None
         if max_tokens is not None:
             self._validate_max_tokens(max_tokens)
-        self._default_max_tokens = max_tokens
+        self._default_max_tokens = max_tokens or DEFAULT_MAX_TOKENS
 
         self._timeout = timeout
         self._sdk_version: str | None = None
@@ -709,6 +712,7 @@ class OpenAIProvider(AgentProvider):
             resolve_compaction_window,
             resolve_output_limit,
             target_tokens,
+            tool_buffer_tokens,
             trigger_tokens,
         )
         from conductor.providers._pydantic_ai.events import emit_compaction_config
@@ -727,9 +731,11 @@ class OpenAIProvider(AgentProvider):
         output_limit = await resolve_output_limit(
             provider=self,
             model=effective_model,
-            has_custom_base_url=self._base_url is not None,
+            effective_max_tokens=self._default_max_tokens,
+            user_configured=self._max_tokens_user_configured,
         )
-        trigger = trigger_tokens(window.tokens, output_limit.tokens)
+        tool_buffer = tool_buffer_tokens(self._tool_output_config)
+        trigger = trigger_tokens(window.tokens, output_limit.tokens, tool_buffer)
         target = target_tokens(window.tokens, trigger)
         compaction_cfg = CompactionConfig(
             window_tokens=window.tokens,

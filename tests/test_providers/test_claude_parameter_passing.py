@@ -121,7 +121,7 @@ class TestClaudeParameterPassing:
 
         kwargs = mock_build_agent.call_args.kwargs
         assert kwargs["default_temperature"] is None
-        assert kwargs["default_max_tokens"] == 8192
+        assert kwargs["default_max_tokens"] == 16_384
 
     @pytest.mark.asyncio
     async def test_agent_model_overrides_provider_model(self) -> None:

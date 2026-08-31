@@ -158,8 +158,8 @@ class TestSchemaToProviderIntegration:
 
         # When temperature is None, it should NOT be passed as a default
         assert mock_build_agent.call_args.kwargs["default_temperature"] is None
-        # max_tokens uses the provider default of 8192 when not specified
-        assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 8192
+        # max_tokens uses the provider default of 16384 when not specified
+        assert mock_build_agent.call_args.kwargs["default_max_tokens"] == 16_384
 
         await provider.close()
 
