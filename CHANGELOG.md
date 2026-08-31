@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.35...HEAD)
 
+### Added
+
+- **Automatic client-side context compaction for pydantic-ai providers** (`claude` and `openai`). When the conversation history crosses a calculated trigger threshold based on the model's context window and output limits, Conductor automatically condenses the history. It uses a three-stage strategy: clearing old tool results first, summarizing older messages with a nested model call, and sliding the window as a deterministic fallback. Users can override the resolved context window size using the `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable.
+
 ## [0.1.35](https://github.com/microsoft/conductor/compare/v0.1.34...v0.1.35) - 2026-08-28
 
 ### Removed

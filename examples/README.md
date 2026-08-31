@@ -169,6 +169,16 @@ conductor run examples/validator.yaml --input diff="$(git diff HEAD~1)"
 
 See [Validator](../docs/workflow-syntax.md#validator) for the full field reference and behavior notes.
 
+## Context Compaction
+
+### compaction.yaml
+
+Demonstrates automatic, client-side context compaction for `claude` and `openai` providers. Runs a loop-back agent that accumulates conversation history. Once the history crosses the calculated trigger threshold, older tool results and messages are compacted.
+
+```bash
+conductor run examples/compaction.yaml --input iterations=10
+```
+
 ## Multi-Agent Workflows
 
 ### research-assistant.yaml

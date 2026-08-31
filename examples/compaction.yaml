@@ -1,0 +1,68 @@
+# Context Compaction Workflow Example
+#
+# This workflow demonstrates automatic client-side context compaction.
+# It uses a loop-back agent pattern to accumulate conversation history.
+# As history grows and crosses the trigger threshold, Conductor will
+# automatically compact older tool results and messages.
+#
+# For this example, we configure it to run on the claude provider,
+# but it's also supported on the openai provider.
+#
+# Usage:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   conductor run examples/compaction.yaml --input iterations=10
+#
+# To force compaction with a small window override:
+#   CONDUCTOR_COMPACTION_CONTEXT_WINDOW=100000 conductor run examples/compaction.yaml --input iterations=10
+
+workflow:
+  name: context-compaction
+  description: Demonstrates automatic, always-on client-side context compaction using a loop-back agent
+  version: "1.0.0"
+  entry_point: generator
+
+  runtime:
+    provider: claude # compaction is always-on for claude and openai providers
+    default_model: claude-sonnet-4.5
+    temperature: 0.5
+
+  input:
+    iterations:
+      type: number
+      required: false
+      description: The number of loops to run to accumulate context
+      default: 5
+
+  context:
+    mode: accumulate # accumulates prior outputs to grow context size
+
+  limits:
+    max_iterations: 50
+
+agents:
+  - name: generator
+    description: Generates content and checks if we need to loop back to accumulate more context
+    prompt: |
+      You are a content generator participating in a context-compaction simulation.
+      We are on loop iteration {{ generator.output.current_loop | default(1) }} out of {{ workflow.input.iterations }}.
+
+      Previous loop response: {{ generator.output.content | default("None") }}
+
+      Generate a long, detailed paragraph (around 200 words) discussing technical architecture.
+      Also increment the loop count.
+    output:
+      current_loop:
+        type: number
+        description: The current loop iteration counter
+      content:
+        type: string
+        description: The generated detailed content paragraph
+    routes:
+      - to: generator
+        when: "{{ current_loop < workflow.input.iterations }}"
+      - to: $end
+        when: "{{ current_loop >= workflow.input.iterations }}"
+
+output:
+  final_loop: "{{ generator.output.current_loop }}"
+  final_content: "{{ generator.output.content }}"

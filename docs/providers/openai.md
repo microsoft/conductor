@@ -12,6 +12,7 @@ The OpenAI provider enables Conductor workflows to execute agents using OpenAI's
 - [Model Selection & Runtime Configuration](#model-selection--runtime-configuration)
 - [Reasoning Effort Matrix](#reasoning-effort-matrix)
 - [MCP Tools Support](#mcp-tools-support)
+- [Context Compaction](#context-compaction)
 - [Troubleshooting](#troubleshooting)
 
 ## Quick Start
@@ -238,6 +239,19 @@ workflow:
 ```
 
 HTTP and SSE MCP server types are not supported by the OpenAI provider (`stdio` only).
+
+## Context Compaction
+
+The OpenAI provider supports automatic, client-side context compaction. When the estimated history size crosses a calculated threshold, Conductor condenses the conversation.
+
+### How Compaction Resolves on OpenAI
+
+*   **Context Window:** Because the OpenAI models API doesn't expose context window sizes, Conductor resolves the window via the `genai-prices` registry for first-party endpoints. If a custom `base_url` is configured, or registry lookup fails, it falls back to the default $128,000$ tokens fallback.
+*   **Output Limit:** The provider uses the `genai-prices` registry for first-party endpoints, falling back to the default of $64,000$ tokens.
+*   **Trigger Threshold:** Calculated as:
+    $$\text{Trigger} = \text{Context Window} - \max(\text{Output Limit}, 40,000)$$
+
+For more details on the compaction tiers, hysteresis gap, and usage limits, see the [Workflow Syntax Guide](../workflow-syntax.md#context-compaction).
 
 ## Troubleshooting
 

@@ -14,6 +14,7 @@ The Claude provider enables Conductor workflows to use Anthropic's Claude models
 - [System Prompt](#system-prompt)
 - [Streaming Limitations](#streaming-limitations)
 - [Extended Thinking](#extended-thinking)
+- [Context Compaction](#context-compaction)
 - [Troubleshooting](#troubleshooting)
 - [Cost Optimization](#cost-optimization)
 
@@ -456,6 +457,19 @@ emits the same event shape so workflows that mix providers render consistently.
 
 See [`examples/reasoning-effort.yaml`](../../examples/reasoning-effort.yaml) for
 a runnable end-to-end example.
+
+## Context Compaction
+
+The Claude provider supports automatic, client-side context compaction using a tiered strategy. When context usage crosses a calculated threshold, the history is compacted.
+
+### How Compaction Resolves on Claude
+
+*   **Context Window:** The provider queries the Anthropic SDK (`models.list()`) to dynamically retrieve the maximum input tokens for the configured model. If query fails or a custom `base_url` is configured, it falls back to the `genai-prices` registry, and finally to the default $128,000$ tokens fallback.
+*   **Output Limit:** The provider queries `models.list()` to retrieve the model's `max_output_tokens`. If query fails, it falls back to the registry, then to the default of $64,000$ tokens.
+*   **Trigger Threshold:** Calculated as:
+    $$\text{Trigger} = \text{Context Window} - \max(\text{Output Limit}, 40,000)$$
+
+For more details on the compaction tiers, hysteresis gap, and usage limits, see the [Workflow Syntax Guide](../workflow-syntax.md#context-compaction).
 
 ## Troubleshooting
 

@@ -670,6 +670,7 @@ conductor run workflow.yaml --input q="test" | jq '.answer'
 | `OPENAI_API_KEY` | OpenAI provider API key (when `provider: openai`) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `CONDUCTOR_NO_UPDATE_CHECK` | Set to `1` to suppress the passive update-check hint |
+| `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` | Overrides the context window size (in tokens) used by the client-side context compaction logic for `claude` and `openai` providers. Must be a positive integer |
 
 Environment variables in YAML configs support `${VAR}` and `${VAR:-default}` interpolation syntax.
 

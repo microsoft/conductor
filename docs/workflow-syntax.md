@@ -102,18 +102,18 @@ agents:
     description: string             # Optional: Purpose description
     type: agent                     # agent | human_gate | questions | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
-    
+
     prompt: |                       # Required for type=agent: Agent instructions
       Multi-line prompt with Jinja2 templates
       {{ workflow.input.field }}
       {{ previous_agent.output.field }}
-    
+
     input:                          # Optional: Explicit input declarations
       field_name:
         from: "{{ expression }}"
         type: string                # string | number | boolean | array | object
         required: true
-    
+
     output:                         # Optional: Output schema for validation
       field_name:
         type: string                # string | number | boolean | array | object
@@ -134,7 +134,7 @@ agents:
                                     # envelope: explicit opt-in to structured
                                     #   output pipeline (same as default when
                                     #   output: is declared).
-    
+
     tools:                          # Optional: Agent-specific tools
       - tool_name
 
@@ -522,7 +522,7 @@ agents:
   - name: approval_gate
     type: human_gate
     description: "Approve the proposed changes"
-    
+
     options:                        # Required: List of choices
       - name: approve
         description: "Approve and proceed"
@@ -530,7 +530,7 @@ agents:
         description: "Request revisions"
       - name: reject
         description: "Reject the proposal"
-    
+
     routes:
       - to: implementer
         when: "{{ approval_gate.choice == 'approve' }}"
@@ -1257,15 +1257,15 @@ Execute a fixed list of agents in parallel:
 parallel:
   - name: string                    # Required: Group identifier
     description: string             # Optional: Purpose description
-    
+
     agents:                         # Required: Agents to run in parallel
       - agent_name_1
       - agent_name_2
       - agent_name_3
-    
+
     failure_mode: fail_fast         # Required: Error handling strategy
                                     # Options: fail_fast | continue_on_error | all_or_nothing
-    
+
     routes:                         # Optional: Routes after parallel execution
       - to: next_agent
         when: "{{ condition }}"
@@ -1280,14 +1280,14 @@ for_each:
   - name: string                    # Required: Group identifier
     type: for_each                  # Required: Marks this as for-each group
     description: string             # Optional: Purpose description
-    
+
     source: string                  # Required: Reference to array in context
                                     # Example: "finder.output.items"
-    
+
     as: string                      # Required: Loop variable name
                                     # Available in templates as {{ <var> }}
                                     # Reserved names: workflow, context, output, _index, _key
-    
+
     agent:                          # Required: Inline agent definition
       model: string                 # Optional: Model override
       prompt: |                     # Required: Template with {{ <var> }}
@@ -1298,16 +1298,16 @@ for_each:
         {% endif %}
       output:                       # Optional: Output schema
         result: { type: string }
-    
+
     max_concurrent: 10              # Optional: Concurrent execution limit
                                     # Default: 10
-    
+
     failure_mode: fail_fast         # Optional: Error handling strategy
                                     # Default: fail_fast
-    
+
     key_by: string                  # Optional: Path for dict-based outputs
                                     # Example: "item.id" → outputs["123"]
-    
+
     routes:                         # Optional: Routes after execution
       - to: next_agent
 ```
@@ -1346,7 +1346,7 @@ agents:
   - name: summarizer
     prompt: |
       Summarize the research findings:
-      
+
       Web research: {{ parallel_researchers.outputs.web_researcher.summary }}
       Academic research: {{ parallel_researchers.outputs.academic_researcher.summary }}
       News research: {{ parallel_researchers.outputs.news_researcher.summary }}
@@ -1363,22 +1363,22 @@ agents:
   - name: aggregator
     prompt: |
       Process these results:
-      
+
       # Index-based access (when key_by not specified)
       First result: {{ processors.outputs[0].result }}
       Second result: {{ processors.outputs[1].result }}
-      
+
       # Key-based access (when key_by is specified)
       KPI-123 result: {{ analyzers.outputs["KPI-123"].analysis }}
-      
+
       # Iterate over all outputs
       {% for result in processors.outputs %}
       - {{ result | json }}
       {% endfor %}
-      
+
       # Access loop metadata
       Total processed: {{ processors.outputs | length }}
-      
+
       # Check for errors
       {% if processors.errors %}
       Failed items: {{ processors.errors | length }}
@@ -1443,7 +1443,7 @@ input:
     type: string
     required: true
     description: "The question to answer"
-  
+
   context:
     type: string
     required: false
@@ -2338,6 +2338,86 @@ agent, without validating anything else.
 See `examples/plugins.yaml` and `examples/plugin-sources.yaml` for complete
 examples.
 
+## Context Compaction
+
+When a conversation with an agent grows too large, it can exceed the model's context window and cause the provider to reject requests. To prevent this, Conductor features an automatic, always-on client-side context compaction mechanism for `claude` and `openai` providers. When the history size crosses a computed trigger threshold, Conductor automatically condenses the context.
+
+### Trigger Threshold and Targets
+
+Compaction doesn't trigger at a fixed percentage of the context window. Instead, it uses a reserve-based formula to guarantee the model has enough room to output a complete answer and receive tool results.
+
+The trigger threshold is calculated as:
+
+$$\text{Trigger} = \text{Context Window} - \max(\text{Output Limit}, 40,000)$$
+
+The $40,000$ token buffer accommodates roughly two worst-case tool results when using the default tool output limits, plus some estimation overhead.
+
+The target ceiling to which compaction condenses the history is calculated as:
+
+$$\text{Target} = \max(1, \min(\lfloor\text{Context Window} \times 0.55\rfloor, \text{Trigger} - 1))$$
+
+This formula ensures the target remains strictly below the trigger, establishing a hysteresis gap so the agent doesn't trigger compaction again immediately on the next turn.
+
+#### Worked Examples
+
+Here is how these values resolve in practice for different configurations:
+
+*   **128k Window, 64k Output Limit (e.g., Sonnet fallback or default OpenAI):**
+    *   Trigger: 128,000 minus max(64,000, 40,000), which equals 64,000 tokens (50% of window)
+    *   Target: max(1, min(70,400, 63,999)), which equals 63,999 tokens
+*   **200k Window, 32k Output Limit (e.g., standard Claude Sonnet):**
+    *   Trigger: 200,000 minus max(32,000, 40,000), which equals 160,000 tokens (80% of window)
+    *   Target: max(1, min(110,000, 159,999)), which equals 110,000 tokens
+*   **1M Window, 64k Output Limit (e.g., Claude 1M window mode):**
+    *   Trigger: 1,000,000 minus max(64,000, 40,000), which equals 936,000 tokens (93.6% of window)
+    *   Target: max(1, min(550,000, 935,999)), which equals 550,000 tokens
+
+### Compaction Tiers
+
+Conductor uses three sequential tiers to compress the history down to the target:
+
+1.  **Clear Tool Results:** Keeps the most recent three tool call and return pairs, replacing older tool output payloads with simple truncation markers.
+2.  **Summarize History:** Summarizes older messages using an internal model call. The model preserves the most recent 20 messages in their original form.
+3.  **Sliding Window:** Discards the oldest messages. This is a deterministic final fallback that runs if summarization fails or doesn't reclaim enough tokens.
+
+### Resolution Cascades
+
+Conductor resolves the context window and output limit via these priority cascades:
+
+#### Context Window Cascade
+1.  `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable.
+2.  Authoritative provider metadata (e.g., `models.list()` on Claude).
+3.  The `genai-prices` registry, active only when using first-party base URLs.
+4.  Conservative default fallback of $128,000$ tokens.
+
+#### Output Limit Cascade
+1.  Authoritative provider metadata.
+2.  The `genai-prices` registry, active only when using first-party base URLs.
+3.  Conservative default of $64,000$ tokens.
+
+### Customization and Overrides
+
+You don't configure compaction inside the workflow YAML files. The only tuning parameter is the `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable, which lets you manually set the context window size in tokens.
+
+### Usage limits and Costs
+
+A summarizing compaction step runs a nested model call that inherits the parent agent's configuration. This summary call consumes one request slot from the agent's `max_agent_iterations` budget. If your agent uses low iteration limits, compaction can cause a `UsageLimitExceeded` error, which maps to a non-retryable provider error. We recommend setting `max_agent_iterations` to at least 5 when expecting heavy compaction.
+
+All tokens consumed by summarizing compaction are added to the workflow's total usage and cost metrics.
+
+### Observability and Events
+
+Compaction operates in a fail-open manner. If an error occurs during compaction, Conductor logs a warning, disables compaction for the rest of that agent's execution, and continues with the uncompacted history.
+
+Conductor emits three event types to track compaction:
+*   `agent_compaction_config`: Emitted once at the start of agent execution to log resolved window and limit values.
+*   `agent_compaction_start`: Emitted when context size exceeds the trigger threshold and compaction begins.
+*   `agent_compaction_complete`: Emitted when compaction completes, detailing token savings or errors.
+
+### Dashboard Caveat
+
+The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations or when using environment overrides. The bar updates to show post-compaction usage after a compaction event completes.
+
 ## External File References
 
 The `!file` YAML tag lets you reference external files from any YAML field value. The file content is transparently inlined during loading, keeping workflow files concise and enabling reuse of prompts, schemas, and configuration across workflows.
@@ -2604,11 +2684,11 @@ workflow:
   name: code-review
   description: Multi-stage code review with parallel validation
   entry_point: analyzer
-  
+
   limits:
     max_iterations: 20
     timeout_seconds: 600
-  
+
   context_mode: accumulate
 
 input:
@@ -2650,19 +2730,19 @@ agents:
     output:
       security_issues:
         type: array
-  
+
   - name: performance_check
     prompt: "Check for performance issues: {{ analyzer.output.issues }}"
     output:
       performance_issues:
         type: array
-  
+
   - name: style_check
     prompt: "Check for style violations: {{ analyzer.output.issues }}"
     output:
       style_issues:
         type: array
-  
+
   - name: summarizer
     prompt: |
       Summarize findings:
