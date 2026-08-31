@@ -687,13 +687,19 @@ class TestEventEmission:
     @pytest.mark.asyncio
     async def test_emits_start_and_complete_when_compacting(self) -> None:
         """A request above the trigger must emit ``agent_compaction_start`` and
-        a success-shaped ``agent_compaction_complete``."""
+        a success-shaped ``agent_compaction_complete`` with the exact payload keys."""
         events: list[tuple[str, dict[str, Any]]] = []
 
         def callback(event_type: str, data: dict[str, Any]) -> None:
             events.append((event_type, data))
 
-        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        cfg = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+            event_callback=callback,
+            window_tokens=200_000,
+            output_limit_tokens=32_000,
+        )
         capability = build_tiered_compaction(cfg)
 
         messages: list[Any] = []
@@ -708,9 +714,60 @@ class TestEventEmission:
         types = [e[0] for e in events]
         assert "agent_compaction_start" in types
         assert "agent_compaction_complete" in types
+
+        start = events[types.index("agent_compaction_start")][1]
+        expected_start_keys = {
+            "agent_name",
+            "strategy",
+            "model",
+            "context_window",
+            "context_window_source",
+            "output_limit",
+            "output_limit_source",
+            "trigger_tokens",
+            "target_tokens",
+            "messages_before",
+            "tokens_before",
+        }
+        assert set(start.keys()) == expected_start_keys
+        assert start["agent_name"] == cfg.agent_name
+        assert start["strategy"] == "tiered"
+        assert start["model"] == cfg.model_name
+        assert start["context_window"] == cfg.window_tokens
+        assert start["context_window_source"] == cfg.window_source
+        assert start["output_limit"] == cfg.output_limit_tokens
+        assert start["output_limit_source"] == cfg.output_limit_source
+        assert start["trigger_tokens"] == cfg.trigger_tokens
+        assert start["target_tokens"] == cfg.target_tokens
+        assert start["messages_before"] == len(messages)
+        assert start["tokens_before"] > cfg.trigger_tokens
+
         complete = events[types.index("agent_compaction_complete")][1]
+        expected_complete_keys = {
+            "agent_name",
+            "strategy",
+            "model",
+            "context_window",
+            "context_window_source",
+            "messages_before",
+            "messages_after",
+            "tokens_before",
+            "tokens_after",
+            "tokens_saved",
+            "elapsed",
+            "errored",
+        }
+        assert set(complete.keys()) == expected_complete_keys
         assert complete["errored"] is False
+        assert complete["agent_name"] == cfg.agent_name
+        assert complete["strategy"] == "tiered"
+        assert complete["model"] == cfg.model_name
+        assert complete["context_window"] == cfg.window_tokens
+        assert complete["context_window_source"] == cfg.window_source
         assert complete["tokens_before"] >= complete["tokens_after"]
+        assert complete["tokens_saved"] == max(
+            0, complete["tokens_before"] - complete["tokens_after"]
+        )
 
     @pytest.mark.asyncio
     async def test_no_events_when_below_trigger(self) -> None:
@@ -741,7 +798,13 @@ class TestEventEmission:
         def callback(event_type: str, data: dict[str, Any]) -> None:
             events.append((event_type, data))
 
-        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        cfg = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+            event_callback=callback,
+            window_tokens=128_000,
+            output_limit_tokens=64_000,
+        )
         capability = build_tiered_compaction(cfg)
 
         gate = capability._inner  # type: ignore[attr-defined]
@@ -767,8 +830,25 @@ class TestEventEmission:
 
         complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
         assert len(complete) == 1, "expected exactly one errored complete event"
-        assert complete[0]["errored"] is True
-        assert complete[0]["error_type"] == "RuntimeError"
+        errored = complete[0]
+        expected_errored_keys = {
+            "agent_name",
+            "strategy",
+            "model",
+            "errored",
+            "error_type",
+            "message",
+            "context_window",
+            "context_window_source",
+        }
+        assert set(errored.keys()) == expected_errored_keys
+        assert errored["errored"] is True
+        assert errored["error_type"] == "RuntimeError"
+        assert errored["agent_name"] == cfg.agent_name
+        assert errored["strategy"] == "tiered"
+        assert errored["model"] == cfg.model_name
+        assert errored["context_window"] == cfg.window_tokens
+        assert errored["context_window_source"] == cfg.window_source
         assert result1 is not None
         assert result2 is not None
         assert mock_before.call_count == 1, "latch should short-circuit second call"
@@ -805,6 +885,7 @@ class TestEventEmission:
         complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
         assert len(complete) == 1
         assert complete[0]["errored"] is False
+        assert "error_type" not in complete[0]
 
         # A subsequent request above the trigger should still compact (latch off).
         events.clear()

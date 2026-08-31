@@ -26,7 +26,13 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.tools import RunContext
 
-from conductor.providers._pydantic_ai.events import EventCallback
+from conductor.providers._pydantic_ai.events import (
+    EventCallback,
+    emit_compaction_complete,
+    emit_compaction_complete_error,
+    emit_compaction_start,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -102,33 +108,6 @@ def _last_response_input_tokens(messages: list[ModelMessage]) -> int | None:
             usage = message.usage
             return usage.input_tokens or None
     return None
-
-
-def _emit_compaction_event(
-    event_callback: EventCallback | None,
-    event_type: str,
-    payload: dict[str, Any],
-) -> None:
-    """Emit a compaction event, swallowing callback errors."""
-    if event_callback is None:
-        return
-    try:
-        event_callback(event_type, payload)
-    except Exception:
-        logger.debug("Error in event_callback for %s", event_type, exc_info=True)
-
-
-def _build_compaction_config_payload(config: CompactionConfig) -> dict[str, Any]:
-    return {
-        "agent_name": config.agent_name,
-        "model": config.model_name,
-        "context_window": config.window_tokens,
-        "context_window_source": config.window_source,
-        "output_limit": config.output_limit_tokens,
-        "output_limit_source": config.output_limit_source,
-        "trigger_tokens": config.trigger_tokens,
-        "target_tokens": config.target_tokens,
-    }
 
 
 class _TierWrapper(AbstractCapability[Any]):
@@ -231,17 +210,19 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
 
     def _on_before(self, estimate: int, messages_before: int) -> None:
         """Emit ``agent_compaction_start`` through the per-execute callback."""
-        payload = _build_compaction_config_payload(self._config)
-        payload.update(
-            {
-                "messages_before": messages_before,
-                "tokens_before": estimate,
-            }
-        )
-        _emit_compaction_event(
+        emit_compaction_start(
             self._config.event_callback,
-            "agent_compaction_start",
-            payload,
+            agent_name=self._config.agent_name,
+            strategy="tiered",
+            model=self._config.model_name,
+            context_window=self._config.window_tokens,
+            context_window_source=self._config.window_source,
+            output_limit=self._config.output_limit_tokens,
+            output_limit_source=self._config.output_limit_source,
+            trigger_tokens=self._config.trigger_tokens,
+            target_tokens=self._config.target_tokens,
+            messages_before=messages_before,
+            tokens_before=estimate,
         )
 
     def _on_after(
@@ -254,37 +235,31 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
         elapsed_seconds: float,
     ) -> None:
         """Emit a success-shaped ``agent_compaction_complete`` event."""
-        _emit_compaction_event(
+        emit_compaction_complete(
             self._config.event_callback,
-            "agent_compaction_complete",
-            {
-                "agent_name": self._config.agent_name,
-                "strategy": "tiered",
-                "model": self._config.model_name,
-                "messages_before": len(before_messages),
-                "messages_after": len(after_messages),
-                "tokens_before": before_estimate,
-                "tokens_after": after_estimate,
-                "tokens_saved": max(0, before_estimate - after_estimate),
-                "elapsed": elapsed_seconds,
-                "errored": False,
-            },
+            agent_name=self._config.agent_name,
+            strategy="tiered",
+            model=self._config.model_name,
+            context_window=self._config.window_tokens,
+            context_window_source=self._config.window_source,
+            messages_before=len(before_messages),
+            messages_after=len(after_messages),
+            tokens_before=before_estimate,
+            tokens_after=after_estimate,
+            elapsed=elapsed_seconds,
         )
 
     def _on_error(self, exc: Exception) -> None:
         """Emit an errored ``agent_compaction_complete`` event and disable compaction."""
         self._disabled = True
-        _emit_compaction_event(
+        emit_compaction_complete_error(
             self._config.event_callback,
-            "agent_compaction_complete",
-            {
-                "agent_name": self._config.agent_name,
-                "strategy": "tiered",
-                "model": self._config.model_name,
-                "errored": True,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-            },
+            agent_name=self._config.agent_name,
+            strategy="tiered",
+            model=self._config.model_name,
+            exc=exc,
+            context_window=self._config.window_tokens,
+            context_window_source=self._config.window_source,
         )
 
     async def before_model_request(

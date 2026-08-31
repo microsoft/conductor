@@ -224,6 +224,46 @@ def emit_pydantic_event(
         logger.debug("Error in event_callback for %s", event_type, exc_info=True)
 
 
+def emit_compaction_config(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    model: str,
+    context_window: int,
+    context_window_source: str,
+    output_limit: int,
+    output_limit_source: str,
+    trigger_tokens: int,
+    target_tokens: int,
+) -> None:
+    """Emit an ``agent_compaction_config`` event, swallowing callback errors.
+
+    This informational event fires once per agent execution, immediately after
+    the resolved context-window and output-limit values are known. It is
+    emitted even when no compaction occurs so operators can read the trigger
+    and target thresholds from the event log.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_config",
+            {
+                "agent_name": agent_name,
+                "model": model,
+                "context_window": context_window,
+                "context_window_source": context_window_source,
+                "output_limit": output_limit,
+                "output_limit_source": output_limit_source,
+                "trigger_tokens": trigger_tokens,
+                "target_tokens": target_tokens,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_config", exc_info=True)
+
+
 def emit_agent_turn_start(
     event_callback: EventCallback | None,
     turn: int | str,
@@ -291,3 +331,136 @@ def maybe_emit_tool_truncation(
         )
     except Exception:
         logger.debug("Error in event_callback for agent_tool_output_truncated", exc_info=True)
+
+
+def emit_compaction_start(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    context_window: int,
+    context_window_source: str,
+    output_limit: int,
+    output_limit_source: str,
+    trigger_tokens: int,
+    target_tokens: int,
+    messages_before: int,
+    tokens_before: int,
+) -> None:
+    """Emit an ``agent_compaction_start`` event, swallowing callback errors.
+
+    This event fires immediately before compaction begins on a request whose
+    estimated context size is above the trigger threshold.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_start",
+            {
+                "agent_name": agent_name,
+                "strategy": strategy,
+                "model": model,
+                "context_window": context_window,
+                "context_window_source": context_window_source,
+                "output_limit": output_limit,
+                "output_limit_source": output_limit_source,
+                "trigger_tokens": trigger_tokens,
+                "target_tokens": target_tokens,
+                "messages_before": messages_before,
+                "tokens_before": tokens_before,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_start", exc_info=True)
+
+
+def emit_compaction_complete(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    context_window: int,
+    context_window_source: str,
+    messages_before: int,
+    messages_after: int,
+    tokens_before: int,
+    tokens_after: int,
+    elapsed: float,
+) -> None:
+    """Emit a success-shaped ``agent_compaction_complete`` event.
+
+    This event fires after compaction finishes, regardless of which tier
+    produced the final context. A non-final tier failure that was recovered
+    by the deterministic sliding-window fallback is reported as a success.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_complete",
+            {
+                "agent_name": agent_name,
+                "strategy": strategy,
+                "model": model,
+                "context_window": context_window,
+                "context_window_source": context_window_source,
+                "messages_before": messages_before,
+                "messages_after": messages_after,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "tokens_saved": max(0, tokens_before - tokens_after),
+                "elapsed": elapsed,
+                "errored": False,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_complete", exc_info=True)
+
+
+def emit_compaction_complete_error(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    exc: Exception,
+    context_window: int | None = None,
+    context_window_source: str | None = None,
+    messages_before: int | None = None,
+    tokens_before: int | None = None,
+) -> None:
+    """Emit an errored ``agent_compaction_complete`` event, swallowing callback errors.
+
+    This event fires when compaction itself fails and the request context is
+    being returned unchanged. Any before-metrics that are known are included
+    alongside the error details.
+    """
+    if event_callback is None:
+        return
+
+    payload: dict[str, Any] = {
+        "agent_name": agent_name,
+        "strategy": strategy,
+        "model": model,
+        "errored": True,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+    if context_window is not None:
+        payload["context_window"] = context_window
+    if context_window_source is not None:
+        payload["context_window_source"] = context_window_source
+    if messages_before is not None:
+        payload["messages_before"] = messages_before
+    if tokens_before is not None:
+        payload["tokens_before"] = tokens_before
+
+    try:
+        event_callback("agent_compaction_complete", payload)
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_complete", exc_info=True)
