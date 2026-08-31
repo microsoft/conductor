@@ -283,7 +283,7 @@ export interface HighlightedEdge {
 
 export type LogLevel = 'info' | 'success' | 'error' | 'warning' | 'debug';
 
-export type ActivityLogType = 'reasoning' | 'tool-start' | 'tool-complete' | 'turn' | 'message' | 'prompt' | 'parse-recovery';
+export type ActivityLogType = 'reasoning' | 'tool-start' | 'tool-complete' | 'turn' | 'message' | 'prompt' | 'parse-recovery' | 'compaction-config' | 'compaction-start' | 'compaction-complete' | 'compaction-error';
 
 export interface LogEntry {
   timestamp: number;
@@ -1720,6 +1720,41 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(t.nodes, data.agent_name);
   },
 
+  agent_compaction_config: (state, _data) => {
+    const data = _data as unknown as import('@/types/events').AgentCompactionConfigData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = { type: 'compaction-config', icon: '⚙', label: 'compaction', text: `armed (window ${data.context_window} from ${data.context_window_source}, output limit ${data.output_limit} from ${data.output_limit_source}, trigger ${data.trigger_tokens}, target ${data.target_tokens})` };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_compaction_start: (state, _data) => {
+    const data = _data as unknown as import('@/types/events').AgentCompactionStartData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = { type: 'compaction-start', icon: '🧹', label: 'compacting', text: `compacting context (${data.tokens_before ?? '?'} tokens, window ${data.context_window} from ${data.context_window_source})` };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_compaction_complete: (state, _data) => {
+    const data = _data as unknown as import('@/types/events').AgentCompactionCompleteData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    let entry: ActivityEntry;
+    if (data.errored) {
+      entry = { type: 'compaction-error', icon: '⚠️', label: 'compaction failed', text: `${data.error_type || 'Error'}: ${data.message || 'unknown'}` };
+    } else {
+      entry = { type: 'compaction-complete', icon: '🧹', label: 'compacted', text: `${data.tokens_before ?? '?'} → ${data.tokens_after ?? '?'} tokens (${data.messages_before ?? '?'} → ${data.messages_after ?? '?'} messages, ${data.elapsed != null ? formatSec(data.elapsed) : '?'})` };
+    }
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
   agent_tool_output_truncated: (state, _data) => {
     const data = _data as unknown as AgentToolOutputTruncatedData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
@@ -2871,6 +2906,30 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
         timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
         message: `← ${d.tool_name || 'done'}`,
         detail: d.result ? truncate(String(d.result), 300) : null,
+      };
+
+    case 'agent_compaction_config':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'compaction-config',
+        message: `⚙ compaction armed (window ${d.context_window} from ${d.context_window_source}, output limit ${d.output_limit} from ${d.output_limit_source}, trigger ${d.trigger_tokens}, target ${d.target_tokens})`,
+      };
+
+    case 'agent_compaction_start':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'compaction-start',
+        message: `🧹 compacting context (${d.tokens_before ?? '?'} tokens, window ${d.context_window} from ${d.context_window_source})`,
+      };
+
+    case 'agent_compaction_complete':
+      if (d.errored) {
+        return {
+          timestamp: ts, source: String(d.agent_name), type: 'compaction-error',
+          message: `⚠️ compaction failed — ${d.error_type || 'Error'}: ${d.message || 'unknown'}`,
+        };
+      }
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'compaction-complete',
+        message: `🧹 context compacted: ${d.tokens_before ?? '?'} → ${d.tokens_after ?? '?'} tokens (${d.messages_before ?? '?'} → ${d.messages_after ?? '?'} messages, ${d.elapsed != null ? formatSec(d.elapsed as number) : '?'})`,
       };
 
     case 'agent_tool_output_truncated':

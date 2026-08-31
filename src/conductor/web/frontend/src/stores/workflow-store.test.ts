@@ -1119,3 +1119,150 @@ describe('workflow-store — wsAuthFailed (#397)', () => {
     expect(useWorkflowStore.getState().wsAuthFailed).toBe(false);
   });
 });
+
+describe('workflow-store — compaction lifecycle events appear in the activity stream', () => {
+  function startWorkflow() {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'writer' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'writer',
+    }));
+    return processEvent;
+  }
+
+  it('agent_compaction_config appends an informational activity entry', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_compaction_config', {
+      agent_name: 'writer',
+      model: 'gpt-4o',
+      context_window: 128000,
+      context_window_source: 'fallback',
+      output_limit: 64000,
+      output_limit_source: 'default',
+      trigger_tokens: 64000,
+      target_tokens: 63999,
+    }));
+
+    const node = useWorkflowStore.getState().nodes.writer!;
+    expect(node.activity).toHaveLength(1);
+    expect(node.activity[0]).toMatchObject({
+      type: 'compaction-config',
+      icon: '⚙',
+      label: 'compaction',
+      text: 'armed (window 128000 from fallback, output limit 64000 from default, trigger 64000, target 63999)',
+    });
+  });
+
+  it('agent_compaction_start appends a start activity entry', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_compaction_start', {
+      agent_name: 'writer',
+      strategy: 'tiered',
+      model: 'gpt-4o',
+      context_window: 128000,
+      context_window_source: 'fallback',
+      output_limit: 64000,
+      output_limit_source: 'default',
+      trigger_tokens: 64000,
+      target_tokens: 63999,
+      messages_before: 50,
+      tokens_before: 65000,
+    }));
+
+    const node = useWorkflowStore.getState().nodes.writer!;
+    expect(node.activity).toHaveLength(1);
+    expect(node.activity[0]).toMatchObject({
+      type: 'compaction-start',
+      icon: '🧹',
+      label: 'compacting',
+      text: 'compacting context (65000 tokens, window 128000 from fallback)',
+    });
+  });
+
+  it('agent_compaction_complete appends a success activity entry when errored is false', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_compaction_complete', {
+      agent_name: 'writer',
+      strategy: 'tiered',
+      model: 'gpt-4o',
+      context_window: 128000,
+      context_window_source: 'fallback',
+      messages_before: 50,
+      messages_after: 20,
+      tokens_before: 65000,
+      tokens_after: 20000,
+      tokens_saved: 45000,
+      elapsed: 5.5,
+      errored: false,
+    }));
+
+    const node = useWorkflowStore.getState().nodes.writer!;
+    expect(node.activity).toHaveLength(1);
+    expect(node.activity[0]).toMatchObject({
+      type: 'compaction-complete',
+      icon: '🧹',
+      label: 'compacted',
+      text: '65000 → 20000 tokens (50 → 20 messages, 5.5s)',
+    });
+  });
+
+  it('agent_compaction_complete appends a warning activity entry when errored is true', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_compaction_complete', {
+      agent_name: 'writer',
+      strategy: 'tiered',
+      model: 'gpt-4o',
+      errored: true,
+      error_type: 'ValueError',
+      message: 'summarization failed',
+    }));
+
+    const node = useWorkflowStore.getState().nodes.writer!;
+    expect(node.activity).toHaveLength(1);
+    expect(node.activity[0]).toMatchObject({
+      type: 'compaction-error',
+      icon: '⚠️',
+      label: 'compaction failed',
+      text: 'ValueError: summarization failed',
+    });
+  });
+
+  it('compaction events are strictly replay/live-state neutral', () => {
+    const processEvent = startWorkflow();
+
+    // Set some global state
+    useWorkflowStore.setState({
+      isPaused: true,
+      activeDialog: { agentName: 'writer', dialogId: 'dlg-1' },
+      iterationLimitGate: { gate_id: 'g1', agent_name: 'writer', current_iteration: 10, max_iterations: 10, skip_gates: false, agent_history: [], possible_loop: false },
+    });
+
+    const stateBefore = {
+      isPaused: useWorkflowStore.getState().isPaused,
+      activeDialog: useWorkflowStore.getState().activeDialog,
+      iterationLimitGate: useWorkflowStore.getState().iterationLimitGate,
+      workflowStatus: useWorkflowStore.getState().workflowStatus,
+    };
+
+    processEvent(event('agent_compaction_config', { agent_name: 'writer', model: 'gpt-4o', context_window: 128000, context_window_source: 'f', output_limit: 64000, output_limit_source: 'f', trigger_tokens: 64000, target_tokens: 63999 }));
+    processEvent(event('agent_compaction_start', { agent_name: 'writer', strategy: 'tiered', model: 'gpt-4o', context_window: 128000, context_window_source: 'f', output_limit: 64000, output_limit_source: 'f', trigger_tokens: 64000, target_tokens: 63999 }));
+    processEvent(event('agent_compaction_complete', { agent_name: 'writer', strategy: 'tiered', model: 'gpt-4o', errored: false }));
+
+    const stateAfter = {
+      isPaused: useWorkflowStore.getState().isPaused,
+      activeDialog: useWorkflowStore.getState().activeDialog,
+      iterationLimitGate: useWorkflowStore.getState().iterationLimitGate,
+      workflowStatus: useWorkflowStore.getState().workflowStatus,
+    };
+
+    expect(stateAfter).toEqual(stateBefore);
+  });
+});
