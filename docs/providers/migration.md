@@ -260,13 +260,13 @@ runtime:
 # After (Claude) - max_tokens for output generation
 runtime:
   provider: claude
-  max_tokens: 8192  # Required: max response length
+  max_tokens: 16384  # Required: max response length
 ```
 
 **Recommendation**: 
-- Always specify `max_tokens` for Claude (default: 8192)
+- Always specify `max_tokens` for Claude (default: 16384)
 - Understand it controls OUTPUT length, not context window (Claude has 200K context)
-- Use lower values (1024-2048) for concise responses, higher (4096-8192) for detailed output
+- Use lower values (1024 to 2048) for concise responses, higher (4096 to 16384) for detailed output
 
 ### 3. Output Verbosity
 
@@ -470,7 +470,7 @@ temperature: 1.0
 **Solution**: Always specify:
 ```yaml
 runtime:
-  max_tokens: 8192
+  max_tokens: 16384
 ```
 
 ### Pitfall 5: HTTP/SSE MCP Servers Not Working

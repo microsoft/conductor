@@ -232,10 +232,10 @@ Claude offers multiple model tiers optimized for different use cases. All curren
 
 | Model | Best For | Speed | Cost (Input/Output) | Max Output Tokens | Recommended Use |
 |-------|----------|-------|---------------------|-------------------|-----------------|
-| **claude-sonnet-4.5** | General purpose, most workflows | Medium | $3/$15 per MTok | 8192 | **Default recommendation** - stable, avoids deprecation |
-| claude-sonnet-4.5-20250929 | Latest features, cutting-edge | Medium | $3/$15 per MTok | 8192 | When you need the newest capabilities |
-| claude-sonnet-4.5-20241022 | Stable, well-tested | Medium | $3/$15 per MTok | 8192 | Production workloads requiring stability |
-| claude-opus-4.5 | Complex reasoning, creative tasks | Slowest | $5/$25 per MTok | 8192 | Critical analysis, complex decision-making |
+| **claude-sonnet-4.5** | General purpose, most workflows | Medium | $3/$15 per MTok | 16384 (capped by ModelInfo) | **Default recommendation** - stable, avoids deprecation |
+| claude-sonnet-4.5-20250929 | Latest features, cutting-edge | Medium | $3/$15 per MTok | 16384 (capped by ModelInfo) | When you need the newest capabilities |
+| claude-sonnet-4.5-20241022 | Stable, well-tested | Medium | $3/$15 per MTok | 16384 (capped by ModelInfo) | Production workloads requiring stability |
+| claude-opus-4.5 | Complex reasoning, creative tasks | Slowest | $5/$25 per MTok | 16384 (capped by ModelInfo) | Critical analysis, complex decision-making |
 | claude-haiku-4.5 | Simple tasks, high volume | Fastest | $1/$5 per MTok | 4096 | Classification, routing, simple Q&A |
 | claude-3-opus-20240229 | Legacy - complex reasoning | Slow | $15/$75 per MTok | 4096 | Legacy workflows (not recommended) |
 
@@ -307,7 +307,7 @@ The Claude provider supports several runtime configuration options that control 
 | Parameter | Type | Range | Default | Description |
 |-----------|------|-------|---------|-------------|
 | `temperature` | float | 0.0 - 1.0 | 1.0 | Controls randomness (0=deterministic, 1=creative) |
-| `max_tokens` | int | 1 - 8192 | 8192 | Maximum OUTPUT tokens per response |
+| `max_tokens` | int | >= 1 | 16384 | Maximum output tokens per response, capped at runtime by `ModelInfo.max_tokens` |
 
 ### Temperature
 
@@ -339,16 +339,15 @@ workflow:
 ```
 
 **Important**:
-- This is OUTPUT tokens (response length), not context window
-- Context window is 200K tokens for all models (separate limit)
-- Sonnet/Opus: maximum 8192 output tokens
-- Haiku: maximum 4096 output tokens
-- Exceeding the limit causes an error
+- This is output tokens representing response length, not the context window.
+- Context window is 200K tokens for all models, which is a separate limit.
+- Standard models are capped at runtime by `ModelInfo.max_tokens` from the provider, supporting up to 16384 tokens.
+- Exceeding the model limit causes an error.
 
 **Use Cases**:
-- Limit to 1024-2048 for concise responses
-- Increase to 4096-8192 for comprehensive reports
-- Reduce for faster responses and lower costs
+- Limit to 1024 or 2048 for concise responses.
+- Increase to 4096 or up to 16384 for comprehensive reports.
+- Reduce for faster responses and lower costs.
 
 ### Complete Example
 
@@ -464,10 +463,11 @@ The Claude provider supports automatic, client-side context compaction using a t
 
 ### How Compaction Resolves on Claude
 
-*   **Context Window:** The provider queries the Anthropic SDK (`models.list()`) to dynamically retrieve the maximum input tokens for the configured model. If query fails or a custom `base_url` is configured, it falls back to the `genai-prices` registry, and finally to the default $128,000$ tokens fallback.
-*   **Output Limit:** The provider queries `models.list()` to retrieve the model's `max_output_tokens`. If query fails, it falls back to the registry, then to the default of $64,000$ tokens.
-*   **Trigger Threshold:** Calculated as:
-    $$\text{Trigger} = \text{Context Window} - \max(\text{Output Limit}, 40,000)$$
+*   **Context Window:** The provider queries the Anthropic SDK (`models.list()`) to dynamically retrieve the maximum input tokens for the configured model. If the query fails or a custom `base_url` is configured, it falls back to the `genai-prices` registry, and finally to the default 128,000 tokens fallback.
+*   **Output Limit:** The provider queries the effective `max_tokens` sent to the API, which is either explicitly configured under `runtime.max_tokens` (source `settings`) or defaults to 16384 (source `default`, including any adjustments after Claude thinking coercion). This is capped at runtime by `ModelInfo.max_tokens` from the provider metadata (source `provider-cap`).
+*   **Trigger Threshold:** Calculated using the formula:
+    $$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$
+    where the tool buffer is resolved dynamically from the configured tool limits (defaulting to 40,000 tokens).
 
 For more details on the compaction tiers, hysteresis gap, and usage limits, see the [Workflow Syntax Guide](../workflow-syntax.md#context-compaction).
 
@@ -550,15 +550,15 @@ runtime:
 **Error**: `BadRequestError: max_tokens exceeds model limit`
 
 **Solutions**:
-- **Sonnet/Opus**: Maximum 8192 output tokens
-- **Haiku**: Maximum 4096 output tokens
+- The maximum output capability of your model is capped at runtime by `ModelInfo.max_tokens` from the provider.
+- Adjust `runtime.max_tokens` in your workflow config to match the model capability.
 
 ```yaml
 # For Haiku
 agents:
   - name: simple_task
     model: claude-haiku-4.5
-    # Bad: max_tokens: 8192 (exceeds Haiku limit)
+    # Bad: max_tokens: 8192 (exceeds Haiku capability)
     # Good:
     runtime:
       max_tokens: 4096
@@ -719,12 +719,12 @@ Reduce `max_tokens` to limit response length:
 
 ```yaml
 runtime:
-  max_tokens: 1024  # Instead of default 8192
+  max_tokens: 1024  # Instead of default 16384
 ```
 
 **Potential savings**: 
-- 8192 → 1024 tokens = 8x reduction in output costs
-- Example: $15/MTok → $1.88/MTok for 1M output tokens
+*   Reducing from 16384 to 1024 tokens can yield up to a 16x reduction in output costs.
+*   Example: $15/MTok to $0.94/MTok for 1M output tokens.
 
 ### Strategy 3: Optimize Prompts
 
@@ -823,9 +823,9 @@ Look for:
 ### Expected Savings
 
 Applying all strategies:
-- **Model selection**: 3-15x (Haiku vs Opus)
-- **Max tokens**: 2-8x (1024 vs 8192)
-- **Prompt optimization**: 1.5-2x (concise prompts)
-- **Context mode**: 2-10x (explicit vs accumulate)
+*   **Model selection**: 3 to 15x (Haiku vs Opus)
+*   **Max tokens**: up to 16x (1024 vs 16384)
+*   **Prompt optimization**: 1.5 to 2x (concise prompts)
+*   **Context mode**: 2 to 10x (explicit vs accumulate)
 
-**Total potential savings**: 10-100x reduction in costs for optimized workflows
+**Total potential savings**: 10 to 100x reduction in costs for optimized workflows

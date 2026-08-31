@@ -246,10 +246,11 @@ The OpenAI provider supports automatic, client-side context compaction. When the
 
 ### How Compaction Resolves on OpenAI
 
-*   **Context Window:** Because the OpenAI models API doesn't expose context window sizes, Conductor resolves the window via the `genai-prices` registry for first-party endpoints. If a custom `base_url` is configured, or registry lookup fails, it falls back to the default $128,000$ tokens fallback.
-*   **Output Limit:** The provider uses the `genai-prices` registry for first-party endpoints, falling back to the default of $64,000$ tokens.
-*   **Trigger Threshold:** Calculated as:
-    $$\text{Trigger} = \text{Context Window} - \max(\text{Output Limit}, 40,000)$$
+*   **Context Window:** Because the OpenAI models API does not expose context window sizes, Conductor resolves the window via the `genai-prices` registry for first-party endpoints. If a custom `base_url` is configured, or if the registry lookup fails, it falls back to the default 128,000 tokens fallback.
+*   **Output Limit:** The provider resolves the limit from the effective `max_tokens` actually sent to the API, which has the source `settings` if explicitly configured or the source `default` (the unified 16384 default). This value is capped at runtime by provider-reported capabilities (source `provider-cap`). To ensure consistent output limits and predictable compaction thresholds, Conductor now always sends the `max_tokens` parameter (defaulting to 16384) to the OpenAI Chat Completions API.
+*   **Trigger Threshold:** Calculated using the formula:
+    $$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$
+    where the tool buffer is resolved dynamically from the configured tool limits (defaulting to 40,000 tokens).
 
 For more details on the compaction tiers, hysteresis gap, and usage limits, see the [Workflow Syntax Guide](../workflow-syntax.md#context-compaction).
 

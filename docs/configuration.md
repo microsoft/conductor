@@ -433,7 +433,7 @@ workflow:
 
 **Limits**:
 - Haiku: 4096 max
-- Sonnet/Opus: 8192 max
+- Sonnet/Opus: capped at runtime by `ModelInfo.max_tokens` from the provider, supporting up to 16384 tokens
 
 **Note**: This is output tokens, not context window (200K separate limit)
 
@@ -488,16 +488,9 @@ agents (none of which call a model).
   | `xhigh`  | 32 768        |
   | `max`    | 59 904        |
 
-  `max` is pinned to `64000 − 4096` — the largest budget that still leaves the
-  default answer headroom under the 64000-token extended-thinking output cap
-  (at `max`, `max_tokens` lands exactly on the cap).
+  The `max` budget is pinned to `64000 - 4096`, which is the largest budget that still leaves the default answer headroom under the 64000-token cap (at `max`, `max_tokens` lands exactly on the cap).
 
-  Extended thinking is only valid on thinking-capable models
-  (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); a
-  `ValidationError` is raised otherwise. The provider also auto-coerces
-  `temperature` to `1.0` (required by the Anthropic API for extended thinking,
-  logged at INFO) and bumps `max_tokens` to fit `budget + 4096`, capped at
-  `64000` (logged at INFO when clamped).
+  Extended thinking is only valid on thinking-capable models, including `claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, and `claude-haiku-4*` formats. A `ValidationError` is raised otherwise. The provider also auto-coerces `temperature` to `1.0` (required by the Anthropic API for extended thinking, logged at INFO) and bumps `max_tokens` to at least `budget + 4096`, capped at `64000` (logged at INFO when clamped). For `low` and `medium` efforts, because the budget plus headroom is below 16384, the default `max_tokens` of 16384 is sent.
 
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and
@@ -782,7 +775,7 @@ Always set `max_tokens`:
 
 ```yaml
 runtime:
-  max_tokens: 8192
+  max_tokens: 16384
 ```
 
 ### "temperature must be between 0.0 and 1.0" (Claude)

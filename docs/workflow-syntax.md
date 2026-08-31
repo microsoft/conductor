@@ -2344,33 +2344,45 @@ When a conversation with an agent grows too large, it can exceed the model's con
 
 ### Trigger Threshold and Targets
 
-Compaction doesn't trigger at a fixed percentage of the context window. Instead, it uses a reserve-based formula to guarantee the model has enough room to output a complete answer and receive tool results.
+Compaction does not trigger at a fixed percentage of the context window. Instead, it uses a reserve-based formula to guarantee the model has enough room to output a complete answer and receive tool results.
 
-The trigger threshold is calculated as:
+The trigger threshold is calculated using the following formula:
 
-$$\text{Trigger} = \text{Context Window} - \max(\text{Output Limit}, 40,000)$$
+$$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$
 
-The $40,000$ token buffer accommodates roughly two worst-case tool results when using the default tool output limits, plus some estimation overhead.
+Here, the output limit (output_limit) is the minimum of:
+*   The effective max_tokens actually sent to the API. This has the source `settings` if explicitly configured under `runtime.max_tokens`, or the source `default` (the unified 16384 default, including any adjustment after Claude thinking coercion).
+*   The model output cap reported by the provider (with the source `provider-cap`).
+
+The tool buffer (buffer) is calculated using the configured tool output limit:
+
+$$\text{Buffer} = 2 \times \lceil\text{max\_chars} / 4\rceil + 15,000$$
+
+This buffer assumes a character-to-token ratio of 4 and reserves space for 2 worst-case tool results as a sizing heuristic. A workflow using more than two parallel calls per turn might exceed this budget, meaning this is a sizing heuristic, not a guarantee.
 
 The target ceiling to which compaction condenses the history is calculated as:
 
 $$\text{Target} = \max(1, \min(\lfloor\text{Context Window} \times 0.55\rfloor, \text{Trigger} - 1))$$
 
-This formula ensures the target remains strictly below the trigger, establishing a hysteresis gap so the agent doesn't trigger compaction again immediately on the next turn.
+This formula ensures the target remains strictly below the trigger, establishing a hysteresis gap so the agent does not trigger compaction again immediately on the next turn.
 
 #### Worked Examples
 
-Here is how these values resolve in practice for different configurations:
+Below is how these values resolve in practice for different configurations using the default tool buffer of 40,000 tokens (50,000 character limit):
 
-*   **128k Window, 64k Output Limit (e.g., Sonnet fallback or default OpenAI):**
-    *   Trigger: 128,000 minus max(64,000, 40,000), which equals 64,000 tokens (50% of window)
-    *   Target: max(1, min(70,400, 63,999)), which equals 63,999 tokens
-*   **200k Window, 32k Output Limit (e.g., standard Claude Sonnet):**
-    *   Trigger: 200,000 minus max(32,000, 40,000), which equals 160,000 tokens (80% of window)
-    *   Target: max(1, min(110,000, 159,999)), which equals 110,000 tokens
-*   **1M Window, 64k Output Limit (e.g., Claude 1M window mode):**
-    *   Trigger: 1,000,000 minus max(64,000, 40,000), which equals 936,000 tokens (93.6% of window)
-    *   Target: max(1, min(550,000, 935,999)), which equals 550,000 tokens
+*   **128k Window, default 16,384 Output Limit:**
+    *   Trigger: 128,000 minus (16,384 + 40,000), which equals 71,616 tokens (about 56% of the window)
+    *   Target: max(1, min(70,400, 71,615)), which equals 70,400 tokens
+*   **200k Window, default 16,384 Output Limit:**
+    *   Trigger: 200,000 minus (16,384 + 40,000), which equals 143,616 tokens (about 72% of the window)
+    *   Target: max(1, min(110,000, 143,615)), which equals 110,000 tokens
+*   **1M Window, default 16,384 Output Limit:**
+    *   Trigger: 1,000,000 minus (16,384 + 40,000), which equals 943,616 tokens (about 94% of the window)
+    *   Target: max(1, min(550,000, 943,615)), which equals 550,000 tokens
+
+#### Degenerate Window Warning
+
+If the sum of the resolved output limit and the tool buffer meets or exceeds the resolved context window minus one, Conductor logs a warning. This warning alerts you that the trigger has degenerated to 1 token, meaning hysteresis is lost. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`, or raise the context window size with `CONDUCTOR_COMPACTION_CONTEXT_WINDOW`.
 
 ### Compaction Tiers
 
@@ -2388,16 +2400,27 @@ Conductor resolves the context window and output limit via these priority cascad
 1.  `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable.
 2.  Authoritative provider metadata (e.g., `models.list()` on Claude).
 3.  The `genai-prices` registry, active only when using first-party base URLs.
-4.  Conservative default fallback of $128,000$ tokens.
+4.  Conservative default fallback of 128,000 tokens.
 
 #### Output Limit Cascade
-1.  Authoritative provider metadata.
-2.  The `genai-prices` registry, active only when using first-party base URLs.
-3.  Conservative default of $64,000$ tokens.
+1.  Effective `max_tokens` actually sent to the API (source is `settings` or `default`).
+2.  The provider-reported per-model output cap (source is `provider-cap`).
 
 ### Customization and Overrides
 
 You don't configure compaction inside the workflow YAML files. The only tuning parameter is the `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable, which lets you manually set the context window size in tokens.
+
+#### Forced Compaction Testing
+
+To smoke test compaction behavior, you can force the mechanism to trigger early by running your workflow with a very small context window override. For example:
+
+```bash
+CONDUCTOR_COMPACTION_CONTEXT_WINDOW=100000 conductor run workflow.yaml --input question="What is Python?"
+```
+
+#### Loop-back History Behavior
+
+When a workflow runs the same agent multiple times using loop-back routing, the provider-level history does not accumulate across those iterations. Each agent execution starts a fresh model session. History only accumulates within a single execution step (for example, when an agent makes multiple tool calls in a single turn).
 
 ### Usage limits and Costs
 
