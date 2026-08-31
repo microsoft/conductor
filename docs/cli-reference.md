@@ -66,7 +66,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk, hermes) |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
-| `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
+| `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file. Overrides `workflow.runtime.log_file` when supplied. |
 | `--web` | | Start a real-time web dashboard |
 | `--web-bg` | | Run in background, print dashboard URL, exit |
 | `--web-port PORT` | | Port for web dashboard (0 = auto-select) |
@@ -75,6 +75,19 @@ conductor run <workflow.yaml> [OPTIONS]
 > **Note:** Output verbosity (`--quiet`/`-q`, `--silent`/`-s`) is controlled by
 > [root-level options](#root-level-options), which must appear *before* the
 > `run` subcommand: `conductor --quiet run workflow.yaml`.
+
+### File Logging
+
+Debug file logging can be configured with `workflow.runtime.log_file` or the
+`--log-file` / `-l` option. Both forms accept `auto`, which creates a
+timestamped log in the OS temporary directory's `conductor/` subdirectory, or
+an explicit file path. Relative paths are resolved from the Conductor process's
+current working directory.
+
+The YAML setting applies to both `conductor run` and `conductor resume`. An
+explicit CLI option takes precedence over `workflow.runtime.log_file`. If
+neither is set, debug file logging is disabled. See
+[Runtime Configuration](configuration.md#debug-file-logging) for the YAML form.
 
 ### Examples
 

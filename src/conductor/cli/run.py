@@ -139,6 +139,22 @@ def init_file_logging(log_path: Path) -> None:
     )
 
 
+def _try_init_file_logging(log_path: Path | None) -> bool:
+    """Initialize file logging, returning whether initialization succeeded."""
+    if log_path is None:
+        return False
+
+    try:
+        init_file_logging(log_path)
+    except OSError as e:
+        _verbose_console.print(
+            styled("[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_path, e)
+        )
+        return False
+
+    return True
+
+
 def close_file_logging() -> None:
     """Close file logging and clean up resources."""
     global _file_console, _file_handle
@@ -2058,15 +2074,7 @@ async def run_workflow_async(
     started_at_iso = datetime.now(UTC).isoformat()
 
     # Initialize file logging if requested
-    if log_file is not None:
-        try:
-            init_file_logging(log_file)
-        except OSError as e:
-            _verbose_console.print(
-                styled(
-                    "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_file, e
-                )
-            )
+    _try_init_file_logging(log_file)
 
     # Always create event emitter and JSONL log subscriber
     emitter = WorkflowEventEmitter()
@@ -2104,6 +2112,15 @@ async def run_workflow_async(
         load_start = time.time()
         config = load_config(workflow_path)
         verbose_log_timing("Configuration loaded", time.time() - load_start)
+
+        if log_file is None:
+            configured = config.workflow.runtime.log_file
+            if configured is not None:
+                if configured.lower() == "auto":
+                    log_file = generate_log_path(workflow_path.stem)
+                else:
+                    log_file = Path(configured)
+                _try_init_file_logging(log_file)
 
         # Merge CLI metadata on top of YAML-declared metadata
         if metadata:
@@ -2748,15 +2765,7 @@ async def resume_workflow_async(
     started_at_iso = datetime.now(UTC).isoformat()
 
     # Initialize file logging if requested
-    if log_file is not None:
-        try:
-            init_file_logging(log_file)
-        except OSError as e:
-            _verbose_console.print(
-                styled(
-                    "[bold yellow]Warning:[/bold yellow] Cannot open log file {}: {}", log_file, e
-                )
-            )
+    _try_init_file_logging(log_file)
 
     # Always create event emitter and JSONL log subscriber (parity with run)
     emitter = WorkflowEventEmitter()
@@ -2826,6 +2835,15 @@ async def resume_workflow_async(
         # Load workflow config first — needed both to construct the dashboard
         # (workflow_root) and to seed the synthetic replay fallback.
         config = load_config(resolved_workflow_path)
+
+        if log_file is None:
+            configured = config.workflow.runtime.log_file
+            if configured is not None:
+                if configured.lower() == "auto":
+                    log_file = generate_log_path(resolved_workflow_path.stem)
+                else:
+                    log_file = Path(configured)
+                _try_init_file_logging(log_file)
 
         # Merge CLI metadata on top of YAML-declared metadata (parity with run)
         if metadata:

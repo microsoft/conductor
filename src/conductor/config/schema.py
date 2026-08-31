@@ -3374,6 +3374,9 @@ class RuntimeConfig(BaseModel):
     default_model: str | None = None
     """Default model for agents that don't specify one."""
 
+    log_file: str | None = None
+    """Default log file path, or ``auto`` to generate one automatically."""
+
     mcp_servers: dict[str, MCPServerDef] = Field(default_factory=dict)
     """MCP server configurations keyed by server name."""
 
