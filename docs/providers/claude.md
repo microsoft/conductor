@@ -463,7 +463,7 @@ The Claude provider supports automatic, client-side context compaction using a t
 
 ### How Compaction Resolves on Claude
 
-*   **Context Window:** The provider queries the Anthropic SDK (`models.list()`) to dynamically retrieve the maximum input tokens for the configured model. If the query fails or a custom `base_url` is configured, it falls back to the `genai-prices` registry, and finally to the default 128,000 tokens fallback.
+*   **Context Window:** The provider queries the Anthropic SDK (`models.list()`, with full pagination) to dynamically retrieve the maximum input tokens for the configured model. If the query fails or a custom `base_url` is configured, it falls back to the `genai-prices` registry, and finally to the default 128,000 tokens fallback.
 *   **Output Limit:** The provider queries the effective `max_tokens` sent to the API, which is either explicitly configured under `runtime.max_tokens` (source `settings`) or defaults to 16384 (source `default`, including any adjustments after Claude thinking coercion). This is capped at runtime by `ModelInfo.max_tokens` from the provider metadata (source `provider-cap`).
 *   **Trigger Threshold:** Calculated using the formula:
     $$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$

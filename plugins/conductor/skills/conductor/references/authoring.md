@@ -935,7 +935,7 @@ In `accumulate` mode, a long-running conversation can eventually exceed the mode
 
 Each summarizing compaction step consumes one request slot from the agent's `max_agent_iterations` budget. If compaction is expected, ensure `max_agent_iterations` is set high enough (at least 5).
 
-No extra YAML configuration is required.
+No extra YAML configuration is required, and there is no user-facing context window override.
 
 ## Multi-Provider Workflows
 

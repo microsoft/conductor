@@ -5,14 +5,16 @@
 # As history grows and crosses the trigger threshold, Conductor will
 # automatically compact older tool results and messages.
 #
+# There is no user-facing context window override. Resolution uses provider
+# metadata, the registry, or the fallback. For testing, compaction triggers
+# early when configured with a small runtime.max_tokens value.
+#
 # For this example, we configure it to run on the claude provider,
 # but it's also supported on the openai provider.
 #
 # Usage:
 #   export ANTHROPIC_API_KEY=sk-ant-...
 #   conductor run examples/compaction.yaml --input iterations=10
-#
-# To force compaction to trigger early, use a small runtime.max_tokens value.
 
 workflow:
   name: context-compaction

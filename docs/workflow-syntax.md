@@ -2397,7 +2397,7 @@ Conductor uses three sequential tiers to compress the history down to the target
 Conductor resolves the context window and output limit via these priority cascades:
 
 #### Context Window Cascade
-1.  Authoritative provider metadata (e.g., `models.list()` on Claude).
+1.  Authoritative provider metadata (e.g., `models.list()` on Claude or vendor-advertised limits on OpenAI-compatible endpoints).
 2.  The `genai-prices` registry, active only when using first-party base URLs.
 3.  Conservative default fallback of 128,000 tokens.
 
@@ -2407,11 +2407,7 @@ Conductor resolves the context window and output limit via these priority cascad
 
 ### Customization and Overrides
 
-You don't configure compaction inside the workflow YAML files. Tune the trigger by adjusting `runtime.max_tokens` or `runtime.tool_output.max_chars`.
-
-#### Forced Compaction Testing
-
-To smoke test compaction behavior, you can force the mechanism to trigger early by running your workflow with a small `runtime.max_tokens` value. For example, set `max_tokens: 1000` on the agent or workflow runtime.
+You don't configure compaction inside the workflow YAML files, and no user-facing context window override exists. Tune the trigger by adjusting `runtime.max_tokens` or `runtime.tool_output.max_chars`.
 
 #### Loop-back History Behavior
 
@@ -2434,7 +2430,7 @@ Conductor emits three event types to track compaction:
 
 ### Dashboard Caveat
 
-The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations or when using environment overrides. The bar updates to show post-compaction usage after a compaction event completes.
+The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations. The bar updates to show post-compaction usage after a compaction event completes.
 
 ## External File References
 
