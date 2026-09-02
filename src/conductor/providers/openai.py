@@ -18,6 +18,7 @@ Error Handling Strategy:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING, Any
@@ -469,8 +470,9 @@ class OpenAIProvider(AgentProvider):
         assert self._client is not None
         result = self._client.models.list()
         page: Any = await result if inspect.isawaitable(result) else result
-        if hasattr(page, "data"):
-            return list(page.data)
+        data: Any = getattr(page, "data", None)
+        if data is not None:
+            return list(data)
         models: list[Any] = []
         async for model in page:
             models.append(model)
