@@ -553,9 +553,14 @@ class TestCloseMethod:
 
         provider = ClaudeProvider()
         assert provider._client is not None
+        provider._model_listing_unavailable = True
+        provider._model_listing_unavailable_warned = True
 
         await provider.close()
         assert provider._client is None
+        # Requirement: closing resets unavailable-listing state for a later reinitialization.
+        assert provider._model_listing_unavailable is False
+        assert provider._model_listing_unavailable_warned is False
 
 
 class TestBasicExecution:
@@ -1009,7 +1014,7 @@ class TestClaudeModelsPagination:
     async def test_validate_connection_caches_model_metadata_from_later_page(
         self, mock_anthropic_class: Mock
     ) -> None:
-        # Требование: проверка подключения учитывает лимиты моделей со всех страниц API.
+        # Requirement: connection validation uses model limits from every API page.
         first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
         later_page_model = Mock(
             id="claude-sonnet-4-5",
@@ -1033,7 +1038,7 @@ class TestClaudeModelsPagination:
     async def test_model_cache_uses_metadata_from_later_page(
         self, mock_anthropic_class: Mock
     ) -> None:
-        # Требование: ленивый кэш лимитов не теряет модель, возвращённую второй страницей API.
+        # Requirement: lazy limit caching retains a model returned on the second API page.
         first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
         later_page_model = Mock(id="claude-opus-4-5", max_input_tokens=1_000_000, max_tokens=32_000)
         mock_client = Mock()
@@ -1050,7 +1055,7 @@ class TestClaudeModelsPagination:
 
     @pytest.mark.asyncio
     async def test_list_models_returns_ids_from_all_pages(self, mock_anthropic_class: Mock) -> None:
-        # Требование: диагностический список моделей содержит идентификаторы со всех страниц API.
+        # Requirement: diagnostic model listing contains IDs from every API page.
         first_page_model = Mock(id="claude-haiku-4-5")
         later_page_model = Mock(id="claude-sonnet-4-5")
         mock_client = Mock()
@@ -1069,7 +1074,7 @@ class TestClaudeModelsPagination:
     async def test_validate_connection_keeps_partial_result_after_later_page_failure(
         self, mock_logger: Mock, mock_anthropic_class: Mock
     ) -> None:
-        # Требование: сбой продолжения пагинатора предупреждает, но не отменяет первую страницу.
+        # Requirement: a later paginator failure warns without discarding the first page.
         first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
         mock_client = Mock()
         mock_client.models.list = AsyncMock(
@@ -1087,7 +1092,7 @@ class TestClaudeModelsPagination:
     async def test_model_cache_discards_partial_result_after_later_page_failure(
         self, mock_anthropic_class: Mock
     ) -> None:
-        # Требование: ленивый кэш не сохраняет неполный список после сбоя следующей страницы.
+        # Requirement: lazy caching does not retain a partial listing after a later page failure.
         first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
         mock_client = Mock()
         mock_client.models.list = AsyncMock(
@@ -1157,14 +1162,24 @@ class TestClaudeGetMaxPromptTokens:
         assert mock_client.models.list.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_unexpected_exception_propagates(self, mock_anthropic_class: Mock) -> None:
+    async def test_unexpected_exception_does_not_poison_cache(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        """Unexpected listing failures are retryable best-effort metadata misses."""
+        # Requirement: unexpected model-listing exceptions do not poison retryable metadata cache.
         mock_client = Mock()
-        mock_client.models.list = AsyncMock(side_effect=RuntimeError("bug"))
+        mock_client.models.list = AsyncMock(
+            side_effect=[
+                RuntimeError("bug"),
+                Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)]),
+            ]
+        )
         mock_anthropic_class.return_value = mock_client
 
         provider = ClaudeProvider()
-        with pytest.raises(RuntimeError):
-            await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
+        assert mock_client.models.list.await_count == 2
 
     @pytest.mark.asyncio
     async def test_alias_resolves_via_match_model_id(self, mock_anthropic_class: Mock) -> None:

@@ -579,6 +579,10 @@ class TestConnectionHelpers:
         caps = await provider.get_model_capabilities("o3-mini")
         assert caps is not None
         assert caps.supported_reasoning_efforts == ["low", "medium", "high"]
+        # Requirement: capability probes do not report model-listing token limits.
+        assert caps.max_prompt_tokens is None
+        assert caps.max_output_tokens is None
+        assert caps.max_context_window_tokens is None
 
     @pytest.mark.asyncio
     async def test_get_model_capabilities_non_reasoning_models(
@@ -694,6 +698,23 @@ class TestOpenAIModelTokenLimits:
             assert await provider.get_max_prompt_tokens("vendor-model") == 131_072
 
         assert list_models.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_proxy_prefix_is_not_stripped(self, provider: OpenAIProvider) -> None:
+        """A bare model name does not match a vendor-prefixed listing ID."""
+        # Requirement: provider prefixes remain part of model identity during limit lookup.
+        assert provider._client is not None
+        model = SimpleNamespace(id="moonshotai/kimi-k3", max_input_tokens=1_048_576)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(return_value=SimpleNamespace(data=[model])),
+        ) as list_models:
+            assert await provider.get_max_prompt_tokens("kimi-k3") is None
+            assert await provider.get_max_output_tokens("kimi-k3") is None
+
+        list_models.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_successful_probe_reenables_model_limit_lookups(

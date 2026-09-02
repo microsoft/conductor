@@ -6,12 +6,79 @@ model-listing parser must accept without raising.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
+from typing import override
+
 import pytest
 
 from conductor.providers._pydantic_ai.model_listing import (
     ModelTokenLimits,
     extract_model_token_limits,
 )
+
+
+class _HostileMetadataError(Exception):
+    """Test-only failure from an inaccessible metadata value."""
+
+
+class _ContainsFailureMapping(Mapping[str, None]):
+    """Mapping double that raises while checking key presence."""
+
+    @override
+    def __contains__(self, key: object) -> bool:
+        raise _HostileMetadataError("contains failed")
+
+    @override
+    def __getitem__(self, key: str) -> None:
+        return None
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    @override
+    def __len__(self) -> int:
+        return 0
+
+
+class _GetitemFailureMapping(Mapping[str, None]):
+    """Mapping double that raises while retrieving a present key."""
+
+    @override
+    def __contains__(self, key: object) -> bool:
+        return key == "max_input_tokens"
+
+    @override
+    def __getitem__(self, key: str) -> None:
+        raise _HostileMetadataError("getitem failed")
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    @override
+    def __len__(self) -> int:
+        return 0
+
+
+class _RaisingInputLimit:
+    """Object double with an inaccessible input-limit property."""
+
+    @property
+    def max_input_tokens(self) -> int:
+        raise _HostileMetadataError("input limit failed")
+
+
+class _TopProvider:
+    """Attribute-shaped nested provider metadata."""
+
+    max_completion_tokens: int = 8192
+
+
+class _AttributeTopProviderModel:
+    """Object double that exposes nested provider metadata as an attribute."""
+
+    top_provider: _TopProvider = _TopProvider()
 
 
 def test_omniroute_shape() -> None:
@@ -180,3 +247,29 @@ def test_non_mapping_non_object_input() -> None:
     assert extract_model_token_limits(None) == ModelTokenLimits()
     assert extract_model_token_limits("string") == ModelTokenLimits()
     assert extract_model_token_limits(12345) == ModelTokenLimits()
+
+
+def test_contains_failure_mapping_is_treated_as_missing() -> None:
+    """A mapping that rejects membership checks yields unknown limits."""
+    # Requirement: hostile Mapping membership checks must not escape the parser.
+    assert extract_model_token_limits(_ContainsFailureMapping()) == ModelTokenLimits()
+
+
+def test_getitem_failure_mapping_is_treated_as_missing() -> None:
+    """A mapping that rejects value reads yields unknown limits."""
+    # Requirement: hostile Mapping value reads must not escape the parser.
+    assert extract_model_token_limits(_GetitemFailureMapping()) == ModelTokenLimits()
+
+
+def test_raising_attribute_is_treated_as_missing() -> None:
+    """An object property that raises yields unknown limits."""
+    # Requirement: hostile model properties must not escape the parser.
+    assert extract_model_token_limits(_RaisingInputLimit()) == ModelTokenLimits()
+
+
+def test_top_provider_attribute_object_supplies_output_limit() -> None:
+    """Attribute-shaped nested provider metadata exposes the output limit."""
+    # Requirement: top_provider attribute objects provide max_completion_tokens.
+    assert extract_model_token_limits(_AttributeTopProviderModel()) == ModelTokenLimits(
+        max_output_tokens=8192
+    )

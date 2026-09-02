@@ -95,13 +95,21 @@ def _coerce_mapping_value(obj: Any, keys: tuple[str, ...]) -> Any:
         return None
     if isinstance(obj, Mapping):
         for key in keys:
-            if key in obj:
+            try:
+                is_present = key in obj
+            except Exception:  # noqa: BLE001 - vendor metadata parsing must never raise
+                continue
+            if not is_present:
+                continue
+            try:
                 return obj[key]
+            except Exception:  # noqa: BLE001 - vendor metadata parsing must never raise
+                continue
         return None
     for key in keys:
         try:
             value = getattr(obj, key)
-        except AttributeError:
+        except Exception:  # noqa: BLE001 - vendor metadata parsing must never raise
             value = None
         if value is not None:
             return value

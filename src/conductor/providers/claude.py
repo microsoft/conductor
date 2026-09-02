@@ -50,7 +50,7 @@ from conductor.providers.reasoning import (
 # Try to import the Anthropic SDK
 try:
     import anthropic
-    from anthropic import AnthropicError, APIConnectionError, APIStatusError, AsyncAnthropic
+    from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic
     from anthropic.pagination import AsyncPage
 
     ANTHROPIC_SDK_AVAILABLE = True
@@ -59,7 +59,6 @@ except ImportError:
     AsyncAnthropic = None  # type: ignore[misc, assignment]
     AsyncPage = None  # type: ignore[misc, assignment]
     anthropic = None  # type: ignore[assignment]
-    AnthropicError = Exception  # type: ignore[misc, assignment]
 
     class _SDKUnavailableError(Exception):
         """Sentinel that never matches a real exception when the SDK is absent."""
@@ -581,7 +580,7 @@ class ClaudeProvider(AgentProvider):
 
         try:
             models = await self._fetch_all_model_infos()
-        except (TimeoutError, AnthropicError, OSError) as e:
+        except Exception as e:  # noqa: BLE001 - model metadata is best-effort; don't poison cache
             # Don't cache the failure — let the next call retry.
             logger.debug("Failed to list Anthropic models: %s", e)
             return
@@ -703,15 +702,9 @@ class ClaudeProvider(AgentProvider):
         :meth:`get_max_output_tokens` (the Anthropic SDK's ``max_tokens``),
         when available. ``max_context_window_tokens`` is always ``None``.
 
-        Unlike :meth:`get_max_prompt_tokens` (which only catches its
-        documented ``(TimeoutError, AnthropicError, OSError)`` tuple and lets
-        anything else propagate, by design, for its own caller), this hook
-        upholds the base class's stricter "never raise" contract on its own:
-        each field is resolved behind its own guard, so a failure in one
-        (e.g. an unexpected exception from the delegated
-        ``get_max_prompt_tokens`` call, or a non-string ``model``) degrades
-        only that field rather than the whole result or the caller. The
-        reasoning-effort fields are populated even when the SDK is
+        Each field is resolved behind its own guard, so a failure in one
+        degrades only that field rather than the whole result or the caller.
+        The reasoning-effort fields are populated even when the SDK is
         unavailable, ``model`` can't be resolved, or the token-limit lookup
         fails (the heuristic is a pure name match independent of the SDK
         call), so this never returns ``None`` outright.
@@ -862,6 +855,8 @@ class ClaudeProvider(AgentProvider):
             # Drop cached metadata so a re-initialized provider re-fetches.
             self._max_input_cache = None
             self._max_output_cache = None
+            self._model_listing_unavailable = False
+            self._model_listing_unavailable_warned = False
 
     async def execute_dialog_turn(
         self,

@@ -430,7 +430,7 @@ class OpenAIProvider(AgentProvider):
         available_models = [model.id for model in models_page.data]
         logger.info(f"Available OpenAI models: {', '.join(available_models)}")
 
-        if match_model_id(self._default_model, available_models) is None:
+        if self._default_model not in available_models:
             logger.warning(
                 f"Requested model '{self._default_model}' is not in the list of "
                 f"available models. API calls may fail. Available: {available_models}"
@@ -587,9 +587,8 @@ class OpenAIProvider(AgentProvider):
     async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
         """Return reasoning-effort support and prompt-token limits for ``model``.
 
-        Reasoning-effort support is inferred from the pydantic-ai model profile.
-        Token limits reuse :meth:`get_max_prompt_tokens` and
-        :meth:`get_max_output_tokens` when the model listing advertises them.
+        OpenAI does not expose token limits through its model listing, so only
+        reasoning-effort capability is inferred from the pydantic-ai model profile.
         Returns ``None`` when the profile cannot be queried.
         """
         from pydantic_ai.profiles.openai import openai_model_profile
@@ -603,13 +602,11 @@ class OpenAIProvider(AgentProvider):
         if supports_reasoning is None:
             return None
         supported = list(_OPENAI_REASONING_EFFORTS) if supports_reasoning else []
-        max_prompt_tokens = await self.get_max_prompt_tokens(model)
-        max_output_tokens = await self.get_max_output_tokens(model)
         return ModelCapabilityInfo(
             supported_reasoning_efforts=supported,
             default_reasoning_effort=None,
-            max_prompt_tokens=max_prompt_tokens,
-            max_output_tokens=max_output_tokens,
+            max_prompt_tokens=None,
+            max_output_tokens=None,
             max_context_window_tokens=None,
         )
 
