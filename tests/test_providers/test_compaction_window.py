@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import pytest
@@ -11,7 +10,6 @@ import pytest
 from conductor.config.schema import ToolOutputConfig
 from conductor.providers._pydantic_ai.compaction_window import (
     DEFAULT_MAX_TOKENS,
-    ENV_CONTEXT_WINDOW,
     FALLBACK_CONTEXT_WINDOW,
     OutputLimitResolution,
     WindowResolution,
@@ -73,75 +71,8 @@ class _MockProvider(AgentProvider, abstract=True):
         return self._max_output
 
 
-def _clear_env() -> None:
-    """Remove the env override before a test."""
-    os.environ.pop(ENV_CONTEXT_WINDOW, None)
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ensure every test starts without the env override set."""
-    monkeypatch.delenv(ENV_CONTEXT_WINDOW, raising=False)
-
-
 class TestResolveCompactionWindow:
     """Tests for the context-window resolution cascade."""
-
-    async def test_env_override_wins(self) -> None:
-        os.environ[ENV_CONTEXT_WINDOW] = "200000"
-        provider = _MockProvider(max_prompt=128_000)
-
-        result = await resolve_compaction_window(
-            provider=provider,
-            model="gpt-5.2",
-            has_custom_base_url=False,
-        )
-
-        assert result == WindowResolution(tokens=200_000, source="env")
-
-    async def test_invalid_env_falls_through(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        os.environ[ENV_CONTEXT_WINDOW] = "abc"
-        provider = _MockProvider(max_prompt=128_000)
-
-        with caplog.at_level(
-            logging.WARNING,
-            logger="conductor.providers._pydantic_ai.compaction_window",
-        ):
-            result = await resolve_compaction_window(
-                provider=provider,
-                model="gpt-5.2",
-                has_custom_base_url=False,
-            )
-
-        assert result == WindowResolution(tokens=128_000, source="provider")
-        assert "Ignoring invalid" in caplog.text
-
-    async def test_zero_env_falls_through(self, caplog: pytest.LogCaptureFixture) -> None:
-        os.environ[ENV_CONTEXT_WINDOW] = "0"
-
-        result = await resolve_compaction_window(
-            provider=_MockProvider(),
-            model="gpt-5.2",
-            has_custom_base_url=False,
-        )
-
-        assert result.source == "registry"
-        assert result.tokens > 0
-
-    async def test_negative_env_falls_through(self, caplog: pytest.LogCaptureFixture) -> None:
-        os.environ[ENV_CONTEXT_WINDOW] = "-100"
-
-        result = await resolve_compaction_window(
-            provider=_MockProvider(),
-            model="gpt-5.2",
-            has_custom_base_url=False,
-        )
-
-        assert result.source == "registry"
-        assert result.tokens > 0
 
     async def test_provider_metadata_beats_registry(self) -> None:
         # Registry knows gpt-5.2 as 400k; the provider says 200k and wins.
@@ -159,7 +90,6 @@ class TestResolveCompactionWindow:
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        os.environ[ENV_CONTEXT_WINDOW] = "abc"
         provider = _MockProvider()
 
         with caplog.at_level(

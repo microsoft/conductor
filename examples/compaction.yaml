@@ -12,8 +12,7 @@
 #   export ANTHROPIC_API_KEY=sk-ant-...
 #   conductor run examples/compaction.yaml --input iterations=10
 #
-# To force compaction with a small window override:
-#   CONDUCTOR_COMPACTION_CONTEXT_WINDOW=100000 conductor run examples/compaction.yaml --input iterations=10
+# To force compaction to trigger early, use a small runtime.max_tokens value.
 
 workflow:
   name: context-compaction

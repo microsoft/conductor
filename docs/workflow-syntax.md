@@ -2382,7 +2382,7 @@ Below is how these values resolve in practice for different configurations using
 
 #### Degenerate Window Warning
 
-If the sum of the resolved output limit and the tool buffer meets or exceeds the resolved context window minus one, Conductor logs a warning. This warning alerts you that the trigger has degenerated to 1 token, meaning hysteresis is lost. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`, or raise the context window size with `CONDUCTOR_COMPACTION_CONTEXT_WINDOW`.
+If the sum of the resolved output limit and the tool buffer meets or exceeds the resolved context window minus one, Conductor logs a warning. This warning alerts you that the trigger has degenerated to 1 token, meaning hysteresis is lost. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`.
 
 ### Compaction Tiers
 
@@ -2397,10 +2397,9 @@ Conductor uses three sequential tiers to compress the history down to the target
 Conductor resolves the context window and output limit via these priority cascades:
 
 #### Context Window Cascade
-1.  `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable.
-2.  Authoritative provider metadata (e.g., `models.list()` on Claude).
-3.  The `genai-prices` registry, active only when using first-party base URLs.
-4.  Conservative default fallback of 128,000 tokens.
+1.  Authoritative provider metadata (e.g., `models.list()` on Claude).
+2.  The `genai-prices` registry, active only when using first-party base URLs.
+3.  Conservative default fallback of 128,000 tokens.
 
 #### Output Limit Cascade
 1.  Effective `max_tokens` actually sent to the API (source is `settings` or `default`).
@@ -2408,15 +2407,11 @@ Conductor resolves the context window and output limit via these priority cascad
 
 ### Customization and Overrides
 
-You don't configure compaction inside the workflow YAML files. The only tuning parameter is the `CONDUCTOR_COMPACTION_CONTEXT_WINDOW` environment variable, which lets you manually set the context window size in tokens.
+You don't configure compaction inside the workflow YAML files. Tune the trigger by adjusting `runtime.max_tokens` or `runtime.tool_output.max_chars`.
 
 #### Forced Compaction Testing
 
-To smoke test compaction behavior, you can force the mechanism to trigger early by running your workflow with a very small context window override. For example:
-
-```bash
-CONDUCTOR_COMPACTION_CONTEXT_WINDOW=100000 conductor run workflow.yaml --input question="What is Python?"
-```
+To smoke test compaction behavior, you can force the mechanism to trigger early by running your workflow with a small `runtime.max_tokens` value. For example, set `max_tokens: 1000` on the agent or workflow runtime.
 
 #### Loop-back History Behavior
 

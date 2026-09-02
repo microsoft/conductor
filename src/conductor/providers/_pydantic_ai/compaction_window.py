@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -30,9 +29,6 @@ TARGET_FRACTION = 0.55
 #: Conservative context-window fallback when no authoritative source is available.
 FALLBACK_CONTEXT_WINDOW = 128_000
 
-#: Environment variable override for the compaction context window.
-ENV_CONTEXT_WINDOW = "CONDUCTOR_COMPACTION_CONTEXT_WINDOW"
-
 #: Characters-per-token estimate for tool result payloads. This is an
 #: approximation; actual token counts depend on the model's tokenizer.
 TOOL_RESULT_CHARS_PER_TOKEN = 4
@@ -47,23 +43,9 @@ TOOL_RESULT_COUNT_HEURISTIC = 2
 ESTIMATOR_SLOP = 15_000
 
 #: One-shot warnings per process.
-_invalid_env_warned = False
 _custom_base_url_warned = False
 _tool_output_disabled_warned = False
 _trigger_degenerate_warned = False
-
-
-def _warn_invalid_env(value: str) -> None:
-    """Log a one-time warning about an invalid env override."""
-    global _invalid_env_warned
-    if _invalid_env_warned:
-        return
-    _invalid_env_warned = True
-    logger.warning(
-        "Ignoring invalid %s value %r; expected a positive integer.",
-        ENV_CONTEXT_WINDOW,
-        value,
-    )
 
 
 def _warn_custom_base_url() -> None:
@@ -101,7 +83,7 @@ def _warn_trigger_degenerate() -> None:
     logger.warning(
         "The compaction trigger has degenerated to 1 token (output_limit + tool_buffer "
         "reaches the context window). Hysteresis is lost. Lower runtime.max_tokens or "
-        "tool_output.max_chars, or raise CONDUCTOR_COMPACTION_CONTEXT_WINDOW."
+        "tool_output.max_chars."
     )
 
 
@@ -117,7 +99,7 @@ class WindowResolution:
     tokens: int
     """Resolved context-window size in tokens."""
 
-    source: Literal["env", "provider", "registry", "fallback"]
+    source: Literal["provider", "registry", "fallback"]
     """Source that supplied the value."""
 
 
@@ -130,25 +112,6 @@ class OutputLimitResolution:
 
     source: Literal["settings", "provider-cap", "default"]
     """Source that supplied the value."""
-
-
-def _resolve_from_env() -> int | None:
-    """Parse ``CONDUCTOR_COMPACTION_CONTEXT_WINDOW`` as a positive int.
-
-    Returns ``None`` when the variable is unset, empty, or not a positive integer.
-    """
-    raw = os.environ.get(ENV_CONTEXT_WINDOW)
-    if raw is None or raw == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        _warn_invalid_env(raw)
-        return None
-    if value <= 0:
-        _warn_invalid_env(raw)
-        return None
-    return value
 
 
 def _resolve_window_from_registry(model: str) -> int | None:
@@ -186,11 +149,10 @@ async def resolve_compaction_window(
 
     Priority order, highest first:
 
-    1. ``CONDUCTOR_COMPACTION_CONTEXT_WINDOW`` environment variable.
-    2. ``provider.get_max_prompt_tokens(model)`` (authoritative provider metadata).
-    3. ``genai-prices`` registry, but only for first-party endpoints
+    1. ``provider.get_max_prompt_tokens(model)`` (authoritative provider metadata).
+    2. ``genai-prices`` registry, but only for first-party endpoints
        (``has_custom_base_url`` is ``False``).
-    4. Conservative ``FALLBACK_CONTEXT_WINDOW`` fallback.
+    3. Conservative ``FALLBACK_CONTEXT_WINDOW`` fallback.
 
     Args:
         provider: Provider instance to query for metadata.
@@ -203,10 +165,6 @@ async def resolve_compaction_window(
         A :class:`WindowResolution` with the resolved window and its source.
         This function never raises.
     """
-    env_value = _resolve_from_env()
-    if env_value is not None:
-        return WindowResolution(tokens=env_value, source="env")
-
     try:
         provider_value = await provider.get_max_prompt_tokens(model)
     except Exception as exc:  # noqa: BLE001 - metadata is best-effort
