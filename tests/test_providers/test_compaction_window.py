@@ -355,3 +355,57 @@ class TestProxyUnknownModel:
         )
 
         assert trigger_tokens(window.tokens, output_limit.tokens, 40_000) == 71_616
+
+
+class TestSlimmedCascade:
+    """Regression pins for the slimmed cascade (provider -> registry -> fallback)."""
+
+    async def test_provider_advertised_limits_cascade(self) -> None:
+        """Stub provider returning (200_000, 131_072) advertised limits."""
+        provider = _MockProvider(max_prompt=200_000, max_output=131_072)
+
+        window = await resolve_compaction_window(
+            provider=provider,
+            model="vendor-model",
+            has_custom_base_url=False,
+        )
+        assert window == WindowResolution(tokens=200_000, source="provider")
+
+        output_limit = await resolve_output_limit(
+            provider=provider,
+            model="vendor-model",
+            effective_max_tokens=16_384,
+            user_configured=False,
+        )
+        assert output_limit == OutputLimitResolution(tokens=16_384, source="default")
+
+    async def test_provider_advertised_cap_clamps_output(self) -> None:
+        """Inverse case: cap 8192 < 16384 yields provider-cap clamp."""
+        provider = _MockProvider(max_prompt=200_000, max_output=8192)
+
+        window = await resolve_compaction_window(
+            provider=provider,
+            model="vendor-model",
+            has_custom_base_url=False,
+        )
+        assert window == WindowResolution(tokens=200_000, source="provider")
+
+        output_limit = await resolve_output_limit(
+            provider=provider,
+            model="vendor-model",
+            effective_max_tokens=16_384,
+            user_configured=False,
+        )
+        assert output_limit == OutputLimitResolution(tokens=8192, source="provider-cap")
+
+    async def test_first_party_registry_branch_untouched(self) -> None:
+        """First-party registry branch resolves model window when provider returns None."""
+        provider = _MockProvider(max_prompt=None, max_output=None)
+
+        result = await resolve_compaction_window(
+            provider=provider,
+            model="gpt-5.2",
+            has_custom_base_url=False,
+        )
+
+        assert result == WindowResolution(tokens=400_000, source="registry")
