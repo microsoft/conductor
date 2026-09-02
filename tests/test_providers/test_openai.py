@@ -6,6 +6,7 @@ execute()/execute_dialog_turn() surfaces without making network calls.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -477,10 +478,31 @@ class TestConnectionHelpers:
         assert "Available OpenAI models: gpt-5-mini" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_validate_connection_warns_when_default_model_missing(
+    async def test_validate_connection_warns_when_explicit_model_missing(
         self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Requirement: a default model absent from the listing triggers a warning."""
+        """Requirement: an explicitly requested model absent from the listing warns."""
+        from unittest.mock import AsyncMock
+
+        provider._model_user_configured = True
+        provider._default_model = "gpt-5-mini"
+        mock_client = MagicMock()
+        mock_client.models.list = AsyncMock(return_value=MagicMock(data=[MagicMock(id="other")]))
+        provider._client = mock_client  # type: ignore[assignment]
+        with caplog.at_level("WARNING"):
+            assert await provider.validate_connection() is True
+        assert "Requested model 'gpt-5-mini' is not in the list" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_does_not_warn_for_fallback_default(
+        self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: a hardcoded default missing from the listing never warns.
+
+        Per-agent ``model:`` overrides may make the provider default unused, so
+        warning about it (e.g. on a proxy whose listing omits it) is a false
+        positive.
+        """
         from unittest.mock import AsyncMock
 
         mock_client = MagicMock()
@@ -488,7 +510,7 @@ class TestConnectionHelpers:
         provider._client = mock_client  # type: ignore[assignment]
         with caplog.at_level("WARNING"):
             assert await provider.validate_connection() is True
-        assert "Requested model 'gpt-5-mini' is not in the list" in caplog.text
+        assert "is not in the list of available models" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_validate_connection_returns_false_on_non_http_error(
@@ -773,3 +795,106 @@ class TestOpenAIModelTokenLimits:
         assert provider._model_limits_cache is None
         assert provider._model_listing_unavailable is False
         assert provider._model_listing_unavailable_warned is False
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_callers_issue_single_listing(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: concurrent cache-miss calls share one models.list() round-trip."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=131_072)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(return_value=SimpleNamespace(data=[model])),
+        ) as list_models:
+            results = await asyncio.gather(
+                provider.get_max_prompt_tokens("vendor-model"),
+                provider.get_max_prompt_tokens("vendor-model"),
+            )
+
+        assert results == [131_072, 131_072]
+        assert list_models.await_count == 1
+
+
+class TestCompactionOutputLimitPerAgent:
+    """Requirement: per-agent ``max_tokens`` feeds the compaction output limit.
+
+    ``AgentDef`` does not declare ``max_tokens`` yet (issue #471 groundwork);
+    ``agent_builder`` already reads it via ``getattr``. The compaction output
+    limit must use the agent-level value and report ``source="settings"``.
+    """
+
+    async def test_agent_max_tokens_drives_output_limit(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """An agent carrying ``max_tokens=4096`` resolves output_limit=4096 with
+        source ``settings`` in the emitted ``agent_compaction_config`` payload."""
+        agent = AgentDef(name="greeter", model="test", prompt="say hi")
+        object.__setattr__(agent, "max_tokens", 4096)
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("hello"),
+            ),
+            patch.object(
+                OpenAIProvider,
+                "get_max_prompt_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                OpenAIProvider,
+                "get_max_output_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await provider.execute(agent, {}, "say hi", event_callback=callback)
+
+        config_events = [e for e in events if e[0] == "agent_compaction_config"]
+        assert len(config_events) == 1
+        payload = config_events[0][1]
+        assert payload["output_limit"] == 4096
+        assert payload["output_limit_source"] == "settings"
+
+    async def test_agent_without_max_tokens_keeps_default_source(
+        self, provider: OpenAIProvider, no_mcp_manager: Any
+    ) -> None:
+        """Without an agent-level value the output limit falls back to the
+        provider default with source ``default`` (no spurious ``settings``)."""
+        agent = AgentDef(name="greeter", model="test", prompt="say hi")
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("hello"),
+            ),
+            patch.object(
+                OpenAIProvider,
+                "get_max_prompt_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                OpenAIProvider,
+                "get_max_output_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await provider.execute(agent, {}, "say hi", event_callback=callback)
+
+        config_events = [e for e in events if e[0] == "agent_compaction_config"]
+        assert len(config_events) == 1
+        payload = config_events[0][1]
+        assert payload["output_limit"] == 16_384
+        assert payload["output_limit_source"] == "default"

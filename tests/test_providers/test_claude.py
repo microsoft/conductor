@@ -289,7 +289,7 @@ class TestModelVerification:
         mock_anthropic_module: Mock,
         mock_anthropic_class: Mock,
     ) -> None:
-        """Test warning when requested model is not available."""
+        """Requirement: an explicitly requested model missing from the listing warns."""
         mock_anthropic_module.__version__ = "0.77.0"
         mock_client = Mock()
 
@@ -304,6 +304,37 @@ class TestModelVerification:
         mock_logger.warning.assert_called()
         warning_calls = [call[0][0] for call in mock_logger.warning.call_args_list]
         assert any("not in the list of available models" in call for call in warning_calls)
+
+    @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+    @patch("conductor.providers.claude.AsyncAnthropic")
+    @patch("conductor.providers.claude.anthropic")
+    @patch("conductor.providers.claude.logger")
+    @pytest.mark.asyncio
+    async def test_model_verification_does_not_warn_for_fallback_default(
+        self,
+        mock_logger: Mock,
+        mock_anthropic_module: Mock,
+        mock_anthropic_class: Mock,
+    ) -> None:
+        """Requirement: a hardcoded default missing from the listing never warns.
+
+        Per-agent ``model:`` overrides may make the provider default unused,
+        so warning about it (e.g. on a gateway whose listing omits it) is a
+        false positive.
+        """
+        mock_anthropic_module.__version__ = "0.77.0"
+        mock_client = Mock()
+
+        mock_model = Mock()
+        mock_model.id = "claude-3-opus-20240229"
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[mock_model]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        await provider.validate_connection()
+
+        warning_calls = [call[0][0] for call in mock_logger.warning.call_args_list]
+        assert not any("not in the list of available models" in call for call in warning_calls)
 
 
 class TestConnectionValidation:
@@ -1227,6 +1258,26 @@ class TestClaudeGetMaxPromptTokens:
         assert mock_client.models.list.await_count == before
 
     @pytest.mark.asyncio
+    async def test_concurrent_first_callers_issue_single_listing(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        """Requirement: concurrent cache-miss calls share one models.list() round-trip."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        results = await asyncio.gather(
+            provider.get_max_prompt_tokens("claude-sonnet-4-5"),
+            provider.get_max_prompt_tokens("claude-sonnet-4-5"),
+        )
+
+        assert results == [200_000, 200_000]
+        assert mock_client.models.list.await_count == 1
+
+    @pytest.mark.asyncio
     @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False)
     async def test_returns_none_when_sdk_unavailable(self, mock_anthropic_class: Mock) -> None:
         with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True):
@@ -1559,3 +1610,101 @@ class TestClaudeMCPManagerPool:
 
         assert manager is not None
         assert instances[0].connected[0]["cwd"] == os.getcwd()
+
+
+class TestCompactionOutputLimitPerAgent:
+    """Requirement: per-agent ``max_tokens`` marks the compaction output limit
+    as user-configured (``source="settings"``).
+
+    ``AgentDef`` does not declare ``max_tokens`` yet (issue #471 groundwork);
+    ``resolve_anthropic_effective_max_tokens`` already reads it via ``getattr``
+    for the numeric value, and the ``user_configured`` flag must treat an
+    agent-level value the same as a runtime-level one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_max_tokens_marks_output_limit_as_settings(self) -> None:
+        """An agent carrying ``max_tokens=4096`` resolves output_limit=4096 with
+        source ``settings`` in the emitted ``agent_compaction_config`` payload."""
+        provider = ClaudeProvider(api_key="test-key")
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        agent = AgentDef(name="test", prompt="Say hello")
+        object.__setattr__(agent, "max_tokens", 4096)
+
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Hello, world!"),
+            ),
+            patch.object(
+                ClaudeProvider,
+                "get_max_prompt_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                ClaudeProvider,
+                "get_max_output_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="Say hello",
+                event_callback=callback,
+            )
+
+        config_events = [e for e in events if e[0] == "agent_compaction_config"]
+        assert len(config_events) == 1
+        payload = config_events[0][1]
+        assert payload["output_limit"] == 4096
+        assert payload["output_limit_source"] == "settings"
+
+    @pytest.mark.asyncio
+    async def test_agent_without_max_tokens_keeps_default_source(self) -> None:
+        """Without an agent-level value the output limit falls back to the
+        provider default with source ``default`` (no spurious ``settings``)."""
+        provider = ClaudeProvider(api_key="test-key")
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        agent = AgentDef(name="test", prompt="Say hello")
+
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Hello, world!"),
+            ),
+            patch.object(
+                ClaudeProvider,
+                "get_max_prompt_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                ClaudeProvider,
+                "get_max_output_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="Say hello",
+                event_callback=callback,
+            )
+
+        config_events = [e for e in events if e[0] == "agent_compaction_config"]
+        assert len(config_events) == 1
+        payload = config_events[0][1]
+        assert payload["output_limit"] == 16_384
+        assert payload["output_limit_source"] == "default"
