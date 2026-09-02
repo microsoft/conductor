@@ -18,6 +18,7 @@ wrapper that:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -187,8 +188,9 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
     or from the final deterministic tier so that a compaction bug can never abort
     a workflow run.
 
-    It also emits ``agent_compaction_start`` before delegating to the inner
-    strategy and ``agent_compaction_complete`` after the strategy returns or
+    It also emits ``agent_compaction_start`` immediately before delegating to
+    the inner strategy (only when the estimated context size exceeds the
+    trigger) and ``agent_compaction_complete`` after the strategy returns or
     when an unexpected error escapes.
 
     A per-execution disable latch is set after an *outer* failure so the
@@ -275,18 +277,18 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
                 request_context.model_request_parameters,
             )
 
+            # Gate on the token estimate, not the message count: one large
+            # prompt can exceed the trigger with nothing to drop.
+            will_compact = before_estimate > self._config.trigger_tokens
+
+            if will_compact:
+                self._on_before(estimate=before_estimate, messages_before=len(before_messages))
+                start = time.monotonic()
+
             result = await self._inner.before_model_request(ctx, request_context)
 
-            # If the estimated context size is still below the trigger, the gate
-            # decided we were under budget and no compaction lifecycle event is
-            # needed.  Use the estimate (not message count) because a single large
-            # prompt can be above the trigger even when the tiered strategy has
-            # nothing to drop.
-            if before_estimate <= self._config.trigger_tokens:
+            if not will_compact:
                 return result
-
-            # Compaction is actually going to run: emit the start event now.
-            self._on_before(estimate=before_estimate, messages_before=len(before_messages))
 
             after_messages = list(result.messages)
             after_estimate = await _estimate_context_tokens(
@@ -298,7 +300,7 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
                 after_messages=after_messages,
                 before_estimate=before_estimate,
                 after_estimate=after_estimate,
-                elapsed_seconds=0.0,
+                elapsed_seconds=time.monotonic() - start,
             )
             return result
         except Exception as exc:  # noqa: BLE001 - compaction must never fail the run

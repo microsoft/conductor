@@ -770,6 +770,51 @@ class TestEventEmission:
         )
 
     @pytest.mark.asyncio
+    async def test_start_emitted_before_inner_strategy_runs(self) -> None:
+        """Requirement: ``agent_compaction_start`` is emitted before the inner
+        compaction strategy runs, and the complete event carries the real
+        elapsed time of the strategy call (not a hardcoded zero)."""
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        call_order: list[str] = []
+        gate = capability._inner  # type: ignore[attr-defined]
+        original = gate.before_model_request
+
+        async def _slow_inner(ctx: Any, request_context: Any) -> Any:
+            call_order.append("inner")
+            assert any(e[0] == "agent_compaction_start" for e in events), (
+                "agent_compaction_start must be emitted before the inner strategy runs"
+            )
+            await asyncio.sleep(0.01)
+            return await original(ctx, request_context)
+
+        gate.before_model_request = _slow_inner
+
+        try:
+            await capability.before_model_request(  # type: ignore[arg-type]
+                _make_run_context(),
+                _request_context_with_messages(
+                    [ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])]
+                ),
+            )
+        finally:
+            gate.before_model_request = original
+
+        types = [e[0] for e in events]
+        start_index = types.index("agent_compaction_start")
+        complete_index = types.index("agent_compaction_complete")
+        assert start_index < complete_index
+        assert call_order == ["inner"]
+        complete = events[complete_index][1]
+        assert complete["elapsed"] > 0
+
+    @pytest.mark.asyncio
     async def test_no_events_when_below_trigger(self) -> None:
         """A request below the trigger must not emit any compaction lifecycle
         events because compaction never runs."""
