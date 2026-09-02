@@ -3,8 +3,8 @@
 This module assembles the harness's :class:`TieredCompaction` into a conductor
 wrapper that:
 
-1. Gates compaction on a reserve-based token trigger (window minus max(output
-   limit, buffer)).
+1. Gates compaction on a reserve-based token trigger (window minus the output
+   limit minus the tool buffer).
 2. Wraps each escalation tier individually so a failing LLM summarizer still
    yields to the deterministic sliding-window fallback.
 3. Fails open: any unexpected error in the gate or tier chain is logged and the
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.tools import RunContext
 
@@ -94,19 +94,29 @@ async def _estimate_context_tokens(
     )
 
 
-def _last_response_input_tokens(messages: list[ModelMessage]) -> int | None:
-    """Cheap short-circuit estimate from the most recent response's usage.
+def _estimate_after_compaction_tokens(
+    before_messages: list[ModelMessage],
+    after_messages: list[ModelMessage],
+    before_estimate: int,
+) -> int:
+    """Estimate the post-compaction token count, compensating for the anchor.
 
-    This is only used as a pre-check: if even the anchored previous request is
-    already over the trigger, we know compaction is needed without running the
-    full estimator. It must not be the sole estimator because it misses the
-    suffix appended after the anchor (new user/tool messages).
+    ``estimate_context_tokens`` anchors on the most recent ``ModelResponse``
+    with provider-reported ``usage.input_tokens``. That anchoring response
+    survives compaction (every tier keeps the recent tail), so a naive
+    after-estimate still describes the pre-rewrite request and always reports
+    ``after == before`` — i.e. ``tokens_saved == 0`` — no matter how much
+    history was dropped. ``TieredCompaction._escalate`` compensates for this
+    internally by subtracting the tier's measured heuristic reclaim from its
+    anchored baseline; this helper mirrors that compensation so the telemetry
+    reports the same numbers the escalation loop acted on.
     """
-    for message in reversed(messages):
-        if isinstance(message, ModelResponse):
-            usage = message.usage
-            return usage.input_tokens or None
-    return None
+    from pydantic_ai_harness.compaction import estimate_token_count
+
+    reclaimed = estimate_token_count(before_messages, None) - estimate_token_count(
+        after_messages, None
+    )
+    return max(before_estimate - reclaimed, 0)
 
 
 class _TierWrapper(AbstractCapability[Any]):
@@ -114,12 +124,16 @@ class _TierWrapper(AbstractCapability[Any]):
 
     ``TieredCompaction._escalate`` calls each tier's ``compact`` directly and
     does not catch exceptions.  Wrapping ``compact`` lets a failing summarizer
-    still yield to the deterministic sliding-window fallback.
+    still yield to the deterministic sliding-window fallback. A tier that
+    raised sets ``failed`` so the outer wrapper can name the degraded tiers in
+    the ``agent_compaction_complete`` event instead of reporting false success;
+    the flag is reset by the outer wrapper before every request.
     """
 
     def __init__(self, inner: Any, *, tier_name: str) -> None:
         self._inner = inner
         self._tier_name = tier_name
+        self.failed = False
 
     async def compact(
         self,
@@ -129,6 +143,7 @@ class _TierWrapper(AbstractCapability[Any]):
         try:
             return await self._inner.compact(messages, ctx)
         except Exception as exc:  # noqa: BLE001 - tier failure is recoverable
+            self.failed = True
             logger.warning(
                 "Compaction tier %s raised %s; continuing to next tier.",
                 self._tier_name,
@@ -138,62 +153,26 @@ class _TierWrapper(AbstractCapability[Any]):
             return messages
 
 
-class _ThresholdGatedCompaction(AbstractCapability[Any]):
-    """Reserve-based gate that delegates to the inner tiered strategy when over budget.
-
-    The primary estimator is ``estimate_context_tokens``; the last-response usage
-    anchor is used only as a cheap short-circuit pre-check.
-    """
-
-    def __init__(
-        self,
-        inner: AbstractCapability[Any],
-        *,
-        trigger_tokens: int,
-    ) -> None:
-        self._inner = inner
-        self._trigger_tokens = trigger_tokens
-
-    async def before_model_request(
-        self,
-        ctx: RunContext[Any],
-        request_context: ModelRequestContext,
-    ) -> ModelRequestContext:
-        messages = list(request_context.messages)
-
-        anchor = _last_response_input_tokens(messages)
-        if anchor is not None and anchor <= self._trigger_tokens:
-            estimate = await _estimate_context_tokens(
-                messages,
-                request_context.model_request_parameters,
-            )
-            if estimate <= self._trigger_tokens:
-                return request_context
-        else:
-            estimate = await _estimate_context_tokens(
-                messages,
-                request_context.model_request_parameters,
-            )
-            if estimate <= self._trigger_tokens:
-                return request_context
-
-        # Above trigger: delegate to the inner tiered strategy.
-        return await self._inner.before_model_request(ctx, request_context)
-
-
 class _FailOpenCompactionWrapper(AbstractCapability[Any]):
-    """Outer fail-open wrapper: any escaping exception returns the original context.
+    """Outer gate + fail-open wrapper around the tiered strategy.
 
-    This is the last line of defense.  It catches errors from the gate estimator
-    or from the final deterministic tier so that a compaction bug can never abort
-    a workflow run.
+    The token gate lives here rather than in a separate capability: measuring
+    the context once per request (not once in a gate and again inside the
+    inner strategy's own trigger check) halves the estimator work.
 
-    It also emits ``agent_compaction_start`` immediately before delegating to
-    the inner strategy (only when the estimated context size exceeds the
-    trigger) and ``agent_compaction_complete`` after the strategy returns or
-    when an unexpected error escapes.
+    Failure handling is zoned:
 
-    A per-execution disable latch is set after an *outer* failure so the
+    - **Gate measurement failure** — the before-estimate itself raised. Log a
+      warning and return the context unchanged; no event and no disable latch,
+      because a broken estimate says nothing about the compaction path.
+    - **Inner strategy failure** — log, emit an errored
+      ``agent_compaction_complete``, engage the per-execution disable latch,
+      and return the original context unchanged.
+    - **After-telemetry failure** — compaction already happened, so the
+      compacted result is returned; a warning is logged but no errored event
+      is emitted and the latch stays off.
+
+    A per-execution disable latch is set after an *inner* failure so the
     wrapper short-circuits on subsequent requests rather than retrying a
     deterministically broken compaction path.
     """
@@ -203,9 +182,11 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
         inner: AbstractCapability[Any],
         *,
         config: CompactionConfig,
+        tier_wrappers: list[_TierWrapper] | None = None,
     ) -> None:
         self._inner = inner
         self._config = config
+        self._tier_wrappers: list[_TierWrapper] = tier_wrappers or []
         self._disabled = False
 
     def _on_before(self, estimate: int, messages_before: int) -> None:
@@ -233,6 +214,7 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
         before_estimate: int,
         after_estimate: int,
         elapsed_seconds: float,
+        degraded_tiers: list[str],
     ) -> None:
         """Emit a success-shaped ``agent_compaction_complete`` event."""
         emit_compaction_complete(
@@ -247,6 +229,8 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
             tokens_before=before_estimate,
             tokens_after=after_estimate,
             elapsed=elapsed_seconds,
+            degraded_tiers=degraded_tiers,
+            still_over_trigger=after_estimate > self._config.trigger_tokens,
         )
 
     def _on_error(self, exc: Exception) -> None:
@@ -270,39 +254,38 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
         if self._disabled:
             return request_context
 
+        # Zone (a): gate measurement. A broken estimate says nothing about
+        # the compaction path, so this warns and skips compaction for this
+        # request only — no errored event, no disable latch.
         try:
             before_messages = list(request_context.messages)
             before_estimate = await _estimate_context_tokens(
                 before_messages,
                 request_context.model_request_parameters,
             )
+        except Exception:  # noqa: BLE001 - estimation must never fail the run
+            logger.warning(
+                "Compaction gate measurement failed for agent %r; "
+                "skipping compaction for this request.",
+                self._config.agent_name,
+                exc_info=True,
+            )
+            return request_context
 
-            # Gate on the token estimate, not the message count: one large
-            # prompt can exceed the trigger with nothing to drop.
-            will_compact = before_estimate > self._config.trigger_tokens
+        # Gate on the token estimate, not the message count: one large
+        # prompt can exceed the trigger with nothing to drop.
+        if before_estimate <= self._config.trigger_tokens:
+            return request_context
 
-            if will_compact:
-                self._on_before(estimate=before_estimate, messages_before=len(before_messages))
-                start = time.monotonic()
+        self._on_before(estimate=before_estimate, messages_before=len(before_messages))
+        for tier in self._tier_wrappers:
+            tier.failed = False
+        start = time.monotonic()
 
+        # Zone (b): inner strategy. Fail open with the original context, emit
+        # the errored event, and latch the per-execution disable flag.
+        try:
             result = await self._inner.before_model_request(ctx, request_context)
-
-            if not will_compact:
-                return result
-
-            after_messages = list(result.messages)
-            after_estimate = await _estimate_context_tokens(
-                after_messages,
-                request_context.model_request_parameters,
-            )
-            self._on_after(
-                before_messages=before_messages,
-                after_messages=after_messages,
-                before_estimate=before_estimate,
-                after_estimate=after_estimate,
-                elapsed_seconds=time.monotonic() - start,
-            )
-            return result
         except Exception as exc:  # noqa: BLE001 - compaction must never fail the run
             logger.warning(
                 "Compaction failed for agent %r: %s. Continuing without compaction.",
@@ -313,6 +296,33 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
             self._on_error(exc)
             return request_context
 
+        degraded_tiers = [t._tier_name for t in self._tier_wrappers if t.failed]
+
+        # Zone (c): after-telemetry. Compaction already happened, so a failure
+        # here must still return the compacted result — warn, emit nothing,
+        # and leave the latch off.
+        try:
+            after_estimate = _estimate_after_compaction_tokens(
+                before_messages,
+                list(result.messages),
+                before_estimate,
+            )
+            self._on_after(
+                before_messages=before_messages,
+                after_messages=list(result.messages),
+                before_estimate=before_estimate,
+                after_estimate=after_estimate,
+                elapsed_seconds=time.monotonic() - start,
+                degraded_tiers=degraded_tiers,
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never fail the run
+            logger.warning(
+                "Compaction telemetry failed for agent %r; keeping compacted context.",
+                self._config.agent_name,
+                exc_info=True,
+            )
+        return result
+
 
 def build_tiered_compaction(config: CompactionConfig) -> AbstractCapability[Any]:
     """Assemble the tiered compaction capability stack.
@@ -322,14 +332,13 @@ def build_tiered_compaction(config: CompactionConfig) -> AbstractCapability[Any]
 
     The stack is, from outside in:
 
-    1. ``_FailOpenCompactionWrapper`` — catches unexpected errors and returns the
-       original context unchanged.
-    2. ``_ThresholdGatedCompaction`` — only invokes the inner strategy when the
-       estimated context size exceeds the trigger.
-    3. ``TieredCompaction`` — escalates through the three tiers.
-    4. Per-tier wrappers around ``ClearToolResults``, ``SummarizingCompaction``,
+    1. ``_FailOpenCompactionWrapper`` — owns the token gate (measured once per
+       request), catches unexpected errors, and returns the original context
+       unchanged when the inner strategy fails.
+    2. ``TieredCompaction`` — escalates through the three tiers.
+    3. Per-tier wrappers around ``ClearToolResults``, ``SummarizingCompaction``,
        and ``SlidingWindowCompaction`` so a non-final tier failure still proceeds
-       to the deterministic final tier.
+       to the deterministic final tier and is named in ``degraded_tiers``.
     """
     from pydantic_ai_harness.compaction import (
         ClearToolResults,
@@ -365,12 +374,11 @@ def build_tiered_compaction(config: CompactionConfig) -> AbstractCapability[Any]
         tokenizer=None,
     )
 
-    gated = _ThresholdGatedCompaction(
+    return _FailOpenCompactionWrapper(
         tiered,
-        trigger_tokens=config.trigger_tokens,
+        config=config,
+        tier_wrappers=[clear_tier, summarize_tier, slide_tier],
     )
-
-    return _FailOpenCompactionWrapper(gated, config=config)
 
 
 __all__ = [

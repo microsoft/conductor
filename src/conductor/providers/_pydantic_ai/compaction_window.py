@@ -26,6 +26,21 @@ DEFAULT_MAX_TOKENS: int = 16_384
 #: Escalation ceiling as a fraction of the resolved context window.
 TARGET_FRACTION = 0.55
 
+#: Hysteresis gap kept between the trigger and the target, as a fraction of
+#: the resolved context window. A ``target`` equal to ``trigger`` would
+#: re-compact on the very next request.
+HYSTERESIS_FRACTION = 0.05
+
+#: Upper bound on the tool buffer as a fraction of the resolved window.
+#: A ``runtime.tool_output.max_chars`` so large that it would eat the window
+#: (or a whole small window) is clamped to this fraction rather than disabling
+#: compaction outright.
+TOOL_BUFFER_MAX_FRACTION = 0.25
+
+#: Minimum usable trigger in tokens. Below this the reserve leaves no room
+#: for a real history, so compaction is disabled rather than degenerating.
+MIN_VIABLE_TRIGGER = 4_096
+
 #: Conservative context-window fallback when no authoritative source is available.
 FALLBACK_CONTEXT_WINDOW = 128_000
 
@@ -42,10 +57,14 @@ TOOL_RESULT_COUNT_HEURISTIC = 2
 #: non-result overhead. This is a heuristic, not a guarantee.
 ESTIMATOR_SLOP = 15_000
 
-#: One-shot warnings per process.
+#: One-shot warnings per process. These latches are module-scoped (not
+#: instance-scoped) on purpose: the call sites that emit them
+#: (:func:`resolve_compaction_window` and :func:`tool_buffer_tokens`) are
+#: pure functions with no execution state to hang the flag on, and the
+#: warnings describe process-wide configuration problems rather than
+#: per-agent conditions. Tests reset them via ``_reset_warning_latches()``.
 _custom_base_url_warned = False
 _tool_output_disabled_warned = False
-_trigger_degenerate_warned = False
 
 
 def _warn_custom_base_url() -> None:
@@ -74,21 +93,20 @@ def _warn_tool_output_disabled() -> None:
     )
 
 
-def _warn_trigger_degenerate() -> None:
-    """Log a one-time warning that the compaction trigger has degenerated."""
-    global _trigger_degenerate_warned
-    if _trigger_degenerate_warned:
-        return
-    _trigger_degenerate_warned = True
-    logger.warning(
-        "The compaction trigger has degenerated to 1 token (output_limit + tool_buffer "
-        "reaches the context window). Hysteresis is lost. Lower runtime.max_tokens or "
-        "tool_output.max_chars."
-    )
+def _reset_warning_latches() -> None:
+    """Reset every module-level one-shot warning latch.
+
+    Test helper: tests asserting on warning content must start from a clean
+    slate regardless of what earlier tests in the same process already warned
+    about.
+    """
+    global _custom_base_url_warned, _tool_output_disabled_warned
+    _custom_base_url_warned = False
+    _tool_output_disabled_warned = False
 
 
-def _warn_registry_lookup_failed(model: str, exc: Exception) -> None:
-    """Log a one-time debug message when the registry lookup fails."""
+def _log_registry_lookup_failed(model: str, exc: Exception) -> None:
+    """Log a debug message when the registry lookup fails (every occurrence)."""
     logger.debug("Failed to resolve context window from registry for %r: %s", model, exc)
 
 
@@ -123,14 +141,14 @@ def _resolve_window_from_registry(model: str) -> int | None:
     try:
         from genai_prices.data_snapshot import get_snapshot
     except Exception as exc:  # noqa: BLE001 - registry is best-effort
-        _warn_registry_lookup_failed(model, exc)
+        _log_registry_lookup_failed(model, exc)
         return None
 
     try:
         snap = get_snapshot()
         _provider, info = snap.find_provider_model(model, None, None, None)
     except Exception as exc:  # noqa: BLE001 - registry is best-effort
-        _warn_registry_lookup_failed(model, exc)
+        _log_registry_lookup_failed(model, exc)
         return None
 
     window = getattr(info, "context_window", None)
@@ -272,28 +290,124 @@ def tool_buffer_tokens(tool_output: ToolOutputConfig | None) -> int:
     )
 
 
-def trigger_tokens(window: int, output_limit: int, tool_buffer: int) -> int:
-    """Return the reserve-based compaction trigger.
+@dataclass(frozen=True)
+class CompactionPlan:
+    """Resolved compaction plan for one agent execution.
+
+    Produced by :func:`resolve_compaction_plan`. When ``enabled`` is ``True``
+    the plan carries the trigger/target thresholds and the effective tool
+    buffer; when ``False`` those are ``None`` and ``disabled_reason`` names
+    the cause so the config event can report it.
+    """
+
+    enabled: bool
+    """Whether compaction should be armed for this execution."""
+
+    trigger_tokens: int | None = None
+    """Reserve-based trigger at which compaction fires (enabled only)."""
+
+    target_tokens: int | None = None
+    """Escalation-ceiling target passed to the harness tiers (enabled only)."""
+
+    effective_tool_buffer: int | None = None
+    """Tool-result reserve actually applied, after the window-fraction clamp."""
+
+    disabled_reason: str | None = None
+    """Machine-readable reason compaction is off (disabled only)."""
+
+
+#: Reason code used when the reserve (output limit + effective tool buffer)
+#: leaves no viable headroom below the window.
+DISABLED_REASON_INSUFFICIENT_HEADROOM = "insufficient_headroom"
+
+
+def resolve_compaction_plan(
+    *,
+    window: int,
+    output_limit: int,
+    tool_buffer: int,
+) -> CompactionPlan:
+    """Compute the compaction trigger/target plan for one agent execution.
 
     Formula::
 
-        max(1, window - output_limit - tool_buffer)
+        effective_tool_buffer = min(tool_buffer, int(window * TOOL_BUFFER_MAX_FRACTION))
+        trigger = window - output_limit - effective_tool_buffer
+        margin  = max(1, int(window * HYSTERESIS_FRACTION))
+        target  = min(int(window * TARGET_FRACTION), trigger - margin)
 
-    The trigger reserves enough headroom for the model's own maximum answer
-    plus a buffer for the largest likely tool results, preventing the provider
-    from rejecting the request for exceeding its context window.
+    The buffer is clamped to :data:`TOOL_BUFFER_MAX_FRACTION` of the window so
+    a pathological ``runtime.tool_output.max_chars`` (or a small window under
+    the default 40k buffer) cannot consume the entire window; the hysteresis
+    margin keeps the target strictly below the trigger so a successful
+    compaction does not immediately re-fire on the next request.
+
+    When the trigger falls below :data:`MIN_VIABLE_TRIGGER` (or the target
+    would be below 1 token), compaction is **disabled** rather than armed with
+    a degenerate threshold: ``enabled`` is ``False`` and ``disabled_reason``
+    is ``"insufficient_headroom"`` — the remedy is lowering
+    ``runtime.max_tokens`` or ``tool_output.max_chars``. A disabled plan
+    surfaces in the ``agent_compaction_config`` event, so the old one-shot
+    "trigger degenerated" log latch is gone in favor of per-run visibility.
 
     Args:
         window: Resolved context-window size in tokens.
         output_limit: Resolved output-token cap in tokens.
-        tool_buffer: Tool-result reserve in tokens.
+        tool_buffer: Raw tool-result reserve in tokens (before clamping).
+
+    Returns:
+        A :class:`CompactionPlan`. When ``enabled`` is ``True``, the invariant
+        ``0 < target_tokens < trigger_tokens`` holds.
+    """
+    effective_buffer = min(tool_buffer, int(window * TOOL_BUFFER_MAX_FRACTION))
+    trigger = window - output_limit - effective_buffer
+    if trigger < MIN_VIABLE_TRIGGER:
+        return CompactionPlan(
+            enabled=False,
+            effective_tool_buffer=effective_buffer,
+            disabled_reason=DISABLED_REASON_INSUFFICIENT_HEADROOM,
+        )
+    margin = max(1, int(window * HYSTERESIS_FRACTION))
+    target = min(int(window * TARGET_FRACTION), trigger - margin)
+    if target < 1:
+        return CompactionPlan(
+            enabled=False,
+            effective_tool_buffer=effective_buffer,
+            disabled_reason=DISABLED_REASON_INSUFFICIENT_HEADROOM,
+        )
+    return CompactionPlan(
+        enabled=True,
+        trigger_tokens=trigger,
+        target_tokens=target,
+        effective_tool_buffer=effective_buffer,
+    )
+
+
+def trigger_tokens(window: int, output_limit: int, tool_buffer: int) -> int:
+    """Return the reserve-based compaction trigger.
+
+    Legacy compat wrapper over :func:`resolve_compaction_plan`: returns the
+    plan's trigger when enabled, or ``1`` (the historical degenerate floor)
+    when the plan is disabled. New code should consume the plan directly so a
+    disabled plan is visible rather than silently collapsing to 1.
+
+    Args:
+        window: Resolved context-window size in tokens.
+        output_limit: Resolved output-token cap in tokens.
+        tool_buffer: Tool-result reserve in tokens (raw, before clamping).
 
     Returns:
         Token threshold at which compaction should fire.
     """
-    if output_limit + tool_buffer >= window - 1:
-        _warn_trigger_degenerate()
-    return max(1, window - output_limit - tool_buffer)
+    plan = resolve_compaction_plan(
+        window=window,
+        output_limit=output_limit,
+        tool_buffer=tool_buffer,
+    )
+    if plan.enabled:
+        assert plan.trigger_tokens is not None  # guaranteed by resolve_compaction_plan
+        return plan.trigger_tokens
+    return 1
 
 
 def target_tokens(window: int, trigger: int) -> int:

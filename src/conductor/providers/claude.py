@@ -68,9 +68,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on how many entries a models.list() paginator drain accepts. An
+# Anthropic-compatible proxy that ignores ``after_id`` or always reports
+# ``has_more`` would otherwise make the ``async for`` drain loop forever,
+# hanging ``validate_connection()`` and diagnostics on a pathological endpoint.
+MAX_MODEL_LISTING_ITEMS = 2_000
 
-class _PartialModelListingError(OSError):
-    """Carry models retrieved before an Anthropic paginator failed."""
+
+class _PartialModelListingError(Exception):
+    """Carry models retrieved before an Anthropic paginator failed.
+
+    Deliberately not an OSError: this is internal control flow for a
+    partially-successful API listing, not an operating-system I/O failure.
+    """
 
     def __init__(self, models: list[Any], cause: Exception) -> None:
         self.models = models
@@ -232,7 +242,11 @@ class ClaudeProvider(AgentProvider):
         self._client: AsyncAnthropic | None = None
         self._api_key = api_key
         self._auth_token = auth_token
-        self._base_url = base_url
+        # Fold the env fallback into the attribute (mirroring openai.py) so
+        # downstream consumers (e.g. resolve_compaction_window's
+        # has_custom_base_url) see a proxy endpoint even when it came from
+        # ANTHROPIC_BASE_URL rather than an explicit argument.
+        self._base_url = base_url if base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
         self._model_user_configured = model is not None
         self._default_model = model or "claude-3-5-sonnet-latest"
 
@@ -569,6 +583,12 @@ class ClaudeProvider(AgentProvider):
         try:
             async for model in page:
                 models.append(model)
+                if len(models) >= MAX_MODEL_LISTING_ITEMS:
+                    logger.warning(
+                        "models.list() exceeded %d entries; truncating the listing.",
+                        MAX_MODEL_LISTING_ITEMS,
+                    )
+                    break
         except Exception as e:
             if models:
                 raise _PartialModelListingError(models, e) from e
@@ -597,9 +617,28 @@ class ClaudeProvider(AgentProvider):
                 return
             try:
                 models = await self._fetch_all_model_infos()
-            except Exception as e:  # noqa: BLE001 - best-effort; don't poison the cache
-                # Don't cache the failure — let the next call retry.
+            except _PartialModelListingError as e:
+                logger.warning(
+                    "Anthropic model listing incomplete (%s); using %d model(s) "
+                    "from completed pages",
+                    e.cause,
+                    len(e.models),
+                )
+                self._install_model_cache(e.models)
+                return
+            except (APIConnectionError, APIStatusError, TimeoutError) as e:
+                # Transport failures only: don't cache them — let the next call
+                # retry. Anything else (e.g. an AttributeError/TypeError parser
+                # bug) surfaces rather than being swallowed as a debug line.
                 logger.debug("Failed to list Anthropic models: %s", e)
+                return
+            if not models:
+                # An empty successful listing is not a resolved answer: leave the
+                # caches unset so a later call retries instead of permanently
+                # reporting "no models".
+                logger.warning(
+                    "Anthropic models.list() returned no models; metadata remains unresolved."
+                )
                 return
             self._install_model_cache(models)
 
@@ -692,8 +731,22 @@ class ClaudeProvider(AgentProvider):
             return None
         try:
             models = await self._fetch_all_model_infos()
-        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+        except _PartialModelListingError as e:
+            logger.warning(
+                "Anthropic model listing incomplete (%s); using %d model(s) from completed pages",
+                e.cause,
+                len(e.models),
+            )
+            models = e.models
+        except (APIConnectionError, APIStatusError, TimeoutError) as e:
+            # Transport failures only — anything else (e.g. a parser bug) must
+            # surface rather than be swallowed as a diagnostic debug line.
             logger.debug("Failed to list Anthropic models: %s", e)
+            return None
+        if not models:
+            logger.warning(
+                "Anthropic models.list() returned no models; metadata remains unresolved."
+            )
             return None
         return [model.id for model in models]
 
@@ -1032,11 +1085,10 @@ class ClaudeProvider(AgentProvider):
         )
         from conductor.providers._pydantic_ai.compaction import CompactionConfig
         from conductor.providers._pydantic_ai.compaction_window import (
+            resolve_compaction_plan,
             resolve_compaction_window,
             resolve_output_limit,
-            target_tokens,
             tool_buffer_tokens,
-            trigger_tokens,
         )
         from conductor.providers._pydantic_ai.events import emit_compaction_config
         from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
@@ -1066,19 +1118,27 @@ class ClaudeProvider(AgentProvider):
             ),
         )
         tool_buffer = tool_buffer_tokens(self._tool_output_config)
-        trigger = trigger_tokens(window.tokens, output_limit.tokens, tool_buffer)
-        target = target_tokens(window.tokens, trigger)
-        compaction_cfg = CompactionConfig(
-            window_tokens=window.tokens,
-            window_source=window.source,
-            output_limit_tokens=output_limit.tokens,
-            output_limit_source=output_limit.source,
-            trigger_tokens=trigger,
-            target_tokens=target,
-            event_callback=event_callback,
-            agent_name=agent.name,
-            model_name=effective_model,
+        plan = resolve_compaction_plan(
+            window=window.tokens,
+            output_limit=output_limit.tokens,
+            tool_buffer=tool_buffer,
         )
+        if plan.enabled:
+            assert plan.trigger_tokens is not None  # guaranteed by resolve_compaction_plan
+            assert plan.target_tokens is not None
+            compaction_cfg: CompactionConfig | None = CompactionConfig(
+                window_tokens=window.tokens,
+                window_source=window.source,
+                output_limit_tokens=output_limit.tokens,
+                output_limit_source=output_limit.source,
+                trigger_tokens=plan.trigger_tokens,
+                target_tokens=plan.target_tokens,
+                event_callback=event_callback,
+                agent_name=agent.name,
+                model_name=effective_model,
+            )
+        else:
+            compaction_cfg = None
         emit_compaction_config(
             event_callback,
             agent_name=agent.name,
@@ -1087,8 +1147,12 @@ class ClaudeProvider(AgentProvider):
             context_window_source=window.source,
             output_limit=output_limit.tokens,
             output_limit_source=output_limit.source,
-            trigger_tokens=trigger,
-            target_tokens=target,
+            enabled=plan.enabled,
+            disabled_reason=plan.disabled_reason,
+            trigger_tokens=plan.trigger_tokens,
+            target_tokens=plan.target_tokens,
+            tool_buffer=tool_buffer,
+            effective_tool_buffer=plan.effective_tool_buffer,
         )
 
         def build_agent_fn(

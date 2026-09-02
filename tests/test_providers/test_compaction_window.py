@@ -10,9 +10,15 @@ import pytest
 from conductor.config.schema import ToolOutputConfig
 from conductor.providers._pydantic_ai.compaction_window import (
     DEFAULT_MAX_TOKENS,
+    DISABLED_REASON_INSUFFICIENT_HEADROOM,
     FALLBACK_CONTEXT_WINDOW,
+    MIN_VIABLE_TRIGGER,
+    TOOL_BUFFER_MAX_FRACTION,
+    CompactionPlan,
     OutputLimitResolution,
     WindowResolution,
+    _reset_warning_latches,
+    resolve_compaction_plan,
     resolve_compaction_window,
     resolve_output_limit,
     target_tokens,
@@ -20,6 +26,12 @@ from conductor.providers._pydantic_ai.compaction_window import (
     trigger_tokens,
 )
 from conductor.providers.base import AgentProvider
+
+
+@pytest.fixture(autouse=True)
+def _clean_warning_latches() -> None:
+    """Reset module-level one-shot warning latches before every test."""
+    _reset_warning_latches()
 
 
 class _MockProvider(AgentProvider, abstract=True):
@@ -273,43 +285,163 @@ class TestTriggerFormula:
     """Tests for trigger_tokens math."""
 
     def test_worked_examples(self) -> None:
-        # Default output_limit (16384) + default buffer (40000) on common windows.
-        assert trigger_tokens(128_000, 16_384, 40_000) == 71_616
+        # Requirement: trigger = window - output_limit - min(buffer, window*0.25).
+        assert trigger_tokens(128_000, 16_384, 40_000) == 128_000 - 16_384 - 32_000
         assert trigger_tokens(200_000, 16_384, 40_000) == 143_616
         assert trigger_tokens(1_000_000, 16_384, 40_000) == 943_616
-        # Larger output limit with default buffer.
-        assert trigger_tokens(128_000, 64_000, 40_000) == 24_000
+        # Requirement: a larger output limit shrinks the trigger by the same amount.
+        assert trigger_tokens(128_000, 64_000, 40_000) == 128_000 - 64_000 - 32_000
 
     def test_small_window_floor(self) -> None:
-        # Degenerate windows collapse to a minimum trigger of 1.
+        # Requirement: a degenerate (disabled) plan maps to the historical
+        # floor trigger of 1 for the legacy wrapper.
         assert trigger_tokens(1, 1, 1) == 1
         assert trigger_tokens(40_000, 40_000, 1) == 1
 
-    def test_huge_buffer_degenerates_to_one(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        import conductor.providers._pydantic_ai.compaction_window as cw
 
-        cw._trigger_degenerate_warned = False
-        with caplog.at_level(
-            logging.WARNING,
-            logger="conductor.providers._pydantic_ai.compaction_window",
+class TestResolveCompactionPlan:
+    """Tests for resolve_compaction_plan arithmetic and disabled plans."""
+
+    def test_tiny_windows_disable_compaction(self) -> None:
+        # Requirement: a window smaller than the raw output limit + tool
+        # buffer reserve (even after the buffer clamp) disables compaction
+        # with a named reason instead of degenerating.
+        for window, output_limit, tool_buffer in (
+            (8_192, 16_384, 40_000),
+            (32_768, 32_768, 40_000),
+            (56_384, 56_384, 40_000),
         ):
-            # 128k window cannot hold 16_384 + 265_000 of reserve.
-            result = trigger_tokens(128_000, 16_384, 265_000)
+            plan = resolve_compaction_plan(
+                window=window,
+                output_limit=output_limit,
+                tool_buffer=tool_buffer,
+            )
+            assert plan.enabled is False
+            assert plan.disabled_reason == DISABLED_REASON_INSUFFICIENT_HEADROOM
+            assert plan.trigger_tokens is None
+            assert plan.target_tokens is None
 
-        assert result == 1
-        assert "degenerated" in caplog.text.lower()
+    def test_viable_windows_enable_with_hysteresis_gap(self) -> None:
+        # Requirement: target = min(55% ceiling, trigger - margin) with
+        # margin = max(1, int(window*0.05)); the 55% ceiling binds at 120000.
+        for window in (60_000, 80_000, 120_000):
+            plan = resolve_compaction_plan(
+                window=window,
+                output_limit=DEFAULT_MAX_TOKENS,
+                tool_buffer=40_000,
+            )
+            assert plan.enabled is True
+            assert plan.trigger_tokens is not None
+            assert plan.target_tokens is not None
+            margin = max(1, int(window * 0.05))
+            expected_target = min(int(window * 0.55), plan.trigger_tokens - margin)
+            assert plan.target_tokens == expected_target
+            assert plan.trigger_tokens - plan.target_tokens >= margin
+            assert 0 < plan.target_tokens < plan.trigger_tokens
+
+    def test_large_window_buffer_clamped_to_window_fraction(self) -> None:
+        # Requirement: on a 128k window the 40k buffer clamps to 32k and the
+        # trigger is window - output_limit - effective buffer.
+        plan = resolve_compaction_plan(
+            window=128_000,
+            output_limit=DEFAULT_MAX_TOKENS,
+            tool_buffer=40_000,
+        )
+        assert plan.enabled is True
+        assert plan.effective_tool_buffer == int(128_000 * TOOL_BUFFER_MAX_FRACTION)
+        assert plan.trigger_tokens == 128_000 - 16_384 - 32_000
+        assert plan.target_tokens == min(int(128_000 * 0.55), plan.trigger_tokens - 6_400)
+
+    def test_huge_buffer_clamps_to_window_fraction(self) -> None:
+        # Requirement: a max_chars so large it would eat the window clamps to
+        # 25% of the window rather than disabling compaction.
+        plan = resolve_compaction_plan(
+            window=128_000,
+            output_limit=DEFAULT_MAX_TOKENS,
+            tool_buffer=265_000,
+        )
+        assert plan.enabled is True
+        assert plan.effective_tool_buffer == int(128_000 * TOOL_BUFFER_MAX_FRACTION)
+
+    def test_min_viable_trigger_boundary(self) -> None:
+        # Requirement: a trigger with viable headroom above
+        # MIN_VIABLE_TRIGGER is enabled; once the margin no longer leaves a
+        # positive target the plan is disabled.
+        window = 60_000
+        tool_buffer = 15_000
+        margin = int(window * 0.05)
+
+        # trigger = MIN_VIABLE_TRIGGER + margin + 1 => target = MIN_VIABLE_TRIGGER + 1.
+        output_limit = window - tool_buffer - (MIN_VIABLE_TRIGGER + margin + 1)
+        enabled = resolve_compaction_plan(
+            window=window, output_limit=output_limit, tool_buffer=tool_buffer
+        )
+        assert enabled.enabled is True
+        assert enabled.trigger_tokens == MIN_VIABLE_TRIGGER + margin + 1
+        assert enabled.target_tokens == MIN_VIABLE_TRIGGER + 1
+
+        # One margin + two tokens less headroom drops the trigger just below
+        # MIN_VIABLE_TRIGGER => under the viability floor => disabled.
+        disabled = resolve_compaction_plan(
+            window=window, output_limit=output_limit + margin + 2, tool_buffer=tool_buffer
+        )
+        assert disabled.enabled is False
+        assert disabled.disabled_reason == DISABLED_REASON_INSUFFICIENT_HEADROOM
+
+    def test_disabled_plan_event_fields(self) -> None:
+        # Requirement: a disabled plan surfaces enabled=False plus the reason
+        # through emit_compaction_config with null thresholds.
+        from conductor.providers._pydantic_ai.events import emit_compaction_config
+
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        plan = resolve_compaction_plan(window=8_192, output_limit=16_384, tool_buffer=40_000)
+        assert plan == CompactionPlan(
+            enabled=False,
+            effective_tool_buffer=min(40_000, int(8_192 * TOOL_BUFFER_MAX_FRACTION)),
+            disabled_reason=DISABLED_REASON_INSUFFICIENT_HEADROOM,
+        )
+        emit_compaction_config(
+            callback,
+            agent_name="a",
+            model="m",
+            context_window=8_192,
+            context_window_source="fallback",
+            output_limit=16_384,
+            output_limit_source="default",
+            enabled=plan.enabled,
+            disabled_reason=plan.disabled_reason,
+            trigger_tokens=plan.trigger_tokens,
+            target_tokens=plan.target_tokens,
+            tool_buffer=40_000,
+            effective_tool_buffer=min(40_000, int(8_192 * TOOL_BUFFER_MAX_FRACTION)),
+        )
+        assert len(events) == 1
+        payload = events[0][1]
+        assert payload["enabled"] is False
+        assert payload["disabled_reason"] == DISABLED_REASON_INSUFFICIENT_HEADROOM
+        assert payload["trigger_tokens"] is None
+        assert payload["target_tokens"] is None
+
+    def test_two_plans_are_independent(self) -> None:
+        # Requirement: concurrently built plans share no state.
+        a = resolve_compaction_plan(window=128_000, output_limit=16_384, tool_buffer=40_000)
+        b = resolve_compaction_plan(window=8_192, output_limit=16_384, tool_buffer=40_000)
+        assert a.enabled is True
+        assert b.enabled is False
+        assert a.disabled_reason != b.disabled_reason
 
 
 class TestTargetFormula:
     """Tests for target_tokens math."""
 
     def test_small_window_clamps_below_trigger(self) -> None:
-        # 128k window + default output/buffer => trigger 71_616, raw 55% ceiling 70_400.
+        # 128k window + default output/buffer => trigger 79_616, raw 55% ceiling 70_400.
         trigger = trigger_tokens(128_000, 16_384, 40_000)
-        assert trigger == 71_616
+        assert trigger == 79_616
         assert target_tokens(128_000, trigger) == 70_400
 
     def test_large_window_uses_fraction(self) -> None:
@@ -354,7 +486,7 @@ class TestProxyUnknownModel:
             source="default",
         )
 
-        assert trigger_tokens(window.tokens, output_limit.tokens, 40_000) == 71_616
+        assert trigger_tokens(window.tokens, output_limit.tokens, 40_000) == 79_616
 
 
 class TestSlimmedCascade:

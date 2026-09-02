@@ -1209,7 +1209,57 @@ describe('workflow-store — compaction lifecycle events appear in the activity 
       type: 'compaction-complete',
       icon: '🧹',
       label: 'compacted',
-      text: '65000 → 20000 tokens (50 → 20 messages, 5.5s)',
+      text: '65000 → 20000 tokens (50 → 20 messages, 5.5s, saved 45000 tokens)',
+    });
+  });
+
+  it('agent_compaction_config renders the disabled note when enabled is false', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_compaction_config', {
+      agent_name: 'writer',
+      model: 'gpt-4o',
+      context_window: 128000,
+      context_window_source: 'fallback',
+      output_limit: 64000,
+      output_limit_source: 'default',
+      enabled: false,
+      disabled_reason: 'trigger below 4096 tokens',
+      trigger_tokens: null,
+      target_tokens: null,
+    }));
+
+    const node = useWorkflowStore.getState().nodes.writer!;
+    expect(node.activity).toHaveLength(1);
+    expect(node.activity[0]).toMatchObject({
+      type: 'compaction-config',
+      icon: '⚙',
+      label: 'compaction',
+      text: 'disabled: trigger below 4096 tokens',
+    });
+  });
+
+  it('agent_compaction_complete renders a warning entry when tiers degraded or still over trigger', () => {
+    const processEvent = startWorkflow();
+
+    processEvent(event('agent_compaction_complete', {
+      agent_name: 'writer',
+      strategy: 'tiered',
+      model: 'gpt-4o',
+      tokens_before: 65000,
+      tokens_after: 63000,
+      errored: false,
+      degraded_tiers: ['summarize'],
+      still_over_trigger: true,
+    }));
+
+    const node = useWorkflowStore.getState().nodes.writer!;
+    expect(node.activity).toHaveLength(1);
+    expect(node.activity[0]).toMatchObject({
+      type: 'compaction-error',
+      icon: '⚠️',
+      label: 'compacted with warnings',
+      text: '65000 → 63000 tokens (degraded tiers: summarize; still over trigger)',
     });
   });
 

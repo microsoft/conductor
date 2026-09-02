@@ -38,7 +38,12 @@ from pydantic_ai.models.test import TestModel
 
 from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.providers.claude import ClaudeProvider
+from conductor.providers._pydantic_ai.compaction_window import WindowResolution
+from conductor.providers.claude import (
+    MAX_MODEL_LISTING_ITEMS,
+    ClaudeProvider,
+    _PartialModelListingError,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +90,15 @@ class _LaterPageFailurePaginator(_ModelsPaginator):
         for model in self.data:
             yield model
         raise RuntimeError("next model page failed")
+
+
+class _EndlessModelsPaginator(_ModelsPaginator):
+    """AsyncPage test double for a proxy that never completes pagination."""
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for _ in range(MAX_MODEL_LISTING_ITEMS + 1):
+            yield self.data[0]
+        raise AssertionError("model listing was not bounded")
 
 
 def _make_models_paginator(*pages: list[Any]) -> _ModelsPaginator:
@@ -1121,9 +1135,9 @@ class TestClaudeModelsPagination:
 
     @pytest.mark.asyncio
     async def test_model_cache_discards_partial_result_after_later_page_failure(
-        self, mock_anthropic_class: Mock
+        self, mock_anthropic_class: Mock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # Requirement: lazy caching does not retain a partial listing after a later page failure.
+        # Requirement: lazy caching retains models from completed paginator pages after an error.
         first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
         mock_client = Mock()
         mock_client.models.list = AsyncMock(
@@ -1133,9 +1147,57 @@ class TestClaudeModelsPagination:
 
         provider = ClaudeProvider()
 
-        assert await provider.get_max_prompt_tokens("claude-haiku-4-5") is None
+        with caplog.at_level("WARNING"):
+            assert await provider.get_max_prompt_tokens("claude-haiku-4-5") == 200_000
+
+        assert provider._max_input_cache == {"claude-haiku-4-5": 200_000}
+        assert provider._max_output_cache == {"claude-haiku-4-5": 8_192}
+        assert any("model listing incomplete" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_list_models_stops_at_listing_item_limit(
+        self, mock_anthropic_class: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Requirement: a proxy that never advances paginator pages cannot loop diagnostics forever.
+        model = Mock(id="claude-haiku-4-5")
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=_EndlessModelsPaginator(data=[model], has_more=True)
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        with caplog.at_level("WARNING"):
+            models = await provider.list_models()
+
+        assert models == ["claude-haiku-4-5"] * MAX_MODEL_LISTING_ITEMS
+        assert any("exceeded" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_empty_listing_is_not_cached_and_retries(
+        self, mock_anthropic_class: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Requirement: an empty successful listing leaves metadata unresolved so a lookup retries.
+        model = Mock(id="claude-sonnet-4-5", max_input_tokens=200_000, max_tokens=8_192)
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=[Mock(data=[]), Mock(data=[model])])
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        with caplog.at_level("WARNING"):
+            assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
+
         assert provider._max_input_cache is None
         assert provider._max_output_cache is None
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
+        assert mock_client.models.list.await_count == 2
+        assert sum("returned no models" in record.message for record in caplog.records) == 1
+
+    def test_partial_listing_error_is_not_an_os_error(self, mock_anthropic_class: Mock) -> None:
+        # Requirement: partial-page control flow cannot be mistaken for an operating-system failure.
+        assert not issubclass(_PartialModelListingError, OSError)
 
 
 @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
@@ -1193,22 +1255,26 @@ class TestClaudeGetMaxPromptTokens:
         assert mock_client.models.list.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_unexpected_exception_does_not_poison_cache(
+    async def test_parser_error_surfaces_without_poisoning_cache(
         self, mock_anthropic_class: Mock
     ) -> None:
-        """Unexpected listing failures are retryable best-effort metadata misses."""
-        # Requirement: unexpected model-listing exceptions do not poison retryable metadata cache.
+        """Unexpected parser errors surface instead of being swallowed as transport failures."""
+        # Requirement: a parser failure remains visible and leaves the metadata cache retryable.
         mock_client = Mock()
         mock_client.models.list = AsyncMock(
             side_effect=[
-                RuntimeError("bug"),
+                TypeError("invalid model shape"),
                 Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)]),
             ]
         )
         mock_anthropic_class.return_value = mock_client
 
         provider = ClaudeProvider()
-        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
+
+        with pytest.raises(TypeError, match="invalid model shape"):
+            await provider.get_max_prompt_tokens("claude-sonnet-4-5")
+
+        assert provider._max_input_cache is None
         assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 200_000
         assert mock_client.models.list.await_count == 2
 
@@ -1708,3 +1774,37 @@ class TestCompactionOutputLimitPerAgent:
         payload = config_events[0][1]
         assert payload["output_limit"] == 16_384
         assert payload["output_limit_source"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_env_base_url_marks_compaction_window_as_custom(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: ANTHROPIC_BASE_URL skips the public-registry compaction lookup for proxies.
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example/v1")
+        provider = ClaudeProvider(api_key="test-key")
+        agent = AgentDef(name="test", prompt="Say hello")
+
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("Hello, world!"),
+            ),
+            patch.object(
+                ClaudeProvider,
+                "get_max_prompt_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                ClaudeProvider,
+                "get_max_output_tokens",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.compaction_window.resolve_compaction_window",
+                return_value=WindowResolution(tokens=128_000, source="fallback"),
+            ) as mock_resolve_window,
+        ):
+            await provider.execute(agent=agent, context={}, rendered_prompt="Say hello")
+
+        assert mock_resolve_window.await_args.kwargs["has_custom_base_url"] is True

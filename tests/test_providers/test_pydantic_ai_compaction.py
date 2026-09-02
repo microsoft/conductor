@@ -29,7 +29,6 @@ from conductor.providers._pydantic_ai.agent_builder import build_agent
 from conductor.providers._pydantic_ai.compaction import (
     CompactionConfig,
     _FailOpenCompactionWrapper,
-    _ThresholdGatedCompaction,
     _TierWrapper,
     build_tiered_compaction,
 )
@@ -239,12 +238,11 @@ def _build_tiered_compaction_with_keep(config: Any, keep_messages: int) -> Any:
         tokenizer=None,
     )
 
-    gated = _ThresholdGatedCompaction(
+    return _FailOpenCompactionWrapper(
         tiered,
-        trigger_tokens=config.trigger_tokens,
+        config=config,
+        tier_wrappers=[clear_tier, summarize_tier, slide_tier],
     )
-
-    return _FailOpenCompactionWrapper(gated, config=config)
 
 
 def _request_context_with_messages(messages: Any) -> Any:
@@ -274,19 +272,20 @@ def _make_run_context() -> Any:
 
 
 class TestThresholdGating:
-    """Requirement: compaction only fires when estimated usage exceeds trigger."""
+    """Requirement: the wrapper gate compacts only above the trigger."""
 
     @pytest.mark.asyncio
     async def test_below_trigger_skips_compaction(self) -> None:
-        """When the message history is under the trigger, the gate must return
-        the request context unchanged and never call the inner strategy."""
+        # Requirement: a below-trigger estimate returns the request context
+        # unchanged and never delegates to the inner strategy.
         inner = AsyncMock()
-        gate = _ThresholdGatedCompaction(inner, trigger_tokens=10_000)
+        cfg = _make_config(trigger_tokens=10_000, target_tokens=5_000)
+        capability = _FailOpenCompactionWrapper(inner, config=cfg)
 
         request_context = _request_context_with_messages(
             [ModelRequest(parts=[UserPromptPart(content="hello")])]
         )
-        result = await gate.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+        result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
 
         assert result is request_context
         assert len(result.messages) == 1
@@ -294,72 +293,43 @@ class TestThresholdGating:
 
     @pytest.mark.asyncio
     async def test_above_trigger_invokes_inner(self) -> None:
-        """When the message history is above the trigger, the gate must
-        delegate to the inner compaction strategy."""
+        # Requirement: an above-trigger estimate delegates to the inner
+        # compaction strategy exactly once.
         inner = AsyncMock()
         compacted_messages = [ModelRequest(parts=[UserPromptPart(content="compacted")])]
         compacted_context = _request_context_with_messages(compacted_messages)
         inner.before_model_request = AsyncMock(return_value=compacted_context)
 
-        gate = _ThresholdGatedCompaction(inner, trigger_tokens=10)
+        cfg = _make_config(trigger_tokens=10, target_tokens=5)
+        capability = _FailOpenCompactionWrapper(inner, config=cfg)
 
         request_context = _request_context_with_messages(
             [ModelRequest(parts=[UserPromptPart(content="x" * 50_000)])]
         )
-        result = await gate.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+        result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
 
         inner.before_model_request.assert_called_once()
         assert result.messages == compacted_messages
 
     @pytest.mark.asyncio
-    async def test_anchor_short_circuit_fires_trigger(self) -> None:
-        """A recent ModelResponse whose usage.input_tokens exceeds the trigger
-        should short-circuit the gate to the inner strategy without requiring
-        the full estimator to be the only signal."""
-        inner = AsyncMock()
-        compacted_context = _request_context_with_messages(
-            [ModelRequest(parts=[UserPromptPart(content="short")])]
+    async def test_gate_measures_once_via_wrapper_estimate(self) -> None:
+        # Requirement: the gate decision is driven by the wrapper's own
+        # token estimate — patching it below the trigger must skip the inner
+        # strategy (a removed gate fails this test).
+        cfg = _make_config(trigger_tokens=10, target_tokens=5)
+        capability = build_tiered_compaction(cfg)
+
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="x" * 50_000)])]
         )
-        inner.before_model_request = AsyncMock(return_value=compacted_context)
+        with patch(
+            "conductor.providers._pydantic_ai.compaction._estimate_context_tokens",
+            new=AsyncMock(return_value=5),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
 
-        gate = _ThresholdGatedCompaction(inner, trigger_tokens=100)
-
-        response = ModelResponse(
-            parts=[TextPart(content="ok")],
-            usage=RequestUsage(input_tokens=500, output_tokens=10),
-        )
-        request = ModelRequest(parts=[UserPromptPart(content="next")])
-        request_context = _request_context_with_messages([response, request])
-
-        result = await gate.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
-
-        inner.before_model_request.assert_called_once()
-        assert result.messages == compacted_context.messages
-
-    @pytest.mark.asyncio
-    async def test_suffix_after_anchor_can_push_over_trigger(self) -> None:
-        """A large message appended after the last usage anchor must still be
-        counted by the gate, proving the estimator measures the post-anchor
-        suffix and not just the previous request size."""
-        inner = AsyncMock()
-        compacted_context = _request_context_with_messages(
-            [ModelRequest(parts=[UserPromptPart(content="compacted")])]
-        )
-        inner.before_model_request = AsyncMock(return_value=compacted_context)
-
-        gate = _ThresholdGatedCompaction(inner, trigger_tokens=100)
-
-        response = ModelResponse(
-            parts=[TextPart(content="ok")],
-            usage=RequestUsage(input_tokens=50, output_tokens=10),
-        )
-        big_request = ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])
-        request_context = _request_context_with_messages([response, big_request])
-
-        result = await gate.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
-
-        inner.before_model_request.assert_called_once()
-        assert result.messages == compacted_context.messages
+        assert result is request_context
+        assert len(result.messages) == 1
 
 
 class TestTierFallback:
@@ -386,7 +356,7 @@ class TestTierFallback:
         cfg = _make_config(trigger_tokens=10, target_tokens=5)
         capability = build_tiered_compaction(cfg)
 
-        summarizer = capability._inner._inner.tiers[1]  # type: ignore[attr-defined]
+        summarizer = capability._inner.tiers[1]  # type: ignore[attr-defined]
         original_compact = summarizer._inner.compact
         summarizer._inner.compact = AsyncMock(side_effect=RuntimeError("boom"))
 
@@ -396,7 +366,7 @@ class TestTierFallback:
         messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
         request_context = _request_context_with_messages(messages)
 
-        sliding = capability._inner._inner.tiers[2]  # type: ignore[attr-defined]
+        sliding = capability._inner.tiers[2]  # type: ignore[attr-defined]
         original_sliding_compact = sliding._inner.compact
         sliding_calls: list[list[Any]] = []
 
@@ -491,8 +461,8 @@ class TestHysteresis:
 
     @pytest.mark.asyncio
     async def test_no_immediate_re_compaction(self) -> None:
-        """Once compaction shortens the history below target, a subsequent
-        gate evaluation on the compacted history must stay below the trigger."""
+        # Requirement: once compaction shortens the history below target, the
+        # next gate evaluation on the compacted history stays below the trigger.
         cfg = _make_config(trigger_tokens=100, target_tokens=50)
         capability = build_tiered_compaction(cfg)
 
@@ -501,8 +471,7 @@ class TestHysteresis:
         compacted_context = _request_context_with_messages(compacted_messages)
         inner.before_model_request = AsyncMock(return_value=compacted_context)
 
-        gate = capability._inner  # type: ignore[attr-defined]
-        gate._inner = inner
+        capability._inner = inner  # type: ignore[attr-defined]
 
         big_messages = [ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])]
         request_context = _request_context_with_messages(big_messages)
@@ -756,9 +725,14 @@ class TestEventEmission:
             "tokens_saved",
             "elapsed",
             "errored",
+            "degraded_tiers",
+            "still_over_trigger",
         }
         assert set(complete.keys()) == expected_complete_keys
         assert complete["errored"] is False
+        # The summarizing tier has no model outside a real run, so it degrades
+        # and the sliding-window fallback produces the compacted history.
+        assert complete["degraded_tiers"] == ["summarizing"]
         assert complete["agent_name"] == cfg.agent_name
         assert complete["strategy"] == "tiered"
         assert complete["model"] == cfg.model_name
@@ -911,7 +885,7 @@ class TestEventEmission:
         cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
         capability = build_tiered_compaction(cfg)
 
-        summarizer = capability._inner._inner.tiers[1]  # type: ignore[attr-defined]
+        summarizer = capability._inner.tiers[1]  # type: ignore[attr-defined]
         original_compact = summarizer._inner.compact
         summarizer._inner.compact = AsyncMock(side_effect=RuntimeError("summarizer boom"))
 
@@ -931,6 +905,8 @@ class TestEventEmission:
         assert len(complete) == 1
         assert complete[0]["errored"] is False
         assert "error_type" not in complete[0]
+        # A recovered tier failure is named in the event payload.
+        assert complete[0]["degraded_tiers"] == ["summarizing"]
 
         # A subsequent request above the trigger should still compact (latch off).
         events.clear()
@@ -942,6 +918,164 @@ class TestEventEmission:
         result2 = await capability.before_model_request(_make_run_context(), request_context2)  # type: ignore[arg-type]
         assert len(result2.messages) < len(messages2)
         assert any(e[0] == "agent_compaction_complete" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_gate_measurement_failure_skips_without_latch_or_event(self) -> None:
+        # A failing gate estimate warns, returns the
+        # original context, emits no event, and does not engage the latch.
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])]
+        )
+        with patch(
+            "conductor.providers._pydantic_ai.compaction._estimate_context_tokens",
+            new=AsyncMock(side_effect=RuntimeError("estimator exploded")),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+
+        assert result is request_context
+        assert capability._disabled is False  # type: ignore[attr-defined]
+        assert not events
+
+    @pytest.mark.asyncio
+    async def test_telemetry_failure_keeps_compacted_result_without_latch(self) -> None:
+        # When the after-estimate raises, the
+        # compacted result is still returned, no errored event is emitted, the
+        # latch stays off, and a subsequent above-trigger request compacts.
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        messages: list[Any] = []
+        for i in range(40):
+            messages.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
+        request_context = _request_context_with_messages(messages)
+
+        with patch(
+            "conductor.providers._pydantic_ai.compaction._estimate_after_compaction_tokens",
+            side_effect=RuntimeError("telemetry exploded"),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+
+        assert len(result.messages) < len(messages)
+        complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
+        assert not any(e.get("errored") for e in complete)
+        assert capability._disabled is False  # type: ignore[attr-defined]
+
+        # A subsequent above-trigger request still compacts.
+        events.clear()
+        messages2: list[Any] = []
+        for i in range(40):
+            messages2.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages2.append(ModelRequest(parts=[UserPromptPart(content="y" * 80_000)]))
+        request_context2 = _request_context_with_messages(messages2)
+        result2 = await capability.before_model_request(_make_run_context(), request_context2)  # type: ignore[arg-type]
+        assert len(result2.messages) < len(messages2)
+        assert any(e[0] == "agent_compaction_complete" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_tokens_saved_positive_with_surviving_usage_anchor(self) -> None:
+        # With a usage-carrying ModelResponse in the
+        # retained tail, tokens_saved on the complete event is positive
+        # (the anchored estimator's overestimate is compensated).
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=100, target_tokens=50, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        old_large = ModelRequest(parts=[UserPromptPart(content="z" * 400_000)])
+        # The anchor's usage reports the full pre-compaction request size, so
+        # the before-estimate is anchored above the trigger while the tier
+        # escalation can genuinely reclaim the old large message.
+        anchor_response = ModelResponse(
+            parts=[TextPart(content="ok")],
+            usage=RequestUsage(input_tokens=100_500, output_tokens=10),
+        )
+        filler = [ModelRequest(parts=[UserPromptPart(content=f"turn {i:03d}")]) for i in range(30)]
+        recent_request = ModelRequest(parts=[UserPromptPart(content="latest")])
+        request_context = _request_context_with_messages(
+            [old_large, anchor_response, *filler, recent_request]
+        )
+
+        result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+
+        assert len(result.messages) < len(filler) + 3
+        complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
+        assert len(complete) == 1
+        assert complete[0]["errored"] is False
+        assert complete[0]["tokens_saved"] > 0
+        assert complete[0]["tokens_after"] < complete[0]["tokens_before"]
+
+    @pytest.mark.asyncio
+    async def test_still_over_trigger_flagged_when_compaction_cannot_reach(self) -> None:
+        # When every tier is degraded and the estimate stays
+        # above the trigger, the complete event flags still_over_trigger.
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            events.append((event_type, data))
+
+        cfg = _make_config(trigger_tokens=100, target_tokens=50, event_callback=callback)
+        capability = build_tiered_compaction(cfg)
+
+        # Force every tier to fail so the history is returned unchanged.
+        for tier in capability._inner.tiers:  # type: ignore[attr-defined]
+            tier._inner.compact = AsyncMock(side_effect=RuntimeError("tier boom"))
+
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])]
+        )
+        result = await capability.before_model_request(_make_run_context(), request_context)  # type: ignore[arg-type]
+
+        assert len(result.messages) == 1
+        complete = [e[1] for e in events if e[0] == "agent_compaction_complete"]
+        assert len(complete) == 1
+        assert complete[0]["errored"] is False
+        assert complete[0]["still_over_trigger"] is True
+        assert set(complete[0]["degraded_tiers"]) == {
+            "clear_tool_results",
+            "summarizing",
+            "sliding_window",
+        }
+
+    @pytest.mark.asyncio
+    async def test_concurrent_stacks_share_no_state(self) -> None:
+        # Two concurrently built stacks share neither the
+        # disable latch nor the event callback.
+        cfg_a = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+            agent_name="a",
+            event_callback=lambda event_type, data: None,
+        )
+        cfg_b = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+            agent_name="b",
+            event_callback=lambda event_type, data: None,
+        )
+        stack_a = build_tiered_compaction(cfg_a)
+        stack_b = build_tiered_compaction(cfg_b)
+
+        stack_a._disabled = True  # type: ignore[attr-defined]
+
+        assert stack_b._disabled is False  # type: ignore[attr-defined]
+        assert stack_a._config.event_callback is not stack_b._config.event_callback  # type: ignore[attr-defined]
 
 
 class TestProviderIntegration:
@@ -996,11 +1130,17 @@ class TestProviderIntegration:
             "context_window_source",
             "output_limit",
             "output_limit_source",
+            "enabled",
+            "disabled_reason",
             "trigger_tokens",
             "target_tokens",
+            "tool_buffer",
+            "effective_tool_buffer",
         }
         assert set(payload.keys()) == expected_keys
         assert payload["agent_name"] == "cfg-test"
+        assert payload["enabled"] is True
+        assert payload["disabled_reason"] is None
         assert payload["context_window"] == 128_000
         assert payload["output_limit"] == 64_000
         assert mock_build_agent.call_args.kwargs["compaction"] is not None
@@ -1047,7 +1187,24 @@ class TestProviderIntegration:
         config_events = [e for e in events if e[0] == "agent_compaction_config"]
         assert len(config_events) == 1
         payload = config_events[0][1]
+        expected_keys = {
+            "agent_name",
+            "model",
+            "context_window",
+            "context_window_source",
+            "output_limit",
+            "output_limit_source",
+            "enabled",
+            "disabled_reason",
+            "trigger_tokens",
+            "target_tokens",
+            "tool_buffer",
+            "effective_tool_buffer",
+        }
+        assert set(payload.keys()) == expected_keys
         assert payload["agent_name"] == "cfg-test"
+        assert payload["enabled"] is True
+        assert payload["disabled_reason"] is None
         assert payload["context_window"] == 128_000
         assert payload["output_limit"] == 64_000
         assert mock_build_agent.call_args.kwargs["compaction"] is not None

@@ -428,12 +428,12 @@ Maximum OUTPUT tokens per response:
 ```yaml
 workflow:
   runtime:
-    max_tokens: 4096  # Required for Claude
+    max_tokens: 4096  # Optional: defaults to 16384 when unset
 ```
 
 **Limits**:
 - Haiku: 4096 max
-- Sonnet/Opus: capped at runtime by `ModelInfo.max_tokens` from the provider, supporting up to 16384 tokens
+- Sonnet/Opus: Conductor defaults `max_tokens` to 16384 when unset and does not clamp the configured value to the model's advertised cap — a value above the model limit is rejected by the API. The provider-advertised `ModelInfo.max_tokens` is used only to size the compaction output reserve.
 
 **Note**: This is output tokens, not context window (200K separate limit)
 

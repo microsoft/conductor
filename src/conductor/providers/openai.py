@@ -28,7 +28,6 @@ from pydantic import BaseModel
 from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.mcp.manager import MCPManager
-from conductor.providers._pydantic_ai.compaction_window import DEFAULT_MAX_TOKENS
 from conductor.providers._pydantic_ai.model_listing import (
     ModelTokenLimits,
     extract_model_token_limits,
@@ -57,12 +56,27 @@ def _import_openai_sdk() -> tuple[bool, Any]:
         return False, None
 
 
+def _import_async_page() -> Any:
+    """Import the SDK's paginator base class, or ``None`` when unavailable."""
+    try:
+        from openai.pagination import AsyncPage
+
+        return AsyncPage
+    except ImportError:
+        return None
+
+
 OPENAI_SDK_AVAILABLE, openai = _import_openai_sdk()
+AsyncPage = _import_async_page()
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on models drained from a listing paginator. A misbehaving proxy
+# that paginates forever must not hang validate_connection/doctor/first execute.
+MAX_MODEL_LISTING_ITEMS = 2_000
 
 _OPENAI_REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
@@ -185,8 +199,9 @@ class OpenAIProvider(AgentProvider):
                 explicitly.
             model: Default model to use. Defaults to ``gpt-5-mini``.
             temperature: Default temperature (0.0-2.0).
-            max_tokens: Maximum output tokens. Defaults to 16384 when not
-                configured, applied uniformly across Claude and OpenAI providers.
+            max_tokens: Maximum output tokens. Omitted from the request when
+                unset, so the server applies the model's own default; the
+                compaction output reserve assumes 16384 in that case.
             timeout: Request timeout in seconds. Defaults to 600s.
             retry_config: Optional retry configuration. Uses default if not provided.
             mcp_servers: Optional MCP server configurations for tool support.
@@ -224,7 +239,7 @@ class OpenAIProvider(AgentProvider):
         self._max_tokens_user_configured = max_tokens is not None
         if max_tokens is not None:
             self._validate_max_tokens(max_tokens)
-        self._default_max_tokens = max_tokens or DEFAULT_MAX_TOKENS
+        self._default_max_tokens = max_tokens
 
         self._timeout = timeout
         self._sdk_version: str | None = None
@@ -435,6 +450,15 @@ class OpenAIProvider(AgentProvider):
         if self._model_user_configured:
             self._warn_if_requested_model_missing(available_models)
 
+        if not available_models:
+            # An empty probe page must not install an empty cache — that would
+            # mark token limits as resolved for the process lifetime.
+            logger.warning(
+                "Model listing returned no models; context-window limits "
+                "remain unresolved and the next lookup will retry."
+            )
+            return
+
         self._install_model_limits_cache(list(models_page.data))
 
     def _warn_if_requested_model_missing(self, available_models: list[str]) -> None:
@@ -472,22 +496,40 @@ class OpenAIProvider(AgentProvider):
         return cache.get(matched_id)
 
     async def _fetch_model_infos(self) -> list[Any]:
-        """Return model metadata from ``client.models.list()``.
+        """Return every model metadata item emitted by the OpenAI SDK paginator.
 
-        The OpenAI SDK returns an awaitable paginator. Awaiting it yields an
-        ``AsyncPage`` that is itself async-iterable, so we drain the page to
-        collect every model entry. Legacy single-page mocks that expose a
-        ``data`` attribute are still supported.
+        ``client.models.list()`` returns an awaitable paginator. ``AsyncPage``
+        declares a ``data`` attribute, so checking for ``data`` first would
+        return only the first page and never drain a real paginator — every
+        model past page one would silently not exist for context-window
+        resolution on paginating gateways (OpenRouter/LiteLLM/vLLM). A real
+        paginator (``isinstance`` against the SDK's ``AsyncPage`` — duck checks
+        are unreliable since a bare ``MagicMock`` auto-creates every attribute)
+        is drained with ``async for``, bounded by :data:`MAX_MODEL_LISTING_ITEMS`
+        so a proxy that paginates forever cannot hang the caller. The ``data``
+        shortcut remains for legacy single-page mocks only.
         """
         assert self._client is not None
         result = self._client.models.list()
         page: Any = await result if inspect.isawaitable(result) else result
-        data: Any = getattr(page, "data", None)
-        if data is not None:
-            return list(data)
-        models: list[Any] = []
+        if AsyncPage is None or not isinstance(page, AsyncPage):
+            data: Any = getattr(page, "data", None)
+            if data is not None:
+                return list(data)
+            models: list[Any] = []
+            async for model in page:
+                models.append(model)
+            return models
+        models = []
         async for model in page:
             models.append(model)
+            if len(models) >= MAX_MODEL_LISTING_ITEMS:
+                logger.warning(
+                    "Model listing exceeded %d items and was truncated; "
+                    "the endpoint paginates beyond the supported bound.",
+                    MAX_MODEL_LISTING_ITEMS,
+                )
+                break
         return models
 
     async def _ensure_model_limits_cache(self) -> None:
@@ -511,6 +553,14 @@ class OpenAIProvider(AgentProvider):
             except Exception as e:  # noqa: BLE001 - best-effort; don't poison the cache
                 # Don't cache the failure — let the next call retry.
                 logger.debug("Failed to list OpenAI models: %s", e)
+                return
+            if not models:
+                # Don't cache an empty listing as resolved — a proxy may return an
+                # empty page transiently; leave the cache unset so the next call retries.
+                logger.warning(
+                    "Model listing returned no models; context-window limits "
+                    "remain unresolved and the next lookup will retry."
+                )
                 return
             self._install_model_limits_cache(models)
 
@@ -872,11 +922,10 @@ class OpenAIProvider(AgentProvider):
         from conductor.providers._pydantic_ai.agent_builder import build_agent
         from conductor.providers._pydantic_ai.compaction import CompactionConfig
         from conductor.providers._pydantic_ai.compaction_window import (
+            resolve_compaction_plan,
             resolve_compaction_window,
             resolve_output_limit,
-            target_tokens,
             tool_buffer_tokens,
-            trigger_tokens,
         )
         from conductor.providers._pydantic_ai.events import emit_compaction_config
         from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
@@ -901,19 +950,27 @@ class OpenAIProvider(AgentProvider):
             user_configured=agent_max_tokens is not None or self._max_tokens_user_configured,
         )
         tool_buffer = tool_buffer_tokens(self._tool_output_config)
-        trigger = trigger_tokens(window.tokens, output_limit.tokens, tool_buffer)
-        target = target_tokens(window.tokens, trigger)
-        compaction_cfg = CompactionConfig(
-            window_tokens=window.tokens,
-            window_source=window.source,
-            output_limit_tokens=output_limit.tokens,
-            output_limit_source=output_limit.source,
-            trigger_tokens=trigger,
-            target_tokens=target,
-            event_callback=event_callback,
-            agent_name=agent.name,
-            model_name=effective_model,
+        plan = resolve_compaction_plan(
+            window=window.tokens,
+            output_limit=output_limit.tokens,
+            tool_buffer=tool_buffer,
         )
+        if plan.enabled:
+            assert plan.trigger_tokens is not None  # guaranteed by resolve_compaction_plan
+            assert plan.target_tokens is not None
+            compaction_cfg: CompactionConfig | None = CompactionConfig(
+                window_tokens=window.tokens,
+                window_source=window.source,
+                output_limit_tokens=output_limit.tokens,
+                output_limit_source=output_limit.source,
+                trigger_tokens=plan.trigger_tokens,
+                target_tokens=plan.target_tokens,
+                event_callback=event_callback,
+                agent_name=agent.name,
+                model_name=effective_model,
+            )
+        else:
+            compaction_cfg = None
         emit_compaction_config(
             event_callback,
             agent_name=agent.name,
@@ -922,8 +979,12 @@ class OpenAIProvider(AgentProvider):
             context_window_source=window.source,
             output_limit=output_limit.tokens,
             output_limit_source=output_limit.source,
-            trigger_tokens=trigger,
-            target_tokens=target,
+            enabled=plan.enabled,
+            disabled_reason=plan.disabled_reason,
+            trigger_tokens=plan.trigger_tokens,
+            target_tokens=plan.target_tokens,
+            tool_buffer=tool_buffer,
+            effective_tool_buffer=plan.effective_tool_buffer,
         )
 
         def build_agent_fn(

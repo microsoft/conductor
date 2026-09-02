@@ -173,10 +173,10 @@ See [Validator](../docs/workflow-syntax.md#validator) for the full field referen
 
 ### compaction.yaml
 
-Demonstrates automatic, client-side context compaction for `claude` and `openai` providers. Runs a loop-back agent that accumulates conversation history. Once the history crosses the calculated trigger threshold, older tool results and messages are compacted.
+Demonstrates automatic, client-side context compaction for `claude` and `openai` providers. A single research agent runs a long sequence of web searches through an MCP server; the large tool results accumulate in the message history within that one execution, and once the history crosses the calculated trigger threshold, older tool results and messages are compacted. (Loop-back iterations would not demonstrate this — provider history starts fresh on each execution.)
 
 ```bash
-conductor run examples/compaction.yaml --input iterations=10
+conductor run examples/compaction.yaml --input topic="vector databases"
 ```
 
 ## Multi-Agent Workflows

@@ -232,10 +232,10 @@ Claude offers multiple model tiers optimized for different use cases. All curren
 
 | Model | Best For | Speed | Cost (Input/Output) | Max Output Tokens | Recommended Use |
 |-------|----------|-------|---------------------|-------------------|-----------------|
-| **claude-sonnet-4.5** | General purpose, most workflows | Medium | $3/$15 per MTok | 16384 (capped by ModelInfo) | **Default recommendation** - stable, avoids deprecation |
-| claude-sonnet-4.5-20250929 | Latest features, cutting-edge | Medium | $3/$15 per MTok | 16384 (capped by ModelInfo) | When you need the newest capabilities |
-| claude-sonnet-4.5-20241022 | Stable, well-tested | Medium | $3/$15 per MTok | 16384 (capped by ModelInfo) | Production workloads requiring stability |
-| claude-opus-4.5 | Complex reasoning, creative tasks | Slowest | $5/$25 per MTok | 16384 (capped by ModelInfo) | Critical analysis, complex decision-making |
+| **claude-sonnet-4.5** | General purpose, most workflows | Medium | $3/$15 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | **Default recommendation** - stable, avoids deprecation |
+| claude-sonnet-4.5-20250929 | Latest features, cutting-edge | Medium | $3/$15 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | When you need the newest capabilities |
+| claude-sonnet-4.5-20241022 | Stable, well-tested | Medium | $3/$15 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | Production workloads requiring stability |
+| claude-opus-4.5 | Complex reasoning, creative tasks | Slowest | $5/$25 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | Critical analysis, complex decision-making |
 | claude-haiku-4.5 | Simple tasks, high volume | Fastest | $1/$5 per MTok | 4096 | Classification, routing, simple Q&A |
 | claude-3-opus-20240229 | Legacy - complex reasoning | Slow | $15/$75 per MTok | 4096 | Legacy workflows (not recommended) |
 
@@ -307,7 +307,7 @@ The Claude provider supports several runtime configuration options that control 
 | Parameter | Type | Range | Default | Description |
 |-----------|------|-------|---------|-------------|
 | `temperature` | float | 0.0 - 1.0 | 1.0 | Controls randomness (0=deterministic, 1=creative) |
-| `max_tokens` | int | >= 1 | 16384 | Maximum output tokens per response, capped at runtime by `ModelInfo.max_tokens` |
+| `max_tokens` | int | >= 1 | 16384 | Maximum output tokens per response; sent to the API as configured — a value above the model's limit is rejected by the API |
 
 ### Temperature
 
@@ -341,8 +341,7 @@ workflow:
 **Important**:
 - This is output tokens representing response length, not the context window.
 - Context window is 200K tokens for all models, which is a separate limit.
-- Standard models are capped at runtime by `ModelInfo.max_tokens` from the provider, supporting up to 16384 tokens.
-- Exceeding the model limit causes an error.
+- Conductor defaults `max_tokens` to 16384 when unset and sends the configured value to the API verbatim — exceeding the model's own output limit causes an API error.
 
 **Use Cases**:
 - Limit to 1024 or 2048 for concise responses.
@@ -464,7 +463,7 @@ The Claude provider supports automatic, client-side context compaction using a t
 ### How Compaction Resolves on Claude
 
 *   **Context Window:** The provider queries the Anthropic SDK (`models.list()`, with full pagination) to dynamically retrieve the maximum input tokens for the configured model. If the query fails or a custom `base_url` is configured, it falls back to the `genai-prices` registry, and finally to the default 128,000 tokens fallback.
-*   **Output Limit:** The provider queries the effective `max_tokens` sent to the API, which is either explicitly configured under `runtime.max_tokens` (source `settings`) or defaults to 16384 (source `default`, including any adjustments after Claude thinking coercion). This is capped at runtime by `ModelInfo.max_tokens` from the provider metadata (source `provider-cap`).
+*   **Output Limit:** The provider queries the effective `max_tokens` sent to the API, which is either explicitly configured under `runtime.max_tokens` (source `settings`) or defaults to 16384 (source `default`, including any adjustments after Claude thinking coercion). For the compaction output reserve only, this is then capped by the provider-advertised `ModelInfo.max_tokens` (source `provider-cap`) — the value sent to the API itself is never clamped.
 *   **Trigger Threshold:** Calculated using the formula:
     $$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$
     where the tool buffer is resolved dynamically from the configured tool limits (defaulting to 40,000 tokens).
@@ -550,7 +549,7 @@ runtime:
 **Error**: `BadRequestError: max_tokens exceeds model limit`
 
 **Solutions**:
-- The maximum output capability of your model is capped at runtime by `ModelInfo.max_tokens` from the provider.
+- Conductor sends the configured `runtime.max_tokens` to the API verbatim; the model's own output limit (advertised as `ModelInfo.max_tokens`) is enforced by the API, not by Conductor.
 - Adjust `runtime.max_tokens` in your workflow config to match the model capability.
 
 ```yaml

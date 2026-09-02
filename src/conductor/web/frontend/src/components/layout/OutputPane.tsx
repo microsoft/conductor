@@ -187,6 +187,10 @@ const ACTIVITY_TYPE_STYLES: Record<string, { color: string; label: string; label
   message:        { color: 'text-[var(--text)]',  label: 'MSG',    labelColor: 'text-[var(--text-muted)]' },
   prompt:         { color: 'text-cyan-400/70',    label: 'PROMPT', labelColor: 'text-cyan-600' },
   'parse-recovery': { color: 'text-yellow-400',   label: 'RETRY',  labelColor: 'text-yellow-600' },
+  'compaction-config': { color: 'text-[var(--text-muted)]', label: 'COMPACT', labelColor: 'text-[var(--text-muted)]' },
+  'compaction-start': { color: 'text-[var(--text-muted)]', label: 'COMPACT', labelColor: 'text-[var(--text-muted)]' },
+  'compaction-complete': { color: 'text-[var(--text-muted)]', label: 'COMPACT', labelColor: 'text-[var(--text-muted)]' },
+  'compaction-error': { color: 'text-yellow-400',   label: 'COMPACT', labelColor: 'text-yellow-600' },
 };
 
 function ActivityView({ entries }: { entries: ActivityLogEntry[] }) {

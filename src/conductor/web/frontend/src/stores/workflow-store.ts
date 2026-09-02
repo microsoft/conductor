@@ -1724,7 +1724,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const data = _data as unknown as import('@/types/events').AgentCompactionConfigData;
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const t = activeTarget(state, _data);
-    const entry: ActivityEntry = { type: 'compaction-config', icon: '⚙', label: 'compaction', text: `armed (window ${data.context_window} from ${data.context_window_source}, output limit ${data.output_limit} from ${data.output_limit_source}, trigger ${data.trigger_tokens}, target ${data.target_tokens})` };
+    const entry: ActivityEntry = data.enabled === false
+      ? { type: 'compaction-config', icon: '⚙', label: 'compaction', text: `disabled${data.disabled_reason ? `: ${data.disabled_reason}` : ''}` }
+      : { type: 'compaction-config', icon: '⚙', label: 'compaction', text: `armed (window ${data.context_window} from ${data.context_window_source}, output limit ${data.output_limit} from ${data.output_limit_source}, trigger ${data.trigger_tokens ?? '?'}, target ${data.target_tokens ?? '?'})` };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
     replaceNode(t.nodes, data.agent_name);
@@ -1747,8 +1749,14 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     let entry: ActivityEntry;
     if (data.errored) {
       entry = { type: 'compaction-error', icon: '⚠️', label: 'compaction failed', text: `${data.error_type || 'Error'}: ${data.message || 'unknown'}` };
+    } else if (data.still_over_trigger || (data.degraded_tiers && data.degraded_tiers.length > 0)) {
+      const reasons = [
+        ...(data.degraded_tiers && data.degraded_tiers.length > 0 ? [`degraded tiers: ${data.degraded_tiers.join(', ')}`] : []),
+        ...(data.still_over_trigger ? ['still over trigger'] : []),
+      ];
+      entry = { type: 'compaction-error', icon: '⚠️', label: 'compacted with warnings', text: `${data.tokens_before ?? '?'} → ${data.tokens_after ?? '?'} tokens (${reasons.join('; ')})` };
     } else {
-      entry = { type: 'compaction-complete', icon: '🧹', label: 'compacted', text: `${data.tokens_before ?? '?'} → ${data.tokens_after ?? '?'} tokens (${data.messages_before ?? '?'} → ${data.messages_after ?? '?'} messages, ${data.elapsed != null ? formatSec(data.elapsed) : '?'})` };
+      entry = { type: 'compaction-complete', icon: '🧹', label: 'compacted', text: `${data.tokens_before ?? '?'} → ${data.tokens_after ?? '?'} tokens (${data.messages_before ?? '?'} → ${data.messages_after ?? '?'} messages, ${data.elapsed != null ? formatSec(data.elapsed) : '?'}${data.tokens_saved != null ? `, saved ${data.tokens_saved} tokens` : ''})` };
     }
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
@@ -2909,9 +2917,15 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
       };
 
     case 'agent_compaction_config':
+      if (d.enabled === false) {
+        return {
+          timestamp: ts, source: String(d.agent_name), type: 'compaction-config',
+          message: `⚙ compaction disabled${d.disabled_reason ? `: ${d.disabled_reason}` : ''}`,
+        };
+      }
       return {
         timestamp: ts, source: String(d.agent_name), type: 'compaction-config',
-        message: `⚙ compaction armed (window ${d.context_window} from ${d.context_window_source}, output limit ${d.output_limit} from ${d.output_limit_source}, trigger ${d.trigger_tokens}, target ${d.target_tokens})`,
+        message: `⚙ compaction armed (window ${d.context_window} from ${d.context_window_source}, output limit ${d.output_limit} from ${d.output_limit_source}, trigger ${d.trigger_tokens ?? '?'}, target ${d.target_tokens ?? '?'})`,
       };
 
     case 'agent_compaction_start':
@@ -2927,9 +2941,19 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
           message: `⚠️ compaction failed — ${d.error_type || 'Error'}: ${d.message || 'unknown'}`,
         };
       }
+      if (d.still_over_trigger || (Array.isArray(d.degraded_tiers) && d.degraded_tiers.length > 0)) {
+        const reasons = [
+          ...(Array.isArray(d.degraded_tiers) && d.degraded_tiers.length > 0 ? [`degraded tiers: ${(d.degraded_tiers as string[]).join(', ')}`] : []),
+          ...(d.still_over_trigger ? ['still over trigger'] : []),
+        ];
+        return {
+          timestamp: ts, source: String(d.agent_name), type: 'compaction-error',
+          message: `⚠️ context compacted with warnings: ${d.tokens_before ?? '?'} → ${d.tokens_after ?? '?'} tokens (${reasons.join('; ')})`,
+        };
+      }
       return {
         timestamp: ts, source: String(d.agent_name), type: 'compaction-complete',
-        message: `🧹 context compacted: ${d.tokens_before ?? '?'} → ${d.tokens_after ?? '?'} tokens (${d.messages_before ?? '?'} → ${d.messages_after ?? '?'} messages, ${d.elapsed != null ? formatSec(d.elapsed as number) : '?'})`,
+        message: `🧹 context compacted: ${d.tokens_before ?? '?'} → ${d.tokens_after ?? '?'} tokens (${d.messages_before ?? '?'} → ${d.messages_after ?? '?'} messages, ${d.elapsed != null ? formatSec(d.elapsed as number) : '?'}${typeof d.tokens_saved === 'number' ? `, saved ${d.tokens_saved} tokens` : ''})`,
       };
 
     case 'agent_tool_output_truncated':

@@ -233,15 +233,23 @@ def emit_compaction_config(
     context_window_source: str,
     output_limit: int,
     output_limit_source: str,
-    trigger_tokens: int,
-    target_tokens: int,
+    enabled: bool,
+    trigger_tokens: int | None,
+    target_tokens: int | None,
+    tool_buffer: int,
+    effective_tool_buffer: int | None,
+    disabled_reason: str | None = None,
 ) -> None:
     """Emit an ``agent_compaction_config`` event, swallowing callback errors.
 
     This informational event fires once per agent execution, immediately after
     the resolved context-window and output-limit values are known. It is
-    emitted even when no compaction occurs so operators can read the trigger
-    and target thresholds from the event log.
+    emitted whether or not compaction is enabled so operators can read the
+    resolved thresholds — or, for a disabled plan, the reason it is off —
+    from the event log. ``trigger_tokens``/``target_tokens`` are ``None``
+    (serialized as null) when compaction is disabled; ``effective_tool_buffer``
+    is the window-fraction-clamped reserve the plan actually applied, and is
+    ``None`` only when the plan carries no buffer information.
     """
     if event_callback is None:
         return
@@ -256,8 +264,12 @@ def emit_compaction_config(
                 "context_window_source": context_window_source,
                 "output_limit": output_limit,
                 "output_limit_source": output_limit_source,
+                "enabled": enabled,
+                "disabled_reason": disabled_reason,
                 "trigger_tokens": trigger_tokens,
                 "target_tokens": target_tokens,
+                "tool_buffer": tool_buffer,
+                "effective_tool_buffer": effective_tool_buffer,
             },
         )
     except Exception:
@@ -390,12 +402,17 @@ def emit_compaction_complete(
     tokens_before: int,
     tokens_after: int,
     elapsed: float,
+    degraded_tiers: list[str],
+    still_over_trigger: bool,
 ) -> None:
     """Emit a success-shaped ``agent_compaction_complete`` event.
 
     This event fires after compaction finishes, regardless of which tier
-    produced the final context. A non-final tier failure that was recovered
-    by the deterministic sliding-window fallback is reported as a success.
+    produced the final context. ``degraded_tiers`` names the tiers whose own
+    ``compact`` raised and were skipped (recovered by a later tier), and
+    ``still_over_trigger`` reports that the post-compaction estimate remains
+    above the trigger, so consumers can distinguish a full success from a
+    degraded outcome instead of reading both as false success.
     """
     if event_callback is None:
         return
@@ -416,6 +433,8 @@ def emit_compaction_complete(
                 "tokens_saved": max(0, tokens_before - tokens_after),
                 "elapsed": elapsed,
                 "errored": False,
+                "degraded_tiers": degraded_tiers,
+                "still_over_trigger": still_over_trigger,
             },
         )
     except Exception:

@@ -2348,41 +2348,43 @@ Compaction does not trigger at a fixed percentage of the context window. Instead
 
 The trigger threshold is calculated using the following formula:
 
-$$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$
+$$\text{Trigger} = \text{Context Window} - \text{Output Limit} - \text{Effective Tool Buffer}$$
 
 Here, the output limit (output_limit) is the minimum of:
 *   The effective max_tokens actually sent to the API. This has the source `settings` if explicitly configured under `runtime.max_tokens`, or the source `default` (the unified 16384 default, including any adjustment after Claude thinking coercion).
 *   The model output cap reported by the provider (with the source `provider-cap`).
 
-The tool buffer (buffer) is calculated using the configured tool output limit:
+The tool buffer is calculated using the configured tool output limit:
 
 $$\text{Buffer} = 2 \times \lceil\text{max\_chars} / 4\rceil + 15,000$$
 
-This buffer assumes a character-to-token ratio of 4 and reserves space for 2 worst-case tool results as a sizing heuristic. A workflow using more than two parallel calls per turn might exceed this budget, meaning this is a sizing heuristic, not a guarantee.
+This buffer assumes a character-to-token ratio of 4 and reserves space for 2 worst-case tool results as a sizing heuristic. A workflow using more than two parallel calls per turn might exceed this budget, meaning this is a sizing heuristic, not a guarantee. The **effective** tool buffer is this value clamped to at most 25% of the resolved context window, so a pathological `tool_output.max_chars` cannot consume the entire window.
+
+Compaction is **disabled** when the remaining trigger would fall below 4096 tokens (or the computed target would drop below 1 token) — arming a degenerate threshold would compact on every turn. A disabled plan is reported on the `agent_compaction_config` event via `enabled: false` and a `disabled_reason`; the remedy is lowering `runtime.max_tokens` or `tool_output.max_chars`.
 
 The target ceiling to which compaction condenses the history is calculated as:
 
-$$\text{Target} = \max(1, \min(\lfloor\text{Context Window} \times 0.55\rfloor, \text{Trigger} - 1))$$
+$$\text{Target} = \min(\lfloor\text{Context Window} \times 0.55\rfloor, \text{Trigger} - \text{Margin})$$
 
-This formula ensures the target remains strictly below the trigger, establishing a hysteresis gap so the agent does not trigger compaction again immediately on the next turn.
+where the margin is a window-scaled 5% of the context window (minimum 1 token). This keeps the target strictly below the trigger, establishing a hysteresis gap so the agent does not trigger compaction again immediately on the next turn.
 
 #### Worked Examples
 
 Below is how these values resolve in practice for different configurations using the default tool buffer of 40,000 tokens (50,000 character limit):
 
 *   **128k Window, default 16,384 Output Limit:**
-    *   Trigger: 128,000 minus (16,384 + 40,000), which equals 71,616 tokens (about 56% of the window)
-    *   Target: max(1, min(70,400, 71,615)), which equals 70,400 tokens
+    *   Trigger: 128,000 minus 16,384 minus min(40,000, 32,000), which equals 79,616 tokens (about 62% of the window)
+    *   Target: min(70,400, 79,616 minus 6,400), which equals 70,400 tokens
 *   **200k Window, default 16,384 Output Limit:**
-    *   Trigger: 200,000 minus (16,384 + 40,000), which equals 143,616 tokens (about 72% of the window)
-    *   Target: max(1, min(110,000, 143,615)), which equals 110,000 tokens
+    *   Trigger: 200,000 minus 16,384 minus min(40,000, 50,000), which equals 143,616 tokens (about 72% of the window)
+    *   Target: min(110,000, 143,616 minus 10,000), which equals 110,000 tokens
 *   **1M Window, default 16,384 Output Limit:**
-    *   Trigger: 1,000,000 minus (16,384 + 40,000), which equals 943,616 tokens (about 94% of the window)
-    *   Target: max(1, min(550,000, 943,615)), which equals 550,000 tokens
+    *   Trigger: 1,000,000 minus 16,384 minus min(40,000, 250,000), which equals 943,616 tokens (about 94% of the window)
+    *   Target: min(550,000, 943,616 minus 50,000), which equals 550,000 tokens
 
-#### Degenerate Window Warning
+#### Disabled-Compaction Visibility
 
-If the sum of the resolved output limit and the tool buffer meets or exceeds the resolved context window minus one, Conductor logs a warning. This warning alerts you that the trigger has degenerated to 1 token, meaning hysteresis is lost. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`.
+When the reserve (output limit plus effective tool buffer) leaves no viable headroom below the window, compaction is disabled for the agent execution rather than armed with a degenerate threshold. The `agent_compaction_config` event then carries `enabled: false` and a `disabled_reason`, so the condition is visible per run instead of surfacing as a one-shot log warning. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`.
 
 ### Compaction Tiers
 
@@ -2430,7 +2432,7 @@ Conductor emits three event types to track compaction:
 
 ### Dashboard Caveat
 
-The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations. The bar updates to show post-compaction usage after a compaction event completes.
+The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations. The bar is refreshed only when the agent step completes; a mid-execution compaction shows up in the activity log, not in the bar.
 
 ## External File References
 

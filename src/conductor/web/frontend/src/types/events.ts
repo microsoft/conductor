@@ -577,8 +577,14 @@ export interface AgentCompactionConfigData {
   context_window_source: string;
   output_limit: number;
   output_limit_source: string;
-  trigger_tokens: number;
-  target_tokens: number;
+  /** False when compaction was disabled for this execution; trigger/target
+   *  are null in that case and disabled_reason says why. */
+  enabled?: boolean;
+  disabled_reason?: string | null;
+  tool_buffer?: number;
+  effective_tool_buffer?: number;
+  trigger_tokens: number | null;
+  target_tokens: number | null;
 }
 
 export interface AgentCompactionStartData {
@@ -610,6 +616,10 @@ export interface AgentCompactionCompleteData {
   errored: boolean;
   error_type?: string;
   message?: string;
+  /** Tiers that degraded to a weaker strategy during this compaction. */
+  degraded_tiers?: string[];
+  /** True when the post-compaction size still exceeds the trigger. */
+  still_over_trigger?: boolean;
 }
 
 // --- Subworkflow lifecycle ---

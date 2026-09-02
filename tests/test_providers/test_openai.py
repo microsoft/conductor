@@ -7,6 +7,7 @@ execute()/execute_dialog_turn() surfaces without making network calls.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,14 +15,42 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import openai
 import pytest
-from pydantic import SecretStr
+from openai.pagination import AsyncPage
+from pydantic import PrivateAttr, SecretStr
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 
 from conductor.config.schema import AgentDef, OutputField, ProviderSettings
 from conductor.exceptions import ValidationError
 from conductor.providers.factory import create_provider
-from conductor.providers.openai import OpenAIProvider
+from conductor.providers.openai import MAX_MODEL_LISTING_ITEMS, OpenAIProvider
+
+
+class _ModelsPaginator(AsyncPage[Any]):
+    """AsyncPage test double that yields model metadata from every page."""
+
+    _pages: list[list[Any]] = PrivateAttr(default_factory=list)
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for page in self._pages:
+            for model in page:
+                yield model
+
+
+class _EndlessModelsPaginator(_ModelsPaginator):
+    """AsyncPage test double for a proxy that never completes pagination."""
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for _ in range(MAX_MODEL_LISTING_ITEMS + 1):
+            yield self.data[0]
+        raise AssertionError("model listing was not bounded")
+
+
+def _make_models_paginator(*pages: list[Any]) -> _ModelsPaginator:
+    """Build an AsyncPage instance that streams the supplied pages."""
+    paginator = _ModelsPaginator(data=pages[0], object="list")
+    paginator._pages = list(pages)
+    return paginator
 
 
 @pytest.fixture
@@ -46,10 +75,10 @@ class TestProviderConstruction:
     """Tests for OpenAIProvider construction and validation."""
 
     def test_default_model_is_gpt_5_mini(self) -> None:
-        """Requirement: omitted model and cap use the OpenAI provider defaults."""
+        """Requirement: omitted model uses the default; an unset cap stays off the wire."""
         p = OpenAIProvider(api_key="test-key")
         assert p._default_model == "gpt-5-mini"
-        assert p._default_max_tokens == 16_384
+        assert p._default_max_tokens is None
         assert p._max_tokens_user_configured is False
 
     def test_explicit_max_tokens_records_user_provenance(self) -> None:
@@ -816,6 +845,117 @@ class TestOpenAIModelTokenLimits:
 
         assert results == [131_072, 131_072]
         assert list_models.await_count == 1
+
+
+class TestOpenAIModelsPagination:
+    """Model-listing consumers read every page emitted by the OpenAI SDK paginator."""
+
+    @pytest.mark.asyncio
+    async def test_multi_page_paginator_is_fully_drained(self, provider: OpenAIProvider) -> None:
+        """Requirement: limits are cached for models returned on every listing page."""
+        assert provider._client is not None
+        first_page_model = SimpleNamespace(id="vendor-model-a", max_input_tokens=65_536)
+        later_page_model = SimpleNamespace(id="vendor-model-b", max_input_tokens=262_144)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(
+                return_value=_make_models_paginator([first_page_model], [later_page_model])
+            ),
+        ) as list_models:
+            assert await provider.get_max_prompt_tokens("vendor-model-b") == 262_144
+            assert await provider.get_max_prompt_tokens("vendor-model-a") == 65_536
+
+        list_models.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_single_page_data_listing_still_works(self, provider: OpenAIProvider) -> None:
+        """Requirement: a legacy single-page mock exposing ``data`` is still supported."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=131_072)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(return_value=SimpleNamespace(data=[model])),
+        ):
+            assert await provider.get_max_prompt_tokens("vendor-model") == 131_072
+
+    @pytest.mark.asyncio
+    async def test_endless_paginator_is_truncated_at_the_item_cap(
+        self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: a proxy that never ends pagination is capped with one warning."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=131_072)
+
+        with (
+            patch.object(
+                provider._client.models,
+                "list",
+                new=AsyncMock(return_value=_EndlessModelsPaginator(data=[model], object="list")),
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            assert await provider.get_max_prompt_tokens("vendor-model") == 131_072
+
+        assert provider._model_limits_cache is not None
+        assert len(provider._model_limits_cache) == 1
+        truncation_warnings = [
+            record.message for record in caplog.records if "exceeded" in record.message
+        ]
+        assert len(truncation_warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_listing_is_not_cached_and_retries(
+        self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: an empty successful listing stays unresolved so the next lookup retries."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=131_072)
+
+        with (
+            patch.object(
+                provider._client.models,
+                "list",
+                new=AsyncMock(
+                    side_effect=[SimpleNamespace(data=[]), SimpleNamespace(data=[model])]
+                ),
+            ) as list_models,
+            caplog.at_level("WARNING"),
+        ):
+            assert await provider.get_max_prompt_tokens("vendor-model") is None
+            assert provider._model_limits_cache is None
+            assert await provider.get_max_prompt_tokens("vendor-model") == 131_072
+
+        assert list_models.await_count == 2
+        assert any("returned no models" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_with_empty_listing_leaves_cache_retryable(
+        self, provider: OpenAIProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: an empty probe page does not mark token limits as resolved."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=131_072)
+
+        with (
+            patch.object(
+                provider._client.models,
+                "list",
+                new=AsyncMock(
+                    side_effect=[SimpleNamespace(data=[]), SimpleNamespace(data=[model])]
+                ),
+            ) as list_models,
+            caplog.at_level("WARNING"),
+        ):
+            assert await provider.validate_connection() is True
+            assert provider._model_limits_cache is None
+            assert await provider.get_max_prompt_tokens("vendor-model") == 131_072
+
+        assert list_models.await_count == 2
+        assert any("returned no models" in record.message for record in caplog.records)
 
 
 class TestCompactionOutputLimitPerAgent:
