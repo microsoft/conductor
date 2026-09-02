@@ -22,6 +22,7 @@ Startup connection validation is deliberately advisory for non-credential HTTP f
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, get_args
@@ -50,11 +51,13 @@ from conductor.providers.reasoning import (
 try:
     import anthropic
     from anthropic import AnthropicError, APIConnectionError, APIStatusError, AsyncAnthropic
+    from anthropic.pagination import AsyncPage
 
     ANTHROPIC_SDK_AVAILABLE = True
 except ImportError:
     ANTHROPIC_SDK_AVAILABLE = False
     AsyncAnthropic = None  # type: ignore[misc, assignment]
+    AsyncPage = None  # type: ignore[misc, assignment]
     anthropic = None  # type: ignore[assignment]
     AnthropicError = Exception  # type: ignore[misc, assignment]
 
@@ -65,6 +68,15 @@ except ImportError:
     APIStatusError = _SDKUnavailableError  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
+
+
+class _PartialModelListingError(OSError):
+    """Carry models retrieved before an Anthropic paginator failed."""
+
+    def __init__(self, models: list[Any], cause: Exception) -> None:
+        self.models = models
+        self.cause = cause
+        super().__init__(str(cause))
 
 
 class RetryConfig(BaseModel):
@@ -402,9 +414,21 @@ class ClaudeProvider(AgentProvider):
 
         try:
             # Test: list models to verify API key works and perform model verification
-            models_page = await self._client.models.list()
+            models = await self._fetch_all_model_infos()
             # Log available models for debugging
-            self._report_available_models(models_page)
+            self._report_available_models(models)
+            self._connection_probe_note = None
+            self._model_listing_unavailable = False
+            self._model_listing_unavailable_warned = False
+            return True
+        except _PartialModelListingError as e:
+            logger.warning(
+                "Could not retrieve every page from models.list(); using %d model(s) "
+                "from completed pages: %s",
+                len(e.models),
+                e.cause,
+            )
+            self._report_available_models(e.models)
             self._connection_probe_note = None
             self._model_listing_unavailable = False
             self._model_listing_unavailable_warned = False
@@ -462,16 +486,16 @@ class ClaudeProvider(AgentProvider):
         self._model_listing_unavailable_warned = False
         return True
 
-    def _report_available_models(self, models_page: Any) -> None:
+    def _report_available_models(self, models: list[Any]) -> None:
         """Log available models, warn if default model is unavailable.
 
         Also seeds ``_max_input_cache`` so the first call to
         :meth:`get_max_prompt_tokens` doesn't pay for an extra round-trip.
 
         Args:
-            models_page: The result of ``client.models.list()``.
+            models: All metadata returned by ``client.models.list()``.
         """
-        available_models = [model.id for model in models_page.data]
+        available_models = [model.id for model in models]
         logger.info(f"Available Claude models: {', '.join(available_models)}")
 
         # Warn if default model not in list (after stripping aliases like -latest).
@@ -485,7 +509,7 @@ class ClaudeProvider(AgentProvider):
 
         # Seed the metadata caches so get_max_prompt_tokens() and
         # get_max_output_tokens() are pure lookups.
-        self._install_model_cache(models_page.data)
+        self._install_model_cache(models)
 
     def _install_model_cache(self, models_data: list[Any]) -> None:
         """Replace both model metadata caches with fresh mappings."""
@@ -512,6 +536,37 @@ class ClaudeProvider(AgentProvider):
             return None
         return cache.get(matched_id)
 
+    async def _fetch_all_model_infos(self) -> list[Any]:
+        """Return every model metadata item emitted by the Anthropic paginator.
+
+        The SDK returns an awaitable paginator, whereas existing tests and
+        compatible clients may return an awaitable object with ``data``. The
+        latter remains a single-page response.
+
+        Raises:
+            _PartialModelListingError: A later paginator page failed after at
+                least one model was retrieved.
+        """
+        assert self._client is not None
+        result = self._client.models.list(limit=100)
+        page: Any = await result if inspect.isawaitable(result) else result
+        if AsyncPage is None or not isinstance(page, AsyncPage):
+            return self._single_page_model_infos(page)
+
+        models: list[Any] = []
+        try:
+            async for model in page:
+                models.append(model)
+        except Exception as e:
+            if models:
+                raise _PartialModelListingError(models, e) from e
+            raise
+        return models
+
+    def _single_page_model_infos(self, page: Any) -> list[Any]:
+        """Read the model metadata from a legacy single-page response."""
+        return list(page.data)
+
     async def _ensure_model_cache(self) -> None:
         """Populate model metadata caches if not already filled.
 
@@ -525,7 +580,7 @@ class ClaudeProvider(AgentProvider):
             return
 
         try:
-            page = await self._client.models.list()
+            models = await self._fetch_all_model_infos()
         except (TimeoutError, AnthropicError, OSError) as e:
             # Don't cache the failure — let the next call retry.
             logger.debug("Failed to list Anthropic models: %s", e)
@@ -533,7 +588,7 @@ class ClaudeProvider(AgentProvider):
 
         async with self._model_cache_lock:
             if self._max_input_cache is None and self._max_output_cache is None:
-                self._install_model_cache(page.data)
+                self._install_model_cache(models)
 
     def _log_model_listing_unavailable(self) -> None:
         """Log that model listing is unavailable, once at warning then at debug.
@@ -623,11 +678,11 @@ class ClaudeProvider(AgentProvider):
             self._log_model_listing_unavailable()
             return None
         try:
-            page = await self._client.models.list()
+            models = await self._fetch_all_model_infos()
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to list Anthropic models: %s", e)
             return None
-        return [model.id for model in page.data]
+        return [model.id for model in models]
 
     async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
         """Return reasoning-effort support and prompt-token limits for ``model``.

@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import anthropic
 import httpx
 import pytest
-from pydantic import BaseModel
+from anthropic.pagination import AsyncPage
+from pydantic import BaseModel, PrivateAttr
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, ModelResponse
 from pydantic_ai.models.test import TestModel
@@ -63,6 +65,33 @@ def _make_status_error(error_cls: type[Exception], status_code: int) -> Exceptio
     request = httpx.Request("GET", "https://example.com/v1/models")
     response = httpx.Response(status_code, request=request)
     return error_cls(f"error {status_code}", response=response, body=None)  # type: ignore[call-arg]
+
+
+class _ModelsPaginator(AsyncPage[Any]):
+    """AsyncPage test double that yields model metadata from every page."""
+
+    _pages: list[list[Any]] = PrivateAttr(default_factory=list)
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for page in self._pages:
+            for model in page:
+                yield model
+
+
+class _LaterPageFailurePaginator(_ModelsPaginator):
+    """AsyncPage test double that fails after the first page."""
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for model in self.data:
+            yield model
+        raise RuntimeError("next model page failed")
+
+
+def _make_models_paginator(*pages: list[Any]) -> _ModelsPaginator:
+    """Build an AsyncPage instance that streams the supplied pages."""
+    paginator = _ModelsPaginator(data=pages[0], has_more=len(pages) > 1)
+    paginator._pages = list(pages)
+    return paginator
 
 
 class TestClaudeProviderInitialization:
@@ -969,6 +998,108 @@ class TestClaudeExecuteDialogTurn:
                 )
 
             mock_agent.run.assert_not_awaited()
+
+
+@patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude.AsyncAnthropic")
+class TestClaudeModelsPagination:
+    """Model-listing consumers read all pages emitted by the Anthropic SDK."""
+
+    @pytest.mark.asyncio
+    async def test_validate_connection_caches_model_metadata_from_later_page(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        # Требование: проверка подключения учитывает лимиты моделей со всех страниц API.
+        first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
+        later_page_model = Mock(
+            id="claude-sonnet-4-5",
+            max_input_tokens=1_000_000,
+            max_tokens=64_000,
+        )
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=_make_models_paginator([first_page_model], [later_page_model])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        assert await provider.validate_connection() is True
+        assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") == 1_000_000
+        assert await provider.get_max_output_tokens("claude-sonnet-4-5") == 64_000
+        mock_client.models.list.assert_awaited_once_with(limit=100)
+
+    @pytest.mark.asyncio
+    async def test_model_cache_uses_metadata_from_later_page(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        # Требование: ленивый кэш лимитов не теряет модель, возвращённую второй страницей API.
+        first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
+        later_page_model = Mock(id="claude-opus-4-5", max_input_tokens=1_000_000, max_tokens=32_000)
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=_make_models_paginator([first_page_model], [later_page_model])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        assert await provider.get_max_prompt_tokens("claude-opus-4-5") == 1_000_000
+        assert await provider.get_max_output_tokens("claude-opus-4-5") == 32_000
+        mock_client.models.list.assert_awaited_once_with(limit=100)
+
+    @pytest.mark.asyncio
+    async def test_list_models_returns_ids_from_all_pages(self, mock_anthropic_class: Mock) -> None:
+        # Требование: диагностический список моделей содержит идентификаторы со всех страниц API.
+        first_page_model = Mock(id="claude-haiku-4-5")
+        later_page_model = Mock(id="claude-sonnet-4-5")
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=_make_models_paginator([first_page_model], [later_page_model])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        assert await provider.list_models() == ["claude-haiku-4-5", "claude-sonnet-4-5"]
+        mock_client.models.list.assert_awaited_once_with(limit=100)
+
+    @pytest.mark.asyncio
+    @patch("conductor.providers.claude.logger")
+    async def test_validate_connection_keeps_partial_result_after_later_page_failure(
+        self, mock_logger: Mock, mock_anthropic_class: Mock
+    ) -> None:
+        # Требование: сбой продолжения пагинатора предупреждает, но не отменяет первую страницу.
+        first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=_LaterPageFailurePaginator(data=[first_page_model], has_more=True)
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        assert await provider.validate_connection() is True
+        assert await provider.get_max_prompt_tokens("claude-haiku-4-5") == 200_000
+        assert mock_logger.warning.called
+
+    @pytest.mark.asyncio
+    async def test_model_cache_discards_partial_result_after_later_page_failure(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        # Требование: ленивый кэш не сохраняет неполный список после сбоя следующей страницы.
+        first_page_model = Mock(id="claude-haiku-4-5", max_input_tokens=200_000, max_tokens=8_192)
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=_LaterPageFailurePaginator(data=[first_page_model], has_more=True)
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+
+        assert await provider.get_max_prompt_tokens("claude-haiku-4-5") is None
+        assert provider._max_input_cache is None
+        assert provider._max_output_cache is None
 
 
 @patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
