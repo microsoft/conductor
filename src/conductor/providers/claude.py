@@ -233,6 +233,7 @@ class ClaudeProvider(AgentProvider):
         self._api_key = api_key
         self._auth_token = auth_token
         self._base_url = base_url
+        self._model_user_configured = model is not None
         self._default_model = model or "claude-3-5-sonnet-latest"
 
         # Validate and store temperature (enforce schema bounds at instantiation)
@@ -486,10 +487,12 @@ class ClaudeProvider(AgentProvider):
         return True
 
     def _report_available_models(self, models: list[Any]) -> None:
-        """Log available models, warn if default model is unavailable.
+        """Log available models and seed the metadata caches.
 
-        Also seeds ``_max_input_cache`` so the first call to
-        :meth:`get_max_prompt_tokens` doesn't pay for an extra round-trip.
+        Seeds ``_max_input_cache`` / ``_max_output_cache`` so the first call
+        to :meth:`get_max_prompt_tokens` / :meth:`get_max_output_tokens`
+        doesn't pay for an extra round-trip, and warns when an explicitly
+        requested model is absent from the listing.
 
         Args:
             models: All metadata returned by ``client.models.list()``.
@@ -497,18 +500,28 @@ class ClaudeProvider(AgentProvider):
         available_models = [model.id for model in models]
         logger.info(f"Available Claude models: {', '.join(available_models)}")
 
-        # Warn if default model not in list (after stripping aliases like -latest).
-        if match_model_id(self._default_model, available_models) is None:
-            logger.warning(
-                f"Requested model '{self._default_model}' is not in the list of "
-                f"available models. API calls may fail. Available: {available_models}"
-            )
-        else:
-            logger.debug(f"Default model '{self._default_model}' verified in available models")
+        if self._model_user_configured:
+            self._warn_if_requested_model_missing(available_models)
 
         # Seed the metadata caches so get_max_prompt_tokens() and
         # get_max_output_tokens() are pure lookups.
         self._install_model_cache(models)
+
+    def _warn_if_requested_model_missing(self, available_models: list[str]) -> None:
+        """Warn when an explicitly requested model is absent from the listing.
+
+        Aliases like ``-latest`` are stripped via :func:`match_model_id`.
+        The hardcoded fallback default is never warned about: per-agent
+        ``model:`` overrides may make it unused, so a mismatch would be a
+        false positive on endpoints (e.g. gateways) that don't list it.
+        """
+        if match_model_id(self._default_model, available_models) is not None:
+            logger.debug(f"Requested model '{self._default_model}' verified in available models")
+            return
+        logger.warning(
+            f"Requested model '{self._default_model}' is not in the list of "
+            f"available models. API calls may fail. Available: {available_models}"
+        )
 
     def _install_model_cache(self, models_data: list[Any]) -> None:
         """Replace both model metadata caches with fresh mappings."""
@@ -569,8 +582,9 @@ class ClaudeProvider(AgentProvider):
     async def _ensure_model_cache(self) -> None:
         """Populate model metadata caches if not already filled.
 
-        Fetches ``client.models.list()`` outside the lock so concurrent callers
-        don't queue behind a slow round-trip; the lock only guards the install.
+        Uses the double-checked locking pattern: the caches are re-verified
+        after acquiring the lock, so concurrent first-callers issue exactly
+        one ``client.models.list()`` round-trip.
         """
         if self._max_input_cache is not None or self._max_output_cache is not None:
             return
@@ -578,16 +592,16 @@ class ClaudeProvider(AgentProvider):
         if self._client is None:
             return
 
-        try:
-            models = await self._fetch_all_model_infos()
-        except Exception as e:  # noqa: BLE001 - model metadata is best-effort; don't poison cache
-            # Don't cache the failure — let the next call retry.
-            logger.debug("Failed to list Anthropic models: %s", e)
-            return
-
         async with self._model_cache_lock:
-            if self._max_input_cache is None and self._max_output_cache is None:
-                self._install_model_cache(models)
+            if self._max_input_cache is not None or self._max_output_cache is not None:
+                return
+            try:
+                models = await self._fetch_all_model_infos()
+            except Exception as e:  # noqa: BLE001 - best-effort; don't poison the cache
+                # Don't cache the failure — let the next call retry.
+                logger.debug("Failed to list Anthropic models: %s", e)
+                return
+            self._install_model_cache(models)
 
     def _log_model_listing_unavailable(self) -> None:
         """Log that model listing is unavailable, once at warning then at debug.
@@ -1047,7 +1061,9 @@ class ClaudeProvider(AgentProvider):
             provider=self,
             model=effective_model,
             effective_max_tokens=effective_max_tokens,
-            user_configured=self._max_tokens_user_configured,
+            user_configured=(
+                getattr(agent, "max_tokens", None) is not None or self._max_tokens_user_configured
+            ),
         )
         tool_buffer = tool_buffer_tokens(self._tool_output_config)
         trigger = trigger_tokens(window.tokens, output_limit.tokens, tool_buffer)

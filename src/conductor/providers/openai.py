@@ -213,6 +213,7 @@ class OpenAIProvider(AgentProvider):
         self._client: AsyncOpenAI | None = None
         self._api_key = api_key
         self._base_url = base_url
+        self._model_user_configured = model is not None
         self._default_model = model or "gpt-5-mini"
 
         if temperature is not None:
@@ -418,11 +419,12 @@ class OpenAIProvider(AgentProvider):
         return True
 
     def _report_available_models(self, models_page: Any) -> None:
-        """Log available models, warn if default model is unavailable.
+        """Log available models and seed the token-limits cache.
 
-        Also seeds ``_model_limits_cache`` so the first call to
+        Seeds ``_model_limits_cache`` so the first call to
         :meth:`get_max_prompt_tokens` / :meth:`get_max_output_tokens`
-        doesn't pay for an extra round-trip.
+        doesn't pay for an extra round-trip, and warns when an explicitly
+        requested model is absent from the listing.
 
         Args:
             models_page: The result of ``client.models.list()``.
@@ -430,15 +432,25 @@ class OpenAIProvider(AgentProvider):
         available_models = [model.id for model in models_page.data]
         logger.info(f"Available OpenAI models: {', '.join(available_models)}")
 
-        if self._default_model not in available_models:
-            logger.warning(
-                f"Requested model '{self._default_model}' is not in the list of "
-                f"available models. API calls may fail. Available: {available_models}"
-            )
-        else:
-            logger.debug(f"Default model '{self._default_model}' verified in available models")
+        if self._model_user_configured:
+            self._warn_if_requested_model_missing(available_models)
 
         self._install_model_limits_cache(list(models_page.data))
+
+    def _warn_if_requested_model_missing(self, available_models: list[str]) -> None:
+        """Warn when an explicitly requested model is absent from the listing.
+
+        The hardcoded fallback default is never warned about: per-agent
+        ``model:`` overrides may make it unused, so a mismatch would be a
+        false positive on endpoints (e.g. proxies) that don't list it.
+        """
+        if self._default_model in available_models:
+            logger.debug(f"Requested model '{self._default_model}' verified in available models")
+            return
+        logger.warning(
+            f"Requested model '{self._default_model}' is not in the list of "
+            f"available models. API calls may fail. Available: {available_models}"
+        )
 
     def _install_model_limits_cache(self, models_data: list[Any]) -> None:
         """Replace the model token-limits cache with a fresh mapping."""
@@ -481,9 +493,9 @@ class OpenAIProvider(AgentProvider):
     async def _ensure_model_limits_cache(self) -> None:
         """Populate model token-limits cache if not already filled.
 
-        Fetches ``client.models.list()`` outside the lock so concurrent
-        callers don't queue behind a slow round-trip; the lock only guards
-        the install.
+        Uses the double-checked locking pattern: the cache is re-verified
+        after acquiring the lock, so concurrent first-callers issue exactly
+        one ``client.models.list()`` round-trip.
         """
         if self._model_limits_cache is not None:
             return
@@ -491,16 +503,16 @@ class OpenAIProvider(AgentProvider):
         if self._client is None:
             return
 
-        try:
-            models = await self._fetch_model_infos()
-        except Exception as e:  # noqa: BLE001 - model metadata is best-effort; don't poison cache
-            # Don't cache the failure — let the next call retry.
-            logger.debug("Failed to list OpenAI models: %s", e)
-            return
-
         async with self._model_cache_lock:
-            if self._model_limits_cache is None:
-                self._install_model_limits_cache(models)
+            if self._model_limits_cache is not None:
+                return
+            try:
+                models = await self._fetch_model_infos()
+            except Exception as e:  # noqa: BLE001 - best-effort; don't poison the cache
+                # Don't cache the failure — let the next call retry.
+                logger.debug("Failed to list OpenAI models: %s", e)
+                return
+            self._install_model_limits_cache(models)
 
     def _log_model_listing_unavailable(self) -> None:
         """Log that model listing is unavailable, once at warning then at debug.
@@ -879,11 +891,14 @@ class OpenAIProvider(AgentProvider):
             model=effective_model,
             has_custom_base_url=self._base_url is not None,
         )
+        agent_max_tokens = getattr(agent, "max_tokens", None)
         output_limit = await resolve_output_limit(
             provider=self,
             model=effective_model,
-            effective_max_tokens=self._default_max_tokens,
-            user_configured=self._max_tokens_user_configured,
+            effective_max_tokens=(
+                agent_max_tokens if agent_max_tokens is not None else self._default_max_tokens
+            ),
+            user_configured=agent_max_tokens is not None or self._max_tokens_user_configured,
         )
         tool_buffer = tool_buffer_tokens(self._tool_output_config)
         trigger = trigger_tokens(window.tokens, output_limit.tokens, tool_buffer)
