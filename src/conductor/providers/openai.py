@@ -28,11 +28,16 @@ from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.mcp.manager import MCPManager
 from conductor.providers._pydantic_ai.compaction_window import DEFAULT_MAX_TOKENS
+from conductor.providers._pydantic_ai.model_listing import (
+    ModelTokenLimits,
+    extract_model_token_limits,
+)
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
     EventCallback,
     ModelCapabilityInfo,
+    match_model_id,
 )
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
@@ -241,6 +246,15 @@ class OpenAIProvider(AgentProvider):
         # (see _connection_probe_verdict) rather than a confirmed success.
         # diagnostics.py surfaces this note instead of silently claiming "connected".
         self._connection_probe_note: str | None = None
+        self._model_listing_unavailable = False
+        self._model_listing_unavailable_warned = False
+
+        # Cache of model_id -> max_input_tokens / max_output_tokens populated
+        # lazily on first get_max_prompt_tokens/get_max_output_tokens call.
+        # Guarded by an asyncio.Lock to avoid racing concurrent first-callers
+        # and emitting duplicate models.list() requests.
+        self._model_limits_cache: dict[str, ModelTokenLimits] | None = None
+        self._model_cache_lock = asyncio.Lock()
 
         self._initialize_client()
 
@@ -346,6 +360,8 @@ class OpenAIProvider(AgentProvider):
             models_page = await self._client.models.list()
             self._report_available_models(models_page)
             self._connection_probe_note = None
+            self._model_listing_unavailable = False
+            self._model_listing_unavailable_warned = False
             return True
         except Exception as e:
             return self._connection_probe_verdict(e)
@@ -396,10 +412,16 @@ class OpenAIProvider(AgentProvider):
             "will be verified on the first agent call."
         )
         self._connection_probe_note = f"unverified (HTTP {status_code})"
+        self._model_listing_unavailable = True
+        self._model_listing_unavailable_warned = False
         return True
 
     def _report_available_models(self, models_page: Any) -> None:
         """Log available models, warn if default model is unavailable.
+
+        Also seeds ``_model_limits_cache`` so the first call to
+        :meth:`get_max_prompt_tokens` / :meth:`get_max_output_tokens`
+        doesn't pay for an extra round-trip.
 
         Args:
             models_page: The result of ``client.models.list()``.
@@ -407,13 +429,141 @@ class OpenAIProvider(AgentProvider):
         available_models = [model.id for model in models_page.data]
         logger.info(f"Available OpenAI models: {', '.join(available_models)}")
 
-        if self._default_model not in available_models:
+        if match_model_id(self._default_model, available_models) is None:
             logger.warning(
                 f"Requested model '{self._default_model}' is not in the list of "
                 f"available models. API calls may fail. Available: {available_models}"
             )
         else:
             logger.debug(f"Default model '{self._default_model}' verified in available models")
+
+        self._install_model_limits_cache(list(models_page.data))
+
+    def _install_model_limits_cache(self, models_data: list[Any]) -> None:
+        """Replace the model token-limits cache with a fresh mapping."""
+        self._model_limits_cache = {
+            info.id: extract_model_token_limits(info) for info in models_data
+        }
+
+    def _resolve_model_limits(self, model: str) -> ModelTokenLimits | None:
+        """Resolve ``model`` against the cached token limits using alias matching.
+
+        Returns ``None`` when the cache is empty or no alias matches.
+        """
+        cache = self._model_limits_cache
+        if cache is None:
+            return None
+        matched_id = match_model_id(model, cache.keys())
+        if matched_id is None:
+            return None
+        return cache.get(matched_id)
+
+    async def _fetch_model_infos(self) -> list[Any]:
+        """Return model metadata from ``client.models.list()``.
+
+        The OpenAI SDK returns an awaitable paginator. Awaiting it yields an
+        ``AsyncPage`` that is itself async-iterable, so we drain the page to
+        collect every model entry. Legacy single-page mocks that expose a
+        ``data`` attribute are still supported.
+        """
+        assert self._client is not None
+        result = self._client.models.list()
+        page: Any = await result if inspect.isawaitable(result) else result
+        if hasattr(page, "data"):
+            return list(page.data)
+        models: list[Any] = []
+        async for model in page:
+            models.append(model)
+        return models
+
+    async def _ensure_model_limits_cache(self) -> None:
+        """Populate model token-limits cache if not already filled.
+
+        Fetches ``client.models.list()`` outside the lock so concurrent
+        callers don't queue behind a slow round-trip; the lock only guards
+        the install.
+        """
+        if self._model_limits_cache is not None:
+            return
+
+        if self._client is None:
+            return
+
+        try:
+            models = await self._fetch_model_infos()
+        except Exception as e:  # noqa: BLE001 - model metadata is best-effort; don't poison cache
+            # Don't cache the failure — let the next call retry.
+            logger.debug("Failed to list OpenAI models: %s", e)
+            return
+
+        async with self._model_cache_lock:
+            if self._model_limits_cache is None:
+                self._install_model_limits_cache(models)
+
+    def _log_model_listing_unavailable(self) -> None:
+        """Log that model listing is unavailable, once at warning then at debug.
+
+        Called by ``get_max_prompt_tokens`` / ``get_max_output_tokens`` / ``list_models``
+        when ``_model_listing_unavailable`` is set so repeated calls don't each
+        re-attempt a guaranteed-failing ``models.list()`` round-trip.
+        """
+        if not self._model_listing_unavailable_warned:
+            logger.warning(
+                "Model listing is unavailable for this endpoint; context-window "
+                "reporting disabled for this endpoint."
+            )
+            self._model_listing_unavailable_warned = True
+        else:
+            logger.debug("Model listing remains unavailable for this endpoint.")
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the maximum prompt tokens advertised for ``model``.
+
+        On first call, populates a per-instance cache by calling
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache when the probe
+        succeeds. Alias resolution uses :func:`match_model_id` so ``-latest``
+        and dated suffixes resolve to the cached entry.
+
+        Returns ``None`` when the SDK is unavailable, the model can't be
+        resolved, the listing call fails, or the API reports no input cap
+        for the model. Context-window metadata is best-effort and must never
+        block workflow execution.
+        """
+        if not OPENAI_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
+
+        await self._ensure_model_limits_cache()
+        limits = self._resolve_model_limits(model)
+        return limits.max_input_tokens if limits is not None else None
+
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the maximum output tokens advertised for ``model``.
+
+        On first call, populates a per-instance cache by calling
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache when the probe
+        succeeds. Alias resolution uses :func:`match_model_id`.
+
+        Returns ``None`` when the SDK is unavailable, the model can't be
+        resolved, the listing call fails, or the API reports no output cap
+        for the model. Output metadata is best-effort and must never block
+        workflow execution.
+        """
+        if not OPENAI_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
+
+        await self._ensure_model_limits_cache()
+        limits = self._resolve_model_limits(model)
+        return limits.max_output_tokens if limits is not None else None
 
     async def list_models(self) -> list[str] | None:
         """Return the model ids advertised by the OpenAI API.
@@ -422,27 +572,22 @@ class OpenAIProvider(AgentProvider):
         """
         if not OPENAI_SDK_AVAILABLE or self._client is None:
             return None
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
         try:
-            page = await self._client.models.list()
+            models = await self._fetch_model_infos()
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to list OpenAI models: %s", e)
             return None
-        return [model.id for model in page.data]
-
-    async def get_max_prompt_tokens(self, model: str) -> int | None:
-        """Return the maximum prompt tokens for ``model``.
-
-        The OpenAI API does not expose per-model input limits through
-        ``models.list()``, so this always returns ``None``.
-        """
-        del model
-        return None
+        return [model.id for model in models]
 
     async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
         """Return reasoning-effort support and prompt-token limits for ``model``.
 
-        OpenAI does not expose token limits through its model listing, so only
-        reasoning-effort capability is inferred from the pydantic-ai model profile.
+        Reasoning-effort support is inferred from the pydantic-ai model profile.
+        Token limits reuse :meth:`get_max_prompt_tokens` and
+        :meth:`get_max_output_tokens` when the model listing advertises them.
         Returns ``None`` when the profile cannot be queried.
         """
         from pydantic_ai.profiles.openai import openai_model_profile
@@ -456,11 +601,13 @@ class OpenAIProvider(AgentProvider):
         if supports_reasoning is None:
             return None
         supported = list(_OPENAI_REASONING_EFFORTS) if supports_reasoning else []
+        max_prompt_tokens = await self.get_max_prompt_tokens(model)
+        max_output_tokens = await self.get_max_output_tokens(model)
         return ModelCapabilityInfo(
             supported_reasoning_efforts=supported,
             default_reasoning_effort=None,
-            max_prompt_tokens=None,
-            max_output_tokens=None,
+            max_prompt_tokens=max_prompt_tokens,
+            max_output_tokens=max_output_tokens,
             max_context_window_tokens=None,
         )
 
@@ -546,6 +693,11 @@ class OpenAIProvider(AgentProvider):
             self._client = None
             await client.close()
             logger.debug("OpenAI provider closed")
+
+        # Drop cached metadata so a re-initialized provider re-fetches.
+        self._model_limits_cache = None
+        self._model_listing_unavailable = False
+        self._model_listing_unavailable_warned = False
 
     async def execute_dialog_turn(
         self,

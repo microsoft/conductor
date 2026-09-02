@@ -6,8 +6,9 @@ execute()/execute_dialog_turn() surfaces without making network calls.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import openai
@@ -628,3 +629,126 @@ class TestConnectionHelpers:
         monkeypatch.setattr("pydantic_ai.profiles.openai.openai_model_profile", _fake_profile)
         caps = await provider.get_model_capabilities("some-model")
         assert caps is None
+
+
+class TestOpenAIModelTokenLimits:
+    """Tests for vendor-advertised OpenAI-compatible model token limits."""
+
+    @pytest.mark.asyncio
+    async def test_reads_advertised_limits_and_reuses_single_page_cache(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: prompt and output hooks reuse limits advertised by one listing page."""
+        assert provider._client is not None
+        model = SimpleNamespace(
+            id="vendor-model-20260101",
+            context_length=262_144,
+            top_provider={"max_completion_tokens": 32_768},
+        )
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(return_value=SimpleNamespace(data=[model])),
+        ) as list_models:
+            assert await provider.get_max_prompt_tokens("vendor-model-latest") == 262_144
+            assert await provider.get_max_output_tokens("vendor-model-latest") == 32_768
+
+        list_models.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_caches_entries_without_advertised_limits(self, provider: OpenAIProvider) -> None:
+        """Requirement: an entry without limits is cached as an authoritative unknown value."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model")
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(return_value=SimpleNamespace(data=[model])),
+        ) as list_models:
+            assert await provider.get_max_prompt_tokens("vendor-model") is None
+            assert await provider.get_max_output_tokens("vendor-model") is None
+
+        list_models.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_listing_failure_does_not_poison_model_limits_cache(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: a transient models.list() failure leaves cache population retryable."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=131_072)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(
+                side_effect=[
+                    RuntimeError("temporary failure"),
+                    SimpleNamespace(data=[model]),
+                ]
+            ),
+        ) as list_models:
+            assert await provider.get_max_prompt_tokens("vendor-model") is None
+            assert await provider.get_max_prompt_tokens("vendor-model") == 131_072
+
+        assert list_models.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_successful_probe_reenables_model_limit_lookups(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: a successful validation resets a prior unavailable-listing state."""
+        assert provider._client is not None
+        request = httpx.Request("GET", "http://custom/v1/models")
+        response = httpx.Response(404, request=request)
+        unavailable = openai.APIStatusError("not found", response=response, body=None)
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=65_536)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(
+                side_effect=[
+                    unavailable,
+                    SimpleNamespace(data=[model]),
+                ]
+            ),
+        ) as list_models:
+            assert await provider.validate_connection() is True
+            assert await provider.get_max_prompt_tokens("vendor-model") is None
+            assert provider._model_listing_unavailable_warned is True
+
+            assert await provider.validate_connection() is True
+            assert provider._model_listing_unavailable is False
+            assert provider._model_listing_unavailable_warned is False
+            assert await provider.get_max_prompt_tokens("vendor-model") == 65_536
+
+        assert list_models.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_close_clears_model_limits_cache_and_listing_flags(
+        self, provider: OpenAIProvider
+    ) -> None:
+        """Requirement: close discards model metadata and unavailable-listing state."""
+        assert provider._client is not None
+        model = SimpleNamespace(id="vendor-model", max_input_tokens=32_768)
+
+        with patch.object(
+            provider._client.models,
+            "list",
+            new=AsyncMock(return_value=SimpleNamespace(data=[model])),
+        ):
+            assert await provider.get_max_prompt_tokens("vendor-model") == 32_768
+
+        provider._model_listing_unavailable = True
+        provider._model_listing_unavailable_warned = True
+        client = provider._client
+        with patch.object(client, "close", new=AsyncMock()) as close:
+            await provider.close()
+
+        close.assert_awaited_once_with()
+        assert provider._model_limits_cache is None
+        assert provider._model_listing_unavailable is False
+        assert provider._model_listing_unavailable_warned is False
