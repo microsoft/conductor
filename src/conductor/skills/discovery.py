@@ -17,7 +17,10 @@ CLIs' locations, and hands the result to the same
 entries use. Every agent sees the identical discovered set whatever its
 provider. The providers' own discovery stays off — ``copilot`` is never
 given ``enable_config_discovery`` (it would also auto-load MCP servers
-from ``.mcp.json``) and ``claude-agent-sdk`` keeps ``setting_sources=[]``.
+from ``.mcp.json``) and ``claude-agent-sdk`` keeps ``setting_sources`` empty by
+default (a workflow opts specific tiers back in via
+``runtime.provider.setting_sources``, which is a deliberate per-workflow choice
+rather than discovery).
 
 Every mapped location is a *skills root*, so all three categories expand
 by :func:`~conductor.skills.registry.expand_skills_root` — discovery adds

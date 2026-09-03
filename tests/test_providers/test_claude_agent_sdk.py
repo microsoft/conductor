@@ -2662,6 +2662,7 @@ class TestSkillsWiring:
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         tools: list[str] | None = None,
+        setting_sources: list[str] | None = None,
     ):
         captured: dict = {}
 
@@ -2670,7 +2671,7 @@ class TestSkillsWiring:
             yield _result(result="ok")
 
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
-            provider = ClaudeAgentSdkProvider()
+            provider = ClaudeAgentSdkProvider(setting_sources=setting_sources)
             await provider.execute(
                 agent=agent,
                 context={},
@@ -2726,8 +2727,9 @@ class TestSkillsWiring:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @pytest.mark.parametrize("skills", [None, "declared"])
-    async def test_setting_sources_isolated_unconditionally(self, skills: str | None) -> None:
-        """No ambient skills, CLAUDE.md, settings.json, or hooks — ever."""
+    async def test_setting_sources_isolated_by_default(self, skills: str | None) -> None:
+        """No ambient skills, CLAUDE.md, settings.json, or hooks unless a
+        workflow opts in via ``runtime.provider.setting_sources``."""
         options = await self._capture_options(
             AgentDef(name="t", prompt="hi"),
             skill_directories=self._skill_dirs() if skills else None,
@@ -2855,6 +2857,178 @@ class TestSkillsWiring:
         with pytest.raises(ProviderError, match="Two different plugins") as exc:
             _resolve_skill_plugins([str(a / "skills" / "s"), str(b / "skills" / "s")])
         assert exc.value.is_retryable is False
+
+
+class TestSettingSourcesWiring:
+    """``runtime.provider.setting_sources`` decides what ambient Claude Code
+    settings a session may load. Empty by default; opt-in per workflow.
+
+    Extends :class:`TestSkillsWiring` and reuses its helpers, so these assert
+    the argv the SDK builds rather than stopping at the options object.
+    """
+
+    _capture_options = staticmethod(TestSkillsWiring._capture_options)
+    _argv = staticmethod(TestSkillsWiring._argv)
+    _skill_dirs = staticmethod(TestSkillsWiring._skill_dirs)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_grant_the_skill_tool(self) -> None:
+        """Discovered AND invokable.
+
+        CLI-discovered skills never pass through ``skill_names``, so gating the
+        Skill tool on that alone left a tier discovering skills the model held
+        no tool to invoke. On the ``tools: []`` path ``permission_mode`` is
+        ``None``, so ``--allowedTools`` is the only thing granting it — and the
+        ``"all"`` branch emits the bare ``Skill``, not ``Skill(<name>)``.
+        """
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", tools=[]), setting_sources=["project"]
+        )
+
+        assert options.tools == ["Skill"]
+        assert options.permission_mode is None
+
+        argv = self._argv(options)
+        assert argv[argv.index("--allowedTools") + 1] == "Skill"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_sources_no_skills_withholds_the_skill_tool(self) -> None:
+        """``tools: []`` with nothing to reach stays an honest empty tool set."""
+        options = await self._capture_options(AgentDef(name="t", prompt="hi", tools=[]))
+
+        assert options.tools == []
+        assert "--allowedTools" not in self._argv(options)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize(
+        "sources",
+        [["project"], ["user"], ["local"], ["user", "project", "local"]],
+    )
+    async def test_declared_sources_reach_the_cli(self, sources: list[str]) -> None:
+        """The opt-in case: an agent whose working_dir is a target repo that
+        ships its own ``.claude/skills``, which no plugin root packages. Every
+        tier comma-joins into one ``--setting-sources`` argument."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), setting_sources=sources
+        )
+
+        assert options.setting_sources == sources
+        assert f"--setting-sources={','.join(sources)}" in self._argv(options)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_explicit_none_is_normalised_to_empty(self) -> None:
+        """An unset YAML field arrives as ``None`` and must not become the
+        SDK's own default (``["user", "project"]`` once ``skills`` is set)."""
+        assert ClaudeAgentSdkProvider(setting_sources=None)._setting_sources == []
+
+    async def test_factory_forwards_the_field_from_provider_settings(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(
+            provider=ProviderSettings(name="claude-agent-sdk", setting_sources=["project"])
+        )
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+        assert provider._setting_sources == ["project"]
+
+    async def test_factory_defaults_to_no_ambient_sources(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(provider=ProviderSettings(name="claude-agent-sdk"))
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+        assert provider._setting_sources == []
+
+    def test_skill_filter_widens_to_all_only_for_discovery(self) -> None:
+        """``skills`` is a second gate after the ``Skill`` tool grant. Sending
+        ``[]`` while a tier is enabled empties the session's skill allowlist,
+        which hides the discovered skills from the model's listing — the tier
+        would load the repo's skills and then hide every one of them."""
+        from conductor.providers.claude_agent_sdk import _resolve_skill_filter
+
+        # A declared allowlist is the author's intent; discovery must not widen it.
+        assert _resolve_skill_filter(["p:a"], []) == ["p:a"]
+        assert _resolve_skill_filter(["p:a"], ["project"]) == ["p:a"]
+        # Discovery with nothing declared: the enabled tiers decide the set.
+        assert _resolve_skill_filter([], ["project"]) == "all"
+        # Neither: an honest opt-out.
+        assert _resolve_skill_filter([], []) == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_permit_discovered_skill_names(self) -> None:
+        """End of the chain: the tool is granted AND the name filter allows it.
+        Regression guard for a session that could call Skill and had every call
+        refused as not in this session's skills allowlist."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), setting_sources=["project"]
+        )
+
+        assert options.skills == "all"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_skills_are_not_widened_by_a_tier(self) -> None:
+        """Through ``execute``, not the pure function: a workflow that named
+        skills keeps exactly those, and the argv still scopes the grant to
+        ``Skill(<name>)`` rather than the bare tool."""
+        skill_dir = self._skill_dirs()[0]
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", tools=[]),
+            skill_directories=[skill_dir],
+            setting_sources=["project"],
+        )
+
+        assert options.skills == ["conductor:conductor"]
+        assert options.setting_sources == ["project"]
+
+        argv = self._argv(options)
+        assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_agent_skills_opt_out_beats_a_workflow_tier(self) -> None:
+        """``skills: []`` is the one per-agent opt-out and outranks the
+        workflow-global tier — no tier, no ``Skill`` tool, hooks included."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", tools=[], skills=[]), setting_sources=["project"]
+        )
+
+        assert options.setting_sources == []
+        assert options.skills == []
+        assert options.tools == []
+        argv = self._argv(options)
+        # Positive anchor so the negative assertion cannot pass on a broken
+        # argv builder: `tools: []` still reaches the CLI as an empty tool set.
+        assert argv[argv.index("--tools") + 1] == ""
+        assert "--allowedTools" not in argv
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    def test_enabling_a_tier_warns_about_hooks(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Nothing else in the run output distinguishes a run that loaded the
+        target repo's hooks from one that did not."""
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.claude_agent_sdk"):
+            ClaudeAgentSdkProvider(setting_sources=["project"])
+
+        assert "HOOKS" in caplog.text
+        assert "project" in caplog.text
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    def test_default_warns_about_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.claude_agent_sdk"):
+            ClaudeAgentSdkProvider()
+
+        assert "HOOKS" not in caplog.text
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_tools_with_a_tier_keeps_the_default_preset(self) -> None:
+        """The ``claude_code`` preset path: ``tools:`` omitted means the CLI's
+        own default tool set, which a tier must not narrow."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), setting_sources=["project"]
+        )
+
+        assert options.tools == {"type": "preset", "preset": "claude_code"}
+        assert options.skills == "all"
 
 
 class TestValidateConnectionProbeSetPerPlatform:

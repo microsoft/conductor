@@ -1907,6 +1907,45 @@ Two consequences worth knowing:
 * **Eager injection is expensive.** The bundled `conductor` skill alone is
   ~132KB (~33K tokens), prepended to *every* call and every retry.
 
+#### Loading a target repo's own skills (`claude-agent-sdk`)
+
+A repository that ships `.claude/skills` but no plugin manifest is unreachable
+through `skills:` on this provider. `runtime.provider.setting_sources` lets the
+workflow load the Claude Code settings tiers instead, which is how the `claude`
+CLI finds those skills natively:
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [project]   # user | project | local; empty by default
+  agents:
+    - name: reviewer
+      working_dir: ./target-repo   # the tier resolves against this directory
+      prompt: ...
+```
+
+`[project]` reads `<working_dir>/.claude/` — skills, `CLAUDE.md`, and
+`.claude/rules/*.md` — with no plugin packaging. `user` also reads
+`~/.claude/`, which makes the run depend on the operator's machine; prefer
+`[project]`.
+
+> **A tier brings its hooks.** `project` reads
+> `<working_dir>/.claude/settings.json`, whose `hooks` run shell commands on
+> tool events. Enable this only for repositories trusted as much as the
+> workflow itself. The field is workflow-global while `working_dir` is per
+> agent, so every agent on the provider loads the tiers against its own
+> directory (agents without a `working_dir` against the directory `conductor
+> run` was launched in). An agent with an explicit `skills: []` opts out of the
+> tiers entirely.
+
+When the workflow names no skills of its own, enabling a tier also widens the
+session's skill filter to whatever the tier discovered — otherwise the tier
+would load the repo's skills and then hide every one of them. A declared
+`skills:` / `plugins:` list still wins: discovery never widens it. See
+[`examples/claude-agent-sdk-setting-sources.yaml`](../examples/claude-agent-sdk-setting-sources.yaml).
+
 ### Limiting eager injection
 
 `runtime.skill_injection` bounds what eager-injection providers prepend. It

@@ -230,6 +230,8 @@ def _describe_provider(provider: ProviderSettings) -> str:
         parts.append(f"runtime_url={provider.runtime_url}")
     if provider.runtime_token is not None:
         parts.append("runtime_token=***")
+    if provider.setting_sources is not None:
+        parts.append(f"setting_sources={provider.setting_sources}")
     return " ".join(parts)
 
 

@@ -1,0 +1,105 @@
+# Loading a target repository's own skills (`runtime.provider.setting_sources`)
+#
+# The claude-agent-sdk provider sends `setting_sources=[]` by default, so a run
+# inherits nothing from the machine it happens to run on. This workflow opts the
+# `project` tier back in, which is how the `claude` CLI natively finds a
+# repository's `.claude/skills`, `CLAUDE.md`, and `.claude/rules/*.md` — no
+# plugin manifest needed (the SDK has `--plugin-dir` but no `--skill-dir`).
+#
+# The tier resolves against each agent's `working_dir`, so point it at the
+# target repository you want the conventions of.
+#
+# TRUST: an enabled tier brings everything that tier defines, HOOKS INCLUDED —
+# `project` reads <working_dir>/.claude/settings.json, whose `hooks` run shell
+# commands on tool events. Enable it only for a repository you trust as much as
+# this workflow. `setting_sources` is workflow-global, so `audit` below carries
+# an explicit `skills: []` to opt that agent out of the tiers entirely.
+#
+# Full documentation: docs/workflow-syntax.md, "Loading a target repo's own
+# skills", and docs/providers/comparison.md.
+#
+# Pre-requisites:
+#   pip install conductor[claude-agent-sdk]      # or: uv add 'claude-agent-sdk>=0.2.82'
+#   npm install -g @anthropic-ai/claude-code     # the `claude` CLI
+#   claude login
+#
+# Usage (run from the repo root):
+#   conductor run examples/claude-agent-sdk-setting-sources.yaml \
+#     --input repo=../some-checkout --input task="Add a regression test for #123"
+#
+# Validation only (no execution / no API calls):
+#   conductor validate examples/claude-agent-sdk-setting-sources.yaml
+
+workflow:
+  name: claude-agent-sdk-setting-sources
+  description: >
+    Work inside a target repository using that repository's own Claude Code
+    skills and instructions, loaded through the opt-in `project` settings tier.
+  version: "1.0.0"
+  entry_point: work
+
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      # user | project | local. Empty by default; `project` reads the target
+      # repo's own .claude/ tree. Prefer `project` over `user`: `user` reads
+      # ~/.claude/settings.json and makes the run depend on the operator's
+      # machine.
+      setting_sources: [project]
+    default_model: claude-sonnet-4-5
+
+  input:
+    repo:
+      type: string
+      required: true
+      description: Path to the target repository whose conventions to follow.
+    task:
+      type: string
+      required: true
+      description: What to do inside that repository.
+
+agents:
+  - name: work
+    description: Do the task following the target repo's own skills and rules.
+    # The `project` tier resolves against this directory, so the repo's
+    # .claude/skills, CLAUDE.md and .claude/rules all arrive natively.
+    working_dir: "{{ workflow.input.repo }}"
+    prompt: |
+      Task: {{ workflow.input.task }}
+
+      Follow the conventions of the repository in your working directory,
+      including any skills and rules it ships. Name which of its conventions
+      you applied.
+    output:
+      result:
+        type: string
+        description: What was done, and which repo conventions were applied.
+      conventions_used:
+        type: string
+        description: The repo's own skills or rules that were followed.
+    routes:
+      - to: audit
+
+  - name: audit
+    description: Summarise the change without the target repo's conventions.
+    # `skills: []` is the one per-agent opt-out and it outranks the
+    # workflow-global tier: this agent loads no ambient skills, instructions or
+    # hooks, from this repo or any other.
+    skills: []
+    prompt: |
+      Summarise this work for someone reviewing it:
+
+      {{ work.output.result }}
+
+      Conventions the previous agent reported following:
+      {{ work.output.conventions_used }}
+    output:
+      summary:
+        type: string
+        description: Reviewer-ready summary of the change.
+    routes:
+      - to: $end
+
+output:
+  result: "{{ work.output.result }}"
+  summary: "{{ audit.output.summary }}"

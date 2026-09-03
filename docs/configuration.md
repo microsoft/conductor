@@ -199,18 +199,26 @@ neither env var. Only `base_url` falls back on its own.
 
 #### Field compatibility by provider
 
-| Field | `copilot` | `claude` |
-|---|---|---|
-| `base_url` | Supported | Supported |
-| `api_key` | Supported | Supported |
-| `auth_token` | Rejected | Supported |
-| `bearer_token` | Supported | Rejected |
-| `type` | Supported | Rejected |
-| `wire_api` | Supported | Rejected |
-| `headers` | Supported | Rejected |
-| `azure` | Supported | Rejected |
-| `runtime_url` | Supported | Rejected |
-| `runtime_token` | Supported | Rejected |
+| Field | `copilot` | `claude` | `claude-agent-sdk` |
+|---|---|---|---|
+| `base_url` | Supported | Supported | Rejected |
+| `api_key` | Supported | Supported | Rejected |
+| `auth_token` | Rejected | Supported | Rejected |
+| `bearer_token` | Supported | Rejected | Rejected |
+| `type` | Supported | Rejected | Rejected |
+| `wire_api` | Supported | Rejected | Rejected |
+| `headers` | Supported | Rejected | Rejected |
+| `azure` | Supported | Rejected | Rejected |
+| `runtime_url` | Supported | Rejected | Rejected |
+| `runtime_token` | Supported | Rejected | Rejected |
+| `setting_sources` | Rejected | Rejected | Supported |
+
+`setting_sources` (`user` / `project` / `local`) selects which Claude Code
+settings tiers a session may load; it is empty by default and only the
+`claude-agent-sdk` provider reads it, so it is rejected on every other provider
+name rather than accepted and dropped. An enabled tier brings that tier's
+hooks — see
+[claude-agent-sdk: skills and ambient settings](providers/comparison.md#important-skills-and-ambient-settings).
 
 #### Secrets
 

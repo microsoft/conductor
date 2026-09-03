@@ -161,17 +161,42 @@ Skills are loaded natively: the Claude Code plugin that ships a declared skill i
 registered on the session and the skill enabled by its `<plugin>:<skill>` name, so
 the CLI reads only the `SKILL.md` frontmatter up front and the body on demand.
 
-Conductor also pins the SDK's `setting_sources` to an empty list on every run — the
+Conductor also sends the SDK's `setting_sources` as an empty list by default — the
 skills counterpart to `strict_mcp_config`. Without it the `claude` CLI enables skills
 the workflow never declared, varying by machine and launch directory, which made
 `skills: []` a no-op on this provider.
 
-That isolation is broader than skills. Agents on this provider do **not** pick up:
+That isolation is broader than skills. By default, agents on this provider do **not**
+pick up:
 
 - ambient skills from `~/.claude/skills/` or any `.claude/skills/` directory
 - `CLAUDE.md` and `.claude/rules/*.md`
 - user, project, and local `settings.json` (including `env` and `apiKeyHelper`)
 - hooks
+
+A workflow can opt back in per tier with `runtime.provider.setting_sources`:
+
+```yaml
+runtime:
+  provider:
+    name: claude-agent-sdk
+    setting_sources: [project]   # user | project | local
+```
+
+The case it exists for is an agent whose `working_dir` is a *target* repository that
+ships its own `.claude/skills` — the CLI has `--plugin-dir` but no `--skill-dir`, so
+otherwise that repo has to package its skills as a Claude Code plugin to be reachable.
+`[project]` reads them, and the repo's `CLAUDE.md` / `.claude/rules` with them.
+
+An enabled tier brings **everything that tier defines, hooks included** — `project`
+reads `<working_dir>/.claude/settings.json`, whose `hooks` run shell commands on tool
+events. Enable it only for repositories trusted as much as the workflow itself.
+`user` additionally reads `~/.claude/settings.json`, which makes a run depend on the
+operator's machine; prefer `[project]`. The field is workflow-global while
+`working_dir` is per agent, so every agent on the provider loads the tiers against
+its own directory (agents without a `working_dir` against the launch directory) —
+give any agent that must stay hermetic an explicit `skills: []`, which opts it out of
+the tiers entirely.
 
 Instruction files have a replacement: run with `--workspace-instructions` (or
 `--instructions <file>`) to inject `AGENTS.md` / `CLAUDE.md` explicitly. Settings and

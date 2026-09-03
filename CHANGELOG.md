@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.36...HEAD)
 
+### Added
+
+- **Opt-in `runtime.provider.setting_sources` on `claude-agent-sdk`** (#501) —
+  selects which Claude Code settings tiers (`user` / `project` / `local`) a
+  session may load. It is empty by default, so behaviour is unchanged unless a
+  workflow asks: the provider still sends an explicit `[]`, which is
+  load-bearing because the SDK re-defaults an unset value to
+  `["user", "project"]` whenever `skills` is set. The case it exists for is an
+  agent whose `working_dir` is a *target* repository shipping its own
+  `.claude/skills` — the SDK has `--plugin-dir` but no `--skill-dir`, so that
+  repo otherwise has to package its skills as a Claude Code plugin;
+  `[project]` reads them, and the repo's `CLAUDE.md` / `.claude/rules` with
+  them. An enabled tier brings that tier's **hooks**, so it is only for
+  repositories trusted as much as the workflow itself; the field is rejected on
+  every other provider name rather than accepted and silently ignored, counts
+  as structured config (so `--provider` overrides warn before discarding it and
+  `-v` shows it), and a per-agent `skills: []` opts that agent out of the tiers
+  entirely. See
+  [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
+
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
 ### Added
