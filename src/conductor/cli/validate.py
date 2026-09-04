@@ -6,6 +6,7 @@ without executing them, displaying detailed error information.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,8 @@ from rich.text import Text
 from conductor.config.loader import load_config
 from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.exceptions import ConductorError
+from conductor.install_hint import install_command
+from conductor.telemetry.guards import OTEL_SDK_AVAILABLE
 
 if TYPE_CHECKING:
     from conductor.config.schema import WorkflowConfig
@@ -71,8 +74,20 @@ def validate_workflow(
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
     _report_plugins(config, workflow_path, output_console)
     _report_mcp(config, output_console)
+    _report_telemetry_sdk(output_console)
 
     return True, config
+
+
+def _report_telemetry_sdk(console: MarkupFreeConsole) -> None:
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip() and not OTEL_SDK_AVAILABLE:
+        console.print(
+            styled(
+                "  [yellow]⚠[/yellow] OTEL_EXPORTER_OTLP_ENDPOINT is set but the telemetry "
+                "extra is not installed. Install it with: {}",
+                install_command("telemetry"),
+            )
+        )
 
 
 def _report_plugins(

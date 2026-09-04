@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1806,6 +1807,66 @@ class TestResumeWiring:
         assert isinstance(rc.log_file, str) and rc.log_file
         # event_emitter must be wired so the dashboard / event log receive events
         assert engine_kwargs.get("event_emitter") is not None
+
+    @pytest.mark.asyncio
+    async def test_telemetry_subscribes_and_closes_after_resume(self, tmp_path: Path) -> None:
+        from conductor.cli.run import resume_workflow_async
+        from conductor.config.loader import load_config
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+        config = load_config(wf_path)
+        mock_registry, mock_engine = _make_resume_mocks()
+        telemetry_subscriber = MagicMock()
+        subscribed_callbacks: list[Callable[[WorkflowEvent], None]] = []
+        original_subscribe = WorkflowEventEmitter.subscribe
+
+        def capture_subscribe(
+            emitter: WorkflowEventEmitter, callback: Callable[[WorkflowEvent], None]
+        ) -> None:
+            subscribed_callbacks.append(callback)
+            original_subscribe(emitter, callback)
+
+        # Given: a checkpoint whose resumed run has an active tracer provider.
+        # When: the CLI resumes the workflow.
+        with (
+            patch("conductor.cli.run.load_config", return_value=config),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "conductor.cli.run._prefetch_plugin_sources",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch("conductor.cli.run._write_run_record_for_current_process"),
+            patch("conductor.cli.run._remove_run_record_for_current_process_safe"),
+            patch("conductor.fleet.retention.maybe_prune_event_logs"),
+            patch(
+                "conductor.telemetry.setup.init_tracer_provider", return_value=MagicMock()
+            ) as init,
+            patch(
+                "conductor.telemetry.subscriber.TelemetrySubscriber",
+                return_value=telemetry_subscriber,
+            ) as subscriber_type,
+            patch.object(WorkflowEventEmitter, "subscribe", new=capture_subscribe),
+        ):
+            result = await resume_workflow_async(checkpoint_path=cp_path, no_interactive=True)
+
+        # Then: telemetry is initialized, wired to events, and finalized after resume.
+        assert result == {"result": "ok"}
+        init.assert_called_once()
+        resumed_run_id = init.call_args.kwargs["run_id"]
+        assert isinstance(resumed_run_id, str)
+        assert resumed_run_id != ""
+        subscriber_type.assert_called_once_with(init.return_value, resumed=True)
+        assert telemetry_subscriber.on_event in subscribed_callbacks
+        telemetry_subscriber.close.assert_called_once()
 
     def test_metadata_value_with_equals_sign_via_cli(self, tmp_path: Path) -> None:
         """Regression: --metadata key=https://x?a=b must keep the right-hand =."""

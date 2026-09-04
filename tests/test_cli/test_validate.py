@@ -358,6 +358,45 @@ agents:
         assert "workflow.input.topic" in out
         assert "explicit" in out
 
+    def test_otlp_endpoint_without_sdk_warns_without_failing_validation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from io import StringIO
+
+        from conductor.cli.validate import validate_workflow
+        from conductor.console import make_console
+
+        workflow_file = tmp_path / "telemetry.yaml"
+        self._write(
+            workflow_file,
+            """
+workflow:
+  name: telemetry
+  entry_point: writer
+agents:
+  - name: writer
+    model: gpt-4
+    prompt: "Write"
+    routes:
+      - to: $end
+""",
+        )
+        output = StringIO()
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+        monkeypatch.setattr("conductor.cli.validate.OTEL_SDK_AVAILABLE", False)
+
+        # Given: an OTLP endpoint is configured where the optional SDK is unavailable.
+        # When: the workflow is validated.
+        is_valid, config = validate_workflow(
+            workflow_file, console=make_console(file=output, force_terminal=False)
+        )
+
+        # Then: the configuration remains valid and names the required extra.
+        assert is_valid is True
+        assert config is not None
+        assert "OTEL_EXPORTER_OTLP_ENDPOINT is set" in output.getvalue()
+        assert "telemetry" in output.getvalue()
+
     def test_for_loop_var_does_not_block_validation(self, tmp_path: Path) -> None:
         """Regression test: false-positive #1 should not cause CLI failure."""
         from conductor.cli.validate import validate_workflow

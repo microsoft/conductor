@@ -486,6 +486,24 @@ describe('workflow-store processEvent — system log metadata capture (#330)', (
   });
 });
 
+describe('workflow-store processEvent — for-each agent lifecycle', () => {
+  it('accepts the backend for_each_agent_started telemetry event without changing item progress', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    // Requirement: backend-only per-item agent metadata remains a supported
+    // event even though the dashboard progress model uses for_each_item_started.
+    processEvent(event('for_each_agent_started', {
+      group_name: 'reviews',
+      agent_name: 'reviewer[0]',
+      item_key: '0',
+      index: 0,
+      working_dir: '/workspace/review-0',
+    }));
+
+    expect(useWorkflowStore.getState().nodes.reviews).toBeUndefined();
+  });
+});
+
 describe('workflow-store — eager static sub-workflow preview (dashboard expandability)', () => {
   it('seeds a pending child context from static `subworkflow` topology on workflow_started', () => {
     const { processEvent } = useWorkflowStore.getState();

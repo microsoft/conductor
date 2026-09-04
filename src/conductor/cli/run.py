@@ -2181,6 +2181,7 @@ async def run_workflow_async(
     # Always create event emitter and JSONL log subscriber
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
+    telemetry_subscriber: Any = None
     dashboard: Any = None
 
     # Terminal-outcome locals (MCP server plan E2): populated on every exit
@@ -2276,6 +2277,16 @@ async def run_workflow_async(
 
         event_log_subscriber = EventLogSubscriber(config.workflow.name)
         emitter.subscribe(event_log_subscriber.on_event)
+
+        from conductor.telemetry.setup import init_tracer_provider
+        from conductor.telemetry.subscriber import TelemetrySubscriber
+
+        telemetry_subscriber = TelemetrySubscriber(
+            init_tracer_provider(
+                run_id=event_log_subscriber.run_id,
+            )
+        )
+        emitter.subscribe(telemetry_subscriber.on_event)
 
         # Write the Fleet Manager run record (E2): this is the first point
         # where run_id, event_log_path, and the already-started dashboard's
@@ -2542,6 +2553,9 @@ async def run_workflow_async(
         # Stop dashboard if it was started
         if dashboard is not None:
             await dashboard.stop()
+
+        if telemetry_subscriber is not None:
+            telemetry_subscriber.close()
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
@@ -2871,6 +2885,7 @@ async def resume_workflow_async(
     # Always create event emitter and JSONL log subscriber (parity with run)
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
+    telemetry_subscriber: Any = None
     dashboard: Any = None
 
     # Terminal-outcome locals (MCP server plan E2), mirroring
@@ -3050,6 +3065,17 @@ async def resume_workflow_async(
             )
             emitter.subscribe(event_log_subscriber.on_event)
 
+            from conductor.telemetry.setup import init_tracer_provider
+            from conductor.telemetry.subscriber import TelemetrySubscriber
+
+            telemetry_subscriber = TelemetrySubscriber(
+                init_tracer_provider(
+                    run_id=event_log_subscriber.run_id,
+                ),
+                resumed=True,
+            )
+            emitter.subscribe(telemetry_subscriber.on_event)
+
             # Write the Fleet Manager run record immediately, before any
             # further setup (dashboard seeding, engine construction) that
             # could take an arbitrary amount of time. `existing_log_path`
@@ -3128,6 +3154,11 @@ async def resume_workflow_async(
                 from conductor.events import WorkflowEvent
 
                 event_log_subscriber.on_event(
+                    WorkflowEvent(
+                        type="workflow_started", timestamp=time.time(), data=workflow_started_data
+                    )
+                )
+                telemetry_subscriber.on_event(
                     WorkflowEvent(
                         type="workflow_started", timestamp=time.time(), data=workflow_started_data
                     )
@@ -3343,6 +3374,9 @@ async def resume_workflow_async(
         # Stop dashboard if it was started
         if dashboard is not None:
             await dashboard.stop()
+
+        if telemetry_subscriber is not None:
+            telemetry_subscriber.close()
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:

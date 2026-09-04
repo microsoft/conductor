@@ -3407,6 +3407,16 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_telemetry(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "telemetry" in value:
+            raise ValueError(
+                "runtime.telemetry was removed; tracing is enabled via the "
+                "OTEL_EXPORTER_OTLP_ENDPOINT environment variable"
+            )
+        return value
+
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     """SDK provider configuration.
 

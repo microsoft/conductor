@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """GitHub Copilot SDK provider implementation.
 
 This module provides the CopilotProvider class for executing agents
@@ -41,6 +42,7 @@ from conductor.providers.base import (
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
+from conductor.telemetry import guards
 
 if TYPE_CHECKING:
     from copilot.session import PermissionInvocation
@@ -58,6 +60,20 @@ logger = logging.getLogger(__name__)
 # ``get_model_pricing`` returns ``None`` and cost falls back to the static
 # table rather than emitting a confident-wrong number. See #265.
 _COPILOT_USD_PER_CREDIT: float = 0.01
+
+
+def _build_client_telemetry() -> dict[str, Any] | None:
+    # Provider registry lifetime is run-scoped; holding a registry across telemetry-state changes is not a supported embedding pattern.
+    if not guards.is_telemetry_active():
+        return None
+    protocol = guards.current_otlp_protocol()
+    if protocol not in {"http/protobuf", "http/json"}:
+        return None
+    return {
+        "otlp_endpoint": guards.current_otlp_endpoint(),
+        "otlp_protocol": protocol,
+        "capture_content": guards.capture_span_content(),
+    }
 
 
 def _is_finite_nonneg(value: object) -> TypeGuard[float]:
@@ -298,6 +314,8 @@ class CopilotProvider(AgentProvider):
         # Streaming events (``agent_message``, ``agent_tool_*``) fire
         # incrementally during execution.
         streaming_events=True,
+        # Per-run activation is carried by the ``native_otel_spans_active`` start-event field.
+        native_otel_spans=True,
         # ``agent_reasoning`` is emitted for thinking-equivalent content
         # from models that expose it (GPT-5 / o1 series).
         agent_reasoning_events=True,
@@ -2844,9 +2862,9 @@ class CopilotProvider(AgentProvider):
         reuses the authenticated runtime process while creating a separate SDK
         session for each agent.
 
-        Otherwise a nested runtime is spawned via a plain, argument-free
-        ``CopilotClient()``. A ``github_token`` supplied at construction is
-        deliberately *not* passed here: the SDK's constructor-level
+        Otherwise a nested runtime is spawned via ``CopilotClient()`` with
+        optional HTTP OTLP telemetry. A ``github_token`` supplied at
+        construction is deliberately *not* passed here: the SDK's constructor-level
         ``github_token`` is exported to the spawned runtime as a
         ``COPILOT_SDK_AUTH_TOKEN`` environment variable, not delivered
         in-memory. Instead, the token is forwarded per-session via
@@ -2858,6 +2876,20 @@ class CopilotProvider(AgentProvider):
         """
         connection = self._resolve_runtime_connection()
         if connection is None:
+            telemetry = _build_client_telemetry()
+            if telemetry is not None:
+                return CopilotClient(
+                    telemetry={
+                        "otlp_endpoint": telemetry["otlp_endpoint"],
+                        "otlp_protocol": telemetry["otlp_protocol"],
+                        "capture_content": telemetry["capture_content"],
+                    }
+                )
+            if guards.is_telemetry_active() and guards.warn_copilot_grpc_once():
+                logger.warning(
+                    "Copilot native OpenTelemetry spans require HTTP OTLP; set "
+                    "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf."
+                )
             return CopilotClient()
 
         url, token = connection

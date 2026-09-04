@@ -8,7 +8,7 @@ covered (20 from design doc + script_failed).
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,6 +20,7 @@ from conductor.config.schema import (
     LimitsConfig,
     OutputField,
     ParallelGroup,
+    ProviderSettings,
     ReasoningConfig,
     RouteDef,
     RuntimeConfig,
@@ -29,6 +30,7 @@ from conductor.config.schema import (
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ConductorError, MaxIterationsError
+from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -383,6 +385,7 @@ class TestAgentEvents:
                 AgentDef(
                     name="b",
                     model="gpt-4",
+                    provider="openai",
                     prompt="do b",
                     output={"val": OutputField(type="string")},
                     routes=[RouteDef(to="$end")],
@@ -400,7 +403,12 @@ class TestAgentEvents:
         assert started[0].data["agent_name"] == "a"
         assert started[0].data["agent_type"] == "agent"
         assert started[0].data["iteration"] == 1
+        # Then: the lifecycle payload identifies the resolved provider.
+        assert started[0].data["provider"] == "copilot"
+        assert started[0].data["native_otel_spans_active"] is False
         assert started[1].data["agent_name"] == "b"
+        assert started[1].data["provider"] == "openai"
+        assert started[1].data["native_otel_spans_active"] is True
 
         # Check agent_completed events
         completed = collector.of_type("agent_completed")
@@ -410,6 +418,112 @@ class TestAgentEvents:
         assert completed[0].data["output"] == {"val": "a"}
         assert completed[0].data["output_keys"] == ["val"]
         assert completed[1].data["agent_name"] == "b"
+
+    @pytest.mark.asyncio
+    async def test_agent_started_uses_provider_matched_runtime_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given provider overrides, when their start events are emitted,
+        # then each event evaluates native OTEL state for its emitted provider.
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="provider-settings-gate",
+                entry_point="copilot_grpc",
+                runtime=RuntimeConfig(provider="openai"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="copilot_grpc",
+                    model="gpt-4",
+                    provider="copilot",
+                    prompt="copilot override",
+                    output={"value": OutputField(type="string")},
+                    routes=[RouteDef(to="openai_default")],
+                ),
+                AgentDef(
+                    name="openai_default",
+                    model="gpt-4",
+                    prompt="openai default",
+                    output={"value": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"value": "{{ openai_default.output.value }}"},
+        )
+        provider = CopilotProvider(mock_handler=lambda _a, _p, _c: {"value": "done"})
+        monkeypatch.setattr(
+            "conductor.engine.workflow.guards.current_otlp_protocol",
+            lambda: "grpc",
+        )
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        started = {
+            event.data["agent_name"]: event.data for event in collector.of_type("agent_started")
+        }
+        assert started["copilot_grpc"]["provider"] == "copilot"
+        assert started["copilot_grpc"]["native_otel_spans_active"] is False
+        assert started["openai_default"]["provider"] == "openai"
+        assert started["openai_default"]["native_otel_spans_active"] is True
+
+    @pytest.mark.asyncio
+    async def test_copilot_override_passes_mismatched_structured_runtime_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given structured settings for Claude, when a Copilot override starts,
+        # then the setting does not alter its native OTEL state.
+        emitter, collector = _make_emitter_and_collector()
+        runtime = RuntimeConfig(provider=ProviderSettings(name="claude"))
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="copilot-override",
+                entry_point="copilot_agent",
+                runtime=runtime,
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="copilot_agent",
+                    model="gpt-4",
+                    provider="copilot",
+                    prompt="copilot override",
+                    output={"value": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"value": "{{ copilot_agent.output.value }}"},
+        )
+        provider = CopilotProvider(mock_handler=lambda _a, _p, _c: {"value": "done"})
+        calls: list[tuple[str, ProviderSettings | None, str | None]] = []
+
+        def capture_native_otel_state(
+            provider_name: str,
+            provider_settings: ProviderSettings | None,
+            *,
+            telemetry_protocol: str | None,
+        ) -> bool:
+            calls.append((provider_name, provider_settings, telemetry_protocol))
+            return provider_name == "copilot"
+
+        monkeypatch.setattr(
+            "conductor.engine.workflow.native_otel_spans_active",
+            capture_native_otel_state,
+        )
+        monkeypatch.setattr(
+            "conductor.engine.workflow.guards.current_otlp_protocol",
+            lambda: "http/protobuf",
+        )
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        event = collector.first("agent_started")
+        assert event.data["provider"] == "copilot"
+        assert event.data["native_otel_spans_active"] is True
+        assert calls == [("copilot", runtime.provider, "http/protobuf")]
 
     @pytest.mark.asyncio
     async def test_agent_failed_on_error(self) -> None:
@@ -694,6 +808,11 @@ class TestScriptEvents:
         assert "stdout" in completed.data
         assert "exit_code" in completed.data
 
+        # Given a provider-free script, when its generic start event is emitted,
+        # then it must not be marked as a native-OTEL LLM span.
+        agent_started = collector.first("agent_started")
+        assert "native_otel_spans_active" not in agent_started.data
+
     @pytest.mark.asyncio
     async def test_script_failed_emitted(self) -> None:
         """script_failed event emitted when a script raises an exception."""
@@ -739,7 +858,7 @@ class TestParallelGroupEvents:
     """Tests for parallel group event emission."""
 
     @pytest.mark.asyncio
-    async def test_parallel_lifecycle_events(self) -> None:
+    async def test_parallel_lifecycle_events(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """parallel_started, parallel_agent_completed, parallel_completed emitted."""
         emitter, collector = _make_emitter_and_collector()
         config = WorkflowConfig(
@@ -760,6 +879,7 @@ class TestParallelGroupEvents:
                 AgentDef(
                     name="r2",
                     model="gpt-4",
+                    provider="openai",
                     prompt="research 2",
                     output={"result": OutputField(type="string")},
                 ),
@@ -774,6 +894,20 @@ class TestParallelGroupEvents:
             output={"result": "done"},
         )
         provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": a.name})
+        monkeypatch.setattr(
+            provider,
+            "_execute_with_retry",
+            AsyncMock(
+                return_value=AgentOutput(
+                    content={"result": "complete"},
+                    raw_response=None,
+                    tokens_used=21,
+                    input_tokens=13,
+                    output_tokens=8,
+                    model="gpt-4",
+                )
+            ),
+        )
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
         await engine.run({})
 
@@ -781,6 +915,18 @@ class TestParallelGroupEvents:
         started = collector.first("parallel_started")
         assert started.data["group_name"] == "team"
         assert started.data["agents"] == ["r1", "r2"]
+
+        # Then: each parallel lifecycle payload identifies its provider.
+        agent_started = collector.of_type("parallel_agent_started")
+        assert len(agent_started) == 2
+        assert {event.data["agent_name"]: event.data["provider"] for event in agent_started} == {
+            "r1": "copilot",
+            "r2": "openai",
+        }
+        assert {
+            event.data["agent_name"]: event.data["native_otel_spans_active"]
+            for event in agent_started
+        } == {"r1": False, "r2": True}
 
         # Check parallel_agent_completed (2 agents)
         agent_completed = collector.of_type("parallel_agent_completed")
@@ -790,6 +936,9 @@ class TestParallelGroupEvents:
         for e in agent_completed:
             assert e.data["group_name"] == "team"
             assert e.data["elapsed"] > 0
+            # Then: completion retains the provider token breakdown.
+            assert e.data["input_tokens"] == 13
+            assert e.data["output_tokens"] == 8
 
         # Check parallel_completed
         completed = collector.first("parallel_completed")
@@ -856,6 +1005,107 @@ class TestParallelGroupEvents:
         assert completed.data["success_count"] == 1
         assert completed.data["failure_count"] == 1
 
+    @pytest.mark.asyncio
+    async def test_parallel_agent_failed_includes_available_token_breakdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parallel-token-fail",
+                entry_point="team",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="good",
+                    model="gpt-4",
+                    prompt="complete",
+                    output={"result": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="bad",
+                    model="gpt-4",
+                    prompt="fail after output",
+                    output={"result": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="team",
+                    agents=["good", "bad"],
+                    failure_mode="continue_on_error",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "partial"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "complete"})
+        monkeypatch.setattr(
+            provider,
+            "_execute_with_retry",
+            AsyncMock(
+                return_value=AgentOutput(
+                    content={"result": "complete"},
+                    raw_response=None,
+                    tokens_used=10,
+                    input_tokens=6,
+                    output_tokens=4,
+                    model="gpt-4",
+                )
+            ),
+        )
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+
+        async def fail_usage_for_bad(agent: AgentDef, model: str | None) -> None:
+            if agent.name == "bad":
+                raise RuntimeError("pricing failed")
+
+        monkeypatch.setattr(engine, "_ensure_pricing_resolved", fail_usage_for_bad)
+        await engine.run({})
+
+        failed = collector.first("parallel_agent_failed")
+        assert failed.data["agent_name"] == "bad"
+        # Then: an error after output retains the received token data.
+        assert failed.data["input_tokens"] == 6
+        assert failed.data["output_tokens"] == 4
+
+    @pytest.mark.asyncio
+    async def test_parallel_set_completion_reports_zero_token_breakdown(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parallel-set-tokens",
+                entry_point="team",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(name="left", type="set", value="left"),
+                AgentDef(name="right", type="set", value="right"),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="team",
+                    agents=["left", "right"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "done"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "unused"})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        completed = collector.of_type("parallel_agent_completed")
+        assert len(completed) == 2
+        # Then: provider-free set steps report zero model tokens.
+        assert all(event.data["input_tokens"] == 0 for event in completed)
+        assert all(event.data["output_tokens"] == 0 for event in completed)
+
 
 class TestForEachGroupEvents:
     """Tests for for-each group event emission."""
@@ -890,6 +1140,7 @@ class TestForEachGroupEvents:
                     agent=AgentDef(
                         name="processor",
                         model="gpt-4",
+                        provider="openai",
                         prompt="process {{ item }}",
                         output={"result": OutputField(type="string")},
                     ),
@@ -919,15 +1170,27 @@ class TestForEachGroupEvents:
         # Check for_each_item_started (3 items)
         item_started = collector.of_type("for_each_item_started")
         assert len(item_started) == 3
-        for e in item_started:
-            assert e.data["group_name"] == "process_items"
+        assert {(event.data["item_key"], event.data["index"]) for event in item_started} == {
+            ("0", 0),
+            ("1", 1),
+            ("2", 2),
+        }
+
+        # Then: each for-each lifecycle payload identifies its provider.
+        agent_started = collector.of_type("for_each_agent_started")
+        assert len(agent_started) == 3
+        assert {event.data["provider"] for event in agent_started} == {"openai"}
+        assert {event.data["native_otel_spans_active"] for event in agent_started} == {True}
 
         # Check for_each_item_completed (3 items)
         item_completed = collector.of_type("for_each_item_completed")
         assert len(item_completed) == 3
-        for e in item_completed:
-            assert e.data["group_name"] == "process_items"
-            assert e.data["elapsed"] > 0
+        assert {(event.data["item_key"], event.data["index"]) for event in item_completed} == {
+            ("0", 0),
+            ("1", 1),
+            ("2", 2),
+        }
+        assert all(event.data["elapsed"] > 0 for event in item_completed)
 
         # Check for_each_completed
         completed = collector.first("for_each_completed")
@@ -992,6 +1255,8 @@ class TestForEachGroupEvents:
         failed = collector.of_type("for_each_item_failed")
         assert len(failed) == 1
         assert failed[0].data["group_name"] == "process_items"
+        assert failed[0].data["item_key"] == "1"
+        assert failed[0].data["index"] == 1
         assert failed[0].data["error_type"] == "ProviderError"
 
         # Check for_each_completed with failure count

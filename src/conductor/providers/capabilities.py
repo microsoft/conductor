@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -30,6 +31,7 @@ from conductor.plugins.manifest import PluginFlavor
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
+    from conductor.config.schema import ProviderSettings
     from conductor.providers.base import AgentProvider
 
 logger = logging.getLogger(__name__)
@@ -95,6 +97,10 @@ class ProviderCapabilities(BaseModel):
     streaming_events: bool
     """``True`` when the provider emits ``agent_message`` / ``agent_tool_*``
     events incrementally during execution (vs. only at completion)."""
+
+    native_otel_spans: bool = False
+    """``True`` when the provider's SDK emits OpenTelemetry spans for agent
+    operations, including tools, without Conductor creating duplicates."""
 
     agent_reasoning_events: bool
     """``True`` when the provider emits ``agent_reasoning`` events for
@@ -519,6 +525,46 @@ def uses_native_skills(provider_type: str) -> bool | None:
     return _resolve_static_flag(provider_type, "supports_native_skills")
 
 
+def has_native_otel_spans(provider_type: str) -> bool | None:
+    """Whether a provider's SDK emits the tool spans Conductor would duplicate.
+
+    Returns ``None`` when the provider cannot be resolved; callers retain
+    Conductor spans in that case.
+    """
+    try:
+        return get_capabilities(provider_type).native_otel_spans
+    except (AttributeError, ImportError, KeyError):
+        return None
+
+
+def native_otel_spans_active(
+    provider_name: str,
+    provider_settings: ProviderSettings | None,
+    *,
+    telemetry_protocol: str | None,
+) -> bool:
+    """Return whether the resolved provider can emit native OTEL spans for this run."""
+    try:
+        native_otel_spans = get_capabilities(provider_name).native_otel_spans
+    except (AttributeError, ImportError, KeyError):
+        return False
+
+    if not native_otel_spans:
+        return False
+    if provider_name != "copilot":
+        return True
+    if telemetry_protocol not in {"http/protobuf", "http/json"}:
+        return False
+
+    settings = (
+        provider_settings
+        if provider_settings is not None and provider_settings.name == provider_name
+        else None
+    )
+    runtime_url = settings.runtime_url if settings is not None else None
+    return not (runtime_url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL"))
+
+
 def uses_native_plugins(provider_type: str) -> bool | None:
     """Whether a provider can register a plugin's subagents.
 
@@ -577,7 +623,9 @@ __all__ = [
     "ReasoningEffortLevel",
     "StructuredOutputMode",
     "get_capabilities",
+    "has_native_otel_spans",
     "known_provider_names",
+    "native_otel_spans_active",
     "plugin_flavor_for",
     "requires_plugin_root_for_skills",
     "uses_native_plugins",

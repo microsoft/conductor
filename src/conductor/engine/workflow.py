@@ -66,6 +66,8 @@ from conductor.gates.human import (
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 from conductor.providers.base import AgentOutput, EventCallback
+from conductor.providers.capabilities import native_otel_spans_active
+from conductor.telemetry import guards
 
 logger = logging.getLogger(__name__)
 
@@ -4436,6 +4438,9 @@ class WorkflowEngine:
                             if is_llm_agent
                             else agent
                         )
+                        event_provider = (
+                            resolved_agent.provider or self.config.workflow.runtime.provider.name
+                        )
 
                         # Only an LLM agent has a context window to report, and
                         # asking for one *constructs the provider* — an SDK
@@ -4450,6 +4455,7 @@ class WorkflowEngine:
                             "agent_name": agent.name,
                             "iteration": agent_execution_count,
                             "agent_type": agent.type or "agent",
+                            "provider": event_provider,
                             "context_window_max": (
                                 await self._get_context_window_for_agent(resolved_agent)
                                 if is_llm_agent
@@ -4458,6 +4464,11 @@ class WorkflowEngine:
                         }
                         if is_llm_agent:
                             started_payload["working_dir"] = resolved_agent.working_dir
+                            started_payload["native_otel_spans_active"] = native_otel_spans_active(
+                                event_provider,
+                                self.config.workflow.runtime.provider,
+                                telemetry_protocol=guards.current_otlp_protocol(),
+                            )
                         self._emit("agent_started", started_payload)
 
                         # Handle terminate steps — explicit workflow exit with a
@@ -6122,6 +6133,7 @@ class WorkflowEngine:
                 Exception: Any exception from agent execution (wrapped).
             """
             _agent_start = _time.time()
+            output_for_error: AgentOutput | None = None
             try:
                 # Build context for this agent using the snapshot
                 agent_context = context_snapshot.build_for_agent(
@@ -6149,6 +6161,8 @@ class WorkflowEngine:
                             "elapsed": _agent_elapsed,
                             "model": "",
                             "tokens": 0,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
                             "cost_usd": 0.0,
                             "context_window_used": 0,
                             "context_window_max": None,
@@ -6165,12 +6179,21 @@ class WorkflowEngine:
                 # LLM-only per-member start event: emitted only here (after the
                 # per-agent resolution) so ``working_dir`` is the resolved value;
                 # the pre-context envelope ``parallel_started`` stays unchanged.
+                event_provider = (
+                    resolved_agent.provider or self.config.workflow.runtime.provider.name
+                )
                 self._emit(
                     "parallel_agent_started",
                     {
                         "group_name": parallel_group.name,
                         "agent_name": agent.name,
                         "working_dir": resolved_agent.working_dir,
+                        "provider": event_provider,
+                        "native_otel_spans_active": native_otel_spans_active(
+                            event_provider,
+                            self.config.workflow.runtime.provider,
+                            telemetry_protocol=guards.current_otlp_protocol(),
+                        ),
                     },
                 )
 
@@ -6187,6 +6210,7 @@ class WorkflowEngine:
                         event_callback=event_callback,
                     ),
                 )
+                output_for_error = output
                 _agent_elapsed = _time.time() - _agent_start
 
                 # Validator: grade output and re-run once on failure
@@ -6200,6 +6224,7 @@ class WorkflowEngine:
                         guidance_section,
                         event_callback,
                     )
+                    output_for_error = output
                     _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
@@ -6218,6 +6243,8 @@ class WorkflowEngine:
                         "elapsed": _agent_elapsed,
                         "model": output.model,
                         "tokens": output.tokens_used,
+                        "input_tokens": output.input_tokens,
+                        "output_tokens": output.output_tokens,
                         "cost_usd": usage.cost_usd,
                         **await self._context_window_fields(resolved_agent, output),
                     },
@@ -6238,6 +6265,12 @@ class WorkflowEngine:
                         "elapsed": _agent_elapsed,
                         "error_type": type(e).__name__,
                         "message": str(e),
+                        "input_tokens": (
+                            output_for_error.input_tokens if output_for_error is not None else None
+                        ),
+                        "output_tokens": (
+                            output_for_error.output_tokens if output_for_error is not None else None
+                        ),
                     },
                 )
 
@@ -6603,6 +6636,7 @@ class WorkflowEngine:
                         {
                             "group_name": for_each_group.name,
                             "item_key": key,
+                            "index": index,
                             "elapsed": _item_elapsed,
                             "tokens": child_usage.total_tokens,
                             "cost_usd": child_usage.total_cost_usd or 0.0,
@@ -6626,6 +6660,7 @@ class WorkflowEngine:
                         {
                             "group_name": for_each_group.name,
                             "item_key": key,
+                            "index": index,
                             "elapsed": _item_elapsed,
                             "tokens": 0,
                             "cost_usd": 0.0,
@@ -6652,13 +6687,23 @@ class WorkflowEngine:
                 # per-item resolution) so ``working_dir`` is the resolved value;
                 # the pre-context envelope ``for_each_item_started`` stays
                 # unchanged.
+                event_provider = (
+                    qualified_agent.provider or self.config.workflow.runtime.provider.name
+                )
                 self._emit(
                     "for_each_agent_started",
                     {
                         "group_name": for_each_group.name,
                         "agent_name": qualified_agent.name,
                         "item_key": key,
+                        "index": index,
                         "working_dir": qualified_agent.working_dir,
+                        "provider": event_provider,
+                        "native_otel_spans_active": native_otel_spans_active(
+                            event_provider,
+                            self.config.workflow.runtime.provider,
+                            telemetry_protocol=guards.current_otlp_protocol(),
+                        ),
                     },
                 )
 
@@ -6672,7 +6717,12 @@ class WorkflowEngine:
                 # consumers (dashboard, JSONL log) — they always see the
                 # for-each group name plus a separate ``item_key``.
                 def _item_callback(event_type: str, data: dict[str, Any]) -> None:
-                    data_with_agent = {**data, "agent_name": for_each_group.name, "item_key": key}
+                    data_with_agent = {
+                        **data,
+                        "agent_name": for_each_group.name,
+                        "item_key": key,
+                        "index": index,
+                    }
                     self._emit(event_type, data_with_agent)
 
                 event_callback = _item_callback if self._event_emitter else None
@@ -6717,6 +6767,7 @@ class WorkflowEngine:
                     {
                         "group_name": for_each_group.name,
                         "item_key": key,
+                        "index": index,
                         "elapsed": _item_elapsed,
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
@@ -6734,6 +6785,7 @@ class WorkflowEngine:
                     {
                         "group_name": for_each_group.name,
                         "item_key": key,
+                        "index": index,
                         "elapsed": _item_elapsed,
                         "error_type": type(e).__name__,
                         "message": str(e),

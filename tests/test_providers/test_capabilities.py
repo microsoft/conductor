@@ -5,11 +5,13 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from conductor.config.schema import ProviderSettings
 from conductor.providers.capabilities import (
     _NOT_YET_IMPLEMENTED_PROVIDERS,
     ProviderCapabilities,
     get_capabilities,
     known_provider_names,
+    native_otel_spans_active,
     plugin_flavor_for,
     uses_native_skills,
 )
@@ -259,6 +261,130 @@ class TestResolver:
         ):
             caps = get_capabilities("copilot")
             assert isinstance(caps, ProviderCapabilities)
+
+
+class TestNativeOtelSpansActive:
+    @pytest.mark.parametrize(
+        ("provider_name", "telemetry_protocol", "expected"),
+        [
+            ("openai", None, True),
+            ("claude", "grpc", True),
+            ("copilot", "grpc", False),
+            ("copilot", "http/protobuf", True),
+            ("copilot", "http/json", True),
+            ("copilot", "HTTP/PROTOBUF", False),
+            ("copilot", None, False),
+        ],
+    )
+    def test_active_when_provider_and_protocol_allow_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_name: str,
+        telemetry_protocol: str | None,
+        expected: bool,
+    ) -> None:
+        # Given native capabilities, when the provider/protocol pair is evaluated,
+        # then only Copilot HTTP protocols may report its spans as active.
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        native_capabilities = _stable_capabilities(native_otel_spans=True)
+        monkeypatch.setattr(
+            "conductor.providers.capabilities.get_capabilities",
+            lambda _provider_name: native_capabilities,
+        )
+
+        assert (
+            native_otel_spans_active(
+                provider_name,
+                None,
+                telemetry_protocol=telemetry_protocol,
+            )
+            is expected
+        )
+
+    def test_inactive_when_provider_capability_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given an unknown provider, when native OTEL status is requested,
+        # then it fails closed to avoid a duplicate-native marker.
+        monkeypatch.setattr(
+            "conductor.providers.capabilities.get_capabilities",
+            lambda _provider_name: (_ for _ in ()).throw(KeyError("unknown")),
+        )
+
+        assert (
+            native_otel_spans_active("unknown", None, telemetry_protocol="http/protobuf") is False
+        )
+
+    @pytest.mark.parametrize("provider_name", ["hermes", "aca"])
+    def test_inactive_when_provider_has_no_native_otel_capability(self, provider_name: str) -> None:
+        # Given a provider without native spans, when its status is requested,
+        # then it remains inactive for every OTLP protocol.
+        assert (
+            native_otel_spans_active(provider_name, None, telemetry_protocol="http/protobuf")
+            is False
+        )
+
+    def test_copilot_runtime_url_disables_native_spans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given a configured external runtime, when Copilot's status is evaluated,
+        # then it is not marked as natively instrumented.
+        native_capabilities = _stable_capabilities(native_otel_spans=True)
+        monkeypatch.setattr(
+            "conductor.providers.capabilities.get_capabilities",
+            lambda _provider_name: native_capabilities,
+        )
+        settings = ProviderSettings(name="copilot", runtime_url="localhost:9000")
+
+        assert (
+            native_otel_spans_active("copilot", settings, telemetry_protocol="http/protobuf")
+            is False
+        )
+
+    def test_copilot_environment_runtime_url_disables_native_spans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given the external-runtime environment fallback, when Copilot is evaluated,
+        # then it is not marked as natively instrumented.
+        native_capabilities = _stable_capabilities(native_otel_spans=True)
+        monkeypatch.setattr(
+            "conductor.providers.capabilities.get_capabilities",
+            lambda _provider_name: native_capabilities,
+        )
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "localhost:9000")
+
+        assert native_otel_spans_active("copilot", None, telemetry_protocol="http/json") is False
+
+    def test_mismatched_settings_are_ignored_for_provider_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given structured settings for another provider, when Copilot is evaluated,
+        # then those settings cannot affect the per-agent override.
+        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+        native_capabilities = _stable_capabilities(native_otel_spans=True)
+        monkeypatch.setattr(
+            "conductor.providers.capabilities.get_capabilities",
+            lambda _provider_name: native_capabilities,
+        )
+        mismatched_settings = ProviderSettings(name="claude").model_copy(
+            update={"runtime_url": "localhost:9000"}
+        )
+
+        assert (
+            native_otel_spans_active(
+                "copilot", mismatched_settings, telemetry_protocol="http/protobuf"
+            )
+            is True
+        )
+
+        monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "localhost:9000")
+
+        assert (
+            native_otel_spans_active(
+                "copilot", mismatched_settings, telemetry_protocol="http/protobuf"
+            )
+            is False
+        )
 
 
 class TestSubclassEnforcement:

@@ -47,6 +47,39 @@ only limit that can end a genuinely hung tool call. Raise it alongside
 longer than 30 minutes. Both `idle_timeout_seconds` and
 `max_idle_recovery_attempts` are Copilot-only; other providers ignore them.
 
+### OpenTelemetry Tracing
+
+Conductor tracing is opt-in. Install the optional telemetry dependencies and
+configure an OTLP collector through standard OpenTelemetry environment
+variables:
+
+```bash
+uv sync --extra telemetry
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_SERVICE_NAME=research-workflow
+```
+
+Each enabled run emits provider-independent spans for workflow, group, agent,
+step, and tool lifecycles. Conductor unifies high-level orchestration spans and
+native provider spans, for `copilot`, `claude`, and `openai` providers, into a single
+unified trace tree.
+
+The exporter uses gRPC by default. Set `OTEL_EXPORTER_OTLP_PROTOCOL` to
+`http/protobuf` or `http/json` when your collector expects OTLP/HTTP. Copilot CLI tracing
+requires an HTTP-based protocol. The service name is
+`OTEL_SERVICE_NAME` when set, otherwise `conductor`. `OTEL_SDK_DISABLED=true`
+disables tracing for the process.
+
+Conductor's own spans record execution metadata, not prompts or model
+responses. Native spans for `copilot`, `claude`, and `openai` also exclude message content by default.
+Set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `true`,
+`SPAN_ONLY`, or `SPAN_AND_EVENT` only after confirming that the collector and
+its retention policy are approved for prompt and response data. For details on how content capture behaves under different providers, see the [Copilot Provider telemetry documentation](telemetry.md#copilot-provider).
+
+Tracing is best effort: a missing telemetry extra, exporter initialization
+failure, or exporter shutdown failure logs a warning and never prevents the
+workflow from running.
+
 ## Provider Selection
 
 ### Copilot Provider
@@ -741,6 +774,22 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ```bash
 export CONDUCTOR_LOG_LEVEL=DEBUG  # INFO, DEBUG, WARNING, ERROR
 ```
+
+### OpenTelemetry
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable tracing; the OpenTelemetry SDK
+configures itself using standard environment variables. For detailed setup
+instructions, export protocols, and privacy policies, see the
+[OpenTelemetry Tracing guide](telemetry.md).
+
+| Variable | Purpose |
+|----------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint; setting it enables tracing. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | Export protocol: `grpc` (default), `http/protobuf`, or `http/json` (supported by Copilot CLI). |
+| `OTEL_SERVICE_NAME` | Service name reported to the collector; defaults to `conductor`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Key-value pairs for resource attributes (e.g. `deployment.environment=testing`). |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Enables native-span content capture only for `true`, `SPAN_ONLY`, or `SPAN_AND_EVENT`. |
+| `OTEL_SDK_DISABLED` | Set to `true` to disable tracing for the process. |
 
 ## Best Practices
 

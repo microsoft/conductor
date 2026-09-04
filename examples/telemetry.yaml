@@ -1,0 +1,54 @@
+# OpenTelemetry Tracing Example Workflow
+#
+# This example demonstrates environment-driven OpenTelemetry tracing in Conductor.
+#
+# Prerequisite:
+#   Install the optional telemetry dependencies:
+#     uv sync --extra telemetry
+#
+# Usage:
+#   # Start a Jaeger collector in the background:
+#   # docker run --rm -d -p 4317:4317 -p 4318:4318 -p 16686:16686 jaegertracing/all-in-one:latest
+#
+#   # Run the workflow with OTLP configuration:
+#   # For the copilot provider, you must export over HTTP. The default gRPC protocol (port 4317)
+#   # leaves Copilot without native LLM spans (though Conductor's orchestration spans still export).
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#   export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+#   export OTEL_SERVICE_NAME=telemetry-demo-service
+#   conductor run examples/telemetry.yaml --input question="Explain OpenTelemetry in one sentence."
+#
+# For details, configuration options, and conventions, see:
+# - docs/telemetry.md
+# - docs/configuration.md#opentelemetry-tracing
+
+workflow:
+  name: telemetry-example
+  description: A minimal workflow that exports OpenTelemetry traces when configured by the environment
+  version: "1.0.0"
+  entry_point: answerer
+
+  runtime:
+    provider: copilot
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answerer
+    description: Answers the user's question
+    model: gpt-4o-mini
+    prompt: |
+      Answer the following question:
+      {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
