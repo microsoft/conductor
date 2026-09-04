@@ -62,7 +62,10 @@ export type EventType =
   | 'iteration_limit_resolved'
   | 'budget_exceeded'
   | 'guidance_received'
-  | 'guidance_applied';
+  | 'guidance_applied'
+  | 'agent_compaction_config'
+  | 'agent_compaction_start'
+  | 'agent_compaction_complete';
 
 // --- Workflow lifecycle ---
 
@@ -563,6 +566,60 @@ export interface AgentValidationFailedData {
   /** True on the second emission, when the feedback re-run itself failed and
    *  the original (failing) output was kept. */
   rerun_errored?: boolean;
+}
+
+// --- Compaction events ---
+
+export interface AgentCompactionConfigData {
+  agent_name: string;
+  model: string;
+  context_window: number;
+  context_window_source: string;
+  output_limit: number;
+  output_limit_source: string;
+  /** False when compaction was disabled for this execution; trigger/target
+   *  are null in that case and disabled_reason says why. */
+  enabled?: boolean;
+  disabled_reason?: string | null;
+  tool_buffer?: number;
+  effective_tool_buffer?: number;
+  trigger_tokens: number | null;
+  target_tokens: number | null;
+}
+
+export interface AgentCompactionStartData {
+  agent_name: string;
+  strategy: string;
+  model: string;
+  context_window: number;
+  context_window_source: string;
+  output_limit: number;
+  output_limit_source: string;
+  trigger_tokens: number;
+  target_tokens: number;
+  messages_before?: number;
+  tokens_before?: number;
+}
+
+export interface AgentCompactionCompleteData {
+  agent_name: string;
+  strategy: string;
+  model: string;
+  context_window?: number;
+  context_window_source?: string;
+  messages_before?: number;
+  messages_after?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  tokens_saved?: number;
+  elapsed?: number;
+  errored: boolean;
+  error_type?: string;
+  message?: string;
+  /** Tiers that degraded to a weaker strategy during this compaction. */
+  degraded_tiers?: string[];
+  /** True when the post-compaction size still exceeds the trigger. */
+  still_over_trigger?: boolean;
 }
 
 // --- Subworkflow lifecycle ---

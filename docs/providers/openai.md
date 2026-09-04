@@ -12,6 +12,7 @@ The OpenAI provider enables Conductor workflows to execute agents using OpenAI's
 - [Model Selection & Runtime Configuration](#model-selection--runtime-configuration)
 - [Reasoning Effort Matrix](#reasoning-effort-matrix)
 - [MCP Tools Support](#mcp-tools-support)
+- [Context Compaction](#context-compaction)
 - [Troubleshooting](#troubleshooting)
 
 ## Quick Start
@@ -238,6 +239,20 @@ workflow:
 ```
 
 HTTP and SSE MCP server types are not supported by the OpenAI provider (`stdio` only).
+
+## Context Compaction
+
+The OpenAI provider supports automatic, client-side context compaction. When the estimated history size crosses a calculated threshold, Conductor condenses the conversation.
+
+### How Compaction Resolves on OpenAI
+
+*   **Context Window:** Conductor first checks for vendor-advertised token limits returned by the endpoint's model listing (`models.list()`). When available, it extracts the context window using a prioritized list of fields: `max_input_tokens`, `context_length`, `max_model_len`, and `max_context_length`. This works with endpoints that advertise token metadata in their models listing (such as OpenRouter, vLLM, or LM Studio). Model matching uses exact and alias matching (`match_model_id`) for suffixes like `-latest` or dates, with no prefix stripping. If the endpoint does not advertise token limits (such as official OpenAI endpoints), or if model listing is unavailable (such as Ollama), Conductor falls back to the `genai-prices` registry for first-party endpoints, or to the conservative 128,000 tokens fallback for custom `base_url` endpoints.
+*   **Output Limit:** The provider resolves the limit from the effective `max_tokens` sent to the API (source `settings` if configured, or source `default` for the unified 16384 default). This value is capped at runtime by vendor-advertised limits from the models listing using `max_output_tokens` or `top_provider.max_completion_tokens` (source `provider-cap`). To ensure consistent output limits and predictable compaction thresholds, Conductor always sends the `max_tokens` parameter (defaulting to 16384) to the OpenAI Chat Completions API.
+*   **Trigger Threshold:** Calculated using the formula:
+    $$\text{Trigger} = \text{Context Window} - (\text{Output Limit} + \text{Buffer})$$
+    where the tool buffer is resolved dynamically from configured tool limits (defaulting to 40,000 tokens).
+
+For more details on the compaction tiers, hysteresis gap, and usage limits, see the [Workflow Syntax Guide](../workflow-syntax.md#context-compaction).
 
 ## Troubleshooting
 

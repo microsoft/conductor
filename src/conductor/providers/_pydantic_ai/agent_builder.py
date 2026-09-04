@@ -25,6 +25,10 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from conductor.exceptions import ValidationError
+from conductor.providers._pydantic_ai.compaction import (
+    CompactionConfig,
+    build_tiered_compaction,
+)
 from conductor.providers._pydantic_ai.converters import (
     _sanitize_json_schema,
     output_schema_to_pydantic_model,
@@ -399,6 +403,53 @@ def _build_openai_model_settings(
     return settings
 
 
+def resolve_anthropic_effective_max_tokens(
+    agent: AgentDef,
+    *,
+    default_max_tokens: int | None,
+    default_reasoning_effort: ReasoningEffort | None,
+    default_model: str | None,
+) -> int | None:
+    """Return the effective ``max_tokens`` for an Anthropic agent.
+
+    Resolves the agent's own ``max_tokens`` (when present) over the workflow
+    default, then applies the same coercion logic used to build Anthropic model
+    settings: when extended thinking is enabled, ``max_tokens`` is bumped to at
+    least ``budget_tokens + _ANTHROPIC_THINKING_HEADROOM`` and clamped to
+    ``_ANTHROPIC_THINKING_OUTPUT_CAP``.
+
+    Args:
+        agent: The Conductor agent definition.
+        default_max_tokens: Workflow-level default ``max_tokens``.
+        default_reasoning_effort: Workflow-wide default reasoning effort.
+        default_model: Fallback model identifier when ``agent.model`` is unset.
+            Used for the thinking-support check so it matches the model the run
+            will actually use instead of the hardcoded library default.
+
+    Returns:
+        The effective ``max_tokens`` value, or ``None`` when neither the agent
+        nor the workflow default supplies one and thinking is disabled.
+    """
+    model_name = (agent.model or default_model) or DEFAULT_ANTHROPIC_MODEL
+
+    thinking = _resolve_anthropic_thinking(
+        agent,
+        model_name,
+        default_reasoning_effort,
+    )
+
+    agent_max_tokens = getattr(agent, "max_tokens", None)
+    max_tokens = agent_max_tokens if agent_max_tokens is not None else default_max_tokens
+
+    _, effective_max_tokens = _coerce_for_thinking(
+        None,
+        max_tokens,
+        thinking,
+        model_name,
+    )
+    return effective_max_tokens
+
+
 def _build_anthropic_model_settings(
     agent: AgentDef,
     default_temperature: float | None,
@@ -435,12 +486,17 @@ def _build_anthropic_model_settings(
 
     agent_temperature = getattr(agent, "temperature", None)
     temperature = agent_temperature if agent_temperature is not None else default_temperature
-    agent_max_tokens = getattr(agent, "max_tokens", None)
-    max_tokens = agent_max_tokens if agent_max_tokens is not None else default_max_tokens
 
-    effective_temperature, effective_max_tokens = _coerce_for_thinking(
+    effective_max_tokens = resolve_anthropic_effective_max_tokens(
+        agent,
+        default_max_tokens=default_max_tokens,
+        default_reasoning_effort=default_reasoning_effort,
+        default_model=default_model,
+    )
+
+    effective_temperature, _ = _coerce_for_thinking(
         temperature,
-        max_tokens,
+        effective_max_tokens,
         thinking,
         model_name,
     )
@@ -477,6 +533,7 @@ def build_agent(
     tools: list[Any] | None = None,
     backend: Literal["anthropic", "openai"] = "anthropic",
     http_client: httpx.AsyncClient | None = None,
+    compaction: CompactionConfig | None = None,
 ) -> Agent[Any, Any]:
     """Build a Pydantic AI Agent from a Conductor agent definition.
 
@@ -502,6 +559,8 @@ def build_agent(
         backend: Which LLM backend to build the agent for.
         http_client: Optional ``httpx.AsyncClient`` shared across model requests
             (openai backend only).
+        compaction: Optional resolved compaction config. When provided, a
+            tiered compaction capability is attached to the agent.
 
     Returns:
         A configured Pydantic AI ``Agent`` ready to run.
@@ -540,6 +599,35 @@ def build_agent(
     if output_type is None:
         output_type = str
 
+    capabilities: list[Any] = []
+    if compaction is not None:
+        try:
+            capabilities.append(build_tiered_compaction(compaction))
+        except Exception as exc:  # noqa: BLE001
+            error_type = type(exc).__name__
+            message = str(exc)
+            logger.warning(
+                "Failed to build tiered compaction capability for agent %s: %s: %s",
+                agent.name,
+                error_type,
+                message,
+            )
+            if compaction.event_callback is not None:
+                try:
+                    compaction.event_callback(
+                        "agent_compaction_complete",
+                        {
+                            "agent_name": compaction.agent_name,
+                            "strategy": "tiered",
+                            "model": compaction.model_name,
+                            "errored": True,
+                            "error_type": error_type,
+                            "message": message,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Error emitting agent_compaction_complete", exc_info=True)
+
     pydantic_agent: Agent[Any, Any] = Agent(
         model=model,
         output_type=output_type,
@@ -550,6 +638,7 @@ def build_agent(
         retries=AgentRetries(tools=0, output=max_parse_recovery_attempts),
         toolsets=toolsets or [],
         tools=tools or [],
+        capabilities=capabilities,
     )
 
     if isinstance(pydantic_agent.output_type, ToolOutput):

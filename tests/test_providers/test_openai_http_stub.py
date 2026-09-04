@@ -114,7 +114,9 @@ def _build_pipeline_runner(
         backoff="fixed",
     )
 
-    def build_agent_fn(toolsets: list[Any], *, max_parse_recovery_attempts: int) -> Any:
+    def build_agent_fn(
+        toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any | None = None
+    ) -> Any:
         """Return a pre-built OpenAI-backed Pydantic AI agent."""
         return build_agent(
             agent=agent,
@@ -128,6 +130,7 @@ def _build_pipeline_runner(
             default_max_tokens=1024,
             toolsets=toolsets,
             max_parse_recovery_attempts=max_parse_recovery_attempts,
+            compaction=compaction,
         )
 
     async def _run() -> Any:

@@ -30,6 +30,7 @@ from conductor.config.schema import (
     OutputField,
     RouteDef,
     RuntimeConfig,
+    ToolOutputConfig,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -88,7 +89,7 @@ def _make_provider_with_mcp() -> ClaudeProvider:
 
     provider._mcp_managers = {os.getcwd(): mock_mcp}
     provider._mcp_manager_locks = {}
-    provider._tool_output_config = MagicMock()
+    provider._tool_output_config = ToolOutputConfig()
 
     return provider
 

@@ -3443,7 +3443,7 @@ class RuntimeConfig(BaseModel):
         le=200000,
         description=(
             "Maximum OUTPUT tokens generated per response (NOT context window limit). "
-            "Claude 4: max 8192 (Opus/Sonnet) or 4096 (Haiku). "
+            "When omitted, the Claude and OpenAI providers apply a unified default of 16384. "
             "Context window: 200K tokens input+output combined (separate from this setting)"
         ),
     )
@@ -3452,7 +3452,8 @@ class RuntimeConfig(BaseModel):
     Note: This controls response length, NOT context window. Context trimming
     is handled separately by the workflow engine if needed.
 
-    Claude 4 limits: Opus/Sonnet 8192, Haiku 4096.
+    When omitted, the Claude and OpenAI providers apply a unified default of
+    16384 tokens per response.
     """
 
     timeout: float | None = Field(

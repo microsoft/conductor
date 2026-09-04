@@ -244,11 +244,11 @@ runtime:
   temperature: 1.0  # Maximum allowed
 ```
 
-### 2. Max Tokens Requirement
+### 2. Max Tokens Semantics
 
 **IMPORTANT**: The `max_tokens` field in RuntimeConfig has DIFFERENT meanings for Claude vs other providers:
 - **Copilot/OpenAI**: Context window trimming (optional, handled by workflow engine)
-- **Claude**: Maximum OUTPUT tokens per response (required by Claude API)
+- **Claude**: Maximum OUTPUT tokens per response (sent to the API; defaults to 16384 when unset)
 
 **Migration**:
 ```yaml
@@ -260,13 +260,13 @@ runtime:
 # After (Claude) - max_tokens for output generation
 runtime:
   provider: claude
-  max_tokens: 8192  # Required: max response length
+  max_tokens: 16384  # Optional: max response length (this is also the default)
 ```
 
 **Recommendation**: 
-- Always specify `max_tokens` for Claude (default: 8192)
+- Set `max_tokens` explicitly when you want a non-default response-length cap for Claude (default: 16384); Conductor does not clamp it to the model's advertised cap, so a value above the model limit is rejected by the API
 - Understand it controls OUTPUT length, not context window (Claude has 200K context)
-- Use lower values (1024-2048) for concise responses, higher (4096-8192) for detailed output
+- Use lower values (1024 to 2048) for concise responses, higher (4096 to 16384) for detailed output
 
 ### 3. Output Verbosity
 
@@ -470,7 +470,7 @@ temperature: 1.0
 **Solution**: Always specify:
 ```yaml
 runtime:
-  max_tokens: 8192
+  max_tokens: 16384
 ```
 
 ### Pitfall 5: HTTP/SSE MCP Servers Not Working

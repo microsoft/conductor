@@ -691,6 +691,26 @@ class TestHermesProviderParams:
         _, kwargs = mock_cls.call_args
         assert kwargs["max_tokens"] == 1024
 
+    def test_omitted_max_tokens_is_not_forwarded(self) -> None:
+        """Requirement: Hermes keeps its own cap when the workflow omits max_tokens."""
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            provider = HermesProvider()
+
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = _make_result()
+            mock_cls.return_value = mock_instance
+
+            asyncio.run(provider.execute(agent, {}, "hello"))
+
+        _, kwargs = mock_cls.call_args
+        assert "max_tokens" not in kwargs
+
     def test_temperature_forwarded(self) -> None:
         with (
             patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),

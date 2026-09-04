@@ -52,6 +52,7 @@ function ActivityEntryRow({ entry }: { entry: ActivityEntry }) {
     turn: 'text-amber-400',
     message: 'text-[var(--text)]',
     'parse-recovery': 'text-yellow-400',
+    'compaction-error': 'text-yellow-400',
   };
 
   return (

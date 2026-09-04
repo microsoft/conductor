@@ -18,6 +18,7 @@ Error Handling Strategy:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING, Any
@@ -27,11 +28,16 @@ from pydantic import BaseModel
 from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.mcp.manager import MCPManager
+from conductor.providers._pydantic_ai.model_listing import (
+    ModelTokenLimits,
+    extract_model_token_limits,
+)
 from conductor.providers.base import (
     AgentOutput,
     AgentProvider,
     EventCallback,
     ModelCapabilityInfo,
+    match_model_id,
 )
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
@@ -50,12 +56,27 @@ def _import_openai_sdk() -> tuple[bool, Any]:
         return False, None
 
 
+def _import_async_page() -> Any:
+    """Import the SDK's paginator base class, or ``None`` when unavailable."""
+    try:
+        from openai.pagination import AsyncPage
+
+        return AsyncPage
+    except ImportError:
+        return None
+
+
 OPENAI_SDK_AVAILABLE, openai = _import_openai_sdk()
+AsyncPage = _import_async_page()
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on models drained from a listing paginator. A misbehaving proxy
+# that paginates forever must not hang validate_connection/doctor/first execute.
+MAX_MODEL_LISTING_ITEMS = 2_000
 
 _OPENAI_REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
@@ -178,8 +199,9 @@ class OpenAIProvider(AgentProvider):
                 explicitly.
             model: Default model to use. Defaults to ``gpt-5-mini``.
             temperature: Default temperature (0.0-2.0).
-            max_tokens: Maximum output tokens. ``None`` leaves the parameter unset so
-                the server applies its own default.
+            max_tokens: Maximum output tokens. Omitted from the request when
+                unset, so the server applies the model's own default; the
+                compaction output reserve assumes 16384 in that case.
             timeout: Request timeout in seconds. Defaults to 600s.
             retry_config: Optional retry configuration. Uses default if not provided.
             mcp_servers: Optional MCP server configurations for tool support.
@@ -206,12 +228,15 @@ class OpenAIProvider(AgentProvider):
         self._client: AsyncOpenAI | None = None
         self._api_key = api_key
         self._base_url = base_url
+        self._model_user_configured = model is not None
         self._default_model = model or "gpt-5-mini"
 
         if temperature is not None:
             self._validate_temperature(temperature)
         self._default_temperature = temperature
 
+        # Validate and store max_tokens (enforce schema bounds at instantiation)
+        self._max_tokens_user_configured = max_tokens is not None
         if max_tokens is not None:
             self._validate_max_tokens(max_tokens)
         self._default_max_tokens = max_tokens
@@ -238,6 +263,15 @@ class OpenAIProvider(AgentProvider):
         # (see _connection_probe_verdict) rather than a confirmed success.
         # diagnostics.py surfaces this note instead of silently claiming "connected".
         self._connection_probe_note: str | None = None
+        self._model_listing_unavailable = False
+        self._model_listing_unavailable_warned = False
+
+        # Cache of model_id -> max_input_tokens / max_output_tokens populated
+        # lazily on first get_max_prompt_tokens/get_max_output_tokens call.
+        # Guarded by an asyncio.Lock to avoid racing concurrent first-callers
+        # and emitting duplicate models.list() requests.
+        self._model_limits_cache: dict[str, ModelTokenLimits] | None = None
+        self._model_cache_lock = asyncio.Lock()
 
         self._initialize_client()
 
@@ -343,6 +377,8 @@ class OpenAIProvider(AgentProvider):
             models_page = await self._client.models.list()
             self._report_available_models(models_page)
             self._connection_probe_note = None
+            self._model_listing_unavailable = False
+            self._model_listing_unavailable_warned = False
             return True
         except Exception as e:
             return self._connection_probe_verdict(e)
@@ -393,10 +429,17 @@ class OpenAIProvider(AgentProvider):
             "will be verified on the first agent call."
         )
         self._connection_probe_note = f"unverified (HTTP {status_code})"
+        self._model_listing_unavailable = True
+        self._model_listing_unavailable_warned = False
         return True
 
     def _report_available_models(self, models_page: Any) -> None:
-        """Log available models, warn if default model is unavailable.
+        """Log available models and seed the token-limits cache.
+
+        Seeds ``_model_limits_cache`` so the first call to
+        :meth:`get_max_prompt_tokens` / :meth:`get_max_output_tokens`
+        doesn't pay for an extra round-trip, and warns when an explicitly
+        requested model is absent from the listing.
 
         Args:
             models_page: The result of ``client.models.list()``.
@@ -404,13 +447,187 @@ class OpenAIProvider(AgentProvider):
         available_models = [model.id for model in models_page.data]
         logger.info(f"Available OpenAI models: {', '.join(available_models)}")
 
-        if self._default_model not in available_models:
+        if self._model_user_configured:
+            self._warn_if_requested_model_missing(available_models)
+
+        if not available_models:
+            # An empty probe page must not install an empty cache — that would
+            # mark token limits as resolved for the process lifetime.
             logger.warning(
-                f"Requested model '{self._default_model}' is not in the list of "
-                f"available models. API calls may fail. Available: {available_models}"
+                "Model listing returned no models; context-window limits "
+                "remain unresolved and the next lookup will retry."
             )
+            return
+
+        self._install_model_limits_cache(list(models_page.data))
+
+    def _warn_if_requested_model_missing(self, available_models: list[str]) -> None:
+        """Warn when an explicitly requested model is absent from the listing.
+
+        The hardcoded fallback default is never warned about: per-agent
+        ``model:`` overrides may make it unused, so a mismatch would be a
+        false positive on endpoints (e.g. proxies) that don't list it.
+        """
+        if self._default_model in available_models:
+            logger.debug(f"Requested model '{self._default_model}' verified in available models")
+            return
+        logger.warning(
+            f"Requested model '{self._default_model}' is not in the list of "
+            f"available models. API calls may fail. Available: {available_models}"
+        )
+
+    def _install_model_limits_cache(self, models_data: list[Any]) -> None:
+        """Replace the model token-limits cache with a fresh mapping."""
+        self._model_limits_cache = {
+            info.id: extract_model_token_limits(info) for info in models_data
+        }
+
+    def _resolve_model_limits(self, model: str) -> ModelTokenLimits | None:
+        """Resolve ``model`` against the cached token limits using alias matching.
+
+        Returns ``None`` when the cache is empty or no alias matches.
+        """
+        cache = self._model_limits_cache
+        if cache is None:
+            return None
+        matched_id = match_model_id(model, cache.keys())
+        if matched_id is None:
+            return None
+        return cache.get(matched_id)
+
+    async def _fetch_model_infos(self) -> list[Any]:
+        """Return every model metadata item emitted by the OpenAI SDK paginator.
+
+        ``client.models.list()`` returns an awaitable paginator. ``AsyncPage``
+        declares a ``data`` attribute, so checking for ``data`` first would
+        return only the first page and never drain a real paginator — every
+        model past page one would silently not exist for context-window
+        resolution on paginating gateways (OpenRouter/LiteLLM/vLLM). A real
+        paginator (``isinstance`` against the SDK's ``AsyncPage`` — duck checks
+        are unreliable since a bare ``MagicMock`` auto-creates every attribute)
+        is drained with ``async for``, bounded by :data:`MAX_MODEL_LISTING_ITEMS`
+        so a proxy that paginates forever cannot hang the caller. The ``data``
+        shortcut remains for legacy single-page mocks only.
+        """
+        assert self._client is not None
+        result = self._client.models.list()
+        page: Any = await result if inspect.isawaitable(result) else result
+        if AsyncPage is None or not isinstance(page, AsyncPage):
+            data: Any = getattr(page, "data", None)
+            if data is not None:
+                return list(data)
+            models: list[Any] = []
+            async for model in page:
+                models.append(model)
+            return models
+        models = []
+        async for model in page:
+            models.append(model)
+            if len(models) >= MAX_MODEL_LISTING_ITEMS:
+                logger.warning(
+                    "Model listing exceeded %d items and was truncated; "
+                    "the endpoint paginates beyond the supported bound.",
+                    MAX_MODEL_LISTING_ITEMS,
+                )
+                break
+        return models
+
+    async def _ensure_model_limits_cache(self) -> None:
+        """Populate model token-limits cache if not already filled.
+
+        Uses the double-checked locking pattern: the cache is re-verified
+        after acquiring the lock, so concurrent first-callers issue exactly
+        one ``client.models.list()`` round-trip.
+        """
+        if self._model_limits_cache is not None:
+            return
+
+        if self._client is None:
+            return
+
+        async with self._model_cache_lock:
+            if self._model_limits_cache is not None:
+                return
+            try:
+                models = await self._fetch_model_infos()
+            except Exception as e:  # noqa: BLE001 - best-effort; don't poison the cache
+                # Don't cache the failure — let the next call retry.
+                logger.debug("Failed to list OpenAI models: %s", e)
+                return
+            if not models:
+                # Don't cache an empty listing as resolved — a proxy may return an
+                # empty page transiently; leave the cache unset so the next call retries.
+                logger.warning(
+                    "Model listing returned no models; context-window limits "
+                    "remain unresolved and the next lookup will retry."
+                )
+                return
+            self._install_model_limits_cache(models)
+
+    def _log_model_listing_unavailable(self) -> None:
+        """Log that model listing is unavailable, once at warning then at debug.
+
+        Called by ``get_max_prompt_tokens`` / ``get_max_output_tokens`` / ``list_models``
+        when ``_model_listing_unavailable`` is set so repeated calls don't each
+        re-attempt a guaranteed-failing ``models.list()`` round-trip.
+        """
+        if not self._model_listing_unavailable_warned:
+            logger.warning(
+                "Model listing is unavailable for this endpoint; context-window "
+                "reporting disabled for this endpoint."
+            )
+            self._model_listing_unavailable_warned = True
         else:
-            logger.debug(f"Default model '{self._default_model}' verified in available models")
+            logger.debug("Model listing remains unavailable for this endpoint.")
+
+    async def get_max_prompt_tokens(self, model: str) -> int | None:
+        """Return the maximum prompt tokens advertised for ``model``.
+
+        On first call, populates a per-instance cache by calling
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache when the probe
+        succeeds. Alias resolution uses :func:`match_model_id` so ``-latest``
+        and dated suffixes resolve to the cached entry.
+
+        Returns ``None`` when the SDK is unavailable, the model can't be
+        resolved, the listing call fails, or the API reports no input cap
+        for the model. Context-window metadata is best-effort and must never
+        block workflow execution.
+        """
+        if not OPENAI_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
+
+        await self._ensure_model_limits_cache()
+        limits = self._resolve_model_limits(model)
+        return limits.max_input_tokens if limits is not None else None
+
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the maximum output tokens advertised for ``model``.
+
+        On first call, populates a per-instance cache by calling
+        ``client.models.list()``; subsequent calls are dictionary lookups.
+        ``validate_connection()`` already populates the cache when the probe
+        succeeds. Alias resolution uses :func:`match_model_id`.
+
+        Returns ``None`` when the SDK is unavailable, the model can't be
+        resolved, the listing call fails, or the API reports no output cap
+        for the model. Output metadata is best-effort and must never block
+        workflow execution.
+        """
+        if not OPENAI_SDK_AVAILABLE or self._client is None:
+            return None
+
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
+
+        await self._ensure_model_limits_cache()
+        limits = self._resolve_model_limits(model)
+        return limits.max_output_tokens if limits is not None else None
 
     async def list_models(self) -> list[str] | None:
         """Return the model ids advertised by the OpenAI API.
@@ -419,21 +636,15 @@ class OpenAIProvider(AgentProvider):
         """
         if not OPENAI_SDK_AVAILABLE or self._client is None:
             return None
+        if self._model_listing_unavailable:
+            self._log_model_listing_unavailable()
+            return None
         try:
-            page = await self._client.models.list()
+            models = await self._fetch_model_infos()
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             logger.debug("Failed to list OpenAI models: %s", e)
             return None
-        return [model.id for model in page.data]
-
-    async def get_max_prompt_tokens(self, model: str) -> int | None:
-        """Return the maximum prompt tokens for ``model``.
-
-        The OpenAI API does not expose per-model input limits through
-        ``models.list()``, so this always returns ``None``.
-        """
-        del model
-        return None
+        return [model.id for model in models]
 
     async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
         """Return reasoning-effort support and prompt-token limits for ``model``.
@@ -543,6 +754,11 @@ class OpenAIProvider(AgentProvider):
             self._client = None
             await client.close()
             logger.debug("OpenAI provider closed")
+
+        # Drop cached metadata so a re-initialized provider re-fetches.
+        self._model_limits_cache = None
+        self._model_listing_unavailable = False
+        self._model_listing_unavailable_warned = False
 
     async def execute_dialog_turn(
         self,
@@ -704,13 +920,76 @@ class OpenAIProvider(AgentProvider):
                 )
 
         from conductor.providers._pydantic_ai.agent_builder import build_agent
+        from conductor.providers._pydantic_ai.compaction import CompactionConfig
+        from conductor.providers._pydantic_ai.compaction_window import (
+            resolve_compaction_plan,
+            resolve_compaction_window,
+            resolve_output_limit,
+            tool_buffer_tokens,
+        )
+        from conductor.providers._pydantic_ai.events import emit_compaction_config
         from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
         from conductor.providers._pydantic_ai.runner import run_agent_pipeline
 
         resolved_cwd = agent.working_dir or os.getcwd()
         manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
-        def build_agent_fn(toolsets: list[Any], *, max_parse_recovery_attempts: int) -> Any:
+        effective_model = agent.model or self._default_model
+        window = await resolve_compaction_window(
+            provider=self,
+            model=effective_model,
+            has_custom_base_url=self._base_url is not None,
+        )
+        agent_max_tokens = getattr(agent, "max_tokens", None)
+        output_limit = await resolve_output_limit(
+            provider=self,
+            model=effective_model,
+            effective_max_tokens=(
+                agent_max_tokens if agent_max_tokens is not None else self._default_max_tokens
+            ),
+            user_configured=agent_max_tokens is not None or self._max_tokens_user_configured,
+        )
+        tool_buffer = tool_buffer_tokens(self._tool_output_config)
+        plan = resolve_compaction_plan(
+            window=window.tokens,
+            output_limit=output_limit.tokens,
+            tool_buffer=tool_buffer,
+        )
+        if plan.enabled:
+            assert plan.trigger_tokens is not None  # guaranteed by resolve_compaction_plan
+            assert plan.target_tokens is not None
+            compaction_cfg: CompactionConfig | None = CompactionConfig(
+                window_tokens=window.tokens,
+                window_source=window.source,
+                output_limit_tokens=output_limit.tokens,
+                output_limit_source=output_limit.source,
+                trigger_tokens=plan.trigger_tokens,
+                target_tokens=plan.target_tokens,
+                event_callback=event_callback,
+                agent_name=agent.name,
+                model_name=effective_model,
+            )
+        else:
+            compaction_cfg = None
+        emit_compaction_config(
+            event_callback,
+            agent_name=agent.name,
+            model=effective_model,
+            context_window=window.tokens,
+            context_window_source=window.source,
+            output_limit=output_limit.tokens,
+            output_limit_source=output_limit.source,
+            enabled=plan.enabled,
+            disabled_reason=plan.disabled_reason,
+            trigger_tokens=plan.trigger_tokens,
+            target_tokens=plan.target_tokens,
+            tool_buffer=tool_buffer,
+            effective_tool_buffer=plan.effective_tool_buffer,
+        )
+
+        def build_agent_fn(
+            toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any | None = None
+        ) -> Any:
             return build_agent(
                 agent=agent,
                 system_prompt=agent.system_prompt or "",
@@ -726,6 +1005,7 @@ class OpenAIProvider(AgentProvider):
                 toolsets=toolsets,
                 backend="openai",
                 http_client=None,
+                compaction=compaction,
             )
 
         retry_config = PydanticRetryConfig(
@@ -769,4 +1049,5 @@ class OpenAIProvider(AgentProvider):
             default_model=self._default_model,
             retry_history=self._retry_history,
             build_agent_fn=build_agent_fn,
+            compaction=compaction_cfg,
         )

@@ -545,6 +545,32 @@ class AgentProvider(ABC):
         """
         return None
 
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the SDK-reported maximum output (completion) tokens for ``model``.
+
+        This is the provider's output cap for a single response. It is used by
+        compaction to reserve enough headroom in the context window for the
+        model's own answer.
+
+        Implementations should:
+
+        * Query their SDK's model-listing endpoint (cached after the first call).
+        * Return ``None`` when the model is unknown to the provider, when the
+          SDK call fails, or when no metadata is available.
+        * Never raise — context-window metadata is best-effort and must not
+          interrupt workflow execution.
+
+        The default implementation returns ``None``.
+
+        Args:
+            model: The model identifier as it would be sent to the SDK
+                (e.g. ``"gpt-5.2"``, ``"claude-sonnet-4-5-20250929"``).
+
+        Returns:
+            The maximum output tokens the SDK will accept, or ``None``.
+        """
+        return None
+
     async def get_model_pricing(self, model: str) -> ModelPricing | None:
         """Return provider-supplied pricing for ``model``, or ``None``.
 

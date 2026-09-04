@@ -220,10 +220,10 @@ agents:
         with _capture_build_agent(captured, {"result": "Test response"}):
             await engine.run({})
 
-        # ClaudeProvider defaults: temperature=None, max_tokens=8192.
+        # ClaudeProvider defaults: temperature=None, max_tokens=16384.
         # _build_anthropic_model_settings only includes temperature when it is not None.
         assert captured["model_settings"].get("temperature") is None
-        assert captured["model_settings"]["max_tokens"] == 8192
+        assert captured["model_settings"]["max_tokens"] == 16_384
 
         await provider.close()
 

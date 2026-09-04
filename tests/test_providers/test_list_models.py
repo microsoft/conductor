@@ -91,11 +91,26 @@ class TestClaudeListModels:
         assert await provider.list_models() is None
 
     async def test_sdk_error_returns_none(self) -> None:
+        # A transport failure (connection/timeout) still resolves to None.
+        from anthropic import APIConnectionError
+
+        provider = ClaudeProvider(api_key="test-key")
+        provider._client = SimpleNamespace(  # type: ignore[assignment]
+            models=SimpleNamespace(
+                list=AsyncMock(side_effect=APIConnectionError(request=None))  # type: ignore[arg-type]
+            )
+        )
+        assert await provider.list_models() is None
+
+    async def test_unexpected_sdk_error_raises(self) -> None:
+        # A non-transport SDK error (e.g. a parser bug) must surface, not be
+        # swallowed as an indistinguishable diagnostic debug line.
         provider = ClaudeProvider(api_key="test-key")
         provider._client = SimpleNamespace(  # type: ignore[assignment]
             models=SimpleNamespace(list=AsyncMock(side_effect=RuntimeError("boom")))
         )
-        assert await provider.list_models() is None
+        with pytest.raises(RuntimeError, match="boom"):
+            await provider.list_models()
 
     async def test_sdk_unavailable_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         provider = ClaudeProvider(api_key="test-key")

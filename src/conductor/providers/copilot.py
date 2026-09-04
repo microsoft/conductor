@@ -3226,6 +3226,24 @@ class CopilotProvider(AgentProvider):
         limits = getattr(info.capabilities, "limits", None)
         return getattr(limits, "max_prompt_tokens", None)
 
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the Copilot SDK's ``max_output_tokens`` for ``model``.
+
+        Implements the :meth:`AgentProvider.get_max_output_tokens` hook by
+        delegating to :meth:`get_model_capabilities`, which reads
+        ``capabilities.limits.max_output_tokens`` off the same
+        ``client.list_models()`` entry. Compaction uses this to reserve
+        headroom for the model's own answer.
+
+        Returns ``None`` in mock-handler mode, when the SDK is unavailable,
+        when no match is found, or when the SDK call fails — context-window
+        metadata must never block workflow execution.
+        """
+        capabilities = await self.get_model_capabilities(model)
+        if capabilities is None:
+            return None
+        return capabilities.max_output_tokens
+
     async def get_model_pricing(self, model: str) -> ModelPricing | None:
         """Derive per-token USD pricing for ``model`` from the SDK billing data.
 

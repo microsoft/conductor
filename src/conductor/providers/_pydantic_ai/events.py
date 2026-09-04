@@ -224,6 +224,58 @@ def emit_pydantic_event(
         logger.debug("Error in event_callback for %s", event_type, exc_info=True)
 
 
+def emit_compaction_config(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    model: str,
+    context_window: int,
+    context_window_source: str,
+    output_limit: int,
+    output_limit_source: str,
+    enabled: bool,
+    trigger_tokens: int | None,
+    target_tokens: int | None,
+    tool_buffer: int,
+    effective_tool_buffer: int | None,
+    disabled_reason: str | None = None,
+) -> None:
+    """Emit an ``agent_compaction_config`` event, swallowing callback errors.
+
+    This informational event fires once per agent execution, immediately after
+    the resolved context-window and output-limit values are known. It is
+    emitted whether or not compaction is enabled so operators can read the
+    resolved thresholds — or, for a disabled plan, the reason it is off —
+    from the event log. ``trigger_tokens``/``target_tokens`` are ``None``
+    (serialized as null) when compaction is disabled; ``effective_tool_buffer``
+    is the window-fraction-clamped reserve the plan actually applied, and is
+    ``None`` only when the plan carries no buffer information.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_config",
+            {
+                "agent_name": agent_name,
+                "model": model,
+                "context_window": context_window,
+                "context_window_source": context_window_source,
+                "output_limit": output_limit,
+                "output_limit_source": output_limit_source,
+                "enabled": enabled,
+                "disabled_reason": disabled_reason,
+                "trigger_tokens": trigger_tokens,
+                "target_tokens": target_tokens,
+                "tool_buffer": tool_buffer,
+                "effective_tool_buffer": effective_tool_buffer,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_config", exc_info=True)
+
+
 def emit_agent_turn_start(
     event_callback: EventCallback | None,
     turn: int | str,
@@ -291,3 +343,143 @@ def maybe_emit_tool_truncation(
         )
     except Exception:
         logger.debug("Error in event_callback for agent_tool_output_truncated", exc_info=True)
+
+
+def emit_compaction_start(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    context_window: int,
+    context_window_source: str,
+    output_limit: int,
+    output_limit_source: str,
+    trigger_tokens: int,
+    target_tokens: int,
+    messages_before: int,
+    tokens_before: int,
+) -> None:
+    """Emit an ``agent_compaction_start`` event, swallowing callback errors.
+
+    This event fires immediately before compaction begins on a request whose
+    estimated context size is above the trigger threshold.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_start",
+            {
+                "agent_name": agent_name,
+                "strategy": strategy,
+                "model": model,
+                "context_window": context_window,
+                "context_window_source": context_window_source,
+                "output_limit": output_limit,
+                "output_limit_source": output_limit_source,
+                "trigger_tokens": trigger_tokens,
+                "target_tokens": target_tokens,
+                "messages_before": messages_before,
+                "tokens_before": tokens_before,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_start", exc_info=True)
+
+
+def emit_compaction_complete(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    context_window: int,
+    context_window_source: str,
+    messages_before: int,
+    messages_after: int,
+    tokens_before: int,
+    tokens_after: int,
+    elapsed: float,
+    degraded_tiers: list[str],
+    still_over_trigger: bool,
+) -> None:
+    """Emit a success-shaped ``agent_compaction_complete`` event.
+
+    This event fires after compaction finishes, regardless of which tier
+    produced the final context. ``degraded_tiers`` names the tiers whose own
+    ``compact`` raised and were skipped (recovered by a later tier), and
+    ``still_over_trigger`` reports that the post-compaction estimate remains
+    above the trigger, so consumers can distinguish a full success from a
+    degraded outcome instead of reading both as false success.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_complete",
+            {
+                "agent_name": agent_name,
+                "strategy": strategy,
+                "model": model,
+                "context_window": context_window,
+                "context_window_source": context_window_source,
+                "messages_before": messages_before,
+                "messages_after": messages_after,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "tokens_saved": max(0, tokens_before - tokens_after),
+                "elapsed": elapsed,
+                "errored": False,
+                "degraded_tiers": degraded_tiers,
+                "still_over_trigger": still_over_trigger,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_complete", exc_info=True)
+
+
+def emit_compaction_complete_error(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    exc: Exception,
+    context_window: int | None = None,
+    context_window_source: str | None = None,
+    messages_before: int | None = None,
+    tokens_before: int | None = None,
+) -> None:
+    """Emit an errored ``agent_compaction_complete`` event, swallowing callback errors.
+
+    This event fires when compaction itself fails and the request context is
+    being returned unchanged. Any before-metrics that are known are included
+    alongside the error details.
+    """
+    if event_callback is None:
+        return
+
+    payload: dict[str, Any] = {
+        "agent_name": agent_name,
+        "strategy": strategy,
+        "model": model,
+        "errored": True,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+    if context_window is not None:
+        payload["context_window"] = context_window
+    if context_window_source is not None:
+        payload["context_window_source"] = context_window_source
+    if messages_before is not None:
+        payload["messages_before"] = messages_before
+    if tokens_before is not None:
+        payload["tokens_before"] = tokens_before
+
+    try:
+        event_callback("agent_compaction_complete", payload)
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_complete", exc_info=True)

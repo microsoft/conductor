@@ -1169,6 +1169,114 @@ class ConsoleEventSubscriber:
                 style="yellow",
             )
 
+        elif t == "agent_compaction_config":
+            agent_name = d.get("agent_name", "?")
+            context_window = d.get("context_window", 0)
+            output_limit = d.get("output_limit", 0)
+            if not d.get("enabled", True):
+                verbose_log(
+                    styled(
+                        "  WARNING: compaction disabled for '[bold]{}[/bold]' ({}) — "
+                        "lower runtime.max_tokens or tool_output.max_chars",
+                        agent_name,
+                        d.get("disabled_reason") or "unknown",
+                    ),
+                    style="yellow",
+                )
+            else:
+                trigger_tokens = d.get("trigger_tokens", 0)
+                target_tokens = d.get("target_tokens", 0)
+                verbose_log(
+                    styled(
+                        "  NOTE: compaction armed for '[bold]{}[/bold]' "
+                        "(window {} from {}, output limit {} from {}, trigger {}, target {})",
+                        agent_name,
+                        context_window,
+                        d.get("context_window_source", "?"),
+                        output_limit,
+                        d.get("output_limit_source", "?"),
+                        trigger_tokens,
+                        target_tokens,
+                    ),
+                    style="dim",
+                )
+
+        elif t == "agent_compaction_start":
+            agent_name = d.get("agent_name", "?")
+            tokens_before = d.get("tokens_before", 0)
+            context_window = d.get("context_window", 0) or 0
+            context_window_source = d.get("context_window_source", "?")
+            pct = int(tokens_before / context_window * 100) if context_window > 0 else 0
+            verbose_log(
+                styled(
+                    "  NOTE: compacting context for '[bold]{}[/bold]' "
+                    "({} tokens, {}% of {} window from {})",
+                    agent_name,
+                    tokens_before,
+                    pct,
+                    context_window,
+                    context_window_source,
+                ),
+                style="dim blue",
+            )
+
+        elif t == "agent_compaction_complete":
+            agent_name = d.get("agent_name", "?")
+            if d.get("errored"):
+                error_type = d.get("error_type", "Error")
+                message = d.get("message", "unknown")
+                verbose_log(
+                    styled(
+                        "  WARNING: context compaction failed for '[bold]{}[/bold]' "
+                        "({}: {}) — compaction is disabled for the remainder of this run",
+                        agent_name,
+                        error_type,
+                        message,
+                    ),
+                    style="yellow",
+                )
+            else:
+                tokens_before = d.get("tokens_before", 0)
+                tokens_after = d.get("tokens_after", 0)
+                messages_before = d.get("messages_before", 0)
+                messages_after = d.get("messages_after", 0)
+                elapsed = d.get("elapsed", 0.0)
+                degraded_tiers = d.get("degraded_tiers") or []
+                still_over_trigger = d.get("still_over_trigger", False)
+                if degraded_tiers or still_over_trigger:
+                    reasons: list[str] = []
+                    if degraded_tiers:
+                        reasons.append(f"tier(s) degraded: {', '.join(degraded_tiers)}")
+                    if still_over_trigger:
+                        reasons.append("history remains above the trigger")
+                    verbose_log(
+                        styled(
+                            "  WARNING: context compacted for '[bold]{}[/bold]': "
+                            "{} → {} tokens ({} → {} messages, {:.2f}s) — {}",
+                            agent_name,
+                            tokens_before,
+                            tokens_after,
+                            messages_before,
+                            messages_after,
+                            elapsed,
+                            "; ".join(reasons),
+                        ),
+                        style="yellow",
+                    )
+                else:
+                    verbose_log(
+                        styled(
+                            "  NOTE: context compacted for '[bold]{}[/bold]': "
+                            "{} → {} tokens ({} → {} messages, {:.2f}s)",
+                            agent_name,
+                            tokens_before,
+                            tokens_after,
+                            messages_before,
+                            messages_after,
+                            elapsed,
+                        )
+                    )
+
         elif t == "guidance_received":
             pending = d.get("pending", 1)
             verbose_log(

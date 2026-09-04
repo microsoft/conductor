@@ -1,0 +1,77 @@
+# Context Compaction Workflow Example
+#
+# This workflow demonstrates automatic client-side context compaction.
+# Compaction operates on the pydantic-ai message history built up inside a
+# SINGLE agent execution — a multi-turn tool loop where every tool call and
+# its (potentially large) result stays in the history. Loop-back iterations
+# do NOT accumulate it: each agent execution starts a fresh provider session.
+#
+# The researcher below runs a web-search MCP server whose results arrive as
+# full pages of text. Across several search-and-read turns in one execution,
+# the history grows until it crosses the compaction trigger and Conductor
+# clears old tool results, summarizes older messages, then slides the window.
+#
+# There is no user-facing context window override. Resolution uses provider
+# metadata, the registry, or the fallback. For testing, a LARGE
+# runtime.max_tokens lowers the trigger threshold (window minus output limit
+# minus effective tool buffer) and makes compaction fire sooner.
+#
+# For this example, we configure it to run on the claude provider,
+# but it's also supported on the openai provider.
+#
+# Usage:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   conductor run examples/compaction.yaml --input topic="vector databases"
+#
+# The MCP server below is fetched on demand by npx (Node.js required).
+
+workflow:
+  name: context-compaction
+  description: Demonstrates automatic, always-on client-side context compaction across a multi-turn MCP tool loop
+  version: "1.0.0"
+  entry_point: researcher
+
+  runtime:
+    provider: claude # compaction is always-on for claude and openai providers
+    default_model: claude-sonnet-4.5
+    temperature: 0.5
+    # Deliberately large: the trigger is window minus output limit minus
+    # effective tool buffer, so a large output limit lowers the trigger and
+    # makes compaction fire sooner within a single tool-loop execution.
+    max_tokens: 32768
+    max_agent_iterations: 15 # >= 5 recommended when expecting compaction
+    mcp_servers:
+      web-search:
+        # Same open-websearch server as examples/tool-output-limits.yaml.
+        command: sh
+        args: ["-c", "MODE=stdio DEFAULT_SEARCH_ENGINE=duckduckgo ALLOWED_SEARCH_ENGINES=duckduckgo exec npx -y open-websearch@latest"]
+        tools: ["search"]
+
+  input:
+    topic:
+      type: string
+      required: false
+      default: "vector databases"
+      description: The topic to research across many searches
+
+agents:
+  - name: researcher
+    description: Runs a long sequence of web searches, accumulating large tool results in one execution
+    prompt: |
+      Research "{{ workflow.input.topic }}" thoroughly.
+
+      Run at least 8 separate web searches, each on a different sub-topic
+      (architecture, indexing algorithms, query planning, consistency models,
+      deployment topologies, benchmarking, failure modes, ecosystem). After
+      each search, read the full result text carefully before moving on.
+
+      When you are done, produce a consolidated report of your findings.
+    output:
+      report:
+        type: string
+        description: The consolidated research report
+    routes:
+      - to: $end
+
+output:
+  report: "{{ researcher.output.report }}"

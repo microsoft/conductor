@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this bound restores them; the pin does not change behavior for anyone
   already on `mcp` 1.x.
 
+### Added
+
+- **Automatic client-side context compaction for pydantic-ai providers** (`claude` and `openai`). Conductor automatically condenses conversation history when it crosses a calculated trigger threshold. The trigger is computed using an additive reserve formula — context window minus output limit minus an effective tool-output-derived buffer (clamped to at most 25% of the window) — and compaction is disabled with a `disabled_reason` on the `agent_compaction_config` event when the remaining trigger would fall below 4096 tokens. To condense history, the compaction process runs a three-stage strategy: clearing old tool results first, summarizing older messages with a nested model call, and sliding the window as a deterministic fallback.
+- **Provider-advertised model token-limit metadata** for compaction sizing. The `claude` and `openai` providers read per-model input/output token limits from their SDK model listings (with full pagination for the Anthropic SDK, and a vendor-field parser for OpenAI-compatible endpoints), the `copilot` provider implements the `get_max_output_tokens` hook, and resolution falls back through the `genai-prices` registry to a conservative default.
+
+### Changed
+
+- **Claude default `max_tokens` raised from 8192 to 16384** when unset. This doubles the worst-case output cost per call for users who never set it; set `runtime.max_tokens` explicitly to keep the former behavior. For Claude thinking agents, `low` or `medium` effort levels without an explicit `max_tokens` limit now send 16384 tokens instead of the former 8192 or 12288 tokens.
+- **The `openai` provider honors vendor-advertised token limits** from the models listing when available, using them to size the compaction output reserve.
+
 ## [0.1.35](https://github.com/microsoft/conductor/compare/v0.1.34...v0.1.35) - 2026-08-28
 
 ### Removed
