@@ -41,6 +41,107 @@ class TestValidateWorkflowConfig:
         warnings = validate_workflow_config(config)
         assert isinstance(warnings, list)
 
+    def test_script_with_error_routes_requires_success_route(self) -> None:
+        """A successful script must have a deterministic success path."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="script"),
+            agents=[
+                AgentDef(
+                    name="script",
+                    type="script",
+                    command="echo",
+                    routes=[RouteDef(to="$end", on_error=True)],
+                )
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="no success route"):
+            validate_workflow_config(config)
+
+    def test_raises_validates_specific_error_routes_when_present(self) -> None:
+        """A raises declaration catches misspelled specific route kinds."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="script"),
+            agents=[
+                AgentDef(
+                    name="script",
+                    type="script",
+                    command="echo",
+                    raises=["external.git.drift"],
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="$end", on_error="external.git.fetch_failed"),
+                    ],
+                )
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="not declared in raises"):
+            validate_workflow_config(config)
+
+    def test_error_routes_are_rejected_on_non_script_steps(self) -> None:
+        """Phase 1 cannot accept error handlers that the engine will never run."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="agent"),
+            agents=[
+                AgentDef(
+                    name="agent",
+                    prompt="work",
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="$end", on_error=True),
+                    ],
+                )
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="only for script steps"):
+            validate_workflow_config(config)
+
+    def test_error_routes_are_rejected_on_parallel_groups(self) -> None:
+        """Group error routing stays out of the Phase 1 execution surface."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="group"),
+            agents=[
+                AgentDef(name="one", prompt="one"),
+                AgentDef(name="two", prompt="two"),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="group",
+                    agents=["one", "two"],
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="$end", on_error=True),
+                    ],
+                )
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="Parallel group 'group'.*on_error"):
+            validate_workflow_config(config)
+
+    def test_error_catch_all_must_be_last(self) -> None:
+        """A catch-all cannot shadow a later specific error route."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="test", entry_point="script"),
+            agents=[
+                AgentDef(
+                    name="script",
+                    type="script",
+                    command="echo",
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="$end", on_error=True),
+                        RouteDef(to="$end", on_error="external.git.drift"),
+                    ],
+                )
+            ],
+        )
+
+        with pytest.raises(ConfigurationError, match="catch-all on_error route must be last"):
+            validate_workflow_config(config)
+
     def test_valid_multi_agent_config(self) -> None:
         """Test validation of a valid multi-agent config."""
         config = WorkflowConfig(
@@ -1167,6 +1268,81 @@ class TestExplicitModeWarnings:
         )
         warnings = validate_workflow_config(config)
         assert any("research.output" in w and "explicit" in w and "writer" in w for w in warnings)
+
+    def test_undeclared_agent_error_ref_in_explicit_mode_warns(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="checker",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                AgentDef(
+                    name="checker",
+                    type="script",
+                    command="check",
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="recovery", on_error=True),
+                    ],
+                ),
+                _agent_with_prompt("recovery", "Handle {{ checker.error.kind }}"),
+            ],
+        )
+
+        warnings = validate_workflow_config(config)
+
+        assert any("checker.error" in w and "explicit" in w and "recovery" in w for w in warnings)
+
+    def test_declared_agent_error_ref_in_explicit_mode_has_no_warning(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="checker",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                AgentDef(
+                    name="checker",
+                    type="script",
+                    command="check",
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="recovery", on_error=True),
+                    ],
+                ),
+                _agent_with_prompt(
+                    "recovery",
+                    "Handle {{ checker.error.kind }}",
+                    input=["checker.error.kind"],
+                ),
+            ],
+        )
+
+        warnings = validate_workflow_config(config)
+
+        assert not any("checker.error" in w and "explicit context mode" in w for w in warnings)
+
+    def test_legacy_error_field_shorthand_remains_an_output_declaration(self) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="producer",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                _agent_with_prompt("producer", "Produce", routes=[RouteDef(to="consumer")]),
+                _agent_with_prompt(
+                    "consumer",
+                    "Handle {{ producer.output.error }}",
+                    input=["producer.error"],
+                ),
+            ],
+        )
+
+        warnings = validate_workflow_config(config)
+
+        assert not any("producer.output.error" in w and "explicit" in w for w in warnings)
 
     def test_undeclared_workflow_input_ref_in_explicit_mode_warns(self) -> None:
         config = WorkflowConfig(

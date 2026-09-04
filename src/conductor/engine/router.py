@@ -14,6 +14,7 @@ from conductor.executor.template import TemplateRenderer
 
 if TYPE_CHECKING:
     from conductor.config.schema import RouteDef
+    from conductor.error_envelope import ErrorEnvelope
 
 
 @dataclass
@@ -64,6 +65,8 @@ class Router:
         routes: list[RouteDef],
         current_output: dict[str, Any],
         context: dict[str, Any],
+        *,
+        error: ErrorEnvelope | None = None,
     ) -> RouteResult:
         """Evaluate routes and return the first matching target.
 
@@ -82,12 +85,20 @@ class Router:
             ValueError: If no routes match (shouldn't happen with proper config).
         """
         # Add current output to context for condition evaluation
-        eval_context = {
+        eval_context: dict[str, Any] = {
             **context,
             "output": current_output,
         }
+        if error is not None:
+            eval_context["error"] = error.to_dict()
 
         for route in routes:
+            if error is None:
+                if route.on_error is not None:
+                    continue
+            elif not self._matches_error(route, error.kind):
+                continue
+
             if route.when is None:
                 # No condition = always matches
                 return RouteResult(
@@ -109,6 +120,18 @@ class Router:
             "No matching route found. Ensure at least one route has no 'when' clause "
             "or add a catch-all route at the end."
         )
+
+    @staticmethod
+    def _matches_error(route: RouteDef, kind: str) -> bool:
+        """Return whether an error route selects the supplied kind."""
+        selector = route.on_error
+        if selector is True:
+            return True
+        if isinstance(selector, str):
+            return selector == kind
+        if isinstance(selector, list):
+            return kind in selector
+        return False
 
     def _evaluate_condition(self, when: str, context: dict[str, Any]) -> bool:
         """Evaluate a 'when' condition.
