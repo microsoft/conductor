@@ -78,7 +78,7 @@ REPO_GIT_URL: Final = "https://github.com/microsoft/conductor.git"
 _UV_RECEIPT_NAME: Final = "uv-receipt.toml"
 
 #: The extras declared in ``pyproject.toml``'s ``[project.optional-dependencies]``.
-ExtraName = Literal["tui", "aca", "claude-agent-sdk"]
+ExtraName = Literal["tui", "aca", "claude-agent-sdk", "telemetry"]
 
 # A PEP 508 extra name. Checked at the parse boundary because these values
 # are interpolated into a single-quoted command the user is told to paste,

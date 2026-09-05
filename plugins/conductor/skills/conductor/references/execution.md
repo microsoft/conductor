@@ -670,8 +670,33 @@ conductor run workflow.yaml --input q="test" | jq '.answer'
 | `OPENAI_API_KEY` | OpenAI provider API key (when `provider: openai`) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `CONDUCTOR_NO_UPDATE_CHECK` | Set to `1` to suppress the passive update-check hint |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint; setting it enables tracing |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | Export protocol: `grpc` (default), `http/protobuf`, or `http/json`. Copilot CLI tracing requires `http/protobuf` or `http/json`. |
+| `OTEL_SERVICE_NAME` | Service name reported to the collector; defaults to `conductor` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Key-value pairs for resource attributes (e.g. `deployment.environment=testing`) |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Enables native-span content capture (Pydantic AI and Copilot CLI) when set to `true`, `SPAN_ONLY`, or `SPAN_AND_EVENT` |
+| `OTEL_SDK_DISABLED` | Set to `true` to disable all tracing for the process |
 
 Environment variables in YAML configs support `${VAR}` and `${VAR:-default}` interpolation syntax.
+
+## OpenTelemetry Tracing
+
+Conductor supports OpenTelemetry tracing for workflow runs. To use it, install the telemetry dependencies:
+
+```bash
+uv sync --extra telemetry
+```
+
+Then configure tracing through standard OpenTelemetry environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_SERVICE_NAME=my-workflow-service
+```
+
+### Unified Traces
+
+For `copilot`, `claude`, and `openai` providers, Conductor registers native OpenTelemetry instrumentation. Conductor unifies high-level orchestration spans and low-level LLM call spans into a single unified trace tree. High-level orchestration spans act as parent spans, and native provider spans nest directly under them, sharing the same `trace_id` and trace context. The workflow `run_id` is propagated as the `gen_ai.conversation.id` attribute across all spans in the tree.
 
 ## Performance Tips
 

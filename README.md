@@ -31,6 +31,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
 - **[Fleet Manager](#fleet-manager-tui)** - An interactive TUI over every running `conductor` process (foreground, `--web`, or `--web-bg`): live status, tokens and cost, gate alerts you can answer, step-level drill-down, and launching new runs — plus non-interactive `conductor stop` / `conductor fleet list`
 - **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
+- **OpenTelemetry tracing**: Export detailed workflow execution traces to OTLP collectors, such as Jaeger or Tempo, with native Pydantic AI and Copilot CLI span correlation.
 
 ## Installation
 

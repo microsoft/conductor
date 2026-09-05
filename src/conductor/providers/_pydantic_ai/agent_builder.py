@@ -17,7 +17,7 @@ from anthropic.types.beta.beta_thinking_config_enabled_param import (
     BetaThinkingConfigEnabledParam,
 )
 from openai import AsyncOpenAI
-from pydantic_ai import Agent, AgentRetries
+from pydantic_ai import Agent, AgentRetries, InstrumentationSettings
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.output import ToolOutput
@@ -39,6 +39,7 @@ from conductor.providers.reasoning import (
     is_claude_thinking_model,
     resolve_reasoning_effort,
 )
+from conductor.telemetry import guards
 
 if TYPE_CHECKING:
     import httpx
@@ -640,6 +641,12 @@ def build_agent(
         tools=tools or [],
         capabilities=capabilities,
     )
+
+    if guards.is_telemetry_active():
+        pydantic_agent.instrument = InstrumentationSettings(
+            tracer_provider=guards.current_tracer_provider(),
+            include_content=guards.capture_span_content(),
+        )
 
     if isinstance(pydantic_agent.output_type, ToolOutput):
         toolset = pydantic_agent._output_schema.toolset

@@ -41,6 +41,7 @@ export type EventType =
   | 'parallel_completed'
   | 'for_each_started'
   | 'for_each_item_started'
+  | 'for_each_agent_started'
   | 'for_each_item_completed'
   | 'for_each_item_failed'
   | 'for_each_completed'
@@ -445,6 +446,14 @@ export interface ForEachItemStartedData {
   item_key: string;
   index: number;
   item?: unknown;
+}
+
+export interface ForEachAgentStartedData {
+  group_name: string;
+  agent_name: string;
+  item_key: string;
+  index: number;
+  working_dir: string | null;
 }
 
 export interface ForEachItemCompletedData {

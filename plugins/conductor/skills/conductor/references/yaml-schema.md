@@ -904,6 +904,7 @@ scheme.
 - All referenced agents/groups must be defined
 - Input parameter names must be valid identifiers
 - Unknown fields on `WorkflowConfig`, `AgentDef`, `ParallelGroup`, and `ForEachDef` are **rejected** (not silently dropped)
+- Warning when `OTEL_EXPORTER_OTLP_ENDPOINT` is set but the `telemetry` extra is not installed
 
 ### Agent Validation
 

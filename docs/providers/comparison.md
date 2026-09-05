@@ -23,6 +23,7 @@ This guide helps you choose between GitHub Copilot, OpenAI, Anthropic Claude, Cl
 | **Structured Output** | Prompt injection | Native | Native | Prompt injection | Prompt injection |
 | **Session Resume** | Yes | No | No | No | Yes |
 | **Tool Output Limits** | native SDK spill (large_output) | conductor-side truncation+spill | conductor-side truncation+spill | native CLI env var | N/A |
+| **Native OpenTelemetry Spans** | Yes (HTTP only) | Yes | Yes | Depends on CLI | No |
 
 > **About the experimental tier.** `claude-agent-sdk` and `hermes` declare
 > specific capability carve-outs (e.g. no per-agent tools allowlist). `conductor validate`

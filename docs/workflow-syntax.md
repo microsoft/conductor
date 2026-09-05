@@ -1680,6 +1680,10 @@ workflow:
 
 See `examples/tool-output-limits.yaml` for a complete example.
 
+### OpenTelemetry Tracing
+
+OpenTelemetry tracing is configured exclusively via environment variables. For setup instructions, configuration options, and details on unified traces, see the [OpenTelemetry Tracing guide](telemetry.md).
+
 ## Tools
 
 Tools can be configured at workflow or agent level.

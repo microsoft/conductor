@@ -36,6 +36,7 @@ from conductor.providers._pydantic_ai.events import (
     emit_pydantic_event,
 )
 from conductor.providers._pydantic_ai.usage import last_request_input_tokens
+from conductor.telemetry import guards
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +228,11 @@ async def run_with_interrupt(
     session_start = time.monotonic()
 
     try:
-        async with agent.iter(user_prompt, usage_limits=usage_limits) as run:
+        async with agent.iter(
+            user_prompt,
+            usage_limits=usage_limits,
+            conversation_id=guards.current_run_id(),
+        ) as run:
             next_node = run.next_node
             while not isinstance(next_node, End):
                 iteration += 1
@@ -350,6 +355,7 @@ async def _request_partial_output(
             user_prompt=None,
             message_history=partial_history,
             output_type=str,
+            conversation_id=guards.current_run_id(),
         )
     return RunOutcome(
         partial_output=result.output,

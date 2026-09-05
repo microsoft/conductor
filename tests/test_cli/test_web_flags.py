@@ -9,6 +9,7 @@ This module tests:
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -660,6 +661,75 @@ class TestDashboardStartupFailure:
 
         mock_dashboard.start.assert_not_awaited()
         mock_dashboard.stop.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_telemetry_subscribes_and_closes_with_run(self) -> None:
+        from conductor.cli.run import run_workflow_async
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        mock_config = MagicMock()
+        mock_config.workflow.name = "telemetry"
+        mock_config.workflow.entry_point = "agent1"
+        mock_config.workflow.runtime.provider = ProviderSettings(name="copilot")
+        mock_config.workflow.cost.show_summary = False
+        mock_config.agents = []
+        mock_config.tools = None
+        mock_config.mcp_servers = []
+
+        mock_engine = MagicMock()
+        mock_engine.run = AsyncMock(return_value={"result": "done"})
+        mock_engine.get_execution_summary.return_value = {}
+        mock_registry = AsyncMock()
+        mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+        mock_registry.__aexit__ = AsyncMock(return_value=False)
+        telemetry_subscriber = MagicMock()
+        subscribed_callbacks: list[Callable[[WorkflowEvent], None]] = []
+        original_subscribe = WorkflowEventEmitter.subscribe
+
+        def capture_subscribe(
+            emitter: WorkflowEventEmitter, callback: Callable[[WorkflowEvent], None]
+        ) -> None:
+            subscribed_callbacks.append(callback)
+            original_subscribe(emitter, callback)
+
+        # Given: a completed workflow and an active tracer provider.
+        # When: the CLI executes the workflow.
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "conductor.cli.run._prefetch_plugin_sources",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch("conductor.cli.run._write_run_record_for_current_process"),
+            patch("conductor.cli.run._remove_run_record_for_current_process_safe"),
+            patch("conductor.fleet.retention.maybe_prune_event_logs"),
+            patch(
+                "conductor.telemetry.setup.init_tracer_provider", return_value=MagicMock()
+            ) as init,
+            patch(
+                "conductor.telemetry.subscriber.TelemetrySubscriber",
+                return_value=telemetry_subscriber,
+            ) as subscriber_type,
+            patch.object(WorkflowEventEmitter, "subscribe", new=capture_subscribe),
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = False
+            result = await run_workflow_async(Path("/tmp/telemetry.yaml"), {})
+
+        # Then: telemetry receives every event and is finalized after the run.
+        assert result == {"result": "done"}
+        init.assert_called_once()
+        subscriber_type.assert_called_once_with(init.return_value)
+        assert telemetry_subscriber.on_event in subscribed_callbacks
+        telemetry_subscriber.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

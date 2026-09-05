@@ -137,6 +137,7 @@ class ClaudeProvider(AgentProvider):
         # Per-agent ``tools:`` allowlists are forwarded to the SDK.
         workflow_tools_passthrough=True,
         streaming_events=True,
+        native_otel_spans=True,
         # ``agent_reasoning`` events fire for extended-thinking content
         # when the model returns it.
         agent_reasoning_events=True,

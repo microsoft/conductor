@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-v` shows it), and a per-agent `skills: []` opts that agent out of the tiers
   entirely. See
   [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
+- **OpenTelemetry tracing**, new opt-in OpenTelemetry tracing feature activated by
+  `OTEL_EXPORTER_OTLP_ENDPOINT`.
+  It instruments workflow orchestration to emit spans for workflows, agents, parallel/for-each
+  groups, steps, and tool executions. For `claude` and `openai` providers, it also registers
+  and enables native Pydantic AI instrumentation; for `copilot`, it captures native spans
+  from the Copilot CLI child process over OTLP HTTP. In each case Conductor unifies
+  orchestrator spans and LLM/tool calls into a single trace tree. Tracing is enabled by
+  configuring standard `OTEL_*` environment variables for an OTLP collector. See
+  `docs/telemetry.md` and `examples/telemetry.yaml`.
+  * Added native Copilot CLI spans over OTLP HTTP using W3C trace-context propagation, backed by a per-run protocol and endpoint latch that logs a warning if gRPC is used.
 
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 

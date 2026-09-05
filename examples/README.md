@@ -152,6 +152,24 @@ conductor run examples/context-tier.yaml \
 
 See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
 
+## OpenTelemetry Tracing
+
+Enable tracing by setting an OTLP endpoint after installing the optional extra. The trace
+contains provider-independent workflow, agent, and tool spans for every
+provider. Native spans from `copilot`, `claude`, and `openai` are nested
+within a single unified trace tree.
+
+```bash
+uv sync --extra telemetry
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_SERVICE_NAME=conductor
+conductor run examples/simple-qa.yaml --input question="What is OpenTelemetry?"
+```
+
+No prompt or response content is exported by default. See
+[OpenTelemetry Tracing](../docs/configuration.md#opentelemetry-tracing) before
+setting `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`.
+
 ## Output Validation
 
 ### validator.yaml

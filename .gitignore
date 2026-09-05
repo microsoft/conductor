@@ -86,3 +86,6 @@ src/conductor/designer/frontend/node_modules/
 
 # Scratch / temporary working files
 tmp/
+
+# Orchestrator plans / evidence (never committed)
+.omo/

@@ -1243,6 +1243,12 @@ are hidden from `--help` and are slated for removal in a future release.
 | `CONDUCTOR_HOME` | Overrides `~/.conductor/` as the location of run records, the registry config, and `config.toml` |
 | `CONDUCTOR_FLEET_NO_ANIM` | Set to any non-empty value to disable Fleet Manager TUI animation (spinners, splash) and set Textual's own `animation_level` to `none`. Wins over `CONDUCTOR_FLEET_ANIM` and over remote-session detection if both apply. Useful over slow SSH links (which are *not* auto-detected), in recorded terminals, and where movement is distracting. RDP sessions are detected automatically and disable animation by default even without this variable set |
 | `CONDUCTOR_FLEET_ANIM` | Set to any non-empty value to force Fleet Manager TUI animation back on over a detected RDP session. Has no effect when `CONDUCTOR_FLEET_NO_ANIM` is also set |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint; setting it enables tracing |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | Export protocol: `grpc` (default), `http/protobuf`, or `http/json`. Copilot CLI tracing requires `http/protobuf` or `http/json`. |
+| `OTEL_SERVICE_NAME` | Service name reported to the collector; defaults to `conductor` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Key-value pairs for resource attributes (e.g. `deployment.environment=testing`) |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Enables native-span content capture (Pydantic AI and Copilot CLI) when set to `true`, `SPAN_ONLY`, or `SPAN_AND_EVENT` |
+| `OTEL_SDK_DISABLED` | Set to `true` to disable all tracing for the process |
 
 ## Exit Codes
 

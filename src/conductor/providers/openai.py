@@ -127,6 +127,7 @@ class OpenAIProvider(AgentProvider):
         # Per-agent ``tools:`` allowlists are passed through to the Pydantic AI agent.
         workflow_tools_passthrough=True,
         streaming_events=True,
+        native_otel_spans=True,
         # Chat Completions never returns reasoning content from api.openai.com; only
         # third-party proxies echoing ``reasoning_content`` would surface it. This
         # becomes ``True`` only on an OpenAIResponsesModel backend.

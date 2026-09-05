@@ -571,7 +571,7 @@ class TestDeclaredExtrasAreReal:
     """A typo in an extra name reproduces #441 exactly — a confidently printed
     command that installs nothing."""
 
-    @pytest.mark.parametrize("extra", ["tui", "aca", "claude-agent-sdk"])
+    @pytest.mark.parametrize("extra", ["tui", "aca", "claude-agent-sdk", "telemetry"])
     def test_the_extra_is_declared_by_this_package(self, extra: str) -> None:
         import tomllib
 

@@ -61,6 +61,7 @@ dependencies = [
     "websockets>=12.0",
     "httpx>=0.27.0",
     "packaging>=21.0",
+    "opentelemetry-api>=1.20",
     # Timeout-bounded regex matching for output field constraints and provider
     # response normalization. Ships typed stubs and supports per-match deadlines.
     "regex>=2024.11.6",
@@ -87,6 +88,11 @@ tui = [
     # `App.run_test()` / `Pilot` behavior every TUI pilot test depends on
     # changed before it.
     "textual>=8.0",
+]
+telemetry = [
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 
 [project.urls]
