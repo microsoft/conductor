@@ -245,6 +245,11 @@ def _build_output_type(
     a flat one. See the pinned regression test
     ``TestOpenAIBackend::test_openai_nested_output_schema_is_not_ref_inlined_known_limitation``.
 
+    Workaround until a follow-up fix lands: keep each ``openai``-backend
+    agent step's ``output:`` schema flat, and reassemble any nested
+    structure in a downstream ``type: script``/``type: set`` step instead
+    -- nesting is pure data shaping and needs no LLM call.
+
     Args:
         agent: The Conductor agent definition.
         backend: Which LLM backend this agent will run against.

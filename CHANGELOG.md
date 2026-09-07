@@ -58,6 +58,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own goal. `tests/test_providers/test_pydantic_ai_agent_builder.py::TestOpenAIBackend::test_openai_nested_output_schema_is_not_ref_inlined_known_limitation`
   pins the current behavior as a concrete target for a follow-up fix.
 
+  **Workaround, until that follow-up lands:** avoid a nested `output:`
+  schema on an `openai`-backend agent step entirely. Have each agent step
+  return a flat schema, then reassemble the nested structure in a
+  downstream `type: script` (or `type: set`) step — nesting is pure data
+  shaping and needs no LLM call, so it never hits this limitation. This is
+  also the same decomposition pattern that improves parse-recovery
+  reliability on weak local models generally (smaller, flatter one-shot
+  generations retry more predictably than one large structured call), so
+  it is a good default shape for a local-model-backed workflow regardless
+  of this specific limitation. See `examples/` (a worked example is a good
+  follow-up addition here).
+
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
 ### Added
