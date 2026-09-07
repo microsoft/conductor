@@ -233,8 +233,17 @@ def _build_output_type(
     parse-recovery budget (``UnexpectedModelBehavior: Exceeded maximum output
     retries``). ``PromptedOutput`` instead asks the model to emit the schema
     as JSON in its normal text response, which these backends handle
-    correctly. The Anthropic backend is left on ``ToolOutput`` since real
-    tool-calling is reliable there.
+    correctly for flat/scalar output schemas. The Anthropic backend is left
+    on ``ToolOutput`` since real tool-calling is reliable there.
+
+    KNOWN LIMITATION: ``ToolOutput``'s rendered tool schema is sanitized
+    (``$ref``/``$defs`` inlined, pydantic-internal keys stripped) before
+    being sent to the model; ``PromptedOutput`` has no equivalent hook in
+    its current public API and renders the raw ``model_json_schema()`` for
+    a nested output schema, ``$ref``/``$defs`` included. This can make a
+    nested ``output:`` schema harder for a weak local model to satisfy than
+    a flat one. See the pinned regression test
+    ``TestOpenAIBackend::test_openai_nested_output_schema_is_not_ref_inlined_known_limitation``.
 
     Args:
         agent: The Conductor agent definition.

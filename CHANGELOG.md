@@ -42,10 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regardless of schema size or retry configuration. `PromptedOutput` asks
   the model to emit the schema as JSON in its normal text response instead,
   which these backends handle correctly; verified via a real end-to-end
-  workflow run against `qwen2.5-coder:14b-8k` over Ollama, which failed
-  consistently before this change and passed cleanly after. Scoped to the
-  `openai` backend only — the `claude`/Anthropic backend keeps `ToolOutput`,
-  since real tool-calling is reliable there.
+  workflow run against `qwen2.5-coder:14b-8k` over Ollama with a **flat**
+  output schema, which failed consistently before this change and passed
+  cleanly after. Scoped to the `openai` backend only — the `claude`/
+  Anthropic backend keeps `ToolOutput`, since real tool-calling is reliable
+  there.
+
+  **Known limitation, not fixed by this change:** `ToolOutput`'s rendered
+  tool schema is sanitized (`$ref`/`$defs` inlined, pydantic-internal keys
+  stripped) before being sent to the model; `PromptedOutput` has no
+  equivalent hook in its current public API and renders the raw
+  `model_json_schema()` — `$ref`/`$defs` included — for a **nested** output
+  schema. This can make a nested `output:` schema harder for a weak local
+  model to satisfy than a flat one, partially working against this fix's
+  own goal. `tests/test_providers/test_pydantic_ai_agent_builder.py::TestOpenAIBackend::test_openai_nested_output_schema_is_not_ref_inlined_known_limitation`
+  pins the current behavior as a concrete target for a follow-up fix.
 
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 

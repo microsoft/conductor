@@ -175,6 +175,46 @@ class TestOpenAIBackend:
         assert isinstance(pydantic_agent.output_type, PromptedOutput)
         assert not isinstance(pydantic_agent.output_type, ToolOutput)
 
+    def test_openai_nested_output_schema_is_not_ref_inlined_known_limitation(self) -> None:
+        """KNOWN LIMITATION, tracked as a follow-up, not fixed by this test.
+
+        ToolOutput's rendered tool schema is sanitized via
+        ``_sanitize_json_schema`` (inlining ``$ref``/``$defs``, stripping
+        pydantic-internal keys) before being sent to the model. PromptedOutput
+        has no equivalent hook in its public API (``outputs``/``name``/
+        ``description``/``template`` only) -- it renders the dynamic model's
+        raw ``model_json_schema()`` into the prompt, ``$ref``/``$defs`` and
+        all. For a *nested* output schema this means the openai/PromptedOutput
+        path hands a weak local model a schema shape it must dereference
+        itself, which is exactly the class of prompt the models this fix
+        targets are weakest at satisfying -- a real, open gap this fix does
+        not close. This test pins the current (undesirable but honest)
+        behavior so a future fix has a concrete regression target, and so a
+        silent behavior change doesn't go unnoticed either way.
+        """
+        agent_def = AgentDef(
+            name="nested_formatter",
+            output={
+                "nested": OutputField(
+                    type="object",
+                    properties={"inner": OutputField(type="string")},
+                )
+            },
+        )
+
+        pydantic_agent = build_agent(
+            agent_def, system_prompt="", rendered_prompt="", backend="openai"
+        )
+
+        assert isinstance(pydantic_agent.output_type, PromptedOutput)
+        rendered_schema = pydantic_agent._output_schema.object_def.json_schema
+        assert "$defs" in rendered_schema, (
+            "If this now fails, PromptedOutput's rendered schema is no longer "
+            "$ref-shaped for nested output -- the known limitation documented "
+            "above may have been resolved; update this test and the CHANGELOG "
+            "entry to reflect nested-schema coverage."
+        )
+
     def test_openai_sampling_settings(self) -> None:
         """OpenAI model settings must carry temperature, max_tokens and timeout."""
         agent_def = AgentDef(name="sampler")
