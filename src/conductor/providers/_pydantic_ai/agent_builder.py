@@ -20,7 +20,7 @@ from openai import AsyncOpenAI
 from pydantic_ai import Agent, AgentRetries
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
-from pydantic_ai.output import ToolOutput
+from pydantic_ai.output import PromptedOutput, ToolOutput
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -215,19 +215,34 @@ def _resolve_anthropic_model(
 
 def _build_output_type(
     agent: AgentDef,
-) -> type[Any] | ToolOutput[Any] | None:
+    backend: str = "anthropic",
+) -> type[Any] | ToolOutput[Any] | PromptedOutput[Any] | None:
     """Translate the agent's ``output`` schema into a Pydantic AI output spec.
 
     An empty or missing schema means plain text output (``None`` is returned
     so callers fall back to the default ``str`` output). Otherwise, the schema
-    is converted to a dynamic Pydantic model and wrapped in ``ToolOutput`` to
-    request tool-based structured output as required by the provider plan.
+    is converted to a dynamic Pydantic model.
+
+    For the ``openai`` backend (typically an OpenAI-compatible endpoint such
+    as Ollama, vLLM, or LM Studio), the output is wrapped in ``PromptedOutput``
+    rather than ``ToolOutput``. Several widely-used local models do not
+    reliably emit a real function/tool call for structured output over an
+    OpenAI-compatible API, even when explicitly requested (see
+    ollama/ollama#8095, ollama/ollama#8063, pydantic/pydantic-ai#877) --
+    ``ToolOutput`` on these backends silently fails after exhausting the
+    parse-recovery budget (``UnexpectedModelBehavior: Exceeded maximum output
+    retries``). ``PromptedOutput`` instead asks the model to emit the schema
+    as JSON in its normal text response, which these backends handle
+    correctly. The Anthropic backend is left on ``ToolOutput`` since real
+    tool-calling is reliable there.
 
     Args:
         agent: The Conductor agent definition.
+        backend: Which LLM backend this agent will run against.
 
     Returns:
-        A ``ToolOutput`` wrapping the dynamic model, or ``None`` for text output.
+        A ``PromptedOutput`` (openai backend) or ``ToolOutput`` (anthropic
+        backend) wrapping the dynamic model, or ``None`` for text output.
     """
     dynamic_model = output_schema_to_pydantic_model(
         f"{agent.name}Output",
@@ -235,6 +250,8 @@ def _build_output_type(
     )
     if dynamic_model is None:
         return None
+    if backend == "openai":
+        return PromptedOutput(dynamic_model)
     return ToolOutput(dynamic_model)
 
 
@@ -595,7 +612,7 @@ def build_agent(
             timeout=timeout,
         )
 
-    output_type = _build_output_type(agent)
+    output_type = _build_output_type(agent, backend)
     if output_type is None:
         output_type = str
 

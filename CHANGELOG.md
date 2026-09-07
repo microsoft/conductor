@@ -27,6 +27,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entirely. See
   [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
 
+### Fixed
+
+- **`openai` provider structured output uses `PromptedOutput` instead of
+  `ToolOutput`** — several widely-used local models served behind an
+  OpenAI-compatible endpoint (e.g. Ollama) do not reliably emit a real
+  function/tool call for structured output, even when explicitly requested
+  (see [ollama/ollama#8095](https://github.com/ollama/ollama/issues/8095),
+  [ollama/ollama#8063](https://github.com/ollama/ollama/issues/8063),
+  [pydantic/pydantic-ai#877](https://github.com/pydantic/pydantic-ai/issues/877)).
+  Under the previous `ToolOutput` wrapping, any agent with a non-empty
+  `output:` schema against such a model exhausted its parse-recovery budget
+  and raised `UnexpectedModelBehavior: Exceeded maximum output retries`,
+  regardless of schema size or retry configuration. `PromptedOutput` asks
+  the model to emit the schema as JSON in its normal text response instead,
+  which these backends handle correctly; verified via a real end-to-end
+  workflow run against `qwen2.5-coder:14b-8k` over Ollama, which failed
+  consistently before this change and passed cleanly after. Scoped to the
+  `openai` backend only — the `claude`/Anthropic backend keeps `ToolOutput`,
+  since real tool-calling is reliable there.
+
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
 ### Added

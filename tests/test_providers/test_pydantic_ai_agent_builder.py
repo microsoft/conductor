@@ -2,7 +2,8 @@
 
 Tests verify that build_agent() maps Conductor agent configuration to Pydantic
 AI constructs with parity to the existing Claude provider: model resolution,
-system prompt wiring, structured output via ToolOutput, sampling settings,
+system prompt wiring, structured output via ToolOutput (anthropic) /
+PromptedOutput (openai), sampling settings,
 extended-thinking budgets, and Anthropic API constraint coercion.
 """
 
@@ -20,7 +21,7 @@ from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.output import ToolOutput
+from pydantic_ai.output import PromptedOutput, ToolOutput
 
 from conductor.config.schema import AgentDef, OutputField, ReasoningConfig
 from conductor.exceptions import ValidationError
@@ -149,8 +150,18 @@ class TestOpenAIModelMapping:
 class TestOpenAIBackend:
     """Tests specific to the openai backend branch."""
 
-    def test_openai_output_schema_becomes_tool_output(self) -> None:
-        """OpenAI backend must wrap a non-empty output schema in ToolOutput."""
+    def test_openai_output_schema_becomes_prompted_output(self) -> None:
+        """OpenAI backend must wrap a non-empty output schema in PromptedOutput.
+
+        Not ToolOutput: several widely-used local models served behind an
+        OpenAI-compatible endpoint (e.g. Ollama) do not reliably emit a real
+        tool call for structured output, even when explicitly requested (see
+        ollama/ollama#8095, ollama/ollama#8063, pydantic/pydantic-ai#877) --
+        ToolOutput exhausts the parse-recovery budget and raises
+        UnexpectedModelBehavior on these backends. PromptedOutput asks the
+        model to emit the schema as JSON in its normal text response
+        instead, which these backends handle correctly.
+        """
         agent_def = AgentDef(
             name="formatter",
             output={"answer": OutputField(type="string")},
@@ -161,7 +172,8 @@ class TestOpenAIBackend:
         )
 
         assert isinstance(pydantic_agent.model, OpenAIChatModel)
-        assert isinstance(pydantic_agent.output_type, ToolOutput)
+        assert isinstance(pydantic_agent.output_type, PromptedOutput)
+        assert not isinstance(pydantic_agent.output_type, ToolOutput)
 
     def test_openai_sampling_settings(self) -> None:
         """OpenAI model settings must carry temperature, max_tokens and timeout."""
