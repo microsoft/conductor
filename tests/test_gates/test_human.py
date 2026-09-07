@@ -9,7 +9,7 @@ import pytest
 
 from conductor.config.schema import AgentDef, GateOption
 from conductor.exceptions import HumanGateError
-from conductor.gates.human import GateResult, HumanGateHandler
+from conductor.gates.human import GateResult, HumanGateHandler, read_multiline_lines
 
 
 @pytest.fixture
@@ -752,3 +752,48 @@ class TestDaemonThreadReader:
         from conductor.gates.human import read_on_daemon_thread
 
         assert await asyncio.wait_for(read_on_daemon_thread(lambda: "ok"), timeout=5) == "ok"
+
+
+class TestReadMultilineLines:
+    """Regression tests for the extracted module-level multi-line reader."""
+
+    def test_read_multiline_lines_preserves_internal_newlines(self) -> None:
+        """Extracting the helper must not change behavior or drop newlines."""
+        with patch(
+            "builtins.input",
+            side_effect=["line one", "line two", "line three", "."],
+        ):
+            result, hit_eof = read_multiline_lines(MagicMock())
+
+        assert result == "line one\nline two\nline three"
+        assert hit_eof is False
+
+    def test_read_multiline_lines_custom_sentinel(self) -> None:
+        """A lone '.' is not a submit under a custom sentinel."""
+        with patch("builtins.input", side_effect=[".", "still going", "/send"]):
+            result, hit_eof = read_multiline_lines(MagicMock(), sentinel="/send")
+
+        assert result == ".\nstill going"
+        assert hit_eof is False
+
+    def test_read_multiline_lines_eof_returns_accumulated(self) -> None:
+        """EOF submits accumulated content, not empty."""
+        with patch("builtins.input", side_effect=["a", "b", EOFError()]):
+            result, hit_eof = read_multiline_lines(MagicMock())
+
+        assert result == "a\nb"
+        assert hit_eof is True
+
+    def test_read_multiline_lines_reports_eof_on_empty_read(self) -> None:
+        """A bare EOF is distinguishable from an empty sentinel submission.
+
+        The dialog gate relies on this to tell a deliberate Ctrl-D (dismiss)
+        from a sentinel typed with nothing above it (not a turn).
+        """
+        with patch("builtins.input", side_effect=EOFError()):
+            text, hit_eof = read_multiline_lines(MagicMock())
+        assert (text, hit_eof) == ("", True)
+
+        with patch("builtins.input", side_effect=["."]):
+            text, hit_eof = read_multiline_lines(MagicMock())
+        assert (text, hit_eof) == ("", False)

@@ -158,7 +158,8 @@ step-by-step checklist.
   - `factory.py` - Provider instantiation
 
 - **gates/**: Human-in-the-loop support
-  - `human.py` - Rich terminal UI for human gate interactions
+  - `human.py` - Rich terminal UI for human gate interactions. `read_multiline_lines(console, sentinel)` is the shared blocking multi-line stdin reader behind both the human gate's `.` sentinel (`MULTILINE_SENTINEL`) and the dialog gate's `/send` (`DIALOG_SUBMIT_SENTINEL`); it returns `(text, hit_eof)` because an EOF that yielded no text is a deliberate dismissal while the sentinel with no text is an empty submission. The two gates use different sentinels, so a caller passes the one it wants rather than relying on the default
+  - `dialog.py` - Dialog-mode gate. On a tty the main turn reads through `read_multiline_lines`, so a pasted block is one turn rather than one turn per line; off a tty it falls back to single-line `Prompt.ask`, where the sentinel has no effect — `_display_dialog_start` gates the sentinel hint on the same `sys.stdin.isatty()` condition so the banner never advertises a keystroke that does nothing
 
 - **interrupt/**: Interactive workflow interruption (Esc/Ctrl+G to pause)
   - `listener.py` - Keyboard listener daemon thread for Esc/Ctrl+G detection

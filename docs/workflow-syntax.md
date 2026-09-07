@@ -1198,6 +1198,7 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 
 **Behavior notes:**
 - Dialog is supported on regular `agent` type only (not `human_gate`, `questions`, `script`, `workflow`, or `wait`)
+- In an interactive terminal, a reply may span multiple lines — paste or type freely and submit the turn with `/send` on its own line. Ctrl-D (Ctrl-Z then Enter on Windows) also submits whatever has been typed, or dismisses the dialog when nothing has. Off a tty (a pipe, CI, or the web dashboard) replies are read one line at a time and `/send` does not apply
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,11 @@ from rich.text import Text
 
 from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.executor.linkify import linkify_markdown
+from conductor.gates.human import (
+    DIALOG_SUBMIT_SENTINEL,
+    read_multiline_lines,
+    read_on_daemon_thread,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -272,6 +278,11 @@ class DialogHandler:
                 # EOF or error
                 result.user_dismissed = True
                 break
+
+            if user_input == "":
+                # User submitted nothing on a tty (e.g. an accidental bare
+                # sentinel line) -- not a turn, and not dismissal either.
+                continue
 
             result.messages.append(DialogMessage(role="user", content=user_input))
             self._emit_event(
@@ -600,15 +611,31 @@ class DialogHandler:
         base_dir: Path | None = None,
     ) -> None:
         """Display the dialog opening with full agent context."""
+        # Gated on the same condition as the multi-line reader in
+        # _get_user_input: off a tty, that turn falls back to a single-line
+        # Prompt.ask and the sentinel does nothing, so advertising it would
+        # instruct the user to type something with no effect. The markup stays
+        # in the template because styled() inserts *values* verbatim.
+        if sys.stdin.isatty():
+            multiline_hint = (
+                " It can span multiple lines; send it with [bold]{}[/bold] on its own line."
+            )
+            hint_args: tuple[object, ...] = (DIALOG_SUBMIT_SENTINEL,)
+        else:
+            multiline_hint = ""
+            hint_args = ()
+
         self.console.print()
         self.console.print(
             Panel(
                 styled(
                     "[bold]Agent '{}'[/bold] would like to discuss "
                     "its output with you.\n"
-                    "[dim]Type your responses below. Say [bold]done[/bold] or "
-                    "[bold]/done[/bold] when finished.[/dim]",
+                    "[dim]Type your response below." + multiline_hint + " "
+                    "Say [bold]done[/bold] or [bold]/done[/bold] when "
+                    "finished.[/dim]",
                     agent.name,
+                    *hint_args,
                 ),
                 title=Text.from_markup("[bold magenta]Dialog Mode[/bold magenta]"),
                 border_style="magenta",
@@ -732,8 +759,25 @@ class DialogHandler:
                 passing an interpolated f-string here.
 
         Returns:
-            User input text, or None on EOF/error.
+            User input text, or None on EOF/error, which the caller treats as
+            dismissal. The main turn (``prompt_text is None`` on a tty) reads
+            multi-line, so an EOF that *terminates a paste* returns the
+            accumulated content rather than dismissing; an EOF with nothing
+            accumulated is a deliberate Ctrl-D and still returns None.
         """
+        if prompt_text is None and sys.stdin.isatty():
+            self.console.print(styled("[bold magenta]You[/bold magenta]"))
+            try:
+                text, hit_eof = await read_on_daemon_thread(
+                    lambda: read_multiline_lines(self.console, DIALOG_SUBMIT_SENTINEL)
+                )
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if hit_eof and not text:
+                # Ctrl-D at an empty prompt: the user is leaving, not pasting.
+                return None
+            return text
+
         prompt = styled("[bold magenta]You[/bold magenta]") if prompt_text is None else prompt_text
         try:
 

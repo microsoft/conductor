@@ -27,6 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entirely. See
   [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
 
+### Fixed
+
+- **A multi-line reply to a terminal dialog is now one turn** (#509) —
+  dialog mode was the only free-text human-input surface that could not accept
+  a multi-line answer (`QuestionDef.multiline` defaults to `True` and
+  `GateOption.multiline` opts in, both served by one reader in `gates/human.py`).
+  The dialog gate read a reply with single-line `Prompt.ask`, so pasting a block of
+  text into an interactive terminal dispatched *each line* as its own turn: a
+  three-line paste became three separate questions to the model, each answered
+  against a fragment, and the paste's trailing newline added a fourth turn with
+  empty content. Terminal turns now read through the multi-line reader already
+  behind the human gate's `.` sentinel, submitted with `/send` on its own line,
+  so internal newlines survive and a paste is a single message; an empty
+  submission is no longer dispatched as a turn. Ctrl-D (Ctrl-Z then Enter on
+  Windows) submits what has been typed and dismisses the dialog when nothing
+  has, and Ctrl-C dismisses rather than propagating. The dialog uses `/send`
+  where the human gate keeps `.`, since a lone `.` is likelier to be prose in
+  a conversational reply. Off a tty — a pipe, CI, or the web dashboard — the
+  single-line path is unchanged, and the opening banner advertises the sentinel
+  only where it applies.
+
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
 ### Added
