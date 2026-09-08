@@ -279,9 +279,10 @@ class DialogHandler:
                 result.user_dismissed = True
                 break
 
-            if user_input == "":
-                # User submitted nothing on a tty (e.g. an accidental bare
-                # sentinel line) -- not a turn, and not dismissal either.
+            if not user_input.strip():
+                # Empty submission -- not a turn, and not dismissal either. On
+                # a tty this is a bare sentinel line; off a tty it is a blank
+                # line from the pipe, which ``Prompt.ask`` returns as "".
                 continue
 
             result.messages.append(DialogMessage(role="user", content=user_input))
@@ -763,7 +764,8 @@ class DialogHandler:
             dismissal. The main turn (``prompt_text is None`` on a tty) reads
             multi-line, so an EOF that *terminates a paste* returns the
             accumulated content rather than dismissing; an EOF with nothing
-            accumulated is a deliberate Ctrl-D and still returns None.
+            but whitespace accumulated is a deliberate Ctrl-D and still
+            returns None.
         """
         if prompt_text is None and sys.stdin.isatty():
             self.console.print(styled("[bold magenta]You[/bold magenta]"))
@@ -773,7 +775,7 @@ class DialogHandler:
                 )
             except (EOFError, KeyboardInterrupt):
                 return None
-            if hit_eof and not text:
+            if hit_eof and not text.strip():
                 # Ctrl-D at an empty prompt: the user is leaving, not pasting.
                 return None
             return text

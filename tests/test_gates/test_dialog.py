@@ -889,3 +889,56 @@ class TestDialogMultilineInput:
         user_msgs = [m for m in result.messages if m.role == "user"]
         assert user_msgs[0].content == "a\nb\nc"
         assert result.user_dismissed is True
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_submission_is_not_a_turn(self) -> None:
+        """Whitespace must not slip past the empty-submission guard.
+
+        The reader strips trailing newlines, not whitespace, so a buffer of
+        spaces survives as a truthy string. Dispatched, it would re-run the
+        agent believing the user replied with whitespace.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["   ", "/send", "done", EOFError()]),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        assert [m.content for m in result.messages if m.role == "user"] == ["done"]
+        provider.execute_dialog_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ctrl_d_after_whitespace_dismisses_without_submitting(self) -> None:
+        """Ctrl-D means "I am leaving", even with whitespace in the buffer.
+
+        Without a stripping guard the whitespace is dispatched as a turn and
+        the dialog dismisses afterwards -- the user asked to leave and sent a
+        message instead.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["   ", EOFError()]),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        provider.execute_dialog_turn.assert_not_awaited()
+        assert [m for m in result.messages if m.role == "user"] == []
+        assert result.user_dismissed is True
