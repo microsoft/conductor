@@ -45,24 +45,26 @@ def _eof_key_hint() -> str:
     return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
 
 
-def read_multiline_lines(
-    console: MarkupFreeConsole, sentinel: str = MULTILINE_SENTINEL
-) -> tuple[str, bool]:
+def read_multiline_lines(console: MarkupFreeConsole, *, sentinel: str) -> tuple[str, bool]:
     """Read a multi-line answer from stdin (blocking; call on a thread).
 
     Terminates on a line whose stripped text equals ``sentinel`` or on EOF.
-    Internal newlines are preserved; trailing blank lines are stripped.
+    Internal newlines are preserved; trailing empty lines are dropped, but a
+    trailing line of whitespace is kept verbatim -- a real strip would eat the
+    meaningful indentation of a pasted code block.
 
     Args:
         console: Console to print the input hint to.
         sentinel: Line that, typed alone, submits the accumulated text.
+            Keyword-only and required: the two gates use different sentinels,
+            so a caller states which one it means.
 
     Returns:
-        ``(text, hit_eof)`` -- the collected text with trailing blank lines
-        stripped, and whether the read ended at EOF rather than at the
-        sentinel. Callers need the distinction because an EOF that yielded no
-        text is a deliberate dismissal (Ctrl-D at an empty prompt), whereas
-        the sentinel with no text is merely an empty submission.
+        ``(text, hit_eof)`` -- the collected text and whether the read ended at
+        EOF rather than at the sentinel. Callers need the distinction because
+        an EOF that yielded no text is a deliberate dismissal (Ctrl-D at an
+        empty prompt), whereas the sentinel with no text is merely an empty
+        submission.
     """
     console.print(
         styled(
@@ -76,10 +78,14 @@ def read_multiline_lines(
     while True:
         try:
             line = input()
-        except (EOFError, StopIteration):
-            # StopIteration only ever arises from a test double's exhausted
-            # ``side_effect`` list (real ``input()`` never raises it) --
-            # treated the same as EOF: submit what has been accumulated.
+        except EOFError:
+            # The only end-of-input a real stdin produces here: an exhausted
+            # or non-tty stream raises EOFError, a closed one ValueError.
+            # StopIteration is deliberately *not* caught -- input() would only
+            # relay it from a contrived stdin replacement, and treating it as
+            # EOF would submit a truncated turn as if the user had pressed
+            # Ctrl-D. A test double that runs past what it supplied is a bug
+            # in the test, so it must surface rather than read as a dismissal.
             hit_eof = True
             break
         if line.strip() == sentinel:
@@ -528,13 +534,13 @@ class HumanGateHandler:
         """Read a multi-line answer from stdin (blocking; call in a thread).
 
         Delegates to the shared :func:`read_multiline_lines` with this gate's
-        historical ``.`` sentinel, so behavior is unchanged by the extraction.
+        historical ``.`` sentinel.
 
         Returns:
-            The collected text with trailing blank lines stripped. Internal
-            newlines are preserved.
+            The collected text, with trailing empty lines dropped and internal
+            newlines preserved.
         """
-        text, _ = read_multiline_lines(self.console, MULTILINE_SENTINEL)
+        text, _ = read_multiline_lines(self.console, sentinel=MULTILINE_SENTINEL)
         return text
 
 

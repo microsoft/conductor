@@ -87,6 +87,38 @@ DISMISS_KEYWORDS = frozenset(
 _READY_MARKER = "[READY_TO_CONTINUE]"
 
 
+def _reads_multiline_turn() -> bool:
+    """Whether a conversational dialog turn is read multi-line.
+
+    Off a tty the turn falls back to a single-line ``Prompt.ask``, where the
+    submit sentinel has no effect. Both the reader in
+    ``DialogHandler._get_user_input`` and the opening banner's sentinel hint
+    ask this, so the banner can never advertise a keystroke the reader ignores.
+    """
+    return sys.stdin.isatty()
+
+
+def _dismiss_instruction() -> Text:
+    """How to actually leave the dialog, phrased for the active reader.
+
+    A dismiss keyword is only recognised once the turn is *submitted*, so on a
+    tty it needs the sentinel after it. Saying "type done" there describes a
+    keystroke that does nothing until the reply is sent -- the exit instruction
+    has to move with :func:`_reads_multiline_turn` or it contradicts the very
+    banner that advertises the sentinel.
+
+    Returns:
+        A pre-styled ``Text``, so a caller splices it through ``styled`` and
+        keeps its own template a literal (#406).
+    """
+    if _reads_multiline_turn():
+        return styled(
+            "send [bold]done[/bold] or [bold]/done[/bold] with [bold]{}[/bold]",
+            DIALOG_SUBMIT_SENTINEL,
+        )
+    return Text.from_markup("say [bold]done[/bold] or [bold]/done[/bold]")
+
+
 def _extract_ready_marker(response: str) -> tuple[bool, str]:
     """Return ``(proposed, cleaned)`` for an agent response.
 
@@ -321,9 +353,9 @@ class DialogHandler:
                     exc_info=True,
                 )
                 self.console.print(
-                    Text.from_markup(
-                        "[dim red]  (Agent response failed — you can continue "
-                        "or type 'done')[/dim red]"
+                    styled(
+                        "[dim red]  (Agent response failed — you can continue, or {})[/dim red]",
+                        _dismiss_instruction(),
                     )
                 )
                 continue
@@ -612,19 +644,30 @@ class DialogHandler:
         base_dir: Path | None = None,
     ) -> None:
         """Display the dialog opening with full agent context."""
-        # Gated on the same condition as the multi-line reader in
-        # _get_user_input: off a tty, that turn falls back to a single-line
-        # Prompt.ask and the sentinel does nothing, so advertising it would
-        # instruct the user to type something with no effect. The markup stays
-        # in the template because styled() inserts *values* verbatim.
-        if sys.stdin.isatty():
-            multiline_hint = (
-                " It can span multiple lines; send it with [bold]{}[/bold] on its own line."
+        # Advertised only where the sentinel applies -- see
+        # _reads_multiline_turn. Pre-rendered as a Text so the outer template
+        # has fixed arity: styled() splices a Text in with its own spans
+        # re-anchored, and raises IndexError on a template/argument mismatch
+        # that only the tty branch would reach. Off a tty the sentence keeps
+        # its original plural, since each line really is a separate response
+        # there.
+        instruction = (
+            styled(
+                "Type your response below. It can span multiple lines; send it"
+                " with [bold]{}[/bold] on its own line. A dismiss keyword ends"
+                " the dialog the same way: send [bold]done[/bold] or"
+                " [bold]/done[/bold] with [bold]{}[/bold].",
+                DIALOG_SUBMIT_SENTINEL,
+                DIALOG_SUBMIT_SENTINEL,
             )
-            hint_args: tuple[object, ...] = (DIALOG_SUBMIT_SENTINEL,)
-        else:
-            multiline_hint = ""
-            hint_args = ()
+            if _reads_multiline_turn()
+            # Byte-identical to upstream's sentence: off a tty every line is a
+            # turn already, so a dismiss keyword needs nothing after it.
+            else Text.from_markup(
+                "Type your responses below. Say [bold]done[/bold] or "
+                "[bold]/done[/bold] when finished."
+            )
+        )
 
         self.console.print()
         self.console.print(
@@ -632,11 +675,9 @@ class DialogHandler:
                 styled(
                     "[bold]Agent '{}'[/bold] would like to discuss "
                     "its output with you.\n"
-                    "[dim]Type your response below." + multiline_hint + " "
-                    "Say [bold]done[/bold] or [bold]/done[/bold] when "
-                    "finished.[/dim]",
+                    "[dim]{}[/dim]",
                     agent.name,
-                    *hint_args,
+                    instruction,
                 ),
                 title=Text.from_markup("[bold magenta]Dialog Mode[/bold magenta]"),
                 border_style="magenta",
@@ -767,11 +808,11 @@ class DialogHandler:
             but whitespace accumulated is a deliberate Ctrl-D and still
             returns None.
         """
-        if prompt_text is None and sys.stdin.isatty():
+        if prompt_text is None and _reads_multiline_turn():
             self.console.print(styled("[bold magenta]You[/bold magenta]"))
             try:
                 text, hit_eof = await read_on_daemon_thread(
-                    lambda: read_multiline_lines(self.console, DIALOG_SUBMIT_SENTINEL)
+                    lambda: read_multiline_lines(self.console, sentinel=DIALOG_SUBMIT_SENTINEL)
                 )
             except (EOFError, KeyboardInterrupt):
                 return None

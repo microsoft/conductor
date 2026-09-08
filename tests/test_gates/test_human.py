@@ -9,7 +9,13 @@ import pytest
 
 from conductor.config.schema import AgentDef, GateOption
 from conductor.exceptions import HumanGateError
-from conductor.gates.human import GateResult, HumanGateHandler, read_multiline_lines
+from conductor.gates.human import (
+    DIALOG_SUBMIT_SENTINEL,
+    MULTILINE_SENTINEL,
+    GateResult,
+    HumanGateHandler,
+    read_multiline_lines,
+)
 
 
 @pytest.fixture
@@ -763,7 +769,7 @@ class TestReadMultilineLines:
             "builtins.input",
             side_effect=["line one", "line two", "line three", "."],
         ):
-            result, hit_eof = read_multiline_lines(MagicMock())
+            result, hit_eof = read_multiline_lines(MagicMock(), sentinel=MULTILINE_SENTINEL)
 
         assert result == "line one\nline two\nline three"
         assert hit_eof is False
@@ -779,7 +785,7 @@ class TestReadMultilineLines:
     def test_read_multiline_lines_eof_returns_accumulated(self) -> None:
         """EOF submits accumulated content, not empty."""
         with patch("builtins.input", side_effect=["a", "b", EOFError()]):
-            result, hit_eof = read_multiline_lines(MagicMock())
+            result, hit_eof = read_multiline_lines(MagicMock(), sentinel=MULTILINE_SENTINEL)
 
         assert result == "a\nb"
         assert hit_eof is True
@@ -791,9 +797,78 @@ class TestReadMultilineLines:
         from a sentinel typed with nothing above it (not a turn).
         """
         with patch("builtins.input", side_effect=EOFError()):
-            text, hit_eof = read_multiline_lines(MagicMock())
+            text, hit_eof = read_multiline_lines(MagicMock(), sentinel=MULTILINE_SENTINEL)
         assert (text, hit_eof) == ("", True)
 
         with patch("builtins.input", side_effect=["."]):
-            text, hit_eof = read_multiline_lines(MagicMock())
+            text, hit_eof = read_multiline_lines(MagicMock(), sentinel=MULTILINE_SENTINEL)
         assert (text, hit_eof) == ("", False)
+
+    @pytest.mark.parametrize("sentinel", [MULTILINE_SENTINEL, DIALOG_SUBMIT_SENTINEL])
+    def test_hint_names_the_sentinel_it_will_accept(self, sentinel: str) -> None:
+        """The per-turn hint is where the user learns how to submit.
+
+        Each gate passes its own sentinel, so a hint rendered from anything
+        else would tell the user to type a line the reader ignores -- and
+        leave them at a prompt that never submits.
+        """
+        console = MagicMock()
+        with patch("builtins.input", side_effect=[sentinel]):
+            read_multiline_lines(console, sentinel=sentinel)
+
+        printed = console.print.call_args.args[0].plain
+        assert f"'{sentinel}'" in printed, printed
+
+    def test_a_broken_stdin_is_not_read_as_a_dismissal(self) -> None:
+        """Only EOFError ends the read; anything else propagates.
+
+        A stdin source raising something the loop swallowed would submit a
+        truncated turn as though the user had pressed Ctrl-D, with nothing
+        logged. StopIteration is the case that matters: it is what an
+        exhausted test double raises, so catching it would also let a double
+        read past what it supplied and still pass as a clean submission.
+        """
+        with (
+            patch("builtins.input", side_effect=StopIteration("broken source")),
+            pytest.raises(StopIteration),
+        ):
+            read_multiline_lines(MagicMock(), sentinel=MULTILINE_SENTINEL)
+
+    def test_sentinel_must_be_passed_by_keyword(self) -> None:
+        """The sentinel is required, so neither gate can inherit the other's.
+
+        A positional default made ``read_multiline_lines(console)`` silently
+        valid, which would truncate a dialog reply at any lone "." with no
+        signal at the call site. Pinned because the hazard is re-openable by
+        restoring one default and nothing else would fail.
+        """
+        with pytest.raises(TypeError, match="sentinel"):
+            read_multiline_lines(MagicMock())  # ty: ignore[missing-argument]
+
+    @pytest.mark.parametrize("typed", ["/send", " /send", "/send ", "\t/send  "])
+    def test_sentinel_tolerates_surrounding_whitespace(self, typed: str) -> None:
+        """A stray space around the sentinel still submits.
+
+        Terminals and paste buffers add trailing whitespace routinely, and
+        without this the user would sit at a prompt that never submits. The
+        trailing ``"unreachable"`` proves the reader stopped at the sentinel
+        rather than merely running out of mock values.
+        """
+        with patch("builtins.input", side_effect=["body", typed, "unreachable"]):
+            text, hit_eof = read_multiline_lines(MagicMock(), sentinel="/send")
+
+        assert (text, hit_eof) == ("body", False)
+
+    def test_trailing_whitespace_line_is_kept_verbatim(self) -> None:
+        """Trailing *empty* lines are dropped; a whitespace line is content.
+
+        Pins the docstring's distinction: stripping it would eat the closing
+        indentation of a pasted code block.
+        """
+        with patch("builtins.input", side_effect=["a", "", "", "/send"]):
+            text, _ = read_multiline_lines(MagicMock(), sentinel="/send")
+        assert text == "a"
+
+        with patch("builtins.input", side_effect=["a", "   ", "", "/send"]):
+            text, _ = read_multiline_lines(MagicMock(), sentinel="/send")
+        assert text == "a\n   "

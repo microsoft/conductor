@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from conductor.config.schema import AgentDef, DialogConfig
+from conductor.console import styled
 from conductor.gates.dialog import DialogHandler, DialogResult
-from conductor.gates.human import DIALOG_SUBMIT_SENTINEL
+from conductor.gates.human import (
+    DIALOG_SUBMIT_SENTINEL,
+    read_multiline_lines,
+    read_on_daemon_thread,
+)
 
 
 class TestDialogHandlerSkip:
@@ -746,7 +752,7 @@ class TestDialogMultilineInput:
             patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
             patch(
                 "builtins.input",
-                side_effect=["line one", "line two", "line three", "/send", "done"],
+                side_effect=["line one", "line two", "line three", "/send", "done", EOFError()],
             ),
         ):
             result = await handler.handle_dialog(
@@ -771,7 +777,7 @@ class TestDialogMultilineInput:
             patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
             patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
             # Paste, then Ctrl-D (EOF) instead of /send; then a real dismissal.
-            patch("builtins.input", side_effect=["ticket text", EOFError(), "done"]),
+            patch("builtins.input", side_effect=["ticket text", EOFError(), "done", EOFError()]),
         ):
             result = await handler.handle_dialog(
                 agent=agent,
@@ -779,9 +785,13 @@ class TestDialogMultilineInput:
                 opening_question="Q?",
                 provider=provider,
             )
-        user_msgs = [m for m in result.messages if m.role == "user"]
-        assert user_msgs[0].content == "ticket text"  # not dropped as None
-        provider.execute_dialog_turn.assert_awaited()  # the turn WAS dispatched
+        # The paste-terminating EOF submitted its content and did NOT dismiss --
+        # the dialog went on to accept a further turn, which is what ended it.
+        assert [m.content for m in result.messages if m.role == "user"] == [
+            "ticket text",
+            "done",
+        ]
+        provider.execute_dialog_turn.assert_awaited_once()
 
     @pytest.mark.parametrize("isatty", [True, False])
     def test_opening_banner_advertises_the_sentinel_only_on_a_tty(self, isatty: bool) -> None:
@@ -810,6 +820,20 @@ class TestDialogMultilineInput:
         assert (needle in rendered) is isatty, rendered
         # The markup must be parsed, not inserted verbatim as a value.
         assert "[bold]" not in rendered, rendered
+        # Off a tty the sentence keeps its original plural, since each line
+        # really is a separate response there. Asserted because this wording
+        # has already drifted to the singular once, and only a byte comparison
+        # against the unmodified banner would otherwise have caught it.
+        expected = "Typeyourresponsesbelow." if not isatty else "Typeyourresponsebelow."
+        assert expected in rendered, rendered
+        # The exit instruction has to describe the *active* reader. On a tty a
+        # dismiss keyword is only seen once the turn is submitted, so telling
+        # the user to "say done" there names a keystroke that does nothing.
+        if isatty:
+            assert "senddoneor/donewith/send" in rendered, rendered
+            assert "Saydoneor/donewhenfinished." not in rendered, rendered
+        else:
+            assert "Saydoneor/donewhenfinished." in rendered, rendered
 
     @pytest.mark.asyncio
     async def test_ctrl_d_at_empty_prompt_dismisses(self) -> None:
@@ -823,12 +847,28 @@ class TestDialogMultilineInput:
         agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
         provider = MagicMock()
         provider.execute_dialog_turn = AsyncMock(return_value="ack")
-        # A bounded list: if the loop spins, input() raises StopIteration
-        # rather than hanging the suite.
+
+        # A *bounded* EOF source. ``side_effect=EOFError()`` re-raises forever,
+        # so dropping the dismissal branch would spin this loop and hang the
+        # suite rather than fail it -- there is no pytest-timeout configured.
+        calls = itertools.count()
+
+        def _eof_but_bounded(*_args: object, **_kwargs: object) -> str:
+            assert next(calls) < 10, "dialog loop spun on an empty EOF read"
+            raise EOFError
+
         with (
             patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
             patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
-            patch("builtins.input", side_effect=EOFError()),
+            patch("builtins.input", side_effect=_eof_but_bounded),
+            patch(
+                "conductor.gates.dialog.read_multiline_lines",
+                wraps=read_multiline_lines,
+            ) as reader,
+            patch(
+                "conductor.gates.dialog.read_on_daemon_thread",
+                wraps=read_on_daemon_thread,
+            ) as dispatch,
         ):
             result = await handler.handle_dialog(
                 agent=agent,
@@ -839,10 +879,24 @@ class TestDialogMultilineInput:
         assert result.user_dismissed is True
         assert [m for m in result.messages if m.role == "user"] == []
         provider.execute_dialog_turn.assert_not_awaited()
+        # Pins *this* reader, not merely "some reader dismissed on EOF".
+        reader.assert_called_once()
+        # And pins the dispatch: a cancelled ``asyncio.to_thread`` leaves its
+        # worker blocked in ``input()`` holding a slot in the shared default
+        # executor, which eventually deadlocks unrelated ``to_thread`` calls --
+        # see ``read_on_daemon_thread``'s own docstring.
+        dispatch.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_ctrl_c_dismisses_rather_than_propagating(self) -> None:
-        """KeyboardInterrupt on the tty turn dismisses, as on the single-line path."""
+    async def test_reader_exception_dismisses_rather_than_crashing_the_dialog(self) -> None:
+        """An exception out of the reader dismisses instead of escaping.
+
+        This does **not** cover Ctrl-C. CPython runs signal handlers on the
+        main thread only, and the read happens on a daemon thread, so a real
+        SIGINT never reaches this ``except``: asyncio cancels the main task and
+        ``KeyboardInterrupt`` tears the run down, as it does everywhere else.
+        What is covered is an exception the reader itself raises.
+        """
         handler = DialogHandler(console=MagicMock())
         agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
         provider = MagicMock()
@@ -889,6 +943,157 @@ class TestDialogMultilineInput:
         user_msgs = [m for m in result.messages if m.role == "user"]
         assert user_msgs[0].content == "a\nb\nc"
         assert result.user_dismissed is True
+
+    @pytest.mark.asyncio
+    async def test_non_tty_main_turn_uses_the_single_line_prompt(self) -> None:
+        """Off a tty the conversational turn stays on ``Prompt.ask``.
+
+        Half of the reader gate: without the ``isatty()`` check the multi-line
+        reader would activate under a pipe or in CI, waiting for a sentinel
+        nobody can type.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=False),
+            patch(
+                "conductor.gates.dialog.Prompt.ask",
+                side_effect=["piped answer", "done"],
+            ) as ask,
+            patch("builtins.input", side_effect=AssertionError("must not read raw stdin")),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        assert ask.call_count == 2
+        assert [m.content for m in result.messages if m.role == "user"] == [
+            "piped answer",
+            "done",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_confirmation_prompt_stays_single_line_on_a_tty(self) -> None:
+        """A ``prompt_text`` question must not require the sentinel.
+
+        The other half of the reader gate: without the ``prompt_text is None``
+        check the yes/no confirmation would start demanding ``/send`` after
+        "yes" on every interactive run.
+        """
+        handler = DialogHandler(console=MagicMock())
+        with (
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("conductor.gates.dialog.Prompt.ask", return_value="yes") as ask,
+            patch("builtins.input", side_effect=AssertionError("must not read multi-line")),
+        ):
+            answer = await handler._get_user_input(prompt_text=styled("[bold]Continue?[/bold]"))
+        assert answer == "yes"
+        ask.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_bare_sentinel_is_skipped_and_the_loop_continues(self) -> None:
+        """An empty submission is neither a turn nor dismissal."""
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch(
+                "builtins.input",
+                side_effect=["/send", "real turn", "/send", "done", "/send", EOFError()],
+            ),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        # No empty turn recorded, none dispatched, and the loop carried on to
+        # accept a real turn afterwards.
+        assert [m.content for m in result.messages if m.role == "user"] == [
+            "real turn",
+            "done",
+        ]
+        provider.execute_dialog_turn.assert_awaited_once()
+        assert result.user_dismissed is True
+
+    @pytest.mark.parametrize("isatty", [True, False])
+    def test_failure_notice_names_a_working_exit(self, isatty: bool) -> None:
+        """The recovery notice must not name an inert keystroke either.
+
+        It fires when a provider call has just failed -- the moment the user
+        most wants a reliable way out -- so it has to move with the reader the
+        same way the banner does.
+        """
+        from conductor.gates.dialog import _dismiss_instruction
+
+        with patch("conductor.gates.dialog.sys.stdin.isatty", return_value=isatty):
+            hint = _dismiss_instruction()
+
+        assert ("with /send" in hint) is isatty, hint
+
+    @pytest.mark.asyncio
+    async def test_dismiss_keyword_still_exits_a_tty_dialog(self) -> None:
+        """ "done" submitted with the sentinel ends the dialog.
+
+        The banner promises this; without it the only exits from a tty dialog
+        would be Ctrl-D and whatever the agent decides.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["done", "/send", EOFError()]),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        assert result.user_dismissed is True
+        provider.execute_dialog_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pasted_indentation_reaches_the_provider_intact(self) -> None:
+        """A pasted code block keeps its leading and interior whitespace.
+
+        The empty-submission guards strip only to *decide* whether there is
+        anything to send; the text itself must go through verbatim. Stripping
+        it would silently reindent a pasted block, which is the data loss this
+        whole reader exists to prevent, and no other test covers the leading
+        edge of it.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        block = ["    def f():", "", "        return 1", "    "]
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=[*block, "/send", "done", EOFError()]),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        expected = "    def f():\n\n        return 1\n    "
+        assert [m.content for m in result.messages if m.role == "user"][0] == expected
+        assert provider.execute_dialog_turn.await_args.kwargs["user_message"] == expected
 
     @pytest.mark.asyncio
     async def test_whitespace_only_submission_is_not_a_turn(self) -> None:
@@ -942,3 +1147,32 @@ class TestDialogMultilineInput:
         provider.execute_dialog_turn.assert_not_awaited()
         assert [m for m in result.messages if m.role == "user"] == []
         assert result.user_dismissed is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blank", ["", "   "])
+    async def test_blank_piped_line_is_skipped_off_a_tty(self, blank: str) -> None:
+        """The empty guard also covers the non-tty path.
+
+        ``Prompt.ask`` returns "" for a blank line, which previously reached
+        the provider as an empty turn. The whitespace case is parametrised
+        because ``rich.prompt.PromptBase.process_response`` strips its result,
+        so in production a whitespace-only line already arrives as "" -- these
+        mocks bypass that, and the guard has to hold either way.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=False),
+            patch("conductor.gates.dialog.Prompt.ask", side_effect=[blank, "done"]),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        assert [m.content for m in result.messages if m.role == "user"] == ["done"]
+        provider.execute_dialog_turn.assert_not_awaited()
