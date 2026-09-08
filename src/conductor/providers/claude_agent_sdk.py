@@ -668,6 +668,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # rather than being stamped individually as they are for Copilot:
         # the SDK's ``McpStdioServerConfig`` has no cwd field.
         working_dir=True,
+        # ``settings_dir`` reaches ``ClaudeAgentOptions.add_dirs``, the CLI's
+        # ``--add-dir``. It is the only provider that has anywhere to put it.
+        settings_dir=True,
         # Skills are loaded natively: the owning plugin is registered via
         # ``ClaudeAgentOptions.plugins`` and enabled by its qualified name
         # through ``skills``, so the model reads the frontmatter up front
@@ -993,6 +996,27 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
+            # The authored ``settings_dir`` and nothing else.
+            #
+            # What this does, measured: it makes a directory's *project*
+            # settings tier discoverable — its ``.claude/skills`` become
+            # listed and invocable with cwd elsewhere entirely, and only
+            # those, not CLAUDE.md, .claude/rules/*.md, .claude/settings.json
+            # or .claude/agents, which all stay with cwd. So it is the skills
+            # portion of a project tier rather than a cwd-independent way to
+            # load one.
+            #
+            # Do not extend this to the directory args of stdio MCP servers to
+            # widen what those servers may read: it cannot work. A filesystem
+            # MCP server uses its argv directories only when the client does
+            # not support MCP Roots, and the CLI does support Roots —
+            # advertising exactly one, its cwd — so the server discards its
+            # argv directories and permits cwd alone. ``--add-dir`` takes no
+            # part in that negotiation; it widens the CLI's own file tools,
+            # never what a server permits. Measured: cwd alone is the
+            # effective allowlist whether or not every declared root is also
+            # passed here.
+            add_dirs=[agent.settings_dir] if agent.settings_dir else [],
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,

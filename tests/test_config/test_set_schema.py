@@ -132,6 +132,7 @@ class TestSetAgentDefForbiddenFields:
             ("args", ["x"], "cannot have 'args'"),
             ("env", {"K": "v"}, "cannot have 'env'"),
             ("working_dir", "/tmp", "cannot have 'working_dir'"),
+            ("settings_dir", "/tmp", "cannot have 'settings_dir'"),
             ("timeout", 5, "cannot have 'timeout'"),
             ("workflow", "x.yaml", "cannot have 'workflow'"),
             ("input_mapping", {"a": "1"}, "cannot have 'input_mapping'"),

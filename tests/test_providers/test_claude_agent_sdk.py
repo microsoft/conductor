@@ -3083,3 +3083,212 @@ class TestValidateConnectionProbeSetPerPlatform:
             "a Windows user's local install must still be found"
         )
         assert any(p.endswith(".npm-global/bin/claude") for p in probed)
+
+
+class TestSettingsDirAddDirs:
+    """``settings_dir`` is the only source of ``ClaudeAgentOptions.add_dirs``.
+
+    The mechanism these tests rest on is measured rather than reasoned about
+    (``tests/test_integration/test_mcp_roots_negotiation.py`` pins it against
+    the real server without an LLM): ``@modelcontextprotocol/server-filesystem``
+    uses its argv directories only when the client does not support MCP Roots;
+    the Claude CLI does support Roots and advertises exactly one, its cwd; so
+    the server discards its argv directories and permits cwd alone.
+    ``--add-dir`` does not participate in that negotiation, so it cannot be
+    used to widen what an MCP server permits -- which is why this field is
+    fed only by the author's ``settings_dir`` and never derived from server
+    arguments.
+
+    What ``add_dirs`` does do is make a directory's *project* settings tier
+    contribute its skills, independent of cwd -- which is what lets an agent
+    keep a cwd wide enough for its MCP servers while loading a narrower
+    target repository's conventions.
+    """
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_becomes_add_dirs(self, tmp_path: Path) -> None:
+        """Requirement: the authored directory reaches the SDK option."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", settings_dir=str(tmp_path)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["add_dirs"] == [str(tmp_path)]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_settings_dir_sends_no_add_dirs(self) -> None:
+        """An agent that names no directory adds none.
+
+        The empty list matters: the CLI would otherwise be handed a directory
+        whose skills, being in an enabled settings tier, become listed and
+        invocable -- ambient content the workflow never declared.
+        """
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["add_dirs"] == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_stdio_server_dir_args_are_not_forwarded(self, tmp_path: Path) -> None:
+        """The regression this class is named for.
+
+        A stdio server's own directory arguments must NOT reach ``add_dirs``.
+        Forwarding them was measurably ineffective, and reinstating it would
+        silently widen skill discovery to every declared MCP root -- granting
+        content from directories the author named as *data*, not as a source
+        of conventions.
+        """
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+        root_b = tmp_path / "rootB"
+        root_b.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={
+                    "filesystem": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": [
+                            "-y",
+                            "@modelcontextprotocol/server-filesystem",
+                            str(root_a),
+                            str(root_b),
+                        ],
+                    }
+                }
+            )
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["add_dirs"] == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_is_independent_of_cwd(self, tmp_path: Path) -> None:
+        """The whole point of the field: the two directories are unrelated.
+
+        ``cwd`` becomes the session's sole MCP root; ``settings_dir`` only
+        adds a project tier to read skills from. An agent must be able to set
+        a wide cwd and a narrow settings_dir at once -- neither derived from
+        nor constrained by the other.
+        """
+        wide = tmp_path / "wide"
+        wide.mkdir()
+        narrow = wide / "repo"
+        narrow.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(
+                    name="t",
+                    prompt="hi",
+                    working_dir=str(wide),
+                    settings_dir=str(narrow),
+                ),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["cwd"] == str(wide)
+        assert captured["add_dirs"] == [str(narrow)]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_does_not_become_a_second_cwd(self, tmp_path: Path) -> None:
+        """The boundary of what this field can deliver, pinned deliberately.
+
+        ``add_dirs`` carries a directory's ``.claude/skills`` and nothing
+        else: ``CLAUDE.md``, ``.claude/rules/*.md``, ``.claude/settings.json``
+        (so ``env`` and ``hooks``) and ``.claude/agents`` all follow cwd
+        instead -- measured against the CLI, not inferred. So a
+        ``settings_dir`` must never be quietly promoted into ``cwd`` in an
+        attempt to widen what it loads: that would hand the agent the narrow
+        directory as its sole MCP root, which is the exact defect this field
+        exists to avoid.
+
+        An agent needing a repository's rules *and* a wide cwd cannot have
+        both from these two fields, and this test is what keeps that trade
+        visible rather than papered over.
+        """
+        wide = tmp_path / "wide"
+        wide.mkdir()
+        narrow = wide / "repo"
+        narrow.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(
+                    name="t", prompt="hi", working_dir=str(wide), settings_dir=str(narrow)
+                ),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # The line that pins it: cwd is the wide directory exactly. The
+        # earlier `narrow not in cwd` substring check added nothing -- it also
+        # passes for an implementation that sets cwd to an unrelated third
+        # directory, so it read as a guard without being one.
+        assert captured["cwd"] == str(wide)
+        assert captured["add_dirs"] == [str(narrow)]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_passed_verbatim(self, tmp_path: Path) -> None:
+        """Not re-resolved, matching ``cwd``: the engine already rendered,
+        absolutized and existence-checked it, and ``resolve()`` here would
+        collapse the symlink aliases the engine preserves on purpose."""
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", settings_dir=str(link)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["add_dirs"] == [str(link)]

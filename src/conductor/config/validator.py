@@ -1272,6 +1272,11 @@ def _collect_template_strings(
         templates.append((f"agent '{agent.name}' args[{i}]", arg))
     if agent.working_dir:
         templates.append((f"agent '{agent.name}' working_dir", agent.working_dir))
+    # getattr for the same reason the 'set' bindings below use it: duck-typed
+    # test fixtures predate this field and would raise on direct access.
+    settings_dir = getattr(agent, "settings_dir", None)
+    if settings_dir:
+        templates.append((f"agent '{agent.name}' settings_dir", settings_dir))
 
     # 'set' step bindings — value: single expression, values: named expressions.
     # Use getattr so duck-typed test fixtures without these attributes still
@@ -1805,6 +1810,18 @@ _LLM_AGENT_TYPES = frozenset({None, "agent"})
 def _is_llm_agent(agent: AgentDef) -> bool:
     """True iff this agent invokes a provider (vs. human_gate, script, etc.)."""
     return agent.type in _LLM_AGENT_TYPES
+
+
+def _setting_sources_enabled(config: WorkflowConfig) -> bool:
+    """True iff the workflow enables any Claude Code settings tier.
+
+    ``runtime.provider`` is either the bare string shorthand (no tiers, by
+    definition) or a ``ProviderSettings`` carrying ``setting_sources``. An
+    empty or absent list means Conductor sends ``[]`` -- load nothing ambient
+    -- so no ``project`` tier exists for a ``settings_dir`` to be read from.
+    """
+    provider = config.workflow.runtime.provider
+    return bool(getattr(provider, "setting_sources", None))
 
 
 def _resolved_provider_name(agent: AgentDef, default: str) -> str:
@@ -2451,6 +2468,31 @@ def _validate_provider_capabilities(
                 f"Agent '{agent.name}' sets working_dir={agent.working_dir!r} "
                 f"but provider '{provider_name}' does not apply agent working "
                 f"directories (capabilities.working_dir=False)."
+            )
+
+        # settings_dir: same class as working_dir. A provider with nowhere to
+        # put the directory would load the wrong repository's conventions and
+        # report success, so this is an error rather than a dropped field.
+        if agent.settings_dir is not None and not caps.settings_dir:
+            errors.append(
+                f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} "
+                f"but provider '{provider_name}' does not apply it "
+                f"(capabilities.settings_dir=False). Only 'claude-agent-sdk' "
+                f"has a surface for it; use working_dir, or move this agent to "
+                f"that provider."
+            )
+        elif agent.settings_dir is not None and not _setting_sources_enabled(config):
+            # A warning, not an error: the FILESYSTEM half of settings_dir
+            # applies regardless, so the workflow is not broken -- but the
+            # skill discovery it is normally set for is a no-op without the
+            # project tier enabled, and a green validate would imply otherwise.
+            warnings.append(
+                f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} but "
+                f"the workflow does not set runtime.provider.setting_sources, so no "
+                f"settings tier is enabled and no skills will be discovered from it. "
+                f"The directory is still granted to the model's built-in file tools. "
+                f"Add 'setting_sources: [project]' to runtime.provider to load that "
+                f"repository's skills."
             )
 
         # session_key: a provider that ignores it starts a fresh session every

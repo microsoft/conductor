@@ -3583,6 +3583,7 @@ class _RecordingWorkingDirProvider:
 
     def __init__(self) -> None:
         self.seen: list[tuple[str, str | None]] = []
+        self.seen_settings_dir: list[tuple[str, str | None]] = []
         self.calls: int = 0
 
     async def execute(
@@ -3599,6 +3600,7 @@ class _RecordingWorkingDirProvider:
     ):
         self.calls += 1
         self.seen.append((agent.name, agent.working_dir))
+        self.seen_settings_dir.append((agent.name, agent.settings_dir))
         content = dict.fromkeys(agent.output or {}, f"{agent.name}-ok")
         return AgentOutput(
             content=content,
@@ -3622,6 +3624,7 @@ def _single_agent_config(
     *,
     working_dir: str | None = None,
     runtime_working_dir: str | None = None,
+    settings_dir: str | None = None,
     model: str = "gpt-4",
     max_tokens: int | None = None,
 ) -> WorkflowConfig:
@@ -3640,6 +3643,7 @@ def _single_agent_config(
                 model=model,
                 prompt="Do work",
                 working_dir=working_dir,
+                settings_dir=settings_dir,
                 output={"result": OutputField(type="string")},
                 routes=[RouteDef(to="$end")],
             ),
@@ -4381,3 +4385,132 @@ class TestWorkingDirEvents:
         envelope = [e for e in events if e.type == "for_each_item_started"]
         assert len(envelope) == 1
         assert envelope[0].data == {"group_name": "fans", "item_key": "0", "index": 0}
+
+
+class TestAgentSettingsDirResolution:
+    """Engine resolution of ``AgentDef.settings_dir``.
+
+    ``settings_dir`` selects the directory whose Claude Code *project*
+    settings tier an agent reads skills from. It is resolved exactly like
+    ``working_dir`` -- shared code, so the two cannot drift -- but is
+    deliberately independent of it: ``working_dir`` becomes the session cwd,
+    which the CLI advertises as its sole MCP root, whereas ``settings_dir``
+    only adds a tier to discover skills in. Keeping them separate is what
+    lets an agent hold a cwd wide enough for every path its MCP servers must
+    reach while still loading a narrower target repository's conventions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_absolute_settings_dir_reaches_provider(self, tmp_path: Path) -> None:
+        """Requirement: the resolved directory is set on the ``AgentDef`` the
+        provider receives, which is where it becomes ``add_dirs``."""
+        target = tmp_path / "repo"
+        target.mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(target)),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(target)))]
+
+    @pytest.mark.asyncio
+    async def test_settings_dir_does_not_become_working_dir(self, tmp_path: Path) -> None:
+        """The separation, asserted from the engine side.
+
+        An agent naming only ``settings_dir`` must leave ``working_dir``
+        unset, so the provider keeps its own cwd -- and with it the wide MCP
+        root. Coupling the two here would silently reintroduce the narrowing
+        the field exists to avoid.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(target)),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen == [("worker", None)]
+
+    @pytest.mark.asyncio
+    async def test_both_directories_resolve_independently(self, tmp_path: Path) -> None:
+        """The intended shape: a wide cwd and a narrow settings tier at once."""
+        wide = tmp_path / "wide"
+        narrow = wide / "repo"
+        narrow.mkdir(parents=True)
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(working_dir=str(wide), settings_dir=str(narrow)),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen == [("worker", os.path.normpath(str(wide)))]
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(narrow)))]
+
+    @pytest.mark.asyncio
+    async def test_templated_settings_dir_is_rendered(self, tmp_path: Path) -> None:
+        """Requirement: Jinja-rendered against the per-agent context, since the
+        directory a step reviews is normally an upstream step's output."""
+        target = tmp_path / "from-input"
+        target.mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir="{{ workflow.input.target }}"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({"target": str(target)})
+
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(target)))]
+
+    @pytest.mark.asyncio
+    async def test_relative_settings_dir_resolves_against_workflow_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: relative paths resolve against the workflow file's
+        directory, not the process cwd -- matching ``working_dir``."""
+        (tmp_path / "sub").mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir="./sub"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(tmp_path / "sub")))]
+
+    @pytest.mark.asyncio
+    async def test_missing_settings_dir_raises_before_the_provider_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: a bad path fails fast and names its own field.
+
+        Naming ``settings_dir`` rather than ``working_dir`` is the point: the
+        two are resolved by shared code, and a message naming the wrong field
+        would send an author to correct a value that is already right.
+        """
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(tmp_path / "nope")),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await engine.run({})
+
+        assert "settings_dir" in str(exc_info.value)
+        assert provider.calls == 0
