@@ -33,20 +33,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dialog mode was the only free-text human-input surface that could not accept
   a multi-line answer (`QuestionDef.multiline` defaults to `True` and
   `GateOption.multiline` opts in, both served by one reader in `gates/human.py`).
-  The dialog gate read a reply with single-line `Prompt.ask`, so pasting a block of
-  text into an interactive terminal dispatched *each line* as its own turn: a
+  The dialog gate read a reply with single-line `Prompt.ask`, so pasting a block
+  of text into an interactive terminal dispatched *each line* as its own turn: a
   three-line paste became three separate questions to the model, each answered
   against a fragment, and the paste's trailing newline added a fourth turn with
   empty content. Terminal turns now read through the multi-line reader already
   behind the human gate's `.` sentinel, submitted with `/send` on its own line,
-  so internal newlines survive and a paste is a single message; an empty
-  submission is no longer dispatched as a turn. Ctrl-D (Ctrl-Z then Enter on
-  Windows) submits what has been typed and dismisses the dialog when nothing
-  has, and Ctrl-C dismisses rather than propagating. The dialog uses `/send`
-  where the human gate keeps `.`, since a lone `.` is likelier to be prose in
-  a conversational reply. Off a tty — a pipe, CI, or the web dashboard — the
-  single-line path is unchanged, and the opening banner advertises the sentinel
-  only where it applies.
+  so internal newlines survive and a paste is a single message. An empty or
+  whitespace-only submission is no longer dispatched as a turn. A dismiss
+  keyword is recognised only once a turn is submitted, so on a tty `done` now
+  needs `/send` after it, and both the opening banner and the failure-recovery
+  notice say so rather than naming a keystroke that does nothing there.
+
+  Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows) also submits the
+  lines entered so far, or dismisses the dialog when there are none. Because a
+  terminal's EOF does not persist, abandoning a part-written reply that way now
+  sends what was already entered and a second Ctrl-D is needed to leave, where
+  one used to exit; on an empty prompt it still exits in one keystroke.
+
+  The dialog uses `/send` where the human gate keeps `.`, since a lone `.` is
+  likelier to be prose in a conversational reply. Off a tty — a pipe or CI —
+  replies are still read one line at a time and `/send` has no effect; the one
+  change on that path is that a blank line is now skipped instead of dispatched
+  as an empty turn. The web dashboard is unaffected: it takes a separate path
+  that already delivered each message whole.
 
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
