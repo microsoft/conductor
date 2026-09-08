@@ -996,15 +996,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
-            # The authored ``settings_dir`` and nothing else.
+            # The authored ``settings_dir`` and nothing else. Two effects,
+            # and the order matters because the second is easy to miss.
             #
-            # What this does, measured: it makes a directory's *project*
-            # settings tier discoverable — its ``.claude/skills`` become
-            # listed and invocable with cwd elsewhere entirely, and only
-            # those, not CLAUDE.md, .claude/rules/*.md, .claude/settings.json
-            # or .claude/agents, which all stay with cwd. So it is the skills
-            # portion of a project tier rather than a cwd-independent way to
-            # load one.
+            # (1) UNCONDITIONAL: per the SDK's own contract this is
+            #     "additional directories Claude can access beyond the current
+            #     working directory", so this line widens the model's built-in
+            #     Read/Edit/Bash to that tree with no settings tier enabled at
+            #     all (measured). It does NOT widen what an MCP server permits.
+            #
+            # (2) CONDITIONAL on ``setting_sources`` enabling the ``project``
+            #     tier: the directory's ``.claude/skills`` become listed and
+            #     invocable with cwd elsewhere entirely, and only those — not
+            #     CLAUDE.md, .claude/rules/*.md, .claude/settings.json (so no
+            #     env and no hooks) or .claude/agents, which all stay with cwd.
+            #     So it is the skills portion of a project tier rather than a
+            #     cwd-independent way to load one.
             #
             # Do not extend this to the directory args of stdio MCP servers to
             # widen what those servers may read: it cannot work. A filesystem

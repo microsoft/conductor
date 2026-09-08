@@ -17,7 +17,7 @@ import time as _time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
@@ -594,7 +594,12 @@ class WorkflowEngine:
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
     def _resolve_agent_directory(
-        self, agent: AgentDef, agent_context: dict[str, Any], field: str, raw: str
+        self,
+        agent: AgentDef,
+        agent_context: dict[str, Any],
+        *,
+        field: Literal["working_dir", "settings_dir"],
+        raw: str,
     ) -> str:
         """Render and absolutize one authored directory value.
 
@@ -611,6 +616,22 @@ class WorkflowEngine:
                 — before any provider call.
         """
         rendered = self.renderer.render(raw, agent_context)
+        # A template can render empty even when the raw value passed the schema's
+        # min_length -- an --input given as `repo=`, a script step that printed
+        # nothing, a `set` binding evaluating to "". Path("") is Path("."), which
+        # is not absolute, so it would join onto the workflow file's own directory
+        # and pass the is_dir() check below. For settings_dir that silently grants
+        # the model file access to the workflow's own tree, so refuse it here.
+        if not rendered.strip():
+            raise ExecutionError(
+                f"Agent '{agent.name}': {field} rendered to an empty string from '{raw}'",
+                agent_name=agent.name,
+                suggestion=(
+                    f"An empty value would resolve to the workflow file's own "
+                    f"directory. Check that the input or upstream step feeding "
+                    f"{field} produced a path."
+                ),
+            )
         path = Path(rendered).expanduser()
         if not path.is_absolute():
             base = self._workflow_dir if self._workflow_dir is not None else Path.cwd()
@@ -659,12 +680,12 @@ class WorkflowEngine:
             raw = self.config.workflow.runtime.working_dir
         if raw is not None:
             update["working_dir"] = self._resolve_agent_directory(
-                agent, agent_context, "working_dir", raw
+                agent, agent_context, field="working_dir", raw=raw
             )
 
         if agent.settings_dir is not None:
             update["settings_dir"] = self._resolve_agent_directory(
-                agent, agent_context, "settings_dir", agent.settings_dir
+                agent, agent_context, field="settings_dir", raw=agent.settings_dir
             )
 
         if not update:

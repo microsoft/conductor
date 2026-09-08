@@ -81,6 +81,7 @@ class TestSettingsDirRejectedOnNonProviderSteps:
             ({"type": "terminate", "status": "success", "reason": "done"},),
             ({"type": "script", "command": "echo hi"},),
             ({"type": "workflow", "workflow": "child.yaml"},),
+            ({"type": "questions", "questions": [{"id": "a", "text": "x"}]},),
             (
                 {
                     "type": "human_gate",
@@ -181,3 +182,118 @@ class TestSettingsDirValidation:
 
         with pytest.raises(ConfigurationError, match="nonexistent_step"):
             validate_workflow_config(config)
+
+
+class TestEmptySettingsDirIsRefused:
+    """An empty or whitespace-only ``settings_dir`` is rejected at the schema.
+
+    ``Path("")`` is ``Path(".")``, which is not absolute, so an empty value
+    would be joined onto the workflow file's own directory, pass the engine's
+    ``is_dir()`` check, and be forwarded as a real ``add_dirs`` entry -- the
+    grant is unconditional, so a value meaning "nothing" would hand the model
+    file access to the workflow's own tree. Rejecting at the type boundary is
+    what keeps the four layers (schema guards, engine, validator, provider)
+    agreeing on what "set" means.
+    """
+
+    @pytest.mark.parametrize("value", ["", " ", "   ", "\t", "\n"])
+    def test_blank_is_rejected(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            AgentDef(name="a", prompt="p", settings_dir=value)
+
+    def test_surrounding_whitespace_is_stripped(self) -> None:
+        agent = AgentDef(name="a", prompt="p", settings_dir="  /repo  ")
+        assert agent.settings_dir == "/repo"
+
+    def test_a_blank_value_cannot_bypass_a_step_type_rejection(self) -> None:
+        """The step-type guards use ``is not None``, so "" cannot slip past.
+
+        With truthiness guards and no schema constraint, ``settings_dir=""``
+        was accepted on a ``wait`` step despite the documented rejection.
+        """
+        with pytest.raises(ValidationError):
+            AgentDef(name="w", type="wait", duration="1s", settings_dir="")
+
+
+class TestProjectTierWarningCauses:
+    """The no-skills warning must fire for every cause, with a usable remedy.
+
+    ``settings_dir`` feeds the ``project`` tier and nothing else, so a check
+    for *any* tier stayed silent on ``['user']`` and ``['local']`` -- neither
+    of which can make a ``settings_dir``'s skills discoverable -- and on a
+    per-agent ``skills: []``, which zeroes the tier for that agent in
+    ``claude_agent_sdk.py::execute``. Each cause has a different remedy, and
+    one of them (a per-agent provider override) cannot be fixed by adding
+    ``setting_sources`` at all, so a single prescriptive message was advice
+    the author could not act on.
+    """
+
+    @staticmethod
+    def _warn(provider: object, agent_extra: dict, tmp_path: Path) -> str | None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="w",
+                entry_point="a",
+                runtime=RuntimeConfig(provider=provider),  # type: ignore[arg-type]
+            ),
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    settings_dir=str(tmp_path),
+                    output={"r": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                    **agent_extra,
+                )
+            ],
+            output={"r": "{{ a.output.r }}"},
+        )
+        hits = [w for w in validate_workflow_config(config) if "settings_dir" in w]
+        return hits[0] if hits else None
+
+    def test_no_setting_sources_names_the_project_tier(self, tmp_path: Path) -> None:
+        warning = self._warn(ProviderSettings(name="claude-agent-sdk"), {}, tmp_path)
+        assert warning is not None
+        assert "setting_sources" in warning
+
+    @pytest.mark.parametrize("tier", ["user", "local"])
+    def test_a_non_project_tier_still_warns(self, tier: str, tmp_path: Path) -> None:
+        """``user`` reads ``~/.claude`` and ``local`` is cwd-bound."""
+        warning = self._warn(
+            ProviderSettings(name="claude-agent-sdk", setting_sources=[tier]),  # type: ignore[list-item]
+            {},
+            tmp_path,
+        )
+        assert warning is not None, f"{tier} tier cannot serve a settings_dir"
+
+    def test_project_tier_is_silent(self, tmp_path: Path) -> None:
+        assert (
+            self._warn(
+                ProviderSettings(name="claude-agent-sdk", setting_sources=["project"]),
+                {},
+                tmp_path,
+            )
+            is None
+        )
+
+    def test_agent_skills_opt_out_warns_and_names_skills(self, tmp_path: Path) -> None:
+        """``skills: []`` disables the tier for that agent, tier or not."""
+        warning = self._warn(
+            ProviderSettings(name="claude-agent-sdk", setting_sources=["project"]),
+            {"skills": []},
+            tmp_path,
+        )
+        assert warning is not None
+        assert "skills: []" in warning
+
+    def test_provider_override_does_not_advise_the_impossible(self, tmp_path: Path) -> None:
+        """``setting_sources`` is schema-rejected unless runtime.provider is the SDK.
+
+        So telling an author with a per-agent override to add it produces a
+        ``ValidationError``; the warning must say the tier is workflow-scoped
+        instead.
+        """
+        warning = self._warn("copilot", {"provider": "claude-agent-sdk"}, tmp_path)
+        assert warning is not None
+        assert "workflow-scoped" in warning
+        assert "Add 'project' to runtime.provider.setting_sources" not in warning

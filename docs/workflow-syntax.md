@@ -405,9 +405,11 @@ Because paths are normalized lexically instead of resolving to their real paths:
 ### Target-Repository Skills (`settings_dir`)
 
 `settings_dir` names a second directory whose Claude Code *project* settings
-tier the agent reads skills from. It applies to `claude-agent-sdk` agents in a
-workflow that sets `runtime.provider.setting_sources`, and is ignored by every
-other provider.
+tier the agent reads skills from. It applies only to `claude-agent-sdk` agents.
+Setting it against any other provider is an **error**, reported by `conductor
+validate` and again at run time — not a silently dropped field. The skills half
+additionally requires `runtime.provider.setting_sources` to enable the `project`
+tier; the filesystem grant below applies either way.
 
 ```yaml
 workflow:

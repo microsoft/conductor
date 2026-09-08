@@ -897,6 +897,60 @@ class _StubProvider(AgentProvider, abstract=True):
         return None
 
 
+class TestSettingsDirCapabilityRejection:
+    """``capabilities.settings_dir=False`` must hold at run time too.
+
+    ``conductor run`` never calls the static validator, and the engine
+    renders, absolutizes and existence-checks the directory for *every*
+    provider -- so an author saw the field processed and then handed to a
+    provider that never reads it. The agent answered from whatever
+    conventions its cwd supplied and the run exited 0, which is the
+    silent-wrong-answer case the capability exists to prevent. Mirrors
+    :class:`TestSessionKeyCapabilityRejection`, and the four ``_reject_*``
+    helpers that exist for the same reason.
+    """
+
+    @staticmethod
+    def _agent(tmp_path) -> AgentDef:
+        return AgentDef(name="review", prompt="hi", settings_dir=str(tmp_path))
+
+    @staticmethod
+    def _copilot(calls: list[str] | None = None) -> CopilotProvider:
+        def mock_handler(agent, prompt, context):
+            if calls is not None:
+                calls.append(agent.name)
+            return {"answer": "x"}
+
+        return CopilotProvider(mock_handler=mock_handler)
+
+    @pytest.mark.asyncio
+    async def test_provider_that_cannot_apply_it_is_refused(self, tmp_path) -> None:
+        assert CopilotProvider.CAPABILITIES.settings_dir is False
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await AgentExecutor(self._copilot()).execute(self._agent(tmp_path), {})
+
+        assert "does not apply it" in str(exc_info.value)
+        assert exc_info.value.agent_name == "review"
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_precedes_the_provider_call(self, tmp_path) -> None:
+        """An answer from the wrong repository's conventions is worse than none."""
+        calls: list[str] = []
+        with pytest.raises(ExecutionError):
+            await AgentExecutor(self._copilot(calls)).execute(self._agent(tmp_path), {})
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_agent_without_settings_dir_is_untouched(self) -> None:
+        output = await AgentExecutor(self._copilot()).execute(
+            AgentDef(name="review", prompt="hi"), {}
+        )
+
+        assert output.content == {"answer": "x"}
+
+
 class TestSessionKeyCapabilityRejection:
     """``capabilities.session_continuity=False`` must hold at run time too.
 

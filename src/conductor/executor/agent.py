@@ -381,6 +381,7 @@ class AgentExecutor:
         # decided by the agent and the provider alone, so there is nothing to
         # learn from rendering a prompt or calling a model first.
         self._reject_unsupported_session_key(agent)
+        self._reject_unsupported_settings_dir(agent)
 
         # Render model field if it contains template expressions
         if is_jinja_template(agent.model):
@@ -1128,5 +1129,47 @@ class AgentExecutor:
                 "Remove the session_key, or override the agent to a provider that "
                 "continues sessions (claude-agent-sdk). 'conductor validate' "
                 "reports this before a run starts."
+            ),
+        )
+
+    def _reject_unsupported_settings_dir(self, agent: AgentDef) -> None:
+        """Refuse ``settings_dir`` on a provider that cannot apply it.
+
+        Mirrors the ``capabilities.settings_dir`` check in
+        :func:`conductor.config.validator.validate_workflow_config`.
+        ``conductor validate`` already rejects the combination, but
+        ``conductor run`` never invokes the static validator — and the
+        engine renders, absolutizes and existence-checks the directory for
+        *every* provider, so an author sees the field processed and then
+        handed to a provider that never reads it. The agent answers from
+        whatever conventions its cwd happened to supply and the run exits 0,
+        which is the silent-wrong-answer case the capability exists to stop.
+
+        A provider with no ``CAPABILITIES`` is left alone, for the reason
+        given in :meth:`_reject_unsupported_skills`.
+
+        Args:
+            agent: The agent whose ``settings_dir`` is being checked. Agents
+                that declare none return immediately.
+
+        Raises:
+            ExecutionError: If the provider declares
+                ``capabilities.settings_dir=False``.
+        """
+        if agent.settings_dir is None:
+            return
+        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        if capabilities is None or capabilities.settings_dir:
+            return
+        raise ExecutionError(
+            f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} but "
+            f"provider '{type(self.provider).__name__}' does not apply it "
+            f"(capabilities.settings_dir=False), so the agent would load "
+            f"whatever conventions its working directory supplies instead.",
+            agent_name=agent.name,
+            suggestion=(
+                "Use working_dir, or override the agent to a provider that "
+                "applies it (claude-agent-sdk). 'conductor validate' reports "
+                "this before a run starts."
             ),
         )

@@ -67,6 +67,27 @@ workflow:
   version: "1.0.0"
   entry_point: review
 
+  input:
+    workspace:
+      type: string
+      required: true
+      description: >
+        Wide directory containing BOTH the repository under review and the
+        artifacts directory. Becomes every agent's cwd, and therefore the
+        filesystem MCP server's only root.
+    repo:
+      type: string
+      required: true
+      description: >
+        The repository under review, inside `workspace`. Its own
+        `.claude/skills` are loaded via `settings_dir`.
+    artifacts:
+      type: string
+      required: true
+      description: >
+        Prior findings, inside `workspace` but OUTSIDE `repo` -- the path that
+        a narrowed cwd would make unreadable.
+
   runtime:
     provider:
       name: claude-agent-sdk

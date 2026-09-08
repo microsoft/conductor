@@ -1381,11 +1381,14 @@ class AgentDef(BaseModel):
     wait/set/terminate/human_gate/workflow step types.
     """
 
-    settings_dir: str | None = None
+    settings_dir: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
+        None
+    )
     """Directory whose Claude Code *project* settings tier this agent loads.
 
-    ``claude-agent-sdk`` only -- ``conductor validate`` refuses it against a
-    provider that cannot apply it, rather than dropping it silently. Resolved
+    ``claude-agent-sdk`` only -- a provider that cannot apply it refuses it
+    both at ``conductor validate`` and at run time, rather than dropping it
+    silently (``conductor run`` never calls the static validator). Resolved
     by the engine exactly like :attr:`working_dir` (Jinja-rendered,
     ``~``-expanded, made absolute against the workflow file's directory,
     ``normpath``-normalised, existence-checked), then forwarded to the SDK as
@@ -1435,7 +1438,7 @@ class AgentDef(BaseModel):
     from a sibling directory::
 
         agents:
-          judge:
+          - name: judge
             settings_dir: "{{ setup_worktree.output.worktree_path }}"
             # No working_dir: cwd stays the launch directory, which contains
             # both the worktree and the artifacts the judge must read.
@@ -2090,7 +2093,7 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("human_gate agents cannot have 'working_dir'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("human_gate agents cannot have 'settings_dir'")
             if self.session_key is not None:
                 raise ValueError("human_gate agents cannot have 'session_key'")
@@ -2155,7 +2158,7 @@ class AgentDef(BaseModel):
                 raise ValueError("questions agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("questions agents cannot have 'working_dir'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("questions agents cannot have 'settings_dir'")
             if self.session_key is not None:
                 raise ValueError("questions agents cannot have 'session_key'")
@@ -2190,7 +2193,7 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'validator'")
             if self.sandbox is not None:
                 raise ValueError("script agents cannot have 'sandbox'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("script agents cannot have 'settings_dir'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
@@ -2258,7 +2261,7 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("workflow agents cannot have 'working_dir'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("workflow agents cannot have 'settings_dir'")
         elif self.type == "wait":
             if self.duration is None:
@@ -2283,7 +2286,7 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("wait agents cannot have 'working_dir'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("wait agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("wait agents cannot have 'timeout'")
@@ -2358,7 +2361,7 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("set agents cannot have 'working_dir'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("set agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("set agents cannot have 'timeout'")
@@ -2434,7 +2437,7 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("terminate agents cannot have 'working_dir'")
-            if self.settings_dir:
+            if self.settings_dir is not None:
                 raise ValueError("terminate agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("terminate agents cannot have 'timeout'")

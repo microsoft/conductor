@@ -1812,16 +1812,23 @@ def _is_llm_agent(agent: AgentDef) -> bool:
     return agent.type in _LLM_AGENT_TYPES
 
 
-def _setting_sources_enabled(config: WorkflowConfig) -> bool:
-    """True iff the workflow enables any Claude Code settings tier.
+def _project_tier_enabled(config: WorkflowConfig, agent: AgentDef) -> bool:
+    """True iff this agent's session will enable the ``project`` settings tier.
+
+    ``settings_dir`` feeds the ``project`` tier and nothing else, so any tier
+    is not enough: ``user`` reads ``~/.claude`` and ``local`` is cwd-bound, so
+    neither can make a ``settings_dir``'s skills discoverable. A per-agent
+    ``skills: []`` opts the agent out of the tiers entirely
+    (``claude_agent_sdk.py::execute`` computes ``effective_sources`` that way),
+    so the check is per agent rather than per workflow.
 
     ``runtime.provider`` is either the bare string shorthand (no tiers, by
-    definition) or a ``ProviderSettings`` carrying ``setting_sources``. An
-    empty or absent list means Conductor sends ``[]`` -- load nothing ambient
-    -- so no ``project`` tier exists for a ``settings_dir`` to be read from.
+    definition) or a ``ProviderSettings`` carrying ``setting_sources``.
     """
+    if agent.skills == []:
+        return False
     provider = config.workflow.runtime.provider
-    return bool(getattr(provider, "setting_sources", None))
+    return "project" in (getattr(provider, "setting_sources", None) or [])
 
 
 def _resolved_provider_name(agent: AgentDef, default: str) -> str:
@@ -2481,19 +2488,46 @@ def _validate_provider_capabilities(
                 f"has a surface for it; use working_dir, or move this agent to "
                 f"that provider."
             )
-        elif agent.settings_dir is not None and not _setting_sources_enabled(config):
+        elif agent.settings_dir is not None and not _project_tier_enabled(config, agent):
             # A warning, not an error: the FILESYSTEM half of settings_dir
             # applies regardless, so the workflow is not broken -- but the
             # skill discovery it is normally set for is a no-op without the
             # project tier enabled, and a green validate would imply otherwise.
-            warnings.append(
+            #
+            # Three distinct causes, each with a different remedy (or none), so
+            # the message branches rather than prescribing one fix that may be
+            # impossible to apply.
+            common = (
                 f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} but "
-                f"the workflow does not set runtime.provider.setting_sources, so no "
-                f"settings tier is enabled and no skills will be discovered from it. "
-                f"The directory is still granted to the model's built-in file tools. "
-                f"Add 'setting_sources: [project]' to runtime.provider to load that "
-                f"repository's skills."
+                f"its session will not enable the 'project' settings tier, so no "
+                f"skills will be discovered from that directory. The directory is "
+                f"still granted to the model's built-in file tools."
             )
+            if agent.skills == []:
+                warnings.append(
+                    f"{common} The agent's own 'skills: []' opts it out of the "
+                    f"settings tiers entirely. Remove it to let the tier apply, or "
+                    f"remove settings_dir if the filesystem grant was not intended."
+                )
+            elif provider_name != default_provider:
+                # setting_sources lives on the single workflow-level
+                # ProviderSettings and the schema rejects it unless that
+                # provider is claude-agent-sdk, so telling this author to add
+                # it would produce a ValidationError.
+                warnings.append(
+                    f"{common} The settings tier is workflow-scoped "
+                    f"(runtime.provider.setting_sources) and cannot be enabled for "
+                    f"an agent that overrides its provider, since the schema "
+                    f"accepts setting_sources only when runtime.provider is "
+                    f"'claude-agent-sdk' (it is {default_provider!r}). Move "
+                    f"the provider to runtime.provider to enable the tier, or keep "
+                    f"settings_dir for the filesystem grant alone."
+                )
+            else:
+                warnings.append(
+                    f"{common} Add 'project' to runtime.provider.setting_sources to "
+                    f"load that repository's skills."
+                )
 
         # session_key: a provider that ignores it starts a fresh session every
         # execution, silently discarding the context the author asked to keep.

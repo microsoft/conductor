@@ -227,6 +227,19 @@ class OutputValidator:
             tools=[],
             output=_VALIDATOR_OUTPUT_SCHEMA,
             working_dir=agent.working_dir,
+            # Deliberately NOT inherited, unlike working_dir. This grader runs
+            # with ``tools=[]``, so neither half of settings_dir would do
+            # anything for it: no skill can be invoked without the Skill tool,
+            # and the filesystem grant has no file tool to widen. Inheriting it
+            # would hand the grader access to a tree it cannot use, which is a
+            # wider grant than the run needs.
+            #
+            # Built field by field rather than by ``model_copy`` for the same
+            # reason: a copy would also carry ``validator`` (making the grader
+            # validate itself), ``session_key`` (two sessions appending to one
+            # transcript, which config/validator.py refuses for concurrent
+            # executions) and ``routes``. Add new fields here explicitly.
+            settings_dir=None,
         )
 
     def _parse(self, content: Any) -> tuple[bool, list[str], bool]:

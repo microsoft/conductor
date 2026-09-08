@@ -38,9 +38,19 @@ import pytest
 _SERVER = "@modelcontextprotocol/server-filesystem"
 _ADOPTED = "Updated allowed directories from MCP roots"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("npx") is None, reason="npx not available; needs the real filesystem MCP server"
-)
+# ``real_api`` because this fetches @modelcontextprotocol/server-filesystem from
+# npm: it pins *upstream's* negotiation behaviour rather than Conductor's own
+# code, so an npm outage or a new server release must not redden an unrelated
+# PR. The repo's convention for a test reaching an external service is an
+# opt-in marker (cf. ``real_api`` / ``install_scripts`` / ``performance`` in
+# pyproject.toml); CI runs ``-m "not real_api and not performance"``.
+pytestmark = [
+    pytest.mark.real_api,
+    pytest.mark.skipif(
+        shutil.which("npx") is None,
+        reason="npx not available; needs the real filesystem MCP server",
+    ),
+]
 
 
 def _list_allowed_directories(
@@ -52,9 +62,17 @@ def _list_allowed_directories(
     asked and keeps its argv directories. A list declares the capability and
     is what the server receives when it asks.
     """
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".err") as errf:
+    # ``shutil.which`` finds ``npx.cmd`` on Windows but ``CreateProcess`` only
+    # appends ``.exe``, so a bare "npx" would fail to launch there while the
+    # skipif above says it is present. Pass the resolved path.
+    npx = shutil.which("npx")
+    assert npx is not None  # guarded by the module-level skipif
+    # A plain file rather than NamedTemporaryFile: the stderr poll below reopens
+    # it by name, which is unsupported while the handle is open on Windows.
+    err_path = Path(tempfile.mkdtemp(prefix="mcp-roots-")) / "server.err"
+    with err_path.open("w") as errf:
         proc = subprocess.Popen(  # noqa: S603
-            ["npx", "-y", _SERVER, *root_dirs],  # noqa: S607
+            [npx, "-y", _SERVER, *root_dirs],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=errf,
@@ -80,7 +98,7 @@ def _list_allowed_directories(
 
         def server_stderr() -> str:
             errf.flush()
-            return Path(errf.name).read_text(errors="replace")
+            return err_path.read_text(errors="replace")
 
         try:
             send(

@@ -3292,3 +3292,50 @@ class TestSettingsDirAddDirs:
             )
 
         assert captured["add_dirs"] == [str(link)]
+
+    @pytest.mark.asyncio
+    async def test_settings_dir_reaches_the_cli_as_add_dir(self, tmp_path: Path) -> None:
+        """The SDK still turns ``add_dirs`` into the ``--add-dir`` argv flag.
+
+        Asserting ``options.add_dirs`` alone proves only that Conductor set the
+        field. ``settings_dir`` has no fallback delivery path -- there is no
+        prompt-injection equivalent that could carry a settings tier -- and the
+        pin is ``claude-agent-sdk>=0.2.82``, a floor with no ceiling, so a lock
+        bump that renamed or dropped the flag would leave every other test in
+        this class green with the feature silently dead.
+        """
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        target = tmp_path / "target"
+        target.mkdir()
+
+        async def options_for(settings_dir: str | None):
+            captured: dict = {}
+
+            async def fake_query(**kwargs):
+                captured["options"] = kwargs["options"]
+                yield _result(result="ok")
+
+            with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+                provider = ClaudeAgentSdkProvider()
+                await provider.execute(
+                    agent=AgentDef(name="t", prompt="hi", settings_dir=settings_dir),
+                    context={},
+                    rendered_prompt="hi",
+                )
+            return captured["options"]
+
+        def argv(options) -> list[str]:
+            transport = SubprocessCLITransport(prompt="hi", options=options)
+            transport._cli_path = "/usr/bin/claude"
+            return transport._build_command()
+
+        with_dir = argv(await options_for(str(target)))
+        assert "--add-dir" in with_dir, with_dir
+        assert with_dir[with_dir.index("--add-dir") + 1] == str(target)
+
+        # Negative control: without a settings_dir the flag is absent entirely,
+        # so the assertion above cannot pass against an always-emitted flag.
+        assert "--add-dir" not in argv(await options_for(None))

@@ -4514,3 +4514,30 @@ class TestAgentSettingsDirResolution:
 
         assert "settings_dir" in str(exc_info.value)
         assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_a_template_rendering_empty_is_refused(self, tmp_path: Path) -> None:
+        """An empty render must not resolve to the workflow's own directory.
+
+        The schema rejects a literal blank, but a *template* can still render
+        empty at run time -- ``--input repo=``, a script step that printed
+        nothing, a ``set`` binding evaluating to "". ``Path("")`` is
+        ``Path(".")``, which is not absolute, so without this guard the value
+        would be joined onto the workflow file's directory, pass ``is_dir()``,
+        and be forwarded as a real ``add_dirs`` entry -- and the filesystem
+        grant is unconditional, so a value meaning "nothing" would hand the
+        model access to the workflow's own tree.
+        """
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir="{{ workflow.input.repo }}"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await engine.run({"repo": ""})
+
+        assert "empty string" in str(exc_info.value)
+        assert "settings_dir" in str(exc_info.value)
+        assert provider.calls == 0
