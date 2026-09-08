@@ -622,7 +622,7 @@ class WorkflowEngine:
         # is not absolute, so it would join onto the workflow file's own directory
         # and pass the is_dir() check below. For settings_dir that silently grants
         # the model file access to the workflow's own tree, so refuse it here.
-        if not rendered.strip():
+        if not rendered.strip() and field == "settings_dir":
             raise ExecutionError(
                 f"Agent '{agent.name}': {field} rendered to an empty string from '{raw}'",
                 agent_name=agent.name,
@@ -4515,6 +4515,13 @@ class WorkflowEngine:
                         }
                         if is_llm_agent:
                             started_payload["working_dir"] = resolved_agent.working_dir
+                            # Emitted alongside working_dir because it is a
+                            # trust decision: settings_dir loads another
+                            # repository's conventions AND widens the model's
+                            # built-in file tools to that tree. A grant the
+                            # dashboard and the JSONL log never mention cannot
+                            # be audited after the fact.
+                            started_payload["settings_dir"] = resolved_agent.settings_dir
                         self._emit("agent_started", started_payload)
 
                         # Handle terminate steps — explicit workflow exit with a
@@ -6228,6 +6235,7 @@ class WorkflowEngine:
                         "group_name": parallel_group.name,
                         "agent_name": agent.name,
                         "working_dir": resolved_agent.working_dir,
+                        "settings_dir": resolved_agent.settings_dir,
                     },
                 )
 
@@ -6716,6 +6724,7 @@ class WorkflowEngine:
                         "agent_name": qualified_agent.name,
                         "item_key": key,
                         "working_dir": qualified_agent.working_dir,
+                        "settings_dir": qualified_agent.settings_dir,
                     },
                 )
 

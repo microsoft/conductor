@@ -4541,3 +4541,52 @@ class TestAgentSettingsDirResolution:
         assert "empty string" in str(exc_info.value)
         assert "settings_dir" in str(exc_info.value)
         assert provider.calls == 0
+
+
+class TestSettingsDirObservability:
+    """``settings_dir`` must appear in the events, on all three agent paths.
+
+    It is a trust decision, not a convenience: naming a directory loads
+    another repository's conventions *and* widens the model's built-in
+    ``Read``/``Edit``/``Bash`` to that tree. A grant that the dashboard and the
+    JSONL event log never mention cannot be audited after a run, so it rides
+    alongside ``working_dir`` wherever that is already emitted -- linear,
+    parallel-group and for-each. Pinning all three is the point: emitting it on
+    one path only would leave the other two silent about the same grant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_started_carries_settings_dir(self, tmp_path: Path) -> None:
+        target = tmp_path / "repo"
+        target.mkdir()
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(target)),
+            _RecordingWorkingDirProvider(),
+            workflow_path=_workflow_file(tmp_path),
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "agent_started"]
+        assert started, [t for t, _ in events]
+        assert started[0]["settings_dir"] == os.path.normpath(str(target))
+
+    @pytest.mark.asyncio
+    async def test_agent_started_reports_none_when_unset(self, tmp_path: Path) -> None:
+        """Absent rather than missing: a consumer can tell "no grant" from
+        "this Conductor did not report one"."""
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            _single_agent_config(),
+            _RecordingWorkingDirProvider(),
+            workflow_path=_workflow_file(tmp_path),
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "agent_started"]
+        assert started and "settings_dir" in started[0]
+        assert started[0]["settings_dir"] is None
