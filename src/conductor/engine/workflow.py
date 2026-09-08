@@ -611,9 +611,15 @@ class WorkflowEngine:
         normalised with :func:`os.path.normpath` (``resolve()`` is
         deliberately not used so symlink aliases stay distinct).
 
+        Applies to ``working_dir`` as well as ``settings_dir``: a value that
+        renders empty previously resolved to the workflow file's own directory
+        and ran there, which is the same footgun in a quieter form, so both
+        are refused.
+
         Raises:
-            ExecutionError: if the resolved path is not an existing directory
-                — before any provider call.
+            ExecutionError: if the value renders empty, or if the resolved
+                path is not an existing directory — both before any provider
+                call.
         """
         rendered = self.renderer.render(raw, agent_context)
         # A template can render empty even when the raw value passed the schema's
@@ -622,7 +628,7 @@ class WorkflowEngine:
         # is not absolute, so it would join onto the workflow file's own directory
         # and pass the is_dir() check below. For settings_dir that silently grants
         # the model file access to the workflow's own tree, so refuse it here.
-        if not rendered.strip() and field == "settings_dir":
+        if not rendered.strip():
             raise ExecutionError(
                 f"Agent '{agent.name}': {field} rendered to an empty string from '{raw}'",
                 agent_name=agent.name,

@@ -4542,6 +4542,31 @@ class TestAgentSettingsDirResolution:
         assert "settings_dir" in str(exc_info.value)
         assert provider.calls == 0
 
+    @pytest.mark.asyncio
+    async def test_an_empty_working_dir_render_is_refused_too(self, tmp_path: Path) -> None:
+        """The same guard covers ``working_dir``, and that is a deliberate change.
+
+        An empty-rendering ``working_dir`` previously resolved to the workflow
+        file's own directory and ran there -- the same "nothing means
+        something" footgun, just without the filesystem grant that makes the
+        ``settings_dir`` case dangerous. Pinned in its own right so a later
+        edit narrowing the guard to ``settings_dir`` cannot silently restore
+        it, and so the behaviour change is visible to anyone reading the tests.
+        """
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(working_dir="{{ workflow.input.repo }}"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await engine.run({"repo": ""})
+
+        assert "empty string" in str(exc_info.value)
+        assert "working_dir" in str(exc_info.value)
+        assert provider.calls == 0
+
 
 class TestSettingsDirObservability:
     """``settings_dir`` must appear in the events, on all three agent paths.
@@ -4590,3 +4615,146 @@ class TestSettingsDirObservability:
         started = [d for t, d in events if t == "agent_started"]
         assert started and "settings_dir" in started[0]
         assert started[0]["settings_dir"] is None
+
+
+class TestSettingsDirInGroups:
+    """``settings_dir`` must resolve inside parallel groups and for-each loops.
+
+    All three agent paths route through ``_resolve_agent_working_dir``, so the
+    field does reach them -- but nothing pinned that, and the for-each site is
+    the one where a per-iteration template (``{{ item }}``) is most likely to
+    be used. It resolves *after* loop-variable injection, an ordering a future
+    refactor of the for-each body could break with no test to notice: the
+    agent would then silently load a different iteration's skills.
+    """
+
+    @pytest.mark.asyncio
+    async def test_for_each_resolves_settings_dir_per_iteration(self, tmp_path: Path) -> None:
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-for-each",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        settings_dir=str(tmp_path / "{{ repo }}"),
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        seen: list[tuple[str, str | None]] = []
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            if agent.name == "lister":
+                return AgentOutput(
+                    content={"repos": ["one", "two"]},
+                    raw_response=None,
+                    model=agent.model,
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+            seen.append((agent.name, agent.settings_dir))
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider = _RecordingWorkingDirProvider()
+        provider.execute = _execute  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider, workflow_path=_workflow_file(tmp_path))
+
+        await engine.run({})
+
+        assert sorted(d for _, d in seen) == sorted(
+            [os.path.normpath(str(tmp_path / "one")), os.path.normpath(str(tmp_path / "two"))]
+        ), seen
+
+    @pytest.mark.asyncio
+    async def test_parallel_member_resolves_its_own_settings_dir(self, tmp_path: Path) -> None:
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-parallel",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="member_a",
+                    model="gpt-4",
+                    prompt="A",
+                    settings_dir=str(dir_a),
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="member_b",
+                    model="gpt-4",
+                    prompt="B",
+                    settings_dir=str(dir_b),
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="fan",
+                    agents=["member_a", "member_b"],
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+            output={},
+        )
+        seen: list[tuple[str, str | None]] = []
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            seen.append((agent.name, agent.settings_dir))
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider = _RecordingWorkingDirProvider()
+        provider.execute = _execute  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider, workflow_path=_workflow_file(tmp_path))
+
+        await engine.run({})
+
+        assert sorted(seen) == [
+            ("member_a", os.path.normpath(str(dir_a))),
+            ("member_b", os.path.normpath(str(dir_b))),
+        ], seen

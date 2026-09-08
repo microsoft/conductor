@@ -1404,7 +1404,15 @@ class AgentDef(BaseModel):
     directory here widens the model's built-in ``Read``/``Edit``/``Bash``
     tools to that tree regardless of any settings tier. It does **not** widen
     what a filesystem MCP server permits -- that stays cwd alone, which is why
-    this field exists. Point it only at a directory the agent may read.
+    this field exists.
+
+    That grant is currently latent rather than reachable from a workflow:
+    Conductor runs this provider either with the full ``claude_code`` preset
+    under ``bypassPermissions`` (``tools:`` omitted), where reads already
+    succeed everywhere, or with ``tools: []``, where the model holds at most
+    the ``Skill`` loader and no file tool at all. So it is a property of the
+    SDK contract to design against rather than an exposure today. Point it
+    only at a directory the agent may read.
 
     It exists because ``working_dir`` was doing two unrelated jobs. The CLI
     supports MCP Roots and advertises exactly one root — its cwd — so a

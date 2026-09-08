@@ -227,12 +227,17 @@ class OutputValidator:
             tools=[],
             output=_VALIDATOR_OUTPUT_SCHEMA,
             working_dir=agent.working_dir,
-            # Deliberately NOT inherited, unlike working_dir. This grader runs
-            # with ``tools=[]``, so neither half of settings_dir would do
-            # anything for it: no skill can be invoked without the Skill tool,
-            # and the filesystem grant has no file tool to widen. Inheriting it
-            # would hand the grader access to a tree it cannot use, which is a
-            # wider grant than the run needs.
+            # Deliberately NOT inherited, unlike working_dir. This grader
+            # runs with ``tools=[]``, which yields at most the ``Skill``
+            # loader and never Read/Edit/Bash -- so the filesystem half of
+            # settings_dir has no file tool to widen, and grading an output
+            # against a rubric needs no skills. Inheriting it would hand the
+            # grader a tree it has no way to use: a wider grant than the run
+            # needs.
+            #
+            # (Not "no skill can be invoked": with a settings tier enabled the
+            # grader does hold the ``Skill`` tool, since
+            # ``_resolve_tool_config`` grants it back for ``tools: []``.)
             #
             # Built field by field rather than by ``model_copy`` for the same
             # reason: a copy would also carry ``validator`` (making the grader

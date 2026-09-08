@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entirely. See
   [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
 
+- **Per-agent `settings_dir` on `claude-agent-sdk`** (#513) — selects which
+  directory's `project` settings tier supplies an agent's **skills**,
+  independently of `working_dir`. The CLI advertises exactly one MCP root —
+  its cwd — and a filesystem MCP server that sees a Roots-capable client
+  discards the directories in its own argv, so pointing `working_dir` at a
+  target repository to pick up its skills also narrowed the agent's only MCP
+  root onto it. `settings_dir` splits the two, letting cwd stay wide enough
+  for every path the agent must read. It carries a second, unconditional
+  effect: `add_dirs` widens the model's built-in `Read`/`Edit`/`Bash` to that
+  tree regardless of any settings tier, though no Conductor configuration
+  reaches a permission mode where that is observable today. Only the skills
+  of that directory travel — not `CLAUDE.md`, `.claude/rules/*.md`,
+  `.claude/settings.json` or `.claude/agents`, all measured. Refused at
+  `conductor validate` *and* at run time on a provider that cannot apply it,
+  and reported on the agent lifecycle events so the grant is auditable. See
+  [`examples/claude-agent-sdk-settings-dir.yaml`](examples/claude-agent-sdk-settings-dir.yaml).
+
 ### Fixed
 
 - **Context compaction window guard against token-dense drift** (#507) — the
@@ -75,6 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure is reported as a new `agent_compaction_skipped` event
   (`reason: "estimate_unavailable"`) rather than vanishing into stderr. See
   [Workflow Syntax → Context Compaction](docs/workflow-syntax.md#context-compaction).
+
+### Changed
+
+- **A `working_dir` or `settings_dir` template that renders empty is now an
+  error** (#513). Previously an empty render resolved to the workflow file's
+  own directory — `Path("")` is `Path(".")`, which is not absolute, so it was
+  joined onto that directory and passed the existence check — and the agent
+  ran there. A value meaning "nothing" silently becoming something real is
+  the defect; for `settings_dir` it would also have granted the model access
+  to the workflow's own tree. Both fields now fail before the provider call,
+  naming the field and the template it came from.
 
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
