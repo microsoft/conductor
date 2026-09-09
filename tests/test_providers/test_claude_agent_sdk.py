@@ -3397,16 +3397,60 @@ class TestSettingsDirAddDirs:
         assert bool(hits) is expect_warning, [r.message for r in caplog.records]
 
     @pytest.mark.asyncio
-    async def test_the_tier_warning_is_latched_per_agent(
+    async def test_the_tier_warning_is_latched_per_directory(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Once per agent, not once per execution -- and not once per run.
+        """Once per directory, and specifically once across a for_each.
 
-        The condition is static per agent while executions are not, so an
-        unlatched warning would emit one identical line per for-each item.
-        Keyed by agent name rather than a bare flag because a global latch
-        would silence a *second* affected agent, which is the case that
-        matters: the point of the warning is naming the directory.
+        Latched because the condition is static while executions are not.
+        Keyed by the resolved directory rather than the agent name because
+        the engine renames a for_each member per item (``<agent>[<key>]``),
+        so a name-keyed latch emits one line per item -- the exact case
+        latching exists to prevent. Not a bare flag either: a second agent
+        naming a *different* directory must still be reported, since naming
+        the directory is the point of the warning.
+        """
+        target = tmp_path / "repo"
+        other = tmp_path / "other"
+        target.mkdir()
+        other.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                # Eight for_each iterations over one directory, as the engine
+                # drives them: same settings_dir, a fresh name each time.
+                for key in range(8):
+                    await provider.execute(
+                        agent=AgentDef(name=f"fan[{key}]", prompt="hi", settings_dir=str(target)),
+                        context={},
+                        rendered_prompt="hi",
+                    )
+                await provider.execute(
+                    agent=AgentDef(name="judge", prompt="hi", settings_dir=str(other)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        warned = [
+            (r.args[0], r.args[1])
+            for r in caplog.records
+            if "no skills are discovered" in r.message and r.args
+        ]
+        assert warned == [("fan[0]", str(target)), ("judge", str(other))], warned
+
+    @pytest.mark.asyncio
+    async def test_the_tier_warning_remedy_matches_the_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Advice an author can act on, as ``config/validator.py`` does.
+
+        Telling an author to add ``'project'`` when their own ``skills: []``
+        is what zeroed the tier sends them to add a value already present,
+        and the warning keeps firing.
         """
         target = tmp_path / "repo"
         target.mkdir()
@@ -3414,16 +3458,29 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        def agent(name: str) -> AgentDef:
-            return AgentDef(name=name, prompt="hi", settings_dir=str(target))
+        async def remedy_for(sources: list[str] | None, skills: list[str] | None) -> str:
+            caplog.clear()
+            kwargs = {} if sources is None else {"setting_sources": sources}
+            with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+                provider = ClaudeAgentSdkProvider(**kwargs)  # type: ignore[arg-type]
+                with caplog.at_level(logging.WARNING):
+                    await provider.execute(
+                        agent=AgentDef(
+                            name="judge",
+                            prompt="hi",
+                            settings_dir=str(target),
+                            skills=skills,
+                        ),
+                        context={},
+                        rendered_prompt="hi",
+                    )
+            hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+            assert hits, [r.message for r in caplog.records]
+            return hits[0].message
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
-            provider = ClaudeAgentSdkProvider()
-            with caplog.at_level(logging.WARNING):
-                for name in ("fan", "fan", "fan", "other", "other"):
-                    await provider.execute(agent=agent(name), context={}, rendered_prompt="hi")
+        no_tier = await remedy_for(None, None)
+        assert "Add 'project' to runtime.provider.setting_sources" in no_tier
 
-        warned = [
-            r.args[0] for r in caplog.records if "no skills are discovered" in r.message and r.args
-        ]
-        assert warned == ["fan", "other"], warned
+        opted_out = await remedy_for(["project"], [])
+        assert "'skills: []' opts it out" in opted_out
+        assert "Add 'project'" not in opted_out, "advice is a no-op for this cause"

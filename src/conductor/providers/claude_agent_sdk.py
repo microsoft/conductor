@@ -741,12 +741,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # the point, and by cwd because the CLI stores transcripts per working
         # directory, so one key under two directories is two sessions.
         self._session_ids: dict[tuple[str, str], str] = {}
-        # Agents already warned about a settings_dir with no `project` tier.
-        # Keyed by agent name, not a bare flag: the condition is per agent, so
-        # a global latch would silence a second affected agent. Latched at all
-        # because the condition is static per agent while executions are not --
-        # a 50-item for_each would otherwise emit 50 identical lines. Matches
-        # the `_warned` convention in claude.py and engine/workflow.py.
+        # settings_dir values already warned about for having no `project`
+        # tier. Keyed by the resolved DIRECTORY, and that choice is a trade:
+        #
+        # - Not the agent name, alone or paired with the directory: the engine
+        #   renames a for_each member per item (`<agent>[<key>]`,
+        #   engine/workflow.py), so any name-bearing key emits one line per
+        #   item -- the very case latching exists to prevent.
+        # - Not a bare flag: `settings_dir` is Jinja-rendered per execution, so
+        #   one agent can name several directories across loop-backs, and each
+        #   is a distinct grant the operator needs told about.
+        # - The cost, accepted: two differently-named agents naming the SAME
+        #   directory warn once, naming only the first. The actionable content
+        #   is the directory and the remedy is workflow-global, so the second
+        #   line would add nothing the first did not say.
+        #
+        # Matches the `_warned` convention in claude.py and engine/workflow.py.
         self._settings_dir_tier_warned: set[str] = set()
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
@@ -981,17 +991,28 @@ class ClaudeAgentSdkProvider(AgentProvider):
         if (
             agent.settings_dir is not None
             and "project" not in effective_sources
-            and agent.name not in self._settings_dir_tier_warned
+            and agent.settings_dir not in self._settings_dir_tier_warned
         ):
-            self._settings_dir_tier_warned.add(agent.name)
+            self._settings_dir_tier_warned.add(agent.settings_dir)
+            # The remedy depends on the cause, as it does in
+            # config/validator.py: telling an author to add 'project' when
+            # their own `skills: []` is what zeroed the tier sends them to add
+            # a value that is already there, and the warning keeps firing.
+            remedy = (
+                "This agent's own 'skills: []' opts it out of the settings tiers "
+                "entirely; remove it to let the tier apply"
+                if agent.skills == []
+                else "Add 'project' to runtime.provider.setting_sources"
+            )
             logger.warning(
                 "Agent '%s' sets settings_dir=%r but its session does not enable the "
                 "'project' settings tier, so no skills are discovered from that "
                 "directory. The directory is still granted to the model's built-in "
-                "file tools. Add 'project' to runtime.provider.setting_sources, or "
-                "remove settings_dir if the filesystem grant was not intended.",
+                "file tools. %s, or remove settings_dir if the filesystem grant was "
+                "not intended.",
                 agent.name,
                 agent.settings_dir,
+                remedy,
             )
 
         sdk_tools, permission_mode = self._resolve_tool_config(
