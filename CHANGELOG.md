@@ -5,39 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.36...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.37...HEAD)
 
-### Fixed
-
-- **`openai`: retry transient errors delivered inside an SSE stream** (#506) —
-  the OpenAI SDK raises a bare `openai.APIError` (no HTTP status) for an
-  `error` object embedded in a stream, which pydantic-ai does not translate,
-  so a configured `retry:` policy was skipped and the run failed after the
-  first attempt. Now retried: OpenAI mid-stream 5xx (`server_error` /
-  `internal_server_error`), OpenAI rate limits (`type` `requests` / `tokens`
-  with code `rate_limit_exceeded`), Anthropic-shaped gateway errors proxied
-  unchanged (`rate_limit_error` / `overloaded_error` / `api_error`), and
-  stream errors with no parseable payload `type` (a non-object `error` value
-  from an Ollama/vLLM gateway, or an Azure-style `{"code": ...}` shape),
-  which are treated like broken streams. Still fatal: recognized client-side
-  payload types (e.g. `invalid_request_error`) and every HTTP 4xx. Errors a
-  narrowed `retry_on:` declines are now wrapped in `ProviderError` naming the
-  declined category instead of escaping as raw SDK exceptions, a declined
-  retry is logged at warning level (a taken one already was), and a fatal
-  bare `APIError`'s message now carries the payload `type`/`code` the SDK
-  leaves out of `str(e)`.
-- **Validator retries preserve the primary agent conversation.** When a
-  semantic validator rejects output from the Claude, OpenAI, or Hermes provider,
-  the correction now continues the completed agent conversation — the Pydantic
-  AI message history for Claude/OpenAI, the run's own message list for Hermes —
-  and sends validation feedback as the next user turn. This preserves prior
-  reasoning and tool exchanges
-  without repeating the original prompt, workspace instructions, or injected skills.
-  A failed re-run now reports its cause on the `agent_validation_failed` event and in
-  the console log, and the dashboard keeps the agent's original prompt visible instead
-  of replacing it with the feedback-only turn.
+## [0.1.37](https://github.com/microsoft/conductor/compare/v0.1.36...v0.1.37) - 2026-09-09
 
 ### Added
+
+- **Always-on client-side context compaction for the `claude` and `openai`
+  providers** (#503) — an agent whose conversation outgrows the model's
+  context window no longer fails the run. Conductor condenses the history
+  once it crosses a calculated trigger threshold and continues. The trigger
+  is computed from an additive reserve formula — context window minus output
+  limit minus an effective tool-output-derived buffer (clamped to at most 25%
+  of the window) — and compaction is disabled, with a `disabled_reason` on
+  the `agent_compaction_config` event, when the remaining trigger would fall
+  below 4096 tokens. Condensing runs a three-stage strategy: clearing old
+  tool results first, summarizing older messages with a nested model call,
+  and sliding the window as a deterministic fallback. It is client-side only,
+  so behaviour is identical behind an API proxy, always on with no new YAML
+  surface, and fail-open — a compaction failure never aborts a run, and an
+  unrecovered one disables compaction for the rest of that agent execution.
+  Every compaction is surfaced in the console, the JSONL event log, and the
+  web dashboard.
+
+- **Provider-advertised model token-limit metadata** (#503) for compaction
+  sizing. The `claude` and `openai` providers read per-model input/output
+  token limits from their SDK model listings (with full pagination for the
+  Anthropic SDK, and a vendor-field parser for OpenAI-compatible endpoints),
+  the `copilot` provider implements the `get_max_output_tokens` hook, and
+  resolution falls back through the `genai-prices` registry to a conservative
+  default.
 
 - **Opt-in `runtime.provider.setting_sources` on `claude-agent-sdk`** (#501) —
   selects which Claude Code settings tiers (`user` / `project` / `local`) a
@@ -76,7 +73,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reported on the agent lifecycle events so the grant is auditable. See
   [`examples/claude-agent-sdk-settings-dir.yaml`](examples/claude-agent-sdk-settings-dir.yaml).
 
+### Changed
+
+- **Claude default `max_tokens` raised from 8192 to 16384** when unset
+  (#503). This doubles the worst-case output cost per call for users who
+  never set it; set `runtime.max_tokens` explicitly to keep the former
+  behavior. For Claude thinking agents, `low` or `medium` effort levels
+  without an explicit `max_tokens` limit now send 16384 tokens instead of the
+  former 8192 or 12288 tokens.
+
+- **The `openai` provider honors vendor-advertised token limits** (#503) from
+  the models listing when available, using them to size the compaction output
+  reserve.
+
+- **A `working_dir` or `settings_dir` template that renders empty is now an
+  error** (#513). Previously an empty render resolved to the workflow file's
+  own directory — `Path("")` is `Path(".")`, which is not absolute, so it was
+  joined onto that directory and passed the existence check — and the agent
+  ran there. A value meaning "nothing" silently becoming something real is
+  the defect; for `settings_dir` it would also have granted the model access
+  to the workflow's own tree. Both fields now fail before the provider call,
+  naming the field and the template it came from.
+
 ### Fixed
+
+- **`openai`: retry transient errors delivered inside an SSE stream** (#506) —
+  the OpenAI SDK raises a bare `openai.APIError` (no HTTP status) for an
+  `error` object embedded in a stream, which pydantic-ai does not translate,
+  so a configured `retry:` policy was skipped and the run failed after the
+  first attempt. Now retried: OpenAI mid-stream 5xx (`server_error` /
+  `internal_server_error`), OpenAI rate limits (`type` `requests` / `tokens`
+  with code `rate_limit_exceeded`), Anthropic-shaped gateway errors proxied
+  unchanged (`rate_limit_error` / `overloaded_error` / `api_error`), and
+  stream errors with no parseable payload `type` (a non-object `error` value
+  from an Ollama/vLLM gateway, or an Azure-style `{"code": ...}` shape),
+  which are treated like broken streams. Still fatal: recognized client-side
+  payload types (e.g. `invalid_request_error`) and every HTTP 4xx. Errors a
+  narrowed `retry_on:` declines are now wrapped in `ProviderError` naming the
+  declined category instead of escaping as raw SDK exceptions, a declined
+  retry is logged at warning level (a taken one already was), and a fatal
+  bare `APIError`'s message now carries the payload `type`/`code` the SDK
+  leaves out of `str(e)`.
 
 - **Context compaction window guard against token-dense drift** (#507) — the
   `claude` / `openai` providers' compaction trigger anchors on
@@ -104,6 +141,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure is reported as a new `agent_compaction_skipped` event
   (`reason: "estimate_unavailable"`) rather than vanishing into stderr. See
   [Workflow Syntax → Context Compaction](docs/workflow-syntax.md#context-compaction).
+
+- **Validator retries preserve the primary agent conversation** (#511) — when a
+  semantic validator rejects output from the Claude, OpenAI, or Hermes provider,
+  the correction now continues the completed agent conversation — the Pydantic
+  AI message history for Claude/OpenAI, the run's own message list for Hermes —
+  and sends validation feedback as the next user turn. This preserves prior
+  reasoning and tool exchanges
+  without repeating the original prompt, workspace instructions, or injected skills.
+  A failed re-run now reports its cause on the `agent_validation_failed` event and in
+  the console log, and the dashboard keeps the agent's original prompt visible instead
+  of replacing it with the feedback-only turn.
+
+- **Concurrent agents no longer build duplicate provider instances** (#512) —
+  resolving one provider type from two agents at once (a parallel group, or a
+  `for_each` with `max_concurrent > 1`) was a check-then-act with an `await`
+  between the cache check and the cache write, so each could construct its
+  own instance and the second write replaced the first, leaving the two
+  agents holding different objects for the same provider type. A waiter could
+  also observe a provider before its restored resume-session state had been
+  applied. Construction, resume-session wiring, and cache publication are now
+  one operation under a registry-local lock that re-checks the cache; cached
+  reads stay lock-free, a failed construction caches nothing and strands no
+  waiter, and distinct provider types remain independent.
 
 - **A multi-line reply to a terminal dialog is now one turn** (#509) —
   dialog mode was the only free-text human-input surface that could not accept
@@ -133,17 +193,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change on that path is that a blank line is now skipped instead of dispatched
   as an empty turn. The web dashboard is unaffected: it takes a separate path
   that already delivered each message whole.
-
-### Changed
-
-- **A `working_dir` or `settings_dir` template that renders empty is now an
-  error** (#513). Previously an empty render resolved to the workflow file's
-  own directory — `Path("")` is `Path(".")`, which is not absolute, so it was
-  joined onto that directory and passed the existence check — and the agent
-  ran there. A value meaning "nothing" silently becoming something real is
-  the defect; for `settings_dir` it would also have granted the model access
-  to the workflow's own tree. Both fields now fail before the provider call,
-  naming the field and the template it came from.
 
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
@@ -225,16 +274,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool listing — MCP tools were silently non-functional. Re-locking with
   this bound restores them; the pin does not change behavior for anyone
   already on `mcp` 1.x.
-
-### Added
-
-- **Automatic client-side context compaction for pydantic-ai providers** (`claude` and `openai`). Conductor automatically condenses conversation history when it crosses a calculated trigger threshold. The trigger is computed using an additive reserve formula — context window minus output limit minus an effective tool-output-derived buffer (clamped to at most 25% of the window) — and compaction is disabled with a `disabled_reason` on the `agent_compaction_config` event when the remaining trigger would fall below 4096 tokens. To condense history, the compaction process runs a three-stage strategy: clearing old tool results first, summarizing older messages with a nested model call, and sliding the window as a deterministic fallback.
-- **Provider-advertised model token-limit metadata** for compaction sizing. The `claude` and `openai` providers read per-model input/output token limits from their SDK model listings (with full pagination for the Anthropic SDK, and a vendor-field parser for OpenAI-compatible endpoints), the `copilot` provider implements the `get_max_output_tokens` hook, and resolution falls back through the `genai-prices` registry to a conservative default.
-
-### Changed
-
-- **Claude default `max_tokens` raised from 8192 to 16384** when unset. This doubles the worst-case output cost per call for users who never set it; set `runtime.max_tokens` explicitly to keep the former behavior. For Claude thinking agents, `low` or `medium` effort levels without an explicit `max_tokens` limit now send 16384 tokens instead of the former 8192 or 12288 tokens.
-- **The `openai` provider honors vendor-advertised token limits** from the models listing when available, using them to size the compaction output reserve.
 
 ## [0.1.35](https://github.com/microsoft/conductor/compare/v0.1.34...v0.1.35) - 2026-08-28
 
