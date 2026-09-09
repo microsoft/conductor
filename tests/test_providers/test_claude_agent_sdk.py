@@ -3479,8 +3479,79 @@ class TestSettingsDirAddDirs:
             return hits[0].message
 
         no_tier = await remedy_for(None, None)
-        assert "Add 'project' to runtime.provider.setting_sources" in no_tier
+        assert "Enable the 'project' tier via runtime.provider.setting_sources" in no_tier
 
         opted_out = await remedy_for(["project"], [])
         assert "'skills: []' opts it out" in opted_out
-        assert "Add 'project'" not in opted_out, "advice is a no-op for this cause"
+        assert "Enable the 'project' tier" not in opted_out, "advice is a no-op for this cause"
+
+    @pytest.mark.asyncio
+    async def test_two_causes_on_one_directory_both_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The latch key includes the cause, because the remedy depends on it.
+
+        Keying on the directory alone dedupes a for_each correctly, but two
+        agents can name one directory for different reasons -- and then a
+        single line prescribes a fix that is wrong for the agent it does not
+        name. The pair keeps the for_each collapse (all members share a cause)
+        while letting a differently-caused agent through.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(
+                        name="opted_out", prompt="hi", settings_dir=str(target), skills=[]
+                    ),
+                    context={},
+                    rendered_prompt="hi",
+                )
+                await provider.execute(
+                    agent=AgentDef(name="no_tier", prompt="hi", settings_dir=str(target)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert [r.args[0] for r in hits] == ["opted_out", "no_tier"], [r.args[0] for r in hits]
+        assert "'skills: []' opts it out" in hits[0].message
+        assert "Enable the 'project' tier" in hits[1].message
+
+    @pytest.mark.asyncio
+    async def test_the_no_tier_remedy_does_not_prescribe_a_rejected_edit(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An agent overriding its provider cannot enable the tier at all.
+
+        ``providers/registry.py`` forwards structured settings only to the
+        matching provider, so an agent overriding to ``claude-agent-sdk``
+        under a different ``runtime.provider`` reaches the provider with no
+        ``setting_sources``. The schema rejects ``setting_sources`` unless
+        ``runtime.provider`` is itself ``claude-agent-sdk``, so the remedy
+        must not tell that author to just add it -- it names the requirement.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(name="judge", prompt="hi", settings_dir=str(target)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert hits
+        assert "requires runtime.provider itself to be 'claude-agent-sdk'" in hits[0].message

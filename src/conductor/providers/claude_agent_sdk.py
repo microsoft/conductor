@@ -742,22 +742,27 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # directory, so one key under two directories is two sessions.
         self._session_ids: dict[tuple[str, str], str] = {}
         # settings_dir values already warned about for having no `project`
-        # tier. Keyed by the resolved DIRECTORY, and that choice is a trade:
+        # tier, keyed by `(resolved directory, cause)`:
         #
-        # - Not the agent name, alone or paired with the directory: the engine
-        #   renames a for_each member per item (`<agent>[<key>]`,
-        #   engine/workflow.py), so any name-bearing key emits one line per
-        #   item -- the very case latching exists to prevent.
+        # - The directory, not the agent name: the engine renames a for_each
+        #   member per item (`<agent>[<key>]`, engine/workflow.py), so any
+        #   name-bearing key emits one line per item -- the very case latching
+        #   exists to prevent. All members of one loop share a directory and a
+        #   cause, so they collapse to one line.
         # - Not a bare flag: `settings_dir` is Jinja-rendered per execution, so
         #   one agent can name several directories across loop-backs, and each
         #   is a distinct grant the operator needs told about.
-        # - The cost, accepted: two differently-named agents naming the SAME
-        #   directory warn once, naming only the first. The actionable content
-        #   is the directory and the remedy is workflow-global, so the second
-        #   line would add nothing the first did not say.
+        # - Plus the cause, because the remedy below depends on it: two agents
+        #   can name the same directory for different reasons, and one line
+        #   would prescribe a fix that is wrong for the other. Bounded at two
+        #   lines per directory.
+        #
+        # The residual cost, accepted: two agents naming the same directory
+        # for the SAME reason warn once, naming only the first. The remedy is
+        # then identical for both, so the second line would add nothing.
         #
         # Matches the `_warned` convention in claude.py and engine/workflow.py.
-        self._settings_dir_tier_warned: set[str] = set()
+        self._settings_dir_tier_warned: set[tuple[str, bool]] = set()
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
         # session the first still has open — see :meth:`_claim_session_slot`.
@@ -988,21 +993,32 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # calls the static validator, so without this the run is silent about
         # a no-op the author is relying on. Warned rather than raised, matching
         # validate's own choice: the workflow is not wrong, just ineffective.
+        opted_out = agent.skills == []
         if (
             agent.settings_dir is not None
             and "project" not in effective_sources
-            and agent.settings_dir not in self._settings_dir_tier_warned
+            and (agent.settings_dir, opted_out) not in self._settings_dir_tier_warned
         ):
-            self._settings_dir_tier_warned.add(agent.settings_dir)
+            self._settings_dir_tier_warned.add((agent.settings_dir, opted_out))
             # The remedy depends on the cause, as it does in
             # config/validator.py: telling an author to add 'project' when
             # their own `skills: []` is what zeroed the tier sends them to add
             # a value that is already there, and the warning keeps firing.
+            #
+            # The other arm covers two of validator.py's causes at once -- a
+            # missing tier, and a per-agent provider override, where the tier
+            # cannot be enabled at all because the schema accepts
+            # `setting_sources` only when `runtime.provider` is
+            # 'claude-agent-sdk'. The provider does not know the
+            # workflow-level provider name, so the wording names the
+            # requirement rather than prescribing an edit that would be
+            # refused on that path.
             remedy = (
                 "This agent's own 'skills: []' opts it out of the settings tiers "
                 "entirely; remove it to let the tier apply"
-                if agent.skills == []
-                else "Add 'project' to runtime.provider.setting_sources"
+                if opted_out
+                else "Enable the 'project' tier via runtime.provider.setting_sources, "
+                "which requires runtime.provider itself to be 'claude-agent-sdk'"
             )
             logger.warning(
                 "Agent '%s' sets settings_dir=%r but its session does not enable the "
