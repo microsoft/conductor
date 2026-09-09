@@ -3083,3 +3083,484 @@ class TestValidateConnectionProbeSetPerPlatform:
             "a Windows user's local install must still be found"
         )
         assert any(p.endswith(".npm-global/bin/claude") for p in probed)
+
+
+class TestSettingsDirAddDirs:
+    """``settings_dir`` is the only source of ``ClaudeAgentOptions.add_dirs``.
+
+    The mechanism these tests rest on is measured rather than reasoned about
+    (``tests/test_integration/test_mcp_roots_negotiation.py`` pins it against
+    the real server without an LLM): ``@modelcontextprotocol/server-filesystem``
+    uses its argv directories only when the client does not support MCP Roots;
+    the Claude CLI does support Roots and advertises exactly one, its cwd; so
+    the server discards its argv directories and permits cwd alone.
+    ``--add-dir`` does not participate in that negotiation, so it cannot be
+    used to widen what an MCP server permits -- which is why this field is
+    fed only by the author's ``settings_dir`` and never derived from server
+    arguments.
+
+    What ``add_dirs`` does do is make a directory's *project* settings tier
+    contribute its skills, independent of cwd -- which is what lets an agent
+    keep a cwd wide enough for its MCP servers while loading a narrower
+    target repository's conventions.
+    """
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_becomes_add_dirs(self, tmp_path: Path) -> None:
+        """Requirement: the authored directory reaches the SDK option."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", settings_dir=str(tmp_path)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["add_dirs"] == [str(tmp_path)]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_settings_dir_sends_no_add_dirs(self) -> None:
+        """An agent that names no directory adds none.
+
+        The empty list matters: the CLI would otherwise be handed a directory
+        whose skills, being in an enabled settings tier, become listed and
+        invocable -- ambient content the workflow never declared.
+        """
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["add_dirs"] == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_stdio_server_dir_args_are_not_forwarded(self, tmp_path: Path) -> None:
+        """The regression this class is named for.
+
+        A stdio server's own directory arguments must NOT reach ``add_dirs``.
+        Forwarding them was measurably ineffective, and reinstating it would
+        silently widen skill discovery to every declared MCP root -- granting
+        content from directories the author named as *data*, not as a source
+        of conventions.
+        """
+        root_a = tmp_path / "rootA"
+        root_a.mkdir()
+        root_b = tmp_path / "rootB"
+        root_b.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={
+                    "filesystem": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": [
+                            "-y",
+                            "@modelcontextprotocol/server-filesystem",
+                            str(root_a),
+                            str(root_b),
+                        ],
+                    }
+                }
+            )
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["add_dirs"] == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_is_independent_of_cwd(self, tmp_path: Path) -> None:
+        """The whole point of the field: the two directories are unrelated.
+
+        ``cwd`` becomes the session's sole MCP root; ``settings_dir`` only
+        adds a project tier to read skills from. An agent must be able to set
+        a wide cwd and a narrow settings_dir at once -- neither derived from
+        nor constrained by the other.
+        """
+        wide = tmp_path / "wide"
+        wide.mkdir()
+        narrow = wide / "repo"
+        narrow.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(
+                    name="t",
+                    prompt="hi",
+                    working_dir=str(wide),
+                    settings_dir=str(narrow),
+                ),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["cwd"] == str(wide)
+        assert captured["add_dirs"] == [str(narrow)]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_does_not_become_a_second_cwd(self, tmp_path: Path) -> None:
+        """The boundary of what this field can deliver, pinned deliberately.
+
+        ``add_dirs`` carries a directory's ``.claude/skills`` and nothing
+        else: ``CLAUDE.md``, ``.claude/rules/*.md``, ``.claude/settings.json``
+        (so ``env`` and ``hooks``) and ``.claude/agents`` all follow cwd
+        instead -- measured against the CLI, not inferred. So a
+        ``settings_dir`` must never be quietly promoted into ``cwd`` in an
+        attempt to widen what it loads: that would hand the agent the narrow
+        directory as its sole MCP root, which is the exact defect this field
+        exists to avoid.
+
+        An agent needing a repository's rules *and* a wide cwd cannot have
+        both from these two fields, and this test is what keeps that trade
+        visible rather than papered over.
+        """
+        wide = tmp_path / "wide"
+        wide.mkdir()
+        narrow = wide / "repo"
+        narrow.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(
+                    name="t", prompt="hi", working_dir=str(wide), settings_dir=str(narrow)
+                ),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        # The line that pins it: cwd is the wide directory exactly. The
+        # earlier `narrow not in cwd` substring check added nothing -- it also
+        # passes for an implementation that sets cwd to an unrelated third
+        # directory, so it read as a guard without being one.
+        assert captured["cwd"] == str(wide)
+        assert captured["add_dirs"] == [str(narrow)]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_passed_verbatim(self, tmp_path: Path) -> None:
+        """Not re-resolved, matching ``cwd``: the engine already rendered,
+        absolutized and existence-checked it, and ``resolve()`` here would
+        collapse the symlink aliases the engine preserves on purpose."""
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi", settings_dir=str(link)),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["add_dirs"] == [str(link)]
+
+    @pytest.mark.asyncio
+    async def test_settings_dir_reaches_the_cli_as_add_dir(self, tmp_path: Path) -> None:
+        """The SDK still turns ``add_dirs`` into the ``--add-dir`` argv flag.
+
+        Asserting ``options.add_dirs`` alone proves only that Conductor set the
+        field. ``settings_dir`` has no fallback delivery path -- there is no
+        prompt-injection equivalent that could carry a settings tier -- and the
+        pin is ``claude-agent-sdk>=0.2.82``, a floor with no ceiling, so a lock
+        bump that renamed or dropped the flag would leave every other test in
+        this class green with the feature silently dead.
+        """
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        target = tmp_path / "target"
+        target.mkdir()
+
+        async def options_for(settings_dir: str | None):
+            captured: dict = {}
+
+            async def fake_query(**kwargs):
+                captured["options"] = kwargs["options"]
+                yield _result(result="ok")
+
+            with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+                provider = ClaudeAgentSdkProvider()
+                await provider.execute(
+                    agent=AgentDef(name="t", prompt="hi", settings_dir=settings_dir),
+                    context={},
+                    rendered_prompt="hi",
+                )
+            return captured["options"]
+
+        def argv(options) -> list[str]:
+            # Deliberately local rather than reusing ``TestSkillsWiring._argv``:
+            # that is another class's private helper, and importing across test
+            # classes couples them. Both wrap the same three SDK calls; if the
+            # SDK's command builder moves, both fail together rather than one
+            # silently passing.
+            transport = SubprocessCLITransport(prompt="hi", options=options)
+            transport._cli_path = "/usr/bin/claude"
+            return transport._build_command()
+
+        with_dir = argv(await options_for(str(target)))
+        assert "--add-dir" in with_dir, with_dir
+        assert with_dir[with_dir.index("--add-dir") + 1] == str(target)
+
+        # Negative control: without a settings_dir the flag is absent entirely,
+        # so the assertion above cannot pass against an always-emitted flag.
+        assert "--add-dir" not in argv(await options_for(None))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sources", "agent_skills", "expect_warning"),
+        [
+            (None, None, True),
+            (["user"], None, True),
+            (["local"], None, True),
+            (["project"], None, False),
+            (["project"], [], True),
+        ],
+    )
+    async def test_a_settings_dir_with_no_project_tier_warns_at_run_time(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        sources: list[str] | None,
+        agent_skills: list[str] | None,
+        expect_warning: bool,
+    ) -> None:
+        """``conductor run`` must not be silent when the skills half no-ops.
+
+        ``conductor validate`` warns about this, but ``conductor run`` never
+        calls the static validator -- the same reason the four ``_reject_*``
+        helpers exist. Without this the author gets the one effect they did
+        not ask for (the filesystem grant, which applies regardless) and no
+        diagnostic about the one they did.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        kwargs = {} if sources is None else {"setting_sources": sources}
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(**kwargs)  # type: ignore[arg-type]
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(
+                        name="judge",
+                        prompt="hi",
+                        settings_dir=str(target),
+                        skills=agent_skills,
+                    ),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert bool(hits) is expect_warning, [r.message for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_the_tier_warning_is_latched_per_directory_and_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Once per directory, and specifically once across a for_each.
+
+        Latched because the condition is static while executions are not.
+        Keyed by the resolved directory rather than the agent name because
+        the engine renames a for_each member per item (``<agent>[<key>]``),
+        so a name-keyed latch emits one line per item -- the exact case
+        latching exists to prevent. Not a bare flag either: a second agent
+        naming a *different* directory must still be reported, since naming
+        the directory is the point of the warning. The key is additionally
+        paired with the cause, since the remedy depends on it -- see
+        :meth:`test_two_causes_on_one_directory_both_warn`.
+        """
+        target = tmp_path / "repo"
+        other = tmp_path / "other"
+        target.mkdir()
+        other.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                # Eight for_each iterations over one directory, as the engine
+                # drives them: same settings_dir, a fresh name each time.
+                for key in range(8):
+                    await provider.execute(
+                        agent=AgentDef(name=f"fan[{key}]", prompt="hi", settings_dir=str(target)),
+                        context={},
+                        rendered_prompt="hi",
+                    )
+                await provider.execute(
+                    agent=AgentDef(name="judge", prompt="hi", settings_dir=str(other)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        warned = [
+            (r.args[0], r.args[1])
+            for r in caplog.records
+            if "no skills are discovered" in r.message and r.args
+        ]
+        assert warned == [("fan[0]", str(target)), ("judge", str(other))], warned
+
+    @pytest.mark.asyncio
+    async def test_the_tier_warning_remedy_matches_the_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Advice an author can act on, as ``config/validator.py`` does.
+
+        Telling an author to add ``'project'`` when their own ``skills: []``
+        is what zeroed the tier sends them to add a value already present,
+        and the warning keeps firing.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        async def remedy_for(sources: list[str] | None, skills: list[str] | None) -> str:
+            caplog.clear()
+            kwargs = {} if sources is None else {"setting_sources": sources}
+            with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+                provider = ClaudeAgentSdkProvider(**kwargs)  # type: ignore[arg-type]
+                with caplog.at_level(logging.WARNING):
+                    await provider.execute(
+                        agent=AgentDef(
+                            name="judge",
+                            prompt="hi",
+                            settings_dir=str(target),
+                            skills=skills,
+                        ),
+                        context={},
+                        rendered_prompt="hi",
+                    )
+            hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+            assert hits, [r.message for r in caplog.records]
+            return hits[0].message
+
+        no_tier = await remedy_for(None, None)
+        assert "Enable the 'project' tier via runtime.provider.setting_sources" in no_tier
+
+        opted_out = await remedy_for(["project"], [])
+        assert "'skills: []' opts it out" in opted_out
+        assert "Enable the 'project' tier" not in opted_out, "advice is a no-op for this cause"
+
+    @pytest.mark.asyncio
+    async def test_two_causes_on_one_directory_both_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The latch key includes the cause, because the remedy depends on it.
+
+        Keying on the directory alone dedupes a for_each correctly, but two
+        agents can name one directory for different reasons -- and then a
+        single line prescribes a fix that is wrong for the agent it does not
+        name. The pair keeps the for_each collapse (all members share a cause)
+        while letting a differently-caused agent through.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(
+                        name="opted_out", prompt="hi", settings_dir=str(target), skills=[]
+                    ),
+                    context={},
+                    rendered_prompt="hi",
+                )
+                await provider.execute(
+                    agent=AgentDef(name="no_tier", prompt="hi", settings_dir=str(target)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert [r.args[0] for r in hits] == ["opted_out", "no_tier"], [r.args[0] for r in hits]
+        assert "'skills: []' opts it out" in hits[0].message
+        assert "Enable the 'project' tier" in hits[1].message
+
+    @pytest.mark.asyncio
+    async def test_the_no_tier_remedy_does_not_prescribe_a_rejected_edit(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The no-tier arm must not prescribe an edit the schema would reject.
+
+        This arm serves two of ``config/validator.py``'s causes at once: a
+        missing tier, and a per-agent ``provider: claude-agent-sdk`` override
+        under a different ``runtime.provider``, where ``factory.py`` forwards
+        no ``setting_sources`` and the schema would then reject adding it.
+
+        The provider cannot tell those two apart -- it never receives the
+        workflow-level provider name, only ``setting_sources`` -- which is
+        why one shared arm is the right design and why this test can pin
+        only the wording that is true of both. The override path itself is
+        covered at validate time, where the config *is* visible:
+        ``test_config/test_settings_dir_schema.py::
+        TestProjectTierWarningCauses::
+        test_provider_override_does_not_advise_the_impossible``.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(name="judge", prompt="hi", settings_dir=str(target)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert hits
+        assert "requires runtime.provider itself to be 'claude-agent-sdk'" in hits[0].message

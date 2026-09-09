@@ -17,7 +17,7 @@ import time as _time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
@@ -593,29 +593,56 @@ class WorkflowEngine:
         """Resolved parent directory of the workflow file, or None if unset."""
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
-    def _resolve_agent_working_dir(
-        self, agent: AgentDef, agent_context: dict[str, Any]
-    ) -> AgentDef:
-        """Resolve an agent's effective ``working_dir`` and return an updated copy.
+    def _resolve_agent_directory(
+        self,
+        agent: AgentDef,
+        agent_context: dict[str, Any],
+        *,
+        field: Literal["working_dir", "settings_dir"],
+        raw: str,
+    ) -> str:
+        """Render and absolutize one authored directory value.
 
-        Precedence is ``agent.working_dir`` over ``runtime.working_dir``; the
-        chosen raw value is Jinja-rendered against the per-agent context (so
-        both levels support templates, e.g. ``{{ item }}`` in for-each), then
-        ``~``-expanded, made absolute against the workflow file's directory
-        (falling back to the process cwd), and lexically normalised with
-        :func:`os.path.normpath` (``resolve()`` is deliberately not used so
-        symlink aliases stay distinct). A missing directory raises
-        :class:`ExecutionError` before any provider call. When neither level
-        sets a value the agent is returned unchanged (``working_dir=None`` and
-        the provider uses its own cwd).
+        Shared by ``working_dir`` and ``settings_dir`` so the two cannot drift
+        apart: the raw value is Jinja-rendered against the per-agent context
+        (so templates such as ``{{ item }}`` in for-each work at either
+        level), then ``~``-expanded, made absolute against the workflow
+        file's directory (falling back to the process cwd), and lexically
+        normalised with :func:`os.path.normpath` (``resolve()`` is
+        deliberately not used so symlink aliases stay distinct).
+
+        Applies to ``working_dir`` as well as ``settings_dir``: a value that
+        renders empty previously resolved to the workflow file's own directory
+        and ran there, which is the same footgun in a quieter form, so both
+        are refused.
+
+        Raises:
+            ExecutionError: if the value renders empty, or if the resolved
+                path is not an existing directory — both before any provider
+                call.
         """
-        raw = agent.working_dir
-        if raw is None:
-            raw = self.config.workflow.runtime.working_dir
-        if raw is None:
-            return agent
-
         rendered = self.renderer.render(raw, agent_context)
+        # A template can render empty even when the raw value passed the schema's
+        # min_length -- an --input given as `repo=`, a script step that printed
+        # nothing, a `set` binding evaluating to "". Path("") is Path("."), which
+        # is not absolute, so it would join onto the workflow file's own directory
+        # and pass the is_dir() check below: a value meaning "nothing" silently
+        # becoming somewhere real.
+        #
+        # Refused for BOTH fields, deliberately. settings_dir is the dangerous
+        # one -- there the workflow's own tree would be handed to the model's
+        # file tools -- but working_dir running an agent in the wrong directory
+        # is the same defect without the grant, so neither is worth keeping.
+        if not rendered.strip():
+            raise ExecutionError(
+                f"Agent '{agent.name}': {field} rendered to an empty string from '{raw}'",
+                agent_name=agent.name,
+                suggestion=(
+                    f"An empty value would resolve to the workflow file's own "
+                    f"directory. Check that the input or upstream step feeding "
+                    f"{field} produced a path."
+                ),
+            )
         path = Path(rendered).expanduser()
         if not path.is_absolute():
             base = self._workflow_dir if self._workflow_dir is not None else Path.cwd()
@@ -624,16 +651,57 @@ class WorkflowEngine:
 
         if not Path(resolved).is_dir():
             raise ExecutionError(
-                f"Agent '{agent.name}': working_dir '{resolved}' does not exist or "
+                f"Agent '{agent.name}': {field} '{resolved}' does not exist or "
                 f"is not a directory (rendered from '{raw}')",
                 agent_name=agent.name,
                 suggestion=(
                     "Create the directory before the agent runs (e.g. via a "
-                    "script step) or fix the working_dir template."
+                    f"script step) or fix the {field} template."
                 ),
             )
+        return resolved
 
-        return agent.model_copy(update={"working_dir": resolved})
+    def _resolve_agent_working_dir(
+        self, agent: AgentDef, agent_context: dict[str, Any]
+    ) -> AgentDef:
+        """Resolve an agent's ``working_dir`` and ``settings_dir``, returning a copy.
+
+        The name says ``working_dir`` only for historical reasons -- it is
+        referenced by name from four other modules' comments, so renaming it
+        costs more than it explains. Grep for ``settings_dir`` and this is
+        where it is resolved.
+
+        ``working_dir`` precedence is ``agent.working_dir`` over
+        ``runtime.working_dir``; ``settings_dir`` is per-agent only, since the
+        directory whose conventions apply is what varies between steps. Both
+        are resolved by :meth:`_resolve_agent_directory`. An agent setting
+        neither is returned unchanged, leaving the provider its own cwd.
+
+        The two are independent on purpose: ``working_dir`` becomes the
+        session cwd, which the CLI advertises as its sole MCP root, while
+        ``settings_dir`` only adds a directory whose project-tier skills are
+        discoverable. An agent can therefore keep a wide cwd — wide enough
+        for every path its MCP servers must reach — and still load a
+        narrower target repository's skills.
+        """
+        update: dict[str, Any] = {}
+
+        raw = agent.working_dir
+        if raw is None:
+            raw = self.config.workflow.runtime.working_dir
+        if raw is not None:
+            update["working_dir"] = self._resolve_agent_directory(
+                agent, agent_context, field="working_dir", raw=raw
+            )
+
+        if agent.settings_dir is not None:
+            update["settings_dir"] = self._resolve_agent_directory(
+                agent, agent_context, field="settings_dir", raw=agent.settings_dir
+            )
+
+        if not update:
+            return agent
+        return agent.model_copy(update=update)
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -4426,7 +4494,7 @@ class WorkflowEngine:
                             agent_type=agent.type,
                         )
 
-                        # Resolve working_dir only for provider-backed LLM agents
+                        # Resolve working_dir / settings_dir for provider-backed LLM agents
                         # (type None/"agent"). wait/set/terminate/human_gate/
                         # workflow are schema-rejected from declaring one, and
                         # script resolves its own in ScriptExecutor.
@@ -4458,6 +4526,13 @@ class WorkflowEngine:
                         }
                         if is_llm_agent:
                             started_payload["working_dir"] = resolved_agent.working_dir
+                            # Emitted alongside working_dir because it is a
+                            # trust decision: settings_dir loads another
+                            # repository's conventions AND widens the model's
+                            # built-in file tools to that tree. A grant the
+                            # dashboard and the JSONL log never mention cannot
+                            # be audited after the fact.
+                            started_payload["settings_dir"] = resolved_agent.settings_dir
                         self._emit("agent_started", started_payload)
 
                         # Handle terminate steps — explicit workflow exit with a
@@ -6157,7 +6232,7 @@ class WorkflowEngine:
                     )
                     return (agent.name, set_output.value)
 
-                # Resolve working_dir for provider-backed LLM agents against
+                # Resolve working_dir / settings_dir for provider-backed LLM agents against
                 # this agent's own (pre-group snapshot) context. `set` steps
                 # returned above; other types in a parallel group are LLM agents.
                 resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
@@ -6171,6 +6246,7 @@ class WorkflowEngine:
                         "group_name": parallel_group.name,
                         "agent_name": agent.name,
                         "working_dir": resolved_agent.working_dir,
+                        "settings_dir": resolved_agent.settings_dir,
                     },
                 )
 
@@ -6643,7 +6719,7 @@ class WorkflowEngine:
                     update={"name": f"{for_each_group.agent.name}[{key}]"}
                 )
 
-                # Resolve working_dir AFTER loop variables were injected into
+                # Resolve working_dir / settings_dir AFTER loop variables were injected into
                 # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
                 # the path resolves to this iteration's value.
                 qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
@@ -6659,6 +6735,7 @@ class WorkflowEngine:
                         "agent_name": qualified_agent.name,
                         "item_key": key,
                         "working_dir": qualified_agent.working_dir,
+                        "settings_dir": qualified_agent.settings_dir,
                     },
                 )
 

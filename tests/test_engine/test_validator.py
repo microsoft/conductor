@@ -138,6 +138,34 @@ class TestValidatorAgentConstruction:
         v = OutputValidator()._build_validator_agent(agent)
         assert "VERY_SPECIFIC_RUBRIC" in (v.system_prompt or "")
 
+    def test_settings_dir_is_not_inherited(self) -> None:
+        """The grader must not inherit the primary agent's ``settings_dir``.
+
+        ``working_dir`` IS inherited, so this is a deliberate asymmetry rather
+        than an omission: the grader runs with ``tools=[]``, which yields at
+        most the ``Skill`` loader and never Read/Edit/Bash, so the filesystem
+        grant would widen access to a tree it has no way to use.
+
+        Pinned because the consequence is latent, not active: today there is
+        no file tool for the grant to widen, but ``_resolve_tool_config``'s
+        carve-outs have already grown once (the ``Skill`` grant-back). The
+        next time a tool is granted back to a ``tools: []`` agent this line
+        becomes load-bearing, and without this assertion nothing would notice
+        if it had drifted.
+        """
+        agent = AgentDef(
+            name="reviewer",
+            prompt="x",
+            working_dir="/tmp",
+            settings_dir="/tmp",
+            validator=ValidatorConfig(criteria="check"),
+        )
+
+        v = OutputValidator()._build_validator_agent(agent)
+
+        assert v.settings_dir is None
+        assert v.working_dir == "/tmp", "working_dir is still inherited"
+
     def test_no_tools_and_has_output_schema(self) -> None:
         v = OutputValidator()._build_validator_agent(_agent())
         assert v.tools == []

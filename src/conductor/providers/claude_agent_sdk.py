@@ -668,6 +668,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # rather than being stamped individually as they are for Copilot:
         # the SDK's ``McpStdioServerConfig`` has no cwd field.
         working_dir=True,
+        # ``settings_dir`` reaches ``ClaudeAgentOptions.add_dirs``, the CLI's
+        # ``--add-dir``. It is the only provider that has anywhere to put it.
+        settings_dir=True,
         # Skills are loaded natively: the owning plugin is registered via
         # ``ClaudeAgentOptions.plugins`` and enabled by its qualified name
         # through ``skills``, so the model reads the frontmatter up front
@@ -738,6 +741,28 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # the point, and by cwd because the CLI stores transcripts per working
         # directory, so one key under two directories is two sessions.
         self._session_ids: dict[tuple[str, str], str] = {}
+        # settings_dir values already warned about for having no `project`
+        # tier, keyed by `(resolved directory, cause)`:
+        #
+        # - The directory, not the agent name: the engine renames a for_each
+        #   member per item (`<agent>[<key>]`, engine/workflow.py), so any
+        #   name-bearing key emits one line per item -- the very case latching
+        #   exists to prevent. All members of one loop share a directory and a
+        #   cause, so they collapse to one line.
+        # - Not a bare flag: `settings_dir` is Jinja-rendered per execution, so
+        #   one agent can name several directories across loop-backs, and each
+        #   is a distinct grant the operator needs told about.
+        # - Plus the cause, because the remedy below depends on it: two agents
+        #   can name the same directory for different reasons, and one line
+        #   would prescribe a fix that is wrong for the other. Bounded at two
+        #   lines per directory.
+        #
+        # The residual cost, accepted: two agents naming the same directory
+        # for the SAME reason warn once, naming only the first. The remedy is
+        # then identical for both, so the second line would add nothing.
+        #
+        # Matches the `_warned` convention in claude.py and engine/workflow.py.
+        self._settings_dir_tier_warned: set[tuple[str, bool]] = set()
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
         # session the first still has open — see :meth:`_claim_session_slot`.
@@ -961,6 +986,51 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # reads off ``agent.tools``.
         effective_sources: list[SettingSource] = [] if agent.skills == [] else self._setting_sources
 
+        # A settings_dir whose `project` tier is not enabled discovers no
+        # skills -- and the filesystem grant applies anyway, so the one effect
+        # the author did not ask for is the only one they get.
+        # ``conductor validate`` warns about this, but ``conductor run`` never
+        # calls the static validator, so without this the run is silent about
+        # a no-op the author is relying on. Warned rather than raised, matching
+        # validate's own choice: the workflow is not wrong, just ineffective.
+        opted_out = agent.skills == []
+        if (
+            agent.settings_dir is not None
+            and "project" not in effective_sources
+            and (agent.settings_dir, opted_out) not in self._settings_dir_tier_warned
+        ):
+            self._settings_dir_tier_warned.add((agent.settings_dir, opted_out))
+            # The remedy depends on the cause, as it does in
+            # config/validator.py: telling an author to add 'project' when
+            # their own `skills: []` is what zeroed the tier sends them to add
+            # a value that is already there, and the warning keeps firing.
+            #
+            # The other arm covers two of validator.py's causes at once -- a
+            # missing tier, and a per-agent provider override, where the tier
+            # cannot be enabled at all because the schema accepts
+            # `setting_sources` only when `runtime.provider` is
+            # 'claude-agent-sdk'. The provider does not know the
+            # workflow-level provider name, so the wording names the
+            # requirement rather than prescribing an edit that would be
+            # refused on that path.
+            remedy = (
+                "This agent's own 'skills: []' opts it out of the settings tiers "
+                "entirely; remove it to let the tier apply"
+                if opted_out
+                else "Enable the 'project' tier via runtime.provider.setting_sources, "
+                "which requires runtime.provider itself to be 'claude-agent-sdk'"
+            )
+            logger.warning(
+                "Agent '%s' sets settings_dir=%r but its session does not enable the "
+                "'project' settings tier, so no skills are discovered from that "
+                "directory. The directory is still granted to the model's built-in "
+                "file tools. %s, or remove settings_dir if the filesystem grant was "
+                "not intended.",
+                agent.name,
+                agent.settings_dir,
+                remedy,
+            )
+
         sdk_tools, permission_mode = self._resolve_tool_config(
             tools,
             agent,
@@ -993,6 +1063,34 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
+            # The authored ``settings_dir`` and nothing else. Two effects,
+            # and the order matters because the second is easy to miss.
+            #
+            # (1) UNCONDITIONAL: per the SDK's own contract this is
+            #     "additional directories Claude can access beyond the current
+            #     working directory", so this line widens the model's built-in
+            #     Read/Edit/Bash to that tree with no settings tier enabled at
+            #     all (measured). It does NOT widen what an MCP server permits.
+            #
+            # (2) CONDITIONAL on ``setting_sources`` enabling the ``project``
+            #     tier: the directory's ``.claude/skills`` become listed and
+            #     invocable with cwd elsewhere entirely, and only those — not
+            #     CLAUDE.md, .claude/rules/*.md, .claude/settings.json (so no
+            #     env and no hooks) or .claude/agents, which all stay with cwd.
+            #     So it is the skills portion of a project tier rather than a
+            #     cwd-independent way to load one.
+            #
+            # Do not extend this to the directory args of stdio MCP servers to
+            # widen what those servers may read: it cannot work. A filesystem
+            # MCP server uses its argv directories only when the client does
+            # not support MCP Roots, and the CLI does support Roots —
+            # advertising exactly one, its cwd — so the server discards its
+            # argv directories and permits cwd alone. ``--add-dir`` takes no
+            # part in that negotiation; it widens the CLI's own file tools,
+            # never what a server permits. Measured: cwd alone is the
+            # effective allowlist whether or not every declared root is also
+            # passed here.
+            add_dirs=[agent.settings_dir] if agent.settings_dir else [],
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,

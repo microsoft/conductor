@@ -143,6 +143,22 @@ class ProviderCapabilities(BaseModel):
     the directory would run the agent in the wrong repository. Defaults to
     ``False`` (conservative)."""
 
+    settings_dir: bool = False
+    """``True`` when the provider applies an agent's resolved ``settings_dir``.
+
+    Workflows that set ``settings_dir`` against a provider with
+    ``settings_dir=False`` are refused twice -- by ``conductor validate`` and
+    again at run time by
+    :meth:`conductor.executor.agent.AgentExecutor._reject_unsupported_settings_dir`,
+    because ``conductor run`` never invokes the static validator. Both are
+    needed for the same reason: the field selects which repository's
+    conventions the agent loads *and* widens the model's built-in file tools
+    to that tree, so silently ignoring it would run the agent against the
+    wrong conventions while reporting success. Distinct from ``working_dir`` because the two are
+    deliberately independent axes -- cwd is the sole root a filesystem MCP
+    server gets, while this only adds a directory. Defaults to ``False``
+    (conservative)."""
+
     skills: bool = False
     """``True`` when the provider exposes :mod:`conductor.skills` content
     to the agent. The user-facing contract is the same regardless of

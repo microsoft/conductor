@@ -1,0 +1,155 @@
+# Target-repository skills without narrowing the MCP root (`settings_dir`)
+#
+# A reviewer agent that loads a TARGET repository's own `.claude/skills` while
+# keeping filesystem access wide enough to also read a sibling artifacts
+# directory. Two directories, two jobs, set independently.
+#
+# THE PROBLEM THIS EXAMPLE EXISTS FOR
+#   On `claude-agent-sdk`, an agent's cwd does two unrelated jobs at once:
+#
+#     1. The `claude` CLI supports the MCP Roots protocol and advertises
+#        exactly ONE root -- its cwd. `@modelcontextprotocol/server-filesystem`
+#        uses the directories in its own argv only while the client does NOT
+#        support Roots, so with this CLI it discards them and permits cwd
+#        alone. cwd is therefore the only handle on what the agent may read.
+#        (`--add-dir` cannot widen this: it takes no part in that negotiation.)
+#
+#     2. cwd is also what the `project` settings tier resolves against, so it
+#        decides WHOSE conventions load.
+#
+#   Point `working_dir` at the repository under review and job 2 is satisfied
+#   while job 1 breaks: the artifacts directory outside that repository is now
+#   denied. Widen `working_dir` back and job 2 breaks instead -- the reviewer
+#   loads the ORCHESTRATOR's conventions while reviewing someone else's code.
+#
+# THE FIX
+#   `settings_dir` carries job 2 on its own. Skills are discovered from cwd
+#   AND from `settings_dir`, so cwd stays wide:
+#
+#     working_dir  (or none)  -> the single MCP root: keep it wide
+#     settings_dir            -> whose .claude/skills load: keep it narrow
+#
+#   Only skills travel this way. `CLAUDE.md`, `.claude/settings.json` (so
+#   `env` and `hooks`) and `.claude/agents` all keep following cwd -- which
+#   cuts favourably here: the target repository's skills arrive without its
+#   hooks also running.
+#
+# Pre-requisites:
+#   pip install conductor[claude-agent-sdk]
+#   npm install -g @anthropic-ai/claude-code     # the `claude` CLI
+#   claude login
+#   npx -y @modelcontextprotocol/server-filesystem --help   # warms the server
+#
+# Usage -- `workspace` must CONTAIN both the repo and the artifacts directory:
+#   conductor run examples/claude-agent-sdk-settings-dir.yaml \
+#     --input workspace=/path/to/workspace \
+#     --input repo=/path/to/workspace/target-repo \
+#     --input artifacts=/path/to/workspace/artifacts
+#
+#   where:
+#     workspace  -- contains BOTH the repo and the artifacts directory. It
+#                   becomes cwd, and therefore the filesystem MCP server's
+#                   only root: everything the agent reads must live under it.
+#     repo       -- the target repository, under `workspace`. Supplies the
+#                   skills, via `settings_dir`.
+#     artifacts  -- prior findings, under `workspace` but OUTSIDE `repo` --
+#                   the path a narrowed cwd would deny.
+#
+# Validation only (no execution / no API calls):
+#   conductor validate examples/claude-agent-sdk-settings-dir.yaml
+
+workflow:
+  name: claude-agent-sdk-settings-dir
+  description: >
+    Reviewer that loads a target repository's own skills via `settings_dir`
+    while keeping a wide cwd, so its filesystem MCP server can still reach a
+    sibling artifacts directory.
+  version: "1.0.0"
+  entry_point: review
+
+  input:
+    workspace:
+      type: string
+      required: true
+      description: >
+        Wide directory containing BOTH the repository under review and the
+        artifacts directory. Becomes every agent's cwd, and therefore the
+        filesystem MCP server's only root.
+    repo:
+      type: string
+      required: true
+      description: >
+        The repository under review, inside `workspace`. Its own
+        `.claude/skills` are loaded via `settings_dir`.
+    artifacts:
+      type: string
+      required: true
+      description: >
+        Prior findings, inside `workspace` but OUTSIDE `repo` -- the path that
+        a narrowed cwd would make unreadable.
+
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      # Opt in to the `project` tier. Off by default, so a run does not
+      # inherit whatever the machine happens to have installed. A tier brings
+      # everything it defines: enable it only for repositories trusted to the
+      # same degree as this workflow.
+      setting_sources: [project]
+    default_model: claude-sonnet-4-5
+
+    # cwd for every agent: the wide directory. The filesystem MCP server's
+    # argv roots below are discarded by the server itself (see the header), so
+    # THIS is what actually decides what the agent can read.
+    working_dir: "{{ workflow.input.workspace }}"
+
+    mcp_servers:
+      filesystem:
+        type: stdio
+        command: npx
+        args:
+          - "-y"
+          - "@modelcontextprotocol/server-filesystem"
+          # Declared for a client that does not negotiate Roots. The `claude`
+          # CLI does, so it permits cwd alone and these are ignored -- kept
+          # because they are still the honest declaration of intent, not
+          # because they take effect here.
+          - "{{ workflow.input.repo }}"
+          - "{{ workflow.input.artifacts }}"
+
+agents:
+  - name: review
+    # The narrow half: this repository's `.claude/skills` become listed and
+    # invocable, with cwd still the wide workspace above. Templated, since the
+    # directory under review is normally an upstream step's output.
+    settings_dir: "{{ workflow.input.repo }}"
+    prompt: |
+      You are reviewing the repository at {{ workflow.input.repo }}.
+
+      First, list the skills available to you. Any skill this repository ships
+      in its own `.claude/skills` should be among them -- that is what
+      `settings_dir` provides, and you should follow its conventions rather
+      than any you would apply by default.
+
+      Then read the prior findings under {{ workflow.input.artifacts }} using
+      the filesystem MCP server. That directory sits outside the repository,
+      so a run that had narrowed the working directory onto the repository
+      could not read it at all.
+
+      Report:
+        - which repository-supplied skills you found
+        - what the prior findings say
+        - whether the repository's conventions change your reading of them
+    output:
+      skills_found:
+        type: string
+        description: Repository-supplied skills the session offered.
+      findings_summary:
+        type: string
+        description: What the artifacts directory contained.
+    routes:
+      - to: "$end"
+
+output:
+  skills_found: "{{ review.output.skills_found }}"
+  findings_summary: "{{ review.output.findings_summary }}"
