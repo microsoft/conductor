@@ -741,6 +741,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # the point, and by cwd because the CLI stores transcripts per working
         # directory, so one key under two directories is two sessions.
         self._session_ids: dict[tuple[str, str], str] = {}
+        # Agents already warned about a settings_dir with no `project` tier.
+        # Keyed by agent name, not a bare flag: the condition is per agent, so
+        # a global latch would silence a second affected agent. Latched at all
+        # because the condition is static per agent while executions are not --
+        # a 50-item for_each would otherwise emit 50 identical lines. Matches
+        # the `_warned` convention in claude.py and engine/workflow.py.
+        self._settings_dir_tier_warned: set[str] = set()
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
         # session the first still has open — see :meth:`_claim_session_slot`.
@@ -971,7 +978,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # calls the static validator, so without this the run is silent about
         # a no-op the author is relying on. Warned rather than raised, matching
         # validate's own choice: the workflow is not wrong, just ineffective.
-        if agent.settings_dir is not None and "project" not in effective_sources:
+        if (
+            agent.settings_dir is not None
+            and "project" not in effective_sources
+            and agent.name not in self._settings_dir_tier_warned
+        ):
+            self._settings_dir_tier_warned.add(agent.name)
             logger.warning(
                 "Agent '%s' sets settings_dir=%r but its session does not enable the "
                 "'project' settings tier, so no skills are discovered from that "

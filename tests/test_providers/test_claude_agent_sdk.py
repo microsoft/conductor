@@ -3395,3 +3395,35 @@ class TestSettingsDirAddDirs:
 
         hits = [r for r in caplog.records if "no skills are discovered" in r.message]
         assert bool(hits) is expect_warning, [r.message for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_the_tier_warning_is_latched_per_agent(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Once per agent, not once per execution -- and not once per run.
+
+        The condition is static per agent while executions are not, so an
+        unlatched warning would emit one identical line per for-each item.
+        Keyed by agent name rather than a bare flag because a global latch
+        would silence a *second* affected agent, which is the case that
+        matters: the point of the warning is naming the directory.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        def agent(name: str) -> AgentDef:
+            return AgentDef(name=name, prompt="hi", settings_dir=str(target))
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                for name in ("fan", "fan", "fan", "other", "other"):
+                    await provider.execute(agent=agent(name), context={}, rendered_prompt="hi")
+
+        warned = [
+            r.args[0] for r in caplog.records if "no skills are discovered" in r.message and r.args
+        ]
+        assert warned == ["fan", "other"], warned

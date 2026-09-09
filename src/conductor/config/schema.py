@@ -1402,8 +1402,9 @@ class AgentDef(BaseModel):
 
     **Two effects, and only one of them is conditional.** Skill discovery
     requires ``runtime.provider.setting_sources`` to enable the ``project``
-    tier; ``conductor validate`` warns when this field is set without it,
-    since the skills half is then a no-op. The *filesystem* grant is
+    tier; both ``conductor validate`` and the run itself warn when this field
+    is set without it, since the skills half is then a no-op and
+    ``conductor run`` never calls the static validator. The *filesystem* grant is
     unconditional: ``add_dirs``' own SDK contract is "additional directories
     Claude can access beyond the current working directory", so naming a
     directory here widens the model's built-in ``Read``/``Edit``/``Bash``
