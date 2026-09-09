@@ -60,8 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches a permission mode where that is observable today. Only the skills
   of that directory travel — not `CLAUDE.md`, `.claude/rules/*.md`,
   `.claude/settings.json` or `.claude/agents`, all measured. Refused at
-  `conductor validate` *and* at run time on a provider that cannot apply it,
-  and reported on the agent lifecycle events so the grant is auditable. See
+  `conductor validate` *and* at run time on a provider that cannot apply it;
+  a `settings_dir` whose `project` tier is not enabled warns in both places
+  too, since the filesystem grant applies even when the skills half no-ops.
+  Reported on the agent lifecycle events so the grant is auditable. See
   [`examples/claude-agent-sdk-settings-dir.yaml`](examples/claude-agent-sdk-settings-dir.yaml).
 
 ### Fixed

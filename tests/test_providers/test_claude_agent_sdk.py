@@ -3344,3 +3344,54 @@ class TestSettingsDirAddDirs:
         # Negative control: without a settings_dir the flag is absent entirely,
         # so the assertion above cannot pass against an always-emitted flag.
         assert "--add-dir" not in argv(await options_for(None))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sources", "agent_skills", "expect_warning"),
+        [
+            (None, None, True),
+            (["user"], None, True),
+            (["local"], None, True),
+            (["project"], None, False),
+            (["project"], [], True),
+        ],
+    )
+    async def test_a_settings_dir_with_no_project_tier_warns_at_run_time(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        sources: list[str] | None,
+        agent_skills: list[str] | None,
+        expect_warning: bool,
+    ) -> None:
+        """``conductor run`` must not be silent when the skills half no-ops.
+
+        ``conductor validate`` warns about this, but ``conductor run`` never
+        calls the static validator -- the same reason the four ``_reject_*``
+        helpers exist. Without this the author gets the one effect they did
+        not ask for (the filesystem grant, which applies regardless) and no
+        diagnostic about the one they did.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        kwargs = {} if sources is None else {"setting_sources": sources}
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(**kwargs)  # type: ignore[arg-type]
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(
+                        name="judge",
+                        prompt="hi",
+                        settings_dir=str(target),
+                        skills=agent_skills,
+                    ),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        hits = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert bool(hits) is expect_warning, [r.message for r in caplog.records]

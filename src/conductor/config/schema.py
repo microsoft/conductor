@@ -1384,7 +1384,12 @@ class AgentDef(BaseModel):
     settings_dir: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
         None
     )
-    """Directory whose Claude Code *project* settings tier this agent loads.
+    """Directory whose ``.claude/skills`` this agent may use, and whose tree the
+    model's built-in file tools may read.
+
+    Both halves of that first line are deliberate: this carries the *skills*
+    third of a Claude Code ``project`` settings tier and nothing else of it,
+    and it widens the model's filesystem access unconditionally. Details below.
 
     ``claude-agent-sdk`` only -- a provider that cannot apply it refuses it
     both at ``conductor validate`` and at run time, rather than dropping it

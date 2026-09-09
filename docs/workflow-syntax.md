@@ -404,8 +404,11 @@ Because paths are normalized lexically instead of resolving to their real paths:
 
 ### Target-Repository Skills (`settings_dir`)
 
-`settings_dir` names a second directory whose Claude Code *project* settings
-tier the agent reads skills from. It applies only to `claude-agent-sdk` agents.
+`settings_dir` names a second directory whose `.claude/skills` the agent may
+use, and whose tree the model's built-in file tools may read. It carries the
+*skills* third of a Claude Code `project` settings tier and nothing else of it
+— the table below is exact about which — and the filesystem half applies
+whether or not any tier is enabled. It applies only to `claude-agent-sdk` agents.
 Setting it against any other provider is an **error**, reported by `conductor
 validate` and again at run time — not a silently dropped field. The skills half
 additionally requires `runtime.provider.setting_sources` to enable the `project`
@@ -477,6 +480,10 @@ Measured against the CLI:
 > Skill discovery is the *reason* to set this field; the filesystem grant is
 > its unavoidable companion. Point it at a directory the agent is entitled to
 > read.
+>
+> `conductor validate` warns when `settings_dir` is set without the `project`
+> tier enabled, and so does the run itself — otherwise the only effect an
+> author would get is the one they did not ask for.
 
 Note this grant is for the model's **built-in** tools only. It does not widen
 what a filesystem MCP server permits — that stays cwd alone, which is the

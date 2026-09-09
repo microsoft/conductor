@@ -964,6 +964,24 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # reads off ``agent.tools``.
         effective_sources: list[SettingSource] = [] if agent.skills == [] else self._setting_sources
 
+        # A settings_dir whose `project` tier is not enabled discovers no
+        # skills -- and the filesystem grant applies anyway, so the one effect
+        # the author did not ask for is the only one they get.
+        # ``conductor validate`` warns about this, but ``conductor run`` never
+        # calls the static validator, so without this the run is silent about
+        # a no-op the author is relying on. Warned rather than raised, matching
+        # validate's own choice: the workflow is not wrong, just ineffective.
+        if agent.settings_dir is not None and "project" not in effective_sources:
+            logger.warning(
+                "Agent '%s' sets settings_dir=%r but its session does not enable the "
+                "'project' settings tier, so no skills are discovered from that "
+                "directory. The directory is still granted to the model's built-in "
+                "file tools. Add 'project' to runtime.provider.setting_sources, or "
+                "remove settings_dir if the filesystem grant was not intended.",
+                agent.name,
+                agent.settings_dir,
+            )
+
         sdk_tools, permission_mode = self._resolve_tool_config(
             tools,
             agent,
