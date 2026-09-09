@@ -1242,13 +1242,19 @@ class ConsoleEventSubscriber:
                 messages_after = d.get("messages_after", 0)
                 elapsed = d.get("elapsed", 0.0)
                 degraded_tiers = d.get("degraded_tiers") or []
+                degraded_estimators = d.get("degraded_estimators") or []
                 still_over_trigger = d.get("still_over_trigger", False)
-                if degraded_tiers or still_over_trigger:
+                still_over_window = d.get("still_over_window", False)
+                if degraded_tiers or degraded_estimators or still_over_trigger or still_over_window:
                     reasons: list[str] = []
                     if degraded_tiers:
                         reasons.append(f"tier(s) degraded: {', '.join(degraded_tiers)}")
+                    if degraded_estimators:
+                        reasons.append(f"estimator(s) degraded: {', '.join(degraded_estimators)}")
                     if still_over_trigger:
                         reasons.append("history remains above the trigger")
+                    if still_over_window:
+                        reasons.append("history remains above the known context window")
                     verbose_log(
                         styled(
                             "  WARNING: context compacted for '[bold]{}[/bold]': "
@@ -1276,6 +1282,17 @@ class ConsoleEventSubscriber:
                             elapsed,
                         )
                     )
+
+        elif t == "agent_compaction_skipped":
+            verbose_log(
+                styled(
+                    "  WARNING: compaction skipped for '[bold]{}[/bold]' ({}) — "
+                    "context size could not be measured for this request",
+                    d.get("agent_name", "?"),
+                    d.get("reason", "unknown"),
+                ),
+                style="yellow",
+            )
 
         elif t == "guidance_received":
             pending = d.get("pending", 1)

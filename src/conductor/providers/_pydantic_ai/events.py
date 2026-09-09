@@ -359,11 +359,20 @@ def emit_compaction_start(
     target_tokens: int,
     messages_before: int,
     tokens_before: int,
+    trigger_reason: str = "trigger",
+    density_tokens: int | None = None,
 ) -> None:
     """Emit an ``agent_compaction_start`` event, swallowing callback errors.
 
-    This event fires immediately before compaction begins on a request whose
-    estimated context size is above the trigger threshold.
+    This event fires immediately before compaction begins. ``trigger_reason``
+    names the gate that fired: ``"trigger"`` when the primary token estimate
+    exceeded the reserve-based trigger threshold, or ``"window_guard"`` when
+    the density-calibrated safety estimate reached the known context window
+    (which can happen well below the trigger on token-dense content).
+    ``tokens_before`` is always the primary-scale token estimate; the
+    density-calibrated value that fired the window guard is reported
+    separately as ``density_tokens`` (``None`` when that measurement was
+    unavailable).
     """
     if event_callback is None:
         return
@@ -383,6 +392,8 @@ def emit_compaction_start(
                 "target_tokens": target_tokens,
                 "messages_before": messages_before,
                 "tokens_before": tokens_before,
+                "trigger_reason": trigger_reason,
+                "density_tokens": density_tokens,
             },
         )
     except Exception:
@@ -404,6 +415,8 @@ def emit_compaction_complete(
     elapsed: float,
     degraded_tiers: list[str],
     still_over_trigger: bool,
+    degraded_estimators: list[str] | None = None,
+    still_over_window: bool = False,
 ) -> None:
     """Emit a success-shaped ``agent_compaction_complete`` event.
 
@@ -413,6 +426,13 @@ def emit_compaction_complete(
     ``still_over_trigger`` reports that the post-compaction estimate remains
     above the trigger, so consumers can distinguish a full success from a
     degraded outcome instead of reading both as false success.
+    ``degraded_estimators`` names the measurements that were lost before
+    compaction ran — ``"primary"`` when the token gate fell back to the
+    density-calibrated estimate, ``"density"`` when the window guard was
+    disarmed for the request. ``still_over_window`` reports that a
+    window-guard compaction could not bring the density-calibrated estimate
+    back below the known context window — the request may still be rejected
+    by the provider.
     """
     if event_callback is None:
         return
@@ -435,6 +455,8 @@ def emit_compaction_complete(
                 "errored": False,
                 "degraded_tiers": degraded_tiers,
                 "still_over_trigger": still_over_trigger,
+                "degraded_estimators": degraded_estimators or [],
+                "still_over_window": still_over_window,
             },
         )
     except Exception:
@@ -483,3 +505,37 @@ def emit_compaction_complete_error(
         event_callback("agent_compaction_complete", payload)
     except Exception:
         logger.debug("Error in event_callback for agent_compaction_complete", exc_info=True)
+
+
+def emit_compaction_skipped(
+    event_callback: EventCallback | None,
+    *,
+    agent_name: str,
+    strategy: str,
+    model: str,
+    reason: str,
+) -> None:
+    """Emit an ``agent_compaction_skipped`` event, swallowing callback errors.
+
+    This event fires when compaction did not run for a reason other than the
+    gate staying below its thresholds — currently only
+    ``reason="estimate_unavailable"``, when both the primary and the fallback
+    context measurements failed. It exists so a silently skipped safety gate
+    is visible in the JSONL log and dashboard instead of being
+    indistinguishable from a request that simply needed no compaction.
+    """
+    if event_callback is None:
+        return
+
+    try:
+        event_callback(
+            "agent_compaction_skipped",
+            {
+                "agent_name": agent_name,
+                "strategy": strategy,
+                "model": model,
+                "reason": reason,
+            },
+        )
+    except Exception:
+        logger.debug("Error in event_callback for agent_compaction_skipped", exc_info=True)

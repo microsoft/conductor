@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.36...HEAD)
 
+### Fixed
+
+- **`openai`: retry transient errors delivered inside an SSE stream** (#506) —
+  the OpenAI SDK raises a bare `openai.APIError` (no HTTP status) for an
+  `error` object embedded in a stream, which pydantic-ai does not translate,
+  so a configured `retry:` policy was skipped and the run failed after the
+  first attempt. Now retried: OpenAI mid-stream 5xx (`server_error` /
+  `internal_server_error`), OpenAI rate limits (`type` `requests` / `tokens`
+  with code `rate_limit_exceeded`), Anthropic-shaped gateway errors proxied
+  unchanged (`rate_limit_error` / `overloaded_error` / `api_error`), and
+  stream errors with no parseable payload `type` (a non-object `error` value
+  from an Ollama/vLLM gateway, or an Azure-style `{"code": ...}` shape),
+  which are treated like broken streams. Still fatal: recognized client-side
+  payload types (e.g. `invalid_request_error`) and every HTTP 4xx. Errors a
+  narrowed `retry_on:` declines are now wrapped in `ProviderError` naming the
+  declined category instead of escaping as raw SDK exceptions, a declined
+  retry is logged at warning level (a taken one already was), and a fatal
+  bare `APIError`'s message now carries the payload `type`/`code` the SDK
+  leaves out of `str(e)`.
+
 ### Added
 
 - **Opt-in `runtime.provider.setting_sources` on `claude-agent-sdk`** (#501) —
@@ -28,6 +48,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
 
 ### Fixed
+
+- **Context compaction window guard against token-dense drift** (#507) — the
+  `claude` / `openai` providers' compaction trigger anchors on
+  provider-reported token usage and estimates everything after the anchor
+  with a ~4-characters-per-token heuristic, which undercounts token-dense
+  content (CJK and other non-Latin scripts, base64, hex, minified data) by
+  2-4x. A dense suffix could therefore grow the real request past a known
+  context window while the trigger estimate stayed below the threshold, and
+  the provider rejected the request with `context_length_exceeded`. A second,
+  density-calibrated estimate now guards the hard window: it matches the
+  primary heuristic on ordinary prose, counts text with a substantial
+  non-ASCII share at ~1 token per character, and whitespace-poor ASCII blobs
+  at ~2 characters per token, so it fires only on genuinely dense content —
+  never on a history that is merely large. When it fires, the tier chain is
+  driven directly against that measurement (the inner strategy's own gate
+  would re-measure with the same heuristic that under-counted the content
+  and no-op), until the estimate is back under the target. Telemetry stays on
+  the token scale: `agent_compaction_start` gains `trigger_reason`
+  (`"trigger"` / `"window_guard"`) and a separate `density_tokens` field
+  instead of overloading `tokens_before`, and `agent_compaction_complete`
+  gains `degraded_estimators` and `still_over_window` so a guard compaction
+  that could not get back under the window reads as degraded, not as false
+  success. A failed primary measurement falls back to an independent
+  density-calibrated estimate that shares no code with it, and a double
+  failure is reported as a new `agent_compaction_skipped` event
+  (`reason: "estimate_unavailable"`) rather than vanishing into stderr. See
+  [Workflow Syntax → Context Compaction](docs/workflow-syntax.md#context-compaction).
 
 - **A multi-line reply to a terminal dialog is now one turn** (#509) —
   dialog mode was the only free-text human-input surface that could not accept

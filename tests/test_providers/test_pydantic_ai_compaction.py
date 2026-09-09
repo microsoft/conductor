@@ -28,10 +28,14 @@ from conductor.config.schema import AgentDef
 from conductor.providers._pydantic_ai.agent_builder import build_agent
 from conductor.providers._pydantic_ai.compaction import (
     CompactionConfig,
+    _density_text_token_bound,
+    _estimate_context_tokens,
+    _estimate_context_tokens_density,
     _FailOpenCompactionWrapper,
     _TierWrapper,
     build_tiered_compaction,
 )
+from conductor.providers._pydantic_ai.compaction_window import resolve_compaction_plan
 
 
 @pytest.fixture(autouse=True)
@@ -330,6 +334,294 @@ class TestThresholdGating:
 
         assert result is request_context
         assert len(result.messages) == 1
+
+
+class TestKnownWindowSafety:
+    """Requirement: known context windows are hard pre-request boundaries."""
+
+    @pytest.mark.asyncio
+    async def test_token_dense_suffix_compacts_before_known_window_overflow(self) -> None:
+        # Requirement: provider usage plus token-dense suffix growth must compact
+        # before the next request can exceed the known context window — under the
+        # thresholds the production resolver actually produces.
+        events: list[tuple[str, dict[str, Any]]] = []
+        plan = resolve_compaction_plan(window=200_000, output_limit=64_000, tool_buffer=15_000)
+        assert plan.enabled and plan.trigger_tokens is not None and plan.target_tokens is not None
+        cfg = _make_config(
+            trigger_tokens=plan.trigger_tokens,
+            target_tokens=plan.target_tokens,
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        capability = build_tiered_compaction(cfg)
+        # CJK text tokenizes near one token per character, so the primary
+        # ~4-chars-per-token heuristic undercounts the suffix by ~4x: the primary
+        # estimate stays below the trigger while the real request is past the
+        # known window.
+        messages: list[Any] = [
+            ModelResponse(
+                parts=[TextPart(content="compaction complete")],
+                usage=RequestUsage(input_tokens=74_499, output_tokens=0),
+            )
+        ]
+        for index in range(30):
+            messages.append(
+                ModelRequest(parts=[UserPromptPart(content=f"turn-{index}-" + "日本" * 2_098)])
+            )
+        request_context = _request_context_with_messages(messages)
+
+        from pydantic_ai.models import ModelRequestParameters
+
+        primary_before = await _estimate_context_tokens(messages, ModelRequestParameters())
+        density_before = await _estimate_context_tokens_density(messages, ModelRequestParameters())
+        # The scenario must isolate the window guard: primary below the trigger,
+        # density-calibrated estimate at or above the window.
+        assert primary_before <= plan.trigger_tokens < density_before
+        assert density_before >= cfg.window_tokens
+
+        result = await capability.before_model_request(_make_run_context(), request_context)
+
+        assert len(result.messages) < len(messages)
+        density_after = await _estimate_context_tokens_density(
+            list(result.messages), ModelRequestParameters()
+        )
+        assert density_after < cfg.window_tokens, (
+            "compaction must bring the density-calibrated estimate back under the known window"
+        )
+
+        start = [d for t, d in events if t == "agent_compaction_start"]
+        complete = [d for t, d in events if t == "agent_compaction_complete"]
+        assert len(start) == 1 and len(complete) == 1
+        assert start[0]["trigger_reason"] == "window_guard"
+        assert start[0]["density_tokens"] == density_before
+        # tokens_before stays on the primary token scale — the density value is
+        # a gate input, never token telemetry.
+        assert start[0]["tokens_before"] == primary_before
+        # The summarizing tier has no model in this harness, so it degrades and
+        # the sliding-window fallback produces the compacted history.
+        assert complete[0]["degraded_tiers"] == ["summarizing"]
+        assert complete[0]["degraded_estimators"] == []
+        assert complete[0]["still_over_window"] is False
+
+    @pytest.mark.asyncio
+    async def test_estimator_failure_uses_safe_fallback_before_large_request(self) -> None:
+        # Requirement: a failed primary estimate must not bypass compaction when an
+        # independent density-calibrated estimate shows the request can exceed the
+        # known window.
+        events: list[tuple[str, dict[str, Any]]] = []
+        inner = AsyncMock()
+        compacted = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="compacted")])]
+        )
+        inner.before_model_request = AsyncMock(return_value=compacted)
+        capability = _FailOpenCompactionWrapper(
+            inner,
+            config=_make_config(
+                trigger_tokens=121_000,
+                target_tokens=110_000,
+                event_callback=lambda t, d: events.append((t, d)),
+            ),
+        )
+        # A single token-dense message: the independent fallback measures ~1 token
+        # per CJK character and trips the window guard without the primary estimate.
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="日本" * 100_001)])]
+        )
+
+        with patch(
+            "conductor.providers._pydantic_ai.compaction._estimate_context_tokens",
+            new=AsyncMock(side_effect=RuntimeError("estimator exploded")),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)
+
+        inner.before_model_request.assert_called_once()
+        assert result is compacted
+        start = [d for t, d in events if t == "agent_compaction_start"]
+        complete = [d for t, d in events if t == "agent_compaction_complete"]
+        assert len(start) == 1 and len(complete) == 1
+        assert start[0]["trigger_reason"] == "window_guard"
+        assert start[0]["tokens_before"] == 200_002
+        assert complete[0]["degraded_estimators"] == ["primary"]
+
+    @pytest.mark.asyncio
+    async def test_shared_harness_failure_still_compacts_via_independent_fallback(self) -> None:
+        # Requirement: a failure inside the shared harness estimator must not take
+        # the fallback down with it — the independent estimate walks the messages
+        # directly, so a real estimator bug still compacts before a large request.
+        inner = AsyncMock()
+        compacted = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="compacted")])]
+        )
+        inner.before_model_request = AsyncMock(return_value=compacted)
+        capability = _FailOpenCompactionWrapper(
+            inner,
+            config=_make_config(trigger_tokens=121_000, target_tokens=110_000),
+        )
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="日本" * 100_001)])]
+        )
+
+        with patch(
+            "pydantic_ai_harness.compaction.estimate_context_tokens",
+            side_effect=RuntimeError("harness estimator bug"),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)
+
+        inner.before_model_request.assert_called_once()
+        assert result is compacted
+
+    @pytest.mark.asyncio
+    async def test_ordinary_prose_below_trigger_is_not_compacted(self) -> None:
+        # Requirement: ordinary prose well below the trigger must neither compact
+        # nor emit compaction events — the density-calibrated guard fires only on
+        # genuinely token-dense content, never on a history that is merely large.
+        events: list[tuple[str, dict[str, Any]]] = []
+        plan = resolve_compaction_plan(window=200_000, output_limit=64_000, tool_buffer=15_000)
+        assert plan.enabled and plan.trigger_tokens is not None and plan.target_tokens is not None
+        cfg = _make_config(
+            trigger_tokens=plan.trigger_tokens,
+            target_tokens=plan.target_tokens,
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        capability = build_tiered_compaction(cfg)
+        prose = "The quick brown fox jumps over the lazy dog and then writes a "
+        messages = [
+            ModelRequest(parts=[UserPromptPart(content=(prose * 70)[:4_000])]) for _ in range(50)
+        ]  # 200,000 characters ~= 50,000 real tokens
+        request_context = _request_context_with_messages(messages)
+
+        result = await capability.before_model_request(_make_run_context(), request_context)
+
+        assert len(result.messages) == len(messages)
+        assert not events
+
+    @pytest.mark.asyncio
+    async def test_window_guard_fires_at_exact_window_boundary(self) -> None:
+        # Requirement: the guard comparison is inclusive — a density estimate
+        # exactly equal to the known window must trip it.
+        events: list[tuple[str, dict[str, Any]]] = []
+        cfg = _make_config(
+            trigger_tokens=121_000,
+            target_tokens=110_000,
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        capability = build_tiered_compaction(cfg)
+        exact = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="日本" * 100_000)])]
+        )  # density estimate == window_tokens exactly
+
+        result = await capability.before_model_request(_make_run_context(), exact)
+
+        start = [d for t, d in events if t == "agent_compaction_start"]
+        assert len(start) == 1
+        assert start[0]["trigger_reason"] == "window_guard"
+        assert start[0]["density_tokens"] == 200_000
+        assert len(result.messages) <= 1
+
+        events.clear()
+        below = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="日" * 199_999)])]
+        )
+        result_below = await capability.before_model_request(_make_run_context(), below)
+        assert len(result_below.messages) == 1
+        assert not events
+
+
+class TestDensityTextTokenBound:
+    """Requirement: the density bound escalates only for genuinely dense text."""
+
+    def test_cjk_text_counts_one_token_per_character(self) -> None:
+        # CJK tokenizes near one token per character, which the ~4-chars-per-token
+        # heuristic undercounts by ~4x — the case the window guard exists for.
+        assert _density_text_token_bound("日本語" * 1_000) == 3_000
+
+    def test_whitespace_poor_ascii_counts_two_chars_per_token(self) -> None:
+        # base64/hex/minified blobs tokenize near 1.5-2 characters per token.
+        assert _density_text_token_bound("a" * 10_000) == 5_001
+
+    def test_ordinary_prose_matches_primary_heuristic(self) -> None:
+        # Ordinary text must not be escalated: the bound stays the chars/4
+        # heuristic so the guard never fires on a history that is merely large.
+        prose = "The quick brown fox jumps over the lazy dog and then writes a "
+        assert _density_text_token_bound(prose * 70) == len(prose * 70) // 4
+
+    def test_empty_text_is_zero(self) -> None:
+        assert _density_text_token_bound("") == 0
+
+    @pytest.mark.asyncio
+    async def test_density_estimate_counts_cjk_characters_not_heuristic(self) -> None:
+        # The harness-anchored density estimate must apply the density bound to
+        # message text, not the ~4-chars heuristic.
+        from pydantic_ai.models import ModelRequestParameters
+
+        messages = [ModelRequest(parts=[UserPromptPart(content="日本語" * 1_000)])]
+        assert await _estimate_context_tokens_density(messages, ModelRequestParameters()) == 3_000
+
+
+class TestEstimatorFailureBranches:
+    """Requirement: estimator degradations are visible and never latch."""
+
+    @pytest.mark.asyncio
+    async def test_double_estimator_failure_emits_skipped_event_without_latch(self) -> None:
+        # Requirement: when both the primary and the fallback measurement fail,
+        # the request context is returned unchanged with an
+        # agent_compaction_skipped event and the disable latch stays off.
+        events: list[tuple[str, dict[str, Any]]] = []
+        cfg = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        capability = build_tiered_compaction(cfg)
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="x" * 80_000)])]
+        )
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.compaction._estimate_context_tokens",
+                new=AsyncMock(side_effect=RuntimeError("primary exploded")),
+            ),
+            patch(
+                "conductor.providers._pydantic_ai.compaction._estimate_context_tokens_independent",
+                new=AsyncMock(side_effect=RuntimeError("fallback exploded")),
+            ),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)
+
+        assert result is request_context
+        assert capability._disabled is False  # type: ignore[attr-defined]
+        assert [t for t, _ in events] == ["agent_compaction_skipped"]
+        assert events[0][1]["reason"] == "estimate_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_density_failure_compacts_on_primary_and_reports_degradation(self) -> None:
+        # Requirement: when the density-calibrated measurement fails but the
+        # primary succeeds, compaction proceeds on the primary alone, the
+        # complete event names the lost measurement in degraded_estimators,
+        # and the latch stays off.
+        events: list[tuple[str, dict[str, Any]]] = []
+        cfg = _make_config(
+            trigger_tokens=10,
+            target_tokens=5,
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        capability = build_tiered_compaction(cfg)
+        messages: list[Any] = []
+        for i in range(40):
+            messages.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
+        request_context = _request_context_with_messages(messages)
+        with patch(
+            "conductor.providers._pydantic_ai.compaction._estimate_context_tokens_density",
+            new=AsyncMock(side_effect=RuntimeError("density exploded")),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)
+
+        assert len(result.messages) < len(messages)
+        complete = [d for t, d in events if t == "agent_compaction_complete"]
+        assert len(complete) == 1
+        assert complete[0]["errored"] is False
+        assert complete[0]["degraded_estimators"] == ["density"]
+        assert capability._disabled is False  # type: ignore[attr-defined]
 
 
 class TestTierFallback:
@@ -697,6 +989,8 @@ class TestEventEmission:
             "target_tokens",
             "messages_before",
             "tokens_before",
+            "trigger_reason",
+            "density_tokens",
         }
         assert set(start.keys()) == expected_start_keys
         assert start["agent_name"] == cfg.agent_name
@@ -710,6 +1004,9 @@ class TestEventEmission:
         assert start["target_tokens"] == cfg.target_tokens
         assert start["messages_before"] == len(messages)
         assert start["tokens_before"] > cfg.trigger_tokens
+        assert start["trigger_reason"] == "trigger"
+        assert isinstance(start["density_tokens"], int)
+        assert start["density_tokens"] < cfg.window_tokens
 
         complete = events[types.index("agent_compaction_complete")][1]
         expected_complete_keys = {
@@ -727,12 +1024,16 @@ class TestEventEmission:
             "errored",
             "degraded_tiers",
             "still_over_trigger",
+            "degraded_estimators",
+            "still_over_window",
         }
         assert set(complete.keys()) == expected_complete_keys
         assert complete["errored"] is False
         # The summarizing tier has no model outside a real run, so it degrades
         # and the sliding-window fallback produces the compacted history.
         assert complete["degraded_tiers"] == ["summarizing"]
+        assert complete["degraded_estimators"] == []
+        assert complete["still_over_window"] is False
         assert complete["agent_name"] == cfg.agent_name
         assert complete["strategy"] == "tiered"
         assert complete["model"] == cfg.model_name
@@ -920,9 +1221,9 @@ class TestEventEmission:
         assert any(e[0] == "agent_compaction_complete" for e in events)
 
     @pytest.mark.asyncio
-    async def test_gate_measurement_failure_skips_without_latch_or_event(self) -> None:
-        # A failing gate estimate warns, returns the
-        # original context, emits no event, and does not engage the latch.
+    async def test_gate_measurement_failure_uses_fallback_without_latch(self) -> None:
+        # Requirement: a failed primary estimate uses the density-calibrated
+        # fallback without disabling compaction for later requests.
         events: list[tuple[str, dict[str, Any]]] = []
 
         def callback(event_type: str, data: dict[str, Any]) -> None:
@@ -942,7 +1243,18 @@ class TestEventEmission:
 
         assert result is request_context
         assert capability._disabled is False  # type: ignore[attr-defined]
-        assert not events
+        assert [event_type for event_type, _ in events] == [
+            "agent_compaction_start",
+            "agent_compaction_complete",
+        ]
+        start = events[0][1]
+        complete = events[1][1]
+        # The whitespace-poor payload measures ~2 chars/token under the density
+        # bound, which drives the trigger when the primary estimate is lost.
+        assert start["tokens_before"] == 40_001
+        assert start["density_tokens"] == 40_001
+        assert start["trigger_reason"] == "trigger"
+        assert complete["degraded_estimators"] == ["primary"]
 
     @pytest.mark.asyncio
     async def test_telemetry_failure_keeps_compacted_result_without_latch(self) -> None:

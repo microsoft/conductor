@@ -30,6 +30,6 @@
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0",
     "vite": "^8.0.16",
-    "vitest": "^3.0.0"
+    "vitest": "^5.0.0"
   }
 }

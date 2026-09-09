@@ -2426,6 +2426,14 @@ Below is how these values resolve in practice for different configurations using
 
 When the reserve (output limit plus effective tool buffer) leaves no viable headroom below the window, compaction is disabled for the agent execution rather than armed with a degenerate threshold. The `agent_compaction_config` event then carries `enabled: false` and a `disabled_reason`, so the condition is visible per run instead of surfacing as a one-shot log warning. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`.
 
+#### Window Guard Against Token-Dense Content
+
+The trigger is measured by the primary estimator: the provider's reported token usage for the history up to the most recent response, plus a ~4-characters-per-token heuristic for everything after it. That heuristic undercounts token-dense content — CJK and other non-Latin scripts, base64, hex, or minified data — by 2-4x, so a dense suffix can grow the real request past the known context window while the trigger estimate stays below the threshold.
+
+A second, density-calibrated estimate guards the hard window. It matches the primary heuristic on ordinary prose, counts text with a substantial non-ASCII share at ~1 token per character, and whitespace-poor ASCII blobs at ~2 characters per token. When that estimate reaches the known window, compaction runs even if the trigger never fired, and the tier chain is driven against the density-calibrated measurement until the history fits the target. Because the two estimates agree on ordinary text, the guard never compacts a history that is merely large.
+
+The start event reports which gate fired via `trigger_reason` (`"trigger"` or `"window_guard"`) and carries the density-calibrated value separately as `density_tokens`; `tokens_before` always stays the primary token estimate.
+
 ### Compaction Tiers
 
 Conductor uses three sequential tiers to compress the history down to the target:
@@ -2463,12 +2471,13 @@ All tokens consumed by summarizing compaction are added to the workflow's total 
 
 ### Observability and Events
 
-Compaction operates in a fail-open manner. If an error occurs during compaction, Conductor logs a warning, disables compaction for the rest of that agent's execution, and continues with the uncompacted history.
+Compaction operates in a fail-open manner. If an error occurs during compaction, Conductor logs a warning, disables compaction for the rest of that agent's execution, and continues with the uncompacted history. A failed context measurement never disables anything: the primary estimate falls back to an independent density-calibrated one, and only when both fail is compaction skipped for that request alone, reported as `agent_compaction_skipped` with `reason: "estimate_unavailable"`.
 
-Conductor emits three event types to track compaction:
+Conductor emits four event types to track compaction:
 *   `agent_compaction_config`: Emitted once at the start of agent execution to log resolved window and limit values.
-*   `agent_compaction_start`: Emitted when context size exceeds the trigger threshold and compaction begins.
-*   `agent_compaction_complete`: Emitted when compaction completes, detailing token savings or errors.
+*   `agent_compaction_start`: Emitted when compaction begins. `trigger_reason` names the gate that fired (`"trigger"` or `"window_guard"`), and `density_tokens` carries the density-calibrated estimate alongside the primary-scale `tokens_before`.
+*   `agent_compaction_complete`: Emitted when compaction completes, detailing token savings or errors. Degraded outcomes are named rather than hidden: `degraded_tiers` for recovered tier failures, `degraded_estimators` for lost measurements, `still_over_trigger` when the history remains above the trigger, and `still_over_window` when a window-guard compaction could not get back below the known window.
+*   `agent_compaction_skipped`: Emitted when compaction did not run because the context size could not be measured at all.
 
 ### Dashboard Caveat
 

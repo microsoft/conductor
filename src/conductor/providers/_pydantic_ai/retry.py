@@ -9,20 +9,31 @@ plain-text answers to a tool-output schema must be recovered in-session before
 Conductor retries the whole call.
 
 pydantic-ai translates the Anthropic SDK's own exceptions before Conductor
-ever sees them — a private helper (``_map_api_errors`` in pydantic-ai 2.x;
-written inline in ``AnthropicModel`` at the 1.44.0 floor pinned in
-pyproject.toml, with identical resulting behavior) wraps the SDK call: an
-HTTP error response (``APIStatusError``, including ``RateLimitError``)
-becomes ``ModelHTTPError``, and a transport failure (``APIConnectionError``,
-including ``APITimeoutError``) becomes a bare ``ModelAPIError``. Those are
-the exception types actually observed on this path, not the SDK's own
+ever sees them — a private helper (``_map_api_errors`` in
+``pydantic_ai.models.anthropic``) wraps the SDK call: an HTTP error response
+(``APIStatusError``, including ``RateLimitError``) becomes ``ModelHTTPError``,
+and a transport failure (``APIConnectionError``, including
+``APITimeoutError``) becomes a bare ``ModelAPIError``. Those are the
+exception types actually observed on the Anthropic path, not the SDK's own
 classes, so ``_is_retryable_error`` and ``_get_retry_after`` classify those
-translated types directly (issue #454). Only the public ``ModelHTTPError``/
-``ModelAPIError`` types are relied on at runtime, so a change to the private
-translator degrades this comment, not the code. The translation also drops
-the original response headers, so a server's ``retry-after`` value is only
+translated types directly (issue #454). The translation also drops the
+original response headers, so a server's ``retry-after`` value is only
 recoverable through ``__cause__``, which the translator sets to the
 untranslated SDK exception via ``from e``.
+
+The OpenAI path is translated by the same-named ``_map_api_errors`` in
+``pydantic_ai.models.openai``, which catches only ``APIStatusError``
+(-> ``ModelHTTPError``) and ``APIConnectionError`` (-> ``ModelAPIError``).
+It deliberately does not catch the bare ``openai.APIError`` that
+``openai/_streaming.py`` raises for an ``error`` object embedded in an SSE
+body, so that one SDK class does reach Conductor untranslated and is
+classified directly in ``_is_retryable_error``. If pydantic-ai widens that
+``except`` clause, the branch goes dead and mid-stream errors arrive as
+``ModelAPIError`` — which is unconditionally retryable, reversing the fatal
+classification for client-side payload types. A canary test
+(``test_pydantic_ai_does_not_translate_bare_openai_api_error``) pins the
+upstream behavior so that change fails loudly instead of silently
+re-classifying errors.
 """
 
 from __future__ import annotations
@@ -142,9 +153,12 @@ def _is_retryable_error(exception: Exception) -> bool:
 
     Extended to classify the ``ModelHTTPError``/``ModelAPIError`` types
     pydantic-ai actually raises on this path (see the module docstring;
-    issue #454). The SDK-class-name and ``anthropic.APIStatusError``
-    fallback below is unreachable in production but kept intentionally —
-    see the comment at its definition.
+    issue #454), plus the bare ``openai.APIError`` the OpenAI SDK raises for
+    an error object embedded in an SSE body, which pydantic-ai does **not**
+    translate and which is therefore reachable in production. The
+    SDK-class-name and ``anthropic.APIStatusError`` fallback below remains
+    unreachable in production but is kept intentionally — see the comment
+    at its definition.
     """
     if isinstance(exception, ProviderError):
         return exception.is_retryable
@@ -168,6 +182,47 @@ def _is_retryable_error(exception: Exception) -> bool:
     # may not be a transient condition.
     if type(exception) is ModelAPIError:
         return True
+
+    # The OpenAI SDK raises a bare APIError for an error object embedded in
+    # an SSE body after the response has started (openai/_streaming.py).
+    # Unlike the HTTP APIStatusError subclasses, that exception carries no
+    # status code — only the payload's free-form `type`/`code` passthroughs
+    # (no SDK enum backs them), so the retryable vocabulary is spelled out
+    # here with its sources:
+    #   - "server_error" / "internal_server_error": OpenAI mid-stream 5xx
+    #   - "requests" / "tokens" + code "rate_limit_exceeded": an OpenAI 429
+    #     (see the code literals in openai/types/beta/threads/run.py)
+    #   - "rate_limit_error" / "overloaded_error" / "api_error":
+    #     Anthropic-shaped gateways (e.g. LiteLLM) proxying that vocabulary
+    #     unchanged onto OpenAI-compatible endpoints
+    # An exact-type check, not isinstance: APIStatusError subclasses (e.g.
+    # BadRequestError) must keep their status-based classification below.
+    if openai is not None and type(exception) is openai.APIError:
+        payload_type = getattr(exception, "type", None)
+        payload_code = getattr(exception, "code", None)
+        if payload_type is None:
+            # A mid-stream error whose payload carries no `type` — a
+            # non-object `error` value ("upstream overloaded" from an
+            # Ollama/vLLM gateway) or a shape like Azure's {"code": "429"} —
+            # is indistinguishable from a broken stream, and by the time a
+            # stream has started, auth and request validation have already
+            # passed. Treat it like the transport failures above rather
+            # than burning the run.
+            return True
+        retryable_markers = {
+            "server_error",
+            "internal_server_error",
+            "requests",
+            "tokens",
+            "rate_limit_exceeded",
+            "rate_limit_error",
+            "overloaded_error",
+            "api_error",
+        }
+        # `in` is type-agnostic: the SDK does not coerce, so a payload like
+        # {"type": 500} arrives as an int, simply misses the set, and stays
+        # fatal (unknown marker) rather than crashing the comparison.
+        return payload_type in retryable_markers or payload_code in retryable_markers
 
     error_type_name = type(exception).__name__
 
@@ -313,6 +368,30 @@ def _get_retry_after(exception: Exception) -> float | None:
     return None
 
 
+def _describe_stream_error(exception: BaseException | None) -> str:
+    """Render an exception for an error message, adding payload details for a
+    bare ``openai.APIError``.
+
+    ``str()`` of a bare ``APIError`` carries only the message — not the
+    payload ``type``/``code``, and not the body when a gateway sent a
+    non-object ``error`` value — and the SDK substitutes the generic "An
+    error occurred during streaming" when the payload has no usable message,
+    so an unenriched failure is undiagnosable.
+    """
+    if exception is None or openai is None or type(exception) is not openai.APIError:
+        return str(exception)
+    details: list[str] = []
+    if exception.type is not None:
+        details.append(f"type={exception.type!r}")
+    if exception.code is not None:
+        details.append(f"code={exception.code!r}")
+    if exception.body is not None and not isinstance(exception.body, dict):
+        details.append(f"body={repr(exception.body)[:200]}")
+    if not details:
+        return str(exception)
+    return f"{exception} ({', '.join(details)})"
+
+
 def _extract_status_code(exception: Exception) -> int | None:
     """Extract HTTP status code from exception if available.
 
@@ -442,16 +521,29 @@ async def execute_with_retry[T](
             )
 
             if not is_retryable:
+                # Asymmetric with a retry *taken*, which logs a warning and
+                # emits agent_retry: a declined retry must also leave a
+                # trace. Conductor installs no logging handlers, so the
+                # debug line above never reaches an operator, and nothing
+                # would otherwise record that a retry policy existed and
+                # was declined.
+                logger.warning(
+                    "[No retry] %s classified non-retryable on attempt %s/%s: %s",
+                    type(e).__name__,
+                    attempt,
+                    retry_config.max_attempts,
+                    e,
+                )
                 status_code = _extract_status_code(e)
                 if status_code is not None:
                     raise ProviderError(
-                        f"Pydantic AI provider error: {e}",
+                        f"Pydantic AI provider error: {_describe_stream_error(e)}",
                         suggestion="Check API key, model name, and request parameters",
                         status_code=status_code,
                         is_retryable=False,
                     ) from e
                 raise ProviderError(
-                    f"Pydantic AI call failed: {e}",
+                    f"Pydantic AI call failed: {_describe_stream_error(e)}",
                     suggestion="Check API key, model name, and request parameters",
                     is_retryable=False,
                 ) from e
@@ -459,7 +551,20 @@ async def execute_with_retry[T](
             if retry_config.retry_on is not None:
                 error_category = _classify_error(e)
                 if error_category not in retry_config.retry_on:
-                    raise
+                    # A retry policy was configured and declined this error.
+                    # Keep the ProviderError contract: a bare `raise` here
+                    # would let a raw SDK exception (e.g. a mid-stream
+                    # openai.APIError) escape past callers that catch
+                    # ProviderError.
+                    raise ProviderError(
+                        f"Pydantic AI call failed: {_describe_stream_error(e)}",
+                        suggestion=(
+                            f"Error category {error_category!r} is not in retry_on="
+                            f"{retry_config.retry_on}; widen retry_on to retry it."
+                        ),
+                        status_code=_extract_status_code(e),
+                        is_retryable=False,
+                    ) from e
 
             if attempt >= retry_config.max_attempts:
                 break
@@ -541,7 +646,8 @@ async def execute_with_retry[T](
         suggestion = f"Check API connectivity and rate limits. Last error: {last_error}"
 
     raise ProviderError(
-        f"Pydantic AI call failed after {retry_config.max_attempts} attempts: {last_error}",
+        f"Pydantic AI call failed after {retry_config.max_attempts} attempts: "
+        f"{_describe_stream_error(last_error)}",
         suggestion=suggestion,
         is_retryable=False,
     ) from last_error
