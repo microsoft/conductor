@@ -4616,6 +4616,160 @@ class TestSettingsDirObservability:
         assert started and "settings_dir" in started[0]
         assert started[0]["settings_dir"] is None
 
+    @staticmethod
+    def _parallel_config(dir_a: Path, dir_b: Path) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-ev-parallel",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="member_a",
+                    model="gpt-4",
+                    prompt="A",
+                    settings_dir=str(dir_a),
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="member_b",
+                    model="gpt-4",
+                    prompt="B",
+                    settings_dir=str(dir_b) if dir_b else None,
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="fan",
+                    agents=["member_a", "member_b"],
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+            output={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_started_carries_settings_dir(self, tmp_path: Path) -> None:
+        """The parallel fan-out path, which the linear test cannot see.
+
+        Resolution and emission are different code paths: deleting the field
+        from this payload leaves ``provider.execute`` receiving the right
+        directory, so ``TestSettingsDirInGroups`` stays green while the event
+        goes silent.
+        """
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            self._parallel_config(dir_a, dir_b),
+            _RecordingWorkingDirProvider(),
+            workflow_path=_workflow_file(tmp_path),
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "parallel_agent_started"]
+        assert {d["agent_name"]: d["settings_dir"] for d in started} == {
+            "member_a": os.path.normpath(str(dir_a)),
+            "member_b": os.path.normpath(str(dir_b)),
+        }, started
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_started_reports_none_when_unset(self, tmp_path: Path) -> None:
+        """Negative control, matching ``TestWorkingDirEvents``' own pattern."""
+        dir_a = tmp_path / "a"
+        dir_a.mkdir()
+        config = self._parallel_config(dir_a, None)  # type: ignore[arg-type]
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            config, _RecordingWorkingDirProvider(), workflow_path=_workflow_file(tmp_path)
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = {d["agent_name"]: d for t, d in events if t == "parallel_agent_started"}
+        assert started["member_b"]["settings_dir"] is None
+        assert started["member_a"]["settings_dir"] == os.path.normpath(str(dir_a))
+
+    @pytest.mark.asyncio
+    async def test_for_each_agent_started_carries_settings_dir_per_item(
+        self, tmp_path: Path
+    ) -> None:
+        """The for-each path, per iteration.
+
+        This is where a templated ``settings_dir`` most needs auditing: the
+        value varies per item, so an event omitting it makes the grant
+        unauditable exactly where it changes.
+        """
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-ev-for-each",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        settings_dir=str(tmp_path / "{{ repo }}"),
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        events: list[tuple[str, dict]] = []
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            content = {"repos": ["one", "two"]} if agent.name == "lister" else {"r": "ok"}
+            return AgentOutput(
+                content=content,
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider = _RecordingWorkingDirProvider()
+        provider.execute = _execute  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider, workflow_path=_workflow_file(tmp_path))
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "for_each_agent_started"]
+        assert sorted(d["settings_dir"] for d in started) == sorted(
+            [os.path.normpath(str(tmp_path / "one")), os.path.normpath(str(tmp_path / "two"))]
+        ), started
+
 
 class TestSettingsDirInGroups:
     """``settings_dir`` must resolve inside parallel groups and for-each loops.

@@ -3328,6 +3328,11 @@ class TestSettingsDirAddDirs:
             return captured["options"]
 
         def argv(options) -> list[str]:
+            # Deliberately local rather than reusing ``TestSkillsWiring._argv``:
+            # that is another class's private helper, and importing across test
+            # classes couples them. Both wrap the same three SDK calls; if the
+            # SDK's command builder moves, both fail together rather than one
+            # silently passing.
             transport = SubprocessCLITransport(prompt="hi", options=options)
             transport._cli_path = "/usr/bin/claude"
             return transport._build_command()

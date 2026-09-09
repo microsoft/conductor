@@ -626,8 +626,13 @@ class WorkflowEngine:
         # min_length -- an --input given as `repo=`, a script step that printed
         # nothing, a `set` binding evaluating to "". Path("") is Path("."), which
         # is not absolute, so it would join onto the workflow file's own directory
-        # and pass the is_dir() check below. For settings_dir that silently grants
-        # the model file access to the workflow's own tree, so refuse it here.
+        # and pass the is_dir() check below: a value meaning "nothing" silently
+        # becoming somewhere real.
+        #
+        # Refused for BOTH fields, deliberately. settings_dir is the dangerous
+        # one -- there the workflow's own tree would be handed to the model's
+        # file tools -- but working_dir running an agent in the wrong directory
+        # is the same defect without the grant, so neither is worth keeping.
         if not rendered.strip():
             raise ExecutionError(
                 f"Agent '{agent.name}': {field} rendered to an empty string from '{raw}'",
