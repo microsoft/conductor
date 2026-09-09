@@ -3397,7 +3397,7 @@ class TestSettingsDirAddDirs:
         assert bool(hits) is expect_warning, [r.message for r in caplog.records]
 
     @pytest.mark.asyncio
-    async def test_the_tier_warning_is_latched_per_directory(
+    async def test_the_tier_warning_is_latched_per_directory_and_cause(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Once per directory, and specifically once across a for_each.
@@ -3408,7 +3408,9 @@ class TestSettingsDirAddDirs:
         so a name-keyed latch emits one line per item -- the exact case
         latching exists to prevent. Not a bare flag either: a second agent
         naming a *different* directory must still be reported, since naming
-        the directory is the point of the warning.
+        the directory is the point of the warning. The key is additionally
+        paired with the cause, since the remedy depends on it -- see
+        :meth:`test_two_causes_on_one_directory_both_warn`.
         """
         target = tmp_path / "repo"
         other = tmp_path / "other"
@@ -3528,14 +3530,21 @@ class TestSettingsDirAddDirs:
     async def test_the_no_tier_remedy_does_not_prescribe_a_rejected_edit(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """An agent overriding its provider cannot enable the tier at all.
+        """The no-tier arm must not prescribe an edit the schema would reject.
 
-        ``providers/registry.py`` forwards structured settings only to the
-        matching provider, so an agent overriding to ``claude-agent-sdk``
-        under a different ``runtime.provider`` reaches the provider with no
-        ``setting_sources``. The schema rejects ``setting_sources`` unless
-        ``runtime.provider`` is itself ``claude-agent-sdk``, so the remedy
-        must not tell that author to just add it -- it names the requirement.
+        This arm serves two of ``config/validator.py``'s causes at once: a
+        missing tier, and a per-agent ``provider: claude-agent-sdk`` override
+        under a different ``runtime.provider``, where ``factory.py`` forwards
+        no ``setting_sources`` and the schema would then reject adding it.
+
+        The provider cannot tell those two apart -- it never receives the
+        workflow-level provider name, only ``setting_sources`` -- which is
+        why one shared arm is the right design and why this test can pin
+        only the wording that is true of both. The override path itself is
+        covered at validate time, where the config *is* visible:
+        ``test_config/test_settings_dir_schema.py::
+        TestProjectTierWarningCauses::
+        test_provider_override_does_not_advise_the_impossible``.
         """
         target = tmp_path / "repo"
         target.mkdir()

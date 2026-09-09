@@ -471,9 +471,11 @@ Measured against the CLI:
 > maps to the SDK's `add_dirs`, whose own contract is *"additional directories
 > Claude can access beyond the current working directory"* — so naming a
 > directory here widens the model's built-in file tools to that tree whether or
-> not any settings tier is enabled. Measured at `permission_mode: "default"`
-> with `setting_sources` unset: a read outside cwd is refused without
-> `settings_dir` and succeeds with it. Note an agent that omits `tools:` runs
+> not any settings tier is enabled. Measured against `claude` CLI 2.1.263 at
+> `permission_mode: "default"` with `setting_sources` unset: a read outside
+> cwd is refused without `settings_dir` and succeeds with it. (Later CLI
+> builds no longer accept that mode by name; Conductor never passes it
+> explicitly, so the reproduction needs the version above.) Note an agent that omits `tools:` runs
 > under `bypassPermissions`, where reads already succeed everywhere, so the
 > grant only becomes observable once permissions are in play.
 >
