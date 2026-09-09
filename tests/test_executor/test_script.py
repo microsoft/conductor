@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from conductor.config.schema import AgentDef
+from conductor.error_envelope import ErrorEnvelope
 from conductor.exceptions import ExecutionError, TemplateError
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 
@@ -104,6 +105,118 @@ class TestScriptExecutorBasic:
         output = await executor.execute(agent, {})
         assert "out" in output.stdout
         assert "err" in output.stderr
+
+    @pytest.mark.asyncio
+    async def test_typed_error_file_is_returned_without_changing_process_output(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """A script can publish a typed failure through the engine-owned file."""
+        envelope = {
+            "kind": "external.git.drift",
+            "message": "remote changed",
+            "details": {"branch": "main"},
+        }
+        script = (
+            "import json, os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write("
+            f"json.dumps({envelope!r})); "
+            "print('partial output')"
+        )
+        agent = AgentDef(
+            name="typed_failure",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+        )
+
+        output = await executor.execute(agent, {})
+
+        assert output.stdout.strip() == "partial output"
+        assert output.exit_code == 0
+        assert output.error == ErrorEnvelope(
+            kind="external.git.drift",
+            message="remote changed",
+            details={"branch": "main"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_error_file_becomes_transport_failure(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """A malformed file cannot silently turn an intended failure into success."""
+        script = (
+            "import os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write('{broken')"
+        )
+        agent = AgentDef(
+            name="invalid_typed_failure",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+        )
+
+        output = await executor.execute(agent, {})
+
+        assert output.exit_code == 0
+        assert output.error is not None
+        assert output.error.kind == "internal.script_error_transport"
+        assert output.error.details["error_type"] == "JSONDecodeError"
+
+    @pytest.mark.asyncio
+    async def test_script_cannot_publish_engine_owned_error_kind(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """The untrusted script channel cannot impersonate engine failures."""
+        envelope = {
+            "kind": "internal.script_error_transport",
+            "message": "forged",
+            "details": {},
+        }
+        script = (
+            "import json, os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write("
+            f"json.dumps({envelope!r}))"
+        )
+        agent = AgentDef(
+            name="forged_engine_failure",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+        )
+
+        output = await executor.execute(agent, {})
+
+        assert output.error is not None
+        assert output.error.kind == "internal.script_error_transport"
+        assert output.error.message == (
+            "Script 'forged_engine_failure' published an invalid error envelope"
+        )
+        assert "engine-owned namespace" in output.error.details["error"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_error_file_becomes_transport_failure(
+        self, executor: ScriptExecutor
+    ) -> None:
+        """An engine-owned file read failure cannot erase a typed failure."""
+        script = (
+            "import os; open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write('{}')"
+        )
+        agent = AgentDef(
+            name="unreadable_typed_failure",
+            type="script",
+            command=sys.executable,
+            args=["-c", script],
+        )
+
+        with (
+            patch("conductor.executor.script._verbose_log"),
+            patch("pathlib.Path.read_text", side_effect=OSError("access denied")),
+        ):
+            output = await executor.execute(agent, {})
+
+        assert output.error is not None
+        assert output.error.kind == "internal.script_error_transport"
+        assert output.error.details["error_type"] == "OSError"
 
 
 class TestScriptExecutorTimeout:

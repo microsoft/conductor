@@ -16,6 +16,7 @@ Tests cover:
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,9 +32,15 @@ from conductor.config.schema import (
     WorkflowConfig,
     WorkflowDef,
 )
+from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ConfigurationError, ValidationError
+from conductor.exceptions import (
+    ConfigurationError,
+    ExecutionError,
+    UnhandledNodeError,
+    ValidationError,
+)
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -253,6 +260,213 @@ class TestScriptRouting:
         result = await engine.run({})
 
         assert result["path"] == "ran success_handler"
+
+    @pytest.mark.asyncio
+    async def test_typed_script_failure_routes_with_error_context(self) -> None:
+        """A typed failure selects error routes and is visible to its handler."""
+        script = (
+            "import json, os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write("
+            "json.dumps({'kind': 'external.git.drift', "
+            "'message': 'remote changed', 'details': {'branch': 'main'}})); "
+            "print('partial')"
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="typed-script-route",
+                entry_point="checker",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="checker",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", script],
+                    output={"result": OutputField(type="string")},
+                    routes=[
+                        RouteDef(to="success_handler"),
+                        RouteDef(to="recovery", on_error="external.git.drift"),
+                    ],
+                ),
+                AgentDef(
+                    name="success_handler",
+                    prompt="Unexpected success",
+                    routes=[RouteDef(to="$end")],
+                ),
+                AgentDef(
+                    name="recovery",
+                    prompt=(
+                        "Recover {{ checker.error.kind }}: "
+                        "{{ checker.error.message }} / {{ checker.output.stdout }}"
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"path": "{{ recovery.output.result }}"},
+        )
+        received_prompts: list[str] = []
+
+        def mock_handler(agent, prompt, context):
+            received_prompts.append(prompt)
+            return {"result": f"ran {agent.name}"}
+
+        engine = WorkflowEngine(config, CopilotProvider(mock_handler=mock_handler))
+
+        result = await engine.run({})
+
+        assert result["path"] == "ran recovery"
+        assert [prompt.strip() for prompt in received_prompts] == [
+            "Recover external.git.drift: remote changed / partial"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unhandled_typed_failure_checkpoints_before_state_commit(
+        self, tmp_path: Path
+    ) -> None:
+        """An unhandled failure checkpoints the failing step for replay."""
+        script = (
+            "import json, os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write("
+            "json.dumps({'kind': 'external.git.drift', "
+            "'message': 'remote changed', 'details': {}}))"
+        )
+        workflow_path = tmp_path / "workflow.yaml"
+        workflow_path.write_text("workflow: {}", encoding="utf-8")
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="typed-script-unhandled",
+                entry_point="checker",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="checker",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", script],
+                )
+            ],
+        )
+        provider = MagicMock()
+        provider.get_session_ids.return_value = {}
+        engine = WorkflowEngine(config, provider, workflow_path=workflow_path)
+
+        with pytest.raises(UnhandledNodeError) as raised:
+            await engine.run({})
+
+        assert raised.value.error.kind == "external.git.drift"
+        assert "checker" not in engine.context.agent_outputs
+        assert engine.limits.current_iteration == 0
+        assert engine._last_checkpoint_path is not None
+
+    @pytest.mark.asyncio
+    async def test_handler_failure_checkpoint_includes_routed_error_context(
+        self, tmp_path: Path
+    ) -> None:
+        """A later handler failure checkpoints the handler and prior envelope."""
+        script = (
+            "import json, os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write("
+            "json.dumps({'kind': 'external.git.drift', "
+            "'message': 'remote changed', 'details': {'branch': 'main'}})); "
+            "print('partial')"
+        )
+        workflow_path = tmp_path / "workflow.yaml"
+        workflow_path.write_text("workflow: {}", encoding="utf-8")
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="typed-script-handler-failure",
+                entry_point="checker",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="checker",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", script],
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="recovery", on_error="external.git.drift"),
+                    ],
+                ),
+                AgentDef(
+                    name="recovery",
+                    type="script",
+                    command="definitely-not-a-real-conductor-command",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+        provider = MagicMock()
+        provider.get_session_ids.return_value = {}
+        engine = WorkflowEngine(config, provider, workflow_path=workflow_path)
+
+        with pytest.raises(ExecutionError, match="command not found"):
+            await engine.run({})
+
+        assert engine._last_checkpoint_path is not None
+        checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert checkpoint.current_agent == "recovery"
+        assert checkpoint.context["agent_outputs"]["checker"]["stdout"].strip() == "partial"
+        assert checkpoint.context["step_errors"]["checker"] == {
+            "kind": "external.git.drift",
+            "message": "remote changed",
+            "details": {"branch": "main"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_catch_all_preserves_kind_not_declared_in_raises(self) -> None:
+        """Raises is documentation-only; catch-all routes retain the runtime kind."""
+        script = (
+            "import json, os; "
+            "open(os.environ['CONDUCTOR_ERROR_OUT'], 'w', encoding='utf-8').write("
+            "json.dumps({'kind': 'external.git.unexpected', "
+            "'message': 'unexpected', 'details': {}}))"
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="typed-script-catch-all",
+                entry_point="checker",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="checker",
+                    type="script",
+                    command=sys.executable,
+                    args=["-c", script],
+                    raises=["external.git.drift"],
+                    routes=[
+                        RouteDef(to="$end"),
+                        RouteDef(to="recovery", on_error=True),
+                    ],
+                ),
+                AgentDef(
+                    name="recovery",
+                    prompt="{{ checker.error.kind }}",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"kind": "{{ recovery.output.result }}"},
+        )
+        engine = WorkflowEngine(
+            config,
+            CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": prompt}),
+        )
+
+        result = await engine.run({})
+
+        assert result["kind"] == "external.git.unexpected"
 
 
 class TestScriptLimits:

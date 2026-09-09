@@ -14,6 +14,7 @@ import pytest
 
 from conductor.config.schema import RouteDef
 from conductor.engine.router import Router, RouteResult
+from conductor.error_envelope import ErrorEnvelope
 
 
 class TestRouteResult:
@@ -276,6 +277,54 @@ class TestRouterFallthrough:
 
         result = router.evaluate(routes, {"special": False, "other": True}, {})
         assert result.target == "default"
+
+
+class TestRouterErrorRoutes:
+    """Tests for deterministic success/error route buckets."""
+
+    def test_error_route_matches_kind_with_output_and_error_context(self) -> None:
+        """Error conditions can inspect partial output and the typed envelope."""
+        router = Router()
+        routes = [
+            RouteDef(to="success"),
+            RouteDef(
+                to="recover",
+                on_error="external.git.drift",
+                when=("{{ output.exit_code == 0 and error.details.branch == 'main' }}"),
+            ),
+            RouteDef(to="fallback", on_error=True),
+        ]
+        error = ErrorEnvelope(
+            kind="external.git.drift",
+            message="remote changed",
+            details={"branch": "main"},
+        )
+
+        result = router.evaluate(routes, {"exit_code": 0}, {}, error=error)
+
+        assert result.target == "recover"
+
+    def test_arithmetic_error_route_receives_flattened_error_context(self) -> None:
+        """Simple expressions can inspect the same typed envelope."""
+        router = Router()
+        routes = [
+            RouteDef(to="success"),
+            RouteDef(
+                to="recover",
+                on_error="external.git.drift",
+                when="error_kind == 'external.git.drift' and exit_code == 0",
+            ),
+            RouteDef(to="fallback", on_error=True),
+        ]
+        error = ErrorEnvelope(
+            kind="external.git.drift",
+            message="remote changed",
+            details={"branch": "main"},
+        )
+
+        result = router.evaluate(routes, {"exit_code": 0}, {}, error=error)
+
+        assert result.target == "recover"
 
 
 class TestRouterOutputTransform:
