@@ -193,7 +193,11 @@ def _auth_ready() -> Any:
     return patch.object(
         ClaudeAgentSdkProvider,
         "_check_auth_readiness",
-        return_value=ClaudeAuthStatus(requested_mode="auto", resolved_mode="api_key", ready=True),
+        AsyncMock(
+            return_value=ClaudeAuthStatus(
+                requested_mode="auto", inferred_mode="api_key", ready=True
+            )
+        ),
     )
 
 

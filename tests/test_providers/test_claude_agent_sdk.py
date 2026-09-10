@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -136,19 +136,20 @@ class TestValidateConnection:
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
-    async def test_validate_connection_falls_back_to_path_lookup(self) -> None:
-        """When no bundled binary exists, shutil.which('claude') is consulted."""
-        import pathlib
+    async def test_validate_connection_reflects_auth_readiness(self) -> None:
+        """``validate_connection`` is now a thin wrapper around ``_check_auth_readiness``.
 
+        The redundant bundled-binary / ``shutil.which`` CLI pre-check was
+        removed: it duplicated the CLI-presence check ``_check_auth_readiness``
+        already performs as part of the subscription-mode auth-status
+        subprocess, and could disagree with it. This test replaces
+        ``test_validate_connection_falls_back_to_path_lookup``, which asserted
+        the removed fallback.
+        """
         provider = ClaudeAgentSdkProvider()
-        _ready = ClaudeAuthStatus(requested_mode="auto", resolved_mode="api_key", ready=True)
-        with (
-            patch.object(pathlib.Path, "exists", return_value=False),
-            patch("shutil.which", return_value="/usr/local/bin/claude") as which_mock,
-            patch.object(provider, "_check_auth_readiness", return_value=_ready),
-        ):
+        _ready = ClaudeAuthStatus(requested_mode="auto", inferred_mode="api_key", ready=True)
+        with patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=_ready)):
             assert await provider.validate_connection() is True
-        which_mock.assert_called_with("claude")
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
@@ -2282,12 +2283,12 @@ class TestMcpOptionsWiring:
             captured["path"] = kwargs["options"].mcp_servers
             yield _assistant(content=[TextBlock(text="partial")])
 
-        _ready = ClaudeAuthStatus(requested_mode="auto", resolved_mode="api_key", ready=True)
+        _ready = ClaudeAuthStatus(requested_mode="auto", inferred_mode="api_key", ready=True)
         with (
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch(
                 "conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider._check_auth_readiness",
-                return_value=_ready,
+                AsyncMock(return_value=_ready),
             ),
         ):
             provider = ClaudeAgentSdkProvider(

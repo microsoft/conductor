@@ -235,15 +235,29 @@ and compiled into this file at release time.
 - **`claude-agent-sdk` provider now selects a deterministic authentication
 - **`claude-agent-sdk` provider: explicit authentication mode selection.**
   The new `runtime.provider.auth_mode` field (`"auto"` default,
-  `"subscription"`, `"api_key"`) lets you declare the credential path
-  rather than relying on ambient environment inference. `auto` behaves
-  as before for existing workflows — no migration needed. `subscription`
-  checks the existing Claude CLI login status via `claude auth status --json`
-  with a hard timeout before each agent execution and surfaces a clear
-  diagnostic when the session is unavailable; `api_key` skips the CLI check
-  entirely and reads only
-  `ANTHROPIC_API_KEY`. `conductor doctor --check` now reports Claude Agent SDK
-  readiness with clearer diagnostics for unavailable CLI, login, and keychain state.
+  `"subscription"`, `"api_key"`) selects the child-process authentication
+  path for the spawned `claude` subprocess: `subscription` selects the
+  child-process subscription path by passing empty `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN` through `ClaudeAgentOptions.env`; `api_key` requires
+  a non-empty inherited `ANTHROPIC_API_KEY` and clears the competing
+  `ANTHROPIC_AUTH_TOKEN` the same way; `auto` preserves inherited credential
+  resolution and is intentionally non-deterministic (no override is
+  contributed) — the default, so existing workflows are unaffected. No
+  global `os.environ` mutation occurs in any mode. Separately, `subscription`
+  (and `auto` when it infers a subscription-style check) runs a hard-bounded
+  preflight via `claude auth status --json` before each agent execution;
+  `api_key` skips that subprocess entirely. This preflight is a
+  readiness/reachability check only — it is not billing attribution and
+  must not be read as evidence of a real model invocation. Its internal
+  result keeps Conductor's own `requested_mode` / `inferred_mode` fields
+  distinct from the raw CLI-observed `authMethod` / `apiKeySource` /
+  `subscriptionType` fields it echoes; `conductor doctor --check` renders
+  both as separate `Conductor:` / `SDK:` groups on the connection cell
+  (never the raw CLI payload, an account identity, or a billing/plan claim),
+  regardless of connection outcome, plus a note under `auto` that the
+  effective credential path follows the SDK/CLI's inherited-environment
+  precedence — distinguishing a subscription session from an
+  API-key-present one, which `authMethod` alone cannot do.
 
 - **Per-agent `settings_dir` on `claude-agent-sdk`** (#513) — selects which
   directory's `project` settings tier supplies an agent's **skills**,

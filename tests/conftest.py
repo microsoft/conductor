@@ -199,3 +199,71 @@ def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         return runs_dir
 
     monkeypatch.setattr("conductor.rundir.runs_dir", _isolated)
+
+
+# Test modules that genuinely exercise `ClaudeAgentSdkProvider._check_auth_readiness`
+# itself (calling the real method against a mocked subprocess, or asserting on its
+# exact CLI-probe/timeout/interrupt behavior) and must therefore receive the *real*
+# implementation rather than the hermetic stub below. Matched by module basename
+# (without `.py`) so it is independent of which directory collects the file.
+_CLAUDE_AUTH_READINESS_HERMETIC_EXEMPT_MODULES = frozenset(
+    {
+        "test_claude_agent_sdk_auth",
+        "test_claude_agent_sdk",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_auth_readiness(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stub ``ClaudeAgentSdkProvider._check_auth_readiness`` to a deterministic,
+    already-ready result for every test, repository-wide (TICKET-20260816-0002).
+
+    ``execute()`` now runs a real, hard-timeout-bounded ``claude auth status
+    --json`` preflight before every agent turn (see ``_check_auth_readiness``
+    in ``providers/claude_agent_sdk.py``). Without this fixture, *any* test
+    that drives ``ClaudeAgentSdkProvider.execute()`` -- directly or via
+    ``WorkflowEngine`` -- spawns that real subprocess: on a developer machine
+    with the ``claude`` CLI installed this silently depends on local login
+    state; on upstream CI (no CLI, no ``ANTHROPIC_API_KEY``) every such test
+    fails or hangs on the readiness check instead of exercising its own
+    behavior. Per-file ad hoc patches (as several test modules already carry)
+    do not scale to the next test someone writes, and two modules in
+    particular -- ``tests/test_integration/test_session_key_continuity.py``
+    and ``tests/test_providers/test_claude_agent_sdk_session_key.py`` -- carry
+    no such patch at all.
+
+    This is a pure hermeticity guard, not a behavior assertion: it always
+    reports an *inferred* subscription readiness, regardless of the
+    provider's configured ``auth_mode``, matching this fixture's only job
+    (let unrelated tests run without touching a real CLI or real
+    credentials) rather than modeling any particular auth outcome.
+
+    A test in a module listed in
+    :data:`_CLAUDE_AUTH_READINESS_HERMETIC_EXEMPT_MODULES` -- one that
+    genuinely exercises the preflight itself (its CLI-probe path set,
+    timeout, or exact ``ClaudeAuthStatus`` it derives) against a mocked
+    subprocess -- receives the real, unstubbed method instead. A test
+    elsewhere that needs to assert on a *specific* readiness outcome (e.g. a
+    not-ready/error status) still overrides this default in the usual way,
+    via ``patch.object(provider, "_check_auth_readiness", ...)`` scoped to
+    that test -- an instance-level patch always wins over this fixture's
+    class-level default.
+    """
+    module = request.node.module
+    module_name = module.__name__.rsplit(".", 1)[-1] if module is not None else ""
+    if module_name in _CLAUDE_AUTH_READINESS_HERMETIC_EXEMPT_MODULES:
+        return
+
+    from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider, ClaudeAuthStatus
+
+    async def _always_ready(self: ClaudeAgentSdkProvider) -> ClaudeAuthStatus:
+        return ClaudeAuthStatus(
+            requested_mode=self._auth_mode,
+            inferred_mode="subscription",
+            ready=True,
+        )
+
+    monkeypatch.setattr(ClaudeAgentSdkProvider, "_check_auth_readiness", _always_ready)

@@ -202,6 +202,18 @@ class ProviderDiagnostic:
     models: list[ModelDiagnostic] | None = None
     models_error: str | None = None
     note: str | None = None
+    auth_diagnostic: dict[str, Any] | None = None
+    """Provider-supplied, doctor-facing auth readiness detail (issue
+
+    TICKET-20260816-0002). Populated via the duck-typed
+    ``auth_status_diagnostic`` hook (mirroring ``connection_error_hint``) —
+    absent for providers that don't define it. Shaped as two separate
+    groups (``conductor_inferred`` vs. ``sdk_observed``) so a renderer never
+    conflates Conductor's own mode inference with the SDK/CLI's sanitized,
+    as-observed fields; see
+    :attr:`conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider.auth_status_diagnostic`
+    for the field-level contract.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation."""
@@ -219,6 +231,7 @@ class ProviderDiagnostic:
             "models": [m.to_dict() for m in self.models] if self.models is not None else None,
             "models_error": self.models_error,
             "note": self.note,
+            "auth_diagnostic": self.auth_diagnostic,
         }
 
 
@@ -843,6 +856,14 @@ async def gather_provider(
             hint = getattr(provider, "connection_error_hint", None)
             if isinstance(hint, str) and hint:
                 diag.connection_error = hint
+
+        # Duck-typed like connection_error_hint above: read regardless of
+        # connection_ok, since distinguishing a ready subscription session
+        # from a ready API-key session is exactly the case this exists for
+        # (TICKET-20260816-0002) — not just a failure explainer.
+        auth_diagnostic = getattr(provider, "auth_status_diagnostic", None)
+        if isinstance(auth_diagnostic, dict):
+            diag.auth_diagnostic = auth_diagnostic
 
         # Gate on a verified (not merely truthy) connection: an inconclusive
         # probe means models.list() already failed once, so calling
