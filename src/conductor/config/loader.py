@@ -61,7 +61,7 @@ def resolve_env_vars(value: str, max_depth: int = 10) -> str:
             raise ConfigurationError(
                 f"Required environment variable '{var_name}' is not set",
                 suggestion=f"Set the environment variable '{var_name}' or provide a default "
-                f"value using the syntax: ${{{{{{var_name}}}}:-default_value}}",
+                "value using the syntax: " + "${" + var_name + ":-default_value}",
             )
 
     # Perform substitution
