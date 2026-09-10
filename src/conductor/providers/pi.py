@@ -98,7 +98,22 @@ class PiProvider(AgentProvider):
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
+        """Execute through the bridge.
+
+        Args:
+            continuation_state: Ignored. In-memory continuation is not supported.
+        """
+        del continuation_state
+        if custom_agents or extra_mcp_servers:
+            raise ProviderError(
+                "Pi provider does not support Conductor plugin agents or MCP servers.",
+                provider_name="pi",
+                is_retryable=False,
+            )
         if tools:
             raise ProviderError(
                 "Pi provider cannot map Conductor `tools:` allowlists to Pi tools.",

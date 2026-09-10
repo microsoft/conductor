@@ -54,6 +54,8 @@ def get_copilot_example_files() -> list[Path]:
             continue
         if "compaction" in example.name.lower():
             continue
+        if example.name.lower().startswith("pi-"):
+            continue
 
         copilot_examples.append(example)
 

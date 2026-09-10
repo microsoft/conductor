@@ -112,9 +112,7 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     ),
     "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
     "hermes": _CredentialSpec(),
-    "pi": _CredentialSpec(
-        optional_auth_note="authenticates through Pi's local auth/config files"
-    ),
+    "pi": _CredentialSpec(optional_auth_note="authenticates through Pi's local auth/config files"),
 }
 
 # Update-check opt-out env var (mirrors cli/update.py so diagnostics does not
