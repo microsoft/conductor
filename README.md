@@ -347,14 +347,14 @@ See [docs/fleet.md](docs/fleet.md) for every screen, key binding, the status voc
 
 Conductor supports multiple AI providers. Choose based on your needs:
 
-| Feature | Copilot | OpenAI | Claude | Claude Agent SDK | Hermes | ACA |
-|---------|---------|--------|--------|------------------|--------|-----|
-| **Tier** | Stable | Stable | Stable | Experimental | Experimental | Experimental |
-| **Pricing** | Subscription | Pay-per-token | Pay-per-token | Subscription | Pay-per-token (via hermes) | Subscription + ACA compute |
-| **Context Window** | Per-model | Per-model | Per-model | Per-model | Per-model | Per-model (inner Copilot) |
-| **Tool Support (MCP)** | Yes | Yes (stdio) | Yes (stdio) | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) |
-| **Streaming** | Yes | Yes | Yes | Yes | No | Yes |
-| **Best For** | Heavy usage, tools | OpenAI ecosystem, pay-per-use | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access | Untrusted/isolation-sensitive agents |
+| Feature | Copilot | OpenAI | Claude | Claude Agent SDK | Hermes | ACA | Pi SDK |
+|---------|---------|--------|--------|------------------|--------|-----|--------|
+| **Tier** | Stable | Stable | Stable | Experimental | Experimental | Experimental | Experimental |
+| **Pricing** | Subscription | Pay-per-token | Pay-per-token | Subscription | Pay-per-token (via hermes) | Subscription + ACA compute | Depends on Pi model provider |
+| **Context Window** | Per-model | Per-model | Per-model | Per-model | Per-model | Per-model (inner Copilot) | Per-model |
+| **Tool Support (MCP)** | Yes | Yes (stdio) | Yes (stdio) | Yes (built-in) | No (hermes internal tools) | Yes (always forwarded, not allowlisted) | No |
+| **Streaming** | Yes | Yes | Yes | Yes | No | Yes | Yes |
+| **Best For** | Heavy usage, tools | OpenAI ecosystem, pay-per-use | Large context, pay-per-use | Full Claude Code toolset | Multi-provider model access | Untrusted/isolation-sensitive agents | Pi tools, skills, extensions |
 
 ### Using Copilot
 
@@ -401,6 +401,44 @@ workflow:
 Requires the `claude` CLI to be installed and authenticated. Install the SDK: `uv add 'claude-agent-sdk>=0.2.82'`
 
 > **Note:** `runtime.mcp_servers` is supported — servers are translated into the SDK's own MCP config and attach alongside the built-in `claude_code` preset (a narrowing per-server `tools:` filter is refused, since the SDK cannot enforce one). Per-agent tool allowlists are not bridged: a workflow-level `tools:` block is rejected at `conductor validate` for any agent that omits `tools:` (it would otherwise inherit a list the CLI can't map). Omit `tools:` to grant the full `claude_code` preset; an agent's `tools: []` disables the built-in tools, though declared MCP servers still attach.
+
+### Using Pi SDK (Experimental)
+
+Requires Node.js 22.19.0 or newer and npm. From a source checkout, install the
+runner's locked dependencies:
+
+```bash
+npm --prefix src/conductor/providers/_pi ci
+```
+
+The runner and its Node manifests live alongside the Python provider in
+`src/conductor/providers/_pi/`. Python installation includes these files but does
+not install Node dependencies. For an installed Python package, run the following
+with the Python interpreter from Conductor's environment to locate that directory,
+then run `npm --prefix "<printed-directory>" ci`:
+
+```bash
+python -c "from pathlib import Path; import conductor.providers.pi as p; print(Path(p.__file__).parent / '_pi')"
+```
+
+Repeat the npm setup after upgrading Conductor if its lockfile changes.
+
+```yaml
+workflow:
+  runtime:
+    provider: pi
+    # Omit default_model to use Pi configured default model.
+    # To pin one, use Pi id: provider/model-id.
+```
+
+Conductor starts one Node runner and persisted Pi `AgentSession` per agent step.
+Pi project/user skills and extensions load normally. Pi sessions are checkpointed and
+restored by `conductor resume`; malformed structured output gets same-session recovery.
+`max_session_seconds` and `max_agent_iterations` are enforced. Inspect authenticated
+model ids with `conductor doctor providers --models --provider pi`.
+
+`runtime.mcp_servers`, per-agent `tools:`, `temperature`, and `max_tokens` are not
+bridged. See [`examples/pi-research-pipeline.yaml`](examples/pi-research-pipeline.yaml).
 
 ### Using Hermes (Experimental)
 

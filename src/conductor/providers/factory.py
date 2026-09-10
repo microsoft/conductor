@@ -23,6 +23,7 @@ from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
 from conductor.providers.openai import OPENAI_SDK_AVAILABLE, OpenAIProvider
+from conductor.providers.pi import PiProvider
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
@@ -268,6 +269,19 @@ async def create_provider(
                     else None
                 ),
             )
+        case "pi":
+            if temperature is not None or max_tokens is not None:
+                raise ProviderError(
+                    "Pi provider does not support Conductor `temperature` or `max_tokens`.",
+                    suggestion=(
+                        "Remove those runtime fields; configure Pi model behavior in Pi settings."
+                    ),
+                )
+            provider = PiProvider(
+                model=default_model,
+                max_session_seconds=max_session_seconds,
+                max_agent_iterations=max_agent_iterations,
+            )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:
                 raise ProviderError(
@@ -295,7 +309,7 @@ async def create_provider(
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
                 suggestion=(
-                    "Valid providers are: copilot, openai, claude, claude-agent-sdk, hermes, aca"
+                    "Valid providers are: copilot, openai, claude, claude-agent-sdk, hermes, aca, pi"
                 ),
             )
 

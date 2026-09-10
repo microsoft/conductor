@@ -26,6 +26,7 @@ import contextlib
 import logging
 import os
 import platform
+import shutil
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -111,6 +112,9 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     ),
     "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
     "hermes": _CredentialSpec(),
+    "pi": _CredentialSpec(
+        optional_auth_note="authenticates through Pi's local auth/config files"
+    ),
 }
 
 # Update-check opt-out env var (mirrors cli/update.py so diagnostics does not
@@ -477,6 +481,10 @@ def _sdk_available(name: str) -> bool:
             from conductor.providers.hermes import HERMES_SDK_AVAILABLE
 
             return HERMES_SDK_AVAILABLE
+        if name == "pi":
+            from conductor.providers.pi import PiProvider
+
+            return shutil.which("node") is not None and PiProvider()._bridge.is_file()
     except Exception:  # noqa: BLE001 - diagnostics must never raise
         return False
     return False
