@@ -3056,3 +3056,94 @@ class TestStaticSubworkflowTopology:
         # one fetch for the whole run, not two.
         assert len(fetch_calls) == 1
         assert result["result"] == "ok"
+
+
+class TestSubWorkflowGateEnvironment:
+    """A gate inside a sub-workflow must see the parent's interaction environment."""
+
+    @pytest.mark.asyncio
+    async def test_nested_gate_inherits_bg_mode_and_skips_cli_prompt(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """In ``--web-bg``, a gate nested in a sub-workflow must wait web-only.
+
+        Only the CLI builds a ``RunContext``, so a child engine used to read
+        ``bg_mode`` as False. With a dashboard attached and stdin looking like
+        a TTY, the gate then raced the CLI arm, ``Prompt.ask`` raised
+        ``EOFError`` instantly, won ``FIRST_COMPLETED``, and failed the run --
+        the issue #286 crash surviving one level of nesting.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from conductor.engine.workflow import RunContext
+
+        _write_yaml(
+            tmp_workflow_dir / "sub.yaml",
+            """\
+            workflow:
+              name: sub-gate
+              entry_point: approval_gate
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 5
+            agents:
+              - name: approval_gate
+                type: human_gate
+                prompt: "Approve?"
+                options:
+                  - label: Approve
+                    value: approve
+                    route: "$end"
+            output:
+              decision: "approve"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent-gate",
+                entry_point="nested",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="nested",
+                    type="workflow",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"decision": "{{ nested.output.decision }}"},
+        )
+
+        mock_dashboard = MagicMock()
+        mock_dashboard.wait_for_gate_response = AsyncMock(
+            return_value={"selected_value": "approve", "additional_input": {}}
+        )
+        mock_dashboard.has_connections = MagicMock(return_value=True)
+
+        provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {})
+        engine = WorkflowEngine(
+            config,
+            provider,
+            workflow_path=parent_path,
+            skip_gates=False,
+            web_dashboard=mock_dashboard,
+            run_context=RunContext(bg_mode=True),
+        )
+
+        # A TTY-looking stdin is what made the child take the racing path.
+        with (
+            patch("conductor.gates.human.sys.stdin.isatty", return_value=True),
+            patch("conductor.gates.human.Prompt.ask", side_effect=EOFError) as cli_prompt,
+        ):
+            result = await engine.run({})
+
+        assert result["decision"] == "approve"
+        cli_prompt.assert_not_called()
+        mock_dashboard.wait_for_gate_response.assert_awaited_once()

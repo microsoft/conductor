@@ -484,6 +484,7 @@ class WorkflowEngine:
         instructions_preamble: str | None = None,
         plugin_marketplaces: Mapping[str, Marketplace] | None = None,
         _guidance_channel: GuidanceChannel | None = None,
+        _inherited_bg_mode: bool = False,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -531,6 +532,10 @@ class WorkflowEngine:
                 mid-run would stall an agent on a network round trip, and
                 a failure there would surface as an agent error rather
                 than a configuration one. Inherited by sub-workflows.
+            _inherited_bg_mode: Parent engine's background-mode flag. Only the
+                CLI supplies a ``run_context``, so child engines must be told
+                explicitly that stdin cannot be prompted; otherwise a gate
+                inside a sub-workflow crashes on ``EOFError``.
             _guidance_channel: Shared mid-run guidance channel (issue #400).
                 When None, a fresh :class:`GuidanceChannel` is created. Child
                 engines inherit the parent's channel so a paused sub-workflow
@@ -724,7 +729,11 @@ class WorkflowEngine:
 
         # System metadata fields (set by CLI, used in workflow_started event)
         self._dashboard_port = self._run_context.dashboard_port
-        self._bg_mode = self._run_context.bg_mode
+        # Only the CLI builds a RunContext, so a child engine would otherwise
+        # read bg_mode as False and let a gate prompt a stdin that is not
+        # there. Interaction environment is a property of the process, not of
+        # the nesting level.
+        self._bg_mode = self._run_context.bg_mode or _inherited_bg_mode
         self._system_metadata: dict[str, Any] = {}
 
         # When True, ``_execute_loop`` skips its ``workflow_started`` emit.
@@ -2635,6 +2644,7 @@ class WorkflowEngine:
             instructions_preamble=child_preamble,
             plugin_marketplaces=child_marketplaces,
             _guidance_channel=self._guidance,
+            _inherited_bg_mode=self._bg_mode,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -2722,6 +2732,7 @@ class WorkflowEngine:
             "web_dashboard": self._web_dashboard,
             "_subworkflow_depth": self._subworkflow_depth + 1,
             "_guidance_channel": self._guidance,
+            "_inherited_bg_mode": self._bg_mode,
         }
         # Thread the dashboard context path into the child engine when the
         # field exists on this engine (added by the breadcrumb-navigation PR).
