@@ -160,6 +160,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure is reported as a new `agent_compaction_skipped` event
   (`reason: "estimate_unavailable"`) rather than vanishing into stderr. See
   [Workflow Syntax → Context Compaction](docs/workflow-syntax.md#context-compaction).
+- **Terminal left in cbreak mode (no echo/ICANON) after a run exited** — a
+  `KeyboardListener` started while the terminal was already in cbreak mode
+  (after an Esc pause/resume cycle, or a second listener in the same process)
+  captured that cbreak state as its "original" settings and restored it on
+  `stop()`, leaving the user's interactive shell without echo or canonical
+  mode. The tty baseline is now captured once per process, before the first
+  `tty.setcbreak()`, and reused by every later listener; `start()` is
+  idempotent while active so a duplicate call can't overwrite the baseline;
+  restore uses `TCSANOW` so a blocked output drain can't delay it; and the
+  saved baseline is cleared only after a successful `tcsetattr` so a
+  transient failure can be retried by `atexit`/`SIGTERM`/`stop()`. The
+  SIGTERM cleanup handler also no longer swallows the signal: after
+  restoring the terminal it delegates to the previously-installed
+  disposition (reset-and-re-raise for `SIG_DFL`, ignore for `SIG_IGN`,
+  invoke a callable previous handler), and re-registration captures the
+  previous disposition in the handler closure so the listener can no
+  longer recurse into itself. The run and resume commands now also reapply
+  and retire the baseline at their outermost cleanup boundary, after provider
+  shutdown and every other teardown step. This closes a later race where
+  normal completion or Ctrl+C could restore the terminal correctly and then
+  a provider's cleanup could put it back into cbreak; SIGTERM during that same
+  late-cleanup window restores the process baseline before terminating.
+  ([#290](https://github.com/microsoft/conductor/issues/290))
 
 - **Validator retries preserve the primary agent conversation** (#511) — when a
   semantic validator rejects output from the Claude, OpenAI, or Hermes provider,

@@ -2561,46 +2561,55 @@ async def run_workflow_async(
             terminal_error_message = str(exc)
         raise
     finally:
-        # Write the terminal run record (MCP server plan E2) before
-        # removing the live one below, so a completed run remains
-        # resolvable by run_id after this process exits. Never raises --
-        # see the helper's own docstring.
-        _write_terminal_record_for_current_process(
-            event_log_subscriber=event_log_subscriber,
-            workflow_path=workflow_path,
-            started_at=started_at_iso,
-            status=terminal_status,
-            output=terminal_output,
-            error_type=terminal_error_type,
-            error_message=terminal_error_message,
-            engine=engine,
-        )
-
-        # Clean up the Fleet Manager run record on every exit path (E2 —
-        # normal completion, an explicit WorkflowTerminated re-raise, or an
-        # unexpected exception all funnel through this finally). Unlike the
-        # legacy PID file (removed only by a background child), this runs
-        # unconditionally: foreground and foreground-with-dashboard runs now
-        # write a record too and must remove it on exit just the same.
-        # Guarded (never raises) so a failure here cannot prevent the
-        # dashboard/event-log/file-logging cleanup below from running.
-        _remove_run_record_for_current_process_safe()
-
-        # Stop dashboard if it was started
-        if dashboard is not None:
-            await dashboard.stop()
-
-        # Close JSONL event log and report path
-        if event_log_subscriber is not None:
-            event_log_subscriber.close()
-            _verbose_console.print(
-                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+        try:
+            # Write the terminal run record (MCP server plan E2) before
+            # removing the live one below, so a completed run remains
+            # resolvable by run_id after this process exits. Never raises --
+            # see the helper's own docstring.
+            _write_terminal_record_for_current_process(
+                event_log_subscriber=event_log_subscriber,
+                workflow_path=workflow_path,
+                started_at=started_at_iso,
+                status=terminal_status,
+                output=terminal_output,
+                error_type=terminal_error_type,
+                error_message=terminal_error_message,
+                engine=engine,
             )
 
-        # Report log file path to stderr and close file logging
-        if log_file is not None and _file_console is not None:
-            _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
-        close_file_logging()
+            # Clean up the Fleet Manager run record on every exit path (E2 —
+            # normal completion, an explicit WorkflowTerminated re-raise, or an
+            # unexpected exception all funnel through this finally). Unlike the
+            # legacy PID file (removed only by a background child), this runs
+            # unconditionally: foreground and foreground-with-dashboard runs now
+            # write a record too and must remove it on exit just the same.
+            # Guarded (never raises) so a failure here cannot prevent the
+            # dashboard/event-log/file-logging cleanup below from running.
+            _remove_run_record_for_current_process_safe()
+
+            # Stop dashboard if it was started
+            if dashboard is not None:
+                await dashboard.stop()
+
+            # Close JSONL event log and report path
+            if event_log_subscriber is not None:
+                event_log_subscriber.close()
+                _verbose_console.print(
+                    styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+                )
+
+            # Report log file path to stderr and close file logging
+            if log_file is not None and _file_console is not None:
+                _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
+            close_file_logging()
+        finally:
+            # Provider shutdown occurs after the listener's inner ``finally``
+            # and may itself touch the controlling TTY. Reapply the process
+            # baseline at the outermost boundary so normal exit, Ctrl+C, and a
+            # later cleanup failure all return a sane terminal to the shell.
+            from conductor.interrupt.listener import restore_terminal_baseline
+
+            restore_terminal_baseline(clear=True)
 
 
 def format_routes(routes: list[dict[str, Any]]) -> Text:
@@ -3366,44 +3375,50 @@ async def resume_workflow_async(
             terminal_error_message = str(exc)
         raise
     finally:
-        # Write the terminal run record (MCP server plan E2) before
-        # removing the live one below -- mirrors run_workflow_async. A
-        # resumed run reuses its predecessor's run_id, so this call
-        # replaces the earlier terminal record rather than duplicating it.
-        # Never raises -- see the helper's own docstring.
-        _write_terminal_record_for_current_process(
-            event_log_subscriber=event_log_subscriber,
-            workflow_path=resolved_workflow_path,
-            started_at=started_at_iso,
-            status=terminal_status,
-            output=terminal_output,
-            error_type=terminal_error_type,
-            error_message=terminal_error_message,
-            engine=engine,
-        )
-
-        # Clean up the Fleet Manager run record on every exit path (E2 —
-        # mirrors run_workflow_async so a resumed run's record is removed
-        # the same way a fresh run's is). Guarded (never raises) so a
-        # failure here cannot prevent the dashboard/event-log/file-logging
-        # cleanup below from running.
-        _remove_run_record_for_current_process_safe()
-
-        # Stop dashboard if it was started
-        if dashboard is not None:
-            await dashboard.stop()
-
-        # Close JSONL event log and report path
-        if event_log_subscriber is not None:
-            event_log_subscriber.close()
-            _verbose_console.print(
-                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+        try:
+            # Write the terminal run record (MCP server plan E2) before
+            # removing the live one below -- mirrors run_workflow_async. A
+            # resumed run reuses its predecessor's run_id, so this call
+            # replaces the earlier terminal record rather than duplicating it.
+            # Never raises -- see the helper's own docstring.
+            _write_terminal_record_for_current_process(
+                event_log_subscriber=event_log_subscriber,
+                workflow_path=resolved_workflow_path,
+                started_at=started_at_iso,
+                status=terminal_status,
+                output=terminal_output,
+                error_type=terminal_error_type,
+                error_message=terminal_error_message,
+                engine=engine,
             )
 
-        # Report log file path to stderr and close file logging
-        if log_file is not None and _file_console is not None:
-            _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
-        close_file_logging()
+            # Clean up the Fleet Manager run record on every exit path (E2 —
+            # mirrors run_workflow_async so a resumed run's record is removed
+            # the same way a fresh run's is). Guarded (never raises) so a
+            # failure here cannot prevent the dashboard/event-log/file-logging
+            # cleanup below from running.
+            _remove_run_record_for_current_process_safe()
+
+            # Stop dashboard if it was started
+            if dashboard is not None:
+                await dashboard.stop()
+
+            # Close JSONL event log and report path
+            if event_log_subscriber is not None:
+                event_log_subscriber.close()
+                _verbose_console.print(
+                    styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+                )
+
+            # Report log file path to stderr and close file logging
+            if log_file is not None and _file_console is not None:
+                _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
+            close_file_logging()
+        finally:
+            # Keep resume teardown parity with ``run_workflow_async``.
+            from conductor.interrupt.listener import restore_terminal_baseline
+
+            restore_terminal_baseline(clear=True)
 
 
 async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str, Any]:
