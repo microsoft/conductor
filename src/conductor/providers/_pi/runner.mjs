@@ -199,19 +199,30 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
+/** Session teardown can leave handles that keep the loop alive, so exit on our own terms. */
+async function exitAfterFlush(code) {
+  await new Promise((resolve) => {
+    if (process.stdout.write("")) resolve();
+    else process.stdout.once("drain", resolve);
+  });
+  process.exit(code);
+}
+
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 let request;
 for await (const line of lines) {
   if (line.trim()) { request = JSON.parse(line); break; }
 }
+lines.close();
 if (!request) {
   emit({ type: "error", error: "Expected one JSON request on stdin." });
-  process.exitCode = 2;
+  await exitAfterFlush(2);
 } else {
   try {
     await run(request);
+    await exitAfterFlush(0);
   } catch (error) {
     emit({ type: "error", error: error instanceof Error ? error.message : String(error) });
-    process.exitCode = 1;
+    await exitAfterFlush(1);
   }
 }

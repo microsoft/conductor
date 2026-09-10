@@ -82,6 +82,45 @@ async def test_execute_accepts_current_provider_contract() -> None:
     process.wait.assert_awaited_once()
 
 
+async def test_execute_returns_when_bridge_outlives_its_result() -> None:
+    """A bridge that never closes stdout must not strand a finished agent."""
+    provider = PiProvider()
+    process = MagicMock()
+    process.stdin.drain = AsyncMock()
+    process.stdout = asyncio.StreamReader()
+    process.stdout.feed_data(
+        (json.dumps({"type": "result", "text": "hello", "model": "test/model"}) + "\n").encode()
+    )
+    # No feed_eof(): the live Pi session keeps the bridge process running.
+    process.stderr = asyncio.StreamReader()
+    process.stderr.feed_eof()
+    process.returncode = None
+
+    async def _wait() -> int:
+        process.returncode = 0
+        return 0
+
+    process.wait = AsyncMock(side_effect=_wait)
+    with patch(
+        "conductor.providers.pi.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        output = await asyncio.wait_for(
+            provider.execute(
+                AgentDef(name="test", prompt="hello"),
+                {},
+                "hello",
+                custom_agents=None,
+                extra_mcp_servers=None,
+                continuation_state=object(),
+            ),
+            timeout=10,
+        )
+    assert output.content == {"response": "hello"}
+    process.terminate.assert_called_once()
+    process.kill.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [{"custom_agents": [{"name": "child"}]}, {"extra_mcp_servers": {"server": {}}}],

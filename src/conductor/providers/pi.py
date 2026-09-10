@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -200,8 +201,10 @@ class PiProvider(AgentProvider):
                 result = message
                 if message.get("session_path"):
                     self._session_ids[agent.name] = message["session_path"]
+                break  # One request per process: result is terminal, do not await EOF.
             elif kind == "error":
                 bridge_error = message["error"]
+                break
             elif kind == "parse_recovery":
                 emit_parse_recovery_event(
                     event_callback,
@@ -213,8 +216,7 @@ class PiProvider(AgentProvider):
             elif event_callback is not None:
                 self._emit_event(event_callback, message)
 
-        stderr = (await process.stderr.read()).decode() if process.stderr is not None else ""
-        await process.wait()
+        stderr = await self._reap(process)
         if timed_out:
             raise ProviderError(
                 f"Pi agent exceeded max_session_seconds ({max_seconds:.0f}s).",
@@ -248,6 +250,32 @@ class PiProvider(AgentProvider):
             model=result.get("model"),
             partial=bool(result.get("partial") or interrupted),
         )
+
+    @staticmethod
+    async def _reap(process: asyncio.subprocess.Process) -> str:
+        """Terminate the bridge if it outlived its result, then drain stderr.
+
+        The bridge holds a live Pi session, so its event loop can stay alive
+        after the terminal message. Neither the stderr drain nor the exit wait
+        may block on that, or a finished agent never returns.
+        """
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                process.kill()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=5)
+        else:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=5)
+        if process.stderr is None:
+            return ""
+        try:
+            return (await asyncio.wait_for(process.stderr.read(), timeout=5)).decode()
+        except TimeoutError:
+            return ""
 
     @staticmethod
     def _emit_event(callback: EventCallback, message: dict[str, Any]) -> None:
