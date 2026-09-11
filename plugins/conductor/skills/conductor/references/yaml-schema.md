@@ -30,6 +30,8 @@ workflow:
     provider: string | object       # "copilot" (default), "claude", "claude-agent-sdk", "hermes", or "openai"
                                     # — or a ProviderSettings object (see below)
     default_model: string           # Default model for all agents
+    log_file: string                # Full debug log path, or "auto" for a generated temp file (optional)
+                                    # CLI --log-file overrides this value; omitted means no file logging
     temperature: float              # 0.0-1.0, controls randomness (optional, copilot/claude/hermes)
     max_tokens: integer             # Max OUTPUT tokens per response, 1-200000 (optional, copilot/claude/hermes)
     timeout: float                  # Per-request timeout in seconds (optional, default: 600, copilot/claude only)
