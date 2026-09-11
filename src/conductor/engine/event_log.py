@@ -79,6 +79,7 @@ class EventLogSubscriber:
         *,
         existing_path: Path | None = None,
         existing_run_id: str | None = None,
+        event_log_dir: Path | None = None,
     ) -> None:
         """Initialise the subscriber.
 
@@ -150,11 +151,12 @@ class EventLogSubscriber:
                 )
             self._run_id = new_run_id()
         ts = time.strftime("%Y%m%d-%H%M%S")
-        self._path = (
-            Path(tempfile.gettempdir())
-            / "conductor"
-            / f"conductor-{workflow_name}-{ts}-{self._run_id}.events.jsonl"
+        base_dir = (
+            event_log_dir
+            if event_log_dir is not None
+            else Path(tempfile.gettempdir()) / "conductor"
         )
+        self._path = base_dir / f"conductor-{workflow_name}-{ts}-{self._run_id}.events.jsonl"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
 
