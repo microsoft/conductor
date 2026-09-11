@@ -1,0 +1,32 @@
+workflow:
+  name: pi-research-pipeline
+  entry_point: research
+  runtime:
+    provider: pi
+    # Omit default_model to use Pi configured default model.
+    # To pin model, use Pi id: provider/model-id.
+    working_dir: .
+
+agents:
+  - name: research
+    prompt: |
+      Research this request: {{ workflow.input.question }}
+      Return JSON only with fields `findings` and `risks`.
+    output:
+      findings:
+        type: array
+      risks:
+        type: array
+    routes:
+      - to: synthesize
+
+  - name: synthesize
+    prompt: |
+      Turn this research into an implementation brief.
+      Findings: {{ research.output.findings }}
+      Risks: {{ research.output.risks }}
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ synthesize.output.response }}"
