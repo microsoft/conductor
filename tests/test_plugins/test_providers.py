@@ -181,6 +181,26 @@ class TestNonNativeProvidersDeclareNoPluginSupport:
         assert AcaRuntimeProvider.CAPABILITIES.plugins is False
 
 
+def _auth_ready() -> Any:
+    """Neutralise the auth preflight so plugin delivery is what's under test.
+
+    ``execute`` runs an authentication readiness check before it builds any
+    options, so without this every test below fails on a missing credential
+    rather than on the component wiring it is actually asserting.
+    """
+    from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider, ClaudeAuthStatus
+
+    return patch.object(
+        ClaudeAgentSdkProvider,
+        "_check_auth_readiness",
+        AsyncMock(
+            return_value=ClaudeAuthStatus(
+                requested_mode="auto", inferred_mode="api_key", ready=True
+            )
+        ),
+    )
+
+
 class TestClaudeAgentSdkDelivery:
     """The last hop: components must reach ``ClaudeAgentOptions``, not just translate.
 
@@ -203,6 +223,7 @@ class TestClaudeAgentSdkDelivery:
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
+            _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
@@ -234,6 +255,7 @@ class TestClaudeAgentSdkDelivery:
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
+            _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
@@ -254,6 +276,7 @@ class TestClaudeAgentSdkDelivery:
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={"shared": {"type": "stdio", "command": "wf"}}

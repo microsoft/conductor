@@ -2928,6 +2928,14 @@ class ProviderSettings(BaseModel):
           auth_token: ${DATABRICKS_TOKEN}
     """
 
+    auth_mode: Literal["auto", "subscription", "api_key"] | None = None
+    """Authentication source selection for ``claude-agent-sdk``.
+
+    ``"auto"`` prefers ``ANTHROPIC_API_KEY`` when present and otherwise uses
+    the local ``claude login`` subscription context. ``"subscription"`` and
+    ``"api_key"`` force deterministic selection of one path.
+    """
+
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
@@ -3158,6 +3166,8 @@ class ProviderSettings(BaseModel):
             extras = sorted(k for k, v in claude_only_fields.items() if v is not None)
             if extras:
                 raise ValueError(f"Provider fields {extras} are only supported when name='claude'.")
+        if self.auth_mode is not None and self.name != "claude-agent-sdk":
+            raise ValueError("'auth_mode' is only supported when name='claude-agent-sdk'")
         if self.name != "aca":
             extras = sorted(k for k, v in aca_only_fields.items() if v is not None)
             if extras:
@@ -3295,6 +3305,8 @@ class ProviderSettings(BaseModel):
                 object.__setattr__(self, "identifier_scope", "agent")
             if self.auth is None:
                 object.__setattr__(self, "auth", "azure_default")
+        if self.name == "claude-agent-sdk" and self.auth_mode is None:
+            object.__setattr__(self, "auth_mode", "auto")
 
         return self
 
@@ -3353,6 +3365,7 @@ class ProviderSettings(BaseModel):
             or self.has_external_runtime()
             or self.has_aca_config()
             or self.setting_sources is not None
+            or self.auth_mode in ("subscription", "api_key")
         )
 
     @model_serializer(mode="wrap")

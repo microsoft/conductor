@@ -575,6 +575,73 @@ class TestGatherProviderCheck:
         assert model.input_per_mtok == 2.50
 
 
+class TestGatherProviderAuthDiagnostic:
+    """``diag.auth_diagnostic`` is read duck-typed off the provider, exactly
+    like ``connection_error_hint`` (TICKET-20260816-0002, Finding 3) — a
+    provider without the attribute, or one whose value is not a ``dict``
+    (including an ``AsyncMock`` auto-vivified child, which is truthy but not
+    a ``dict``), must never populate it."""
+
+    async def test_plain_mock_without_explicit_attribute_does_not_populate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True)
+        # A bare AsyncMock() auto-vivifies `provider.auth_status_diagnostic`
+        # as a truthy child mock if merely accessed — this pins that the
+        # isinstance(..., dict) guard rejects it rather than being fooled.
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("copilot", check=True)
+        assert diag.auth_diagnostic is None
+
+    async def test_dict_valued_attribute_is_surfaced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True)
+        provider.auth_status_diagnostic = {
+            "conductor_inferred": {
+                "requested_mode": "subscription",
+                "inferred_mode": "subscription",
+            },
+            "sdk_observed": {"authMethod": "claude.ai", "subscriptionType": "max"},
+        }
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("claude-agent-sdk", check=True)
+        assert diag.auth_diagnostic == {
+            "conductor_inferred": {
+                "requested_mode": "subscription",
+                "inferred_mode": "subscription",
+            },
+            "sdk_observed": {"authMethod": "claude.ai", "subscriptionType": "max"},
+        }
+
+    async def test_populated_even_when_connection_ok_is_true(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike ``connection_error_hint``, ``auth_diagnostic`` is not
+        gated on failure — a ready subscription session and a ready
+        API-key session must both be distinguishable."""
+        monkeypatch.setattr("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True)
+        provider.auth_status_diagnostic = {
+            "conductor_inferred": {"requested_mode": "api_key", "inferred_mode": "api_key"},
+            "sdk_observed": {"authMethod": "claude.ai", "apiKeySource": "env"},
+        }
+        monkeypatch.setattr(
+            "conductor.providers.factory.create_provider",
+            AsyncMock(return_value=provider),
+        )
+        diag = await d.gather_provider("claude-agent-sdk", check=True)
+        assert diag.connection_ok is True
+        assert diag.auth_diagnostic is not None
+        assert diag.auth_diagnostic["sdk_observed"]["apiKeySource"] == "env"
+
+
 class TestModelPricingDiagnostics:
     """Tests for per-model pricing resolution in ``--models`` (issue #386)."""
 

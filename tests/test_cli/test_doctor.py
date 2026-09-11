@@ -79,6 +79,7 @@ def _prov(
     models: list[str] | list[ModelDiagnostic] | None = None,
     models_error: str | None = None,
     note: str | None = None,
+    auth_diagnostic: dict[str, object] | None = None,
 ) -> ProviderDiagnostic:
     """Build a ``ProviderDiagnostic`` for tests.
 
@@ -107,6 +108,7 @@ def _prov(
         models=model_diagnostics,
         models_error=models_error,
         note=note,
+        auth_diagnostic=auth_diagnostic,
     )
 
 
@@ -252,6 +254,78 @@ class TestDoctorCredentialRendering:
         assert result.exit_code == 0
         assert "✗ ANTHROPIC_API_KEY" in result.output
         assert "○ ANTHROPIC_API_KEY" not in result.output
+
+
+class TestDoctorAuthDiagnosticRendering:
+    """``conductor doctor --check`` distinguishes subscription vs. API-key
+    sessions via the ``Conductor:``/``SDK:`` groups (TICKET-20260816-0002,
+    Finding 3) — never by ``authMethod`` alone."""
+
+    def test_both_groups_rendered_distinctly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude-agent-sdk",
+                    checked=True,
+                    connection_ok=True,
+                    auth_diagnostic={
+                        "conductor_inferred": {
+                            "requested_mode": "subscription",
+                            "inferred_mode": "subscription",
+                        },
+                        "sdk_observed": {
+                            "authMethod": "claude.ai",
+                            "subscriptionType": "max",
+                        },
+                    },
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers", "--check"])
+        assert result.exit_code == 0
+        assert "Conductor: requested_mode=subscription, inferred_mode=subscription" in result.output
+        assert "SDK: authMethod=claude.ai, subscriptionType=max" in result.output
+
+    def test_auto_note_rendered_when_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude-agent-sdk",
+                    checked=True,
+                    connection_ok=True,
+                    auth_diagnostic={
+                        "conductor_inferred": {
+                            "requested_mode": "auto",
+                            "inferred_mode": "subscription",
+                        },
+                        "sdk_observed": {"authMethod": "claude.ai"},
+                        "auto_note": (
+                            "auto follows the SDK/CLI's inherited-environment "
+                            "credential precedence."
+                        ),
+                    },
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers", "--check"])
+        assert result.exit_code == 0
+        assert "inherited-environment" in result.output
+
+    def test_no_auth_diagnostic_renders_only_base_connection_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A provider with no ``auth_diagnostic`` (e.g. every provider other
+        than ``claude-agent-sdk``) must not gain the extra lines."""
+        report = DoctorReport(
+            providers=[_prov("copilot", checked=True, connection_ok=True)]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers", "--check"])
+        assert result.exit_code == 0
+        assert "Conductor:" not in result.output
+        assert "SDK:" not in result.output
 
 
 # ---------------------------------------------------------------------------

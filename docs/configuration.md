@@ -247,6 +247,7 @@ neither env var. Only `base_url` falls back on its own.
 | `runtime_url` | Supported | Rejected | Rejected |
 | `runtime_token` | Supported | Rejected | Rejected |
 | `setting_sources` | Rejected | Rejected | Supported |
+| `auth_mode` | Rejected | Rejected | Supported |
 
 `setting_sources` (`user` / `project` / `local`) selects which Claude Code
 settings tiers a session may load; it is empty by default and only the
@@ -254,6 +255,26 @@ settings tiers a session may load; it is empty by default and only the
 name rather than accepted and dropped. An enabled tier brings that tier's
 hooks — see
 [claude-agent-sdk: skills and ambient settings](providers/comparison.md#important-skills-and-ambient-settings).
+
+`auth_mode` (`"auto"` default / `"subscription"` / `"api_key"`) **selects the
+child-process authentication path** for the `claude` subprocess this provider
+spawns — it is rejected on every other provider name, the same way
+`setting_sources` is. `subscription` selects the child-process subscription
+path by passing empty `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` through
+`ClaudeAgentOptions.env`; `api_key` requires a non-empty inherited
+`ANTHROPIC_API_KEY` and clears the competing `ANTHROPIC_AUTH_TOKEN` the same
+way; `auto` preserves inherited credential resolution and is intentionally
+non-deterministic (no override is contributed at all). **No global
+`os.environ` mutation occurs** in any mode — the override is scoped to the
+per-call `ClaudeAgentOptions.env` mapping. This selects a credential path, not
+an endpoint — it composes with, and is orthogonal to, the routing fields
+above. See
+[Authentication Mode](workflow-syntax.md#authentication-mode-auth_mode)
+in the workflow syntax guide and the
+[Authentication](providers/experimental.md#authentication-claude-agent-sdk)
+section of the experimental-providers guide for the full contract, including
+the readiness preflight (`claude auth status --json`, a reachability check
+**not** billing attribution).
 
 #### Secrets
 

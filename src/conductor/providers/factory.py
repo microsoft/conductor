@@ -18,6 +18,7 @@ from conductor.providers.claude import ANTHROPIC_SDK_AVAILABLE, ClaudeProvider
 from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
     ClaudeAgentSdkProvider,
+    ClaudeAuthMode,
 )
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
@@ -256,6 +257,13 @@ async def create_provider(
                         "Remove `runtime.max_tokens` for workflows that use claude-agent-sdk."
                     ),
                 )
+            auth_mode: ClaudeAuthMode = "auto"
+            if (
+                provider_settings is not None
+                and provider_settings.name == "claude-agent-sdk"
+                and provider_settings.auth_mode is not None
+            ):
+                auth_mode = provider_settings.auth_mode
             provider = ClaudeAgentSdkProvider(
                 model=default_model,
                 max_turns=max_agent_iterations,
@@ -267,6 +275,7 @@ async def create_provider(
                     and provider_settings.name == "claude-agent-sdk"
                     else None
                 ),
+                auth_mode=auth_mode,
             )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:
@@ -300,8 +309,9 @@ async def create_provider(
             )
 
     if validate and not await provider.validate_connection():
+        hint = provider.connection_error_hint
         raise ProviderError(
-            f"Failed to connect to {provider_type} provider",
+            f"Failed to connect to {provider_type} provider" + (f": {hint}" if hint else ""),
             suggestion="Check your credentials and network connection",
         )
 

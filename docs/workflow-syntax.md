@@ -592,6 +592,76 @@ agents:
 
 See [`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml).
 
+### Authentication Mode (`auth_mode`)
+
+The optional `runtime.provider.auth_mode` field (`"auto"` default,
+`"subscription"`, `"api_key"`) **selects the child-process authentication
+path** for the `claude` CLI subprocess this provider spawns. Only the
+`claude-agent-sdk` provider reads it.
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      auth_mode: subscription   # auto | subscription | api_key
+```
+
+- **`subscription`** selects the child-process subscription path by passing
+  empty `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` through the per-call
+  `ClaudeAgentOptions.env` mapping, so the CLI falls through to whichever
+  account is already logged in — regardless of what the parent process
+  inherited.
+- **`api_key`** requires a non-empty inherited `ANTHROPIC_API_KEY` and clears
+  the competing `ANTHROPIC_AUTH_TOKEN` through the same mapping, leaving
+  `ANTHROPIC_API_KEY` untouched.
+- **`auto`** (default) **preserves inherited credential resolution** — it
+  contributes no override at all, so the child process resolves credentials
+  exactly as the SDK/CLI would with no Conductor intervention. This is
+  intentionally non-deterministic across machines and environments; treat it
+  as a compatibility default, not a resolved choice.
+
+**No global `os.environ` mutation occurs in any mode.** The override above is
+scoped to the per-call `ClaudeAgentOptions.env` mapping passed when spawning
+each `claude` subprocess — Conductor's own process environment is never
+written, and read only for the separate readiness check below.
+
+Separately from the env override, `subscription` mode (and `auto` when it
+infers a subscription-style check) runs a hard-bounded preflight —
+`claude auth status --json` — before `validate_connection()` and each
+`execute()` call, to confirm a session is reachable; `api_key` mode skips
+this subprocess entirely. **This preflight is a readiness/reachability check
+only, not billing attribution** — it must never be cited as evidence of a
+real model invocation, account plan, or usage. The preflight's internal
+result keeps Conductor's own inference separate from what the CLI reported:
+`requested_mode` / `inferred_mode` are Conductor's own fields, while
+`authMethod` / `subscriptionType` / `apiKeySource` are raw values echoed
+from the CLI's JSON response after passing through an explicit field
+allowlist — never the raw CLI payload, an account identity, or a
+billing/plan claim. `conductor doctor --check` renders both groups
+separately on the connection cell — regardless of whether the connection
+succeeded — plus a third note when `requested_mode` is `auto` stating that
+the effective credential path follows the SDK/CLI's inherited-environment
+precedence. This is what distinguishes a subscription session from an
+API-key-present session, since `authMethod` alone reports identically for
+both:
+
+```text
+$ conductor doctor --check
+claude-agent-sdk   installed   ✓ connected
+                                Conductor: requested_mode=subscription, inferred_mode=subscription
+                                SDK: authMethod=claude.ai, subscriptionType=max
+```
+
+
+A non-`auto` `auth_mode` is preserved in checkpoint serialization so the
+explicit choice is restored on `conductor resume`.
+
+See the [Authentication](providers/experimental.md#authentication-claude-agent-sdk)
+section of the experimental-providers guide for the full contract and the
+[configuration guide](configuration.md#field-compatibility-by-provider) for
+field compatibility across providers.
+
 ### Sandbox Configuration (ACA)
 
 The optional per-agent `sandbox:` block overrides settings for the

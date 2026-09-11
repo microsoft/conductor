@@ -330,16 +330,51 @@ def _credentials_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
 
 
 def _connection_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
-    """Format the connection-check result cell."""
+    """Format the connection-check result cell.
+
+    A provider-supplied ``auth_diagnostic`` (issue TICKET-20260816-0002,
+    currently only ``claude-agent-sdk``) is appended as two further lines,
+    never merged into the connection line above: a ``Conductor:`` line for
+    Conductor's own mode inference (``requested_mode``/``inferred_mode``) and
+    an ``SDK:`` line for the CLI's sanitized, as-observed fields
+    (``authMethod``/``apiKeySource``/``subscriptionType``) — the two groups a
+    subscription-vs-API-key-present distinction actually needs, since
+    ``authMethod`` alone reports identically for both. Fields the CLI didn't
+    report are omitted from the ``SDK:`` line rather than back-filled. Under
+    ``auto`` a third line states the credential follows inherited-environment
+    precedence rather than a Conductor-made selection.
+    """
+    lines: list[Text] = []
     if not diag.checked or diag.connection_ok is None:
-        return glyphs.dash
-    if diag.connection_ok and diag.connection_note:
-        return styled("{} {}", glyphs.warn, diag.connection_note)
-    if diag.connection_ok:
-        return styled("{} connected", glyphs.check)
-    if diag.connection_error:
-        return styled("{} [dim]{}[/dim]", glyphs.cross, diag.connection_error)
-    return styled("{} [dim]connection failed[/dim]", glyphs.cross)
+        base = glyphs.dash
+    elif diag.connection_ok and diag.connection_note:
+        base = styled("{} {}", glyphs.warn, diag.connection_note)
+    elif diag.connection_ok:
+        base = styled("{} connected", glyphs.check)
+    elif diag.connection_error:
+        base = styled("{} [dim]{}[/dim]", glyphs.cross, diag.connection_error)
+    else:
+        base = styled("{} [dim]connection failed[/dim]", glyphs.cross)
+    lines.append(base)
+
+    auth = diag.auth_diagnostic
+    if auth:
+        inferred = auth.get("conductor_inferred") or {}
+        observed = auth.get("sdk_observed") or {}
+        if inferred:
+            inferred_text = ", ".join(f"{k}={v}" for k, v in inferred.items() if v is not None)
+            if inferred_text:
+                lines.append(styled("[dim]Conductor: {}[/dim]", inferred_text))
+        if observed:
+            observed_text = ", ".join(f"{k}={v}" for k, v in observed.items())
+            lines.append(styled("[dim]SDK: {}[/dim]", observed_text))
+        auto_note = auth.get("auto_note")
+        if isinstance(auto_note, str) and auto_note:
+            lines.append(styled("[dim]{}[/dim]", auto_note))
+
+    if len(lines) == 1:
+        return lines[0]
+    return join("\n", lines)
 
 
 def _models_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:

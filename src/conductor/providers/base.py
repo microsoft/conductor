@@ -373,6 +373,11 @@ class AgentProvider(ABC):
         """
         return False
 
+    @property
+    def connection_error_hint(self) -> str | None:
+        """Sanitized connection failure reason for conductor doctor --check."""
+        return None
+
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         """Enforce that a production subclass declares what it can honour.
 

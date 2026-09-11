@@ -1,7 +1,7 @@
 """Unit tests for the provider factory."""
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from pydantic import SecretStr
@@ -701,3 +701,40 @@ class TestHermesFactory:
         assert provider._skip_memory is None
         assert provider._skip_context_files is None
         await provider.close()
+
+
+class TestClaudeAgentSdkAuthModeFactory:
+    """Tests auth_mode forwarding for the claude-agent-sdk provider."""
+
+    @pytest.mark.asyncio
+    async def test_auth_mode_forwarded_from_provider_settings(self) -> None:
+        settings = ProviderSettings(name="claude-agent-sdk", auth_mode="subscription")
+        with (
+            patch("conductor.providers.factory.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+        ):
+            provider = await create_provider(
+                "claude-agent-sdk",
+                validate=False,
+                provider_settings=settings,
+            )
+        assert provider._auth_mode == "subscription"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_factory_error_includes_connection_hint(self) -> None:
+        with (
+            patch("conductor.providers.factory.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch(
+                "conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider.validate_connection",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider.connection_error_hint",
+                new_callable=PropertyMock,
+                return_value="Authentication failed: Not logged in",
+            ),
+            pytest.raises(ProviderError, match="Not logged in"),
+        ):
+            await create_provider("claude-agent-sdk", validate=True)
