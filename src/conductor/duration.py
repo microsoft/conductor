@@ -14,6 +14,7 @@ to callers so the same parser can be reused for different policies.
 
 from __future__ import annotations
 
+import math
 import re
 
 _DURATION_PATTERN = re.compile(r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>ms|s|m|h)?\s*$")
@@ -64,6 +65,8 @@ def parse_duration(value: str | int | float) -> float:
         raise ValueError(f"duration must be a number or duration string, not boolean: {value!r}")
 
     if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError(f"duration must be finite, got {value!r}")
         return float(value)
 
     if not isinstance(value, str):
@@ -79,5 +82,7 @@ def parse_duration(value: str | int | float) -> float:
         )
 
     number = float(match.group("value"))
+    if not math.isfinite(number):
+        raise ValueError(f"duration must be finite, got {value!r}")
     unit = match.group("unit") or "s"
     return number * _UNIT_TO_SECONDS[unit]
