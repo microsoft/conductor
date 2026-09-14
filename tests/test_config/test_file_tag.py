@@ -331,3 +331,79 @@ agents:
 """
         config = loader.load_string(valid_yaml)
         assert config.workflow.name == "after-error"
+
+
+class TestRawFileTag:
+    """Tests for the !rawfile tag: always returns verbatim string content."""
+
+    def test_file_tag_trap_on_yaml_shaped_markdown(self) -> None:
+        """!file on a Markdown file that parses as YAML rejects a str-typed field.
+
+        Documents the trap !rawfile exists to avoid: yaml_shaped.md's prose is a
+        valid YAML mapping (a line ending in ':' followed by a '- ' bullet list),
+        so !file returns a dict where system_prompt (typed str) needs a string.
+        """
+        loader = ConfigLoader()
+        yaml_content = """\
+workflow:
+  name: file-tag-trap
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    system_prompt: !file yaml_shaped.md
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        with pytest.raises(ConfigurationError, match="valid string"):
+            loader.load_string(
+                yaml_content,
+                source_path=FIXTURES_DIR / "file_tag_trap.yaml",
+            )
+
+    def test_rawfile_bypasses_yaml_sniffing(self) -> None:
+        """!rawfile on the same YAML-shaped Markdown file stays a string."""
+        loader = ConfigLoader()
+        yaml_content = """\
+workflow:
+  name: rawfile-test
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    system_prompt: !rawfile yaml_shaped.md
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        config = loader.load_string(
+            yaml_content,
+            source_path=FIXTURES_DIR / "rawfile_test.yaml",
+        )
+        assert isinstance(config.agents[0].system_prompt, str)
+        assert "Summarize the changelog" in config.agents[0].system_prompt
+
+    def test_rawfile_missing_file_raises_configuration_error(self) -> None:
+        """!rawfile shares !file's missing-file error handling."""
+        loader = ConfigLoader()
+        yaml_content = """\
+workflow:
+  name: rawfile-missing-test
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    system_prompt: !rawfile nonexistent.md
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        with pytest.raises(ConfigurationError, match="File not found"):
+            loader.load_string(
+                yaml_content,
+                source_path=FIXTURES_DIR / "rawfile_missing_test.yaml",
+            )
