@@ -31,6 +31,7 @@ from conductor.fleet.tui.anim import FRAME_INTERVAL
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens import runs as runs_module
 from conductor.fleet.tui.screens.runs import RunScan, RunsScreen, _collect_runs
+from conductor.fleet.tui.screens.splash import SplashScreen
 from tests.test_fleet.conftest import settle, wait_for
 
 # ---------------------------------------------------------------------------
@@ -2147,6 +2148,9 @@ class TestRunsScreenPausesWhileNotOnTop:
         and leaving it alone.
         """
         monkeypatch.delenv("CONDUCTOR_FLEET_NO_ANIM", raising=False)
+        # Keep the splash in place regardless of runner speed. Its own tests
+        # cover dismissal; this test controls when the Runs screen is uncovered.
+        monkeypatch.setattr(SplashScreen, "_dismiss", lambda self: None)
         self._seed_gated_run(tmp_path)
 
         ticks: list[int] = []
@@ -2162,27 +2166,27 @@ class TestRunsScreenPausesWhileNotOnTop:
         async with app.run_test() as pilot:
             # Animation is on, so the splash is pushed over the Runs screen.
             await pilot.pause()
+            assert isinstance(app.screen, SplashScreen)
             # The timer is created by `on_mount` and must already be paused
             # under the splash -- the launch-time case of the same bug.
             runs = next(s for s in app.screen_stack if isinstance(s, RunsScreen))
             assert runs._anim_timer is not None
             ticks.clear()
             await asyncio.sleep(FRAME_INTERVAL * 4)
+            assert isinstance(app.screen, SplashScreen)
             assert ticks == [], "the timer must not fire while the splash covers the fleet"
 
-            await pilot.press("x")
-            for _ in range(40):
-                await pilot.pause()
-                if isinstance(app.screen, RunsScreen):
-                    break
-                await asyncio.sleep(0.05)
+            app.pop_screen()
+            await pilot.pause()
             screen = app.screen
             assert isinstance(screen, RunsScreen)
 
             ticks.clear()
-            await asyncio.sleep(FRAME_INTERVAL * 4)
-            await pilot.pause()
-            assert ticks, "the timer fires while the Runs screen is on top"
+            await wait_for(
+                pilot,
+                lambda: bool(ticks),
+                message="the timer fires while the Runs screen is on top",
+            )
 
             app.push_screen(GateOptionsModal(_gate_info()))
             await pilot.pause()
@@ -2194,9 +2198,11 @@ class TestRunsScreenPausesWhileNotOnTop:
             app.pop_screen()
             await pilot.pause()
             ticks.clear()
-            await asyncio.sleep(FRAME_INTERVAL * 4)
-            await pilot.pause()
-            assert ticks, "the timer fires again once the gate is answered"
+            await wait_for(
+                pilot,
+                lambda: bool(ticks),
+                message="the timer fires again once the gate is answered",
+            )
 
 
 class TestAwaitNextGateThreading:
