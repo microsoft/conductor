@@ -1014,16 +1014,19 @@ output:
     # Record every attach/detach with its owning task so the assertions below
     # observe what production code actually did — an uninstalled spy would
     # make the cross-task-detach assertion vacuous. contextvars.Token is
-    # unhashable, so recordings key on id(token).
+    # unhashable, so recordings key on id(token). Retain every token until the
+    # assertions finish so Python cannot reuse an ID and overwrite its owner.
     otel_context_module = sys.modules["opentelemetry.context"]
     original_attach = otel_context_module.attach
     original_detach = otel_context_module.detach
     main_task = asyncio.current_task()
+    attached_tokens: list[object] = []
     attach_owner: dict[int, asyncio.Task[None] | None] = {}
     detach_events: list[tuple[int, asyncio.Task[None] | None]] = []
 
     def recording_attach(context: Any) -> object:
         token = original_attach(context)
+        attached_tokens.append(token)
         attach_owner[id(token)] = asyncio.current_task()
         return token
 
