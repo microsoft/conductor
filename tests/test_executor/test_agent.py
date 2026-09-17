@@ -695,8 +695,9 @@ class TestAgentExecutorWithTools:
         await executor.execute(agent, {})
 
         call_history = provider.get_call_history()
-        # Agent should get empty list when workflow has no tools
-        assert call_history[0]["tools"] == []
+        # Neither side declared tools -> unconstrained (None), never an
+        # empty allowlist that a passthrough provider reads as "no tools".
+        assert call_history[0]["tools"] is None
 
     @pytest.mark.asyncio
     async def test_execute_with_unknown_tools_raises_error(self) -> None:
@@ -790,10 +791,27 @@ class TestResolveAgentTools:
         assert "web_search" in exc_info.value.suggestion
 
     def test_empty_workflow_tools_with_none_agent_tools(self) -> None:
-        """Test that empty workflow tools with None agent tools returns empty."""
+        """Explicit workflow ``tools: []`` with None agent tools returns empty."""
         workflow_tools: list[str] = []
         result = resolve_agent_tools(None, workflow_tools)
         assert result == []
+
+    def test_undeclared_workflow_tools_with_none_agent_tools_returns_none(self) -> None:
+        """Regression: neither side declared tools -> None, not [].
+
+        ``[]`` here made every tools-omitting agent in a workflow without
+        ``tools:`` run toolless on providers that honour the allowlist (pi).
+        """
+        assert resolve_agent_tools(None, None) is None
+
+    def test_undeclared_workflow_tools_with_empty_agent_tools_returns_empty(self) -> None:
+        """Explicit agent ``tools: []`` is still "no tools" without a workflow list."""
+        assert resolve_agent_tools([], None) == []
+
+    def test_undeclared_workflow_tools_with_agent_tools_raises(self) -> None:
+        """An agent cannot narrow a workflow list that was never declared."""
+        with pytest.raises(ValidationError, match="unknown tools"):
+            resolve_agent_tools(["tool_a"], None)
 
     def test_empty_workflow_tools_with_agent_tools_raises(self) -> None:
         """Test that agent tools with empty workflow tools raises error."""

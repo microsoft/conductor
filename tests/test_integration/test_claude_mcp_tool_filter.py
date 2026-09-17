@@ -220,8 +220,8 @@ class TestMcpToolsReachApiInWorkflow:
             output={"content": "{{ reader.output.content }}"},
         )
 
-        # Sanity: the workflow has no explicit tools
-        assert config.tools == []
+        # Sanity: the workflow has no explicit tools (undeclared, not [])
+        assert config.tools is None
 
         with _patch_build_agent(captured, {"content": "hello world"}):
             engine = WorkflowEngine(config, provider)
@@ -284,7 +284,7 @@ class TestWorkflowYamlWithMcpServers:
     """Test loading and validating a workflow YAML that mirrors the issue repro."""
 
     def test_load_mcp_workflow_has_empty_tools(self, tmp_path) -> None:
-        """A workflow with mcp_servers but no tools: section has config.tools == []."""
+        """A workflow with mcp_servers but no tools: section has config.tools is None."""
         workflow_yaml = tmp_path / "mcp_workflow.yaml"
         workflow_yaml.write_text("""\
 workflow:
@@ -312,8 +312,8 @@ agents:
 
         config = load_workflow(str(workflow_yaml))
 
-        # The workflow has no `tools:` key → defaults to []
-        assert config.tools == []
+        # The workflow has no `tools:` key → undeclared (None), not []
+        assert config.tools is None
 
         # But mcp_servers IS configured
         assert "filesystem" in config.workflow.runtime.mcp_servers

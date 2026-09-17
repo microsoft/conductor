@@ -343,7 +343,9 @@ def validate_workflow_config(
 
         # Validate tool references (skip for script, set, and wait agents — they don't use tools)
         if agent.tools is not None and agent.tools and agent.type not in ("script", "set", "wait"):
-            tool_errors = _validate_tool_references(agent.name, agent.tools, set(config.tools))
+            tool_errors = _validate_tool_references(
+                agent.name, agent.tools, set(config.tools or [])
+            )
             errors.extend(tool_errors)
 
         # Warn when an LLM agent has system_prompt but no (non-empty) prompt.

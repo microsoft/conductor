@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Omitted workflow-level `tools:` no longer resolves to an empty allowlist** —
+  `WorkflowConfig.tools` defaulted to `[]`, making a workflow that never
+  mentioned tools indistinguishable from one that wrote `tools: []`. Every
+  agent that also omitted its own `tools:` therefore resolved to `[]`, and a
+  provider honouring the allowlist (`pi`, once
+  `workflow_tools_passthrough=True` landed) ran the model with zero tools —
+  surfacing only as a downstream `ValidationError: Response was not a JSON
+  object`. `WorkflowConfig.tools` is now `list[str] | None = None`, matching
+  `AgentDef.tools`' three-state convention, and `resolve_agent_tools` returns
+  `None` ("unconstrained, provider default") when neither side declared tools.
+  An explicit `tools: []` at either level still means "no tools".
 - **Pydantic AI structured-output agents explicitly require `final_result`** —
   the generated output tool now tells models that they must call it before
   finishing and that plain-text responses are not accepted. This improves

@@ -1163,7 +1163,7 @@ def _validate_skill_entries(entries: list[str]) -> list[str]:
     return entries
 
 
-ProviderName = Literal["copilot", "openai", "claude", "claude-agent-sdk", "hermes", "aca"]
+ProviderName = Literal["copilot", "openai", "claude", "claude-agent-sdk", "hermes", "aca", "pi"]
 """Canonical set of supported agent provider names.
 
 Used by :attr:`AgentDef.provider` and :attr:`ProviderSettings.name` so the
@@ -4074,8 +4074,23 @@ class WorkflowConfig(BaseModel):
     workflow: WorkflowDef
     """Workflow-level settings."""
 
-    tools: list[str] = Field(default_factory=list)
-    """Tools available to agents in this workflow."""
+    tools: list[str] | None = None
+    """Tools available to agents in this workflow.
+
+    Three-state, mirroring :attr:`AgentDef.tools`:
+
+    * ``None`` (omitted) -- no workflow-level constraint. An agent that also
+      omits its own ``tools:`` resolves to ``None`` and the provider applies
+      its own default toolset.
+    * ``[]`` -- explicitly no tools. An agent that omits ``tools:`` resolves
+      to ``[]`` and the provider disables its tools.
+    * ``[name, ...]`` -- explicit allowlist agents inherit or narrow.
+
+    The former ``default_factory=list`` made an omitted ``tools:`` identical
+    to an explicit ``tools: []``, so every agent in a workflow that never
+    mentioned tools was handed an empty allowlist -- fatal for a provider
+    that honours it (``pi`` after ``workflow_tools_passthrough=True``).
+    """
 
     agents: list[AgentDef]
     """Agent definitions."""

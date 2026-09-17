@@ -135,38 +135,46 @@ def _merge_skills(
 
 def resolve_agent_tools(
     agent_tools: list[str] | None,
-    workflow_tools: list[str],
-) -> list[str]:
+    workflow_tools: list[str] | None,
+) -> list[str] | None:
     """Resolve which tools an agent should have access to.
 
     The resolution follows these rules:
-    - agent_tools=None (omitted): Agent gets ALL workflow tools
+    - agent_tools=None (omitted): Agent gets ALL workflow tools. When the
+      workflow itself declared no ``tools:`` (``workflow_tools=None``) the
+      result is ``None`` -- "unconstrained, provider default" -- rather
+      than ``[]``, which providers honouring the allowlist read as "no
+      tools at all".
     - agent_tools=[] (empty list): Agent gets NO tools
     - agent_tools=[list]: Agent gets only specified tools (must be subset of workflow)
 
     Args:
         agent_tools: Agent's tool specification (None=all, []=none, [list]=subset)
-        workflow_tools: Tools defined at workflow level
+        workflow_tools: Tools defined at workflow level (None=undeclared,
+            []=explicitly none, [list]=allowlist)
 
     Returns:
-        List of tool names for this agent
+        List of tool names for this agent, or ``None`` when neither the
+        agent nor the workflow constrained tools.
 
     Raises:
         ValidationError: If agent specifies tools not in workflow tools
     """
     if agent_tools is None:
-        # None means all workflow tools
-        return workflow_tools.copy()
+        # None means all workflow tools; an undeclared workflow list stays
+        # undeclared so the provider applies its own default.
+        return None if workflow_tools is None else workflow_tools.copy()
 
     if not agent_tools:
         # Empty list means no tools
         return []
 
-    # Validate subset
-    invalid = set(agent_tools) - set(workflow_tools)
+    # Validate subset. An undeclared workflow list offers nothing to narrow.
+    available = workflow_tools or []
+    invalid = set(agent_tools) - set(available)
     if invalid:
         sorted_invalid = sorted(invalid)
-        sorted_available = sorted(workflow_tools)
+        sorted_available = sorted(available)
         raise ValidationError(
             f"Agent specifies unknown tools: {sorted_invalid}",
             suggestion=f"Available workflow tools: {sorted_available}",
@@ -208,7 +216,9 @@ class AgentExecutor:
 
         Args:
             provider: The agent provider to use for execution.
-            workflow_tools: Tools defined at workflow level. Defaults to empty list.
+            workflow_tools: Tools defined at workflow level. ``None`` (the
+                default) means the workflow declared none, which is distinct
+                from an explicit ``[]``; see :func:`resolve_agent_tools`.
             instructions_preamble: Optional workspace instructions text to prepend
                 to every agent's rendered prompt.
             workflow_skills: Workflow-level default skills (from
@@ -240,7 +250,7 @@ class AgentExecutor:
                 fetch rather than told the marketplace does not exist.
         """
         self.provider = provider
-        self.workflow_tools = workflow_tools or []
+        self.workflow_tools: list[str] | None = workflow_tools
         self.instructions_preamble = instructions_preamble
         self._workflow_skills: list[str] = list(workflow_skills or [])
         self._workflow_dir = workflow_dir

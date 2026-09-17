@@ -82,6 +82,9 @@ Thumbs.db
 src/conductor/web/frontend/node_modules/
 src/conductor/designer/frontend/node_modules/
 
+# Pi SDK runner dependencies
+src/conductor/providers/_pi/node_modules/
+
 .playwright-mcp/
 
 # Scratch / temporary working files

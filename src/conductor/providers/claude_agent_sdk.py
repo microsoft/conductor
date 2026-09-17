@@ -1641,12 +1641,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         to the SDK rather than silently grant the wrong native tools.
 
         The ``tools`` argument is the executor's *resolved* list from
-        :func:`conductor.executor.agent.resolve_agent_tools`. That function
-        erases the distinction between an omitted ``tools:`` and an explicit
-        ``tools: []``: both arrive here as an empty list whenever the
-        workflow declares no workflow-level ``tools:`` (``config.tools`` is
-        empty; a non-empty list makes an omitted agent resolve non-empty). We
-        therefore consult the RAW ``agent.tools`` field — the only place the
+        :func:`conductor.executor.agent.resolve_agent_tools`. Since the
+        ``WorkflowConfig.tools`` default became ``None``, an omitted agent
+        ``tools:`` in a workflow that declares none arrives here as ``None``
+        rather than ``[]``; but a workflow-level explicit ``tools: []`` still
+        makes an omitted agent resolve to ``[]``, so we keep consulting the
+        RAW ``agent.tools`` field — the only place the per-agent
         omitted-vs-explicit signal survives — to pick the default.
 
         Semantics:

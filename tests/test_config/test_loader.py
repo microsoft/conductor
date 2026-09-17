@@ -307,7 +307,8 @@ agents:
       - to: $end
 """
         config = load_config_string(yaml_content)
-        assert config.tools == []
+        # Undeclared, not explicitly empty: distinct from ``tools: []``.
+        assert config.tools is None
 
     def test_route_to_end(self) -> None:
         """Test that $end is a valid route target."""
