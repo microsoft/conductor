@@ -381,6 +381,21 @@ def test_blocked_package_index_reports_guidance_and_skips_retries(
     )
 
 
+def test_blocked_index_offers_credential_safe_pip_bridge(
+    sandbox: Sandbox, wheels: WheelPair
+) -> None:
+    """Offer a bridge without reading or printing the configured index URL."""
+    shim_env = _install_uv_shim(sandbox, mode="network-always")
+
+    result = run_install_script(sandbox, source=wheels.new, force=True, extra_env=shim_env)
+
+    assert result.returncode != 0, f"install should have failed:\n{result.combined}"
+    combined = result.combined
+    assert "If pip already works" in combined
+    assert "pip config get global.index-url" in combined
+    assert "UV_DEFAULT_INDEX" in combined
+
+
 def test_ordinary_failure_still_retries_and_shows_no_index_guidance(
     sandbox: Sandbox, wheels: WheelPair
 ) -> None:

@@ -252,6 +252,18 @@ def test_install_scripts_name_the_uv_index_variable() -> None:
         )
 
 
+def test_install_scripts_recommend_current_system_certificate_setting() -> None:
+    """TLS guidance should lead with uv's current, non-deprecated setting."""
+    for path in (INSTALL_SH, INSTALL_PS1):
+        body = _guidance_body(path)
+        assert "UV_SYSTEM_CERTS=1" in body, (
+            f"{path.name}'s guidance must recommend uv's current system-certificate setting"
+        )
+        assert "legacy UV_NATIVE_TLS=1" in body, (
+            f"{path.name}'s guidance should retain a compatibility note for uv older than 0.11"
+        )
+
+
 def test_install_scripts_do_not_hardcode_a_private_index() -> None:
     """Neither script may ship a specific organization's package mirror.
 
