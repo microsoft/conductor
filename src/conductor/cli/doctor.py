@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from rich.table import Table
 from rich.text import Text
 
-from conductor.console import MarkupFreeConsole, join, styled
+from conductor.console import MarkupFreeConsole, join, select_console_glyph, styled
 from conductor.providers.capabilities import known_provider_names
 from conductor.providers.diagnostics import (
     ALL_SECTIONS,
@@ -49,61 +49,29 @@ class _Glyphs(NamedTuple):
     (issue #319)."""
 
 
-_UNICODE_GLYPHS = _Glyphs(
-    check=Text.from_markup("[green]✓[/green]"),
-    cross=Text.from_markup("[red]✗[/red]"),
-    dash=Text.from_markup("[dim]—[/dim]"),
-    warn=Text.from_markup("[yellow]⚠[/yellow]"),
-    optional="○",
-)
-_ASCII_GLYPHS = _Glyphs(
-    check=Text.from_markup("[green]OK[/green]"),
-    cross=Text.from_markup("[red]X[/red]"),
-    dash=Text.from_markup("[dim]-[/dim]"),
-    warn=Text.from_markup("[yellow]![/yellow]"),
-    optional="o",
-)
-
-
-def _encodable(text: str, encoding: str | None) -> bool:
-    """Whether *text* can be encoded to *encoding*.
-
-    A falsy ``encoding`` is treated as capable so an in-memory buffer is not
-    needlessly downgraded. ``io.StringIO`` has an ``.encoding`` of ``None``;
-    rich's ``NULL_FILE`` has no such attribute at all. This is a deliberate
-    fail-open: a stream that is lossy *and* silent about its encoding (e.g.
-    ``codecs.getwriter``) will still raise.
-    """
-    if not encoding:
-        return True
-    try:
-        text.encode(encoding)
-    except (UnicodeEncodeError, LookupError):
-        return False
-    return True
-
-
 def _resolve_glyphs(console: MarkupFreeConsole) -> _Glyphs:
     """Pick Unicode or ASCII-safe glyphs for *console*'s stream encoding.
 
     Rich hands a rendered line straight to the underlying file's ``write()``;
     it does not check whether the target encoding can represent it. A legacy
-    Windows console (``cp1252``) cannot encode ``✓``/``✗``/``○``/``⚠``, so the
-    table dies mid-write, part-printed (issue #401). Resolved once per
+    Windows console (``cp1252``) cannot encode ``✓``/``✗``/``○``/``⚠`` but
+    *does* encode ``—``, so the table dies mid-write, part-printed, unless
+    each glyph is checked on its own (issue #401). Resolved once per
     ``run_doctor`` call and passed down rather than re-checked per cell, so
     every cell in one report agrees.
 
-    Probed per glyph rather than through rich's ``ConsoleOptions.ascii_only``,
-    which is a ``startswith("utf")`` prefix test: ``gb18030`` encodes all of
-    these and that check would downgrade it for nothing.
+    Selection is delegated to :func:`conductor.console.select_console_glyph`,
+    which probes per glyph rather than through rich's
+    ``ConsoleOptions.ascii_only`` (a ``startswith("utf")`` prefix test):
+    ``gb18030`` encodes all of these and that check would downgrade it for
+    nothing.
     """
-    encoding = console.encoding
     return _Glyphs(
-        check=_UNICODE_GLYPHS.check if _encodable("✓", encoding) else _ASCII_GLYPHS.check,
-        cross=_UNICODE_GLYPHS.cross if _encodable("✗", encoding) else _ASCII_GLYPHS.cross,
-        dash=_UNICODE_GLYPHS.dash if _encodable("—", encoding) else _ASCII_GLYPHS.dash,
-        warn=_UNICODE_GLYPHS.warn if _encodable("⚠", encoding) else _ASCII_GLYPHS.warn,
-        optional=_UNICODE_GLYPHS.optional if _encodable("○", encoding) else _ASCII_GLYPHS.optional,
+        check=styled("[green]{}[/green]", select_console_glyph(console, "✓", "OK")),
+        cross=styled("[red]{}[/red]", select_console_glyph(console, "✗", "X")),
+        dash=styled("[dim]{}[/dim]", select_console_glyph(console, "—", "-")),
+        warn=styled("[yellow]{}[/yellow]", select_console_glyph(console, "⚠", "!")),
+        optional=select_console_glyph(console, "○", "o"),
     )
 
 
@@ -396,8 +364,7 @@ _PRICING_SOURCE_CELLS: dict[str, Text] = {
 """Pre-built cells for each :attr:`ModelDiagnostic.pricing_source` literal
 (issue #386), plus the synthetic ``"error"`` key used for ``None`` (pricing
 resolution itself failed). Built as module-level constants to avoid
-re-parsing the same markup literal on every table row (matching the
-``_UNICODE_GLYPHS``/``_ASCII_GLYPHS`` constants above) — each markup argument
+re-parsing the same markup literal on every table row — each markup argument
 is still a literal template, not an interpolated value, keeping this inside
 the repo's console rules (see AGENTS.md "Console Output"). Every value here
 is pure ASCII, so no fallback applies: a property of these four literals,

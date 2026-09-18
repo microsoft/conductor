@@ -26,7 +26,7 @@ from rich.text import Text
 
 from conductor.config.loader import load_config
 from conductor.config.schema import AgentDef
-from conductor.console import MarkupFreeConsole, join, make_console, styled
+from conductor.console import MarkupFreeConsole, join, make_console, select_console_glyph, styled
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
@@ -2635,11 +2635,15 @@ async def run_workflow_async(
             logger.warning("Failed to close workflow file logging", exc_info=True)
 
 
-def format_routes(routes: list[dict[str, Any]]) -> Text:
+def format_routes(routes: list[dict[str, Any]], *, arrow: str = "\u2192") -> Text:
     """Format routes for display in the dry-run table.
 
     Args:
         routes: List of route dictionaries with 'to', 'when', and 'is_conditional' keys.
+        arrow: Glyph used to denote a route target. Defaults to the Unicode
+            arrow for historical one-argument callers; ``display_execution_plan``
+            resolves and passes an ASCII-safe substitute when the output
+            console's stream cannot encode it (issue #505).
 
     Returns:
         Formatted representation of routes.
@@ -2654,9 +2658,9 @@ def format_routes(routes: list[dict[str, Any]]) -> Text:
             # Truncate long conditions
             if len(condition) > 40:
                 condition = condition[:37] + "..."
-            parts.append(styled("→ {} [dim](if {})[/dim]", route["to"], condition))
+            parts.append(styled("{} {} [dim](if {})[/dim]", arrow, route["to"], condition))
         else:
-            parts.append(f"→ {route['to']}")
+            parts.append(styled("{} {}", arrow, route["to"]))
     # ``parts`` cannot be empty: ``routes`` is non-empty past the guard above
     # and every iteration appends.
     return join("\n", parts)
@@ -2673,6 +2677,14 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
         console: Optional Rich console. Creates one if not provided.
     """
     output_console = console if console is not None else make_console()
+
+    # Resolved once against the actual output console rather than probed per
+    # row: a legacy stream (e.g. Windows cp1252) cannot encode these glyphs,
+    # and rich hands a rendered line straight to the stream's write() with no
+    # encoding check of its own, so an unresolved arrow or marker would crash
+    # the render mid-table instead of degrading to ASCII (issue #505).
+    arrow = select_console_glyph(output_console, "\u2192", "->")
+    parallel_marker = select_console_glyph(output_console, "\u26a1", "*")
 
     # Header panel with workflow metadata
     timeout_display = f"{plan.timeout_seconds}s" if plan.timeout_seconds else "unlimited"
@@ -2697,7 +2709,7 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
     table.add_column("Routes")
 
     for i, step in enumerate(plan.steps, 1):
-        routes_str = format_routes(step.routes)
+        routes_str = format_routes(step.routes, arrow=arrow)
         # Interpolated via ``styled`` rather than an f-string at the two call
         # sites below: an f-string renders a ``Text`` as its plain form, which
         # would silently drop the yellow that makes a loop target stand out
@@ -2727,7 +2739,7 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
                 )
                 table.add_row(
                     "",
-                    styled("[dim]  ⚡ {}[/dim]", agents_display),
+                    styled("[dim]  {} {}[/dim]", parallel_marker, agents_display),
                     "",
                     "",
                     "",

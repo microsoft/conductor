@@ -24,7 +24,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from conductor.console import join, make_console, styled
+from conductor.console import join, make_console, select_console_glyph, styled
 
 # Values that a workflow, an agent name, a plugin manifest or an exception
 # string can genuinely contain. Split by failure mode, because they fail
@@ -551,3 +551,104 @@ class TestHighlightingIsPreserved:
         before = buf.getvalue()
         after = self._ansi(styled("[dim]Total:[/dim] {} checkpoint(s)", 1353))
         assert after == before
+
+
+class TestSelectConsoleGlyph:
+    """Tests for :func:`select_console_glyph` (issue #505).
+
+    A legacy stream (Windows ``cp1252``, or any encoding narrower than
+    Unicode) cannot represent an arbitrary conductor-authored glyph; rich
+    hands a rendered line straight to the stream's ``write()`` with no
+    encoding check of its own, so an unresolved glyph crashes the render
+    mid-write. The selector must be probed per glyph and against the actual
+    console passed in, not against ambient stdout.
+    """
+
+    ARROW = "\u2192"
+    ASCII_ARROW = "->"
+    EM_DASH = "\u2014"
+    ASCII_DASH = "-"
+
+    @staticmethod
+    def _console(encoding: str) -> Console:
+        buf = io.BytesIO()
+        stream = io.TextIOWrapper(buf, encoding=encoding, newline="")
+        return make_console(file=stream, width=200)
+
+    def test_cp1252_falls_back_for_an_unrepresentable_glyph(self) -> None:
+        console = self._console("cp1252")
+        assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ASCII_ARROW
+
+    def test_cp1252_retains_a_representable_glyph(self) -> None:
+        """cp1252 supports the em dash even though it rejects the arrow.
+
+        Selection is per glyph, not a single yes/no verdict for the whole
+        encoding.
+        """
+        console = self._console("cp1252")
+        assert select_console_glyph(console, self.EM_DASH, self.ASCII_DASH) == self.EM_DASH
+
+    def test_ascii_falls_back(self) -> None:
+        console = self._console("ascii")
+        assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ASCII_ARROW
+
+    def test_utf8_retains_unicode(self) -> None:
+        console = self._console("utf-8")
+        assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ARROW
+
+    def test_gb18030_retains_unicode(self) -> None:
+        """A representable non-UTF encoding keeps the Unicode glyph.
+
+        ``gb18030`` is neither ASCII nor a UTF encoding, but it can encode
+        the arrow -- the selector must not downgrade it just because it is
+        unfamiliar.
+        """
+        console = self._console("gb18030")
+        assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ARROW
+
+    def test_missing_encoding_retains_unicode(self) -> None:
+        """A stream with no ``.encoding`` (e.g. ``io.StringIO``) is treated
+        as capable of anything rather than downgraded."""
+        stream = io.StringIO()
+        assert stream.encoding is None
+        console = make_console(file=stream, width=200)
+        assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ARROW
+
+    def test_falsy_encoding_metadata_retains_unicode(self) -> None:
+        """The fail-open branch: an explicitly falsy ``console.encoding``
+        (``None`` or ``""``) is treated as capable of anything, exercised
+        directly rather than through rich's own ``Console.encoding``
+        fallback (which never reports a falsy value)."""
+
+        class _NoEncodingConsole:
+            encoding = None
+
+        assert (
+            select_console_glyph(_NoEncodingConsole(), self.ARROW, self.ASCII_ARROW)  # type: ignore[arg-type]
+            == self.ARROW
+        )
+
+    def test_invalid_encoding_name_falls_back(self) -> None:
+        """A ``LookupError`` (bogus encoding name) degrades to ASCII rather
+        than raising out of the selector."""
+
+        class _BogusEncodingConsole:
+            encoding = "not-a-real-encoding"
+
+        assert (
+            select_console_glyph(_BogusEncodingConsole(), self.ARROW, self.ASCII_ARROW)  # type: ignore[arg-type]
+            == self.ASCII_ARROW
+        )
+
+    def test_uses_the_supplied_console_not_ambient_stdout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The console passed in is what is probed, never ``sys.stdout``."""
+        import sys
+
+        class _FakeStdout:
+            encoding = "utf-8"
+
+        monkeypatch.setattr(sys, "stdout", _FakeStdout())
+        console = self._console("cp1252")
+        assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ASCII_ARROW

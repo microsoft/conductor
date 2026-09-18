@@ -25,6 +25,7 @@ from conductor.cli.run import (
     parse_input_flags,
     parse_input_json_flags,
 )
+from conductor.console import make_console
 from conductor.mcp_auth import resolve_mcp_env_vars
 
 runner = CliRunner()
@@ -869,6 +870,206 @@ output:
         # Should show parallel group stats in summary
         assert "Parallel groups:" in result.output
 
+    # --- Encoding fallback (issue #505) -------------------------------------
+    #
+    # Dry-run rendering degrades to ASCII markers on a stream that cannot
+    # encode the arrow (U+2192) or parallel-group marker (U+26A1), instead of
+    # crashing mid-render. Follows
+    # ``test_doctor.py::TestDoctorEncodingFallback`` rather than trusting
+    # ``CliRunner``'s UTF-8 capture: binding the CLI's console to a
+    # ``TextIOWrapper`` in the target encoding makes a leaked glyph raise
+    # ``UnicodeEncodeError`` at write time under ``errors="strict"``, and lets
+    # a ``errors="surrogateescape"`` variant assert on the exact decoded
+    # content rather than merely "did not raise" (which that error handler
+    # would satisfy even for a leaked glyph).
+
+    @pytest.fixture(autouse=True)
+    def _no_update_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", "1")
+
+    def _bind_console(
+        self, monkeypatch: pytest.MonkeyPatch, encoding: str, *, errors: str = "strict"
+    ) -> tuple[object, object]:
+        """Point the CLI's output console at a fresh buffer with *encoding*."""
+        import importlib
+        import io
+
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding=encoding, errors=errors, newline="")
+        app_module = importlib.import_module("conductor.cli.app")
+        monkeypatch.setattr(app_module, "output_console", make_console(file=stream, width=200))
+        return buffer, stream
+
+    @staticmethod
+    def _ordinary_workflow(tmp_path: Path) -> Path:
+        workflow_file = tmp_path / "ordinary.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: encoding-test
+  entry_point: checker
+
+agents:
+  - name: checker
+    model: gpt-4
+    prompt: "Check condition"
+    routes:
+      - to: success_handler
+        when: "{{ output.success }}"
+      - to: failure_handler
+        when: "{{ not output.success }}"
+
+  - name: success_handler
+    model: gpt-4
+    prompt: "Handle success"
+    routes:
+      - to: $end
+
+  - name: failure_handler
+    model: gpt-4
+    prompt: "Handle failure"
+    routes:
+      - to: checker
+
+output:
+  result: "done"
+""")
+        return workflow_file
+
+    @staticmethod
+    def _parallel_workflow(tmp_path: Path) -> Path:
+        workflow_file = tmp_path / "parallel.yaml"
+        workflow_file.write_text("""\
+workflow:
+  name: encoding-parallel-test
+  entry_point: coordinator
+
+agents:
+  - name: coordinator
+    model: gpt-4
+    prompt: "Start parallel tasks"
+    routes:
+      - to: parallel_research
+
+  - name: research_a
+    model: gpt-4
+    prompt: "Research A"
+
+  - name: research_b
+    model: gpt-4
+    prompt: "Research B"
+
+  - name: synthesizer
+    model: gpt-4
+    prompt: "Synthesize results"
+    routes:
+      - to: $end
+
+parallel:
+  - name: parallel_research
+    agents:
+      - research_a
+      - research_b
+    failure_mode: fail_fast
+    routes:
+      - to: synthesizer
+
+output:
+  result: "{{ synthesizer.output }}"
+""")
+        return workflow_file
+
+    @pytest.mark.parametrize("errors", ["strict", "surrogateescape"])
+    def test_cp1252_ordinary_workflow_renders_ascii_arrow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, errors: str
+    ) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "cp1252", errors=errors)
+        workflow_file = self._ordinary_workflow(tmp_path)
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            result = runner.invoke(app, ["run", str(workflow_file), "--dry-run"])
+        stream.flush()
+
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert not mock_run.called
+
+        output = buffer.getvalue().decode("cp1252")
+        assert "\u2192" not in output
+        assert "-> success_handler" in output
+        assert "(if" in output
+        assert "-> failure_handler" in output
+        assert "-> checker" in output
+        assert "$end" in output
+        assert "checker" in output
+        assert "Total steps: 3" in output
+        assert "Loop targets: 1" in output
+
+    @pytest.mark.parametrize("errors", ["strict", "surrogateescape"])
+    def test_cp1252_parallel_workflow_renders_ascii_markers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, errors: str
+    ) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "cp1252", errors=errors)
+        workflow_file = self._parallel_workflow(tmp_path)
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            result = runner.invoke(app, ["run", str(workflow_file), "--dry-run"])
+        stream.flush()
+
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert not mock_run.called
+
+        output = buffer.getvalue().decode("cp1252")
+        assert "\u2192" not in output
+        assert "\u26a1" not in output
+        assert "-> parallel_research" in output
+        assert "-> synthesizer" in output
+        assert "* research_a, research_b" in output
+        assert "research_a" in output
+        assert "research_b" in output
+        assert "fail_fast" in output
+        assert "Total steps: 3" in output
+        assert "Parallel groups: 1" in output
+        assert "Parallel agents: 2" in output
+
+    def test_ascii_console_renders_ascii_arrow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "ascii")
+        workflow_file = self._ordinary_workflow(tmp_path)
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            result = runner.invoke(app, ["run", str(workflow_file), "--dry-run"])
+        stream.flush()
+
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert not mock_run.called
+
+        output = buffer.getvalue().decode("ascii")
+        assert "-> success_handler" in output
+        assert "-> failure_handler" in output
+
+    def test_utf8_console_keeps_unicode_arrow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "utf-8")
+        workflow_file = self._parallel_workflow(tmp_path)
+
+        with patch("conductor.cli.run.run_workflow_async") as mock_run:
+            result = runner.invoke(app, ["run", str(workflow_file), "--dry-run"])
+        stream.flush()
+
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert not mock_run.called
+
+        output = buffer.getvalue().decode("utf-8")
+        assert "\u2192 parallel_research" in output
+        assert "\u2192 synthesizer" in output
+        assert "\u26a1 research_a, research_b" in output
+        assert "->" not in output
+
 
 class TestDryRunDisplayFunctions:
     """Tests for dry-run display helper functions."""
@@ -919,6 +1120,60 @@ class TestDryRunDisplayFunctions:
         result = format_routes(routes)
         # Should be truncated
         assert "..." in result
+
+    def test_format_routes_default_arrow_is_unicode(self) -> None:
+        """One-argument callers keep the historical Unicode arrow (issue #505)."""
+        from conductor.cli.run import format_routes
+
+        routes = [{"to": "next_agent", "when": None, "is_conditional": False}]
+        result = format_routes(routes).plain
+        assert "\u2192" in result
+        assert "->" not in result
+
+    def test_format_routes_explicit_ascii_arrow_unconditional(self) -> None:
+        """An unconditional route renders with the supplied ASCII arrow."""
+        from conductor.cli.run import format_routes
+
+        routes = [{"to": "next_agent", "when": None, "is_conditional": False}]
+        result = format_routes(routes, arrow="->").plain
+        assert "-> next_agent" in result
+        assert "\u2192" not in result
+
+    def test_format_routes_explicit_ascii_arrow_conditional(self) -> None:
+        """A conditional route renders with the supplied ASCII arrow too."""
+        from conductor.cli.run import format_routes
+
+        routes = [{"to": "next_agent", "when": "output.success", "is_conditional": True}]
+        result = format_routes(routes, arrow="->").plain
+        assert "-> next_agent" in result
+        assert "if" in result.lower()
+        assert "\u2192" not in result
+
+    def test_format_routes_explicit_arrow_empty_routes_unaffected(self) -> None:
+        """``$end`` rendering does not involve the arrow at all."""
+        from conductor.cli.run import format_routes
+
+        result = format_routes([], arrow="->")
+        assert "$end" in result
+        assert "->" not in result.plain
+
+    def test_format_routes_explicit_arrow_truncation_preserved(self) -> None:
+        """Truncation behavior is unchanged when a custom arrow is supplied."""
+        from conductor.cli.run import format_routes
+
+        long_condition = "a" * 100
+        routes = [{"to": "next", "when": long_condition, "is_conditional": True}]
+        result = format_routes(routes, arrow="->").plain
+        assert "..." in result
+        assert "-> next" in result
+
+    def test_format_routes_explicit_arrow_bracket_containing_value(self) -> None:
+        """A route target containing brackets is never parsed as markup."""
+        from conductor.cli.run import format_routes
+
+        routes = [{"to": "[task1]", "when": None, "is_conditional": False}]
+        result = format_routes(routes, arrow="->").plain
+        assert "[task1]" in result
 
 
 class TestBuildDryRunPlan:

@@ -186,6 +186,45 @@ def make_console(**kwargs: Any) -> MarkupFreeConsole:
     return MarkupFreeConsole(**kwargs)
 
 
+def select_console_glyph(console: Console, unicode_glyph: str, ascii_fallback: str) -> str:
+    """Pick *unicode_glyph* or *ascii_fallback* for *console*'s stream encoding.
+
+    Rich hands a rendered line straight to the underlying file's ``write()``;
+    it does not check whether the target encoding can represent it. A legacy
+    Windows console (``cp1252``) cannot encode arrows, checkmarks, or other
+    conductor-authored decorations, so a table or plan render dies mid-write,
+    part-printed, unless the glyph is chosen up front (issues #401, #505).
+
+    This selects among **conductor's own** decorative glyphs — it is not a
+    general output sanitizer, and it is not a substitute for validating that
+    arbitrary user or workflow text can be written to a stream.
+
+    A falsy ``console.encoding`` is treated as capable of anything, so an
+    in-memory buffer (``io.StringIO``, whose ``.encoding`` is ``None``) is
+    not needlessly downgraded. This is a deliberate fail-open: a stream that
+    is lossy *and* silent about its encoding (e.g. ``codecs.getwriter``) will
+    still raise.
+
+    Args:
+        console: The console whose stream encoding is probed.
+        unicode_glyph: The preferred, Unicode-only glyph.
+        ascii_fallback: The glyph to use when ``unicode_glyph`` cannot be
+            encoded to the console's stream encoding.
+
+    Returns:
+        ``unicode_glyph`` if it is representable in the console's stream
+        encoding (or the encoding is unknown); ``ascii_fallback`` otherwise.
+    """
+    encoding = console.encoding
+    if not encoding:
+        return unicode_glyph
+    try:
+        unicode_glyph.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return ascii_fallback
+    return unicode_glyph
+
+
 def join(separator: str | Text, parts: Iterable[str | Text]) -> Text:
     """Join a mix of plain strings and pre-styled ``Text`` into one ``Text``.
 
