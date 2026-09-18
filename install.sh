@@ -323,7 +323,7 @@ print_index_guidance() {
         printf '          export UV_DEFAULT_INDEX="internal=${pip_index}"\n' >&2
         printf '          curl -sSfL https://aka.ms/conductor/install.sh | sh\n' >&2
         printf '      else\n' >&2
-        printf "          printf '%s\\n' 'No pip global.index-url; use the approved mirror URL above.'\n" >&2
+        printf '%s\n' "          printf '%s\\n' 'No pip global.index-url; use the approved mirror URL above.'" >&2
         printf '      fi\n\n' >&2
     fi
     printf '  Notes:\n' >&2
