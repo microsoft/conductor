@@ -418,6 +418,17 @@ function Write-IndexGuidance {
         Write-Host ""
         Write-Host '      setx UV_DEFAULT_INDEX "internal=https://<your-index-host>/simple/"' -ForegroundColor Cyan
         Write-Host ""
+        Write-Host "  If pip already works through your organization's mirror, reuse its"
+        Write-Host "  configured URL without printing credentials into this installer log:"
+        Write-Host ""
+        Write-Host '      $pipIndex = pip config get global.index-url 2>$null' -ForegroundColor Cyan
+        Write-Host '      if ($pipIndex) {' -ForegroundColor Cyan
+        Write-Host '          $env:UV_DEFAULT_INDEX = "internal=$pipIndex"' -ForegroundColor Cyan
+        Write-Host '          irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
+        Write-Host '      } else {' -ForegroundColor Cyan
+        Write-Host '          Write-Host "No pip global.index-url; use the approved mirror URL above."' -ForegroundColor Cyan
+        Write-Host '      }' -ForegroundColor Cyan
+        Write-Host ""
     }
     Write-Host "  Notes:"
     Write-Host "    * uv does not read pip's configuration. Setting"
@@ -428,7 +439,8 @@ function Write-IndexGuidance {
     Write-Host "      set UV_INDEX_INTERNAL_USERNAME / UV_INDEX_INTERNAL_PASSWORD, or"
     Write-Host "      embed them in the URL."
     Write-Host "    * If the error mentions a certificate, the network is inspecting TLS."
-    Write-Host "      Trust your organization CA via SSL_CERT_FILE, or set UV_NATIVE_TLS=1."
+    Write-Host "      Trust your organization CA via SSL_CERT_FILE, or set UV_SYSTEM_CERTS=1."
+    Write-Host "      On uv older than 0.11, use the legacy UV_NATIVE_TLS=1 setting."
     Write-Host "    * If the error mentions a proxy (407), set HTTPS_PROXY / NO_PROXY."
     Write-Host ""
     Write-Host "  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index"

@@ -316,6 +316,15 @@ print_index_guidance() {
         printf '      curl -sSfL https://aka.ms/conductor/install.sh | sh\n\n' >&2
         printf '  Add the same export to your shell profile so future installs and\n' >&2
         printf "  'conductor update --apply' inherit it.\n\n" >&2
+        printf "  If pip already works through your organization's mirror, reuse its\n" >&2
+        printf '  configured URL without printing credentials into this installer log:\n\n' >&2
+        printf '      pip_index="$(pip config get global.index-url 2>/dev/null || true)"\n' >&2
+        printf '      if [ -n "$pip_index" ]; then\n' >&2
+        printf '          export UV_DEFAULT_INDEX="internal=${pip_index}"\n' >&2
+        printf '          curl -sSfL https://aka.ms/conductor/install.sh | sh\n' >&2
+        printf '      else\n' >&2
+        printf '%s\n' "          printf '%s\\n' 'No pip global.index-url; use the approved mirror URL above.'" >&2
+        printf '      fi\n\n' >&2
     fi
     printf '  Notes:\n' >&2
     printf "    * uv does not read pip's configuration. Setting\n" >&2
@@ -326,7 +335,8 @@ print_index_guidance() {
     printf '      set UV_INDEX_INTERNAL_USERNAME / UV_INDEX_INTERNAL_PASSWORD, or\n' >&2
     printf '      embed them in the URL.\n' >&2
     printf '    * If the error mentions a certificate, the network is inspecting TLS.\n' >&2
-    printf '      Trust your organization CA via SSL_CERT_FILE, or set UV_NATIVE_TLS=1.\n' >&2
+    printf '      Trust your organization CA via SSL_CERT_FILE, or set UV_SYSTEM_CERTS=1.\n' >&2
+    printf '      On uv older than 0.11, use the legacy UV_NATIVE_TLS=1 setting.\n' >&2
     printf '    * If the error mentions a proxy (407), set HTTPS_PROXY / NO_PROXY.\n\n' >&2
     printf '  Details: https://github.com/microsoft/conductor#installing-behind-a-proxy-or-private-package-index\n\n' >&2
 }

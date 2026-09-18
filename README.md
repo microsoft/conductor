@@ -186,6 +186,31 @@ pip config set global.index-url https://<your-index-host>/simple/
 > install`, or `conductor update` — those need `UV_DEFAULT_INDEX` (or
 > `uv.toml`). Configure both if you use both toolchains.
 
+If pip already works through the required mirror, you can bridge its configured
+URL into uv without copying or printing credentials:
+
+```bash
+# macOS / Linux
+pip_index="$(pip config get global.index-url 2>/dev/null || true)"
+if [ -n "$pip_index" ]; then
+    export UV_DEFAULT_INDEX="internal=${pip_index}"
+    curl -sSfL https://aka.ms/conductor/install.sh | sh
+else
+    printf '%s\n' 'No pip global.index-url; use the approved mirror URL above.'
+fi
+```
+
+```powershell
+# Windows
+$pipIndex = pip config get global.index-url 2>$null
+if ($pipIndex) {
+    $env:UV_DEFAULT_INDEX = "internal=$pipIndex"
+    irm https://aka.ms/conductor/install.ps1 | iex
+} else {
+    Write-Host "No pip global.index-url; use the approved mirror URL above."
+}
+```
+
 If the index requires credentials, uv accepts them inline in the URL or via
 `UV_INDEX_INTERNAL_USERNAME` / `UV_INDEX_INTERNAL_PASSWORD` — where `INTERNAL`
 is the index name from the `internal=` prefix (or the `name` key) above,
@@ -204,10 +229,12 @@ the index:
   since unlike a policy block they can genuinely heal.
 
 If the error mentions a certificate, your network is inspecting TLS — trust
-your organization's root CA via `SSL_CERT_FILE`, or set `UV_NATIVE_TLS=1` to
-use the system trust store. If it mentions a proxy (`407`), set `HTTPS_PROXY` /
-`NO_PROXY` as well as the index URL. Do not work around the block by disabling
-security tooling; ask your IT or platform team for the approved index endpoint.
+your organization's root CA via `SSL_CERT_FILE`, or set `UV_SYSTEM_CERTS=1` to
+use the system trust store. For uv versions older than 0.11, use the legacy
+`UV_NATIVE_TLS=1` setting. If the error mentions a proxy (`407`), set
+`HTTPS_PROXY` / `NO_PROXY` as well as the index URL. Do not work around the
+block by disabling security tooling; ask your IT or platform team for the
+approved index endpoint.
 
 ### Use the Conductor skill in Claude Code or Copilot CLI
 
