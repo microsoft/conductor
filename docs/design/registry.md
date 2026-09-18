@@ -206,15 +206,42 @@ which is required by:
 
 ### Workflow assets
 
-Workflows can reference sibling files (prompts, JSON schemas, scripts) via
-relative paths or `!file`. The cache layer fetches the workflow YAML **plus
-all sibling files in its containing directory** as part of a single fetch
-operation. Registry maintainers should keep a workflow and its assets in the
-same directory.
+Workflows can reference sibling and nested files (prompts, JSON schemas,
+scripts, data) via relative paths or `!file`. The cache layer fetches the
+workflow YAML **plus every regular file beneath its containing directory,
+recursively** — not just immediate siblings — as part of a single fetch
+operation (issue #530). A workflow at the repository root therefore pulls
+the entire repository tree; registry maintainers who want scoped, fast
+acquisition should give a workflow its own dedicated directory.
 
-For GitHub registries, sibling fetch uses the Git Trees API to enumerate the
-directory and SHA-pinned `raw.githubusercontent.com` URLs to download files
-at the resolved commit SHA.
+For GitHub registries, recursive acquisition uses the Git Trees API
+(`conductor.registry.github.list_files_recursive`): the workflow's
+containing directory's tree is resolved from the pinned commit, then
+walked with an explicit stack of non-recursive tree requests (never a
+single `recursive=1` request for the whole subtree, and never the
+Contents API, which caps a single directory listing at 1,000 entries).
+Only regular files (blob modes `100644` and `100755`) are downloaded, at
+SHA-pinned `raw.githubusercontent.com` URLs; symlinks and submodules are
+excluded and logged, never followed.
+
+Acquisition is **strictly all-or-nothing**. A failure listing any
+subdirectory, downloading any regular file — including one the workflow
+itself never uses — staging into the temporary directory, or promoting a
+staged file into the shared SHA root aborts the whole fetch with a
+contextual error naming the failing repository, directory, or file.
+Readiness (the per-workflow `.complete` marker) is published only once the
+entire selected subtree has succeeded; there is no best-effort partial
+fetch and no silently-skipped file.
+
+Per-workflow readiness is tracked by a **versioned** marker, not merely a
+marker's presence: it carries the on-disk cache layout version that
+produced it. This matters because a registry's `source.json`/cached
+`index.yaml` can be refreshed (bumping the recorded layout version)
+without ever re-running the asset fetch — the MCP server catalogue builder
+does exactly this when it only needs a registry's index, not a specific
+workflow's files. Checking the marker's version, not just its existence,
+is what forces a stale pre-recursive-acquisition cache entry to be
+refetched under the new contract rather than resurrected as "ready".
 
 ### Run / resume / validate
 
@@ -250,8 +277,8 @@ recent, undocumented in many places, and supersede-able by a 5-line
 | `config.py` | Pydantic models for `registries.toml`. Atomic load/save. Handles missing-file case (returns empty config).                                                                                                            |
 | `resolver.py` | Parses `name[@registry][#ref]`. Decides file-vs-ref. Returns a `ResolvedRef` with registry name, workflow name, ref, and the registry config. Rejects multiple `@`/`#`, empty `#`, and `#ref` against path registries.       |
 | `index.py`  | Loads and parses `index.yaml`/`index.json`. Validates structure. Resolves `latest` to a concrete tag (or default-branch HEAD if no tags). Backed by either the local FS or `github.py`.                                |
-| `cache.py`  | Manages `~/.conductor/cache/registries/`. `get_or_fetch(ref) -> Path`. Idempotent. Fetches sibling files. Cache is keyed by resolved commit SHA; writes are staged in a temp dir and renamed atomically.                |
-| `github.py` | Public-only GitHub helpers: resolve a ref to a commit SHA via the GitHub API, fetch files at a SHA via SHA-pinned raw URLs (bypassing the CDN), list tags via the REST API for `latest`, list directory contents via Git Trees API for sibling enumeration. Uses `httpx`, no auth. |
+| `cache.py`  | Manages `~/.conductor/cache/registries/`. `get_or_fetch(ref) -> Path`. Idempotent. Recursively fetches every regular file beneath a workflow's containing directory. Cache is keyed by resolved commit SHA; writes are staged in a temp dir and renamed atomically; per-workflow readiness is a versioned marker, not a bare sentinel.                |
+| `github.py` | Public-only GitHub helpers: resolve a ref to a commit SHA via the GitHub API, fetch files at a SHA via SHA-pinned raw URLs (bypassing the CDN), list tags via the REST API for `latest`, recursively enumerate a directory's regular files via the Git Trees API (`list_files_recursive`, walked with an explicit stack rather than a single `recursive=1` request). Uses `httpx`, no auth. |
 
 ### CLI: `src/conductor/cli/registry.py`
 
@@ -413,9 +440,6 @@ registry configuration.
 
 ## Open questions
 
-- **Sibling fetch scope for GitHub.** Should we fetch only files in the
-  workflow's immediate directory, or recurse? Proposal: immediate directory
-  only in v1. Workflows that need deeper assets can flatten their layout.
 - **Cache size management.** Unbounded cache growth is fine for v1 (workflows
   are small text). A `conductor registry prune` command can come later.
 - **Empty default registry.** Ship with no default configured. The first

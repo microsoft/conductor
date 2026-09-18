@@ -107,6 +107,22 @@ def populate_github_warm_cache(
         _write_ref_pointer(registry_name, ref if ref != "main" else None, sha)
 
 
+def write_workflow_ready_marker(meta_dir: Path, workflow_name: str) -> None:
+    """Write a current-layout-version readiness marker for *workflow_name*.
+
+    Mirrors ``conductor.registry.cache._write_readiness_marker`` — a bare
+    empty file (the pre-v4 marker format) is no longer treated as "ready"
+    by ``get_cached_workflow_path`` (issue #530), so any test that
+    hand-populates a workflow's cache entry as already-fetched must write
+    this versioned payload instead of an empty file.
+    """
+    safe_name = workflow_name.replace("/", "_").replace("\\", "_")
+    (meta_dir / f"{safe_name}.complete").write_text(
+        json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def patch_github_network_to_raise(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch every ``registry/github.py`` function to raise, everywhere it
     is bound (the module itself, plus the copies ``cache.py`` /
@@ -128,6 +144,7 @@ def patch_github_network_to_raise(monkeypatch: pytest.MonkeyPatch) -> None:
         "get_default_branch",
         "resolve_ref_to_sha",
         "list_directory",
+        "list_files_recursive",
         "parse_github_source",
     ]
     for module in (github_module, cache_module, version_resolver_module):

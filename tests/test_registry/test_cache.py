@@ -12,6 +12,8 @@ import pytest
 from conductor.registry.cache import (
     CACHE_LAYOUT_VERSION,
     ParsedToolInfo,
+    _is_workflow_ready,
+    _readiness_marker_payload,
     _ref_slug,
     _safe_repo_path,
     _write_ref_pointer,
@@ -155,7 +157,7 @@ def _pre_populate_cache(
     )
 
     safe_name = workflow_name.replace("/", "_")
-    (meta_dir / f"{safe_name}.complete").write_text("", encoding="utf-8")
+    (meta_dir / f"{safe_name}.complete").write_text(_readiness_marker_payload(), encoding="utf-8")
 
     return workflow_path
 
@@ -279,11 +281,51 @@ class TestGetCachedWorkflowPath:
         home = _setup_conductor_home(tmp_path, monkeypatch)
         meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
         meta_dir.mkdir(parents=True)
-        (meta_dir / "qa-bot.complete").write_text("")
+        (meta_dir / "qa-bot.complete").write_text(_readiness_marker_payload())
         (meta_dir / "index.yaml").write_text(
             "workflows:\n  qa-bot:\n    description: ''\n    path: workflows/qa-bot.yaml\n"
         )
         # No workflow file under sha_root.
+
+        result = get_cached_workflow_path("myregistry", "qa-bot", _FAKE_SHA)
+        assert result is None
+
+    def test_returns_none_for_empty_legacy_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pre-v4 empty marker (mere presence meant "ready") is now a miss."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        sha_root = home / "cache" / "registries" / "myregistry" / _SHA_DIR
+        wf_dir = sha_root / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "qa-bot.yaml").write_bytes(b"name: qa-bot\n")
+        meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
+        meta_dir.mkdir(parents=True)
+        (meta_dir / "qa-bot.complete").write_text("")  # legacy empty marker
+        (meta_dir / "index.yaml").write_text(
+            "workflows:\n  qa-bot:\n    description: ''\n    path: workflows/qa-bot.yaml\n"
+        )
+
+        result = get_cached_workflow_path("myregistry", "qa-bot", _FAKE_SHA)
+        assert result is None
+
+    def test_returns_none_for_mismatched_version_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A marker naming an older/newer cache_layout_version is a miss."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        sha_root = home / "cache" / "registries" / "myregistry" / _SHA_DIR
+        wf_dir = sha_root / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "qa-bot.yaml").write_bytes(b"name: qa-bot\n")
+        meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
+        meta_dir.mkdir(parents=True)
+        (meta_dir / "qa-bot.complete").write_text(
+            json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION - 1})
+        )
+        (meta_dir / "index.yaml").write_text(
+            "workflows:\n  qa-bot:\n    description: ''\n    path: workflows/qa-bot.yaml\n"
+        )
 
         result = get_cached_workflow_path("myregistry", "qa-bot", _FAKE_SHA)
         assert result is None
@@ -314,7 +356,7 @@ class TestGetCachedWorkflowPath:
         home = _setup_conductor_home(tmp_path, monkeypatch)
         meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
         meta_dir.mkdir(parents=True)
-        (meta_dir / "qa-bot.complete").write_text("")
+        (meta_dir / "qa-bot.complete").write_text(_readiness_marker_payload())
         # No index.yaml on disk — should still work because we pass the path.
 
         sha_root = home / "cache" / "registries" / "myregistry" / _SHA_DIR
@@ -722,6 +764,541 @@ class TestFetchWorkflowGitHub:
         entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
         with pytest.raises(RegistryError, match="not found"):
             fetch_workflow("official", entry, "nope", ref="v1.0.0")
+
+
+# ---------------------------------------------------------------------------
+# _fetch_github — the real recursive-acquisition pipeline (issue #530)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchGithubRealPipeline:
+    """Exercises the real ``_fetch_github`` (not mocked) against a mocked
+    ``list_files_recursive`` / ``fetch_file`` GitHub layer. This is the
+    orchestration ``fetch_workflow`` delegates to for every GitHub-registry
+    fetch, so these tests cover the strict, all-or-nothing recursive
+    acquisition contract directly rather than through ``fetch_workflow``'s
+    higher-level mock of ``_fetch_github`` itself.
+    """
+
+    def _entry(self) -> RegistryEntry:
+        return RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+
+    def test_nested_prompts_scripts_and_data_preserved(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import _fetch_github
+
+        listed = [
+            "workflows/qa-bot.yaml",
+            "workflows/prompts/system.md",
+            "workflows/scripts/run.sh",
+            "workflows/data/seed.json",
+        ]
+        contents = {
+            "workflows/qa-bot.yaml": b"name: qa-bot\n",
+            "workflows/prompts/system.md": b"You are helpful.\n",
+            "workflows/scripts/run.sh": b"#!/bin/sh\necho hi\n",
+            "workflows/data/seed.json": b'{"seed": 1}',
+        }
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch(
+                "conductor.registry.cache.fetch_file",
+                side_effect=lambda owner, repo, path, ref: contents[path],
+            ),
+        ):
+            _fetch_github(self._entry(), "workflows/qa-bot.yaml", _FAKE_SHA, tmp_path)
+
+        for repo_path, content in contents.items():
+            assert (tmp_path / repo_path).read_bytes() == content
+
+    def test_binary_and_empty_files_preserved_byte_for_byte(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import _fetch_github
+
+        listed = ["workflows/wf.yaml", "workflows/data/image.bin", "workflows/data/empty.txt"]
+        binary_content = bytes(range(256))
+        contents = {
+            "workflows/wf.yaml": b"name: wf\n",
+            "workflows/data/image.bin": binary_content,
+            "workflows/data/empty.txt": b"",
+        }
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch(
+                "conductor.registry.cache.fetch_file",
+                side_effect=lambda owner, repo, path, ref: contents[path],
+            ),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+        assert (tmp_path / "workflows" / "data" / "image.bin").read_bytes() == binary_content
+        assert (tmp_path / "workflows" / "data" / "empty.txt").read_bytes() == b""
+
+    def test_duplicate_basenames_in_different_directories(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import _fetch_github
+
+        listed = [
+            "workflows/wf.yaml",
+            "workflows/alpha/note.md",
+            "workflows/beta/note.md",
+        ]
+        contents = {
+            "workflows/wf.yaml": b"name: wf\n",
+            "workflows/alpha/note.md": b"alpha note",
+            "workflows/beta/note.md": b"beta note",
+        }
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch(
+                "conductor.registry.cache.fetch_file",
+                side_effect=lambda owner, repo, path, ref: contents[path],
+            ),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+        assert (tmp_path / "workflows" / "alpha" / "note.md").read_bytes() == b"alpha note"
+        assert (tmp_path / "workflows" / "beta" / "note.md").read_bytes() == b"beta note"
+
+    def test_root_level_workflow(self, tmp_path: Path) -> None:
+        """A repo-root workflow lists directory '.' and every file lands
+        directly under the staging root (no extra parent directory)."""
+        from conductor.registry.cache import _fetch_github
+
+        listed = ["wf.yaml", "prompts/system.md"]
+        contents = {"wf.yaml": b"name: wf\n", "prompts/system.md": b"prompt text"}
+
+        with (
+            patch(
+                "conductor.registry.cache.list_files_recursive", return_value=listed
+            ) as mock_list,
+            patch(
+                "conductor.registry.cache.fetch_file",
+                side_effect=lambda owner, repo, path, ref: contents[path],
+            ),
+        ):
+            _fetch_github(self._entry(), "wf.yaml", _FAKE_SHA, tmp_path)
+
+        assert mock_list.call_args.args[2] == "."
+        assert (tmp_path / "wf.yaml").read_bytes() == b"name: wf\n"
+        assert (tmp_path / "prompts" / "system.md").read_bytes() == b"prompt text"
+
+    def test_exclusion_of_unrelated_subtree(self, tmp_path: Path) -> None:
+        """``list_files_recursive`` is only ever asked to enumerate the
+        workflow's own containing directory — a real GitHub listing scoped
+        that way could never surface an unrelated sibling top-level
+        directory in the first place."""
+        from conductor.registry.cache import _fetch_github
+
+        listed = ["workflows/wf.yaml"]  # "other/unrelated.yaml" never listed
+        contents = {"workflows/wf.yaml": b"name: wf\n"}
+
+        with (
+            patch(
+                "conductor.registry.cache.list_files_recursive", return_value=listed
+            ) as mock_list,
+            patch(
+                "conductor.registry.cache.fetch_file",
+                side_effect=lambda owner, repo, path, ref: contents[path],
+            ),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+        assert mock_list.call_args.args[2] == "workflows"
+        assert not (tmp_path / "other").exists()
+
+    def test_workflow_not_in_listed_subtree_raises(self, tmp_path: Path) -> None:
+        """The requested workflow must itself appear as a regular file in
+        the enumerated subtree — e.g. it was actually a symlink."""
+        from conductor.registry.cache import _fetch_github
+
+        with (
+            patch(
+                "conductor.registry.cache.list_files_recursive",
+                return_value=["workflows/other.yaml"],
+            ),
+            patch("conductor.registry.cache.fetch_file"),
+            pytest.raises(RegistryError, match="not.*regular file"),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+    def test_top_level_listing_failure_raises_contextual_error(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import _fetch_github
+
+        with (
+            patch(
+                "conductor.registry.cache.list_files_recursive",
+                side_effect=RegistryError("boom: directory not found"),
+            ),
+            pytest.raises(RegistryError, match="Failed to list files under 'workflows'"),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+    def test_download_failure_for_unreferenced_file_raises(self, tmp_path: Path) -> None:
+        """A failure downloading a file the workflow never itself uses
+        still aborts the whole fetch (strict completeness)."""
+        from conductor.registry.cache import _fetch_github
+
+        listed = ["workflows/wf.yaml", "workflows/unused/extra.txt"]
+
+        def _fetch(owner: str, repo: str, path: str, ref: str) -> bytes:
+            if path == "workflows/unused/extra.txt":
+                raise RegistryError(f"download failed: {path}")
+            return b"name: wf\n"
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch("conductor.registry.cache.fetch_file", side_effect=_fetch),
+            pytest.raises(RegistryError, match="workflows/unused/extra.txt"),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+    def test_download_failure_for_referenced_workflow_file_raises(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import _fetch_github
+
+        listed = ["workflows/wf.yaml"]
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch(
+                "conductor.registry.cache.fetch_file",
+                side_effect=RegistryError("network blip"),
+            ),
+            pytest.raises(RegistryError, match="Failed to download 'workflows/wf.yaml'"),
+        ):
+            _fetch_github(self._entry(), "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+
+class TestFetchGithubUnsafePaths:
+    """Unsafe or escaping paths are rejected rather than silently skipped."""
+
+    def test_unsafe_listed_path_rejected(self, tmp_path: Path) -> None:
+        from conductor.registry.cache import _fetch_github
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        listed = ["workflows/wf.yaml", "../escape.yaml"]
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch("conductor.registry.cache.fetch_file", return_value=b"x"),
+            pytest.raises(RegistryError, match=r"\.\."),
+        ):
+            _fetch_github(entry, "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+    def test_listed_path_outside_workflow_directory_rejected(self, tmp_path: Path) -> None:
+        """Defense-in-depth: even a syntactically safe path is rejected if
+        it falls outside the workflow's own containing directory — this
+        should never happen given ``list_files_recursive``'s own scoping,
+        but the guard exists in case that invariant is ever broken."""
+        from conductor.registry.cache import _fetch_github
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        listed = ["workflows/wf.yaml", "other/sneaky.yaml"]
+
+        with (
+            patch("conductor.registry.cache.list_files_recursive", return_value=listed),
+            patch("conductor.registry.cache.fetch_file", return_value=b"x"),
+            pytest.raises(RegistryError, match="outside the workflow's containing directory"),
+        ):
+            _fetch_github(entry, "workflows/wf.yaml", _FAKE_SHA, tmp_path)
+
+    def test_promote_rejects_unsafe_staged_path_rather_than_skipping_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged file that fails the safety re-check aborts promotion
+        entirely (issue #530) instead of being silently omitted, which was
+        the pre-#530 best-effort behavior."""
+        from conductor.registry.cache import _promote_staged_files
+
+        tmp_dir = tmp_path / "staging"
+        sha_root = tmp_path / "sha_root"
+        tmp_dir.mkdir()
+        sha_root.mkdir()
+        (tmp_dir / "bad.yaml").write_bytes(b"x")
+
+        def _boom(repo_path: str) -> None:
+            raise RegistryError(f"unsafe staged path: {repo_path!r}")
+
+        monkeypatch.setattr("conductor.registry.cache._safe_repo_path", _boom)
+
+        with pytest.raises(RegistryError, match="unsafe staged path"):
+            _promote_staged_files(tmp_dir, sha_root)
+
+        # Nothing was promoted — the file must not silently vanish from
+        # tmp_dir into sha_root, nor be dropped without a trace.
+        assert not (sha_root / "bad.yaml").exists()
+
+
+class TestFetchWorkflowFailureContract:
+    """``fetch_workflow``-level assertions for the strict completeness
+    contract: a failure anywhere in acquisition leaves no valid readiness
+    marker, cleans up its temp directory, and a subsequent retry can
+    still succeed once the underlying failure is resolved."""
+
+    @patch("conductor.registry.cache.list_files_recursive")
+    @patch("conductor.registry.cache.fetch_file")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_nested_download_failure_leaves_no_readiness_marker(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_file: object,
+        mock_list_files: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_list_files.return_value = [  # type: ignore[union-attr]
+            "workflows/qa-bot.yaml",
+            "workflows/prompts/system.md",
+        ]
+
+        def _fetch(owner: str, repo: str, path: str, ref: str) -> bytes:
+            if path == "workflows/prompts/system.md":
+                raise RegistryError("simulated network failure")
+            return b"name: qa-bot\n"
+
+        mock_fetch_file.side_effect = _fetch  # type: ignore[union-attr]
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        with pytest.raises(RegistryError, match="workflows/prompts/system.md"):
+            fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+
+        sentinel = (
+            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+        )
+        assert not sentinel.exists()
+        meta_root = home / "cache" / "registries" / "official" / "_meta"
+        if meta_root.exists():
+            leftovers = [p for p in meta_root.rglob(".tmp-*") if p.is_dir()]
+            assert leftovers == []
+
+        # A subsequent retry, once the transient failure clears, succeeds.
+        mock_fetch_file.side_effect = lambda owner, repo, path, ref: (  # type: ignore[union-attr]
+            b"name: qa-bot\n" if path == "workflows/qa-bot.yaml" else b"You are helpful.\n"
+        )
+        result = fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+        assert result.is_file()
+        assert _is_workflow_ready(sentinel)
+
+    @patch("conductor.registry.cache.list_files_recursive")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_nested_listing_failure_leaves_no_readiness_marker(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_list_files: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_list_files.side_effect = RegistryError(  # type: ignore[union-attr]
+            "Listing directory 'workflows/nested' failed: not found (404)"
+        )
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        with pytest.raises(RegistryError, match="workflows/nested"):
+            fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+
+        sentinel = (
+            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+        )
+        assert not sentinel.exists()
+
+    @patch("conductor.registry.cache._promote_staged_files")
+    @patch("conductor.registry.cache._fetch_github")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_promotion_failure_leaves_no_readiness_marker(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_github: object,
+        mock_promote: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_fetch_github.side_effect = (  # type: ignore[union-attr]
+            lambda entry, path, sha, dest_dir: _write_workflow_into_staging(dest_dir, path)
+        )
+        mock_promote.side_effect = RegistryError("promotion exploded")  # type: ignore[union-attr]
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        with pytest.raises(RegistryError, match="promotion exploded"):
+            fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+
+        sentinel = (
+            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+        )
+        assert not sentinel.exists()
+        meta_root = home / "cache" / "registries" / "official" / "_meta"
+        if meta_root.exists():
+            leftovers = [p for p in meta_root.rglob(".tmp-*") if p.is_dir()]
+            assert leftovers == []
+
+
+class TestCacheLayoutUpgrade:
+    """Upgrade tests (issue #530): a legacy pre-v4 marker requires an
+    online refill; an offline caller hitting a legacy marker never mutates
+    cache state; and a freshly completed recursive fetch is fully
+    resolvable offline afterwards."""
+
+    @patch("conductor.registry.cache.list_files_recursive")
+    @patch("conductor.registry.cache.fetch_file")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_legacy_empty_marker_triggers_online_refetch(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_file: object,
+        mock_list_files: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A workflow left over from a pre-#530 Conductor has its mirrored
+        file and matching source.json, but only an empty marker (the old
+        "presence means ready" contract). Even with metadata otherwise
+        matching, `fetch_workflow` must re-fetch rather than trust it."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        # Legacy-complete: file present, source.json at the *current*
+        # layout version (as if only the metadata had been refreshed —
+        # mirroring mcp/serve/catalogue.py's index-only refresh), but the
+        # marker itself is the old empty-file format.
+        _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        sentinel = (
+            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+        )
+        sentinel.write_text("")  # downgrade to the legacy empty marker
+
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        mock_list_files.return_value = ["workflows/qa-bot.yaml"]  # type: ignore[union-attr]
+        mock_fetch_file.return_value = b"name: qa-bot\nagents: []\n"  # type: ignore[union-attr]
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+
+        assert result.is_file()
+        mock_list_files.assert_called_once()  # type: ignore[union-attr]
+        assert _is_workflow_ready(sentinel)
+
+    def test_offline_miss_on_legacy_marker_does_not_mutate_cache_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An offline caller hitting a legacy marker gets the existing
+        actionable cache-miss error — it must not delete or otherwise
+        touch what is already on disk, since there is nothing else for it
+        to try."""
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="qa-bot",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/qa-bot.yaml",
+            registry_source="myorg/workflows",
+        )
+        sentinel = (
+            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+        )
+        sentinel.write_text("")  # legacy empty marker
+        before = sentinel.read_text()
+        workflow_file = (
+            home / "cache" / "registries" / "official" / _SHA_DIR / "workflows" / "qa-bot.yaml"
+        )
+        before_content = workflow_file.read_bytes()
+        _patch_all_github_functions_to_raise(monkeypatch)
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        with pytest.raises(RegistryError, match="not available in the local cache"):
+            fetch_workflow("official", entry, "qa-bot", ref=_FAKE_SHA, allow_network=False)
+
+        # Nothing on disk was touched by the failed offline attempt.
+        assert sentinel.read_text() == before
+        assert workflow_file.read_bytes() == before_content
+
+    @patch("conductor.registry.cache.list_files_recursive")
+    @patch("conductor.registry.cache.fetch_file")
+    @patch("conductor.registry.cache.load_index")
+    @patch("conductor.registry.cache.materialize_to_sha")
+    @patch("conductor.registry.cache.resolve_ref")
+    def test_freshly_completed_recursive_cache_resolves_fully_offline(
+        self,
+        mock_resolve_ref: object,
+        mock_materialize: object,
+        mock_load_index: object,
+        mock_fetch_file: object,
+        mock_list_files: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A workflow fetched online under the new recursive contract is
+        fully resolvable offline afterwards, including its nested assets —
+        proven by making both GitHub-level calls raise if touched again."""
+        _setup_conductor_home(tmp_path, monkeypatch)
+        mock_resolve_ref.return_value = "v1.0.0"  # type: ignore[union-attr]
+        mock_materialize.return_value = _FAKE_SHA  # type: ignore[union-attr]
+        mock_load_index.return_value = _make_index()  # type: ignore[union-attr]
+        listed = ["workflows/qa-bot.yaml", "workflows/prompts/system.md"]
+        contents = {
+            "workflows/qa-bot.yaml": b"name: qa-bot\nagents: []\n",
+            "workflows/prompts/system.md": b"You are helpful.\n",
+        }
+        mock_list_files.return_value = listed  # type: ignore[union-attr]
+        mock_fetch_file.side_effect = (  # type: ignore[union-attr]
+            lambda owner, repo, path, ref: contents[path]
+        )
+
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        online_result = fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+        assert online_result.is_file()
+        assert (online_result.parent / "prompts" / "system.md").read_bytes() == (
+            contents["workflows/prompts/system.md"]
+        )
+
+        # Reconfigure the same two mocks (rather than layering monkeypatch
+        # on top of an active @patch, which would restore the wrong value
+        # at teardown) so any further call to either is a test failure.
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise AssertionError("GitHub function called during offline resolution")
+
+        mock_list_files.side_effect = _boom  # type: ignore[union-attr]
+        mock_list_files.return_value = None  # type: ignore[union-attr]
+        mock_fetch_file.side_effect = _boom  # type: ignore[union-attr]
+
+        offline_result = fetch_workflow(
+            "official", entry, "qa-bot", ref="v1.0.0", allow_network=False
+        )
+        assert offline_result == online_result
 
 
 # ---------------------------------------------------------------------------
@@ -1557,6 +2134,7 @@ def _patch_all_github_functions_to_raise(monkeypatch: pytest.MonkeyPatch) -> Non
         "get_default_branch",
         "resolve_ref_to_sha",
         "list_directory",
+        "list_files_recursive",
         "parse_github_source",
     ]
     for module in (github_module, cache_module, version_resolver_module):

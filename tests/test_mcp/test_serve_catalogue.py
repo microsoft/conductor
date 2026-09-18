@@ -19,6 +19,7 @@ from tests.test_mcp.conftest import (
     patch_github_network_to_raise,
     populate_github_warm_cache,
     write_path_registry,
+    write_workflow_ready_marker,
 )
 
 _FAKE_SHA = "c" * 40
@@ -585,7 +586,7 @@ class TestSchemaLadderTiersOffline:
         # Mark the workflow as fully cached (readiness sentinel) so
         # fetch_workflow's cache-hit path is taken without a network call.
         meta_dir = conductor_home / "cache" / "registries" / "official" / "_meta" / _FAKE_SHA[:12]
-        (meta_dir / "qa-bot.complete").write_text("", encoding="utf-8")
+        write_workflow_ready_marker(meta_dir, "qa-bot")
 
         patch_github_network_to_raise(monkeypatch)
 
@@ -763,7 +764,7 @@ class TestPartialIndexMetadata:
             },
         )
         meta_dir = conductor_home / "cache" / "registries" / "official" / "_meta" / _FAKE_SHA[:12]
-        (meta_dir / "qa-bot.complete").write_text("", encoding="utf-8")
+        write_workflow_ready_marker(meta_dir, "qa-bot")
         patch_github_network_to_raise(monkeypatch)
 
         entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
@@ -797,7 +798,7 @@ class TestPartialIndexMetadata:
             workflow_files={"workflows/qa-bot.yaml": _REVIEW_PR_YAML.encode()},
         )
         meta_dir = conductor_home / "cache" / "registries" / "official" / "_meta" / _FAKE_SHA[:12]
-        (meta_dir / "qa-bot.complete").write_text("", encoding="utf-8")
+        write_workflow_ready_marker(meta_dir, "qa-bot")
         patch_github_network_to_raise(monkeypatch)
 
         entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
@@ -891,7 +892,7 @@ class TestNameDerivedFromDeclaredName:
             workflow_files={"workflows/qa-bot.yaml": _REVIEW_PR_YAML.encode()},
         )
         meta_dir = conductor_home / "cache" / "registries" / "official" / "_meta" / _FAKE_SHA[:12]
-        (meta_dir / "qa-bot.complete").write_text("", encoding="utf-8")
+        write_workflow_ready_marker(meta_dir, "qa-bot")
         patch_github_network_to_raise(monkeypatch)
 
         entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")

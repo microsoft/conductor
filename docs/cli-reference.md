@@ -1151,6 +1151,49 @@ conductor run 'qa-bot@#v1.2.3'
 Path-type registries do not support `#<ref>` and will reject any reference
 that includes one.
 
+#### Nested workflow assets
+
+A registry-fetched workflow acquires every regular file beneath its
+containing directory, recursively — not just files directly next to the
+workflow YAML. For example, given this repository layout:
+
+```
+workflows/
+  issue-triage.yaml
+  prompts/
+    issue-triage.md
+  scripts/
+    label.py
+```
+
+`workflows/issue-triage.yaml` can reference its nested prompt directly:
+
+```yaml
+agents:
+  - name: triage
+    prompt: !file prompts/issue-triage.md
+```
+
+and a `type: script` step can locate a nested script the same way it
+would locally, using the existing `{{ workflow.dir }}` convention:
+
+```yaml
+  - name: label
+    type: script
+    command: "python {{ workflow.dir }}/scripts/label.py"
+```
+
+Recursion does not change the process's current working directory —
+scripts still run from wherever `conductor` was invoked, and
+`{{ workflow.dir }}` is what points at the cached workflow's own
+directory. Only files *beneath* the workflow's containing directory are
+acquired; a parent directory's assets are never automatically included. A
+root-level workflow's containing directory is the whole repository, so it
+acquires every file in it — give a workflow its own directory to keep
+fetches scoped. A failure acquiring any regular file in that subtree,
+including one the workflow does not itself reference, blocks the fetch
+entirely rather than proceeding with a partial cache.
+
 See [design/registry.md](./design/registry.md) for the full design.
 
 ## `conductor mcp serve`

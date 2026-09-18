@@ -2042,7 +2042,9 @@ class TestCrossWorkflowRegistryRef:
             "  sdd-plan:\n    description: ''\n    path: sdd-plan/plan.yaml\n"
             "  document-review:\n    description: ''\n    path: document-review/workflow.yaml\n"
         )
-        (meta_dir / "sdd-plan.complete").write_text("")
+        (meta_dir / "sdd-plan.complete").write_text(
+            json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION}, sort_keys=True)
+        )
 
         # Document-review YAML that the engine will auto-fetch.
         sub_yaml = textwrap.dedent(
@@ -2080,6 +2082,15 @@ class TestCrossWorkflowRegistryRef:
             target = dest_dir / workflow_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(sub_yaml)
+            # Auto-fetch acquires the sub-workflow's whole containing
+            # directory (issue #530), not just the workflow file — add a
+            # nested asset here so this test also proves that a nested
+            # file surviving _fetch_github's staging is promoted into the
+            # shared SHA mirror unchanged, without altering the engine's
+            # own resolution semantics (which only ever reads the .yaml).
+            nested = dest_dir / "document-review" / "prompts" / "review.md"
+            nested.parent.mkdir(parents=True, exist_ok=True)
+            nested.write_text("Review the document thoroughly.\n")
 
         def mock_handler(agent, prompt, context):
             return {"verdict": "approved"}
@@ -2105,6 +2116,11 @@ class TestCrossWorkflowRegistryRef:
         # Verify the sibling was actually auto-fetched into the shared SHA root.
         sibling = official_sha_root / "document-review" / "workflow.yaml"
         assert sibling.exists()
+        # Its nested asset was promoted alongside it, at its original
+        # repo-relative path.
+        nested_asset = official_sha_root / "document-review" / "prompts" / "review.md"
+        assert nested_asset.is_file()
+        assert nested_asset.read_text() == "Review the document thoroughly.\n"
         # And its sentinel was written.
         assert (meta_dir / "document-review.complete").exists()
 

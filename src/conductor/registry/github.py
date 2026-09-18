@@ -6,11 +6,14 @@ automatically via the ``gh`` CLI (``gh auth token``) when available.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 
 import httpx
 
 from conductor.registry.errors import RegistryError, RegistryNotFoundError
+
+logger = logging.getLogger(__name__)
 
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 GITHUB_API_BASE = "https://api.github.com"
@@ -274,6 +277,251 @@ def list_directory(owner: str, repo: str, path: str, ref: str = "main") -> list[
             f"Expected a directory at {owner}/{repo}/{path}, but got a single file."
         )
     return [item["name"] for item in items if item.get("type") == "file"]
+
+
+# Git tree blob modes. A blob's `mode` field (not its `type`, which is only
+# "blob"/"tree"/"commit") is what distinguishes a regular file from an
+# executable file, a symlink, or a submodule/gitlink.
+_MODE_REGULAR_FILE = "100644"
+_MODE_EXECUTABLE_FILE = "100755"
+_MODE_SYMLINK = "120000"
+_REGULAR_FILE_MODES = frozenset({_MODE_REGULAR_FILE, _MODE_EXECUTABLE_FILE})
+
+
+def _get_git_tree(owner: str, repo: str, tree_sha: str, *, context: str) -> list[dict]:
+    """Fetch one non-recursive Git Trees API listing and validate its shape.
+
+    Uses GET /repos/{owner}/{repo}/git/trees/{tree_sha} (no ``recursive``
+    query param — the caller walks subdirectories itself via an explicit
+    stack, see :func:`list_files_recursive`). This is deliberately not the
+    Contents API, which caps a single directory listing at 1,000 entries;
+    the Git Trees API has no such per-directory limit, though GitHub may
+    still ``truncated: true`` an individual response for pathological
+    directories (huge fan-out), which is treated as a hard failure below
+    rather than a silent partial listing.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        tree_sha: A tree SHA (or a commit SHA, which resolves to its root
+            tree) to list the immediate contents of.
+        context: Human-readable description of what is being listed, used
+            in error messages.
+
+    Returns:
+        A list of validated entry dicts, each with ``path``, ``mode``,
+        ``type``, and ``sha`` (``sha`` may be ``None`` for a blob entry
+        missing it, though GitHub always includes it in practice).
+
+    Raises:
+        RegistryError: On request failure, a non-JSON/non-object response,
+            a missing or malformed ``tree`` array, a malformed entry, or a
+            truncated response.
+    """
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{tree_sha}"
+    try:
+        response = httpx.get(
+            url, headers=_build_headers(api=True), timeout=DEFAULT_TIMEOUT, follow_redirects=True
+        )
+    except httpx.TimeoutException as exc:
+        raise RegistryError(f"Timeout {context}") from exc
+    except httpx.HTTPError as exc:
+        raise RegistryError(f"HTTP error {context}: {exc}") from exc
+
+    _raise_for_status(response, context=context)
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RegistryError(
+            f"Malformed response {context}: response body is not valid JSON"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise RegistryError(f"Malformed response {context}: expected a JSON object")
+
+    if data.get("truncated"):
+        raise RegistryError(
+            f"{context}: GitHub truncated this tree listing because it has too many entries. "
+            "Refusing to proceed with a partial listing.",
+            suggestion=(
+                "Move the workflow to a directory with fewer nested files, or split large "
+                "subdirectories out of the workflow's containing directory."
+            ),
+        )
+
+    raw_entries = data.get("tree")
+    if not isinstance(raw_entries, list):
+        raise RegistryError(f"Malformed response {context}: missing or invalid 'tree' array")
+
+    entries: list[dict] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise RegistryError(f"Malformed response {context}: tree entry is not an object")
+        path = raw_entry.get("path")
+        mode = raw_entry.get("mode")
+        entry_type = raw_entry.get("type")
+        entry_sha = raw_entry.get("sha")
+        if not isinstance(path, str) or not path:
+            raise RegistryError(f"Malformed response {context}: tree entry missing 'path'")
+        if not isinstance(mode, str) or not mode:
+            raise RegistryError(f"Malformed response {context}: tree entry missing 'mode'")
+        if not isinstance(entry_type, str) or not entry_type:
+            raise RegistryError(f"Malformed response {context}: tree entry missing 'type'")
+        if entry_type == "tree" and not isinstance(entry_sha, str):
+            raise RegistryError(
+                f"Malformed response {context}: directory entry {path!r} missing 'sha'"
+            )
+        entries.append({"path": path, "mode": mode, "type": entry_type, "sha": entry_sha})
+    return entries
+
+
+def _resolve_directory_tree_sha(owner: str, repo: str, commit_sha: str, directory: str) -> str:
+    """Walk from a commit's root tree down to the tree SHA for *directory*.
+
+    ``GET /repos/{owner}/{repo}/git/trees/{commit_sha}`` resolves a commit
+    SHA to its root tree automatically, so the walk starts there and
+    descends one path segment at a time using each segment's own ``tree``
+    entry — never the Contents API, and never a full-repository recursive
+    listing when the workflow occupies a smaller subtree.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        commit_sha: The pinned commit SHA to resolve the tree from.
+        directory: Repo-relative directory path (``""`` or ``"."`` for the
+            repository root).
+
+    Returns:
+        The tree SHA for *directory*.
+
+    Raises:
+        RegistryNotFoundError: If any path segment does not exist or is not
+            a directory.
+        RegistryError: On any other listing failure.
+    """
+    segments = (
+        [s for s in directory.strip("/").split("/") if s] if directory not in ("", ".") else []
+    )
+
+    current_tree_sha = commit_sha
+    walked = ""
+    for segment in segments:
+        entries = _get_git_tree(
+            owner,
+            repo,
+            current_tree_sha,
+            context=f"Listing directory '{walked or '.'}' in {owner}/{repo} at {commit_sha}",
+        )
+        match = next((e for e in entries if e["path"] == segment and e["type"] == "tree"), None)
+        if match is None:
+            raise RegistryNotFoundError(
+                f"Directory '{directory}' not found in {owner}/{repo} at {commit_sha} "
+                f"(missing segment '{segment}')",
+                suggestion="Check the workflow's path in the registry index.",
+            )
+        current_tree_sha = match["sha"]
+        walked = f"{walked}/{segment}" if walked else segment
+    return current_tree_sha
+
+
+def list_files_recursive(owner: str, repo: str, directory: str, ref: str) -> list[str]:
+    """Recursively list every regular file under *directory* at a pinned ref.
+
+    Uses the Git Trees API with an explicit stack for iterative traversal
+    rather than a single ``recursive=1`` request, so a directory this large
+    fetches one small listing per subdirectory instead of one response that
+    GitHub could truncate for the whole subtree at once — and so only the
+    workflow's containing subtree is walked, never the entire repository,
+    when that subtree is smaller than the repo as a whole.
+
+    Symlinks (blob mode ``120000``) and submodules/gitlinks (entry type
+    ``"commit"``) are excluded from the result and logged; they are not
+    followed or downloaded.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        directory: Repo-relative directory to walk (``""`` or ``"."`` for
+            the repository root).
+        ref: A resolved, immutable commit SHA — traversal is pinned to this
+            single commit's tree identities throughout, never re-resolved.
+
+    Returns:
+        A deterministic (sorted), repository-relative list of regular file
+        paths (both ``100644`` and ``100755`` blob modes), rooted at the
+        repository root (not *directory*) — e.g. listing directory
+        ``"workflows/foo"`` returns paths like
+        ``"workflows/foo/prompts/plan.md"``.
+
+    Raises:
+        RegistryNotFoundError: If *directory* does not exist.
+        RegistryError: On any listing failure, malformed response, or a
+            truncated tree — never a partial success.
+    """
+    directory_norm = directory.strip("/")
+    if directory_norm == ".":
+        directory_norm = ""
+    label = directory_norm or "."
+
+    try:
+        root_tree_sha = _resolve_directory_tree_sha(owner, repo, ref, directory_norm)
+    except RegistryNotFoundError:
+        raise
+    except RegistryError as exc:
+        raise RegistryError(
+            f"Failed to locate directory '{label}' in {owner}/{repo} at {ref}: {exc}"
+        ) from exc
+
+    results: list[str] = []
+    # Stack of (repo-relative directory prefix, tree sha) to explore. The
+    # prefix already includes `directory_norm` so returned paths are
+    # repository-relative, not directory-relative.
+    stack: list[tuple[str, str]] = [(directory_norm, root_tree_sha)]
+    while stack:
+        prefix, tree_sha = stack.pop()
+        entries = _get_git_tree(
+            owner,
+            repo,
+            tree_sha,
+            context=f"Listing directory '{prefix or '.'}' in {owner}/{repo} at {ref}",
+        )
+        for entry in entries:
+            entry_path = f"{prefix}/{entry['path']}" if prefix else entry["path"]
+            if entry["type"] == "tree":
+                stack.append((entry_path, entry["sha"]))
+            elif entry["type"] == "blob":
+                if entry["mode"] in _REGULAR_FILE_MODES:
+                    results.append(entry_path)
+                elif entry["mode"] == _MODE_SYMLINK:
+                    logger.warning(
+                        "Skipping symlink %r in %s/%s at %s (symlinks are not followed)",
+                        entry_path,
+                        owner,
+                        repo,
+                        ref,
+                    )
+                else:
+                    logger.warning(
+                        "Skipping blob %r with unexpected mode %r in %s/%s at %s",
+                        entry_path,
+                        entry["mode"],
+                        owner,
+                        repo,
+                        ref,
+                    )
+            elif entry["type"] == "commit":
+                logger.warning(
+                    "Skipping submodule %r in %s/%s at %s (submodules are not followed)",
+                    entry_path,
+                    owner,
+                    repo,
+                    ref,
+                )
+            # Any other entry type (unexpected) is ignored rather than
+            # treated as a fatal shape error — the required fields were
+            # already validated in _get_git_tree.
+    return sorted(results)
 
 
 def parse_github_source(source: str) -> tuple[str, str]:

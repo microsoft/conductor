@@ -13,6 +13,7 @@ from conductor.registry.github import (
     fetch_file_text,
     get_default_branch,
     list_directory,
+    list_files_recursive,
     list_tags,
     parse_github_source,
     resolve_ref_to_sha,
@@ -277,6 +278,275 @@ class TestListDirectory:
 
         with pytest.raises(RegistryError, match="Expected a directory"):
             list_directory("owner", "repo", "file.txt")
+
+
+# --- list_files_recursive ---
+
+
+def _tree_entry(path: str, mode: str, entry_type: str, sha: str | None = "s") -> dict:
+    """Build one Git Trees API entry dict."""
+    return {"path": path, "mode": mode, "type": entry_type, "sha": sha}
+
+
+def _tree_response(
+    entries: list[dict], *, truncated: bool = False, tree_sha: str = "sha"
+) -> MagicMock:
+    return _mock_response(json_data={"sha": tree_sha, "tree": entries, "truncated": truncated})
+
+
+@pytest.fixture(autouse=True)
+def _stub_auth_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No local ``gh`` CLI credential lookup for these tests (issue #530)."""
+    monkeypatch.setattr("conductor.registry.github._get_auth_token", lambda: None)
+
+
+class TestListFilesRecursive:
+    _REF = "f" * 40
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_root_level_workflow_lists_whole_repo(self, mock_get: MagicMock) -> None:
+        """A root-directory listing (a repo-root workflow) walks from the
+        commit SHA directly — one call for the root, no directory-segment
+        resolution calls first."""
+        mock_get.return_value = _tree_response(
+            [
+                _tree_entry("workflow.yaml", "100644", "blob"),
+                _tree_entry("README.md", "100644", "blob"),
+            ]
+        )
+
+        result = list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        assert result == ["README.md", "workflow.yaml"]
+        assert mock_get.call_count == 1
+        called_url = mock_get.call_args_list[0][0][0]
+        assert called_url.endswith(f"/git/trees/{self._REF}")
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_deterministic_sorted_paths_regardless_of_input_order(
+        self, mock_get: MagicMock
+    ) -> None:
+        mock_get.return_value = _tree_response(
+            [
+                _tree_entry("z.yaml", "100644", "blob"),
+                _tree_entry("a.yaml", "100644", "blob"),
+                _tree_entry("m.yaml", "100644", "blob"),
+            ]
+        )
+
+        result = list_files_recursive("owner", "repo", ".", ref=self._REF)
+
+        assert result == ["a.yaml", "m.yaml", "z.yaml"]
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_multiple_nesting_levels(self, mock_get: MagicMock) -> None:
+        """Listing a two-level-deep directory resolves each path segment,
+        then walks the target directory's own nested subtree."""
+        root_tree = _tree_response(
+            [_tree_entry("workflows", "040000", "tree", sha="TREE_WORKFLOWS")]
+        )
+        workflows_tree = _tree_response(
+            [_tree_entry("foo", "040000", "tree", sha="TREE_FOO")], tree_sha="TREE_WORKFLOWS"
+        )
+        foo_tree = _tree_response(
+            [
+                _tree_entry("plan.yaml", "100644", "blob"),
+                _tree_entry("prompts", "040000", "tree", sha="TREE_PROMPTS"),
+            ],
+            tree_sha="TREE_FOO",
+        )
+        prompts_tree = _tree_response(
+            [_tree_entry("plan.md", "100644", "blob")], tree_sha="TREE_PROMPTS"
+        )
+        mock_get.side_effect = [root_tree, workflows_tree, foo_tree, prompts_tree]
+
+        result = list_files_recursive("owner", "repo", "workflows/foo", ref=self._REF)
+
+        assert result == [
+            "workflows/foo/plan.yaml",
+            "workflows/foo/prompts/plan.md",
+        ]
+        assert mock_get.call_count == 4
+        # The first two calls resolve directory segments from the commit SHA
+        # itself, then from the "workflows" tree SHA — never re-touching ref.
+        assert mock_get.call_args_list[0][0][0].endswith(f"/git/trees/{self._REF}")
+        assert mock_get.call_args_list[1][0][0].endswith("/git/trees/TREE_WORKFLOWS")
+        assert mock_get.call_args_list[2][0][0].endswith("/git/trees/TREE_FOO")
+        assert mock_get.call_args_list[3][0][0].endswith("/git/trees/TREE_PROMPTS")
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_regular_and_executable_blobs_included(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _tree_response(
+            [
+                _tree_entry("script.sh", "100755", "blob"),
+                _tree_entry("data.json", "100644", "blob"),
+            ]
+        )
+
+        result = list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        assert result == ["data.json", "script.sh"]
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_symlinks_excluded(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _tree_response(
+            [
+                _tree_entry("real.yaml", "100644", "blob"),
+                _tree_entry("alias.yaml", "120000", "blob"),
+            ]
+        )
+
+        result = list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        assert result == ["real.yaml"]
+        assert "alias.yaml" not in result
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_submodules_excluded(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _tree_response(
+            [
+                _tree_entry("real.yaml", "100644", "blob"),
+                _tree_entry("vendor/lib", "160000", "commit"),
+            ]
+        )
+
+        result = list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        assert result == ["real.yaml"]
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_repeated_tree_contents_at_different_paths(self, mock_get: MagicMock) -> None:
+        """Two sibling directories sharing an identical filename must not
+        be conflated — each resolves to its own repo-relative path."""
+        root_tree = _tree_response(
+            [
+                _tree_entry("alpha", "040000", "tree", sha="TREE_ALPHA"),
+                _tree_entry("beta", "040000", "tree", sha="TREE_BETA"),
+            ]
+        )
+        alpha_tree = _tree_response(
+            [_tree_entry("note.md", "100644", "blob")], tree_sha="TREE_ALPHA"
+        )
+        beta_tree = _tree_response([_tree_entry("note.md", "100644", "blob")], tree_sha="TREE_BETA")
+        mock_get.side_effect = [root_tree, alpha_tree, beta_tree]
+
+        result = list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        assert result == ["alpha/note.md", "beta/note.md"]
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_missing_directory_raises_not_found(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _tree_response([_tree_entry("other", "040000", "tree", sha="X")])
+
+        with pytest.raises(RegistryNotFoundError, match="not found"):
+            list_files_recursive("owner", "repo", "workflows", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_path_segment_that_is_a_file_not_a_directory_raises_not_found(
+        self, mock_get: MagicMock
+    ) -> None:
+        mock_get.return_value = _tree_response(
+            [_tree_entry("workflows", "100644", "blob", sha=None)]
+        )
+
+        with pytest.raises(RegistryNotFoundError):
+            list_files_recursive("owner", "repo", "workflows/foo", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_malformed_response_not_an_object_raises(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(json_data=["not", "an", "object"])
+
+        with pytest.raises(RegistryError, match="Malformed response"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_malformed_response_missing_tree_key_raises(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(json_data={"sha": "x"})
+
+        with pytest.raises(RegistryError, match="Malformed response"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_malformed_entry_missing_path_raises(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(
+            json_data={"sha": "x", "tree": [{"mode": "100644", "type": "blob"}], "truncated": False}
+        )
+
+        with pytest.raises(RegistryError, match="Malformed response"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_malformed_tree_entry_missing_sha_raises(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(
+            json_data={
+                "sha": "x",
+                "tree": [{"path": "sub", "mode": "040000", "type": "tree"}],
+                "truncated": False,
+            }
+        )
+
+        with pytest.raises(RegistryError, match="Malformed response"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_truncated_response_raises(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _tree_response(
+            [_tree_entry("workflow.yaml", "100644", "blob")], truncated=True
+        )
+
+        with pytest.raises(RegistryError, match="truncated"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_timeout_raises_registry_error(self, mock_get: MagicMock) -> None:
+        mock_get.side_effect = httpx.TimeoutException("timed out")
+
+        with pytest.raises(RegistryError, match="Timeout"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_http_error_raises_registry_error(self, mock_get: MagicMock) -> None:
+        mock_get.side_effect = httpx.HTTPError("connection failed")
+
+        with pytest.raises(RegistryError, match="HTTP error"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_404_on_nested_directory_raises_registry_error(self, mock_get: MagicMock) -> None:
+        root_tree = _tree_response([_tree_entry("sub", "040000", "tree", sha="TREE_SUB")])
+        mock_get.side_effect = [root_tree, _mock_response(status_code=404)]
+
+        with pytest.raises(RegistryError, match="not found"):
+            list_files_recursive("owner", "repo", "", ref=self._REF)
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_traversal_pinned_to_commit_and_tree_identities(self, mock_get: MagicMock) -> None:
+        """Every request after the first uses a *tree* SHA discovered from
+        the previous response — never the original ref/branch name — so
+        traversal stays pinned to one immutable commit throughout."""
+        root_tree = _tree_response([_tree_entry("sub", "040000", "tree", sha="TREE_SUB")])
+        sub_tree = _tree_response([_tree_entry("file.yaml", "100644", "blob")], tree_sha="TREE_SUB")
+        mock_get.side_effect = [root_tree, sub_tree]
+
+        result = list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        assert result == ["sub/file.yaml"]
+        urls = [call[0][0] for call in mock_get.call_args_list]
+        assert urls[0].endswith(f"/git/trees/{self._REF}")
+        assert urls[1].endswith("/git/trees/TREE_SUB")
+        assert self._REF not in urls[1]
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_no_auth_header_needed_without_local_gh_cli(self, mock_get: MagicMock) -> None:
+        """The autouse ``_stub_auth_token`` fixture keeps this test (and
+        every other test in this class) from depending on a local ``gh``
+        CLI session — no ``Authorization`` header is sent."""
+        mock_get.return_value = _tree_response([_tree_entry("workflow.yaml", "100644", "blob")])
+
+        list_files_recursive("owner", "repo", "", ref=self._REF)
+
+        headers = mock_get.call_args.kwargs["headers"]
+        assert "Authorization" not in headers
 
 
 # --- parse_github_source ---
