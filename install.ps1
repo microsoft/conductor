@@ -421,9 +421,13 @@ function Write-IndexGuidance {
         Write-Host "  If pip already works through your organization's mirror, reuse its"
         Write-Host "  configured URL without printing credentials into this installer log:"
         Write-Host ""
-        Write-Host '      $pipIndex = pip config get global.index-url' -ForegroundColor Cyan
-        Write-Host '      $env:UV_DEFAULT_INDEX = "internal=$pipIndex"' -ForegroundColor Cyan
-        Write-Host '      irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
+        Write-Host '      $pipIndex = pip config get global.index-url 2>$null' -ForegroundColor Cyan
+        Write-Host '      if ($pipIndex) {' -ForegroundColor Cyan
+        Write-Host '          $env:UV_DEFAULT_INDEX = "internal=$pipIndex"' -ForegroundColor Cyan
+        Write-Host '          irm https://aka.ms/conductor/install.ps1 | iex' -ForegroundColor Cyan
+        Write-Host '      } else {' -ForegroundColor Cyan
+        Write-Host '          Write-Host "No pip global.index-url; use the approved mirror URL above."' -ForegroundColor Cyan
+        Write-Host '      }' -ForegroundColor Cyan
         Write-Host ""
     }
     Write-Host "  Notes:"

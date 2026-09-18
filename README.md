@@ -191,14 +191,24 @@ URL into uv without copying or printing credentials:
 
 ```bash
 # macOS / Linux
-pip_index="$(pip config get global.index-url)"
-export UV_DEFAULT_INDEX="internal=${pip_index}"
+pip_index="$(pip config get global.index-url 2>/dev/null || true)"
+if [ -n "$pip_index" ]; then
+    export UV_DEFAULT_INDEX="internal=${pip_index}"
+    curl -sSfL https://aka.ms/conductor/install.sh | sh
+else
+    printf '%s\n' 'No pip global.index-url; use the approved mirror URL above.'
+fi
 ```
 
 ```powershell
 # Windows
-$pipIndex = pip config get global.index-url
-$env:UV_DEFAULT_INDEX = "internal=$pipIndex"
+$pipIndex = pip config get global.index-url 2>$null
+if ($pipIndex) {
+    $env:UV_DEFAULT_INDEX = "internal=$pipIndex"
+    irm https://aka.ms/conductor/install.ps1 | iex
+} else {
+    Write-Host "No pip global.index-url; use the approved mirror URL above."
+}
 ```
 
 If the index requires credentials, uv accepts them inline in the URL or via

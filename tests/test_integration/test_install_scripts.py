@@ -392,8 +392,29 @@ def test_blocked_index_offers_credential_safe_pip_bridge(
     assert result.returncode != 0, f"install should have failed:\n{result.combined}"
     combined = result.combined
     assert "If pip already works" in combined
-    assert "pip config get global.index-url" in combined
-    assert "UV_DEFAULT_INDEX" in combined
+    if IS_WINDOWS:
+        expected = (
+            "      $pipIndex = pip config get global.index-url 2>$null\n"
+            "      if ($pipIndex) {\n"
+            '          $env:UV_DEFAULT_INDEX = "internal=$pipIndex"\n'
+            "          irm https://aka.ms/conductor/install.ps1 | iex\n"
+            "      } else {\n"
+            '          Write-Host "No pip global.index-url; '
+            'use the approved mirror URL above."\n'
+            "      }\n"
+        )
+    else:
+        expected = (
+            '      pip_index="$(pip config get global.index-url 2>/dev/null || true)"\n'
+            '      if [ -n "$pip_index" ]; then\n'
+            '          export UV_DEFAULT_INDEX="internal=${pip_index}"\n'
+            "          curl -sSfL https://aka.ms/conductor/install.sh | sh\n"
+            "      else\n"
+            "          printf '%s\\n' "
+            "'No pip global.index-url; use the approved mirror URL above.'\n"
+            "      fi\n"
+        )
+    assert expected in combined
 
 
 def test_ordinary_failure_still_retries_and_shows_no_index_guidance(
