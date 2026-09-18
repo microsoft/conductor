@@ -121,8 +121,12 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
         _base_dir: Path = Path(".")
         _file_stack: list[str] = []
 
-        def construct_file_tag(self, node: Any) -> Any:
-            """Resolve a !file tag by reading and optionally parsing the referenced file."""
+        def _read_included_file(self, node: Any) -> tuple[str, Path]:
+            """Resolve a !file/!rawfile path against the current base dir and read it.
+
+            Raises ConfigurationError on a circular reference, a missing file, or
+            invalid UTF-8. Returns the file's raw text content and its resolved path.
+            """
             path_str = self.construct_scalar(node)
             cls = type(self)
 
@@ -139,7 +143,6 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                     suggestion="Remove the circular !file reference.",
                 )
 
-            # Read file content
             try:
                 content = file_path.read_text(encoding="utf-8")
             except FileNotFoundError as e:
@@ -154,9 +157,16 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                     suggestion="Ensure the file is saved as UTF-8 text.",
                 ) from e
 
+            return content, file_path
+
+        def construct_file_tag(self, node: Any) -> Any:
+            """Resolve a !file tag by reading and optionally parsing the referenced file."""
+            content, file_path = self._read_included_file(node)
+            cls = type(self)
+
             # Try to parse as YAML (with nested !file support)
             saved_base_dir = cls._base_dir
-            cls._file_stack.append(file_path_str)
+            cls._file_stack.append(str(file_path))
             try:
                 cls._base_dir = file_path.parent
                 sub_yaml = YAML()
@@ -173,7 +183,18 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                 cls._base_dir = saved_base_dir
                 cls._file_stack.pop()
 
+        def construct_rawfile_tag(self, node: Any) -> Any:
+            """Resolve a !rawfile tag: always return the file's content verbatim.
+
+            Unlike !file, this never sniffs the content as YAML, so a prompt file
+            cannot have its type silently flip between a string and a parsed
+            mapping/list depending on whether its prose happens to parse as YAML.
+            """
+            content, file_path = self._read_included_file(node)
+            return FileString(content, source_path=file_path)
+
     FileTagConstructor.add_constructor("!file", FileTagConstructor.construct_file_tag)
+    FileTagConstructor.add_constructor("!rawfile", FileTagConstructor.construct_rawfile_tag)
     return FileTagConstructor
 
 

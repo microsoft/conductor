@@ -2762,6 +2762,24 @@ The content of the referenced file is handled based on its structure:
 - **YAML dict or list** — If the file content parses as a YAML mapping or sequence, it is returned as structured data (dict or list). This is useful for output schemas, tool lists, or any structured configuration.
 - **Scalar or non-YAML** — If the file contains a YAML scalar (e.g., a plain string), is not valid YAML, or is a non-YAML format like Markdown, the raw file content is returned as a string.
 
+This detection applies to the file's *structure*, not its extension: a Markdown prompt whose text happens to parse as a YAML mapping (a line ending in `:` followed by a `- ` bulleted list, for example) is returned as a dict, and a string-typed field like `prompt` or `system_prompt` then rejects it. Because this depends on the file's exact content, an unrelated prose edit can flip a working prompt file across the boundary with no config change. Use `!rawfile` (below) for any file whose content must always stay a string regardless of what it happens to contain.
+
+### Raw Text Includes (`!rawfile`)
+
+`!rawfile` reads the referenced file and always returns its content verbatim as a string, skipping the YAML-sniffing `!file` does. Use it for `prompt` and `system_prompt` files so their type can never depend on whether the prose happens to be valid YAML:
+
+```yaml
+agents:
+  - name: reviewer
+    model: gpt-4
+    system_prompt: !rawfile prompts/system.md
+    prompt: !rawfile prompts/review.md
+    routes:
+      - to: $end
+```
+
+`!rawfile` does not parse nested `!file`/`!rawfile` tags inside the included file; the content is returned exactly as read. It supports the same path resolution, environment variable resolution, and Jinja include search root as a `!file` tag that happened to return a string.
+
 ### Path Resolution
 
 File paths are resolved **relative to the directory containing the YAML file** that uses the `!file` tag, not relative to the current working directory.
@@ -2882,9 +2900,9 @@ A comprehensive summary of the analysis results.
 
 ### Jinja Includes in Prompt Files
 
-When a prompt or system_prompt is loaded via `!file`, the directory of that file becomes the search root for Jinja template loading. This allows statements like `{% include "_shared.md" %}`, `{% import "_macros.md" as m %}`, and `{% extends "_base.md" %}` to resolve relative to the prompt file's directory rather than the workflow's directory or the current working directory.
+When a prompt or system_prompt is loaded via `!file` or `!rawfile`, the directory of that file becomes the search root for Jinja template loading. This allows statements like `{% include "_shared.md" %}`, `{% import "_macros.md" as m %}`, and `{% extends "_base.md" %}` to resolve relative to the prompt file's directory rather than the workflow's directory or the current working directory.
 
-Only `prompt: !file` and `system_prompt: !file` support this behavior. Other fields that use `!file` (such as command, stdin, value, schemas, or tool lists) don't have include loader support. Inline prompts defined as plain strings don't support loader-dependent Jinja tags. If you attempt to use them inline, the system raises a template rendering error suggesting you switch to a file-backed prompt:
+Only `prompt`/`system_prompt` loaded via `!file` or `!rawfile` support this behavior. Other fields that use `!file`/`!rawfile` (such as command, stdin, value, schemas, or tool lists) don't have include loader support. Inline prompts defined as plain strings don't support loader-dependent Jinja tags. If you attempt to use them inline, the system raises a template rendering error suggesting you switch to a file-backed prompt:
 
 ```
 Template rendering failed: loader-dependent Jinja constructs ({% include %}, {% import %}, {% extends %}) require a file-backed prompt via prompt: !file ...
