@@ -110,14 +110,19 @@ def populate_github_warm_cache(
 def write_workflow_ready_marker(meta_dir: Path, workflow_name: str) -> None:
     """Write a current-layout-version readiness marker for *workflow_name*.
 
-    Mirrors ``conductor.registry.cache._write_readiness_marker`` — a bare
-    empty file (the pre-v4 marker format) is no longer treated as "ready"
-    by ``get_cached_workflow_path`` (issue #530), so any test that
-    hand-populates a workflow's cache entry as already-fetched must write
-    this versioned payload instead of an empty file.
+    Mirrors ``conductor.registry.cache._sentinel_path`` /
+    ``_write_readiness_marker`` — a bare empty file (the pre-v4 marker
+    format) is no longer treated as "ready" by ``get_cached_workflow_path``
+    (issue #530), so any test that hand-populates a workflow's cache entry
+    as already-fetched must write this versioned payload instead of an
+    empty file. The marker lives under a dedicated ``workflows/``
+    subdirectory of ``meta_dir`` so a workflow named e.g. ``tools`` cannot
+    collide with the SHA-keyed parse cache's own ``tools.complete``.
     """
     safe_name = workflow_name.replace("/", "_").replace("\\", "_")
-    (meta_dir / f"{safe_name}.complete").write_text(
+    sentinel_dir = meta_dir / "workflows"
+    sentinel_dir.mkdir(parents=True, exist_ok=True)
+    (sentinel_dir / f"{safe_name}.complete").write_text(
         json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION}, sort_keys=True),
         encoding="utf-8",
     )

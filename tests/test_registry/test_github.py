@@ -80,6 +80,59 @@ class TestFetchFile:
         with pytest.raises(RegistryError, match="rate limit"):
             fetch_file("owner", "repo", "file.txt")
 
+    @patch("conductor.registry.github.httpx.get")
+    def test_path_with_hash_is_percent_encoded(self, mock_get: MagicMock) -> None:
+        """A '#' in the path must not be treated as a URL fragment delimiter.
+
+        Regression for issue #530: an unescaped '#' truncates the request at
+        'prompts/plan.md', silently fetching the wrong file (or the parent
+        file's content again) instead of 'prompts/plan.md#draft'.
+        """
+        mock_get.return_value = _mock_response(content=b"draft content")
+        result = fetch_file("owner", "repo", "prompts/plan.md#draft", ref="v1.0")
+
+        assert result == b"draft content"
+        requested_url = mock_get.call_args[0][0]
+        assert requested_url == (
+            "https://raw.githubusercontent.com/owner/repo/v1.0/prompts/plan.md%23draft"
+        )
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_path_with_question_mark_is_percent_encoded(self, mock_get: MagicMock) -> None:
+        """A '?' in the path must not be treated as a query-string delimiter."""
+        mock_get.return_value = _mock_response(content=b"query-like content")
+        result = fetch_file("owner", "repo", "assets/report?v2.md", ref="v1.0")
+
+        assert result == b"query-like content"
+        requested_url = mock_get.call_args[0][0]
+        assert requested_url == (
+            "https://raw.githubusercontent.com/owner/repo/v1.0/assets/report%3Fv2.md"
+        )
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_path_with_literal_percent_is_percent_encoded(self, mock_get: MagicMock) -> None:
+        """A literal '%' must be re-escaped, not passed through as an existing escape."""
+        mock_get.return_value = _mock_response(content=b"100% done")
+        result = fetch_file("owner", "repo", "notes/100%done.md", ref="v1.0")
+
+        assert result == b"100% done"
+        requested_url = mock_get.call_args[0][0]
+        assert requested_url == (
+            "https://raw.githubusercontent.com/owner/repo/v1.0/notes/100%25done.md"
+        )
+
+    @patch("conductor.registry.github.httpx.get")
+    def test_path_separators_are_not_escaped(self, mock_get: MagicMock) -> None:
+        """Path separators are preserved; only segment names are percent-encoded."""
+        mock_get.return_value = _mock_response(content=b"nested")
+        result = fetch_file("owner", "repo", "a/b/c#weird?name%.md", ref="v1.0")
+
+        assert result == b"nested"
+        requested_url = mock_get.call_args[0][0]
+        assert requested_url == (
+            "https://raw.githubusercontent.com/owner/repo/v1.0/a/b/c%23weird%3Fname%25.md"
+        )
+
 
 # --- fetch_file_text ---
 

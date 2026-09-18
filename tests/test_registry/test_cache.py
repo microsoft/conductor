@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from conductor.registry.cache import (
     _readiness_marker_payload,
     _ref_slug,
     _safe_repo_path,
+    _sentinel_path,
     _write_ref_pointer,
     auto_fetch_relative_workflow,
     clear_cache,
@@ -156,8 +158,9 @@ def _pre_populate_cache(
         encoding="utf-8",
     )
 
-    safe_name = workflow_name.replace("/", "_")
-    (meta_dir / f"{safe_name}.complete").write_text(_readiness_marker_payload(), encoding="utf-8")
+    sentinel = _sentinel_path(registry_name, sha, workflow_name)
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text(_readiness_marker_payload(), encoding="utf-8")
 
     return workflow_path
 
@@ -281,7 +284,9 @@ class TestGetCachedWorkflowPath:
         home = _setup_conductor_home(tmp_path, monkeypatch)
         meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
         meta_dir.mkdir(parents=True)
-        (meta_dir / "qa-bot.complete").write_text(_readiness_marker_payload())
+        sentinel = _sentinel_path("myregistry", _FAKE_SHA, "qa-bot")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(_readiness_marker_payload())
         (meta_dir / "index.yaml").write_text(
             "workflows:\n  qa-bot:\n    description: ''\n    path: workflows/qa-bot.yaml\n"
         )
@@ -301,7 +306,9 @@ class TestGetCachedWorkflowPath:
         (wf_dir / "qa-bot.yaml").write_bytes(b"name: qa-bot\n")
         meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
         meta_dir.mkdir(parents=True)
-        (meta_dir / "qa-bot.complete").write_text("")  # legacy empty marker
+        sentinel = _sentinel_path("myregistry", _FAKE_SHA, "qa-bot")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("")  # legacy empty marker
         (meta_dir / "index.yaml").write_text(
             "workflows:\n  qa-bot:\n    description: ''\n    path: workflows/qa-bot.yaml\n"
         )
@@ -320,9 +327,9 @@ class TestGetCachedWorkflowPath:
         (wf_dir / "qa-bot.yaml").write_bytes(b"name: qa-bot\n")
         meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
         meta_dir.mkdir(parents=True)
-        (meta_dir / "qa-bot.complete").write_text(
-            json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION - 1})
-        )
+        sentinel = _sentinel_path("myregistry", _FAKE_SHA, "qa-bot")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION - 1}))
         (meta_dir / "index.yaml").write_text(
             "workflows:\n  qa-bot:\n    description: ''\n    path: workflows/qa-bot.yaml\n"
         )
@@ -356,7 +363,9 @@ class TestGetCachedWorkflowPath:
         home = _setup_conductor_home(tmp_path, monkeypatch)
         meta_dir = home / "cache" / "registries" / "myregistry" / "_meta" / _SHA_DIR
         meta_dir.mkdir(parents=True)
-        (meta_dir / "qa-bot.complete").write_text(_readiness_marker_payload())
+        sentinel = _sentinel_path("myregistry", _FAKE_SHA, "qa-bot")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(_readiness_marker_payload())
         # No index.yaml on disk — should still work because we pass the path.
 
         sha_root = home / "cache" / "registries" / "myregistry" / _SHA_DIR
@@ -521,7 +530,14 @@ class TestFetchWorkflowGitHub:
 
         # Sentinel was written
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         assert sentinel.is_file()
 
@@ -660,7 +676,14 @@ class TestFetchWorkflowGitHub:
 
         # Sentinel was NEVER written — cache hit must fail on retry.
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         assert not sentinel.exists()
 
@@ -1071,7 +1094,14 @@ class TestFetchWorkflowFailureContract:
             fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
 
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         assert not sentinel.exists()
         meta_root = home / "cache" / "registries" / "official" / "_meta"
@@ -1113,7 +1143,14 @@ class TestFetchWorkflowFailureContract:
             fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
 
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         assert not sentinel.exists()
 
@@ -1146,13 +1183,122 @@ class TestFetchWorkflowFailureContract:
             fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
 
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         assert not sentinel.exists()
         meta_root = home / "cache" / "registries" / "official" / "_meta"
         if meta_root.exists():
             leftovers = [p for p in meta_root.rglob(".tmp-*") if p.is_dir()]
             assert leftovers == []
+
+
+class TestConcurrentFetchDoesNotInvalidatePublishedCache:
+    """Regression for issue #530 review finding: a cross-process lock must
+    guard cache mutations for one registry+SHA from metadata invalidation
+    through readiness-marker publication, and a caller that reacquires the
+    lock after a sibling already published must reuse that sibling's entry
+    rather than invalidate it and race its own (possibly failing) fetch.
+    """
+
+    def test_failing_follower_cannot_invalidate_successful_fetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+
+        _setup_conductor_home(tmp_path, monkeypatch)
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+
+        a_in_lock_fetching = threading.Event()
+        release_a = threading.Event()
+        results: dict[str, object] = {}
+        call_count = {"n": 0}
+        call_count_lock = threading.Lock()
+
+        # All patching happens once, from the main thread, before either
+        # worker thread starts. Using unittest.mock.patch() as a context
+        # manager from *multiple threads* on the same target is itself
+        # unsafe (each __exit__ restores whatever value was in place when
+        # its own __enter__ ran, not necessarily the true original), so
+        # every mocked dependency here is a single, thread-safe callable
+        # shared by both callers.
+        monkeypatch.setattr("conductor.registry.cache.resolve_ref", lambda *_a, **_k: "v1.0.0")
+        monkeypatch.setattr(
+            "conductor.registry.cache.materialize_to_sha", lambda *_a, **_k: _FAKE_SHA
+        )
+        monkeypatch.setattr("conductor.registry.cache.load_index", lambda *_a, **_k: _make_index())
+        monkeypatch.setattr(
+            "conductor.registry.cache.list_files_recursive",
+            lambda *_a, **_k: ["workflows/qa-bot.yaml"],
+        )
+
+        def _fetch_file(owner: str, repo: str, path: str, ref: str) -> bytes:
+            with call_count_lock:
+                call_count["n"] += 1
+                this_call = call_count["n"]
+            if this_call == 1:
+                # The first (winning) caller: signal that it now holds the
+                # cache lock and is mid-fetch, then block there until the
+                # test releases it — simulating "one caller waits [inside
+                # the fetch]" from the review finding.
+                a_in_lock_fetching.set()
+                release_a.wait(timeout=5)
+                return b"name: qa-bot\n"
+            # A second real fetch attempt would only happen if the lock
+            # failed to make the follower reuse the winner's published
+            # entry — assert that never happens.
+            raise RegistryError("simulated follower failure — must never be reached")
+
+        monkeypatch.setattr("conductor.registry.cache.fetch_file", _fetch_file)
+
+        def run_a() -> None:
+            try:
+                results["a"] = fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+            except Exception as exc:  # pragma: no cover - surfaced via assertion below
+                results["a_error"] = exc
+
+        def run_b() -> None:
+            # Only start once A is confirmed to hold the cache lock, so B's
+            # own pre-lock check is guaranteed to still see a miss and it
+            # must then block acquiring the lock behind A.
+            assert a_in_lock_fetching.wait(timeout=5)
+            try:
+                results["b"] = fetch_workflow("official", entry, "qa-bot", ref="v1.0.0")
+            except Exception as exc:  # pragma: no cover - surfaced via assertion below
+                results["b_error"] = exc
+
+        thread_a = threading.Thread(target=run_a)
+        thread_b = threading.Thread(target=run_b)
+        thread_a.start()
+        thread_b.start()
+
+        # Give B a moment to actually reach (and block on) the lock behind A
+        # before letting A finish and publish.
+        assert a_in_lock_fetching.wait(timeout=5)
+        time.sleep(0.2)
+        release_a.set()
+
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+        assert not thread_a.is_alive()
+        assert not thread_b.is_alive()
+
+        assert "a_error" not in results
+        assert "b_error" not in results
+        assert results["a"] == results["b"]
+        assert results["a"].is_file()
+        assert call_count["n"] == 1
+
+        # The published cache entry survived and remains valid offline —
+        # the failing follower never got the chance to invalidate it.
+        cached = get_cached_workflow_path("official", "qa-bot", _FAKE_SHA)
+        assert cached == results["a"]
 
 
 class TestCacheLayoutUpgrade:
@@ -1194,7 +1340,14 @@ class TestCacheLayoutUpgrade:
             registry_source="myorg/workflows",
         )
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         sentinel.write_text("")  # downgrade to the legacy empty marker
 
@@ -1228,7 +1381,14 @@ class TestCacheLayoutUpgrade:
             registry_source="myorg/workflows",
         )
         sentinel = (
-            home / "cache" / "registries" / "official" / "_meta" / _SHA_DIR / "qa-bot.complete"
+            home
+            / "cache"
+            / "registries"
+            / "official"
+            / "_meta"
+            / _SHA_DIR
+            / "workflows"
+            / "qa-bot.complete"
         )
         sentinel.write_text("")  # legacy empty marker
         before = sentinel.read_text()
@@ -1996,6 +2156,47 @@ class TestParsedToolsCache:
         _setup_conductor_home(tmp_path, monkeypatch)
         save_parsed_tools("official", _FAKE_SHA, self._make_tools())
         assert load_parsed_tools("official", _FAKE_SHA2) is None
+
+    def test_workflow_named_tools_does_not_collide_with_parse_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workflow literally named 'tools' must resolve offline even
+        after the SHA-keyed parse cache (tools.json/tools.complete) is
+        saved for the same registry+SHA (issue #530 review finding).
+
+        Before the fix, both the workflow's readiness marker and the parse
+        cache's own sentinel lived directly in the meta dir as
+        'tools.complete', so save_parsed_tools() would overwrite the
+        workflow's marker with an empty-string payload and
+        get_cached_workflow_path() would then treat a fully-cached
+        workflow as a cache miss.
+        """
+        home = _setup_conductor_home(tmp_path, monkeypatch)
+        wf_path = _pre_populate_cache(
+            home,
+            registry_name="official",
+            workflow_name="tools",
+            sha=_FAKE_SHA,
+            workflow_repo_path="workflows/tools.yaml",
+            registry_source="myorg/workflows",
+        )
+
+        # Simulate the parse cache being (re)saved for this registry+SHA
+        # after the workflow was fetched — this used to clobber the
+        # workflow's own readiness marker.
+        save_parsed_tools("official", _FAKE_SHA, self._make_tools())
+
+        assert get_cached_workflow_path("official", "tools", _FAKE_SHA) == wf_path
+
+        _patch_all_github_functions_to_raise(monkeypatch)
+        entry = RegistryEntry(type=RegistryType.github, source="myorg/workflows")
+        result = fetch_workflow("official", entry, "tools", ref=_FAKE_SHA, allow_network=False)
+        assert result == wf_path
+
+        # The parse cache itself must still be intact too.
+        loaded = load_parsed_tools("official", _FAKE_SHA)
+        assert loaded is not None
+        assert "qa-bot" in loaded
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from urllib.parse import quote
 
 import httpx
 
@@ -76,7 +77,12 @@ def _raise_for_status(response: httpx.Response, *, context: str) -> None:
 def fetch_file(owner: str, repo: str, path: str, ref: str = "main") -> bytes:
     """Fetch a single file from a GitHub repo at a given ref.
 
-    Uses raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>.
+    Uses raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>. ``path`` is
+    percent-encoded (preserving ``/`` separators) before being interpolated
+    into the URL, so a repo-relative path containing ``#``, ``?``, or a
+    literal ``%`` is requested — and cached — as the file it actually names,
+    rather than being truncated at a URL fragment/query delimiter or
+    misinterpreted as an existing percent-escape.
 
     Args:
         owner: Repository owner.
@@ -90,7 +96,7 @@ def fetch_file(owner: str, repo: str, path: str, ref: str = "main") -> bytes:
     Raises:
         RegistryError: If the file is not found (404) or request fails.
     """
-    url = f"{GITHUB_RAW_BASE}/{owner}/{repo}/{ref}/{path}"
+    url = f"{GITHUB_RAW_BASE}/{owner}/{repo}/{ref}/{quote(path, safe='/')}"
     try:
         response = httpx.get(
             url, headers=_build_headers(), timeout=DEFAULT_TIMEOUT, follow_redirects=True

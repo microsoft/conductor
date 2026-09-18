@@ -1985,7 +1985,7 @@ class TestCrossWorkflowRegistryRef:
         import json
         from unittest.mock import patch
 
-        from conductor.registry.cache import CACHE_LAYOUT_VERSION
+        from conductor.registry.cache import CACHE_LAYOUT_VERSION, _sentinel_path
 
         # Point CONDUCTOR_HOME at a temp dir so the cache lives there.
         home = tmp_path / "conductor_home"
@@ -2042,7 +2042,9 @@ class TestCrossWorkflowRegistryRef:
             "  sdd-plan:\n    description: ''\n    path: sdd-plan/plan.yaml\n"
             "  document-review:\n    description: ''\n    path: document-review/workflow.yaml\n"
         )
-        (meta_dir / "sdd-plan.complete").write_text(
+        sdd_plan_sentinel = _sentinel_path("official", sha, "sdd-plan")
+        sdd_plan_sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sdd_plan_sentinel.write_text(
             json.dumps({"cache_layout_version": CACHE_LAYOUT_VERSION}, sort_keys=True)
         )
 
@@ -2122,7 +2124,7 @@ class TestCrossWorkflowRegistryRef:
         assert nested_asset.is_file()
         assert nested_asset.read_text() == "Review the document thoroughly.\n"
         # And its sentinel was written.
-        assert (meta_dir / "document-review.complete").exists()
+        assert _sentinel_path("official", sha, "document-review").exists()
 
 
 class TestSubWorkflowTerminate:
