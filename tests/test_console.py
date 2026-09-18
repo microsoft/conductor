@@ -607,8 +607,11 @@ class TestSelectConsoleGlyph:
         assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ARROW
 
     def test_missing_encoding_retains_unicode(self) -> None:
-        """A stream with no ``.encoding`` (e.g. ``io.StringIO``) is treated
-        as capable of anything rather than downgraded."""
+        """``io.StringIO.encoding`` is ``None``, but rich substitutes
+        ``"utf-8"`` for ``console.encoding`` regardless, so this takes the
+        normal encoding probe (and passes) rather than the helper's
+        explicit falsy-``console.encoding`` branch -- see
+        ``test_falsy_encoding_metadata_retains_unicode`` for that branch."""
         stream = io.StringIO()
         assert stream.encoding is None
         console = make_console(file=stream, width=200)

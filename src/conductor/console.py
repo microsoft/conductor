@@ -199,11 +199,15 @@ def select_console_glyph(console: Console, unicode_glyph: str, ascii_fallback: s
     general output sanitizer, and it is not a substitute for validating that
     arbitrary user or workflow text can be written to a stream.
 
-    A falsy ``console.encoding`` is treated as capable of anything, so an
-    in-memory buffer (``io.StringIO``, whose ``.encoding`` is ``None``) is
-    not needlessly downgraded. This is a deliberate fail-open: a stream that
-    is lossy *and* silent about its encoding (e.g. ``codecs.getwriter``) will
-    still raise.
+    An ``io.StringIO`` buffer never reaches the falsy branch below: rich
+    reports its ``console.encoding`` as ``"utf-8"`` regardless of the
+    underlying stream's own ``.encoding`` (which is ``None``), so it takes
+    the normal encoding probe and both glyphs pass. A falsy
+    ``console.encoding`` -- ``None`` or ``""`` -- is what the explicit
+    fail-open branch below actually guards, treating such a console as
+    capable of anything so it is not needlessly downgraded. This is a
+    deliberate trade-off: a stream that is lossy *and* silent about its
+    encoding (e.g. ``codecs.getwriter``) will still raise.
 
     Args:
         console: The console whose stream encoding is probed.

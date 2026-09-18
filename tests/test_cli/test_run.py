@@ -878,10 +878,12 @@ output:
     # ``test_doctor.py::TestDoctorEncodingFallback`` rather than trusting
     # ``CliRunner``'s UTF-8 capture: binding the CLI's console to a
     # ``TextIOWrapper`` in the target encoding makes a leaked glyph raise
-    # ``UnicodeEncodeError`` at write time under ``errors="strict"``, and lets
-    # a ``errors="surrogateescape"`` variant assert on the exact decoded
-    # content rather than merely "did not raise" (which that error handler
-    # would satisfy even for a leaked glyph).
+    # ``UnicodeEncodeError`` at write time under both ``errors="strict"`` and
+    # ``errors="surrogateescape"`` -- the latter only handles escaped-byte
+    # surrogates, not an unencodable arrow or lightning marker, so it offers
+    # no extra leniency here. The ``surrogateescape`` variant instead adds
+    # value by asserting on the exact decoded content (the intended ASCII
+    # replacements) rather than merely "did not raise".
 
     @pytest.fixture(autouse=True)
     def _no_update_check(self, monkeypatch: pytest.MonkeyPatch) -> None:

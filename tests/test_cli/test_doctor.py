@@ -1329,6 +1329,40 @@ class TestDoctorEncodingFallback:
         output = buffer.getvalue().decode("cp1252")
         assert "OK" in output
 
+    def test_cp1252_console_renders_missing_credentials_without_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Covers the credential cross/optional-marker cells the refactor
+        changed: a missing *required* credential renders ``glyphs.cross``
+        and a missing *optional* one renders ``glyphs.optional``, neither of
+        which the parametrized case above exercises (it declares no
+        credentials at all)."""
+        buffer, stream = self._bind_console(monkeypatch, "cp1252")
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    installed=True,
+                    creds=[CredentialEnvVar(name="GH_TOKEN", present=False)],
+                    credentials_optional=True,
+                ),
+                _prov(
+                    "claude",
+                    installed=True,
+                    creds=[CredentialEnvVar(name="ANTHROPIC_API_KEY", present=False)],
+                    credentials_optional=False,
+                ),
+            ],
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        stream.flush()
+        assert result.exception is None
+        assert result.exit_code == 0
+        output = buffer.getvalue().decode("cp1252")
+        assert "X ANTHROPIC_API_KEY" in output
+        assert "o GH_TOKEN" in output
+
     def test_utf8_console_keeps_unicode_glyphs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         buffer, stream = self._bind_console(monkeypatch, "utf-8")
         report = DoctorReport(providers=[_prov("copilot", installed=True)])
