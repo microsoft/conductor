@@ -592,6 +592,102 @@ agents:
 
 See [`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml).
 
+### Authentication Mode (`auth_mode`)
+
+The optional `runtime.provider.auth_mode` field (`"auto"` default,
+`"subscription"`, `"api_key"`) **selects which credential the `claude` CLI
+child process uses**. Only the `claude-agent-sdk` provider reads it. It selects
+a credential, not an endpoint.
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      auth_mode: subscription   # auto | subscription | api_key
+```
+
+| Mode | `setting_sources` | Child environment | Readiness check |
+|---|---|---|---|
+| `auto` | Allowed | Inherited unchanged, including any `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` backend selector; the CLI applies its own credential precedence. | Requires the CLI (located without running it) even when `ANTHROPIC_API_KEY` is set. With the key, ready without running `claude auth status`; otherwise runs `claude auth status --json`. |
+| `subscription` | Refused | Blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_CODE_OAUTH_TOKEN`. **Refuses** an inherited non-blank cloud-backend selector (see below). | Refuses a cloud selector, then requires the CLI, then runs `claude auth status --json`. |
+| `api_key` | Refused | Requires a non-blank `ANTHROPIC_API_KEY`; blanks `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. **Refuses** an inherited non-blank cloud-backend selector (see below). | Refuses a cloud selector, then requires the CLI (located without running it) and the key. Never runs `claude auth status`. |
+
+`auto` is the default, so existing workflows behave as before. Its outcome
+depends on each machine's environment and Claude Code login; choose an
+explicit mode when the credential must not vary.
+
+**One environment for the check and the run.** At the start of each agent
+execution Conductor captures the environment, working directory, settings
+tiers, and CLI path once. The readiness check and the agent session both use
+that capture: the check runs in the same environment and directory, and the
+session receives the complete resulting environment through
+`ClaudeAgentOptions.env`, plus the same CLI path. The check also loads exactly
+the settings tiers the session loads — the check is run as
+`claude --setting-sources=<tiers> auth status --json`, with
+`--setting-sources=` when there are none, so a credential in an ambient
+settings file the session does not load cannot make the check pass. An agent
+with `skills: []` loads no tiers, and its check loads none either. Conductor never modifies its
+own process environment. One SDK limitation remains: the SDK layers
+`ClaudeAgentOptions.env` over its own copy of the process environment, so a
+variable that first appears in Conductor's process *after* the capture can
+still reach the child. The variables an explicit mode blanks are always sent
+explicitly, so this cannot bring them back.
+
+**Explicit modes refuse inherited cloud-backend selectors.** A non-blank
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or
+`CLAUDE_CODE_USE_FOUNDRY` would route the session to that cloud backend
+instead of the credential the mode selects. Conductor does not support that
+combination, so `subscription` and `api_key` fail readiness before the check
+runs or any session starts. The error names the variable (never its value)
+and suggests unsetting it or using `auth_mode: auto`, which keeps the inherited
+backend selection. In both explicit modes the child environment also receives
+these three variables as empty strings, so one set in Conductor's process
+after the capture cannot reach the CLI.
+
+**Explicit modes refuse `setting_sources`.** A Claude Code settings file can
+carry an `env` block, which the CLI applies after Conductor has configured the
+child environment. It could supply a credential or backend selector that
+overrides the explicit mode, and the SDK offers no per-call override that is
+known to take precedence over it. `subscription` and `api_key` therefore reject
+a non-empty `runtime.provider.setting_sources`, both at `conductor validate`
+and when an agent runs — including an agent whose `skills: []` means it would
+not load them; the error suggests removing `setting_sources` or using
+`auth_mode: auto`, which keeps settings tiers available.
+
+The readiness check confirms that a credential path is usable before each
+agent runs. It is **not billing attribution**, and it is not evidence of which
+account a model call was billed to.
+
+`conductor doctor --check` reports the check's result as two groups: a
+`Conductor:` line with Conductor's own `requested_mode` / `inferred_mode`, and
+an `SDK:` line with fields copied from the CLI's status output (`authMethod`,
+`apiProvider`, `apiKeySource`, `subscriptionType`), each only when the CLI
+reported it. `apiProvider` names the API backend, not how the CLI
+authenticated. With `auth_mode: auto` and `ANTHROPIC_API_KEY` set, the `SDK:`
+fields are all empty, because that path does not run `claude auth status`;
+Doctor's default configuration is `auto`, so this is what Doctor shows
+whenever the key is set. Doctor does not read workflows: it always checks the provider's
+**default configuration** (`auth_mode: auto`), and says so on a `Scope:` line,
+so its output does not describe a workflow that sets another `auth_mode`.
+
+```text
+$ conductor doctor providers --check
+claude-agent-sdk   installed   ✓ connected
+                                Conductor: requested_mode=auto, inferred_mode=subscription
+                                SDK: authMethod=claude.ai, subscriptionType=max
+                                auto: the effective credential follows the SDK/CLI's inherited-environment precedence — ...
+                                Scope: default provider configuration; a workflow's runtime.provider.auth_mode is not inspected
+```
+
+A non-`auto` `auth_mode` is preserved in checkpoint serialization so the
+explicit choice is restored on `conductor resume`.
+
+See the [Authentication](providers/experimental.md#authentication-claude-agent-sdk)
+section of the experimental-providers guide and the
+[configuration guide](configuration.md#field-compatibility-by-provider) for
+field compatibility across providers.
+
 ### Sandbox Configuration (ACA)
 
 The optional per-agent `sandbox:` block overrides settings for the

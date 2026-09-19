@@ -27,7 +27,7 @@ import logging
 import os
 import platform
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from conductor import __version__
 from conductor.providers.capabilities import get_capabilities, known_provider_names
@@ -89,6 +89,13 @@ class _CredentialSpec:
 # Per-provider credential environment variables and their offline-diagnostic
 # semantics. See each entry's ``optional_auth_note`` for *why* that provider's
 # vars are optional overrides rather than hard requirements.
+# ``gather_provider`` builds each provider with no workflow settings, so an
+# auth diagnostic describes the default configuration (``auth_mode: auto`` on
+# ``claude-agent-sdk``), never the ``auth_mode`` a particular workflow sets.
+AUTH_DIAGNOSTIC_SCOPE: Final[str] = (
+    "default provider configuration; a workflow's runtime.provider.auth_mode is not inspected"
+)
+
 _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     "copilot": _CredentialSpec(
         env_vars=(
@@ -106,7 +113,8 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     "claude-agent-sdk": _CredentialSpec(
         env_vars=("ANTHROPIC_API_KEY",),
         optional_auth_note=(
-            "authenticates via `claude login`; ANTHROPIC_API_KEY is an optional override"
+            "authenticates via `claude login`; ANTHROPIC_API_KEY is optional "
+            "(used under auth_mode auto or api_key, blanked under subscription)"
         ),
     ),
     "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
@@ -200,6 +208,18 @@ class ProviderDiagnostic:
     models: list[ModelDiagnostic] | None = None
     models_error: str | None = None
     note: str | None = None
+    auth_diagnostic: dict[str, Any] | None = None
+    """Provider-supplied, doctor-facing auth readiness detail (issue
+
+    TICKET-20260816-0002). Populated via the duck-typed
+    ``auth_status_diagnostic`` hook (mirroring ``connection_error_hint``) —
+    absent for providers that don't define it. Shaped as two separate
+    groups (``conductor_inferred`` vs. ``sdk_observed``) so a renderer never
+    conflates Conductor's own mode inference with the SDK/CLI's sanitized,
+    as-observed fields; see
+    :attr:`conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider.auth_status_diagnostic`
+    for the field-level contract.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation."""
@@ -217,6 +237,7 @@ class ProviderDiagnostic:
             "models": [m.to_dict() for m in self.models] if self.models is not None else None,
             "models_error": self.models_error,
             "note": self.note,
+            "auth_diagnostic": self.auth_diagnostic,
         }
 
 
@@ -837,6 +858,18 @@ async def gather_provider(
         except Exception as e:  # noqa: BLE001 - diagnostics must never raise
             diag.connection_ok = False
             diag.connection_error = _format_error(e)
+        if not diag.connection_ok:
+            hint = getattr(provider, "connection_error_hint", None)
+            if isinstance(hint, str) and hint:
+                diag.connection_error = hint
+
+        # Duck-typed like connection_error_hint above: read regardless of
+        # connection_ok, since distinguishing a ready subscription session
+        # from a ready API-key session is exactly the case this exists for
+        # (TICKET-20260816-0002) — not just a failure explainer.
+        auth_diagnostic = getattr(provider, "auth_status_diagnostic", None)
+        if isinstance(auth_diagnostic, dict):
+            diag.auth_diagnostic = {**auth_diagnostic, "scope": AUTH_DIAGNOSTIC_SCOPE}
 
         # Gate on a verified (not merely truthy) connection: an inconclusive
         # probe means models.list() already failed once, so calling

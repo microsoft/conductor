@@ -199,3 +199,48 @@ def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         return runs_dir
 
     monkeypatch.setattr("conductor.rundir.runs_dir", _isolated)
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_auth_readiness(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep every test away from a real ``claude auth status --json``.
+
+    ``ClaudeAgentSdkProvider.execute()`` and ``validate_connection()`` run an
+    authentication preflight that can spawn the ``claude`` CLI. Left real, any
+    test driving the provider — directly or through ``WorkflowEngine`` — would
+    depend on whether this machine has the CLI installed and logged in.
+
+    * **Default:** ``_check_auth_readiness`` is stubbed to a ready status, so
+      ordinary tests never reach the preflight at all.
+    * **Opt-in** (``@pytest.mark.claude_auth_readiness_mocked``): the real
+      method runs, for tests of the preflight itself. Process creation is
+      replaced with a guard that fails the test, so an opted-in test must mock
+      ``asyncio.create_subprocess_exec`` (or ``_run_auth_status_subprocess``)
+      itself; one that forgets fails here instead of silently probing the real
+      CLI with the developer's credentials. Those tests control the
+      environment themselves (``patch.dict(os.environ, ..., clear=True)`` or an
+      explicitly built ``EffectiveAuthContext``).
+    """
+    if request.node.get_closest_marker("claude_auth_readiness_mocked") is not None:
+
+        async def _refuse_real_spawn(*args: object, **kwargs: object) -> None:
+            raise AssertionError(
+                "claude_auth_readiness_mocked test reached real process creation; "
+                "mock asyncio.create_subprocess_exec or _run_auth_status_subprocess."
+            )
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", _refuse_real_spawn)
+        return
+
+    from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider, ClaudeAuthStatus
+
+    async def _always_ready(self: ClaudeAgentSdkProvider, **kwargs: object) -> ClaudeAuthStatus:
+        return ClaudeAuthStatus(
+            requested_mode=self._auth_mode,
+            inferred_mode="subscription",
+            ready=True,
+        )
+
+    monkeypatch.setattr(ClaudeAgentSdkProvider, "_check_auth_readiness", _always_ready)

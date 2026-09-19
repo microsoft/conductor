@@ -1644,6 +1644,24 @@ class AzureProviderOptions(BaseModel):
     falls back to its own default when unset."""
 
 
+def explicit_auth_mode_setting_sources_error(auth_mode: str, setting_sources: Any) -> str:
+    """Explain why an explicit ``claude-agent-sdk`` ``auth_mode`` refuses settings tiers.
+
+    Shared by the static check on :class:`ProviderSettings` and the run-time
+    check in ``ClaudeAgentSdkProvider._check_auth_readiness`` (``conductor run``
+    never calls the static validator), so both boundaries state the same cause
+    and the same two remedies.
+    """
+    return (
+        f"auth_mode '{auth_mode}' cannot be combined with runtime.provider."
+        f"setting_sources ({', '.join(setting_sources)}): a Claude Code settings file's "
+        "'env' block is applied by the CLI after Conductor configures the child "
+        "environment, so it can inject a credential or backend selector that overrides "
+        "the explicit mode, and the SDK offers no override that outranks it. Remove "
+        "setting_sources, or use auth_mode 'auto'."
+    )
+
+
 class ProviderSettings(BaseModel):
     """Structured provider configuration for ``runtime.provider``.
 
@@ -1720,6 +1738,17 @@ class ProviderSettings(BaseModel):
           name: claude
           base_url: https://my-gateway.example.com/api/v1
           auth_token: ${DATABRICKS_TOKEN}
+    """
+
+    auth_mode: Literal["auto", "subscription", "api_key"] | None = None
+    """Credential path for the ``claude`` child process. ``claude-agent-sdk`` only.
+
+    ``"auto"`` leaves the inherited environment untouched, so the CLI applies
+    its own credential precedence. ``"subscription"`` blanks API-key, token,
+    OAuth, and Bedrock/Vertex/Foundry variables in the child environment so
+    the logged-in session is used; ``"api_key"`` requires a nonblank
+    ``ANTHROPIC_API_KEY`` and blanks the others. Both explicit modes refuse
+    ``setting_sources``. Selects a credential, not an endpoint.
     """
 
     headers: dict[str, str] | None = None
@@ -1952,6 +1981,8 @@ class ProviderSettings(BaseModel):
             extras = sorted(k for k, v in claude_only_fields.items() if v is not None)
             if extras:
                 raise ValueError(f"Provider fields {extras} are only supported when name='claude'.")
+        if self.auth_mode is not None and self.name != "claude-agent-sdk":
+            raise ValueError("'auth_mode' is only supported when name='claude-agent-sdk'")
         if self.name != "aca":
             extras = sorted(k for k, v in aca_only_fields.items() if v is not None)
             if extras:
@@ -1962,6 +1993,17 @@ class ProviderSettings(BaseModel):
                 "'setting_sources' is only supported when name='claude-agent-sdk' "
                 f"(got name={self.name!r}). It selects Claude Code settings tiers, "
                 "which no other provider reads."
+            )
+
+        # Explicit auth modes refuse settings tiers; ``auto`` keeps them.
+        # Mirrored at run time in ``_check_auth_readiness``.
+        if (
+            self.name == "claude-agent-sdk"
+            and self.setting_sources
+            and self.auth_mode in ("subscription", "api_key")
+        ):
+            raise ValueError(
+                explicit_auth_mode_setting_sources_error(self.auth_mode, self.setting_sources)
             )
 
         if self.hermes_home is not None and self.name != "hermes":
@@ -2089,6 +2131,8 @@ class ProviderSettings(BaseModel):
                 object.__setattr__(self, "identifier_scope", "agent")
             if self.auth is None:
                 object.__setattr__(self, "auth", "azure_default")
+        if self.name == "claude-agent-sdk" and self.auth_mode is None:
+            object.__setattr__(self, "auth_mode", "auto")
 
         return self
 
@@ -2147,6 +2191,7 @@ class ProviderSettings(BaseModel):
             or self.has_external_runtime()
             or self.has_aca_config()
             or self.setting_sources is not None
+            or self.auth_mode in ("subscription", "api_key")
         )
 
     @model_serializer(mode="wrap")

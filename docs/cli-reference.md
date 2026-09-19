@@ -1026,7 +1026,7 @@ values are never read or printed. Detected variables per provider:
 |----------|-----------------------|-------------|
 | `copilot` | `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `COPILOT_PROVIDER_RUNTIME_TOKEN` | optional overrides — authenticates via the GitHub/Copilot CLI login on disk |
 | `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | required (direct Anthropic API) |
-| `claude-agent-sdk` | `ANTHROPIC_API_KEY` | optional override — authenticates via `claude login` |
+| `claude-agent-sdk` | `ANTHROPIC_API_KEY` | optional — authenticates via `claude login`; the key is used or ignored according to `runtime.provider.auth_mode` |
 | `hermes` | *(none — endpoint / API key are passed explicitly)* | — |
 | `openai` | `OPENAI_API_KEY` | required (direct OpenAI API) |
 
@@ -1039,6 +1039,16 @@ absent optional variable renders as a neutral `○` (with a short note in the
 *required* credential. The offline view only ever reports env-var
 *presence*, never validity, for **any** provider — run a live connection
 probe with `--check` to confirm a provider is actually ready.
+
+`--check` builds each provider with its **default configuration** and does not
+read any workflow. For `claude-agent-sdk` that means `auth_mode: auto`, so the
+connection cell describes the default credential path, not the `auth_mode` a
+particular workflow sets; a `Scope:` line (and a `scope` key in `--json`
+output) says so. The same cell shows Conductor's inferred mode on a
+`Conductor:` line and the CLI-reported `authMethod` / `apiProvider` /
+`apiKeySource` / `subscriptionType` on an `SDK:` line; `apiProvider` names the
+API backend, not how the CLI authenticated. See
+[Authentication Mode](workflow-syntax.md#authentication-mode-auth_mode).
 
 ### Exit codes
 
