@@ -305,12 +305,15 @@ def _connection_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
     never merged into the connection line above: a ``Conductor:`` line for
     Conductor's own mode inference (``requested_mode``/``inferred_mode``) and
     an ``SDK:`` line for the CLI's sanitized, as-observed fields
-    (``authMethod``/``apiKeySource``/``subscriptionType``) — the two groups a
+    (``authMethod``/``apiProvider``/``apiKeySource``/``subscriptionType``;
+    ``apiProvider`` names the backend, not how the CLI authenticated) — the two groups a
     subscription-vs-API-key-present distinction actually needs, since
     ``authMethod`` alone reports identically for both. Fields the CLI didn't
     report are omitted from the ``SDK:`` line rather than back-filled. Under
-    ``auto`` a third line states the credential follows inherited-environment
-    precedence rather than a Conductor-made selection.
+    ``auto`` a further line states the credential follows inherited-environment
+    precedence rather than a Conductor-made selection, and a ``Scope:`` line
+    says the check used the default provider configuration — doctor never
+    reads a workflow, so it cannot report a workflow's explicit ``auth_mode``.
     """
     lines: list[Text] = []
     if not diag.checked or diag.connection_ok is None:
@@ -339,6 +342,9 @@ def _connection_cell(diag: ProviderDiagnostic, glyphs: _Glyphs) -> Text:
         auto_note = auth.get("auto_note")
         if isinstance(auto_note, str) and auto_note:
             lines.append(styled("[dim]{}[/dim]", auto_note))
+        scope = auth.get("scope")
+        if isinstance(scope, str) and scope:
+            lines.append(styled("[dim]Scope: {}[/dim]", scope))
 
     if len(lines) == 1:
         return lines[0]

@@ -20,6 +20,7 @@ from typer.testing import CliRunner
 from conductor.cli.app import app
 from conductor.console import make_console
 from conductor.providers.diagnostics import (
+    AUTH_DIAGNOSTIC_SCOPE,
     CredentialEnvVar,
     DoctorReport,
     EnvDiagnostic,
@@ -270,13 +271,15 @@ class TestDoctorAuthDiagnosticRendering:
                     connection_ok=True,
                     auth_diagnostic={
                         "conductor_inferred": {
-                            "requested_mode": "subscription",
+                            "requested_mode": "auto",
                             "inferred_mode": "subscription",
                         },
                         "sdk_observed": {
                             "authMethod": "claude.ai",
+                            "apiProvider": "firstParty",
                             "subscriptionType": "max",
                         },
+                        "scope": AUTH_DIAGNOSTIC_SCOPE,
                     },
                 )
             ]
@@ -284,8 +287,38 @@ class TestDoctorAuthDiagnosticRendering:
         _patch_gather(monkeypatch, report)
         result = runner.invoke(app, ["doctor", "providers", "--check"])
         assert result.exit_code == 0
-        assert "Conductor: requested_mode=subscription, inferred_mode=subscription" in result.output
-        assert "SDK: authMethod=claude.ai, subscriptionType=max" in result.output
+        output = " ".join(result.output.split())
+        assert "Conductor: requested_mode=auto, inferred_mode=subscription" in output
+        # apiProvider is its own field, never presented as authMethod.
+        assert "SDK: authMethod=claude.ai, apiProvider=firstParty, subscriptionType=max" in output
+        assert "authMethod=firstParty" not in output
+
+    def test_scope_line_states_default_configuration(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Doctor builds providers without a workflow, so it must say it did
+        not inspect a workflow's ``auth_mode``."""
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "claude-agent-sdk",
+                    checked=True,
+                    connection_ok=True,
+                    auth_diagnostic={
+                        "conductor_inferred": {
+                            "requested_mode": "auto",
+                            "inferred_mode": "api_key",
+                        },
+                        "sdk_observed": {},
+                        "scope": AUTH_DIAGNOSTIC_SCOPE,
+                    },
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "providers", "--check"])
+        assert result.exit_code == 0
+        output = " ".join(result.output.split())
+        assert "default provider configuration" in output
+        assert "auth_mode is not inspected" in output
 
     def test_auto_note_rendered_when_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         report = DoctorReport(
@@ -318,9 +351,7 @@ class TestDoctorAuthDiagnosticRendering:
     ) -> None:
         """A provider with no ``auth_diagnostic`` (e.g. every provider other
         than ``claude-agent-sdk``) must not gain the extra lines."""
-        report = DoctorReport(
-            providers=[_prov("copilot", checked=True, connection_ok=True)]
-        )
+        report = DoctorReport(providers=[_prov("copilot", checked=True, connection_ok=True)])
         _patch_gather(monkeypatch, report)
         result = runner.invoke(app, ["doctor", "providers", "--check"])
         assert result.exit_code == 0

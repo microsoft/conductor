@@ -111,6 +111,7 @@ class TestClaudeAgentSdkProviderInitialization:
 
 
 class TestValidateConnection:
+    @pytest.mark.claude_auth_readiness_mocked
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -118,12 +119,15 @@ class TestValidateConnection:
         """The SDK ships a bundled CLI under ``_bundled/`` — detection should succeed.
 
         The binary is named per-platform (``claude.exe`` on Windows, ``claude``
-        elsewhere), matching the SDK's own ``_find_bundled_cli``.
+        elsewhere), matching the SDK's own ``_find_bundled_cli``. Driven through
+        ``api_key`` mode because it is the one path whose readiness is the
+        availability check alone, so the real lookup runs and nothing is spawned.
         """
-        provider = ClaudeAgentSdkProvider()
-        # The installed claude-agent-sdk extra includes the bundled binary,
-        # so this should return True in any env where the test runs.
-        assert await provider.validate_connection() is True
+        provider = ClaudeAgentSdkProvider(auth_mode="api_key")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True):
+            # The installed claude-agent-sdk extra includes the bundled binary,
+            # so this should return True in any env where the test runs.
+            assert await provider.validate_connection() is True
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", False)
     async def test_validate_connection_returns_false_when_sdk_missing(self) -> None:
@@ -151,6 +155,7 @@ class TestValidateConnection:
         with patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=_ready)):
             assert await provider.validate_connection() is True
 
+    @pytest.mark.claude_auth_readiness_mocked
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -158,12 +163,14 @@ class TestValidateConnection:
         """Bundled missing + not on PATH + no fallback location → False."""
         import pathlib
 
-        provider = ClaudeAgentSdkProvider()
+        provider = ClaudeAgentSdkProvider(auth_mode="api_key")
         with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
             patch.object(pathlib.Path, "exists", return_value=False),
             patch("shutil.which", return_value=None),
         ):
             assert await provider.validate_connection() is False
+        assert "Claude CLI not found" in (provider.connection_error_hint or "")
 
 
 class TestExecute:

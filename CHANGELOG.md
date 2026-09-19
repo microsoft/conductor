@@ -232,32 +232,25 @@ and compiled into this file at release time.
   configuring standard `OTEL_*` environment variables for an OTLP collector. See
   `docs/telemetry.md` and `examples/telemetry.yaml`.
   * Added native Copilot CLI spans over OTLP HTTP using W3C trace-context propagation, backed by a per-run protocol and endpoint latch that logs a warning if gRPC is used.
-- **`claude-agent-sdk` provider now selects a deterministic authentication
 - **`claude-agent-sdk` provider: explicit authentication mode selection.**
   The new `runtime.provider.auth_mode` field (`"auto"` default,
-  `"subscription"`, `"api_key"`) selects the child-process authentication
-  path for the spawned `claude` subprocess: `subscription` selects the
-  child-process subscription path by passing empty `ANTHROPIC_API_KEY` and
-  `ANTHROPIC_AUTH_TOKEN` through `ClaudeAgentOptions.env`; `api_key` requires
-  a non-empty inherited `ANTHROPIC_API_KEY` and clears the competing
-  `ANTHROPIC_AUTH_TOKEN` the same way; `auto` preserves inherited credential
-  resolution and is intentionally non-deterministic (no override is
-  contributed) — the default, so existing workflows are unaffected. No
-  global `os.environ` mutation occurs in any mode. Separately, `subscription`
-  (and `auto` when it infers a subscription-style check) runs a hard-bounded
-  preflight via `claude auth status --json` before each agent execution;
-  `api_key` skips that subprocess entirely. This preflight is a
-  readiness/reachability check only — it is not billing attribution and
-  must not be read as evidence of a real model invocation. Its internal
-  result keeps Conductor's own `requested_mode` / `inferred_mode` fields
-  distinct from the raw CLI-observed `authMethod` / `apiKeySource` /
-  `subscriptionType` fields it echoes; `conductor doctor --check` renders
-  both as separate `Conductor:` / `SDK:` groups on the connection cell
-  (never the raw CLI payload, an account identity, or a billing/plan claim),
-  regardless of connection outcome, plus a note under `auto` that the
-  effective credential path follows the SDK/CLI's inherited-environment
-  precedence — distinguishing a subscription session from an
-  API-key-present one, which `authMethod` alone cannot do.
+  `"subscription"`, `"api_key"`) selects which credential the `claude` child
+  process uses. `auto` leaves the inherited environment unchanged, so existing
+  workflows are unaffected. `subscription` blanks `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the
+  `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` selectors in the child
+  environment; `api_key` requires a non-blank `ANTHROPIC_API_KEY` and blanks
+  the others. Both explicit modes refuse a non-empty `setting_sources`, at
+  `conductor validate` and at run time, because a Claude Code settings file's
+  `env` block is applied after Conductor configures the child environment.
+  Each agent execution captures its environment, working directory, settings
+  tiers, and CLI path once; a readiness check (`claude auth status --json`,
+  skipped for `api_key`) and the SDK session both use that capture, and
+  Conductor's own environment is never modified. The readiness check is not
+  billing attribution. `conductor doctor --check` shows Conductor's inferred
+  mode separately from the CLI-reported `authMethod` / `apiProvider` /
+  `apiKeySource` / `subscriptionType`, and states that it checked the default
+  provider configuration rather than any workflow's `auth_mode`.
 
 - **Per-agent `settings_dir` on `claude-agent-sdk`** (#513) — selects which
   directory's `project` settings tier supplies an agent's **skills**,

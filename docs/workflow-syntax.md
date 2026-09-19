@@ -595,9 +595,9 @@ See [`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-
 ### Authentication Mode (`auth_mode`)
 
 The optional `runtime.provider.auth_mode` field (`"auto"` default,
-`"subscription"`, `"api_key"`) **selects the child-process authentication
-path** for the `claude` CLI subprocess this provider spawns. Only the
-`claude-agent-sdk` provider reads it.
+`"subscription"`, `"api_key"`) **selects which credential the `claude` CLI
+child process uses**. Only the `claude-agent-sdk` provider reads it. It selects
+a credential, not an endpoint.
 
 ```yaml
 workflow:
@@ -607,58 +607,64 @@ workflow:
       auth_mode: subscription   # auto | subscription | api_key
 ```
 
-- **`subscription`** selects the child-process subscription path by passing
-  empty `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` through the per-call
-  `ClaudeAgentOptions.env` mapping, so the CLI falls through to whichever
-  account is already logged in — regardless of what the parent process
-  inherited.
-- **`api_key`** requires a non-empty inherited `ANTHROPIC_API_KEY` and clears
-  the competing `ANTHROPIC_AUTH_TOKEN` through the same mapping, leaving
-  `ANTHROPIC_API_KEY` untouched.
-- **`auto`** (default) **preserves inherited credential resolution** — it
-  contributes no override at all, so the child process resolves credentials
-  exactly as the SDK/CLI would with no Conductor intervention. This is
-  intentionally non-deterministic across machines and environments; treat it
-  as a compatibility default, not a resolved choice.
+| Mode | `setting_sources` | Child environment | Readiness check |
+|---|---|---|---|
+| `auto` | Allowed | Inherited unchanged; the CLI applies its own credential precedence. | Ready if `ANTHROPIC_API_KEY` is set; otherwise runs `claude auth status --json`. |
+| `subscription` | Refused | Blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`. | Requires the CLI, then runs `claude auth status --json`. |
+| `api_key` | Refused | Requires a non-blank `ANTHROPIC_API_KEY`; blanks the other five variables. | Requires the CLI (located without running it) and the key. Never runs `claude auth status`. |
 
-**No global `os.environ` mutation occurs in any mode.** The override above is
-scoped to the per-call `ClaudeAgentOptions.env` mapping passed when spawning
-each `claude` subprocess — Conductor's own process environment is never
-written, and read only for the separate readiness check below.
+`auto` is the default, so existing workflows behave as before. Its outcome
+depends on each machine's environment and Claude Code login; choose an
+explicit mode when the credential must not vary.
 
-Separately from the env override, `subscription` mode (and `auto` when it
-infers a subscription-style check) runs a hard-bounded preflight —
-`claude auth status --json` — before `validate_connection()` and each
-`execute()` call, to confirm a session is reachable; `api_key` mode skips
-this subprocess entirely. **This preflight is a readiness/reachability check
-only, not billing attribution** — it must never be cited as evidence of a
-real model invocation, account plan, or usage. The preflight's internal
-result keeps Conductor's own inference separate from what the CLI reported:
-`requested_mode` / `inferred_mode` are Conductor's own fields, while
-`authMethod` / `subscriptionType` / `apiKeySource` are raw values echoed
-from the CLI's JSON response after passing through an explicit field
-allowlist — never the raw CLI payload, an account identity, or a
-billing/plan claim. `conductor doctor --check` renders both groups
-separately on the connection cell — regardless of whether the connection
-succeeded — plus a third note when `requested_mode` is `auto` stating that
-the effective credential path follows the SDK/CLI's inherited-environment
-precedence. This is what distinguishes a subscription session from an
-API-key-present session, since `authMethod` alone reports identically for
-both:
+**One environment for the check and the run.** At the start of each agent
+execution Conductor captures the environment, working directory, settings
+tiers, and CLI path once. The readiness check and the agent session both use
+that capture: the check runs in the same environment and directory, and the
+session receives the complete resulting environment through
+`ClaudeAgentOptions.env`, plus the same CLI path. Conductor never modifies its
+own process environment. One SDK limitation remains: the SDK layers
+`ClaudeAgentOptions.env` over its own copy of the process environment, so a
+variable that first appears in Conductor's process *after* the capture can
+still reach the child. The variables an explicit mode blanks are always sent
+explicitly, so this cannot bring them back.
+
+**Explicit modes refuse `setting_sources`.** A Claude Code settings file can
+carry an `env` block, which the CLI applies after Conductor has configured the
+child environment. It could supply a credential or backend selector that
+overrides the explicit mode, and the SDK offers no per-call override that is
+known to take precedence over it. `subscription` and `api_key` therefore reject
+a non-empty `runtime.provider.setting_sources`, both at `conductor validate`
+and when an agent runs; the error suggests removing `setting_sources` or using
+`auth_mode: auto`, which keeps settings tiers available.
+
+The readiness check confirms that a credential path is usable before each
+agent runs. It is **not billing attribution**, and it is not evidence of which
+account a model call was billed to.
+
+`conductor doctor --check` reports the check's result as two groups: a
+`Conductor:` line with Conductor's own `requested_mode` / `inferred_mode`, and
+an `SDK:` line with fields copied from the CLI's status output (`authMethod`,
+`apiProvider`, `apiKeySource`, `subscriptionType`), each only when the CLI
+reported it. `apiProvider` names the API backend, not how the CLI
+authenticated. Doctor does not read workflows: it always checks the provider's
+**default configuration** (`auth_mode: auto`), and says so on a `Scope:` line,
+so its output does not describe a workflow that sets another `auth_mode`.
 
 ```text
-$ conductor doctor --check
+$ conductor doctor providers --check
 claude-agent-sdk   installed   ✓ connected
-                                Conductor: requested_mode=subscription, inferred_mode=subscription
+                                Conductor: requested_mode=auto, inferred_mode=subscription
                                 SDK: authMethod=claude.ai, subscriptionType=max
+                                auto: the effective credential follows the SDK/CLI's inherited-environment precedence — ...
+                                Scope: default provider configuration; a workflow's runtime.provider.auth_mode is not inspected
 ```
-
 
 A non-`auto` `auth_mode` is preserved in checkpoint serialization so the
 explicit choice is restored on `conductor resume`.
 
 See the [Authentication](providers/experimental.md#authentication-claude-agent-sdk)
-section of the experimental-providers guide for the full contract and the
+section of the experimental-providers guide and the
 [configuration guide](configuration.md#field-compatibility-by-provider) for
 field compatibility across providers.
 

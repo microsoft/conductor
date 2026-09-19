@@ -1644,6 +1644,24 @@ class AzureProviderOptions(BaseModel):
     falls back to its own default when unset."""
 
 
+def explicit_auth_mode_setting_sources_error(auth_mode: str, setting_sources: Any) -> str:
+    """Explain why an explicit ``claude-agent-sdk`` ``auth_mode`` refuses settings tiers.
+
+    Shared by the static check on :class:`ProviderSettings` and the run-time
+    check in ``ClaudeAgentSdkProvider._check_auth_readiness`` (``conductor run``
+    never calls the static validator), so both boundaries state the same cause
+    and the same two remedies.
+    """
+    return (
+        f"auth_mode '{auth_mode}' cannot be combined with runtime.provider."
+        f"setting_sources ({', '.join(setting_sources)}): a Claude Code settings file's "
+        "'env' block is applied by the CLI after Conductor configures the child "
+        "environment, so it can inject a credential or backend selector that overrides "
+        "the explicit mode, and the SDK offers no override that outranks it. Remove "
+        "setting_sources, or use auth_mode 'auto'."
+    )
+
+
 class ProviderSettings(BaseModel):
     """Structured provider configuration for ``runtime.provider``.
 
@@ -1723,11 +1741,14 @@ class ProviderSettings(BaseModel):
     """
 
     auth_mode: Literal["auto", "subscription", "api_key"] | None = None
-    """Authentication source selection for ``claude-agent-sdk``.
+    """Credential path for the ``claude`` child process. ``claude-agent-sdk`` only.
 
-    ``"auto"`` prefers ``ANTHROPIC_API_KEY`` when present and otherwise uses
-    the local ``claude login`` subscription context. ``"subscription"`` and
-    ``"api_key"`` force deterministic selection of one path.
+    ``"auto"`` leaves the inherited environment untouched, so the CLI applies
+    its own credential precedence. ``"subscription"`` blanks API-key, token,
+    OAuth, and Bedrock/Vertex/Foundry variables in the child environment so
+    the logged-in session is used; ``"api_key"`` requires a nonblank
+    ``ANTHROPIC_API_KEY`` and blanks the others. Both explicit modes refuse
+    ``setting_sources``. Selects a credential, not an endpoint.
     """
 
     headers: dict[str, str] | None = None
@@ -1972,6 +1993,17 @@ class ProviderSettings(BaseModel):
                 "'setting_sources' is only supported when name='claude-agent-sdk' "
                 f"(got name={self.name!r}). It selects Claude Code settings tiers, "
                 "which no other provider reads."
+            )
+
+        # Explicit auth modes refuse settings tiers; ``auto`` keeps them.
+        # Mirrored at run time in ``_check_auth_readiness``.
+        if (
+            self.name == "claude-agent-sdk"
+            and self.setting_sources
+            and self.auth_mode in ("subscription", "api_key")
+        ):
+            raise ValueError(
+                explicit_auth_mode_setting_sources_error(self.auth_mode, self.setting_sources)
             )
 
         if self.hermes_home is not None and self.name != "hermes":

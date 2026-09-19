@@ -256,25 +256,22 @@ name rather than accepted and dropped. An enabled tier brings that tier's
 hooks — see
 [claude-agent-sdk: skills and ambient settings](providers/comparison.md#important-skills-and-ambient-settings).
 
-`auth_mode` (`"auto"` default / `"subscription"` / `"api_key"`) **selects the
-child-process authentication path** for the `claude` subprocess this provider
-spawns — it is rejected on every other provider name, the same way
-`setting_sources` is. `subscription` selects the child-process subscription
-path by passing empty `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` through
-`ClaudeAgentOptions.env`; `api_key` requires a non-empty inherited
-`ANTHROPIC_API_KEY` and clears the competing `ANTHROPIC_AUTH_TOKEN` the same
-way; `auto` preserves inherited credential resolution and is intentionally
-non-deterministic (no override is contributed at all). **No global
-`os.environ` mutation occurs** in any mode — the override is scoped to the
-per-call `ClaudeAgentOptions.env` mapping. This selects a credential path, not
-an endpoint — it composes with, and is orthogonal to, the routing fields
-above. See
-[Authentication Mode](workflow-syntax.md#authentication-mode-auth_mode)
-in the workflow syntax guide and the
-[Authentication](providers/experimental.md#authentication-claude-agent-sdk)
-section of the experimental-providers guide for the full contract, including
-the readiness preflight (`claude auth status --json`, a reachability check
-**not** billing attribution).
+`auth_mode` (`"auto"` default / `"subscription"` / `"api_key"`) selects which
+credential the `claude` CLI child process uses; it is rejected on every other
+provider name, the same way `setting_sources` is. `auto` leaves the inherited
+environment unchanged. `subscription` blanks `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the
+`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` selectors in the child
+environment; `api_key` requires a non-blank `ANTHROPIC_API_KEY` and blanks the
+others. Conductor's own process environment is never modified. **Both explicit
+modes refuse a non-empty `setting_sources`**: a settings file's `env` block is
+applied by the CLI after Conductor configures the child environment, and the
+SDK has no override known to outrank it. Remove `setting_sources` or use
+`auto`. `auth_mode` selects a credential, not an endpoint, and is independent
+of the routing fields above. See
+[Authentication Mode](workflow-syntax.md#authentication-mode-auth_mode) for the
+full contract, including the readiness check and what `conductor doctor`
+reports.
 
 #### Secrets
 

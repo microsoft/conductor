@@ -101,62 +101,46 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` (agents without a `session_key` carry no session state across a resume). Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is empty by default as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited unless a workflow opts in via `runtime.provider.setting_sources` ([#501](https://github.com/microsoft/conductor/issues/501)) — which loads the named tiers **including their hooks**, so only for repositories trusted as much as the workflow. Which directory that `project` tier reads **skills** from is chosen per agent with `settings_dir` (cwd alone governs the CLI's sole MCP root, so the two are deliberately separate) — see [Target-Repository Skills](../workflow-syntax.md#target-repository-skills-settings_dir). Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and the session map survives `conductor resume` — see [Authentication Mode](../workflow-syntax.md#authentication-mode-auth_mode) and [Session Continuity](../workflow-syntax.md#session-continuity-session_key). |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` (agents without a `session_key` carry no session state across a resume). Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is empty by default as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited unless a workflow opts in via `runtime.provider.setting_sources` ([#501](https://github.com/microsoft/conductor/issues/501)) — which loads the named tiers **including their hooks**, so only for repositories trusted as much as the workflow. Which directory that `project` tier reads **skills** from is chosen per agent with `settings_dir` (cwd alone governs the CLI's sole MCP root, so the two are deliberately separate) — see [Target-Repository Skills](../workflow-syntax.md#target-repository-skills-settings_dir). Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and the session map survives `conductor resume` — see [Session Continuity](../workflow-syntax.md#session-continuity-session_key). Explicit `auth_mode` values refuse `setting_sources` — see [Authentication](#authentication-claude-agent-sdk). |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 | `aca` | `azure-identity>=1.19.0` | `(unassigned)` | no `workflow_tools_passthrough` (the wrapped in-container `CopilotProvider` never applies the `tools:` allowlist to the SDK session), no `working_dir` (only the separate, container-relative `sandbox.working_dir` is honored — not the generic host-resolved field), `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
 
 ## Authentication (`claude-agent-sdk`)
 
 `runtime.provider.auth_mode` (`"auto"` default, `"subscription"`, `"api_key"`)
-**selects the child-process authentication path** for the `claude` CLI
-subprocess this provider spawns:
+selects which credential the `claude` CLI child process uses. The full
+contract — the per-mode table, the readiness check, and `conductor doctor`
+output — is in
+[Authentication Mode](../workflow-syntax.md#authentication-mode-auth_mode).
+The points that bear on this provider's experimental status:
 
-- `subscription` selects the child-process subscription path by passing empty
-  `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` through
-  `ClaudeAgentOptions.env`, so the CLI falls through to whatever account is
-  already logged in regardless of what the parent process inherited.
-- `api_key` requires a non-empty inherited `ANTHROPIC_API_KEY` and clears the
-  competing `ANTHROPIC_AUTH_TOKEN` through the same mapping, leaving
-  `ANTHROPIC_API_KEY` untouched.
-- `auto` preserves inherited credential resolution — it contributes no
-  override at all, so the child process resolves credentials exactly as the
-  SDK/CLI would with no Conductor intervention. This is intentionally
-  non-deterministic across machines and environments; it is a compatibility
-  default, not a Conductor-resolved choice.
+- **One captured context per execution.** The environment, working directory,
+  settings tiers, and CLI path are captured once. The readiness check
+  (`claude auth status --json`, run for `subscription` and for `auto` without
+  an API key; never for `api_key`) and the SDK session both use that capture,
+  and the session receives the complete resulting environment through
+  `ClaudeAgentOptions.env`. Conductor's own `os.environ` is never modified.
+- **Upstream limitation.** The SDK layers `ClaudeAgentOptions.env` over its own
+  copy of the process environment, so a variable that first appears in the
+  parent after the capture can still reach the child; the variables an
+  explicit mode blanks are always sent, so they cannot. The SDK also exposes no
+  per-call setting verified to take precedence over a settings file's `env`
+  block, which is why `subscription` and `api_key` refuse a non-empty
+  `setting_sources` at `conductor validate` and again at run time. `auto`
+  keeps settings tiers available.
+- **Not billing attribution.** The readiness check shows that a credential path
+  is usable. It is not evidence of which account a model call was billed to.
+- **Doctor scope.** `conductor doctor --check` builds the provider with its
+  default configuration (`auth_mode: auto`) and does not read workflows, so it
+  cannot report a workflow's explicit `auth_mode`; its output says so.
+  `apiProvider` in that output names the API backend and is reported
+  separately from `authMethod`.
 
-**No global `os.environ` mutation occurs.** The override above is scoped to
-the per-call `ClaudeAgentOptions.env` mapping passed when spawning each
-`claude` subprocess; Conductor's own process environment is never read for
-this decision beyond the readiness check below, and never written.
-
-Separately, `subscription` mode (and `auto` when it infers `subscription`)
-runs a hard-bounded preflight — `claude auth status --json` — before
-`validate_connection()` and each `execute()` call, to confirm a session is
-reachable. `api_key` mode skips this subprocess entirely. **This preflight is
-a readiness/reachability check only, not billing attribution** — it must
-never be cited as evidence of a real model invocation, account plan, or
-usage, and no doc, log, or diagnostic may present it as such. The
-preflight's internal result keeps Conductor's own `requested_mode` /
-`inferred_mode` fields distinct from the CLI-observed `authMethod` /
-`apiKeySource` / `subscriptionType` fields it echoes (after passing through
-an explicit allowlist) — never the raw CLI payload, an account identity, or
-a billing/plan claim. `conductor doctor --check` renders both as separate
-groups on the connection cell (a dim `Conductor: requested_mode=...,
-inferred_mode=...` line and a dim `SDK: authMethod=..., ...` line),
-regardless of whether the connection succeeded, plus a third `auto` note
-when `requested_mode` is `auto` — so a subscription session and an
-API-key-present session are distinguishable even though `authMethod` alone
-reports identically for both.
-
-Ordinary tests never invoke the real subprocess: an autouse
-`tests/conftest.py` fixture stubs the readiness check to a deterministic
-result for every test module except `test_claude_agent_sdk_auth` and
-`test_claude_agent_sdk`, which exercise the preflight itself against a
-mocked subprocess.
-
-See [Authentication Mode](../workflow-syntax.md#authentication-mode-auth_mode)
-for a runnable example and [`configuration.md`](../configuration.md#field-compatibility-by-provider)
-for the field-compatibility table.
+Tests never launch a real Claude CLI process. By default, a repository-wide
+autouse fixture in `tests/conftest.py` stubs the readiness check to ready.
+Tests marked `claude_auth_readiness_mocked` execute the real readiness method
+instead, but must mock process creation themselves — the fixture replaces
+process creation with a guard that fails the test if it is reached.
 
 ## See also
 

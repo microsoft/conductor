@@ -618,7 +618,25 @@ class TestGatherProviderAuthDiagnostic:
                 "inferred_mode": "subscription",
             },
             "sdk_observed": {"authMethod": "claude.ai", "subscriptionType": "max"},
+            "scope": d.AUTH_DIAGNOSTIC_SCOPE,
         }
+
+    async def test_scope_states_default_configuration_and_survives_json(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``gather_provider`` never sees a workflow, so the diagnostic says so —
+        in ``--json`` output too, not only in the rendered table."""
+        monkeypatch.setattr("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+        provider = _fake_provider(ok=True)
+        provider.auth_status_diagnostic = {"conductor_inferred": {}, "sdk_observed": {}}
+        create = AsyncMock(return_value=provider)
+        monkeypatch.setattr("conductor.providers.factory.create_provider", create)
+        diag = await d.gather_provider("claude-agent-sdk", check=True)
+        assert create.call_args.kwargs.keys() == {"validate"}
+        assert diag.to_dict()["auth_diagnostic"]["scope"] == (
+            "default provider configuration; a workflow's runtime.provider.auth_mode "
+            "is not inspected"
+        )
 
     async def test_populated_even_when_connection_ok_is_true(
         self, monkeypatch: pytest.MonkeyPatch

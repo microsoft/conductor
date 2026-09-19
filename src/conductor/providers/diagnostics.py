@@ -27,7 +27,7 @@ import logging
 import os
 import platform
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from conductor import __version__
 from conductor.providers.capabilities import get_capabilities, known_provider_names
@@ -89,6 +89,13 @@ class _CredentialSpec:
 # Per-provider credential environment variables and their offline-diagnostic
 # semantics. See each entry's ``optional_auth_note`` for *why* that provider's
 # vars are optional overrides rather than hard requirements.
+# ``gather_provider`` builds each provider with no workflow settings, so an
+# auth diagnostic describes the default configuration (``auth_mode: auto`` on
+# ``claude-agent-sdk``), never the ``auth_mode`` a particular workflow sets.
+AUTH_DIAGNOSTIC_SCOPE: Final[str] = (
+    "default provider configuration; a workflow's runtime.provider.auth_mode is not inspected"
+)
+
 _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     "copilot": _CredentialSpec(
         env_vars=(
@@ -106,9 +113,8 @@ _CREDENTIAL_SPECS: dict[str, _CredentialSpec] = {
     "claude-agent-sdk": _CredentialSpec(
         env_vars=("ANTHROPIC_API_KEY",),
         optional_auth_note=(
-            "authenticates via `claude login` (subscription) or ANTHROPIC_API_KEY "
-            "(api_key mode); ANTHROPIC_API_KEY is an optional override — see auth_mode "
-            "provider setting"
+            "authenticates via `claude login`; ANTHROPIC_API_KEY is optional "
+            "(used under auth_mode auto or api_key, blanked under subscription)"
         ),
     ),
     "openai": _CredentialSpec(env_vars=("OPENAI_API_KEY",)),
@@ -863,7 +869,7 @@ async def gather_provider(
         # (TICKET-20260816-0002) — not just a failure explainer.
         auth_diagnostic = getattr(provider, "auth_status_diagnostic", None)
         if isinstance(auth_diagnostic, dict):
-            diag.auth_diagnostic = auth_diagnostic
+            diag.auth_diagnostic = {**auth_diagnostic, "scope": AUTH_DIAGNOSTIC_SCOPE}
 
         # Gate on a verified (not merely truthy) connection: an inconclusive
         # probe means models.list() already failed once, so calling
