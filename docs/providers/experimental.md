@@ -129,7 +129,12 @@ The points that bear on this provider's experimental status:
 - **Upstream limitation.** The SDK layers `ClaudeAgentOptions.env` over its own
   copy of the process environment, so a variable that first appears in the
   parent after the capture can still reach the child; the variables an
-  explicit mode blanks are always sent, so they cannot. The SDK also exposes no
+  explicit mode blanks are always sent, so they cannot.
+- **Cloud-backend selectors.** An inherited non-blank `CLAUDE_CODE_USE_BEDROCK`,
+  `_VERTEX`, or `_FOUNDRY` is refused in both explicit modes, before the
+  readiness check runs or any session starts, because it would route the
+  session to that backend instead of the requested credential. The error names
+  the variable, never its value. `auto` keeps the inherited selection. The SDK also exposes no
   per-call setting verified to take precedence over a settings file's `env`
   block, which is why `subscription` and `api_key` refuse a non-empty
   `setting_sources` at `conductor validate` and again at run time. `auto`

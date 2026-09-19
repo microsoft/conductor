@@ -260,16 +260,30 @@ hooks — see
 credential the `claude` CLI child process uses; it is rejected on every other
 provider name, the same way `setting_sources` is. `auto` leaves the inherited
 environment unchanged. `subscription` blanks `ANTHROPIC_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the
-`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` selectors in the child
-environment; `api_key` requires a non-blank `ANTHROPIC_API_KEY` and blanks the
-others. Conductor's own process environment is never modified. **Both explicit
+`ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` in the child environment;
+`api_key` requires a non-blank `ANTHROPIC_API_KEY` and blanks the other two.
+**Both explicit modes refuse an inherited non-blank `CLAUDE_CODE_USE_BEDROCK` /
+`_VERTEX` / `_FOUNDRY` cloud-backend selector**, naming the variable (never its
+value); use `auto` to keep an inherited backend selection. Conductor's own
+process environment is never modified. **Both explicit
 modes refuse a non-empty `setting_sources`**: a settings file's `env` block is
 applied by the CLI after Conductor configures the child environment, and the
 SDK has no override known to outrank it. Remove `setting_sources` or use
 `auto`. Every mode requires the `claude` CLI to be installed, `auto` with an
-API key included. `auth_mode` selects a credential, not an endpoint, and is independent
-of the routing fields above. See
+API key included.
+
+`auth_mode` selects a credential, not an endpoint. It does not enable custom
+routing and does not change the compatibility table above:
+
+- Conductor's YAML routing fields (`base_url`, `api_key`, `auth_token`, and the
+  rest) remain rejected for `claude-agent-sdk`, whatever `auth_mode` is set.
+- `auth_mode` remains rejected on `copilot` and `claude`, the providers that
+  support those routing fields.
+
+This is separate from the endpoint configuration the `claude` CLI reads from
+its own environment: an inherited `ANTHROPIC_BASE_URL` reaches the CLI child
+process in every mode, because no `auth_mode` sets or clears it. That is the
+CLI's own behaviour, not a Conductor routing field. See
 [Authentication Mode](workflow-syntax.md#authentication-mode-auth_mode) for the
 full contract, including the readiness check and what `conductor doctor`
 reports.

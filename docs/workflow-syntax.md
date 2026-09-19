@@ -609,9 +609,9 @@ workflow:
 
 | Mode | `setting_sources` | Child environment | Readiness check |
 |---|---|---|---|
-| `auto` | Allowed | Inherited unchanged; the CLI applies its own credential precedence. | Requires the CLI (located without running it) even when `ANTHROPIC_API_KEY` is set. With the key, ready without running `claude auth status`; otherwise runs `claude auth status --json`. |
-| `subscription` | Refused | Blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`. | Requires the CLI, then runs `claude auth status --json`. |
-| `api_key` | Refused | Requires a non-blank `ANTHROPIC_API_KEY`; blanks the other five variables. | Requires the CLI (located without running it) and the key. Never runs `claude auth status`. |
+| `auto` | Allowed | Inherited unchanged, including any `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` backend selector; the CLI applies its own credential precedence. | Requires the CLI (located without running it) even when `ANTHROPIC_API_KEY` is set. With the key, ready without running `claude auth status`; otherwise runs `claude auth status --json`. |
+| `subscription` | Refused | Blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_CODE_OAUTH_TOKEN`. **Refuses** an inherited non-blank cloud-backend selector (see below). | Refuses a cloud selector, then requires the CLI, then runs `claude auth status --json`. |
+| `api_key` | Refused | Requires a non-blank `ANTHROPIC_API_KEY`; blanks `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. **Refuses** an inherited non-blank cloud-backend selector (see below). | Refuses a cloud selector, then requires the CLI (located without running it) and the key. Never runs `claude auth status`. |
 
 `auto` is the default, so existing workflows behave as before. Its outcome
 depends on each machine's environment and Claude Code login; choose an
@@ -634,6 +634,17 @@ variable that first appears in Conductor's process *after* the capture can
 still reach the child. The variables an explicit mode blanks are always sent
 explicitly, so this cannot bring them back.
 
+**Explicit modes refuse inherited cloud-backend selectors.** A non-blank
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or
+`CLAUDE_CODE_USE_FOUNDRY` would route the session to that cloud backend
+instead of the credential the mode selects. Conductor does not support that
+combination, so `subscription` and `api_key` fail readiness before the check
+runs or any session starts. The error names the variable (never its value)
+and suggests unsetting it or using `auth_mode: auto`, which keeps the inherited
+backend selection. In both explicit modes the child environment also receives
+these three variables as empty strings, so one set in Conductor's process
+after the capture cannot reach the CLI.
+
 **Explicit modes refuse `setting_sources`.** A Claude Code settings file can
 carry an `env` block, which the CLI applies after Conductor has configured the
 child environment. It could supply a credential or backend selector that
@@ -653,7 +664,10 @@ account a model call was billed to.
 an `SDK:` line with fields copied from the CLI's status output (`authMethod`,
 `apiProvider`, `apiKeySource`, `subscriptionType`), each only when the CLI
 reported it. `apiProvider` names the API backend, not how the CLI
-authenticated. Doctor does not read workflows: it always checks the provider's
+authenticated. With `auth_mode: auto` and `ANTHROPIC_API_KEY` set, the `SDK:`
+fields are all empty, because that path does not run `claude auth status`;
+Doctor's default configuration is `auto`, so this is what Doctor shows
+whenever the key is set. Doctor does not read workflows: it always checks the provider's
 **default configuration** (`auth_mode: auto`), and says so on a `Scope:` line,
 so its output does not describe a workflow that sets another `auth_mode`.
 

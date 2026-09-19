@@ -76,6 +76,17 @@ ClaudeAuthMode = Literal["auto", "subscription", "api_key"]
 InferredClaudeAuthMode = Literal["subscription", "api_key"]
 
 
+# Cloud-backend selectors. Inherited nonblank, they would route an explicit
+# ``auth_mode`` to Bedrock/Vertex/Foundry instead of the requested credential,
+# so both explicit modes refuse them (see ``_check_auth_readiness``) rather
+# than blanking them silently. They stay in the pinned-blank set below as well,
+# which covers a selector the parent sets only *after* the snapshot.
+_CLOUD_BACKEND_SELECTORS: Final[tuple[str, ...]] = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
 # Credential and backend selectors an explicit ``auth_mode`` pins blank in the
 # child environment. Blank rather than absent: the SDK spreads
 # ``ClaudeAgentOptions.env`` over a *live* copy of ``os.environ`` (0.2.87,
@@ -87,9 +98,7 @@ InferredClaudeAuthMode = Literal["subscription", "api_key"]
 _EXPLICIT_MODE_NEUTRALIZED: Final[tuple[str, ...]] = (
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
+    *_CLOUD_BACKEND_SELECTORS,
 )
 _NEUTRALIZED_BY_MODE: Final[dict[str, tuple[str, ...]]] = {
     "auto": (),
@@ -153,6 +162,12 @@ class EffectiveAuthContext:
             self.setting_sources if configured is None else tuple(configured),
         )
         object.__setattr__(self, "finalized_child_env", types.MappingProxyType(finalized))
+
+    def inherited_cloud_selectors(self) -> list[str]:
+        """Names (never values) of cloud-backend selectors inherited nonblank."""
+        return [
+            name for name in _CLOUD_BACKEND_SELECTORS if self.env_snapshot.get(name, "").strip()
+        ]
 
     def overridden_credentials(self) -> list[str]:
         """Names (never values) of inherited, nonblank variables the mode blanks."""
@@ -1209,6 +1224,25 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 inferred_mode="subscription" if mode == "subscription" else "api_key",
                 ready=False,
                 error=explicit_auth_mode_setting_sources_error(mode, configured_sources),
+            )
+
+        # Also before any success path or probe: an inherited cloud selector
+        # would send an explicit mode to a different backend. Refused rather
+        # than blanked so the conflict is visible; names only, never values.
+        cloud_selectors = context.inherited_cloud_selectors() if mode != "auto" else []
+        if cloud_selectors:
+            names = ", ".join(cloud_selectors)
+            verb = "is" if len(cloud_selectors) == 1 else "are"
+            return ClaudeAuthStatus(
+                requested_mode=mode,
+                inferred_mode="subscription" if mode == "subscription" else "api_key",
+                ready=False,
+                error=(
+                    f"auth_mode '{mode}' cannot be used while {names} {verb} set in the "
+                    "inherited environment: it selects a cloud backend (Bedrock, Vertex, "
+                    "or Foundry) instead of the requested credential. Unset it, or use "
+                    "auth_mode 'auto' to keep the inherited backend selection."
+                ),
             )
 
         if mode == "api_key":

@@ -51,6 +51,10 @@ COMPETING = {
     "UNRELATED": "kept",
 }
 
+# Competing credentials only. Readiness refuses inherited cloud selectors in
+# explicit modes, so tests about env/cwd parity or status parsing use this.
+COMPETING_CREDENTIALS = {k: v for k, v in COMPETING.items() if not k.startswith("CLAUDE_CODE_USE_")}
+
 
 def _ctx(
     env: dict[str, str],
@@ -234,7 +238,7 @@ class TestReadinessAndExecutionShareOneContext:
 
         options_ctor = MagicMock()
         with (
-            patch.dict(os.environ, {**COMPETING, "PATH": "/bin"}, clear=True),
+            patch.dict(os.environ, {**COMPETING_CREDENTIALS, "PATH": "/bin"}, clear=True),
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", probe_then_mutate_parent),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
@@ -377,7 +381,9 @@ class TestSubscriptionStatusParsing:
 
         provider = ClaudeAgentSdkProvider(auth_mode="subscription")
         with patch("asyncio.create_subprocess_exec", create):
-            status = await provider._check_auth_readiness(_ctx(COMPETING, "subscription"))
+            status = await provider._check_auth_readiness(
+                _ctx(COMPETING_CREDENTIALS, "subscription")
+            )
         return status, captured
 
     @pytest.mark.asyncio
@@ -401,7 +407,9 @@ class TestSubscriptionStatusParsing:
     @pytest.mark.asyncio
     async def test_probe_runs_with_the_finalized_env_and_cwd(self) -> None:
         _, captured = await self._readiness(json.dumps({"loggedIn": True}).encode(), 0)
-        assert captured["env"] == dict(_ctx(COMPETING, "subscription").finalized_child_env)
+        assert captured["env"] == dict(
+            _ctx(COMPETING_CREDENTIALS, "subscription").finalized_child_env
+        )
         assert captured["cwd"] == "/work"
 
 
@@ -602,3 +610,95 @@ class TestSettingSourcesParity:
         assert "(user)" in str(exc.value)
         assert probes == []
         query.assert_not_called()
+
+
+CLOUD_SELECTORS = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+# Distinctive so a leak of the value into an error is detectable.
+SELECTOR_VALUE = "selector-value-7f3a"
+
+
+@pytest.mark.claude_auth_readiness_mocked
+class TestExplicitModesRejectInheritedCloudSelectors:
+    """An inherited cloud-backend selector would route an explicit mode to a
+    different backend, so both explicit modes refuse it rather than blanking it
+    silently; ``auto`` keeps the inherited selection."""
+
+    @pytest.mark.parametrize("selector", CLOUD_SELECTORS)
+    @pytest.mark.parametrize("mode", ["subscription", "api_key"])
+    @pytest.mark.asyncio
+    async def test_explicit_mode_refuses_before_probe_or_session(
+        self, mode: str, selector: str
+    ) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode=mode)  # type: ignore[arg-type]
+        agent = AgentDef(name="a", type="agent", prompt="hi")
+        spawn = AsyncMock()
+        query = MagicMock()
+        env = {"ANTHROPIC_API_KEY": "sk-ant-fake", selector: SELECTOR_VALUE}
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
+            patch("asyncio.create_subprocess_exec", spawn),
+            patch("conductor.providers.claude_agent_sdk.query", query),
+        ):
+            with pytest.raises(ProviderError) as exc:
+                await provider.execute(agent=agent, context={}, rendered_prompt="hi")
+            connected = await provider.validate_connection()
+
+        message = str(exc.value)
+        assert selector in message
+        assert "auth_mode 'auto'" in message
+        assert SELECTOR_VALUE not in message
+        assert exc.value.is_retryable is False
+        assert connected is False
+        assert provider._last_validation_error is not None
+        assert selector in provider._last_validation_error
+        assert SELECTOR_VALUE not in provider._last_validation_error
+        spawn.assert_not_called()
+        query.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["subscription", "api_key"])
+    @pytest.mark.asyncio
+    async def test_every_conflicting_selector_is_named(self, mode: str) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode=mode)  # type: ignore[arg-type]
+        env = {"ANTHROPIC_API_KEY": "sk-ant-fake", **dict.fromkeys(CLOUD_SELECTORS, "1")}
+        status = await provider._check_auth_readiness(_ctx(env, mode))
+        assert status.ready is False
+        assert status.error is not None
+        for selector in CLOUD_SELECTORS:
+            assert selector in status.error
+
+    @pytest.mark.parametrize("mode", ["subscription", "api_key"])
+    @pytest.mark.asyncio
+    async def test_blank_selector_is_not_a_conflict(self, mode: str) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode=mode)  # type: ignore[arg-type]
+        env = {"ANTHROPIC_API_KEY": "sk-ant-fake", "CLAUDE_CODE_USE_BEDROCK": "  "}
+        with patch(
+            "asyncio.create_subprocess_exec",
+            AsyncMock(return_value=_status_process(json.dumps({"loggedIn": True}).encode(), 0)),
+        ):
+            status = await provider._check_auth_readiness(_ctx(env, mode))
+        assert status.ready is True
+
+    @pytest.mark.parametrize("selector", CLOUD_SELECTORS)
+    @pytest.mark.asyncio
+    async def test_auto_preserves_inherited_selectors(self, selector: str) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode="auto")
+        agent = AgentDef(name="a", type="agent", prompt="hi")
+        options_ctor = MagicMock()
+        spawn = AsyncMock()
+        env = {"ANTHROPIC_API_KEY": "sk-ant-fake", selector: SELECTOR_VALUE}
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
+            patch("asyncio.create_subprocess_exec", spawn),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
+            patch("conductor.providers.claude_agent_sdk.query", _empty_query),
+        ):
+            await provider.execute(agent=agent, context={}, rendered_prompt="hi")
+
+        assert options_ctor.call_args.kwargs["env"][selector] == SELECTOR_VALUE
+        spawn.assert_not_called()

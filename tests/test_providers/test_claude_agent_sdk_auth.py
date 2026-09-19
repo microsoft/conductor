@@ -29,12 +29,20 @@ from conductor.providers.factory import create_provider
 FAKE_CLI = Path("/fake/claude")
 
 
+# Every credential and backend selector the provider's auth modes read. The
+# developer's (or a hostile CI's) values must never reach readiness.
+_AUTH_VARIABLES = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
 def _clean_env() -> dict[str, str]:
-    return {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-    }
+    return {k: v for k, v in os.environ.items() if k not in _AUTH_VARIABLES}
 
 
 class TestFindClaudeCli:
