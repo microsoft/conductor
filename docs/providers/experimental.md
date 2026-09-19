@@ -117,9 +117,15 @@ The points that bear on this provider's experimental status:
 - **One captured context per execution.** The environment, working directory,
   settings tiers, and CLI path are captured once. The readiness check
   (`claude auth status --json`, run for `subscription` and for `auto` without
-  an API key; never for `api_key`) and the SDK session both use that capture,
-  and the session receives the complete resulting environment through
-  `ClaudeAgentOptions.env`. Conductor's own `os.environ` is never modified.
+  an API key; never for `api_key`) and the SDK session both use that capture:
+  the same environment, directory, CLI, and settings tiers (the check passes
+  `--setting-sources=<tiers>`, empty when there are none, as the SDK does for
+  the session). The session receives the complete resulting environment
+  through `ClaudeAgentOptions.env`. Conductor's own `os.environ` is never
+  modified.
+- **The CLI is required in every mode.** Its absence is detected without
+  running anything, and fails readiness even for `auto` with
+  `ANTHROPIC_API_KEY` set, since the session itself runs the CLI.
 - **Upstream limitation.** The SDK layers `ClaudeAgentOptions.env` over its own
   copy of the process environment, so a variable that first appears in the
   parent after the capture can still reach the child; the variables an

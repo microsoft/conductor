@@ -428,3 +428,177 @@ class TestApiProviderIsNotAuthMethod:
         assert status.auth_method is None
         observed = (provider.auth_status_diagnostic or {})["sdk_observed"]
         assert observed == {"apiProvider": "firstParty"}
+
+
+def _sdk_setting_sources_flag(sources: list[str]) -> str:
+    """The flag the SDK derives from ``ClaudeAgentOptions.setting_sources``
+    (0.2.87, ``_internal/transport/subprocess_cli.py``)."""
+    return f"--setting-sources={','.join(sources)}"
+
+
+def _cli_honouring_setting_sources(recorded: list[tuple[str, ...]]):
+    """A fake ``claude`` that is logged in only through an ambient settings tier.
+
+    Mirrors the bundled CLI, whose ``eagerLoadSettings`` reads
+    ``--setting-sources`` from argv before command dispatch: without the flag
+    it loads every ambient tier; ``--setting-sources=`` loads none.
+    """
+
+    async def spawn(*args: object, **kwargs: object) -> MagicMock:
+        argv = tuple(str(a) for a in args)
+        recorded.append(argv)
+        flags = [a for a in argv if a.startswith("--setting-sources")]
+        ambient_tiers_loaded = not flags or flags[0] != "--setting-sources="
+        if ambient_tiers_loaded:
+            return _status_process(json.dumps({"loggedIn": True}).encode(), 0)
+        return _status_process(json.dumps({"loggedIn": False}).encode(), 1)
+
+    return spawn
+
+
+@pytest.mark.claude_auth_readiness_mocked
+class TestSettingSourcesParity:
+    """The probe loads exactly the settings tiers the SDK session will load."""
+
+    async def _execute(
+        self,
+        provider: ClaudeAgentSdkProvider,
+        agent: AgentDef,
+        env: dict[str, str],
+    ) -> tuple[list[tuple[str, ...]], dict[str, Any]]:
+        probes: list[tuple[str, ...]] = []
+
+        async def spawn(*args: object, **kwargs: object) -> MagicMock:
+            probes.append(tuple(str(a) for a in args))
+            return _status_process(json.dumps({"loggedIn": True}).encode(), 0)
+
+        options_ctor = MagicMock()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
+            patch("asyncio.create_subprocess_exec", spawn),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
+            patch("conductor.providers.claude_agent_sdk.query", _empty_query),
+        ):
+            await provider.execute(agent=agent, context={}, rendered_prompt="hi")
+        return probes, options_ctor.call_args.kwargs
+
+    @pytest.mark.parametrize(
+        ("mode", "configured", "agent_skills", "expected"),
+        [
+            pytest.param("subscription", [], None, [], id="explicit-empty"),
+            pytest.param("auto", [], None, [], id="auto-empty"),
+            pytest.param("auto", ["project", "user"], None, ["project", "user"], id="auto-tiers"),
+            pytest.param("auto", ["project"], [], [], id="skills-opt-out"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_probe_and_options_receive_equivalent_setting_sources(
+        self,
+        mode: str,
+        configured: list[str],
+        agent_skills: list[str] | None,
+        expected: list[str],
+    ) -> None:
+        provider = ClaudeAgentSdkProvider(
+            auth_mode=mode,  # type: ignore[arg-type]
+            setting_sources=configured,  # type: ignore[arg-type]
+        )
+        agent = AgentDef(name="a", type="agent", prompt="hi", skills=agent_skills)
+        # No API key, so ``auto`` takes the subscription path and probes too.
+        probes, options = await self._execute(provider, agent, {"PATH": "/bin"})
+
+        assert options["setting_sources"] == expected
+        assert probes == [
+            (str(FAKE_CLI), _sdk_setting_sources_flag(expected), "auth", "status", "--json")
+        ]
+        assert probes[0][1] == _sdk_setting_sources_flag(options["setting_sources"])
+
+    @pytest.mark.asyncio
+    async def test_skills_opt_out_is_recorded_in_the_context(self) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode="auto", setting_sources=["project"])
+        opted_out = AgentDef(name="a", type="agent", prompt="hi", skills=[])
+        inherits = AgentDef(name="b", type="agent", prompt="hi")
+        with patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI):
+            assert provider._capture_auth_context("/work", opted_out).setting_sources == ()
+            assert provider._capture_auth_context("/work", inherits).setting_sources == ("project",)
+            assert provider._capture_auth_context("/work").setting_sources == ("project",)
+
+    @pytest.mark.parametrize(
+        ("configured", "expected_flag"),
+        [([], "--setting-sources="), (["user", "local"], "--setting-sources=user,local")],
+    )
+    @pytest.mark.asyncio
+    async def test_validate_connection_probes_with_provider_default_sources(
+        self, configured: list[str], expected_flag: str
+    ) -> None:
+        provider = ClaudeAgentSdkProvider(
+            auth_mode="auto",
+            setting_sources=configured,  # type: ignore[arg-type]
+        )
+        probes: list[tuple[str, ...]] = []
+        with (
+            patch.dict(os.environ, {"PATH": "/bin"}, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
+            patch("asyncio.create_subprocess_exec", _cli_honouring_setting_sources(probes)),
+        ):
+            await provider.validate_connection()
+        assert probes == [(str(FAKE_CLI), expected_flag, "auth", "status", "--json")]
+
+    @pytest.mark.asyncio
+    async def test_subscription_cannot_pass_on_an_ambient_tier_the_session_disables(
+        self,
+    ) -> None:
+        """Regression: the only credential lives in an ambient settings tier.
+
+        The SDK session runs with ``--setting-sources=`` and never sees it, so
+        the probe must not see it either — readiness fails and no session
+        starts, instead of vouching for a credential execution will not use.
+        """
+        provider = ClaudeAgentSdkProvider(auth_mode="subscription")
+        agent = AgentDef(name="a", type="agent", prompt="hi")
+        probes: list[tuple[str, ...]] = []
+        query = MagicMock()
+        with (
+            patch.dict(os.environ, {"PATH": "/bin"}, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
+            patch("asyncio.create_subprocess_exec", _cli_honouring_setting_sources(probes)),
+            patch("conductor.providers.claude_agent_sdk.query", query),
+            pytest.raises(ProviderError) as exc,
+        ):
+            await provider.execute(agent=agent, context={}, rendered_prompt="hi")
+
+        assert "Not logged in" in str(exc.value)
+        assert probes and all("--setting-sources=" in p for p in probes)
+        query.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["subscription", "api_key"])
+    @pytest.mark.parametrize("agent_skills", [None, []], ids=["inherits", "skills-opt-out"])
+    @pytest.mark.asyncio
+    async def test_explicit_modes_refuse_a_credential_bearing_tier_before_probing(
+        self, mode: str, agent_skills: list[str] | None
+    ) -> None:
+        """A configured tier that could supply a credential is refused in both
+        explicit modes — even for an agent whose ``skills: []`` would not load
+        it — before any probe runs or any session is queried."""
+        provider = ClaudeAgentSdkProvider(
+            auth_mode=mode,  # type: ignore[arg-type]
+            setting_sources=["user"],
+        )
+        agent = AgentDef(name="a", type="agent", prompt="hi", skills=agent_skills)
+        probes: list[tuple[str, ...]] = []
+        query = MagicMock()
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
+            patch("asyncio.create_subprocess_exec", _cli_honouring_setting_sources(probes)),
+            patch("conductor.providers.claude_agent_sdk.query", query),
+        ):
+            with pytest.raises(ProviderError) as exc:
+                await provider.execute(agent=agent, context={}, rendered_prompt="hi")
+            assert await provider.validate_connection() is False
+
+        assert "Remove setting_sources" in str(exc.value)
+        assert "(user)" in str(exc.value)
+        assert probes == []
+        query.assert_not_called()

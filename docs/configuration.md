@@ -267,7 +267,8 @@ others. Conductor's own process environment is never modified. **Both explicit
 modes refuse a non-empty `setting_sources`**: a settings file's `env` block is
 applied by the CLI after Conductor configures the child environment, and the
 SDK has no override known to outrank it. Remove `setting_sources` or use
-`auto`. `auth_mode` selects a credential, not an endpoint, and is independent
+`auto`. Every mode requires the `claude` CLI to be installed, `auto` with an
+API key included. `auth_mode` selects a credential, not an endpoint, and is independent
 of the routing fields above. See
 [Authentication Mode](workflow-syntax.md#authentication-mode-auth_mode) for the
 full contract, including the readiness check and what `conductor doctor`

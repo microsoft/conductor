@@ -102,12 +102,14 @@ _NEUTRALIZED_BY_MODE: Final[dict[str, tuple[str, ...]]] = {
 class EffectiveAuthContext:
     """Immutable authentication context captured once per provider operation.
 
-    ``__post_init__`` copies ``env_snapshot`` and ``setting_sources`` into
+    ``__post_init__`` copies ``env_snapshot`` and both source sequences into
     read-only containers, so the context is isolated from its caller and from
     later ``os.environ`` changes whatever mapping or sequence it was given.
     ``finalized_child_env`` is derived from the snapshot once, by applying the
     requested mode's neutralizations, and is the single environment both the
     ``claude auth status --json`` probe and ``ClaudeAgentOptions.env`` receive.
+    ``setting_sources`` is likewise the single tier selection both receive, so
+    the probe cannot be satisfied by a settings tier the session never loads.
 
     Both environment fields are excluded from ``repr`` because they hold
     credentials; nothing may log, serialize, or render them.
@@ -115,9 +117,16 @@ class EffectiveAuthContext:
     Attributes:
         env_snapshot: Copy of the inherited environment at capture time.
         resolved_cwd: Working directory for the probe and the SDK session.
-        setting_sources: Claude Code settings tiers the session enables.
+        setting_sources: Settings tiers this operation's probe and session
+            load — the provider's tiers, or ``()`` for an agent that opted out
+            with ``skills: []``.
         cli_path: CLI resolved without spawning it, or ``None`` if absent.
         auth_mode: Requested authentication mode.
+        configured_setting_sources: The provider's configured tiers, before any
+            per-agent opt-out. Explicit modes are refused on these, so a
+            contradictory configuration fails for every agent rather than only
+            for those that happen not to load a tier. Defaults to
+            ``setting_sources``.
         finalized_child_env: ``env_snapshot`` with the mode's neutralizations.
     """
 
@@ -126,6 +135,7 @@ class EffectiveAuthContext:
     setting_sources: tuple[SettingSource, ...]
     cli_path: Path | None
     auth_mode: ClaudeAuthMode
+    configured_setting_sources: tuple[SettingSource, ...] | None = None
     finalized_child_env: Mapping[str, str] = dataclasses.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -136,6 +146,12 @@ class EffectiveAuthContext:
         # Frozen dataclass: normalising a field in place needs object.__setattr__.
         object.__setattr__(self, "env_snapshot", types.MappingProxyType(snapshot))
         object.__setattr__(self, "setting_sources", tuple(self.setting_sources))
+        configured = self.configured_setting_sources
+        object.__setattr__(
+            self,
+            "configured_setting_sources",
+            self.setting_sources if configured is None else tuple(configured),
+        )
         object.__setattr__(self, "finalized_child_env", types.MappingProxyType(finalized))
 
     def overridden_credentials(self) -> list[str]:
@@ -481,14 +497,22 @@ async def _run_auth_status_subprocess(
     cli_path: Path,
     child_env: Mapping[str, str],
     cwd: str,
+    setting_sources: Sequence[SettingSource],
 ) -> tuple[bytes, bytes, int]:
-    """Run ``claude auth status --json`` with a hard timeout.
+    """Run ``claude --setting-sources=<tiers> auth status --json`` with a hard timeout.
 
-    ``child_env`` and ``cwd`` are required rather than defaulting to the live
-    process state: callers pass :attr:`EffectiveAuthContext.finalized_child_env`
-    and :attr:`EffectiveAuthContext.resolved_cwd`, the same values the SDK
-    session later receives, so the probe cannot observe a different
-    environment from the one it vouches for.
+    ``child_env``, ``cwd`` and ``setting_sources`` are required rather than
+    defaulting to the live process state: callers pass the
+    :class:`EffectiveAuthContext` values the SDK session later receives, so the
+    probe cannot observe a different environment from the one it vouches for.
+
+    ``setting_sources`` is always sent, in the exact ``--setting-sources=<csv>``
+    form the SDK derives from ``ClaudeAgentOptions.setting_sources`` (0.2.87,
+    ``_internal/transport/subprocess_cli.py``) — including ``--setting-sources=``
+    for no tiers, since omitting the flag makes the CLI load every ambient
+    tier. It precedes the subcommand because the CLI's root parser uses
+    positional options; the CLI applies it for every command, ``auth status``
+    included, in ``eagerLoadSettings`` before command dispatch.
 
     ``create_subprocess_exec`` is spawned via a separate task and awaited
     through ``asyncio.shield`` rather than directly: a bare
@@ -511,6 +535,7 @@ async def _run_auth_status_subprocess(
     spawn_task: asyncio.Task[asyncio.subprocess.Process] = asyncio.ensure_future(
         asyncio.create_subprocess_exec(
             str(cli_path),
+            f"--setting-sources={','.join(setting_sources)}",
             "auth",
             "status",
             "--json",
@@ -1121,7 +1146,23 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
         return diagnostic
 
-    def _capture_auth_context(self, resolved_cwd: str) -> EffectiveAuthContext:
+    def _effective_setting_sources(self, agent: AgentDef | None) -> list[SettingSource]:
+        """Settings tiers a session for ``agent`` loads.
+
+        ``skills: []`` is the documented per-agent opt-out, and it outranks a
+        workflow-global settings tier: an agent that asked for no skills gets
+        none, tier or not. ``agent.skills is None`` (omitted) is a different
+        signal and keeps the tier — same raw tri-state ``_resolve_tool_config``
+        reads off ``agent.tools``. With no agent (:meth:`validate_connection`)
+        the provider's own tiers apply.
+        """
+        if agent is not None and agent.skills == []:
+            return []
+        return list(self._setting_sources)
+
+    def _capture_auth_context(
+        self, resolved_cwd: str, agent: AgentDef | None = None
+    ) -> EffectiveAuthContext:
         """Snapshot everything one operation's authentication depends on.
 
         Called once at the start of :meth:`execute` and of
@@ -1131,9 +1172,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         return EffectiveAuthContext(
             env_snapshot=os.environ.copy(),
             resolved_cwd=resolved_cwd,
-            setting_sources=tuple(self._setting_sources),
+            setting_sources=tuple(self._effective_setting_sources(agent)),
             cli_path=_find_claude_cli(),
             auth_mode=self._auth_mode,
+            configured_setting_sources=tuple(self._setting_sources),
         )
 
     async def _check_auth_readiness(
@@ -1155,15 +1197,18 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         # Checked before any success path: a settings tier can inject a
         # credential after the child environment is configured, so an explicit
-        # mode cannot be honoured alongside one.
-        if mode != "auto" and context.setting_sources:
+        # mode cannot be honoured alongside one. Judged on the configured
+        # tiers, not this agent's effective ones, so a per-agent ``skills: []``
+        # cannot let a contradictory configuration through.
+        configured_sources = context.configured_setting_sources or ()
+        if mode != "auto" and configured_sources:
             from conductor.config.schema import explicit_auth_mode_setting_sources_error
 
             return ClaudeAuthStatus(
                 requested_mode=mode,
                 inferred_mode="subscription" if mode == "subscription" else "api_key",
                 ready=False,
-                error=explicit_auth_mode_setting_sources_error(mode, context.setting_sources),
+                error=explicit_auth_mode_setting_sources_error(mode, configured_sources),
             )
 
         if mode == "api_key":
@@ -1192,8 +1237,19 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 error="api_key mode requires ANTHROPIC_API_KEY to be set (non-blank)",
             )
 
-        # auto mode with api key: early-return before CLI check (no subprocess).
+        # auto with an API key needs no status probe, but still needs the CLI:
+        # the SDK session *is* the ``claude`` binary. Non-spawning check only.
         if mode == "auto" and api_key_present:
+            if context.cli_path is None:
+                return ClaudeAuthStatus(
+                    requested_mode="auto",
+                    inferred_mode="api_key",
+                    ready=False,
+                    error=(
+                        "Claude CLI not found. "
+                        "Install with: npm install -g @anthropic-ai/claude-code"
+                    ),
+                )
             return ClaudeAuthStatus(
                 requested_mode="auto",
                 inferred_mode="api_key",
@@ -1215,7 +1271,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         try:
             stdout_bytes, stderr_bytes, returncode = await _run_auth_status_subprocess(
-                cli_path, context.finalized_child_env, context.resolved_cwd
+                cli_path,
+                context.finalized_child_env,
+                context.resolved_cwd,
+                context.setting_sources,
             )
         except TimeoutError:
             return ClaudeAuthStatus(
@@ -1352,8 +1411,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         # Captured once, before readiness: the preflight and the SDK session
         # below both read this context and nothing else, so they cannot see
-        # different environments, cwds, settings tiers, or CLI binaries.
-        auth_context = self._capture_auth_context(resolved_cwd)
+        # different environments, cwds, settings tiers, or CLI binaries. The
+        # agent is passed so its ``skills: []`` opt-out shapes both.
+        auth_context = self._capture_auth_context(resolved_cwd, agent)
 
         if session_key is None:
             return await self._execute_session(
@@ -1501,12 +1561,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
             else self._max_session_seconds
         )
 
-        # ``skills: []`` is the documented per-agent opt-out, and it outranks a
-        # workflow-global settings tier: an agent that asked for no skills gets
-        # none, tier or not. ``agent.skills is None`` (omitted) is a different
-        # signal and keeps the tier — same raw tri-state ``_resolve_tool_config``
-        # reads off ``agent.tools``.
-        effective_sources: list[SettingSource] = [] if agent.skills == [] else self._setting_sources
+        # The tiers the readiness probe ran with (see
+        # ``_effective_setting_sources`` for the ``skills: []`` opt-out), read
+        # from the context rather than re-derived so the two cannot diverge.
+        effective_sources: list[SettingSource] = list(auth_context.setting_sources)
 
         # A settings_dir whose `project` tier is not enabled discovers no
         # skills -- and the filesystem grant applies anyway, so the one effect

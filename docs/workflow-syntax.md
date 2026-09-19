@@ -609,7 +609,7 @@ workflow:
 
 | Mode | `setting_sources` | Child environment | Readiness check |
 |---|---|---|---|
-| `auto` | Allowed | Inherited unchanged; the CLI applies its own credential precedence. | Ready if `ANTHROPIC_API_KEY` is set; otherwise runs `claude auth status --json`. |
+| `auto` | Allowed | Inherited unchanged; the CLI applies its own credential precedence. | Requires the CLI (located without running it) even when `ANTHROPIC_API_KEY` is set. With the key, ready without running `claude auth status`; otherwise runs `claude auth status --json`. |
 | `subscription` | Refused | Blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`. | Requires the CLI, then runs `claude auth status --json`. |
 | `api_key` | Refused | Requires a non-blank `ANTHROPIC_API_KEY`; blanks the other five variables. | Requires the CLI (located without running it) and the key. Never runs `claude auth status`. |
 
@@ -622,7 +622,12 @@ execution Conductor captures the environment, working directory, settings
 tiers, and CLI path once. The readiness check and the agent session both use
 that capture: the check runs in the same environment and directory, and the
 session receives the complete resulting environment through
-`ClaudeAgentOptions.env`, plus the same CLI path. Conductor never modifies its
+`ClaudeAgentOptions.env`, plus the same CLI path. The check also loads exactly
+the settings tiers the session loads — the check is run as
+`claude --setting-sources=<tiers> auth status --json`, with
+`--setting-sources=` when there are none, so a credential in an ambient
+settings file the session does not load cannot make the check pass. An agent
+with `skills: []` loads no tiers, and its check loads none either. Conductor never modifies its
 own process environment. One SDK limitation remains: the SDK layers
 `ClaudeAgentOptions.env` over its own copy of the process environment, so a
 variable that first appears in Conductor's process *after* the capture can
@@ -635,7 +640,8 @@ child environment. It could supply a credential or backend selector that
 overrides the explicit mode, and the SDK offers no per-call override that is
 known to take precedence over it. `subscription` and `api_key` therefore reject
 a non-empty `runtime.provider.setting_sources`, both at `conductor validate`
-and when an agent runs; the error suggests removing `setting_sources` or using
+and when an agent runs — including an agent whose `skills: []` means it would
+not load them; the error suggests removing `setting_sources` or using
 `auth_mode: auto`, which keeps settings tiers available.
 
 The readiness check confirms that a credential path is usable before each

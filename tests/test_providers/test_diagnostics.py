@@ -837,3 +837,25 @@ class TestGather:
         report = await d.gather(sections=("env",))
         as_dict = report.to_dict()
         assert set(as_dict) == {"env"}
+
+
+@pytest.mark.claude_auth_readiness_mocked
+class TestClaudeAgentSdkDoctorNeedsCli:
+    """Doctor builds the real provider; an installed SDK with no ``claude``
+    binary is not "connected", even with ``ANTHROPIC_API_KEY`` set."""
+
+    async def test_api_key_without_cli_is_not_connected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("claude_agent_sdk", reason="claude-agent-sdk extra not installed")
+        spawn = AsyncMock()
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+        monkeypatch.setattr("conductor.providers.claude_agent_sdk._find_claude_cli", lambda: None)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+
+        diag = await d.gather_provider("claude-agent-sdk", check=True)
+
+        assert diag.installed is True
+        assert diag.connection_ok is False
+        assert "Claude CLI not found" in (diag.connection_error or "")
+        spawn.assert_not_called()

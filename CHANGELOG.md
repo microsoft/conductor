@@ -245,8 +245,11 @@ and compiled into this file at release time.
   `env` block is applied after Conductor configures the child environment.
   Each agent execution captures its environment, working directory, settings
   tiers, and CLI path once; a readiness check (`claude auth status --json`,
-  skipped for `api_key`) and the SDK session both use that capture, and
-  Conductor's own environment is never modified. The readiness check is not
+  skipped for `api_key`) and the SDK session both use that capture —
+  including the same settings tiers, passed to the check as
+  `--setting-sources` — and Conductor's own environment is never modified.
+  Every mode, `auto` with an API key included, requires the `claude` CLI to be
+  installed, checked without running it. The readiness check is not
   billing attribution. `conductor doctor --check` shows Conductor's inferred
   mode separately from the CLI-reported `authMethod` / `apiProvider` /
   `apiKeySource` / `subscriptionType`, and states that it checked the default

@@ -72,32 +72,49 @@ class TestClaudeAuthStatusAutoMode:
             mock_run.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_auto_with_api_key_no_cli_binary_never_starts_subprocess(self) -> None:
-        """auto + ANTHROPIC_API_KEY: no subprocess started, succeeds with no discoverable binary.
+    async def test_auto_with_api_key_but_no_cli_binary_is_not_ready(self) -> None:
+        """auto + ANTHROPIC_API_KEY still needs a discoverable CLI: the SDK
+        session is the ``claude`` binary, so a key alone cannot run anything.
 
-        Asserts at the observable subprocess-execution seam (asyncio.create_subprocess_exec)
-        rather than the absence of one private helper call, so a rename of the internal
-        wrapper does not silently defeat this test.
-
-        Also leaves _find_claude_cli with no binary to find — if a regression puts a
-        CLI prerequisite back in front of mode resolution, this test fails even in CI
-        where the claude-agent-sdk extra ships a bundled binary.
+        The availability check is non-spawning — asserted at the process
+        creation seam rather than a private helper — and leaves
+        ``_find_claude_cli`` with nothing to find, so it holds even in CI
+        where the extra ships a bundled binary.
         """
         provider = ClaudeAgentSdkProvider(auth_mode="auto")
         with (
             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
-            # No CLI binary discoverable anywhere.
             patch("shutil.which", return_value=None),
             patch("pathlib.Path.exists", return_value=False),
             patch("pathlib.Path.is_file", return_value=False),
-            # Assert at the subprocess-execution seam, not an internal helper.
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            status = await provider._check_auth_readiness()
+            connected = await provider.validate_connection()
+
+        assert status.requested_mode == "auto"
+        assert status.inferred_mode == "api_key"
+        assert status.ready is False
+        assert status.error is not None
+        assert "Claude CLI not found" in status.error
+        assert "npm install -g @anthropic-ai/claude-code" in status.error
+        assert connected is False
+        assert provider._last_validation_error == status.error
+        assert "sk-ant-fake" not in str(dataclasses.asdict(status))
+        mock_exec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auto_with_api_key_and_cli_is_ready_without_spawning(self) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode="auto")
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec") as mock_exec,
         ):
             status = await provider._check_auth_readiness()
 
         assert status.inferred_mode == "api_key"
         assert status.ready is True
-        assert "sk-ant-fake" not in str(dataclasses.asdict(status))
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
@@ -487,7 +504,7 @@ class TestAuthSubprocessSpawnRobustness:
             return proc
 
         with patch("asyncio.create_subprocess_exec", slow_create):
-            task = asyncio.create_task(_run_auth_status_subprocess(FAKE_CLI, {}, "/work"))
+            task = asyncio.create_task(_run_auth_status_subprocess(FAKE_CLI, {}, "/work", ()))
             await spawn_started.wait()
             # Still inside the spawn await — no process handle exists yet in
             # the caller's frame. Cancel here, then let the shielded spawn
@@ -523,7 +540,7 @@ class TestAuthSubprocessSpawnRobustness:
             patch("conductor.providers.claude_agent_sdk._CLAUDE_AUTH_TIMEOUT", 0.01),
             pytest.raises(TimeoutError),
         ):
-            await _run_auth_status_subprocess(FAKE_CLI, {}, "/work")
+            await _run_auth_status_subprocess(FAKE_CLI, {}, "/work", ())
 
         proc.kill.assert_called_once()
         proc.wait.assert_awaited_once()
@@ -537,6 +554,7 @@ class TestAuthSubprocessSpawnRobustness:
         proc.communicate = AsyncMock(return_value=(b"{}", b""))
 
         async def recording_create(*args: object, **kwargs: object) -> MagicMock:
+            captured["argv"] = args
             captured.update(kwargs)
             return proc
 
@@ -544,10 +562,38 @@ class TestAuthSubprocessSpawnRobustness:
             patch.dict(os.environ, {"LIVE_ONLY": "1"}, clear=True),
             patch("asyncio.create_subprocess_exec", recording_create),
         ):
-            await _run_auth_status_subprocess(FAKE_CLI, {"GIVEN": "1"}, "/given/cwd")
+            await _run_auth_status_subprocess(
+                FAKE_CLI, {"GIVEN": "1"}, "/given/cwd", ("project", "local")
+            )
 
         assert captured["env"] == {"GIVEN": "1"}
         assert captured["cwd"] == "/given/cwd"
+        # Root option before the subcommand: the CLI parses positionally.
+        assert captured["argv"] == (
+            str(FAKE_CLI),
+            "--setting-sources=project,local",
+            "auth",
+            "status",
+            "--json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_selection_is_sent_explicitly(self) -> None:
+        """No tiers is ``--setting-sources=``, never an omitted flag — omitting
+        it makes the CLI load every ambient tier."""
+        captured: dict[str, object] = {}
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"{}", b""))
+
+        async def recording_create(*args: object, **kwargs: object) -> MagicMock:
+            captured["argv"] = args
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", recording_create):
+            await _run_auth_status_subprocess(FAKE_CLI, {}, "/work", ())
+
+        assert captured["argv"] == (str(FAKE_CLI), "--setting-sources=", "auth", "status", "--json")
 
 
 @pytest.mark.claude_auth_readiness_mocked
