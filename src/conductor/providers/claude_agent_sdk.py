@@ -494,14 +494,33 @@ def _find_claude_cli() -> Path | None:
     # those would report "no CLI" for a Windows user whose CLI sits at
     # ~/.claude/local/claude, where Claude Code's own local installer puts it,
     # and the SDK would find and run it.
-    fallbacks: tuple[Path, ...] = (
-        Path.home() / ".npm-global/bin/claude",
-        *(() if is_windows else (Path("/usr/local/bin/claude"),)),
-        Path.home() / ".local/bin/claude",
-        Path.home() / "node_modules/.bin/claude",
-        Path.home() / ".yarn/bin/claude",
-        Path.home() / ".claude/local/claude",
+    # ``Path.home()`` raises when no home can be resolved — ``RuntimeError``
+    # when every source is missing (Windows with no ``USERPROFILE`` /
+    # ``HOMEDRIVE``, as under a cleared test environment), ``OSError`` from the
+    # POSIX password-database lookup. Neither is a reason to fail discovery:
+    # the home-anchored candidates below simply cannot exist, while the bundled
+    # CLI and ``PATH`` above need no home at all. Skip them and let the caller
+    # report the actionable "Claude CLI not found" result.
+    try:
+        home = Path.home()
+    except (RuntimeError, OSError):
+        logger.debug("Home directory unavailable; skipping home-anchored CLI paths")
+        home = None
+
+    def _under_home(relative: str) -> Path | None:
+        return None if home is None else home / relative
+
+    # Order preserved from the SDK's own list; a ``None`` entry is one this
+    # platform or this process cannot have, and is dropped rather than probed.
+    candidates: tuple[Path | None, ...] = (
+        _under_home(".npm-global/bin/claude"),
+        None if is_windows else Path("/usr/local/bin/claude"),
+        _under_home(".local/bin/claude"),
+        _under_home("node_modules/.bin/claude"),
+        _under_home(".yarn/bin/claude"),
+        _under_home(".claude/local/claude"),
     )
+    fallbacks: tuple[Path, ...] = tuple(path for path in candidates if path is not None)
     for path in fallbacks:
         if path.exists() and path.is_file():
             return path
@@ -1382,6 +1401,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
         api_provider = filtered.get("apiProvider")
         subscription_type = filtered.get("subscriptionType")
         api_key_source = filtered.get("apiKeySource")
+        if logged_in is True and returncode != 0:
+            # A success payload contradicted by a failing exit code: the CLI
+            # did not complete successfully, so this is not readiness. Reported
+            # generically — never echoing stdout, stderr, or any credential —
+            # because there is no trustworthy specific cause to name.
+            return ClaudeAuthStatus(
+                requested_mode=mode,
+                inferred_mode="subscription",
+                ready=False,
+                error="Authentication check returned an unreadable status response.",
+            )
         if logged_in is True:
             return ClaudeAuthStatus(
                 requested_mode=mode,

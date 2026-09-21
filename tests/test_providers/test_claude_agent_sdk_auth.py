@@ -60,6 +60,27 @@ class TestFindClaudeCli:
             result = _find_claude_cli()
             assert result is not None
 
+    @pytest.mark.parametrize(
+        "error",
+        [RuntimeError("no home"), OSError("home unavailable")],
+    )
+    def test_unresolvable_home_does_not_raise(self, error: Exception) -> None:
+        """Platform-independent regression for the Windows CI failures.
+
+        With the environment cleared, Windows has no ``USERPROFILE`` /
+        ``HOMEDRIVE`` to derive a home from, so ``Path.home()`` raises
+        ``RuntimeError``; the POSIX password-database lookup raises
+        ``OSError``. Both must skip the home-anchored fallbacks rather than
+        propagate, so readiness still reports "Claude CLI not found".
+        """
+        with (
+            patch("shutil.which", return_value=None),
+            patch("pathlib.Path.home", side_effect=error),
+            patch("pathlib.Path.exists", return_value=False),
+            patch("pathlib.Path.is_file", return_value=False),
+        ):
+            assert _find_claude_cli() is None
+
 
 @pytest.mark.claude_auth_readiness_mocked
 class TestClaudeAuthStatusAutoMode:

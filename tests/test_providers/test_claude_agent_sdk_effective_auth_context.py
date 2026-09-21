@@ -398,6 +398,56 @@ class TestSubscriptionStatusParsing:
         assert status.ready is True
 
     @pytest.mark.asyncio
+    async def test_logged_in_true_on_nonzero_exit_is_not_ready(self) -> None:
+        """A success payload contradicted by a failing exit code is not a
+        success. Reported generically, without echoing the CLI's output."""
+        stdout = json.dumps(
+            {"loggedIn": True, "authMethod": "claude.ai", "apiKeySource": "env"}
+        ).encode()
+        status, _ = await self._readiness(stdout, 1)
+        assert status.ready is False
+        assert status.error is not None
+        assert "Not logged in" not in status.error
+        rendered = str(dataclasses.asdict(status))
+        for leaked in ("claude.ai", "loggedIn", "sk-ant-fake", "tok-fake", "oauth-fake"):
+            assert leaked not in rendered
+
+    @pytest.mark.parametrize("returncode", [1, 2, 127])
+    @pytest.mark.asyncio
+    async def test_logged_out_keeps_its_guidance_on_any_nonzero_exit(self, returncode: int) -> None:
+        status, _ = await self._readiness(json.dumps({"loggedIn": False}).encode(), returncode)
+        assert status.ready is False
+        assert status.error == "Not logged in to Claude Code. Run: claude auth login"
+
+    @pytest.mark.asyncio
+    async def test_errors_never_carry_stdout_stderr_or_credentials(self) -> None:
+        """Neither the CLI's own output nor an inherited credential may appear
+        in a status error."""
+        captured: dict[str, Any] = {}
+
+        async def create(*args: object, **kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = 3
+            proc.communicate = AsyncMock(
+                return_value=(b"stdout-marker-a41f", b"stderr-marker-b52e")
+            )
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock(return_value=3)
+            return proc
+
+        provider = ClaudeAgentSdkProvider(auth_mode="subscription")
+        with patch("asyncio.create_subprocess_exec", create):
+            status = await provider._check_auth_readiness(
+                _ctx(COMPETING_CREDENTIALS, "subscription")
+            )
+
+        assert status.ready is False
+        rendered = str(dataclasses.asdict(status))
+        for leaked in ("stdout-marker-a41f", "stderr-marker-b52e", "sk-ant-fake", "tok-fake"):
+            assert leaked not in rendered
+
+    @pytest.mark.asyncio
     async def test_non_json_on_nonzero_exit_is_not_ready(self) -> None:
         status, _ = await self._readiness(b"command failed", 127)
         assert status.ready is False
