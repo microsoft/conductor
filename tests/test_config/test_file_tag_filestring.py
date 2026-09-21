@@ -91,8 +91,8 @@ agents:
     assert terminate_step.reason == "termination completed"
 
 
-def test_file_tag_parsed_yaml_returns_plain_dict(tmp_path: Path) -> None:
-    # Requirement: !file on a file containing YAML dict/list returns
+def test_yamlfile_tag_parsed_yaml_returns_plain_dict(tmp_path: Path) -> None:
+    # Requirement: !yamlfile on a file containing YAML dict/list returns
     # a plain dict/list, not FileString.
     dict_file = tmp_path / "schema.yaml"
     dict_file.write_text("foo: bar\nkey: value")
@@ -101,7 +101,7 @@ def test_file_tag_parsed_yaml_returns_plain_dict(tmp_path: Path) -> None:
     loader._constructor_cls._base_dir = tmp_path
     loader._constructor_cls._file_stack = []
 
-    result = loader._yaml.load("!file schema.yaml")
+    result = loader._yaml.load("!yamlfile schema.yaml")
     # Clean up constructor state
     loader._constructor_cls._base_dir = Path(".")
     loader._constructor_cls._file_stack = []

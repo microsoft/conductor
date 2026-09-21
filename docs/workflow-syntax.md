@@ -2743,7 +2743,14 @@ The web dashboard's context remaining bar estimates context size using only prov
 
 ## External File References
 
-The `!file` YAML tag lets you reference external files from any YAML field value. The file content is transparently inlined during loading, keeping workflow files concise and enabling reuse of prompts, schemas, and configuration across workflows.
+**Breaking change:** as of this release, `!file` always returns a file's content verbatim as a
+string. It no longer sniffs the content to decide whether to return structured data. If you were
+relying on `!file` to load a YAML dict or list (an output schema, a tool list, a nested config
+file), switch that reference to `!yamlfile`, which explicitly parses the file as YAML. A `!file`
+include that only ever held plain text (a prompt, a system prompt, a description) needs no
+change.
+
+The `!file` and `!yamlfile` YAML tags let you reference external files from any YAML field value. The file content is transparently inlined during loading, keeping workflow files concise and enabling reuse of prompts, schemas, and configuration across workflows.
 
 ### Syntax
 
@@ -2755,30 +2762,44 @@ field_name: !file path/to/file
 
 The tag can be used on any scalar YAML value — string fields, output schemas, tool lists, or any other field.
 
-### Content-Type Detection
+### Text Includes (`!file`)
 
-The content of the referenced file is handled based on its structure:
-
-- **YAML dict or list** — If the file content parses as a YAML mapping or sequence, it is returned as structured data (dict or list). This is useful for output schemas, tool lists, or any structured configuration.
-- **Scalar or non-YAML** — If the file contains a YAML scalar (e.g., a plain string), is not valid YAML, or is a non-YAML format like Markdown, the raw file content is returned as a string.
-
-This detection applies to the file's *structure*, not its extension: a Markdown prompt whose text happens to parse as a YAML mapping (a line ending in `:` followed by a `- ` bulleted list, for example) is returned as a dict, and a string-typed field like `prompt` or `system_prompt` then rejects it. Because this depends on the file's exact content, an unrelated prose edit can flip a working prompt file across the boundary with no config change. Use `!rawfile` (below) for any file whose content must always stay a string regardless of what it happens to contain.
-
-### Raw Text Includes (`!rawfile`)
-
-`!rawfile` reads the referenced file and always returns its content verbatim as a string, skipping the YAML-sniffing `!file` does. Use it for `prompt` and `system_prompt` files so their type can never depend on whether the prose happens to be valid YAML:
+`!file` reads the referenced file and always returns its content verbatim as a string. Use it for `prompt` and `system_prompt` files, and for any other field that expects text:
 
 ```yaml
 agents:
   - name: reviewer
     model: gpt-4
-    system_prompt: !rawfile prompts/system.md
-    prompt: !rawfile prompts/review.md
+    system_prompt: !file prompts/system.md
+    prompt: !file prompts/review.md
     routes:
       - to: $end
 ```
 
-`!rawfile` does not parse nested `!file`/`!rawfile` tags inside the included file; the content is returned exactly as read. It supports the same path resolution, environment variable resolution, and Jinja include search root as a `!file` tag that happened to return a string.
+`!file` does not parse nested `!file`/`!yamlfile` tags inside the included file; the content is returned exactly as read. Because `!file` never sniffs the file's structure, a prompt written in Markdown whose prose happens to parse as YAML (a line ending in `:` followed by a `- ` bulleted list, for example) still loads as a string, and its type can never silently depend on what the prose happens to contain.
+
+### Structured Includes (`!yamlfile`)
+
+`!yamlfile` reads the referenced file and parses it as YAML, returning a dict or list (or a scalar, if that's genuinely all the file contains). Use it for output schemas, tool lists, and any other field that expects structured configuration:
+
+```yaml
+agents:
+  - name: analyzer
+    model: gpt-4
+    prompt: !file prompts/analyze.md
+    output: !yamlfile schemas/analysis-output.yaml
+    routes:
+      - to: $end
+```
+
+If the referenced file is not valid YAML, `!yamlfile` raises a `ConfigurationError` naming the file and the parse error, rather than silently falling back to a string:
+
+```
+ConfigurationError: '/absolute/path/schemas/analysis-output.yaml' is not valid YAML: ...
+  Suggestion: Use !file instead of !yamlfile if this file is meant to be loaded as plain text.
+```
+
+`!yamlfile` parses nested `!file`/`!yamlfile` tags inside the included file, each resolving relative to its own file's directory. It supports the same path resolution, environment variable resolution, and Jinja include search root as a `!file` tag.
 
 ### Path Resolution
 
@@ -2834,7 +2855,7 @@ agents:
   - name: analyzer
     model: gpt-4
     prompt: "Analyze the input data"
-    output: !file schemas/analysis-output.yaml
+    output: !yamlfile schemas/analysis-output.yaml
     routes:
       - to: $end
 ```
@@ -2859,7 +2880,7 @@ agents:
   - name: researcher
     model: gpt-4
     prompt: "Research the topic"
-    tools: !file tools/research-tools.yaml
+    tools: !yamlfile tools/research-tools.yaml
     routes:
       - to: $end
 ```
@@ -2873,7 +2894,7 @@ agents:
 
 #### Nested Inclusion
 
-Included YAML files can themselves contain `!file` tags. Each nested reference resolves relative to its own file's directory:
+A `!yamlfile` include can itself contain `!file`/`!yamlfile` tags. Each nested reference resolves relative to its own file's directory:
 
 ```yaml
 # workflow.yaml
@@ -2881,7 +2902,7 @@ agents:
   - name: agent1
     model: gpt-4
     prompt: "Hello"
-    output: !file schemas/nested.yaml
+    output: !yamlfile schemas/nested.yaml
     routes:
       - to: $end
 ```
@@ -2900,9 +2921,9 @@ A comprehensive summary of the analysis results.
 
 ### Jinja Includes in Prompt Files
 
-When a prompt or system_prompt is loaded via `!file` or `!rawfile`, the directory of that file becomes the search root for Jinja template loading. This allows statements like `{% include "_shared.md" %}`, `{% import "_macros.md" as m %}`, and `{% extends "_base.md" %}` to resolve relative to the prompt file's directory rather than the workflow's directory or the current working directory.
+When a prompt or system_prompt is loaded via `!file`, the directory of that file becomes the search root for Jinja template loading. This allows statements like `{% include "_shared.md" %}`, `{% import "_macros.md" as m %}`, and `{% extends "_base.md" %}` to resolve relative to the prompt file's directory rather than the workflow's directory or the current working directory.
 
-Only `prompt`/`system_prompt` loaded via `!file` or `!rawfile` support this behavior. Other fields that use `!file`/`!rawfile` (such as command, stdin, value, schemas, or tool lists) don't have include loader support. Inline prompts defined as plain strings don't support loader-dependent Jinja tags. If you attempt to use them inline, the system raises a template rendering error suggesting you switch to a file-backed prompt:
+Only `prompt`/`system_prompt` loaded via `!file` support this behavior. Other fields that use `!file`/`!yamlfile` (such as command, stdin, value, schemas, or tool lists) don't have include loader support. Inline prompts defined as plain strings don't support loader-dependent Jinja tags. If you attempt to use them inline, the system raises a template rendering error suggesting you switch to a file-backed prompt:
 
 ```
 Template rendering failed: loader-dependent Jinja constructs ({% include %}, {% import %}, {% extends %}) require a file-backed prompt via prompt: !file ...
@@ -2997,7 +3018,7 @@ ConfigurationError: File not found: 'prompts/missing.md' (resolved to '/absolute
 
 #### Circular References
 
-If `!file` tags form a cycle (e.g., file A includes file B which includes file A), a `ConfigurationError` is raised:
+`!file` never recurses into the files it reads, so it cannot form a cycle. If `!yamlfile` tags form a cycle (e.g., file A includes file B which includes file A), a `ConfigurationError` is raised:
 
 ```
 ConfigurationError: Circular file reference detected: 'a.yaml'

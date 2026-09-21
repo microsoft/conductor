@@ -1,1 +1,1 @@
-key: !file cycle_b.yaml
+key: !yamlfile cycle_b.yaml

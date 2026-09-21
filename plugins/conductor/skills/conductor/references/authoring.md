@@ -781,22 +781,23 @@ Prepend workspace context to every agent prompt. Three options:
 
 All three sources are concatenated and prepended to every agent's prompt as a workspace preamble.
 
-## File Includes (`!file` Tag)
+## File Includes (`!file` and `!yamlfile` Tags)
 
-Include external file content in YAML using the `!file` tag:
+Include external file content in YAML using the `!file` tag for text, or `!yamlfile` for structured data:
 
 ```yaml
 agents:
   - name: analyzer
     system_prompt: !file prompts/system.md
     prompt: !file prompts/analyze.md
+    output: !yamlfile schemas/analyzer-output.yaml
 ```
 
 - Paths are **relative to the YAML file's directory**
-- If the included file is valid YAML, it's parsed as a data structure
-- If it's plain text (e.g., Markdown), it's included as a string
-- Supports **recursive includes** — included YAML files can use `!file` too
-- Circular references are detected and raise an error
+- `!file` always returns the file's content verbatim as a string, whatever it contains
+- `!yamlfile` parses the file as YAML and returns a dict/list; it raises a `ConfigurationError` if the file is not valid YAML rather than falling back to a string
+- Only `!yamlfile` **recurses**: an included YAML file can itself use `!file`/`!yamlfile`. `!file` never parses its own content, so it cannot recurse
+- Circular `!yamlfile` references are detected and raise an error
 
 Prompt files loaded via `!file` may also use Jinja loader-dependent tags
 (`{% include %}`, `{% import %}`, `{% extends %}`); relative paths resolve

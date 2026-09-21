@@ -122,7 +122,7 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
         _file_stack: list[str] = []
 
         def _read_included_file(self, node: Any) -> tuple[str, Path]:
-            """Resolve a !file/!rawfile path against the current base dir and read it.
+            """Resolve a !file/!yamlfile path against the current base dir and read it.
 
             Raises ConfigurationError on a circular reference, a missing file, or
             invalid UTF-8. Returns the file's raw text content and its resolved path.
@@ -160,41 +160,51 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
             return content, file_path
 
         def construct_file_tag(self, node: Any) -> Any:
-            """Resolve a !file tag by reading and optionally parsing the referenced file."""
+            """Resolve a !file tag: always return the file's content verbatim as text.
+
+            Never sniffs the content as YAML, so a prompt file's type can't
+            silently flip between a string and a parsed mapping/list depending
+            on whether its prose happens to parse as YAML. Use !yamlfile to
+            explicitly parse a file as structured YAML.
+            """
+            content, file_path = self._read_included_file(node)
+            return FileString(content, source_path=file_path)
+
+        def construct_yamlfile_tag(self, node: Any) -> Any:
+            """Resolve a !yamlfile tag by parsing the referenced file as YAML.
+
+            Supports nested !file/!yamlfile includes. Raises ConfigurationError
+            if the file is not valid YAML, rather than silently falling back to
+            a string the way the old !file content-sniffing did.
+            """
             content, file_path = self._read_included_file(node)
             cls = type(self)
 
-            # Try to parse as YAML (with nested !file support)
             saved_base_dir = cls._base_dir
             cls._file_stack.append(str(file_path))
             try:
                 cls._base_dir = file_path.parent
                 sub_yaml = YAML()
                 sub_yaml.Constructor = type(self)
-                parsed = sub_yaml.load(content)
+                try:
+                    parsed = sub_yaml.load(content)
+                except YAMLError as e:
+                    raise ConfigurationError(
+                        f"'{file_path}' is not valid YAML: {e}",
+                        suggestion="Use !file instead of !yamlfile if this file is meant "
+                        "to be loaded as plain text.",
+                    ) from e
                 if isinstance(parsed, (dict, list)):
                     return parsed
-                # Scalar YAML or None → return raw string content
-                return FileString(content, source_path=file_path)
-            except YAMLError:
-                # Not valid YAML → return as raw string
+                # A scalar YAML document (plain string/number/bool/None): return
+                # the raw content as text, same as !file would.
                 return FileString(content, source_path=file_path)
             finally:
                 cls._base_dir = saved_base_dir
                 cls._file_stack.pop()
 
-        def construct_rawfile_tag(self, node: Any) -> Any:
-            """Resolve a !rawfile tag: always return the file's content verbatim.
-
-            Unlike !file, this never sniffs the content as YAML, so a prompt file
-            cannot have its type silently flip between a string and a parsed
-            mapping/list depending on whether its prose happens to parse as YAML.
-            """
-            content, file_path = self._read_included_file(node)
-            return FileString(content, source_path=file_path)
-
     FileTagConstructor.add_constructor("!file", FileTagConstructor.construct_file_tag)
-    FileTagConstructor.add_constructor("!rawfile", FileTagConstructor.construct_rawfile_tag)
+    FileTagConstructor.add_constructor("!yamlfile", FileTagConstructor.construct_yamlfile_tag)
     return FileTagConstructor
 
 

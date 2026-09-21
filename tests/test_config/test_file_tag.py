@@ -1,4 +1,4 @@
-"""Tests for the !file YAML tag functionality."""
+"""Tests for the !file and !yamlfile YAML tag functionality."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures" / "file_tag"
 
 
 class TestFileTagStringContent:
-    """Tests for !file loading raw string content."""
+    """Tests for !file always loading raw string content, never YAML-parsed."""
 
     def test_file_tag_loads_md_as_string(self) -> None:
         """!file loads a .md file as raw string into prompt field."""
@@ -26,7 +26,7 @@ class TestFileTagStringContent:
         assert "provide a detailed response" in config.agents[0].prompt
 
     def test_file_tag_scalar_yaml_as_string(self) -> None:
-        """YAML file containing only a scalar is returned as raw string."""
+        """A file containing only a YAML scalar is returned as raw string."""
         loader = ConfigLoader()
         yaml_content = """\
 workflow:
@@ -46,12 +46,41 @@ agents:
         )
         assert "just a scalar value" in config.agents[0].prompt
 
+    def test_file_tag_never_sniffs_yaml_shaped_markdown(self) -> None:
+        """!file on prose that happens to parse as YAML still stays a string.
 
-class TestFileTagStructuredContent:
-    """Tests for !file loading structured YAML content."""
+        yaml_shaped.md's prose is a valid YAML mapping (a line ending in ':'
+        followed by a '- ' bullet list). Under !rawfile-era !file this used to
+        be sniffed and returned as a dict, rejecting a str-typed field like
+        system_prompt. !file no longer sniffs at all, so this loads cleanly.
+        """
+        loader = ConfigLoader()
+        yaml_content = """\
+workflow:
+  name: file-tag-no-trap
+  entry_point: agent1
 
-    def test_file_tag_loads_yaml_as_dict(self) -> None:
-        """!file loads a .yaml file as parsed dict into output field."""
+agents:
+  - name: agent1
+    model: gpt-4
+    system_prompt: !file yaml_shaped.md
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        config = loader.load_string(
+            yaml_content,
+            source_path=FIXTURES_DIR / "file_tag_no_trap.yaml",
+        )
+        assert isinstance(config.agents[0].system_prompt, str)
+        assert "Summarize the changelog" in config.agents[0].system_prompt
+
+
+class TestYamlfileTagStructuredContent:
+    """Tests for !yamlfile explicitly parsing structured YAML content."""
+
+    def test_yamlfile_tag_loads_yaml_as_dict(self) -> None:
+        """!yamlfile loads a .yaml file as parsed dict into output field."""
         loader = ConfigLoader()
         config = loader.load(FIXTURES_DIR / "main.yaml")
 
@@ -62,8 +91,8 @@ class TestFileTagStructuredContent:
         assert "score" in output
         assert output["score"].type == "number"
 
-    def test_file_tag_in_list(self) -> None:
-        """!file works inside YAML list items for agent tools."""
+    def test_yamlfile_tag_in_list(self) -> None:
+        """!yamlfile works inside YAML list items for agent tools."""
         loader = ConfigLoader()
         yaml_content = """\
 workflow:
@@ -74,7 +103,7 @@ agents:
   - name: agent1
     model: gpt-4
     prompt: "Hello"
-    tools: !file list_items.yaml
+    tools: !yamlfile list_items.yaml
     routes:
       - to: $end
 """
@@ -84,6 +113,71 @@ agents:
         )
         assert "tool1" in config.agents[0].tools
         assert "tool2" in config.agents[0].tools
+
+    def test_yamlfile_tag_parses_yaml_shaped_markdown_as_dict(self) -> None:
+        """!yamlfile is the explicit opt-in to parse prose that happens to be YAML-shaped."""
+        loader = ConfigLoader()
+        loader._constructor_cls._base_dir = FIXTURES_DIR
+        loader._constructor_cls._file_stack = []
+
+        result = loader._yaml.load("!yamlfile yaml_shaped.md")
+
+        loader._constructor_cls._base_dir = Path(".")
+        loader._constructor_cls._file_stack = []
+
+        assert isinstance(result, dict)
+        assert any("Summarize the changelog" in k for k in result)
+
+    def test_yamlfile_missing_file_raises_configuration_error(self) -> None:
+        """!yamlfile shares !file's missing-file error handling."""
+        loader = ConfigLoader()
+        yaml_content = """\
+workflow:
+  name: yamlfile-missing-test
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    output: !yamlfile nonexistent.yaml
+    routes:
+      - to: $end
+"""
+        with pytest.raises(ConfigurationError, match="File not found"):
+            loader.load_string(
+                yaml_content,
+                source_path=FIXTURES_DIR / "yamlfile_missing_test.yaml",
+            )
+
+    def test_yamlfile_reports_malformed_yaml_instead_of_falling_back(self) -> None:
+        """!yamlfile raises on malformed YAML rather than silently returning a string.
+
+        This is the behavior change jrob5756 asked for: the old !file heuristic
+        caught any YAMLError and fell back to raw text, which meant a typo in a
+        structured include failed at the point of use (a type error against
+        whatever field it landed in, or worse, silently) rather than at the
+        point of the actual syntax mistake.
+        """
+        loader = ConfigLoader()
+        yaml_content = """\
+workflow:
+  name: yamlfile-malformed-test
+  entry_point: agent1
+
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    output: !yamlfile malformed.yaml
+    routes:
+      - to: $end
+"""
+        with pytest.raises(ConfigurationError, match="not valid YAML"):
+            loader.load_string(
+                yaml_content,
+                source_path=FIXTURES_DIR / "yamlfile_malformed_test.yaml",
+            )
 
 
 class TestFileTagRelativePath:
@@ -125,10 +219,10 @@ agents:
 
 
 class TestFileTagNestedInclusion:
-    """Tests for nested !file tag support."""
+    """Tests for nested !file/!yamlfile tag support."""
 
     def test_nested_file_tags_resolve(self) -> None:
-        """Nested !file tags in included files work correctly."""
+        """A !file tag nested inside a !yamlfile include works correctly."""
         loader = ConfigLoader()
         config = loader.load(FIXTURES_DIR / "nested_parent.yaml")
 
@@ -154,7 +248,7 @@ workflow:
 agents:
   - name: agent1
     model: gpt-4
-    prompt: !file cycle_a.yaml
+    prompt: !yamlfile cycle_a.yaml
     routes:
       - to: $end
 """
@@ -331,79 +425,3 @@ agents:
 """
         config = loader.load_string(valid_yaml)
         assert config.workflow.name == "after-error"
-
-
-class TestRawFileTag:
-    """Tests for the !rawfile tag: always returns verbatim string content."""
-
-    def test_file_tag_trap_on_yaml_shaped_markdown(self) -> None:
-        """!file on a Markdown file that parses as YAML rejects a str-typed field.
-
-        Documents the trap !rawfile exists to avoid: yaml_shaped.md's prose is a
-        valid YAML mapping (a line ending in ':' followed by a '- ' bullet list),
-        so !file returns a dict where system_prompt (typed str) needs a string.
-        """
-        loader = ConfigLoader()
-        yaml_content = """\
-workflow:
-  name: file-tag-trap
-  entry_point: agent1
-
-agents:
-  - name: agent1
-    model: gpt-4
-    system_prompt: !file yaml_shaped.md
-    prompt: "Hello"
-    routes:
-      - to: $end
-"""
-        with pytest.raises(ConfigurationError, match="valid string"):
-            loader.load_string(
-                yaml_content,
-                source_path=FIXTURES_DIR / "file_tag_trap.yaml",
-            )
-
-    def test_rawfile_bypasses_yaml_sniffing(self) -> None:
-        """!rawfile on the same YAML-shaped Markdown file stays a string."""
-        loader = ConfigLoader()
-        yaml_content = """\
-workflow:
-  name: rawfile-test
-  entry_point: agent1
-
-agents:
-  - name: agent1
-    model: gpt-4
-    system_prompt: !rawfile yaml_shaped.md
-    prompt: "Hello"
-    routes:
-      - to: $end
-"""
-        config = loader.load_string(
-            yaml_content,
-            source_path=FIXTURES_DIR / "rawfile_test.yaml",
-        )
-        assert isinstance(config.agents[0].system_prompt, str)
-        assert "Summarize the changelog" in config.agents[0].system_prompt
-
-    def test_rawfile_missing_file_raises_configuration_error(self) -> None:
-        """!rawfile shares !file's missing-file error handling."""
-        loader = ConfigLoader()
-        yaml_content = """\
-workflow:
-  name: rawfile-missing-test
-  entry_point: agent1
-
-agents:
-  - name: agent1
-    model: gpt-4
-    system_prompt: !rawfile nonexistent.md
-    prompt: "Hello"
-    routes:
-      - to: $end
-"""
-        with pytest.raises(ConfigurationError, match="File not found"):
-            loader.load_string(
-                yaml_content,
-                source_path=FIXTURES_DIR / "rawfile_missing_test.yaml",
-            )

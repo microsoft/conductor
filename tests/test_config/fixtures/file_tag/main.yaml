@@ -6,6 +6,6 @@ agents:
   - name: analyzer
     model: gpt-4
     prompt: !file prompt.md
-    output: !file output_schema.yaml
+    output: !yamlfile output_schema.yaml
     routes:
       - to: $end

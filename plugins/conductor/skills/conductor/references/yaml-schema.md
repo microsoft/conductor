@@ -504,23 +504,23 @@ routes:
 - Stdio servers only.
 - Events (`mcp_started`, `mcp_completed`, `mcp_failed`) exclude argument values and result data; error messages in events are redacted, and full exception details land only in the run's private `*.mcp-diagnostics.log` file (next to the `*.events.jsonl` log), which the redacted message names.
 
-## File Includes (`!file` Tag)
+## File Includes (`!file` and `!yamlfile` Tags)
 
 Include external file content anywhere in YAML:
 
 ```yaml
 agents:
   - name: analyzer
-    system_prompt: !file prompts/system.md    # Included as string
-    prompt: !file prompts/analyze.md          # Included as string
-    output: !file schemas/analyzer-output.yaml # Included as YAML structure
+    system_prompt: !file prompts/system.md        # Always included as string
+    prompt: !file prompts/analyze.md              # Always included as string
+    output: !yamlfile schemas/analyzer-output.yaml # Parsed as a YAML data structure
 ```
 
 - Paths resolve **relative to the YAML file's directory**
-- Plain text files (Markdown, etc.) are included as strings
-- YAML files are parsed and included as data structures
-- Supports **recursive includes** (included YAML files can use `!file`)
-- Circular references are detected and raise `ConfigurationError`
+- `!file` always includes the file verbatim as a string, whatever it contains
+- `!yamlfile` parses the file as YAML and includes it as a data structure; it raises `ConfigurationError` on malformed YAML rather than falling back to a string
+- Supports **recursive includes** for `!yamlfile` (an included YAML file can use `!file`/`!yamlfile`); `!file` never parses, so it cannot recurse
+- Circular `!yamlfile` references are detected and raise `ConfigurationError`
 
 ## Human Gate Schema
 

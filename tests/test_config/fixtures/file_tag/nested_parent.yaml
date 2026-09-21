@@ -6,6 +6,6 @@ agents:
   - name: agent1
     model: gpt-4
     prompt: "Hello"
-    output: !file nested_child.yaml
+    output: !yamlfile nested_child.yaml
     routes:
       - to: $end
