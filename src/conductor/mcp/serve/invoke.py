@@ -21,11 +21,16 @@ Flow, in order (data flows A/B in the design doc):
 3. Resolve the workflow's on-disk path at its catalogue-pinned identity
    (DD6) and its declared ``input:``/``mcp:`` blocks, reusing the same
    registry primitives ``catalogue.py`` used to build the catalogue rather
-   than a second resolution path.
+   than a second resolution path. Made absolute (issue #544) before it is
+   loaded or launched: the detached child runs with ``cwd=options.launch_dir``
+   rather than inheriting this process's own cwd, so a relative path here
+   must not be left to resolve against the child's *new* directory.
 4. Validate/fill typed inputs via
    :func:`conductor.fleet.launch.build_typed_launch_inputs` (E9-T2).
-5. Launch, unconditionally detached, with ``skip_gates=False`` (DD11) and
-   an MCP-launched metadata stamp (E9-T3).
+5. Launch, unconditionally detached, with ``skip_gates=False`` (DD11), an
+   MCP-launched metadata stamp (E9-T3), and ``cwd=options.launch_dir`` --
+   the operator-configured execution directory frozen at server startup
+   (issue #544), never a per-invocation value.
 6. Resolve ``_wait_seconds`` (FR5, E9-T4) and either return the run handle
    immediately, or poll -- emitting ``notifications/progress`` when a
    token was supplied (E9-T5) -- until a terminal status, ``at-gate``, or
@@ -42,6 +47,7 @@ does not duplicate it.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -779,6 +785,15 @@ async def invoke_workflow_tool(
         registries_config=registries_config,
         source=entry.source,
     )
+    # `Path(os.path.abspath(...))`, not `.resolve()`: matches this repo's
+    # "normpath, not resolve" convention (`fleet/launch.py::resolve_workflow`,
+    # `_resolve_agent_working_dir`) so a symlinked path stays the alias it
+    # already was, and matters here specifically because the detached child
+    # is about to run with `cwd=options.launch_dir` rather than inheriting
+    # this process's own cwd -- a relative path would resolve against the
+    # *child's* new working directory instead of the one it was actually
+    # resolved against above.
+    workflow_path = Path(os.path.abspath(workflow_path))
     config = load_config(workflow_path)
     inputs = build_typed_launch_inputs(values, config.workflow.input)
 
@@ -794,6 +809,7 @@ async def invoke_workflow_tool(
         skip_gates=_NEVER_SKIP_GATES,
         web_port=0,
         metadata=_mcp_launch_metadata(tool_name),
+        cwd=options.launch_dir,
     )
     tracker.register(launch.run_id)
 

@@ -7,6 +7,7 @@ metadata stamp, gate short-circuiting, progress notifications, and the R3
 from __future__ import annotations
 
 import os
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,7 @@ def _make_fake_launch_background(calls: list[dict[str, Any]]) -> Any:
         skip_gates: bool = False,
         web_port: int = 0,
         metadata: dict[str, str] | None = None,
+        cwd: Path | None = None,
         **_ignored: Any,
     ) -> BackgroundLaunch:
         calls.append(
@@ -112,6 +114,7 @@ def _make_fake_launch_background(calls: list[dict[str, Any]]) -> Any:
                 "skip_gates": skip_gates,
                 "web_port": web_port,
                 "metadata": metadata,
+                "cwd": cwd,
             }
         )
         run_id = f"run{len(calls):05d}"
@@ -203,13 +206,14 @@ class TestAlwaysDetached:
             "conductor.mcp.serve.invoke.derive_run_summary",
             lambda record: _summary(record.run_id, status="completed"),
         )
+        options = ServeOptions()
 
         for wait_seconds in (0, 120):
             content, structured = await invoke_workflow_tool(
                 "review_pr",
                 {"pr_number": 7, "_wait_seconds": wait_seconds},
                 catalogue=catalogue,
-                options=ServeOptions(),
+                options=options,
                 tracker=LaunchTracker(),
                 registries_config=registries_config,
             )
@@ -225,6 +229,9 @@ class TestAlwaysDetached:
                 "conductor_mcp_tool": "review_pr",
             }
             assert call["inputs"] == {"pr_number": 7, "depth": "standard"}
+            # issue #544: every launch, immediate or bounded-wait, carries
+            # the server's frozen launch directory.
+            assert call["cwd"] == options.launch_dir
 
     async def test_result_always_carries_a_dashboard_url(
         self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -713,3 +720,108 @@ class TestLaunchTracker:
 
         assert tracker.live_count() == 1
         assert tracker.launched_run_ids == {"alive001"}
+
+
+# ---------------------------------------------------------------------------
+# issue #544: the frozen `options.launch_dir` reaches every launch
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchDirectoryReachesLaunch:
+    """The server's frozen ``launch_dir`` -- not the process cwd, not a
+    workflow-dir's own directory, and not a caller-supplied input -- is
+    what every launch's ``cwd=`` carries."""
+
+    async def test_relative_workflow_dir_launch_uses_absolute_original_path(
+        self, conductor_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workflow discovered via ``--workflow-dir`` must still reach
+        ``launch_background`` with its absolute *original* YAML path --
+        not one rebased onto the server's (separately configured) launch
+        directory -- while the launch itself still carries that separate
+        directory as its ``cwd``."""
+        catalogue_root = tmp_path / "catalogue"
+        execution_root = tmp_path / "execution"
+        catalogue_root.mkdir()
+        execution_root.mkdir()
+
+        wf_dir = catalogue_root / "workflows"
+        wf_dir.mkdir()
+        (wf_dir / "review-pr.yaml").write_text(_REVIEW_PR_YAML, encoding="utf-8")
+
+        options = ServeOptions(workflow_dirs=(wf_dir,), launch_dir=execution_root)
+        catalogue = build_catalogue(options)
+
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+
+        await invoke_workflow_tool(
+            "review_pr",
+            {"pr_number": 1, "_wait_seconds": 0},
+            catalogue=catalogue,
+            options=options,
+            tracker=LaunchTracker(),
+        )
+
+        assert len(calls) == 1
+        launched_path = calls[0]["workflow_path"]
+        assert launched_path.is_absolute()
+        assert launched_path == Path(os.path.abspath(wf_dir / "review-pr.yaml"))
+        assert calls[0]["cwd"] == execution_root
+
+    async def test_workflow_input_named_like_launch_dir_cannot_override_it(
+        self, conductor_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller-supplied input value -- even one literally named
+        ``cwd`` -- can never reach ``launch_background``'s ``cwd=``: that
+        keyword only ever carries the server's own frozen
+        ``options.launch_dir``, decided at startup and independent of any
+        per-call argument."""
+        cwd_yaml = textwrap.dedent("""\
+            workflow:
+              name: cwd-echo
+              description: Accepts an input literally named cwd.
+              entry_point: worker
+              input:
+                cwd:
+                  type: string
+                  required: true
+            agents:
+              - name: worker
+                prompt: "Echo {{ cwd }}"
+                output:
+                  result:
+                    type: string
+            output:
+              result: "{{ worker.output.result }}"
+            """)
+        entry = write_path_registry(tmp_path, name="official", workflows={"cwd-echo": cwd_yaml})
+        registries_config = RegistriesConfig(registries={"official": entry})
+        attacker_supplied_dir = tmp_path / "attacker-supplied"
+        attacker_supplied_dir.mkdir()
+        options = ServeOptions(launch_dir=tmp_path)
+        catalogue = build_catalogue(options, registries_config=registries_config)
+
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
+        )
+
+        await invoke_workflow_tool(
+            "cwd_echo",
+            {"cwd": str(attacker_supplied_dir), "_wait_seconds": 0},
+            catalogue=catalogue,
+            options=options,
+            tracker=LaunchTracker(),
+            registries_config=registries_config,
+        )
+
+        assert len(calls) == 1
+        # The workflow's own declared `cwd` input travels as an ordinary
+        # input value...
+        assert calls[0]["inputs"] == {"cwd": str(attacker_supplied_dir)}
+        # ...and never as the launch's actual working directory.
+        assert calls[0]["cwd"] == options.launch_dir
+        assert calls[0]["cwd"] != attacker_supplied_dir

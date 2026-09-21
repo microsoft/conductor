@@ -135,6 +135,7 @@ def _make_fake_launch_background(calls: list[dict[str, Any]]) -> Any:
         skip_gates: bool = False,
         web_port: int = 0,
         metadata: dict[str, str] | None = None,
+        cwd: Path | None = None,
         **_ignored: Any,
     ) -> BackgroundLaunch:
         calls.append(
@@ -143,6 +144,7 @@ def _make_fake_launch_background(calls: list[dict[str, Any]]) -> Any:
                 "inputs": inputs,
                 "skip_gates": skip_gates,
                 "metadata": metadata,
+                "cwd": cwd,
             }
         )
         run_id = f"run{len(calls):05d}"
@@ -286,12 +288,13 @@ class TestConductorRunWorkflow:
         monkeypatch.setattr(
             "conductor.mcp.serve.invoke.launch_background", _make_fake_launch_background(calls)
         )
+        options = ServeOptions()
 
         content, structured = await conductor_run_workflow(
             "review_pr",
             {"pr_number": 7},
             catalogue=catalogue,
-            options=ServeOptions(),
+            options=options,
             tracker=LaunchTracker(),
             registries_config=registries_config,
         )
@@ -303,6 +306,9 @@ class TestConductorRunWorkflow:
         assert calls[0]["skip_gates"] is False
         assert calls[0]["inputs"] == {"pr_number": 7}
         assert structured["run_id"] == "run00001"
+        # issue #544: `conductor_run_workflow` uses exactly the same frozen
+        # launch directory a generated tool's own dispatch would.
+        assert calls[0]["cwd"] == options.launch_dir
 
     async def test_wait_seconds_is_forwarded_as_the_reserved_parameter(
         self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -518,6 +524,9 @@ class TestDiscoveryToolsAreCallableOnlyInDiscoveryMode:
 
         assert result.isError is not True
         assert len(calls) == 1
+        # issue #544: the live discovery-dispatch path also carries the
+        # server's frozen launch directory.
+        assert calls[0]["cwd"] == options.launch_dir
 
     @pytest.mark.asyncio
     async def test_a_per_workflow_tool_name_is_not_callable_in_discovery_mode(

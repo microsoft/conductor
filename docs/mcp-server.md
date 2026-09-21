@@ -252,6 +252,70 @@ launch is **rejected** with a message pointing at
 server resets the count — the server owns no execution state of its own,
 so there is nothing else for it to remember.
 
+## Launch Directory
+
+Every launched workflow's detached child runs with a working directory —
+the same `system.cwd` an ordinary `conductor run` reports — and by default
+that directory is **your MCP host's own working directory**, not wherever
+`conductor mcp serve` happens to have been installed. Concretely: if your
+host launches this server as a plugin (Claude Code, VS Code, Cursor — see
+[Host Configuration](#host-configuration)), a launched workflow now runs in
+the repository you're actually working in, rather than the plugin's own
+install directory.
+
+Resolution, decided once at server startup and never re-evaluated per
+call:
+
+1. **`--launch-dir <path>`**, if given — bypasses detection entirely.
+2. **The nearest ancestor process identified as the Copilot host's own
+   cwd** — the server walks its own process ancestry (through any
+   intervening launch wrappers) looking for a `copilot` /
+   `copilot.exe` process, and uses its working directory.
+3. **This server's own startup cwd**, unchanged from prior behavior, when
+   no Copilot host can be identified (e.g. running `conductor mcp serve`
+   directly from a terminal — the ordinary case for local testing).
+
+This is an **immutable startup snapshot**, not a live value: the directory
+is captured once, when `ServeOptions` is constructed, and every workflow
+launched for the rest of that server process's life uses it, however long
+the process runs or however many times the host's own directory changes
+afterward. Restarting the server takes a fresh snapshot. If you need an
+exact historical directory, or a directory specific to one session rather
+than "whatever the host's cwd is right now", pass `--launch-dir`
+explicitly rather than relying on the default.
+
+Detection is **best-effort process inspection, not a security boundary or
+a standardized part of the MCP protocol**. It only ever walks this
+process's own ancestor chain (never enumerates unrelated processes), and
+it can fail to identify a host for reasons outside Conductor's control —
+an unrecognized launch wrapper, process reparenting, restrictive OS
+permissions, or a future Copilot packaging change. When detection cannot
+identify a host cleanly, the server falls back to its own startup cwd,
+the same as before this feature existed; a warning is logged only when the
+walk was actually *interrupted* (e.g. a permission error partway through)
+rather than simply finding no match, since the latter is the ordinary
+case. If a host process *is* identified but its working directory cannot
+be read, the server fails at startup with an actionable message rather
+than silently launching workflows from its own plugin directory.
+
+`--workflow-dir` is unrelated to all of this: it only controls which local
+directory's workflow **files** the catalogue discovers at startup. It has
+no bearing on the directory a launched workflow's child process actually
+runs in.
+
+Example — overriding the default explicitly:
+
+```json
+{
+  "mcpServers": {
+    "conductor": {
+      "command": "conductor",
+      "args": ["mcp", "serve", "--launch-dir", "/home/user/my-repo"]
+    }
+  }
+}
+```
+
 ## Startup Summary
 
 Stdout is the JSON-RPC transport (DD9); nothing may write to it but
@@ -264,12 +328,15 @@ them too:
 ```
 conductor mcp serve: exposing 12 workflow(s) in direct mode (--max-direct-tools=25).
 Toolsets enabled: runs, workflows.
+Launch directory: /home/user/my-repo.
   review_pr <- official/review-pr (pin: a1b2c3d4e5f6)
   summarize_topic <- official/summarize-topic (pin: 9f8e7d6c5b4a)
   ...
 ```
 
-It names, in order: the exposed count and direct-vs-discovery mode; every
+It names, in order: the exposed count and direct-vs-discovery mode; the
+enabled toolsets; the effective launch directory (see
+[Launch Directory](#launch-directory) above); every
 published tool with its source registry and pinned identity; every
 workflow exposed with a degraded schema and why (see
 [the schema resolution ladder](#no-outputschema-dd5) note below);

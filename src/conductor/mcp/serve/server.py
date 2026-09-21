@@ -628,6 +628,11 @@ def log_startup_summary(catalogue: Catalogue, options: ServeOptions) -> None:
     # one channel a stdio server has makes that decision visible the same
     # way the exposed-count/mode line above already is.
     console.print(styled("Toolsets enabled: {}.", ", ".join(sorted(options.toolsets)) or "(none)"))
+    # issue #544: the directory every launched workflow's detached child
+    # runs in -- frozen at startup and never re-resolved, so surfacing it
+    # here is the operator's one chance to notice a wrong default before a
+    # workflow actually launches into it.
+    console.print(styled("Launch directory: {}.", str(options.launch_dir)))
 
     for entry in catalogue.entries:
         console.print(

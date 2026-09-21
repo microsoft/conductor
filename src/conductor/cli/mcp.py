@@ -16,7 +16,7 @@ this module is therefore a lazy import inside a function body.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 
@@ -143,6 +143,19 @@ def serve(
             ),
         ),
     ] = False,
+    launch_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--launch-dir",
+            help=(
+                "Directory a launched workflow's detached process runs in -- its "
+                "execution context, distinct from --workflow-dir's catalogue "
+                "discovery. Default: the Copilot host process's own working "
+                "directory, detected at startup; falls back to this server's own "
+                "startup directory when no host can be identified."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Start an MCP server over stdio, publishing a frozen tool catalogue.
 
@@ -157,21 +170,38 @@ def serve(
         conductor mcp serve
         conductor mcp serve --registry official --allow release-*
         conductor mcp serve --workflow-dir ./workflows --max-direct-tools 10
+        conductor mcp serve --launch-dir /home/user/my-repo
     """
+    from conductor.mcp.serve.launch_dir import LaunchDirectoryError
     from conductor.mcp.serve.options import DEFAULT_TOOLSETS, ServeOptions
 
-    options = ServeOptions(
-        registries=tuple(registry) if registry is not None else None,
-        workflow_dirs=tuple(workflow_dir) if workflow_dir else (),
-        allow=tuple(allow) if allow else (),
-        deny=tuple(deny) if deny else (),
-        toolsets=tuple(toolsets) if toolsets else DEFAULT_TOOLSETS,
-        max_direct_tools=max_direct_tools,
-        max_wait_seconds=max_wait_seconds,
-        tool_prefix=tool_prefix,
-        max_concurrent_runs=max_concurrent_runs,
-        introspect_full=introspect_full,
-    )
+    options_kwargs: dict[str, Any] = {
+        "registries": tuple(registry) if registry is not None else None,
+        "workflow_dirs": tuple(workflow_dir) if workflow_dir else (),
+        "allow": tuple(allow) if allow else (),
+        "deny": tuple(deny) if deny else (),
+        "toolsets": tuple(toolsets) if toolsets else DEFAULT_TOOLSETS,
+        "max_direct_tools": max_direct_tools,
+        "max_wait_seconds": max_wait_seconds,
+        "tool_prefix": tool_prefix,
+        "max_concurrent_runs": max_concurrent_runs,
+        "introspect_full": introspect_full,
+    }
+    # Only pass `launch_dir` when the operator supplied `--launch-dir`
+    # explicitly -- omitting the key lets `ServeOptions`' own default
+    # factory detect the Copilot host's cwd instead.
+    if launch_dir is not None:
+        options_kwargs["launch_dir"] = launch_dir
+
+    try:
+        options = ServeOptions(**options_kwargs)
+    except LaunchDirectoryError as exc:
+        # A markup-safe, stderr-only, nonzero-exit failure *before* the
+        # catalogue is built or stdio is opened -- an invalid launch
+        # directory is a startup-configuration error, not a per-tool one.
+        console.print(styled("[bold red]Error:[/bold red] {}", exc))
+        raise typer.Exit(code=1) from None
+
     _serve_impl(options)
 
 

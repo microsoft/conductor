@@ -65,6 +65,12 @@ dependencies = [
     # Timeout-bounded regex matching for output field constraints and provider
     # response normalization. Ships typed stubs and supports per-match deadlines.
     "regex>=2024.11.6",
+    # Portable process inspection for `conductor mcp serve`'s Copilot-host
+    # cwd detection (`mcp/serve/launch_dir.py`, issue #544). A native
+    # dependency, but it avoids maintaining separate Linux, macOS, and
+    # Windows process-ancestry implementations; only `mcp serve` startup
+    # actually imports it (`cli/mcp.py`'s lazy-import boundary).
+    "psutil>=6.0.0",
 ]
 
 [project.optional-dependencies]

@@ -1230,10 +1230,22 @@ no console of its own and hosts surface stderr in their own MCP logs.
 | `--tool-prefix` | none | Optional prefix prepended to every generated workflow tool name. |
 | `--max-concurrent-runs` | `0` (unbounded) | Bound how many runs launched by *this server process* may be live at once. Over the cap, a launch is rejected with an instructive message, never queued. Restarting the server resets the count. |
 | `--introspect-full` | `False` | Restore full tool-call arguments and results on `conductor_run_events` instead of the default `{name, status, byte_size}` reduction. Has no effect unless the `introspect` toolset is also enabled. |
+| `--launch-dir` | detected (see below) | Directory a launched workflow's detached child process runs in — its execution context, distinct from `--workflow-dir`'s catalogue discovery. A relative path resolves against the server's own invocation directory, the same as any other CLI path argument. |
+
+`--launch-dir`'s default, when omitted, is resolved once at startup and
+never re-evaluated afterward: the nearest ancestor process identified as
+the Copilot host's own working directory, falling back to this server's
+own startup cwd when no host can be identified. See
+[Launch Directory](mcp-server.md#launch-directory) in the MCP Server guide
+for the full precedence, the Copilot-plugin motivation, and detection's
+limitations. An invalid `--launch-dir` (missing, not a directory, or
+unreadable) fails the server at startup, before the catalogue is built or
+stdio is opened.
 
 ### Environment
 
-The server itself reads no MCP-specific environment variables. It inherits
+The server itself reads no MCP-specific environment variables — there is
+no environment-variable equivalent to `--launch-dir`. It inherits
 the **full process environment** it was started with (provider
 credentials such as `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`, `CONDUCTOR_HOME`,
 `CONDUCTOR_LOG_LEVEL`, etc.) and passes that same environment through to
@@ -1259,6 +1271,9 @@ conductor mcp serve --toolsets workflows --toolsets runs --toolsets introspect -
 
 # Prefix generated tool names and bound concurrent launches
 conductor mcp serve --tool-prefix conductor_ --max-concurrent-runs 5
+
+# Override the detected execution directory explicitly
+conductor mcp serve --launch-dir /home/user/my-repo
 ```
 
 ## Deprecated command aliases

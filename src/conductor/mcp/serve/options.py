@@ -21,6 +21,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from conductor.mcp.serve.launch_dir import (
+    normalize_launch_dir,
+    resolve_launch_dir,
+    validate_launch_dir,
+)
+
 # Toolsets on by default (design's Key Components -> 5. Toolsets table):
 # every generated workflow tool, plus the four run-lifecycle tools.
 # `introspect` and `diagnose` are off by default (DD3); `discovery` is not
@@ -91,6 +97,16 @@ class ServeOptions:
         introspect_full: Restores full tool-call arguments/results on
             ``conductor_run_events`` instead of the default
             ``{name, status, byte_size}`` reduction (R4).
+        launch_dir: The directory a launched workflow's detached child
+            process runs in (issue #544). Resolved once, at construction,
+            via :func:`conductor.mcp.serve.launch_dir.resolve_launch_dir`
+            -- an operator-supplied ``--launch-dir`` override, else the
+            nearest Copilot-host ancestor's cwd, else this server's own
+            startup cwd. Never re-resolved afterward: a restart takes a
+            new snapshot, but nothing during the connection's lifetime
+            changes it. Distinct from ``workflow_dirs``, which only
+            controls catalogue *discovery* -- this field is the execution
+            context every launched run's ``system.cwd`` reflects.
     """
 
     registries: tuple[str, ...] | None = None
@@ -103,14 +119,23 @@ class ServeOptions:
     tool_prefix: str | None = None
     max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS
     introspect_full: bool = False
+    launch_dir: Path = field(default_factory=lambda: resolve_launch_dir(None))
 
     def __post_init__(self) -> None:
-        """Validate ``toolsets`` once, at construction (E11-T1, DD3).
+        """Validate ``toolsets`` and ``launch_dir`` once, at construction.
 
-        An unrecognized toolset name fails the server at startup rather
-        than being silently ignored for the connection's whole lifetime --
-        the same "decided once, never per request" property DD3 requires
-        of the tool list itself.
+        An unrecognized toolset name, or an invalid ``launch_dir``, fails
+        the server at startup rather than being silently ignored (or
+        discovered only once a launch is attempted) for the connection's
+        whole lifetime -- the same "decided once, never per request"
+        property DD3 requires of the tool list itself.
+
+        ``launch_dir`` is routed through the shared
+        :func:`~conductor.mcp.serve.launch_dir.validate_launch_dir` helper
+        regardless of whether it arrived via the default factory (a
+        detected directory) or an explicit constructor argument (an
+        operator's ``--launch-dir``) -- both receive the exact same
+        validation, exactly once.
         """
         unknown = sorted(set(self.toolsets) - set(ALL_TOOLSETS))
         if unknown:
@@ -118,6 +143,10 @@ class ServeOptions:
                 f"Unknown toolset(s): {', '.join(unknown)}. Recognized toolsets: "
                 f"{', '.join(ALL_TOOLSETS)}."
             )
+
+        normalized = normalize_launch_dir(self.launch_dir)
+        validate_launch_dir(normalized)
+        object.__setattr__(self, "launch_dir", normalized)
 
 
 def is_toolset_enabled(options: ServeOptions, name: str) -> bool:

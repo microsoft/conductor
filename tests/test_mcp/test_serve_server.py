@@ -105,6 +105,7 @@ def _make_fake_launch_background(calls: list[dict[str, Any]]) -> Any:
         skip_gates: bool = False,
         web_port: int = 0,
         metadata: dict[str, str] | None = None,
+        cwd: Path | None = None,
         **_ignored: Any,
     ) -> BackgroundLaunch:
         calls.append(
@@ -113,6 +114,7 @@ def _make_fake_launch_background(calls: list[dict[str, Any]]) -> Any:
                 "inputs": inputs,
                 "skip_gates": skip_gates,
                 "metadata": metadata,
+                "cwd": cwd,
             }
         )
         run_id = f"run{len(calls):05d}"
@@ -229,6 +231,59 @@ class TestServerToolsList:
             result = await client.initialize()
 
         assert result.serverInfo.version == __version__
+
+    @pytest.mark.asyncio
+    async def test_tool_schemas_are_identical_under_different_launch_directories(
+        self, tmp_path: Path
+    ) -> None:
+        """issue #544: `--launch-dir` is an execution-context setting, not a
+        tool parameter -- a fixture with no authored directory inputs must
+        publish byte-identical schemas whatever the server's launch
+        directory is, in both direct and discovery mode, and neither mode
+        gains a launch-directory parameter."""
+        catalogue = _two_tool_catalogue(tmp_path)
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        server_a = build_server(catalogue, ServeOptions(launch_dir=dir_a))
+        server_b = build_server(catalogue, ServeOptions(launch_dir=dir_b))
+
+        async with create_connected_server_and_client_session(server_a) as client_a:
+            tools_a = await client_a.list_tools()
+        async with create_connected_server_and_client_session(server_b) as client_b:
+            tools_b = await client_b.list_tools()
+
+        assert tools_a.tools == tools_b.tools
+        for tool in tools_a.tools:
+            properties = (tool.inputSchema or {}).get("properties", {})
+            assert "launch_dir" not in properties
+            assert "cwd" not in properties
+
+    @pytest.mark.asyncio
+    async def test_discovery_tools_carry_no_launch_directory_parameter(
+        self, tmp_path: Path
+    ) -> None:
+        """Same guarantee as above, for the two static discovery tools."""
+        entry = write_path_registry(
+            tmp_path,
+            name="official",
+            workflows={"review-pr": _REVIEW_PR_YAML, "deploy": _DEPLOY_YAML},
+        )
+        config = RegistriesConfig(registries={"official": entry})
+        options = ServeOptions(max_direct_tools=1)
+        catalogue = build_catalogue(options, registries_config=config, allow_network=False)
+        assert catalogue.mode == "discovery"
+        server = build_server(catalogue, options)
+
+        async with create_connected_server_and_client_session(server) as client:
+            result = await client.list_tools()
+
+        for tool in result.tools:
+            properties = (tool.inputSchema or {}).get("properties", {})
+            assert "launch_dir" not in properties
+            assert "cwd" not in properties
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +411,21 @@ class TestStartupSummary:
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "0" in captured.err
+
+    def test_reports_the_effective_launch_directory(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """issue #544: the startup summary is the operator's one chance to
+        notice a wrong launch directory before a workflow launches into
+        it."""
+        catalogue = _two_tool_catalogue(tmp_path)
+        options = ServeOptions(launch_dir=tmp_path)
+
+        log_startup_summary(catalogue, options)
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert str(tmp_path) in captured.err
 
 
 # ---------------------------------------------------------------------------
