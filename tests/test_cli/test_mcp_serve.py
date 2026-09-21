@@ -228,6 +228,7 @@ class TestServeStdoutIsProtocolPure:
     ) -> None:
         monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor_home"))
         monkeypatch.setattr("conductor.mcp.serve.server.stdio_server", _fake_stdio_server)
+        monkeypatch.setattr("conductor.mcp.serve.server.console.width", 20)
 
         workflow_dir = tmp_path / "workflows"
         workflow_dir.mkdir()
@@ -259,6 +260,7 @@ class TestServeLaunchDirValidation:
     def test_nonexistent_directory_fails_before_catalogue_is_built(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(mcp_module.console, "width", 20)
         catalogue_built = False
 
         def _boom(*args: object, **kwargs: object) -> None:
@@ -278,7 +280,10 @@ class TestServeLaunchDirValidation:
         assert "--launch-dir" in result.stderr
         assert result.stdout == ""
 
-    def test_a_file_as_launch_dir_is_rejected_naming_the_remedy(self, tmp_path: Path) -> None:
+    def test_a_file_as_launch_dir_is_rejected_naming_the_remedy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_module.console, "width", 20)
         file_path = tmp_path / "not-a-dir.txt"
         file_path.write_text("hello", encoding="utf-8")
 

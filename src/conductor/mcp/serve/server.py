@@ -632,7 +632,7 @@ def log_startup_summary(catalogue: Catalogue, options: ServeOptions) -> None:
     # runs in -- frozen at startup and never re-resolved, so surfacing it
     # here is the operator's one chance to notice a wrong default before a
     # workflow actually launches into it.
-    console.print(styled("Launch directory: {}.", str(options.launch_dir)))
+    console.print(styled("Launch directory: {}.", str(options.launch_dir)), soft_wrap=True)
 
     for entry in catalogue.entries:
         console.print(

@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
+import conductor.mcp.serve.server as server_module
 from conductor import __version__
 from conductor.cli.bg_runner import BackgroundLaunch
 from conductor.fleet.records import RunRecord, write_run_record
@@ -413,13 +414,17 @@ class TestStartupSummary:
         assert "0" in captured.err
 
     def test_reports_the_effective_launch_directory(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """issue #544: the startup summary is the operator's one chance to
         notice a wrong launch directory before a workflow launches into
         it."""
         catalogue = _two_tool_catalogue(tmp_path)
         options = ServeOptions(launch_dir=tmp_path)
+        monkeypatch.setattr(server_module.console, "width", 20)
 
         log_startup_summary(catalogue, options)
 

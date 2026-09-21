@@ -199,7 +199,7 @@ def serve(
         # A markup-safe, stderr-only, nonzero-exit failure *before* the
         # catalogue is built or stdio is opened -- an invalid launch
         # directory is a startup-configuration error, not a per-tool one.
-        console.print(styled("[bold red]Error:[/bold red] {}", exc))
+        console.print(styled("[bold red]Error:[/bold red] {}", exc), soft_wrap=True)
         raise typer.Exit(code=1) from None
 
     _serve_impl(options)
