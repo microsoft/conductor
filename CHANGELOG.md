@@ -11,7 +11,121 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.38] - 2026-09-21
 
+### Added
+
+- **Opt-in OpenTelemetry tracing for workflow execution** — setting
+  `OTEL_EXPORTER_OTLP_ENDPOINT` now exports one trace tree spanning workflows,
+  agents, parallel and for-each groups, deterministic steps, gates, model
+  calls, and tool executions. Conductor integrates native Pydantic AI spans
+  for the `claude` and `openai` providers and native Copilot CLI spans over
+  OTLP HTTP, while preserving any tracer provider installed by a host
+  application. See [`docs/telemetry.md`](docs/telemetry.md) and
+  [`examples/telemetry.yaml`](examples/telemetry.yaml). (#482)
+- **Direct MCP workflow steps (`type: mcp`)**: calls a tool on a
+  configured `runtime.mcp_servers` stdio server directly without an LLM.
+  Arguments are rendered recursively with Jinja2 and auto-coerced to
+  JSON-native types; the result envelope (`content`, `structured`, `is_error`)
+  merges structured keys directly onto the output dict so routes and downstream
+  steps can branch on `output.is_error` or individual fields. Calls serialize
+  per server process to maintain stdio stream integrity while distinct servers
+  execute concurrently in parallel groups. Output text payload is bounded by
+  `runtime.tool_output` with spill-to-file support while structured data is
+  preserved intact. Step and result values are excluded from all lifecycle
+  events (`mcp_started`, `mcp_completed`, `mcp_failed`), with failure messages
+  redacted to a safe category and full exception traces written only to a
+  private per-run `*.mcp-diagnostics.log` file (named by the redacted
+  message). See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#mcp-steps) and
+  [`examples/mcp-step.yaml`](examples/mcp-step.yaml). (#392)
+- **GitHub registries now fetch a workflow's nested assets recursively** —
+  previously the cache layer only fetched a workflow's YAML plus its
+  immediate siblings, so a `prompt: !file prompts/plan.md` or a script step
+  reading a nested `scripts/`/`data/` file one or more directories below the
+  workflow YAML silently failed to resolve once cached. `conductor.registry
+  .github.list_files_recursive` walks the workflow's containing directory
+  via the Git Trees API (an explicit stack of non-recursive tree requests,
+  never a single `recursive=1` call and never the Contents API's 1,000-entry
+  cap), downloading every regular file at its original repository-relative
+  path; symlinks and submodules are excluded and logged, never followed.
+  Acquisition is strictly all-or-nothing: a failure listing any
+  subdirectory, downloading any regular file — including one the workflow
+  itself never references — or promoting a staged file into the shared SHA
+  cache aborts the whole fetch with a contextual error naming the failing
+  path, rather than silently completing a partial cache. A root-level
+  workflow's containing directory is the whole repository, so give a
+  workflow its own directory to keep fetches scoped. The on-disk cache
+  layout version is bumped, and per-workflow readiness markers now carry
+  that version rather than being an empty presence-only marker, so an
+  existing cache automatically and transparently refetches under the new
+  recursive contract the next time it's needed online; an offline-only
+  caller against a stale cache still gets the existing actionable
+  cache-miss error. Path registries are unaffected — they already read the
+  source tree directly. (#530)
+- **OpenTelemetry spans for direct MCP workflow steps**: each `type: mcp`
+  execution is exported as an `execute_tool` span under its workflow, parallel
+  group, or for-each item. Spans include bounded server, tool, result-size, and
+  truncation metadata without recording arguments, result contents, or spill
+  paths, and preserve routed tool errors, execution failures, and interrupted
+  attempts as distinct outcomes. (#482)
+
+### Fixed
+
+- **`conductor run --dry-run` no longer crashes on legacy stdout encodings
+  because of its own decorative glyphs** — the execution-plan renderer
+  hardcoded the `→` route arrow and `⚡` parallel-group marker, so a Windows
+  console using `cp1252` (or any other stream that cannot encode them) died
+  mid-render instead of printing the plan. `display_execution_plan` now
+  resolves both glyphs once against its actual output console, via a shared
+  `conductor.console.select_console_glyph` helper, and falls back to `->`/`*`
+  when the stream cannot represent the Unicode originals — matching the
+  fallback `conductor doctor` already used for its own status glyphs. This
+  covers only those two Conductor-authored decorations; workflow-provided
+  text (agent names, prompts, etc.) is rendered unchanged and must still be
+  encodable to the target stream. (#505)
+- **Summarizing context compaction no longer degrades on long agent runs** —
+  the nested summarization call now inherits the run's `usage_limits` instead
+  of falling back to Pydantic AI's default `request_limit=50`. With
+  pydantic-ai-harness 0.24.0 the summarizer shared the parent run's usage but
+  not its limits, so an agent configured with `max_agent_iterations` above 50
+  was refused a summary once it had made 50 requests — the tier silently
+  degraded to the sliding-window fallback exactly when a long run needed real
+  summarization, and the under-compacted history could then exceed the
+  model's context window and fail the run with an HTTP 400. The summary call
+  still consumes one shared request slot, so a genuinely exhausted budget
+  still refuses it. (#531)
+- **`conductor mcp serve` now launches workflows from the Copilot host's
+  working directory, not the server's own installation directory** — a
+  workflow invoked through a generated MCP tool used to run with whatever
+  cwd the server process itself inherited (typically wherever the Copilot
+  plugin was installed), regardless of the repository the operator was
+  actually working in. The server now detects the Copilot host process's
+  own cwd at startup (walking its own process ancestry, through any
+  intervening launch wrappers) and launches every workflow for that
+  process's lifetime in that directory instead. This is a fixed startup
+  snapshot, not a live value: it is captured once and never re-resolved,
+  even across a long-running connection. A new `--launch-dir <path>` flag
+  overrides detection entirely, for an exact historical directory, a
+  session-specific one, or when no Copilot host can be identified. (#544)
+- **MCP launch-directory output remains copyable on narrow terminals**:
+  startup summaries and validation errors no longer insert line breaks inside
+  long paths. (#548)
+- **Nested human gates now work in background workflows** — child workflow
+  engines inherit the parent process's background mode, so a `human_gate`
+  inside a `type: workflow` step waits on the web dashboard instead of trying
+  to prompt unavailable stdin and failing with `EOFError`. (#525)
+- **Pydantic AI structured-output agents explicitly require `final_result`** —
+  the generated output tool now tells models that they must call it before
+  finishing and that plain-text responses are not accepted. This improves
+  adherence for local models behind OpenAI- or Anthropic-compatible endpoints
+  without replacing tool-based output, weakening schema validation, or
+  changing authored system prompts. (#524)
+- **Resumed Copilot sessions preserve custom provider routing** — workflows
+  using `runtime.provider` settings such as `base_url`, `api_key`, `type`, or
+  `wire_api` now apply the same routing to `resume_session` as to a newly
+  created session, instead of silently falling back to the default Copilot
+  endpoint after resume. (#534)
 - **Terminal left in cbreak mode (no echo/ICANON) after a run exited** — a
   `KeyboardListener` started while the terminal was already in cbreak mode
   (after an Esc pause/resume cycle, or a second listener in the same process)
@@ -36,6 +150,32 @@ and compiled into this file at release time.
   late-cleanup window restores the process baseline before terminating.
   ([#290](https://github.com/microsoft/conductor/issues/290))
 
+### Changed
+
+- **Step definitions split into concrete models with a discriminated union** —
+  the single monolithic `AgentDef` that carried every step type's
+  fields is now a set of focused Pydantic models: `AgentDef` (provider-backed
+  LLM agents only), `HumanGateStepDef`, `QuestionsStepDef`, `ScriptStepDef`,
+  `MCPStepDef`, `WaitStepDef`, `SetStepDef`, `TerminateStepDef`, and
+  `WorkflowStepDef`, united by the static `StepDef` union discriminated on
+  `type`. Every model owns exactly the fields meaningful for its kind with
+  `extra="forbid"`, so a misplaced field is rejected next to its step instead
+  of being silently ignored, and the published JSON Schema now exposes a
+  `oneOf` + `discriminator` mapping with per-variant
+  `additionalProperties: false` for editors and tooling. Compatibility:
+  workflow YAML is unchanged — an omitted `type` or an explicit `type: null`
+  still loads as an LLM agent (now canonicalized to `type: "agent"` at parse
+  time) — and `AgentDef(...)` keeps working for LLM agents, including
+  `AgentDef(type=None, ...)`. What changed: constructing a non-LLM step
+  programmatically via `AgentDef(type="script", ...)` no longer works — use
+  the named step class (e.g. `ScriptStepDef(...)`) — and a field that belongs
+  to a different step type now fails with Pydantic's standard
+  `extra_forbidden` error rather than the previous custom
+  `"<type> agents cannot have '<field>'"` messages. Human gates additionally
+  lost the inert `model` field and can no longer appear as a `for_each`
+  inline agent (concurrent iterations would compete for one interactive
+  channel; route to a gate from the group's `routes:` instead). All classes
+  are exported from `conductor.config` and `conductor.config.schema`. (#517)
 ## [0.1.37](https://github.com/microsoft/conductor/compare/v0.1.36...v0.1.37) - 2026-09-09
 
 ### Added
