@@ -195,6 +195,15 @@ class TestGetPricing:
         assert pricing.input_per_mtok == input_per_mtok
         assert pricing.output_per_mtok == output_per_mtok
 
+    def test_astra_pricing(self) -> None:
+        """Astra's static fallback matches the provider-published rates."""
+        assert get_pricing("gpt-6-astra") == ModelPricing(
+            input_per_mtok=10.00,
+            output_per_mtok=50.00,
+            cache_read_per_mtok=1.00,
+            cache_write_per_mtok=12.50,
+        )
+
 
 class TestGpt56Pricing:
     """Tests for the GPT-5.6 pricing entries added in #386."""
@@ -538,21 +547,15 @@ class TestPricingIntegration:
             assert cost is not None, f"Failed to calculate cost for {model_name}"
             assert cost >= 0, f"Negative cost for {model_name}"
 
-    def test_cache_pricing_only_for_claude_models(self) -> None:
-        """Test that cache pricing is only set for Claude models.
+    def test_cache_pricing_rates_are_nonnegative(self) -> None:
+        """Test that published cache rates are valid.
 
         A ``0.0`` cache rate is not "free" — ``calculate_cost`` reads it as
         "no published rate" and leaves those tokens in the input bucket.
         """
-        for model_name, pricing in DEFAULT_PRICING.items():
-            if model_name.startswith("claude"):
-                # Claude models should have cache pricing
-                assert pricing.cache_read_per_mtok >= 0
-                assert pricing.cache_write_per_mtok >= 0
-            elif model_name.startswith("gpt"):
-                # GPT models don't have cache pricing
-                assert pricing.cache_read_per_mtok == 0
-                assert pricing.cache_write_per_mtok == 0
+        for pricing in DEFAULT_PRICING.values():
+            assert pricing.cache_read_per_mtok >= 0
+            assert pricing.cache_write_per_mtok >= 0
 
     @pytest.mark.parametrize(
         "spellings",

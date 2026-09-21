@@ -126,6 +126,12 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gpt-5.6-sol": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.6-terra": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
     "gpt-5.6-luna": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    "gpt-6-astra": ModelPricing(
+        input_per_mtok=10.00,
+        output_per_mtok=50.00,
+        cache_read_per_mtok=1.00,
+        cache_write_per_mtok=12.50,
+    ),
     # O-series
     "o1": ModelPricing(input_per_mtok=15.00, output_per_mtok=60.00),
     "o1-mini": ModelPricing(input_per_mtok=3.00, output_per_mtok=12.00),
