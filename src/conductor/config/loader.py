@@ -187,18 +187,13 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                 sub_yaml = YAML()
                 sub_yaml.Constructor = type(self)
                 try:
-                    parsed = sub_yaml.load(content)
+                    return sub_yaml.load(content)
                 except YAMLError as e:
                     raise ConfigurationError(
                         f"'{file_path}' is not valid YAML: {e}",
                         suggestion="Use !file instead of !yamlfile if this file is meant "
                         "to be loaded as plain text.",
                     ) from e
-                if isinstance(parsed, (dict, list)):
-                    return parsed
-                # A scalar YAML document (plain string/number/bool/None): return
-                # the raw content as text, same as !file would.
-                return FileString(content, source_path=file_path)
             finally:
                 cls._base_dir = saved_base_dir
                 cls._file_stack.pop()

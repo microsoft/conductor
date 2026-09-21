@@ -128,6 +128,27 @@ agents:
         assert isinstance(result, dict)
         assert any("Summarize the changelog" in k for k in result)
 
+    def test_yamlfile_tag_parses_scalar_documents(self) -> None:
+        """!yamlfile parses a scalar document instead of returning it as text.
+
+        jrob5756's blocking review comment: !yamlfile only honored its
+        "always parse as YAML" contract for mappings and sequences, so a bare
+        true/42/quoted string came back as the raw file text instead of the
+        parsed bool/int/str.
+        """
+        loader = ConfigLoader()
+        loader._constructor_cls._base_dir = FIXTURES_DIR
+        loader._constructor_cls._file_stack = []
+
+        bool_result = loader._yaml.load("!yamlfile scalar_bool.yaml")
+        number_result = loader._yaml.load("!yamlfile scalar_number.yaml")
+
+        loader._constructor_cls._base_dir = Path(".")
+        loader._constructor_cls._file_stack = []
+
+        assert bool_result is True
+        assert number_result == 42
+
     def test_yamlfile_missing_file_raises_configuration_error(self) -> None:
         """!yamlfile shares !file's missing-file error handling."""
         loader = ConfigLoader()
