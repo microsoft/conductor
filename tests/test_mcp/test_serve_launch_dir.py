@@ -84,7 +84,7 @@ class TestScanForCopilotAncestor:
         host_cwd = Path("/host/project")
         _mock_ancestry(
             monkeypatch,
-            {_SELF_PID: _ProcessInfo(pid=2, name="copilot", cwd=host_cwd)},
+            {_SELF_PID: _ProcessInfo(pid=2, name="copilot", exe_basename="copilot", cwd=host_cwd)},
         )
 
         scan = _scan_for_copilot_ancestor(_SELF_PID)
@@ -95,12 +95,38 @@ class TestScanForCopilotAncestor:
         host_cwd = Path("C:/Users/dev/project")
         _mock_ancestry(
             monkeypatch,
-            {_SELF_PID: _ProcessInfo(pid=2, name="copilot.exe", cwd=host_cwd)},
+            {
+                _SELF_PID: _ProcessInfo(
+                    pid=2, name="copilot.exe", exe_basename="copilot.exe", cwd=host_cwd
+                )
+            },
         )
 
         scan = _scan_for_copilot_ancestor(_SELF_PID)
 
         assert scan.cwd == host_cwd
+
+    def test_process_name_differing_from_executable_basename_is_still_recognized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real Copilot ancestor reported a `psutil` process ``name()``
+        of ``MainThread`` while its executable basename remained
+        ``copilot`` -- detection must match on the executable, not the
+        process-manager-reported name, or it misses the host entirely
+        (issue #544 P1)."""
+        host_cwd = Path("/host/project")
+        _mock_ancestry(
+            monkeypatch,
+            {
+                _SELF_PID: _ProcessInfo(
+                    pid=2, name="MainThread", exe_basename="copilot", cwd=host_cwd
+                )
+            },
+        )
+
+        scan = _scan_for_copilot_ancestor(_SELF_PID)
+
+        assert scan == _AncestorScan(cwd=host_cwd, limited=False)
 
     def test_walks_through_an_intervening_launch_wrapper(
         self, monkeypatch: pytest.MonkeyPatch
@@ -112,8 +138,10 @@ class TestScanForCopilotAncestor:
         _mock_ancestry(
             monkeypatch,
             {
-                _SELF_PID: _ProcessInfo(pid=2, name="node", cwd=Path("/npm/wrapper/dir")),
-                2: _ProcessInfo(pid=3, name="copilot", cwd=host_cwd),
+                _SELF_PID: _ProcessInfo(
+                    pid=2, name="node", exe_basename="node", cwd=Path("/npm/wrapper/dir")
+                ),
+                2: _ProcessInfo(pid=3, name="copilot", exe_basename="copilot", cwd=host_cwd),
             },
         )
 
@@ -131,8 +159,10 @@ class TestScanForCopilotAncestor:
         _mock_ancestry(
             monkeypatch,
             {
-                _SELF_PID: _ProcessInfo(pid=2, name="copilot", cwd=nearer_cwd),
-                2: _ProcessInfo(pid=3, name="copilot", cwd=further_cwd),
+                _SELF_PID: _ProcessInfo(
+                    pid=2, name="copilot", exe_basename="copilot", cwd=nearer_cwd
+                ),
+                2: _ProcessInfo(pid=3, name="copilot", exe_basename="copilot", cwd=further_cwd),
             },
         )
 
@@ -150,8 +180,15 @@ class TestScanForCopilotAncestor:
         _mock_ancestry(
             monkeypatch,
             {
-                _SELF_PID: _ProcessInfo(pid=2, name="my-copilot-wrapper", cwd=Path("/wrapper")),
-                2: _ProcessInfo(pid=3, name="copilot-clone", cwd=Path("/clone")),
+                _SELF_PID: _ProcessInfo(
+                    pid=2,
+                    name="my-copilot-wrapper",
+                    exe_basename="my-copilot-wrapper",
+                    cwd=Path("/wrapper"),
+                ),
+                2: _ProcessInfo(
+                    pid=3, name="copilot-clone", exe_basename="copilot-clone", cwd=Path("/clone")
+                ),
             },
         )
 
@@ -166,8 +203,12 @@ class TestScanForCopilotAncestor:
         _mock_ancestry(
             monkeypatch,
             {
-                _SELF_PID: _ProcessInfo(pid=2, name="wrapper", cwd=Path("/a")),
-                2: _ProcessInfo(pid=_SELF_PID, name="wrapper", cwd=Path("/b")),  # cycle
+                _SELF_PID: _ProcessInfo(
+                    pid=2, name="wrapper", exe_basename="wrapper", cwd=Path("/a")
+                ),
+                2: _ProcessInfo(
+                    pid=_SELF_PID, name="wrapper", exe_basename="wrapper", cwd=Path("/b")
+                ),  # cycle
             },
         )
 
@@ -183,7 +224,9 @@ class TestScanForCopilotAncestor:
         ancestor could still be further up) -- not an ordinary miss."""
 
         def _ever_deeper(pid: int) -> _ProcessInfo | None:
-            return _ProcessInfo(pid=pid + 1, name="wrapper", cwd=Path(f"/level{pid}"))
+            return _ProcessInfo(
+                pid=pid + 1, name="wrapper", exe_basename="wrapper", cwd=Path(f"/level{pid}")
+            )
 
         monkeypatch.setattr(launch_dir_module, "_parent_process_info", _ever_deeper)
 
@@ -221,7 +264,7 @@ class TestScanForCopilotAncestor:
         error."""
         _mock_ancestry(
             monkeypatch,
-            {_SELF_PID: _ProcessInfo(pid=2, name="copilot", cwd=None)},
+            {_SELF_PID: _ProcessInfo(pid=2, name="copilot", exe_basename="copilot", cwd=None)},
         )
 
         with pytest.raises(LaunchDirectoryError, match="working directory"):
@@ -242,7 +285,10 @@ class TestDetectCopilotAncestorCwd:
 
     def test_returns_the_detected_cwd(self, monkeypatch: pytest.MonkeyPatch) -> None:
         host_cwd = Path("/host/project")
-        _mock_ancestry(monkeypatch, {_SELF_PID: _ProcessInfo(pid=2, name="copilot", cwd=host_cwd)})
+        _mock_ancestry(
+            monkeypatch,
+            {_SELF_PID: _ProcessInfo(pid=2, name="copilot", exe_basename="copilot", cwd=host_cwd)},
+        )
 
         assert detect_copilot_ancestor_cwd(_SELF_PID) == host_cwd
 
@@ -294,7 +340,10 @@ class TestResolveLaunchDirPrecedence:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         host_cwd = Path("/host/project")
-        _mock_ancestry(monkeypatch, {_SELF_PID: _ProcessInfo(pid=2, name="copilot", cwd=host_cwd)})
+        _mock_ancestry(
+            monkeypatch,
+            {_SELF_PID: _ProcessInfo(pid=2, name="copilot", exe_basename="copilot", cwd=host_cwd)},
+        )
         monkeypatch.setattr(launch_dir_module, "detect_copilot_ancestor_cwd", lambda: host_cwd)
 
         result = resolve_launch_dir(None)

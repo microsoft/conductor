@@ -28,9 +28,14 @@ here enumerates unrelated processes on the machine.
 
 Current Copilot npm packages launch a native executable named exactly
 ``copilot`` (POSIX) or ``copilot.exe`` (Windows) -- see
-:data:`_COPILOT_PROCESS_NAMES`. Detection matches on that executable name
-precisely; it does not search command-line arguments for the substring
-"copilot", which could also match an unrelated tool.
+:data:`_COPILOT_EXECUTABLE_BASENAMES`. Detection matches on the basename
+of ``psutil.Process.exe()`` -- the actual executable on disk -- rather
+than ``Process.name()``, which is process-manager-reported and need not
+match the executable at all: a real Copilot host process has been
+observed reporting a ``name()`` of ``MainThread`` while its ``exe()``
+remained ``.../copilot``. Matching by executable basename also means
+detection does not search command-line arguments for the substring
+"copilot", which could match an unrelated tool.
 
 Nothing here ever calls ``os.chdir()``. The resolved directory only ever
 reaches :func:`conductor.cli.bg_runner.launch_background`'s ``cwd``
@@ -52,11 +57,13 @@ from conductor.exceptions import ConductorError
 logger = logging.getLogger(__name__)
 
 # Current Copilot npm packages (`@github/copilot`) launch a native
-# executable under exactly one of these names. Matching the executable
-# name precisely -- rather than scanning `cmdline()` for a substring --
-# means an unrelated process that merely mentions "copilot" somewhere in
-# its arguments is never mistaken for the host.
-_COPILOT_PROCESS_NAMES = frozenset({"copilot", "copilot.exe"})
+# executable under exactly one of these basenames. Matched against
+# `psutil.Process.exe()` -- the actual executable path -- never against
+# `Process.name()`, which is process-manager-reported and has been
+# observed to diverge from the executable (a real Copilot host reporting
+# `name() == "MainThread"`). Compared case-folded so a Windows path's
+# casing (e.g. `Copilot.EXE`) still matches.
+_COPILOT_EXECUTABLE_BASENAMES = frozenset({"copilot", "copilot.exe"})
 
 # Bounds the ancestor walk exactly like `cli/self_run.py::_MAX_ANCESTRY_HOPS`
 # -- a malformed or cyclic parent chain must terminate rather than loop
@@ -86,6 +93,12 @@ class _ProcessInfo:
 
     pid: int
     name: str
+    exe_basename: str | None
+    """The case-folded basename of the process's executable
+    (``psutil.Process.exe()``), or ``None`` when that could not be read
+    (e.g. an OS permission error scoped to that one attribute). This --
+    not :attr:`name`, which is process-manager-reported and need not
+    match the executable -- is what host detection matches against."""
     cwd: Path | None
     """``None`` when the name was readable but the cwd was not (e.g. an
     OS permission error scoped to that one attribute)."""
@@ -105,12 +118,12 @@ def _parent_process_info(pid: int) -> _ProcessInfo | None:
 
     Raises:
         psutil.AccessDenied: If the OS refuses to identify *pid*'s parent
-            at all (as opposed to refusing only its cwd, which is
-            reported via a ``None`` :attr:`_ProcessInfo.cwd` instead).
-            This is deliberately allowed to propagate: an access-denied
-            parent might have been the Copilot host, so the walk cannot
-            silently treat it as "no more ancestors" the way it does a
-            vanished process.
+            at all (as opposed to refusing only its cwd or exe, which are
+            each reported via a ``None`` field on :class:`_ProcessInfo`
+            instead). This is deliberately allowed to propagate: an
+            access-denied parent might have been the Copilot host, so the
+            walk cannot silently treat it as "no more ancestors" the way
+            it does a vanished process.
     """
     try:
         proc = psutil.Process(pid)
@@ -124,13 +137,19 @@ def _parent_process_info(pid: int) -> _ProcessInfo | None:
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return None
 
+    exe_basename: str | None
+    try:
+        exe_basename = os.path.basename(parent.exe()).casefold()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        exe_basename = None
+
     cwd: Path | None
     try:
         cwd = Path(parent.cwd())
     except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
         cwd = None
 
-    return _ProcessInfo(pid=parent.pid, name=name, cwd=cwd)
+    return _ProcessInfo(pid=parent.pid, name=name, exe_basename=exe_basename, cwd=cwd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +194,7 @@ def _scan_for_copilot_ancestor(start_pid: int) -> _AncestorScan:
             return _AncestorScan(cwd=None, limited=False)
         seen.add(info.pid)
 
-        if info.name in _COPILOT_PROCESS_NAMES:
+        if info.exe_basename in _COPILOT_EXECUTABLE_BASENAMES:
             if info.cwd is None:
                 raise LaunchDirectoryError(
                     f"Detected a Copilot host process (pid {info.pid}) but could not "

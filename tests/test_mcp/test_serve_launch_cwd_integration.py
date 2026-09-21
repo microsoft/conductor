@@ -106,6 +106,46 @@ def _event_log_glob(tmp_dir: Path, run_id: str) -> list[Path]:
     return sorted((tmp_dir / "conductor").glob(f"conductor-wait-smoke-*-{run_id}.events.jsonl"))
 
 
+_SIMULATED_HOST_CWD_ENV_VAR = "_CONDUCTOR_TEST_SIMULATED_HOST_CWD"
+
+
+def _write_detection_override_wrapper(tmp_path: Path) -> Path:
+    """Write a wrapper script that runs the real ``conductor`` CLI with
+    ``detect_copilot_ancestor_cwd`` patched to return whatever
+    :data:`_SIMULATED_HOST_CWD_ENV_VAR` names, or ``None`` when that env
+    var is unset or empty.
+
+    Real ancestor process names can't be faked cross-platform from a
+    pytest fixture, and isolating ``HOME``/``CONDUCTOR_HOME``/the temp
+    dir does not isolate process ancestry -- so this is the one seam
+    mocked, inside a real, separate subprocess, while everything else
+    (the real server, the real stdio transport, the real detached
+    workflow child, the real event log) stays unmocked. Used both to
+    simulate a Copilot ancestor and to force "no ancestor detected"
+    deterministically, regardless of whether the test runner itself
+    happens to have a real Copilot ancestor.
+    """
+    wrapper_script = tmp_path / "detection_override_wrapper.py"
+    wrapper_script.write_text(
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from unittest.mock import patch\n"
+        "\n"
+        f'raw = os.environ.get("{_SIMULATED_HOST_CWD_ENV_VAR}")\n'
+        "host_cwd = Path(raw) if raw else None\n"
+        "with patch(\n"
+        '    "conductor.mcp.serve.launch_dir.detect_copilot_ancestor_cwd",\n'
+        "    return_value=host_cwd,\n"
+        "):\n"
+        "    from conductor.cli.app import app\n"
+        "\n"
+        "    app(sys.argv[1:])\n",
+        encoding="utf-8",
+    )
+    return wrapper_script
+
+
 async def _wait_for_root_workflow_started(
     *, tmp_dir: Path, run_id: str, deadline: float
 ) -> dict[str, Any]:
@@ -177,6 +217,17 @@ class TestRealStdioLaunchUsesTheConfiguredDirectory:
     async def test_default_invocation_launches_from_the_servers_own_cwd(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """No `--launch-dir` and no Copilot ancestor detected: the launched
+        child's cwd is the server's own startup cwd.
+
+        Detection is patched to return `None` (via the same
+        simulated-host wrapper-script pattern used below) rather than
+        relying on there being no real Copilot ancestor of the test
+        runner -- isolating `HOME`/`CONDUCTOR_HOME`/the temp dir does not
+        isolate process ancestry, so this test would otherwise fail (or
+        pass for the wrong reason) whenever it happens to run underneath
+        a real Copilot session.
+        """
         home = tmp_path / "home"
         conductor_home = tmp_path / "conductor_home"
         isolated_tmp = tmp_path / "isolated_tmp"
@@ -186,9 +237,16 @@ class TestRealStdioLaunchUsesTheConfiguredDirectory:
             directory.mkdir(parents=True, exist_ok=True)
         _write_wait_smoke_copy(workflow_dir)
 
+        wrapper_script = _write_detection_override_wrapper(tmp_path)
+
         env = _isolated_subprocess_env(
             home=home, conductor_home=conductor_home, tmp_dir=isolated_tmp
         )
+        # Force "no ancestor detected" deterministically -- see
+        # `_write_detection_override_wrapper`'s docstring for why relying
+        # on there being no *real* Copilot ancestor of the test runner is
+        # not safe.
+        env[_SIMULATED_HOST_CWD_ENV_VAR] = ""
         # `_cleanup_run` reads run records via `conductor.fleet.records`,
         # which resolves `CONDUCTOR_HOME` from this (pytest) process's own
         # environment -- point it at the same isolated directory the
@@ -196,7 +254,13 @@ class TestRealStdioLaunchUsesTheConfiguredDirectory:
         monkeypatch.setenv("CONDUCTOR_HOME", str(conductor_home))
         params = StdioServerParameters(
             command=sys.executable,
-            args=["-m", "conductor", "mcp", "serve", "--workflow-dir", str(workflow_dir)],
+            args=[
+                str(wrapper_script),
+                "mcp",
+                "serve",
+                "--workflow-dir",
+                str(workflow_dir),
+            ],
             env=env,
             cwd=str(server_cwd),
         )
@@ -292,29 +356,13 @@ class TestRealStdioLaunchUsesTheConfiguredDirectory:
             directory.mkdir(parents=True, exist_ok=True)
         _write_wait_smoke_copy(workflow_dir)
 
-        wrapper_script = tmp_path / "simulated_copilot_host_wrapper.py"
-        wrapper_script.write_text(
-            "import os\n"
-            "import sys\n"
-            "from pathlib import Path\n"
-            "from unittest.mock import patch\n"
-            "\n"
-            'host_cwd = Path(os.environ["_CONDUCTOR_TEST_SIMULATED_HOST_CWD"])\n'
-            "with patch(\n"
-            '    "conductor.mcp.serve.launch_dir.detect_copilot_ancestor_cwd",\n'
-            "    return_value=host_cwd,\n"
-            "):\n"
-            "    from conductor.cli.app import app\n"
-            "\n"
-            "    app(sys.argv[1:])\n",
-            encoding="utf-8",
-        )
+        wrapper_script = _write_detection_override_wrapper(tmp_path)
 
         env = _isolated_subprocess_env(
             home=home, conductor_home=conductor_home, tmp_dir=isolated_tmp
         )
         monkeypatch.setenv("CONDUCTOR_HOME", str(conductor_home))
-        env["_CONDUCTOR_TEST_SIMULATED_HOST_CWD"] = str(host_cwd)
+        env[_SIMULATED_HOST_CWD_ENV_VAR] = str(host_cwd)
         params = StdioServerParameters(
             command=sys.executable,
             args=[

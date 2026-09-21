@@ -255,13 +255,17 @@ so there is nothing else for it to remember.
 ## Launch Directory
 
 Every launched workflow's detached child runs with a working directory —
-the same `system.cwd` an ordinary `conductor run` reports — and by default
-that directory is **your MCP host's own working directory**, not wherever
-`conductor mcp serve` happens to have been installed. Concretely: if your
-host launches this server as a plugin (Claude Code, VS Code, Cursor — see
-[Host Configuration](#host-configuration)), a launched workflow now runs in
-the repository you're actually working in, rather than the plugin's own
-install directory.
+the same `system.cwd` an ordinary `conductor run` reports. By default
+that directory is the working directory of a **native Copilot host
+process** found in this server's own ancestry (see below) — not wherever
+`conductor mcp serve` happens to have been installed. Concretely: if a
+Copilot CLI/IDE process launches this server, a launched workflow now
+runs in the repository you're actually working in, rather than the
+plugin's own install directory. Only Copilot's own native process is
+detected this way; other hosts (Claude Code, VS Code, Cursor — see
+[Host Configuration](#host-configuration)) launching this server without
+a Copilot ancestor in its process tree fall back to the server's own
+startup cwd unless you pass `--launch-dir` explicitly.
 
 Resolution, decided once at server startup and never re-evaluated per
 call:
