@@ -11,6 +11,87 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.39] - 2026-09-21
+
+### Added
+
+- **`claude-agent-sdk` provider: explicit authentication mode selection.** The
+  new `runtime.provider.auth_mode` field (`"auto"` default, `"subscription"`,
+  `"api_key"`) selects which credential the `claude` child process uses. `auto`
+  leaves the inherited environment unchanged, so existing workflows are
+  unaffected. `subscription` blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`
+  and `CLAUDE_CODE_OAUTH_TOKEN` in the child environment; `api_key` requires a
+  non-blank `ANTHROPIC_API_KEY` and blanks the other two. Both explicit modes
+  refuse an inherited non-blank `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` /
+  `_FOUNDRY` cloud-backend selector, naming the variable but never its value;
+  `auto` keeps it. Both explicit modes also refuse a non-empty
+  `setting_sources`, at `conductor validate` and at run time, because a Claude
+  Code settings file's `env` block is applied after Conductor configures the
+  child environment. Each agent execution captures its environment, working
+  directory, settings tiers, and CLI path once; a readiness check (`claude auth
+  status --json`, skipped for `api_key`) and the SDK session both use that
+  capture — including the same settings tiers, passed to the check as
+  `--setting-sources` — and Conductor's own environment is never modified. Every
+  mode, `auto` with an API key included, requires the `claude` CLI to be
+  installed, checked without running it. The readiness check is not billing
+  attribution. `conductor doctor --check` shows Conductor's inferred mode
+  separately from the CLI-reported `authMethod` / `apiProvider` / `apiKeySource`
+  / `subscriptionType`, and states that it checked the default provider
+  configuration rather than any workflow's `auth_mode`. See
+  `docs/workflow-syntax.md` (Authentication Mode) and `docs/configuration.md`.
+  (#522)
+
+### Fixed
+
+- Fixed skill and plugin path diagnostics on Python 3.14, whose rewritten
+  `pathlib` makes `exists()`, `is_dir()` and `is_file()` swallow
+  `PermissionError` and return `False`: an unreadable skill path, plugin
+  path, local plugin source, or skills-root subdirectory is once again
+  reported as "could not be read" instead of being misreported as missing
+  or silently skipped. Also excluded `performance`-marked tests from the
+  default `make test` and `make test-cov` targets, matching CI. (#540)
+- **Astra cost reporting**: added static pricing for `gpt-6-astra`, including
+  input, output, cache-read, and cache-write token rates, so costs remain
+  available when live Copilot billing metadata cannot be resolved. (#549)
+
+### Changed
+
+- **`!file` no longer YAML-sniffs its content; `!yamlfile` replaces the old
+  content-detection heuristic for structured includes**. Whether
+  `field: !file some/path` returned a string or a parsed dict/list used to
+  depend on the referenced file's exact content: a Markdown prompt whose prose
+  happened to parse as a YAML mapping (a line ending in `:` followed by a `- `
+  bulleted list, for example) was silently returned as a dict, and an unrelated
+  prose edit could flip a working prompt across that boundary with no config
+  change. `!file` now always returns the file's content verbatim as a string. A
+  new `!yamlfile` tag explicitly parses the referenced file as YAML and raises
+  a `ConfigurationError` naming the file if it isn't valid YAML, instead of
+  silently falling back to a string.
+  **Breaking change** for any workflow using `!file` to load structured YAML
+  (an output schema, a tool list, a nested config file): switch that reference
+  to `!yamlfile`. For example, `output: !file schemas/analysis-output.yaml`
+  becomes `output: !yamlfile schemas/analysis-output.yaml`. A `!file` include
+  that only ever held plain text (`prompt`, `system_prompt`, a description
+  field) needs no change; only `!yamlfile` recurses into nested
+  `!file`/`!yamlfile` tags, so a structured include with its own nested
+  includes needs the outer tag switched too. See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#external-file-references). (#528)
+- **AnyIO dependency**: updated the locked indirect dependency from 4.12.1 to
+  4.14.2. (#539)
+- **Script subprocesses are now always killed and reaped when a workflow run is
+  cancelled.** Script-step execution also now runs through a pluggable backend
+  seam owned by the workflow engine — a stdlib-only
+  `conductor.execution` contract (`RunnerBackend` protocol, data-shaped
+  `CommandResult`/`StartError`, run-scoped `WorkspaceLease`) with a local
+  subprocess reference implementation (`LocalRunnerBackend`). The root engine
+  prepares the run's workspace lease in `run()`/`resume()` and finalizes it in
+  the matching `finally` with the run's outcome (succeeded/failed/cancelled);
+  sub-workflows inherit the root run's backend and lease, so one run owns
+  exactly one lease. **No behavior change**: rendered commands, environment
+  handling, timeouts, error messages, and exit-code routing are unchanged; the
+  new backend seam otherwise preserves existing behavior. (#541)
+
+
 ## [0.1.38] - 2026-09-21
 
 ### Added
