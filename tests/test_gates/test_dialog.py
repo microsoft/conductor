@@ -14,6 +14,7 @@ from conductor.gates.dialog import (
     DIALOG_AGENT_SYSTEM_PROMPT,
     DISMISS_KEYWORDS,
     DialogHandler,
+    DialogMessage,
     DialogResult,
     _asks_or_announces_question,
     _build_system_prompt,
@@ -1784,6 +1785,11 @@ class TestAgentQuestionOutstanding:
     def test_result_default(self) -> None:
         assert DialogResult(dialog_id="d").agent_question_outstanding is False
 
+    def test_no_agent_message_means_no_question(self) -> None:
+        assert DialogResult(dialog_id="d").last_agent_message_asks_question() is False
+        only_user = DialogResult(dialog_id="d", messages=[DialogMessage(role="user", content="?")])
+        assert only_user.last_agent_message_asks_question() is False
+
 
 class TestConversationPrompt:
     """``dialog.conversation_prompt`` reaches the agent holding the conversation."""
@@ -1865,3 +1871,12 @@ class TestConversationPrompt:
             name="a", prompt="p", dialog=DialogConfig(trigger_prompt="TRIGGER CRITERIA")
         )
         assert "TRIGGER CRITERIA" not in _build_system_prompt(agent, {"r": 1})
+
+
+class TestBuildSystemPrompt:
+    """The one prompt builder behind both paths."""
+
+    def test_output_json_cannot_serialise_is_rendered_with_str(self) -> None:
+        """A tuple key defeats ``json.dumps`` even with ``default=str``."""
+        agent_output: dict[Any, Any] = {("a", "b"): 1}
+        assert str(agent_output) in _build_system_prompt(_make_agent(), agent_output)
