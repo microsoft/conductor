@@ -45,6 +45,7 @@ See issues #382, #387 and #406.
 from __future__ import annotations
 
 import string
+import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -184,6 +185,42 @@ def make_console(**kwargs: Any) -> MarkupFreeConsole:
         TypeError: If ``markup`` is passed.
     """
     return MarkupFreeConsole(**kwargs)
+
+
+def clear_nonblocking_fd(stream: Any) -> None:
+    """Clear ``O_NONBLOCK`` on *stream*'s underlying file descriptor, if set.
+
+    A parent process (cron, a piped invocation, anything that hands us the
+    write end of a pipe it created for itself) can leave that pipe in
+    non-blocking mode; file status flags live on the shared open file
+    description, so a child inherits whatever the creator set. A console
+    write that exceeds the OS pipe buffer then raises ``BlockingIOError``
+    from ``write()`` instead of blocking for the reader to drain it (#543).
+
+    Mirrors ``providers/copilot.py::_fix_pipe_blocking_mode``, which already
+    does this for the Copilot CLI's own subprocess pipes; same mechanism,
+    applied to our own stdio instead of a child's.
+
+    No-op on Windows, where ``O_NONBLOCK`` does not exist. Any failure to
+    read or set the flags (closed fd, not a real file descriptor at all) is
+    swallowed: this is a best-effort mitigation, not something print output
+    should ever depend on.
+    """
+    if sys.platform == "win32":
+        return
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        import fcntl
+        import os
+
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        if flags & os.O_NONBLOCK:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+    except (OSError, ValueError):
+        pass  # fd may already be closed or invalid
 
 
 def select_console_glyph(console: Console, unicode_glyph: str, ascii_fallback: str) -> str:

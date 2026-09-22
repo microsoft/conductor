@@ -15,6 +15,7 @@ the quiet failure mode of an opening tag like ``[dim]``.
 from __future__ import annotations
 
 import io
+import sys
 
 import pytest
 from rich.console import Console
@@ -24,7 +25,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from conductor.console import join, make_console, select_console_glyph, styled
+from conductor.console import clear_nonblocking_fd, join, make_console, select_console_glyph, styled
 
 # Values that a workflow, an agent name, a plugin manifest or an exception
 # string can genuinely contain. Split by failure mode, because they fail
@@ -655,3 +656,72 @@ class TestSelectConsoleGlyph:
         monkeypatch.setattr(sys, "stdout", _FakeStdout())
         console = self._console("cp1252")
         assert select_console_glyph(console, self.ARROW, self.ASCII_ARROW) == self.ASCII_ARROW
+
+
+class TestClearNonblockingFd:
+    """``clear_nonblocking_fd`` (#543): a pipe stderr/stdout we did not open
+
+    ourselves can already carry ``O_NONBLOCK``, since the flag lives on the
+    open file description and survives across ``dup``/inheritance. Left
+    alone, a large console write then raises ``BlockingIOError`` instead of
+    blocking for the reader to drain it.
+    """
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="O_NONBLOCK is POSIX-only")
+    def test_clears_a_nonblocking_pipe(self) -> None:
+        import fcntl
+        import os
+
+        read_fd, write_fd = os.pipe()
+        try:
+            flags = fcntl.fcntl(write_fd, fcntl.F_GETFL)
+            fcntl.fcntl(write_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            assert fcntl.fcntl(write_fd, fcntl.F_GETFL) & os.O_NONBLOCK
+
+            with os.fdopen(write_fd, "wb", closefd=False) as stream:
+                clear_nonblocking_fd(stream)
+
+            assert not (fcntl.fcntl(write_fd, fcntl.F_GETFL) & os.O_NONBLOCK)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="O_NONBLOCK is POSIX-only")
+    def test_leaves_an_already_blocking_pipe_alone(self) -> None:
+        """No-op on a pipe that was never set non-blocking in the first
+        place, exercised separately from the clearing path above so a
+        regression that always toggles the flag (setting it where it was
+        already clear) would still be caught."""
+        import fcntl
+        import os
+
+        read_fd, write_fd = os.pipe()
+        try:
+            before = fcntl.fcntl(write_fd, fcntl.F_GETFL)
+            assert not (before & os.O_NONBLOCK)
+
+            with os.fdopen(write_fd, "wb", closefd=False) as stream:
+                clear_nonblocking_fd(stream)
+
+            assert fcntl.fcntl(write_fd, fcntl.F_GETFL) == before
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_stream_with_no_fileno_is_a_noop(self) -> None:
+        """``io.StringIO`` has no real fd; must not raise."""
+        clear_nonblocking_fd(io.StringIO())
+
+    def test_object_with_no_fileno_method_is_a_noop(self) -> None:
+        clear_nonblocking_fd(object())
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="O_NONBLOCK is POSIX-only")
+    def test_closed_fd_is_a_noop(self) -> None:
+        import os
+
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        stream = os.fdopen(write_fd, "wb", closefd=True)
+        stream.close()
+
+        clear_nonblocking_fd(stream)  # must not raise

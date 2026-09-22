@@ -26,7 +26,14 @@ from rich.text import Text
 
 from conductor.config.loader import load_config
 from conductor.config.schema import AgentDef
-from conductor.console import MarkupFreeConsole, join, make_console, select_console_glyph, styled
+from conductor.console import (
+    MarkupFreeConsole,
+    clear_nonblocking_fd,
+    join,
+    make_console,
+    select_console_glyph,
+    styled,
+)
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
@@ -73,6 +80,14 @@ class _SilentAwareConsole(MarkupFreeConsole):
         # width, etc.) is caller-tunable.
         kwargs.pop("stderr", None)
         super().__init__(stderr=True, **kwargs)
+        # stderr can be a non-blocking pipe with a slow/absent reader (#543).
+        # Fix the fd up front so a write blocks for the reader instead of
+        # raising: rich only clears its internal render buffer *after* a
+        # successful write, so catching the error post hoc and moving on
+        # would leave that panel's segments queued, and the next print()
+        # would re-render them ahead of its own content, growing without
+        # bound. clear_nonblocking_fd() avoids ever hitting that path.
+        clear_nonblocking_fd(self.file)
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         # Lazy import to avoid the cli.run -> cli.app import cycle at module
@@ -80,9 +95,10 @@ class _SilentAwareConsole(MarkupFreeConsole):
         from conductor.cli.app import is_verbose
 
         if is_verbose():
-            # stderr can be a non-blocking pipe with a slow/absent reader
-            # (same root cause as copilot.py's _fix_pipe_blocking_mode); a
-            # large panel then raises here instead of blocking (#543).
+            # Fallback only: __init__ already clears O_NONBLOCK on this
+            # console's stream, so this should not fire in practice. Kept
+            # in case the flag gets reset on us mid-run; a raise here would
+            # replace the real workflow error with an unrelated one.
             with contextlib.suppress(BlockingIOError):
                 super().print(*args, **kwargs)
 
