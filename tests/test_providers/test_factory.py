@@ -703,6 +703,56 @@ class TestHermesFactory:
         await provider.close()
 
 
+class TestClaudeAgentSdkNativeToolsFactory:
+    """``native_tools`` forwarding, and the secure fallback on every path."""
+
+    @staticmethod
+    async def _build(**kwargs: Any) -> Any:
+        with (
+            patch("conductor.providers.factory.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+        ):
+            return await create_provider("claude-agent-sdk", validate=False, **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_claude_code_forwarded_from_provider_settings(self) -> None:
+        settings = ProviderSettings(name="claude-agent-sdk", native_tools="claude_code")
+        provider = await self._build(provider_settings=settings)
+        assert provider._native_tools == "claude_code"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_shorthand_settings_resolve_to_none(self) -> None:
+        provider = await self._build(provider_settings=ProviderSettings(name="claude-agent-sdk"))
+        assert provider._native_tools == "none"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_no_provider_settings_falls_back_to_none(self) -> None:
+        """A bare `--provider claude-agent-sdk` override arrives with no settings
+        at all; the secure value must hold there too, not only via the schema."""
+        provider = await self._build(provider_settings=None)
+        assert provider._native_tools == "none"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_settings_for_another_provider_do_not_leak(self) -> None:
+        """Mirrors ProviderRegistry: settings apply only when their name matches."""
+        provider = await self._build(provider_settings=ProviderSettings(name="copilot"))
+        assert provider._native_tools == "none"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_auth_mode_is_untouched_by_native_tools(self) -> None:
+        settings = ProviderSettings(
+            name="claude-agent-sdk", native_tools="claude_code", auth_mode="subscription"
+        )
+        provider = await self._build(provider_settings=settings)
+        assert provider._auth_mode == "subscription"
+        assert provider._native_tools == "claude_code"
+        await provider.close()
+
+
 class TestClaudeAgentSdkAuthModeFactory:
     """Tests auth_mode forwarding for the claude-agent-sdk provider."""
 

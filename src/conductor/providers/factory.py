@@ -19,6 +19,7 @@ from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
     ClaudeAgentSdkProvider,
     ClaudeAuthMode,
+    ClaudeNativeTools,
 )
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
@@ -264,6 +265,17 @@ async def create_provider(
                 and provider_settings.auth_mode is not None
             ):
                 auth_mode = provider_settings.auth_mode
+            # "none" is the fallback, not merely the schema's default: this
+            # branch is reachable with `provider_settings=None` (a bare
+            # `--provider claude-agent-sdk` override, or a directly built
+            # RuntimeConfig), and the secure value has to hold there too.
+            native_tools: ClaudeNativeTools = "none"
+            if (
+                provider_settings is not None
+                and provider_settings.name == "claude-agent-sdk"
+                and provider_settings.native_tools is not None
+            ):
+                native_tools = provider_settings.native_tools
             provider = ClaudeAgentSdkProvider(
                 model=default_model,
                 max_turns=max_agent_iterations,
@@ -276,6 +288,7 @@ async def create_provider(
                     else None
                 ),
                 auth_mode=auth_mode,
+                native_tools=native_tools,
             )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:

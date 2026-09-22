@@ -101,3 +101,54 @@ class TestProvidersBlock:
         stub = data["providers"]["copilot"]
         assert stub["status"] == "unresolved"
         assert stub["tier"] is None
+
+
+def _sdk_engine(provider: Any, agent_provider: str | None = None) -> WorkflowEngine:
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="test", entry_point="a", runtime=RuntimeConfig(provider=provider)
+        ),
+        agents=[AgentDef(name="a", prompt="hi", provider=agent_provider)],
+    )
+    return WorkflowEngine(config=config, provider=None)
+
+
+class TestNativeToolsMetadata:
+    """``native_tools`` rides the safe provider metadata the banner reads."""
+
+    @pytest.mark.asyncio
+    async def test_default_is_recorded_as_none(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        data = await _sdk_engine("claude-agent-sdk").build_workflow_started_data()
+        assert data["providers"]["claude-agent-sdk"]["native_tools"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_opt_in_is_recorded(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        engine = _sdk_engine({"name": "claude-agent-sdk", "native_tools": "claude_code"})
+        data = await engine.build_workflow_started_data()
+        assert data["providers"]["claude-agent-sdk"]["native_tools"] == "claude_code"
+
+    @pytest.mark.asyncio
+    async def test_per_agent_override_records_the_secure_fallback(self) -> None:
+        """Mirrors ProviderRegistry: the workflow's settings belong to its own
+        default provider, so an agent overriding onto claude-agent-sdk runs
+        (and is reported) under ``none``."""
+        pytest.importorskip("claude_agent_sdk")
+        data = await _sdk_engine(
+            "copilot", agent_provider="claude-agent-sdk"
+        ).build_workflow_started_data()
+        assert data["providers"]["claude-agent-sdk"]["native_tools"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_other_providers_carry_no_native_tools_key(self) -> None:
+        data = await _sdk_engine("copilot").build_workflow_started_data()
+        assert "native_tools" not in data["providers"]["copilot"]
+
+    @pytest.mark.asyncio
+    async def test_value_is_a_constrained_literal_never_a_secret(self) -> None:
+        """The block goes on the wire (JSONL, dashboard); only the literal may."""
+        pytest.importorskip("claude_agent_sdk")
+        engine = _sdk_engine({"name": "claude-agent-sdk", "native_tools": "claude_code"})
+        data = await engine.build_workflow_started_data()
+        assert data["providers"]["claude-agent-sdk"]["native_tools"] in {"none", "claude_code"}

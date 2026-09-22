@@ -159,8 +159,9 @@ class ProviderCapabilities(BaseModel):
     :meth:`conductor.executor.agent.AgentExecutor._reject_unsupported_settings_dir`,
     because ``conductor run`` never invokes the static validator. Both are
     needed for the same reason: the field selects which repository's
-    conventions the agent loads *and* widens the model's built-in file tools
-    to that tree, so silently ignoring it would run the agent against the
+    conventions the agent loads -- and, when the session carries built-in file
+    tools (``native_tools: claude_code`` on ``claude-agent-sdk``), widens them
+    to that tree -- so silently ignoring it would run the agent against the
     wrong conventions while reporting success. Distinct from ``working_dir`` because the two are
     deliberately independent axes -- cwd is the sole root a filesystem MCP
     server gets, while this only adds a directory. Defaults to ``False``

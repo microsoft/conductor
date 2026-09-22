@@ -225,7 +225,10 @@ class TestClaudeAgentSdkDelivery:
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
             _auth_ready(),
         ):
-            provider = ClaudeAgentSdkProvider()
+            # Subagents need a dispatch tool, which only the claude_code
+            # preset provides; under the default `native_tools: none` they are
+            # refused instead (see test_default_native_tools_refuses_plugin_agents).
+            provider = ClaudeAgentSdkProvider(native_tools="claude_code")
             await provider.execute(
                 agent=AgentDef(name="a", prompt="hi"),
                 context={},
@@ -238,6 +241,56 @@ class TestClaudeAgentSdkDelivery:
         agents = options_mock.call_args[1]["agents"]
         assert list(agents) == ["prs:code-reviewer"]
         assert agents["prs:code-reviewer"].prompt == "Review."
+
+    async def test_default_native_tools_refuses_plugin_agents(self) -> None:
+        """Runtime half of the subagent refusal, before any SDK session starts.
+
+        Under ``native_tools: none`` the agent has no dispatch tool, so its
+        plugin's subagents would be registered and unreachable. Refused rather
+        than silently widened to the preset — shown by the SDK never being
+        queried at all.
+        """
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        queried = False
+
+        async def fake_query(**kwargs: Any) -> Any:
+            nonlocal queried
+            queried = True
+            if False:
+                yield None
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            _auth_ready(),
+        ):
+            provider = ClaudeAgentSdkProvider()
+            with pytest.raises(ProviderError) as exc:
+                await provider.execute(
+                    agent=AgentDef(name="a", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    custom_agents=[
+                        {"name": "prs:code-reviewer", "description": "R.", "prompt": "R."}
+                    ],
+                )
+
+        assert queried is False
+        assert "native_tools: none" in str(exc.value)
+        assert "unreachable" in str(exc.value)
+        assert exc.value.suggestion is not None
+        assert "native_tools: claude_code" in exc.value.suggestion
+        assert "agents: false" in exc.value.suggestion
+        # `agents: false` alone is refused while the plugin's skills are on
+        # (its root would expose the subagents again), so the remedy must
+        # name `skills: false` as well rather than send the author into the
+        # next error.
+        assert "'skills: false' as well" in exc.value.suggestion
+        assert "exposes its subagents again" in exc.value.suggestion
+        assert "copilot" in exc.value.suggestion
+        assert exc.value.is_retryable is False
 
     async def test_no_plugin_agents_leaves_the_option_unset(self) -> None:
         # ``None`` rather than ``{}``: an empty mapping has no opt-out

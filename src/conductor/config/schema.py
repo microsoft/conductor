@@ -1751,6 +1751,37 @@ class ProviderSettings(BaseModel):
     ``setting_sources``. Selects a credential, not an endpoint.
     """
 
+    native_tools: Literal["none", "claude_code"] | None = None
+    """Built-in Claude Code tools granted to an agent that omits ``tools:``.
+    ``claude-agent-sdk`` only.
+
+    ``"none"`` (the default, including for the bare ``provider:
+    claude-agent-sdk`` shorthand) grants no built-in tools: no filesystem
+    read/write, no shell, no web fetch. Declared MCP servers still attach and
+    their tools are permitted by server-scoped allow rules, so an MCP-driven
+    agent keeps working, and the ``Skill`` loader is granted back when the
+    agent reaches a skill. ``"claude_code"`` opts into the CLI's full preset
+    with permissions auto-approved — what an omitted ``tools:`` used to grant
+    implicitly.
+
+    This selects *built-in* tools only. It is unrelated to the per-agent
+    ``tools:`` allowlist, which names workflow tools and is refused by this
+    provider in every mode (``workflow_tools_passthrough=False``); an explicit
+    ``tools: []`` still means "no built-ins" regardless of this field.
+
+    ``"claude_code"`` grants filesystem read/write, shell execution, web
+    access and editing without interactive approval. ``working_dir`` scopes
+    where relative paths resolve; it is not a sandbox. Enable it only for
+    workflows trusted with the machine they run on.
+
+    Example::
+
+        runtime:
+          provider:
+            name: claude-agent-sdk
+            native_tools: claude_code
+    """
+
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
@@ -1983,6 +2014,13 @@ class ProviderSettings(BaseModel):
                 raise ValueError(f"Provider fields {extras} are only supported when name='claude'.")
         if self.auth_mode is not None and self.name != "claude-agent-sdk":
             raise ValueError("'auth_mode' is only supported when name='claude-agent-sdk'")
+        if self.native_tools is not None and self.name != "claude-agent-sdk":
+            raise ValueError(
+                "'native_tools' is only supported when name='claude-agent-sdk' "
+                f"(got name={self.name!r}). It selects which built-in Claude Code "
+                "tools an agent that omits 'tools:' receives, which no other "
+                "provider grants."
+            )
         if self.name != "aca":
             extras = sorted(k for k, v in aca_only_fields.items() if v is not None)
             if extras:
@@ -2133,6 +2171,13 @@ class ProviderSettings(BaseModel):
                 object.__setattr__(self, "auth", "azure_default")
         if self.name == "claude-agent-sdk" and self.auth_mode is None:
             object.__setattr__(self, "auth_mode", "auto")
+        # Secure default. Applied here rather than as a field default so the
+        # gating check above keeps reading `None` as "absent from YAML"
+        # regardless of `name` -- and so YAML `native_tools: null` / `~`,
+        # which Pydantic delivers as `None`, lands on "none" like an omitted
+        # key rather than on some third state.
+        if self.name == "claude-agent-sdk" and self.native_tools is None:
+            object.__setattr__(self, "native_tools", "none")
 
         return self
 
@@ -2192,6 +2237,13 @@ class ProviderSettings(BaseModel):
             or self.has_aca_config()
             or self.setting_sources is not None
             or self.auth_mode in ("subscription", "api_key")
+            # Only the non-default opt-in, never a bare `== "none"`: the
+            # validator above stamps `native_tools` onto EVERY
+            # claude-agent-sdk settings object, including one built from the
+            # bare string shorthand, so testing `is not None` would make
+            # `provider: claude-agent-sdk` round-trip as an object and break
+            # the shorthand contract. Same reasoning as `auth_mode` above.
+            or self.native_tools == "claude_code"
         )
 
     @model_serializer(mode="wrap")

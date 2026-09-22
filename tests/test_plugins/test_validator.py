@@ -34,8 +34,13 @@ def _config(
     plugins: list[PluginDef] | None = None,
     agent_plugins: list[PluginDef] | None = None,
     mcp_servers: dict[str, MCPServerDef] | None = None,
+    native_tools: str | None = None,
+    agent_tools: list[str] | None = None,
 ) -> WorkflowConfig:
-    runtime: dict[str, Any] = {"provider": provider, "plugins": plugins or []}
+    provider_value: Any = provider
+    if native_tools is not None:
+        provider_value = {"name": provider, "native_tools": native_tools}
+    runtime: dict[str, Any] = {"provider": provider_value, "plugins": plugins or []}
     if mcp_servers:
         runtime["mcp_servers"] = mcp_servers
     return WorkflowConfig(
@@ -46,6 +51,7 @@ def _config(
                 prompt="Do it.",
                 output={"result": OutputField(type="string")},
                 plugins=agent_plugins,
+                tools=agent_tools,
             )
         ],
         output={"result": "{{ worker.output.result }}"},
@@ -81,10 +87,22 @@ class TestProviderSupport:
         with pytest.raises(ConfigurationError, match="cannot load them"):
             _validate(config, _wf_path(tmp_path))
 
-    @pytest.mark.parametrize("provider", ["copilot", "claude-agent-sdk"])
-    def test_plugins_accepted_on_native_providers(self, tmp_path: Path, provider: str) -> None:
+    @pytest.mark.parametrize(
+        ("provider", "native_tools"),
+        [
+            ("copilot", None),
+            # A plugin shipping subagents needs a dispatch tool on
+            # claude-agent-sdk, which only the opt-in preset provides.
+            ("claude-agent-sdk", "claude_code"),
+        ],
+    )
+    def test_plugins_accepted_on_native_providers(
+        self, tmp_path: Path, provider: str, native_tools: str | None
+    ) -> None:
         make_plugin(tmp_path / "p", "p", skills=["s"], agents=["helper"])
-        config = _config(provider=provider, plugins=[PluginDef(name="./p")])
+        config = _config(
+            provider=provider, plugins=[PluginDef(name="./p")], native_tools=native_tools
+        )
         _validate(config, _wf_path(tmp_path))
 
     def test_opt_out_is_not_an_error_on_an_unsupported_provider(self, tmp_path: Path) -> None:
@@ -548,3 +566,250 @@ class TestPluginFlavorCacheKey:
         assert "'claude_agent'" in message
         assert "'copilot_agent'" not in message
         assert "claude-only" in message
+
+
+class TestClaudeAgentSdkNativeTools:
+    """``conductor validate``'s half of the ``native_tools`` refusals.
+
+    ``conductor run`` never calls the validator, so each of these is also
+    refused at run time by the provider (``tests/test_providers/
+    test_claude_agent_sdk.py::TestNativeToolsPolicy``); this is the half an
+    author sees before the run.
+    """
+
+    def test_subagents_refused_under_the_default(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p")])
+        with pytest.raises(ConfigurationError, match="native_tools: none") as exc:
+            _validate(config, _wf_path(tmp_path))
+        message = str(exc.value)
+        assert "unreachable" in message
+        assert "native_tools: claude_code" in message
+        assert "agents: false" in message
+        assert "copilot" in message
+
+    def test_subagents_refused_with_explicit_empty_tools(self, tmp_path: Path) -> None:
+        """Previously refused only at run time; now at validate too. The remedy
+        names the agent's own ``tools: []``, not the workflow setting."""
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p")],
+            native_tools="claude_code",
+            agent_tools=[],
+        )
+        with pytest.raises(ConfigurationError, match=r"sets 'tools: \[\]'") as exc:
+            _validate(config, _wf_path(tmp_path))
+        assert "Remove 'tools: []'" in str(exc.value)
+
+    def test_subagents_accepted_under_claude_code(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p")],
+            native_tools="claude_code",
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_disabling_plugin_agents_clears_the_refusal(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p", skills=False, agents=False)],
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_a_plugin_without_subagents_is_fine_under_the_default(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", skills=["s"])
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p")])
+        _validate(config, _wf_path(tmp_path))
+
+    def test_copilot_is_unaffected(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(provider="copilot", plugins=[PluginDef(name="./p")])
+        _validate(config, _wf_path(tmp_path))
+
+    # -- MCP ----------------------------------------------------------------
+
+    def test_mcp_only_agent_is_valid_under_the_default(self, tmp_path: Path) -> None:
+        """Omitted ``tools:`` + ``none`` + declared servers is the secure MCP
+        configuration and must validate."""
+        config = _config(
+            provider="claude-agent-sdk", mcp_servers={"docs": MCPServerDef(command="d")}
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_explicit_empty_tools_with_mcp_stays_invalid(self, tmp_path: Path) -> None:
+        """``tools: []`` means *no* tools; MCP tools would still attach, so the
+        declaration would be misleading. Unchanged by this feature."""
+        config = _config(
+            provider="claude-agent-sdk",
+            mcp_servers={"docs": MCPServerDef(command="d")},
+            agent_tools=[],
+        )
+        with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
+            _validate(config, _wf_path(tmp_path))
+
+    @pytest.mark.parametrize("name", ["a__b", "a_", "_a", "x,y", "a__*,Bash", "has space"])
+    def test_unsafe_workflow_server_name_is_refused(self, tmp_path: Path, name: str) -> None:
+        config = _config(provider="claude-agent-sdk", mcp_servers={name: MCPServerDef(command="d")})
+        with pytest.raises(ConfigurationError, match="cannot be granted a permission rule"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_unsafe_plugin_server_name_is_refused(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", mcp={"a__b": {"type": "stdio", "command": "npx"}})
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p")])
+        with pytest.raises(ConfigurationError, match="cannot be granted a permission rule") as exc:
+            _validate(config, _wf_path(tmp_path))
+        assert "plugin" in str(exc.value)
+
+    def test_unsafe_name_is_accepted_under_claude_code(self, tmp_path: Path) -> None:
+        """No permission rule is built under the opt-in, so the name is harmless
+        there — refusing it would be a check the run never needs."""
+        config = _config(
+            provider="claude-agent-sdk",
+            mcp_servers={"a__b": MCPServerDef(command="d")},
+            native_tools="claude_code",
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_safe_names_pass(self, tmp_path: Path) -> None:
+        config = _config(
+            provider="claude-agent-sdk",
+            mcp_servers={
+                "docs": MCPServerDef(command="d"),
+                "fs.tools-2": MCPServerDef(command="d"),
+                "a_b": MCPServerDef(command="d"),
+            },
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_per_agent_override_gets_the_secure_fallback(self, tmp_path: Path) -> None:
+        """An agent overriding onto claude-agent-sdk receives no provider settings
+        (ProviderRegistry passes them only on a name match), so even a
+        workflow whose default provider is something else runs it under
+        ``none`` — and its subagents are refused accordingly."""
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(provider="copilot", plugins=[PluginDef(name="./p")])
+        config.agents[0].provider = "claude-agent-sdk"
+        with pytest.raises(ConfigurationError, match="native_tools: none"):
+            _validate(config, _wf_path(tmp_path))
+
+
+class TestExplicitEmptyToolsWithPluginMcp:
+    """Static half of the run-time ``tools: []`` + MCP refusal, for plugin servers.
+
+    ``_check_agent_tools`` only sees ``runtime.mcp_servers``; the provider
+    refuses the merged workflow + plugin map at run time. Without this,
+    ``conductor validate`` would pass a config ``conductor run`` rejects.
+    """
+
+    def test_plugin_servers_with_explicit_empty_tools_are_refused(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", mcp={"plugin-srv": {"type": "stdio", "command": "npx"}})
+        config = _config(
+            provider="claude-agent-sdk", plugins=[PluginDef(name="./p")], agent_tools=[]
+        )
+        with pytest.raises(ConfigurationError, match="plugins ship MCP servers") as exc:
+            _validate(config, _wf_path(tmp_path))
+        assert "mcp: false" in str(exc.value)
+
+    @pytest.mark.parametrize("native_tools", ["none", "claude_code"])
+    def test_refused_under_either_native_tools(self, tmp_path: Path, native_tools: str) -> None:
+        make_plugin(tmp_path / "p", "p", mcp={"plugin-srv": {"type": "stdio", "command": "npx"}})
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p")],
+            agent_tools=[],
+            native_tools=native_tools,
+        )
+        with pytest.raises(ConfigurationError, match="plugins ship MCP servers"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_combined_with_workflow_servers_is_reported_once(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", mcp={"plugin-srv": {"type": "stdio", "command": "npx"}})
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p")],
+            mcp_servers={"docs": MCPServerDef(command="d")},
+            agent_tools=[],
+        )
+        with pytest.raises(ConfigurationError) as exc:
+            _validate(config, _wf_path(tmp_path))
+        message = str(exc.value)
+        assert message.count("there is no way to disable tools") == 1
+        assert "plugins ship MCP servers" not in message
+
+    def test_disabling_plugin_mcp_clears_it(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", mcp={"plugin-srv": {"type": "stdio", "command": "npx"}})
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p", mcp=False)],
+            agent_tools=[],
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_omitted_tools_with_plugin_servers_is_valid(self, tmp_path: Path) -> None:
+        """Negative control: the MCP-only configuration."""
+        make_plugin(tmp_path / "p", "p", mcp={"plugin-srv": {"type": "stdio", "command": "npx"}})
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p")])
+        _validate(config, _wf_path(tmp_path))
+
+
+class TestSubagentRemedyIsAccurate:
+    """The disable-the-subagents remedy must be one this provider accepts.
+
+    ``agents: false`` alone is refused on claude-agent-sdk while the same
+    plugin's skills are on (registering the root for its skills exposes its
+    subagents again), so recommending it unconditionally sent authors
+    straight into the next error.
+    """
+
+    def test_plugin_with_skills_and_subagents_names_both_switches(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", skills=["s"], agents=["helper"])
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p")])
+        with pytest.raises(ConfigurationError) as exc:
+            _validate(config, _wf_path(tmp_path))
+        message = str(exc.value)
+        assert "'agents: false' and 'skills: false' on plugin" in message
+        assert "exposes its subagents again" in message
+        assert "native_tools: claude_code" in message
+        assert "copilot" in message
+
+    def test_plugin_with_only_subagents_needs_only_agents_false(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", agents=["helper"])
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p")])
+        with pytest.raises(ConfigurationError) as exc:
+            _validate(config, _wf_path(tmp_path))
+        message = str(exc.value)
+        assert "'agents: false' on plugin" in message
+        assert "skills: false" not in message
+
+    def test_following_the_remedy_validates(self, tmp_path: Path) -> None:
+        """Both switches off clears the refusal; the advice is actionable."""
+        make_plugin(tmp_path / "p", "p", skills=["s"], agents=["helper"])
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p", agents=False, skills=False)],
+        )
+        _validate(config, _wf_path(tmp_path))
+
+    def test_agents_false_alone_is_what_the_remedy_warns_against(self, tmp_path: Path) -> None:
+        """The negative control: the old advice fails, which is why it changed."""
+        make_plugin(tmp_path / "p", "p", skills=["s"], agents=["helper"])
+        config = _config(provider="claude-agent-sdk", plugins=[PluginDef(name="./p", agents=False)])
+        with pytest.raises(ConfigurationError, match="cannot honour"):
+            _validate(config, _wf_path(tmp_path))
+
+    def test_explicit_empty_tools_names_both_switches_too(self, tmp_path: Path) -> None:
+        make_plugin(tmp_path / "p", "p", skills=["s"], agents=["helper"])
+        config = _config(
+            provider="claude-agent-sdk",
+            plugins=[PluginDef(name="./p")],
+            native_tools="claude_code",
+            agent_tools=[],
+        )
+        with pytest.raises(ConfigurationError) as exc:
+            _validate(config, _wf_path(tmp_path))
+        message = str(exc.value)
+        assert "Remove 'tools: []'" in message
+        assert "'agents: false' and 'skills: false' on plugin" in message

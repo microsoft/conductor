@@ -1488,6 +1488,21 @@ class WorkflowEngine:
                 "upstream_pin": caps.upstream_pin,
                 "maintainer": caps.maintainer,
             }
+            if name == "claude-agent-sdk":
+                # Which built-in tools an omitted `tools:` grants — a trust
+                # decision the run output would otherwise never mention, and
+                # what the experimental banner keys its warning line on. A
+                # constrained literal, never a credential, so safe on the wire.
+                # Mirrors `create_provider`: settings apply only when the
+                # workflow-level provider *is* this one; a per-agent override
+                # onto claude-agent-sdk gets no settings and so the secure
+                # fallback.
+                runtime_provider = self.config.workflow.runtime.provider
+                providers_block[name]["native_tools"] = (
+                    runtime_provider.native_tools
+                    if runtime_provider.name == name and runtime_provider.native_tools is not None
+                    else "none"
+                )
 
         # Walk agents (which may use overrides) and the workflow default
         # so the providers block always includes at least the default.
@@ -5518,10 +5533,11 @@ class WorkflowEngine:
                             started_payload["working_dir"] = resolved_agent.working_dir
                             # Emitted alongside working_dir because it is a
                             # trust decision: settings_dir loads another
-                            # repository's conventions AND widens the model's
-                            # built-in file tools to that tree. A grant the
-                            # dashboard and the JSONL log never mention cannot
-                            # be audited after the fact.
+                            # repository's conventions and, when the session
+                            # carries built-in file tools (native_tools:
+                            # claude_code), widens them to that tree. A grant
+                            # the dashboard and the JSONL log never mention
+                            # cannot be audited after the fact.
                             started_payload["settings_dir"] = resolved_agent.settings_dir
                             started_payload["native_otel_spans_active"] = (
                                 self._native_otel_spans_active_for(event_provider)

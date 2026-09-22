@@ -331,3 +331,148 @@ def test_banner_prints_once_per_unique_experimental_provider(
     assert any("exp-one" in p for p in printed_names)
     assert any("exp-two" in p for p in printed_names)
     assert not any("stable-one" in p for p in printed_names)
+
+
+# -- runtime.provider.native_tools: claude_code ---------------------------------
+
+#: Phrases the opt-in warning is required to carry. Asserted individually so a
+#: rewording that drops one capability from the list is caught.
+_NATIVE_TOOLS_REQUIRED_PHRASES = (
+    "native_tools: claude_code",
+    "filesystem read/write",
+    "shell",
+    "web",
+    "editing",
+    "approved automatically",
+    "working_dir is not a sandbox",
+)
+
+
+def _sdk_payload(run_id: str = "run-1", **meta: object) -> dict[str, object]:
+    block: dict[str, object] = {
+        "name": "claude-agent-sdk",
+        "status": "ok",
+        "tier": "experimental",
+        "upstream_pin": "claude-agent-sdk>=0.2.82",
+        "maintainer": "@lesandiz (best-effort)",
+    }
+    block.update(meta)
+    return {"run_id": run_id, "providers": {"claude-agent-sdk": block}}
+
+
+def _rendered_text(mock_console: MagicMock) -> str:
+    """The plain text of every panel printed, joined."""
+    return "\n".join(str(c.args[0].renderable) for c in mock_console.print.call_args_list)
+
+
+def test_claude_code_adds_the_native_tools_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    from conductor.cli import run as run_mod
+
+    mock_console = _patch_console(monkeypatch)
+    run_mod._maybe_print_experimental_banner(_sdk_payload(native_tools="claude_code"))
+
+    text = _rendered_text(mock_console)
+    for phrase in _NATIVE_TOOLS_REQUIRED_PHRASES:
+        assert phrase in text, phrase
+    # One line, inside the existing banner — not a second panel.
+    assert mock_console.print.call_count == 1
+
+
+@pytest.mark.parametrize("meta", [{"native_tools": "none"}, {}])
+def test_no_warning_under_the_default_or_an_older_payload(
+    monkeypatch: pytest.MonkeyPatch, meta: dict[str, object]
+) -> None:
+    """``none`` grants nothing to warn about, and a payload from before the
+    field existed must not be read as the opt-in."""
+    from conductor.cli import run as run_mod
+
+    mock_console = _patch_console(monkeypatch)
+    run_mod._maybe_print_experimental_banner(_sdk_payload(**meta))
+
+    text = _rendered_text(mock_console)
+    assert "Experimental provider in use" in text
+    assert "native_tools" not in text
+    assert "not a sandbox" not in text
+
+
+def test_native_tools_warning_renders_once_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A resume re-seeds the dashboard with a second root ``workflow_started``
+    for the same run; the warning must ride the banner's existing
+    run-scoped latch rather than print again."""
+    from conductor.cli import run as run_mod
+
+    mock_console = _patch_console(monkeypatch)
+    payload = _sdk_payload(run_id="resumed-run", native_tools="claude_code")
+
+    run_mod._maybe_print_experimental_banner(payload)
+    run_mod._maybe_print_experimental_banner(payload)  # replayed on resume
+    run_mod._maybe_print_experimental_banner(payload)  # and again
+
+    assert mock_console.print.call_count == 1
+    assert _rendered_text(mock_console).count("not a sandbox") == 1
+
+
+def test_native_tools_warning_is_per_run_not_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The latch is keyed by run id: a second run in the same process is warned too."""
+    from conductor.cli import run as run_mod
+
+    mock_console = _patch_console(monkeypatch)
+    run_mod._maybe_print_experimental_banner(_sdk_payload("run-a", native_tools="claude_code"))
+    run_mod._maybe_print_experimental_banner(_sdk_payload("run-b", native_tools="claude_code"))
+
+    assert mock_console.print.call_count == 2
+
+
+def test_native_tools_warning_is_suppressed_by_silent_mode() -> None:
+    """``--silent`` is a JSON-only contract; the warning rides the same
+    silent-aware console as the banner, so it is gated identically."""
+    import io
+
+    from conductor.cli import run as run_mod
+    from conductor.cli.app import verbose_mode
+
+    buffer = io.StringIO()
+    console = run_mod._SilentAwareConsole(file=buffer, width=200, highlight=False)
+    original = run_mod._verbose_console
+    run_mod._verbose_console = console
+    token = verbose_mode.set(False)
+    try:
+        run_mod._maybe_print_experimental_banner(_sdk_payload(native_tools="claude_code"))
+    finally:
+        verbose_mode.reset(token)
+        run_mod._verbose_console = original
+
+    assert buffer.getvalue() == ""
+
+
+def test_native_tools_warning_renders_without_markup_tags() -> None:
+    """Rendered through a real markup-free console: the styling must resolve,
+    never leak as a literal ``[bold ...]`` tag."""
+    import io
+
+    from conductor.cli import run as run_mod
+
+    buffer = io.StringIO()
+    console = run_mod._SilentAwareConsole(file=buffer, width=200, highlight=False)
+    original = run_mod._verbose_console
+    run_mod._verbose_console = console
+    try:
+        run_mod._maybe_print_experimental_banner(_sdk_payload(native_tools="claude_code"))
+    finally:
+        run_mod._verbose_console = original
+
+    output = buffer.getvalue()
+    assert "not a sandbox" in output
+    assert "[bold" not in output
+    assert "[/" not in output
+
+
+def test_native_tools_warning_is_a_fresh_text_each_time() -> None:
+    """``Text`` is mutable and the panel is built with ``join``; a shared
+    instance could carry one render into the next."""
+    from conductor.cli import run as run_mod
+
+    first = run_mod._native_tools_claude_code_warning()
+    second = run_mod._native_tools_claude_code_warning()
+    assert first is not second
+    assert first.plain == second.plain

@@ -45,6 +45,8 @@ from conductor.skills import (
 from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from conductor.config.schema import StepDef, WorkflowConfig
     from conductor.plugins.registry import ResolvedPlugin
     from conductor.skills import ResolvedSkill
@@ -1953,6 +1955,35 @@ def _project_tier_enabled(config: WorkflowConfig, agent: AgentDef) -> bool:
     return "project" in (getattr(provider, "setting_sources", None) or [])
 
 
+def _claude_agent_sdk_native_tools(config: WorkflowConfig) -> str:
+    """The ``native_tools`` a ``claude-agent-sdk`` agent will actually run under.
+
+    Mirrors ``ProviderRegistry``: the workflow-level ``runtime.provider``
+    settings reach a provider only when that provider *is* the workflow
+    default, so an agent that overrides onto ``claude-agent-sdk`` gets no
+    settings and therefore the secure fallback — ``"none"``, the same value
+    ``create_provider`` uses when ``provider_settings`` is ``None``.
+    """
+    provider = config.workflow.runtime.provider
+    if provider.name == "claude-agent-sdk" and provider.native_tools is not None:
+        return provider.native_tools
+    return "none"
+
+
+def _claude_agent_sdk_denies_unapproved(config: WorkflowConfig, agent: AgentDef) -> bool:
+    """True iff this claude-agent-sdk agent runs with no built-in tools.
+
+    Mirrors ``ClaudeAgentSdkProvider._resolve_tool_config``: an explicit
+    ``tools: []``, or an omitted ``tools:`` under ``native_tools: none``,
+    yields an empty built-in set under ``dontAsk`` — the one mode in which
+    declared MCP servers are pre-approved by name. A non-empty allowlist is
+    refused elsewhere and is not this predicate's concern.
+    """
+    if agent.tools == []:
+        return True
+    return agent.tools is None and _claude_agent_sdk_native_tools(config) == "none"
+
+
 def _resolved_provider_name(agent: AgentDef, default: str) -> str:
     """The provider name an agent will actually use at runtime.
 
@@ -2139,10 +2170,44 @@ def _validate_provider_capabilities(
                 f"workflow-level tools={config.tools!r}, but provider "
                 f"'{provider_name}' does not honor tool allowlists "
                 f"(capabilities.workflow_tools_passthrough=False). Remove the "
-                f"workflow-level 'tools:' so omitting 'tools:' grants the "
-                f"provider's default tool preset, or set this agent's "
+                f"workflow-level 'tools:' so omitting 'tools:' falls back to the "
+                f"provider's own built-in tool policy, or set this agent's "
                 f"'tools: []' to disable the built-in tools."
             )
+
+        if provider_name == "claude-agent-sdk" and workflow_mcp_servers:
+            _check_mcp_permission_names(agent, workflow_mcp_servers, "runtime.mcp_servers")
+
+    def _check_mcp_permission_names(
+        agent: AgentDef, server_names: Iterable[str], origin: str
+    ) -> None:
+        """Refuse MCP server names that cannot form an unambiguous permission rule.
+
+        The static half of ``ClaudeAgentSdkProvider._mcp_permission_rules``,
+        which refuses the same names at run time. Only relevant when the agent
+        runs with no built-in tools: that is the one mode in which each
+        declared server is pre-approved as ``mcp__<server>__*``, and those
+        rules are ``__``-delimited and ``,``-joined into one ``--allowedTools``
+        value, so a name carrying a delimiter would split into extra rules.
+        Under ``native_tools: claude_code`` no rule is built, and the name is
+        harmless to permissions.
+        """
+        if not _claude_agent_sdk_denies_unapproved(config, agent):
+            return
+        from conductor.plugins.manifest import MCP_PERMISSION_SAFE_NAME
+
+        for name in server_names:
+            if not MCP_PERMISSION_SAFE_NAME.match(name):
+                errors.append(
+                    f"Agent '{agent.name}': MCP server name {name!r} (from {origin}) "
+                    f"cannot be granted a permission rule on claude-agent-sdk. With no "
+                    f"built-in tools each declared server is pre-approved as "
+                    f"'mcp__<server>__*', and these rules are delimited by '__' and "
+                    f"joined with ',', so this name could split into a rule naming a "
+                    f"different server or granting tools the workflow never declared. "
+                    f"Rename it using only letters, digits, '.', '-' and single '_' "
+                    f"characters, not starting or ending with '_'."
+                )
 
     def _check_agent_skills(
         agent: AgentDef, provider_name: str, caps: ProviderCapabilities
@@ -2379,6 +2444,81 @@ def _validate_provider_capabilities(
                         f"the workflow's server, or set 'mcp: false' on the plugin."
                     )
 
+        if provider_name == "claude-agent-sdk":
+            plugin_servers = [server for plugin in resolved for server in plugin.mcp_servers]
+            # The plugin half of `_check_agent_tools`' `tools: []` + MCP rule,
+            # which only sees `runtime.mcp_servers`. The provider refuses the
+            # merged map at run time; without this, validate would pass a
+            # config `conductor run` then rejects. Skipped when the workflow
+            # rule already fired, so one mistake is reported once.
+            if agent.tools == [] and plugin_servers and not workflow_mcp_servers:
+                errors.append(
+                    f"Agent '{agent.name}' declares 'tools: []' to disable all tools, "
+                    f"but its plugins ship MCP servers ({sorted(plugin_servers)!r}) that "
+                    f"would still attach — provider 'claude-agent-sdk' has no per-agent "
+                    f"switch for them. Remove 'tools: []' (under the default "
+                    f"'native_tools: none' the agent then gets the MCP servers and no "
+                    f"built-in tools), or set 'mcp: false' on those plugins."
+                )
+            if any(plugin.agents for plugin in resolved):
+                _check_claude_agent_sdk_subagent_dispatch(agent, resolved)
+            for plugin in resolved:
+                _check_mcp_permission_names(agent, plugin.mcp_servers, f"plugin {plugin.source!r}")
+
+    def _check_claude_agent_sdk_subagent_dispatch(
+        agent: AgentDef, resolved: list[ResolvedPlugin]
+    ) -> None:
+        """Refuse plugin subagents an agent would have no tool to dispatch to.
+
+        Mirrors ``ClaudeAgentSdkProvider._resolve_tool_config``, which refuses
+        the same combination at run time — this is the half that
+        ``conductor validate`` sees, since ``conductor run`` never calls it.
+
+        With no built-in tools the model has no dispatch tool, so the
+        subagents would be registered and unreachable. The SDK exposes no
+        verified identifier for that tool to grant back on its own (unlike
+        ``Skill``), and quietly enabling the full preset instead would widen
+        the agent far beyond what the workflow declared. Two ways in, with
+        different remedies: the agent's own ``tools: []``, or the
+        workflow-level ``native_tools: none`` default reaching an agent that
+        omits ``tools:``.
+
+        The disable-the-subagents remedy is spelled out per plugin, because
+        ``agents: false`` alone is not always accepted here: reaching a
+        plugin's skills registers its root, which exposes its subagents again,
+        so ``agents: false`` with ``skills`` still on is itself refused (see
+        the carve-out above). A plugin whose skills are enabled needs
+        ``skills: false`` too — this is the validator, so it can say which.
+        """
+        if agent.tools is not None and agent.tools:
+            # A non-empty allowlist is refused by `_check_agent_tools`
+            # already; one error per mistake is enough.
+            return
+        if agent.tools == []:
+            cause = "sets 'tools: []'"
+            grant = "Remove 'tools: []' and set 'runtime.provider.native_tools: claude_code'"
+        elif _claude_agent_sdk_native_tools(config) == "none":
+            cause = "runs under 'native_tools: none' (the claude-agent-sdk default)"
+            grant = "Set 'runtime.provider.native_tools: claude_code'"
+        else:
+            return
+        disable = "; ".join(
+            f"'agents: false' and 'skills: false' on plugin {plugin.source!r} "
+            f"(its skills are enabled, and registering its root for them exposes "
+            f"its subagents again)"
+            if plugin.skills
+            else f"'agents: false' on plugin {plugin.source!r}"
+            for plugin in resolved
+            if plugin.agents
+        )
+        errors.append(
+            f"Agent '{agent.name}' {cause} while its plugins ship subagents. With "
+            f"no built-in tools the model has no way to dispatch to them, so they "
+            f"would be registered and unreachable. {grant} to grant the full "
+            f"preset; or disable the subagents with {disable}; or run this agent "
+            f"on 'copilot'."
+        )
+
     def _report_dropped_components(
         agent: AgentDef, plugin: ResolvedPlugin, provider_name: str
     ) -> None:
@@ -2611,39 +2751,63 @@ def _validate_provider_capabilities(
                 f"that provider."
             )
         elif agent.settings_dir is not None and not _project_tier_enabled(config, agent):
-            # A warning, not an error: the FILESYSTEM half of settings_dir
-            # applies regardless, so the workflow is not broken -- but the
-            # skill discovery it is normally set for is a no-op without the
-            # project tier enabled, and a green validate would imply otherwise.
+            # A warning, not an error: the workflow is not broken, but the
+            # skill discovery settings_dir is normally set for is a no-op
+            # without the project tier enabled, and a green validate would
+            # imply otherwise.
             #
-            # Three distinct causes, each with a different remedy (or none), so
-            # the message branches rather than prescribing one fix that may be
-            # impossible to apply.
+            # What the directory still does depends on the tool policy, and
+            # the message must say which: under the `claude_code` preset
+            # add_dirs widens the built-in file tools to that tree; with no
+            # built-in tools (`native_tools: none`, or the agent's own
+            # `tools: []`) there is no file tool for it to widen, so the
+            # directory has no effect at all. Mirrors the provider's run-time
+            # warning, which reads the same fact off the session it builds.
+            grant_active = (
+                agent.tools is None and _claude_agent_sdk_native_tools(config) == "claude_code"
+            )
+            policy = "its explicit 'tools: []'" if agent.tools == [] else "'native_tools: none'"
+            effect = (
+                "The directory is still granted to the model's built-in file tools "
+                "(native_tools: claude_code)."
+                if grant_active
+                else f"Under {policy} the agent has no built-in file tool that could "
+                f"use the directory either, so settings_dir currently has no effect."
+            )
             common = (
                 f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} but "
                 f"its session will not enable the 'project' settings tier, so no "
-                f"skills will be discovered from that directory. The directory is "
-                f"still granted to the model's built-in file tools."
+                f"skills will be discovered from that directory. {effect}"
             )
+            # Three distinct causes, each with a different remedy (or none), so
+            # the message branches rather than prescribing one fix that may be
+            # impossible to apply.
             if agent.skills == []:
+                tail = (
+                    "or remove settings_dir if the filesystem grant was not intended."
+                    if grant_active
+                    else "or remove settings_dir."
+                )
                 warnings.append(
                     f"{common} The agent's own 'skills: []' opts it out of the "
-                    f"settings tiers entirely. Remove it to let the tier apply, or "
-                    f"remove settings_dir if the filesystem grant was not intended."
+                    f"settings tiers entirely. Remove it to let the tier apply, {tail}"
                 )
             elif provider_name != default_provider:
                 # setting_sources lives on the single workflow-level
                 # ProviderSettings and the schema rejects it unless that
                 # provider is claude-agent-sdk, so telling this author to add
-                # it would produce a ValidationError.
+                # it would produce a ValidationError. The same rule means an
+                # overriding agent also receives no `native_tools`, so it
+                # always runs with no built-in tools here: there is no
+                # filesystem grant to keep settings_dir for.
                 warnings.append(
                     f"{common} The settings tier is workflow-scoped "
                     f"(runtime.provider.setting_sources) and cannot be enabled for "
                     f"an agent that overrides its provider, since the schema "
                     f"accepts setting_sources only when runtime.provider is "
                     f"'claude-agent-sdk' (it is {default_provider!r}). Move "
-                    f"the provider to runtime.provider to enable the tier, or keep "
-                    f"settings_dir for the filesystem grant alone."
+                    f"the provider to runtime.provider to enable the tier, or "
+                    f"remove settings_dir."
                 )
             else:
                 warnings.append(

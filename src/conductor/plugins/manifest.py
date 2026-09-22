@@ -81,6 +81,16 @@ PLUGIN_DROPPED_DIRS: tuple[str, ...] = ("hooks", "commands")
 # split into extra permission rules.
 SAFE_NAME: re.Pattern[str] = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 
+# An MCP server name that can be embedded in a claude-agent-sdk
+# ``mcp__<server>__*`` permission rule without ambiguity. ``SAFE_NAME`` keeps
+# out ``,`` (the ``--allowedTools`` joiner) but still admits ``_``, and ``__``
+# is this rule's own field delimiter: ``a__b`` would read as server ``a`` with
+# a tool pattern ``b__*``, and a trailing ``_`` (``a_`` -> ``mcp__a___*``)
+# blurs the same boundary. So on top of ``SAFE_NAME``: no ``__`` anywhere, and
+# no leading or trailing ``_``. Shared by the provider (run time) and the
+# validator (``conductor validate``) so the two cannot disagree.
+MCP_PERMISSION_SAFE_NAME: re.Pattern[str] = re.compile(r"\A(?!_)(?!.*__)[A-Za-z0-9_.-]+(?<!_)\Z")
+
 
 @dataclass(frozen=True)
 class PluginManifest:

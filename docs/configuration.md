@@ -248,6 +248,15 @@ neither env var. Only `base_url` falls back on its own.
 | `runtime_token` | Supported | Rejected | Rejected |
 | `setting_sources` | Rejected | Rejected | Supported |
 | `auth_mode` | Rejected | Rejected | Supported |
+| `native_tools` | Rejected | Rejected | Supported |
+
+`native_tools` (`"none"` default / `"claude_code"`) selects which built-in
+Claude Code tools a `claude-agent-sdk` agent receives when it omits `tools:`.
+Under `none` it gets none — no filesystem, shell, web or editing; under
+`claude_code` it gets the full preset with permissions approved automatically,
+and `working_dir` is not a sandbox. Like the two fields above it is rejected on
+every other provider name. See
+[Native Tools](workflow-syntax.md#native-tools-native_tools).
 
 `setting_sources` (`user` / `project` / `local`) selects which Claude Code
 settings tiers a session may load; it is empty by default and only the

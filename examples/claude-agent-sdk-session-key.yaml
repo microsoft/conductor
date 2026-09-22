@@ -30,7 +30,14 @@ workflow:
   entry_point: investigate
 
   runtime:
-    provider: claude-agent-sdk
+    provider:
+      name: claude-agent-sdk
+      # `investigate` reads the repository in its working directory, which
+      # needs the built-in Claude Code tools. Agents that omit `tools:` get
+      # none by default (`native_tools: none`), so opt in explicitly. This
+      # grants filesystem, shell, web and editing tools with automatic
+      # approval; `working_dir` is not a sandbox.
+      native_tools: claude_code
     default_model: claude-sonnet-4-5
 
   limits:

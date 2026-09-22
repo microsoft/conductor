@@ -46,6 +46,13 @@ workflow:
       # ~/.claude/settings.json and makes the run depend on the operator's
       # machine.
       setting_sources: [project]
+      # `work` operates on files inside the target repository, which needs the
+      # built-in Claude Code tools; agents that omit `tools:` get none by
+      # default. This grants filesystem, shell, web and editing tools with
+      # automatic approval, and `working_dir` is not a sandbox -- the same
+      # "trust this repository as much as the workflow" bar the tier above
+      # already sets.
+      native_tools: claude_code
     default_model: claude-sonnet-4-5
 
   input:
@@ -86,6 +93,10 @@ agents:
     # workflow-global tier: this agent loads no ambient skills, instructions or
     # hooks, from this repo or any other.
     skills: []
+    # This agent only summarises the upstream text below, so it opts out of the
+    # workflow-level `native_tools: claude_code` preset: no filesystem, shell,
+    # web or editing tools. An explicit `tools: []` outranks the workflow grant.
+    tools: []
     prompt: |
       Summarise this work for someone reviewing it:
 

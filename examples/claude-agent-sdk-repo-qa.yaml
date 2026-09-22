@@ -1,21 +1,29 @@
-# Repo Q&A with the claude-agent-sdk provider (default tools preset)
+# Repo Q&A with the claude-agent-sdk provider (`native_tools: claude_code`)
 #
 # This single-agent workflow asks the claude-agent-sdk provider to READ a file
-# in its working directory and answer a question about it. The agent does NOT
-# declare a `tools:` list — it relies on the provider's default behavior.
+# in its working directory and answer a question about it. Reading a file needs
+# the built-in Claude Code tools, so the workflow opts in to them explicitly
+# with `runtime.provider.native_tools: claude_code`.
 #
-# WHY THIS EXAMPLE EXISTS (the bug it guards against):
-#   Before the fix, an agent that omitted `tools:` received NO tools and could
-#   not read the file: the executor's resolve_agent_tools() turned the omitted
-#   `tools:` into an empty list (this workflow declares no workflow-level `tools:` to
-#   inherit), and the provider could not tell that empty list apart from an
-#   explicit `tools: []`, so it disabled every tool. The agent came up with
-#   ZERO filesystem tools and failed to read the file.
+# WHY THE OPT-IN IS EXPLICIT:
+#   An agent that omits `tools:` gets NO built-in tools by default
+#   (`native_tools: none`): no filesystem, no shell, no web. That default used
+#   to be the opposite — omitting `tools:` silently granted the full preset —
+#   which made every agent on this provider a filesystem/shell/web agent
+#   without the workflow ever saying so. `claude_code` grants the full preset
+#   (Read / Bash / Edit / Glob / Grep / WebFetch / ...) with permissions
+#   approved automatically, exactly like the bare `claude` CLI.
 #
-#   After the fix, the provider inspects the raw `agent.tools` field: an OMITTED
-#   `tools:` (agent.tools is None) now grants the full `claude_code` preset
-#   (Read / Bash / Edit / Glob / Grep / WebFetch / ...), exactly like the bare
-#   `claude` CLI. An explicit `tools: []` still disables all tools.
+#   `working_dir` only decides where relative paths resolve; it is NOT a
+#   sandbox. Run this only where the workflow is trusted with the machine.
+#
+# WHY THIS EXAMPLE ALSO GUARDS A BUG:
+#   The executor's resolve_agent_tools() turns an omitted `tools:` into an
+#   empty list (this workflow declares no workflow-level `tools:` to inherit),
+#   so the provider cannot tell it apart from an explicit `tools: []` by that
+#   list alone. It inspects the raw `agent.tools` field instead: an OMITTED
+#   `tools:` here gets the preset, while an explicit `tools: []` would still
+#   disable every built-in tool even under `claude_code`.
 #
 # Pre-requisites:
 #   pip install conductor[claude-agent-sdk]      # or: uv add 'claude-agent-sdk>=0.2.82'
@@ -33,13 +41,17 @@ workflow:
   name: claude-agent-sdk-repo-qa
   description: >
     Single claude-agent-sdk agent that reads a file in its working
-    directory and answers a question about it. Demonstrates the default
-    claude_code tool preset granted when `tools:` is omitted.
+    directory and answers a question about it, using the built-in
+    claude_code tools the workflow opts in to with `native_tools`.
   version: "1.0.0"
   entry_point: repo_reader
 
   runtime:
-    provider: claude-agent-sdk
+    provider:
+      name: claude-agent-sdk
+      # Explicit opt-in to the built-in Claude Code tools. Without it an agent
+      # that omits `tools:` gets none, and could not read README.md.
+      native_tools: claude_code
     # claude-sonnet-4-5 is the SDK's documented default; adjust to whatever
     # your Claude Code backend (anthropic.com / Vertex AI / Bedrock) expects.
     default_model: claude-sonnet-4-5
@@ -53,9 +65,9 @@ workflow:
 agents:
   - name: repo_reader
     description: Read README.md in the working directory and answer the question.
-    # NOTE: there is intentionally NO `tools:` field here. Omitting it grants
-    # the full `claude_code` preset (Read/Bash/Edit/...). Before the fix this
-    # agent received no tools and could not read the file; after the fix it can.
+    # NOTE: there is intentionally NO `tools:` field here. Omitting it lets the
+    # workflow-level `native_tools: claude_code` apply (Read/Bash/Edit/...).
+    # `tools: []` would disable every built-in tool regardless.
     prompt: |
       Read the file README.md in your current working directory, then answer
       the following question using only what that file says. Cite the relevant

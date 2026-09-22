@@ -338,3 +338,66 @@ class TestProjectTierWarningCauses:
         assert warning is not None
         assert "workflow-scoped" in warning
         assert "Add 'project' to runtime.provider.setting_sources" not in warning
+
+    # -- the static warning must describe the effective tool policy ----------
+
+    @pytest.mark.parametrize(
+        ("native_tools", "agent_extra", "grant_active", "policy"),
+        [
+            ("none", {}, False, "'native_tools: none'"),
+            ("claude_code", {}, True, None),
+            ("claude_code", {"tools": []}, False, "its explicit 'tools: []'"),
+            ("none", {"tools": []}, False, "its explicit 'tools: []'"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("setting_sources", "skills_extra", "cause"),
+        [
+            (None, {}, "Add 'project' to runtime.provider.setting_sources"),
+            (["project"], {"skills": []}, "The agent's own 'skills: []'"),
+        ],
+    )
+    def test_warning_reflects_the_tool_policy(
+        self,
+        tmp_path: Path,
+        native_tools: str,
+        agent_extra: dict,
+        grant_active: bool,
+        policy: str | None,
+        setting_sources: list[str] | None,
+        skills_extra: dict,
+        cause: str,
+    ) -> None:
+        """The "still granted to the built-in file tools" claim only under the preset.
+
+        With no built-in tools there is nothing for the directory to widen;
+        telling the author to remove a filesystem grant that does not exist is
+        advice about the wrong session. Each cause keeps its own remedy.
+        """
+        provider = ProviderSettings(
+            name="claude-agent-sdk",
+            native_tools=native_tools,  # type: ignore[arg-type]
+            setting_sources=setting_sources,  # type: ignore[arg-type]
+        )
+        warning = self._warn(provider, {**agent_extra, **skills_extra}, tmp_path)
+
+        assert warning is not None
+        assert cause in warning
+        if grant_active:
+            assert "still granted to the model's built-in file tools" in warning
+            assert "has no effect" not in warning
+        else:
+            assert "still granted" not in warning
+            assert "filesystem grant" not in warning
+            assert "no built-in file tool that could use the directory" in warning
+            assert policy is not None and policy in warning
+
+    def test_provider_override_never_claims_a_filesystem_grant(self, tmp_path: Path) -> None:
+        """An overriding agent receives no provider settings, so it always runs
+        under ``native_tools: none`` -- there is no grant to keep the field for."""
+        warning = self._warn("copilot", {"provider": "claude-agent-sdk"}, tmp_path)
+
+        assert warning is not None
+        assert "filesystem grant" not in warning
+        assert "still granted" not in warning
+        assert "has no effect" in warning

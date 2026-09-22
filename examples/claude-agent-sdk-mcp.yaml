@@ -1,7 +1,9 @@
-# claude-agent-sdk + MCP servers
+# claude-agent-sdk + MCP servers, with no built-in tools
 #
-# Runs an agent with the full `claude_code` CLI tool preset AND custom MCP tool
-# servers attached at the same time.
+# Runs an agent whose ONLY tools are the MCP servers this workflow declares.
+# It has no built-in Claude Code tools at all -- no filesystem, no shell, no
+# web fetch -- because it omits `tools:` and the provider's `native_tools`
+# setting is left at its secure default, `none`.
 #
 # How it works:
 #   - Conductor translates each `mcp_servers:` entry into the SDK's own
@@ -13,14 +15,31 @@
 #   - `strict_mcp_config` is always enabled, so an ambient project `.mcp.json`
 #     or a user-global MCP setting cannot inject servers this workflow never
 #     declared. Servers must be declared here to be reachable.
+#   - With no built-in tools the session runs under the `dontAsk` permission
+#     mode, which denies anything not pre-approved, and each declared server is
+#     pre-approved by exactly one server-scoped rule: `mcp__web-search__*`.
+#     Nothing broader (no `*`, no `mcp__*`) is ever granted.
 #
-# Two carve-outs still apply to this provider:
+# Limitations of this mode:
+#   - An MCP tool that requires interactive user approval may be denied under
+#     `dontAsk` rather than prompting. That is deliberate: a workflow run has
+#     nobody to answer a prompt, and the alternative is `bypassPermissions`.
+#   - Server names must use only letters, digits, '.', '-' and single '_'
+#     characters (not leading or trailing), since they are embedded in a
+#     `__`-delimited permission rule. Anything else is refused, not rewritten.
+#
+# Carve-outs that apply to this provider in every mode:
 #   - Per-server `tools:` filters are refused (the SDK's MCP config has no
 #     equivalent field, and ignoring a filter would grant MORE tools than
 #     declared). Use `tools: ["*"]`, which is the default.
-#   - Per-agent `tools:` allowlists are still refused
-#     (`workflow_tools_passthrough=False`). Omit `tools:` to get the
-#     `claude_code` preset plus every declared MCP server.
+#   - Per-agent `tools:` allowlists are refused
+#     (`workflow_tools_passthrough=False`), and an explicit `tools: []` next to
+#     `mcp_servers:` is refused too: it would claim "no tools" while every MCP
+#     tool stays attached. Omit `tools:` as below.
+#
+# To ALSO give the agent the built-in filesystem/shell/web tools, set
+# `runtime.provider.native_tools: claude_code`. That grants them with automatic
+# approval, and `working_dir` is not a sandbox.
 #
 # Pre-requisites:
 #   pip install conductor[claude-agent-sdk]
@@ -40,11 +59,12 @@ workflow:
   name: claude-agent-sdk-mcp
   description: >
     Research agent running on the experimental claude-agent-sdk provider with
-    a custom MCP search server attached alongside the built-in claude_code
-    tool preset.
+    a custom MCP search server as its only tool — no built-in Claude Code
+    tools, under the secure `native_tools: none` default.
   entry_point: researcher
 
   runtime:
+    # The bare shorthand resolves to `native_tools: none`.
     provider: claude-agent-sdk
     default_model: claude-sonnet-4-5
     max_agent_iterations: 20
@@ -66,17 +86,18 @@ workflow:
 
 agents:
   - name: researcher
-    description: Researches a question using MCP search plus the built-in tools
-    # NOTE: no `tools:` here on purpose. Omitting it grants the claude_code
-    # preset; the MCP servers above are attached on top of it. Declaring an
-    # explicit allowlist would fail validation for this provider.
+    description: Researches a question using only the MCP search server
+    # NOTE: no `tools:` here on purpose. Omitting it lets `native_tools: none`
+    # apply (no built-ins) while the MCP server above stays reachable.
+    # `tools: []` would be refused alongside `mcp_servers:`, and a non-empty
+    # allowlist is refused on this provider.
     prompt: |
       Research the following question and report what you find.
 
       Question: {{ workflow.input.question }}
 
-      Use the web-search MCP tools for current information, and the built-in
-      file and shell tools if local context helps.
+      Use the web-search MCP tools for current information. You have no other
+      tools: do not try to read local files or run commands.
     output:
       answer:
         type: string

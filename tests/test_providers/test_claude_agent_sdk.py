@@ -8,6 +8,7 @@ import glob
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
 from dataclasses import dataclass, field
@@ -597,11 +598,22 @@ class TestMessageDispatch:
 
 
 class TestToolResolution:
-    """Coverage for the per-agent ``tools:`` allowlist security boundary (#241 / A1)."""
+    """Coverage for the per-agent ``tools:`` allowlist security boundary (#241 / A1).
+
+    Every case asserts the *pair* — available tools and permission mode —
+    because the pairing is the security property: a preset under ``dontAsk``
+    or an empty set under ``bypassPermissions`` would each be wrong in a way
+    that checking one half alone would miss.
+    """
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    async def test_tools_none_grants_full_preset(self) -> None:
-        """``tools is None`` (no allowlist declared) keeps the claude_code preset."""
+    async def test_omitted_tools_default_grants_no_builtins(self) -> None:
+        """``tools is None`` under the default ``native_tools`` grants nothing.
+
+        The secure default: omitting ``tools:`` no longer implies the
+        filesystem/shell/web preset. Nothing to approve, and anything
+        unapproved is denied rather than prompted for.
+        """
         options_mock = Mock()
 
         async def fake_query(**kwargs):
@@ -616,20 +628,40 @@ class TestToolResolution:
             await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=None)
 
         call_kwargs = options_mock.call_args[1]
+        assert call_kwargs["tools"] == []
+        assert call_kwargs["permission_mode"] == "dontAsk"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_tools_claude_code_grants_full_preset(self) -> None:
+        """``native_tools="claude_code"`` is the explicit opt-in to the preset."""
+        options_mock = Mock()
+
+        async def fake_query(**kwargs):
+            yield _result(result="done")
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
+        ):
+            provider = ClaudeAgentSdkProvider(native_tools="claude_code")
+            agent = AgentDef(name="test", prompt="hi")
+            await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=None)
+
+        call_kwargs = options_mock.call_args[1]
         assert call_kwargs["tools"] == {"type": "preset", "preset": "claude_code"}
         assert call_kwargs["permission_mode"] == "bypassPermissions"
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    async def test_empty_tools_list_disables_tools(self) -> None:
-        """Explicit ``tools: []`` disables ALL tools and drops the permission bypass.
+    @pytest.mark.parametrize("native_tools", ["none", "claude_code"])
+    async def test_empty_tools_list_disables_tools(self, native_tools: str) -> None:
+        """Explicit ``tools: []`` disables ALL built-ins under either setting.
 
         Regression test for #241 (A1): previously the empty list was silently
         ignored and the agent got the full ``claude_code`` preset
-        (filesystem/bash/web) — a security regression.
-
-        The agent here declares ``tools: []`` explicitly (``agent.tools == []``),
-        which is what distinguishes it from an omitted ``tools:`` (the latter
-        gets the preset — see :class:`TestOmittedToolsDefaultPreset`).
+        (filesystem/bash/web) — a security regression. Parametrized over
+        ``native_tools`` because an explicit per-agent opt-out must outrank a
+        workflow-level grant: ``claude_code`` must not reopen what the agent
+        closed.
         """
         options_mock = Mock()
 
@@ -640,13 +672,13 @@ class TestToolResolution:
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
-            provider = ClaudeAgentSdkProvider()
+            provider = ClaudeAgentSdkProvider(native_tools=native_tools)
             agent = AgentDef(name="test", prompt="hi", tools=[])
             await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=[])
 
         call_kwargs = options_mock.call_args[1]
         assert call_kwargs["tools"] == []
-        assert call_kwargs["permission_mode"] is None
+        assert call_kwargs["permission_mode"] == "dontAsk"
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -675,21 +707,22 @@ class TestToolResolution:
 
 
 class TestOmittedToolsDefaultPreset:
-    """An agent that omits ``tools:`` must receive the ``claude_code`` preset.
+    """Omitted ``tools:`` vs explicit ``tools: []`` must stay distinguishable.
 
     Regression test for the executor↔provider contract bug: the executor's
     ``resolve_agent_tools(agent.tools, workflow_tools)`` returns
     ``workflow_tools.copy()`` (``[]`` when the workflow declares no
     ``runtime`` MCP tools) for an omitted ``tools:``, so the provider is
     ALWAYS handed a concrete list and never ``None``. Before the fix, the
-    provider could not tell "omitted (defaults to all)" from explicit
-    ``tools: []`` (both arrive as ``[]``) and granted ZERO tools to an agent
-    that simply forgot to declare ``tools:`` — e.g. a "read a file and
-    answer" agent came up with no filesystem tools and failed.
+    provider could not tell "omitted" from explicit ``tools: []`` (both arrive
+    as ``[]``).
 
-    The provider distinguishes the two cases by inspecting the raw
-    ``agent.tools`` field, which preserves the omitted (``None``) vs.
-    explicit-empty (``[]``) distinction the executor erases.
+    The provider distinguishes the two by inspecting the raw ``agent.tools``
+    field. Under the default ``native_tools: none`` the two cases resolve to
+    the same empty built-in set, so the distinction is only *observable* under
+    the ``claude_code`` opt-in — which is where these tests exercise it. It
+    still matters under ``none`` for one thing: which remedy a subagent
+    refusal names (see ``TestNativeToolsPolicy``).
     """
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
@@ -697,8 +730,9 @@ class TestOmittedToolsDefaultPreset:
         """The real bug: executor passes ``tools=[]`` for an omitted ``tools:``.
 
         ``AgentDef`` defaults ``tools`` to ``None`` (omitted), and the
-        executor turns that into ``[]`` before calling the provider. The
-        provider must still grant the ``claude_code`` preset, not no tools.
+        executor turns that into ``[]`` before calling the provider. Under the
+        ``claude_code`` opt-in the provider must still grant the preset, not
+        no tools.
         """
         options_mock = Mock()
 
@@ -709,7 +743,7 @@ class TestOmittedToolsDefaultPreset:
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
-            provider = ClaudeAgentSdkProvider()
+            provider = ClaudeAgentSdkProvider(native_tools="claude_code")
             # agent.tools is None (omitted), but the executor erases that to []
             # before calling the provider — exactly what AgentExecutor does.
             agent = AgentDef(name="reader", prompt="read a file and answer")
@@ -718,18 +752,20 @@ class TestOmittedToolsDefaultPreset:
 
         call_kwargs = options_mock.call_args[1]
         assert call_kwargs["tools"] == {"type": "preset", "preset": "claude_code"}, (
-            "An agent that omits `tools:` must receive the claude_code preset "
-            "even though the executor hands the provider an empty list."
+            "Under native_tools: claude_code, an agent that omits `tools:` must "
+            "receive the preset even though the executor hands the provider an "
+            "empty list."
         )
         assert call_kwargs["permission_mode"] == "bypassPermissions"
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_explicit_empty_tools_still_disables_tools(self) -> None:
-        """An agent that explicitly declares ``tools: []`` still gets no tools.
+        """An explicit ``tools: []`` still gets no tools — even under the opt-in.
 
         The executor passes ``[]`` here too, but ``agent.tools == []`` (not
         ``None``) records the explicit opt-out, so the provider disables all
-        tools and drops the permission bypass.
+        built-ins. Run under ``claude_code`` deliberately: that is the only
+        mode where getting this wrong would grant the preset.
         """
         options_mock = Mock()
 
@@ -740,14 +776,14 @@ class TestOmittedToolsDefaultPreset:
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
-            provider = ClaudeAgentSdkProvider()
+            provider = ClaudeAgentSdkProvider(native_tools="claude_code")
             agent = AgentDef(name="no_tools", prompt="hi", tools=[])
             assert agent.tools == []
             await provider.execute(agent=agent, context={}, rendered_prompt="hi", tools=[])
 
         call_kwargs = options_mock.call_args[1]
         assert call_kwargs["tools"] == []
-        assert call_kwargs["permission_mode"] is None
+        assert call_kwargs["permission_mode"] == "dontAsk"
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
@@ -812,13 +848,21 @@ class TestOmittedToolsDefaultPreset:
         assert "tools: []" in exc.value.suggestion
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    async def test_executor_to_provider_end_to_end_grants_preset(self) -> None:
-        """End-to-end through AgentExecutor: an omitted ``tools:`` reaches the
-        provider as the ``claude_code`` preset, with NO workflow tools declared.
+    @pytest.mark.parametrize(
+        ("native_tools", "expected_tools", "expected_mode"),
+        [
+            ("none", [], "dontAsk"),
+            ("claude_code", {"type": "preset", "preset": "claude_code"}, "bypassPermissions"),
+        ],
+    )
+    async def test_executor_to_provider_end_to_end(
+        self, native_tools: str, expected_tools: Any, expected_mode: str
+    ) -> None:
+        """End-to-end through AgentExecutor with NO workflow tools declared.
 
         This pins the full call chain that the original bug broke:
         ``AgentExecutor.execute`` → ``resolve_agent_tools(None, [])`` → ``[]``
-        → ``provider.execute(tools=[])`` → preset.
+        → ``provider.execute(tools=[])`` → the policy ``native_tools`` selects.
         """
         from conductor.executor.agent import AgentExecutor
 
@@ -832,7 +876,7 @@ class TestOmittedToolsDefaultPreset:
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
-            provider = ClaudeAgentSdkProvider()
+            provider = ClaudeAgentSdkProvider(native_tools=native_tools)
             # No workflow-level tools — resolve_agent_tools returns [].
             executor = AgentExecutor(provider, workflow_tools=[])
             agent = AgentDef(
@@ -844,8 +888,8 @@ class TestOmittedToolsDefaultPreset:
             await executor.execute(agent=agent, context={})
             captured.update(options_mock.call_args[1])
 
-        assert captured["tools"] == {"type": "preset", "preset": "claude_code"}
-        assert captured["permission_mode"] == "bypassPermissions"
+        assert captured["tools"] == expected_tools
+        assert captured["permission_mode"] == expected_mode
 
 
 class TestAgentTurnStartOrdering:
@@ -2397,24 +2441,110 @@ class TestMcpOptionsWiring:
         assert not any(Path(p).exists() for p in paths)
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    async def test_empty_tools_still_attaches_mcp_servers(self) -> None:
-        """``tools: []`` disables the CLI preset but does NOT detach MCP
-        servers -- the SDK has no per-request MCP toggle. ``conductor validate``
-        is the only guard and ``conductor run`` never calls it, so pin the
-        runtime behavior. If this ever becomes "detach the servers too", change
-        this test deliberately rather than by accident."""
+    @pytest.mark.parametrize("native_tools", ["none", "claude_code"])
+    @pytest.mark.parametrize("origin", ["workflow", "plugin", "both"])
+    async def test_empty_tools_with_mcp_servers_is_refused_at_run_time(
+        self, native_tools: str, origin: str
+    ) -> None:
+        """``tools: []`` plus attached MCP servers is refused by ``conductor run``.
+
+        This test previously pinned the opposite -- that the servers attached
+        anyway, because the SDK has no per-request MCP toggle and only
+        ``conductor validate`` objected. Changed deliberately: ``conductor run``
+        never calls the validator, and under ``dontAsk`` the attached servers
+        would also be *pre-approved*, handing the agent exactly the tools it
+        declared it does not have. The refusal must precede both the secrets
+        file and the SDK.
+        """
+        workflow = {"docs": {"type": "stdio", "command": "docs-server"}}
+        plugin = {"plugin-srv": {"type": "stdio", "command": "plugin-server"}}
+        queried = False
+
+        async def fake_query(**kwargs):
+            nonlocal queried
+            queried = True
+            yield _result(result="ok")
+
+        write_spy = Mock(wraps=_write_mcp_config)
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch("conductor.providers.claude_agent_sdk._write_mcp_config", write_spy),
+        ):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers=workflow if origin in ("workflow", "both") else None,
+                native_tools=native_tools,
+            )
+            with pytest.raises(ProviderError) as exc:
+                await provider.execute(
+                    agent=AgentDef(name="t", prompt="hi", tools=[]),
+                    context={},
+                    rendered_prompt="hi",
+                    tools=[],
+                    extra_mcp_servers=plugin if origin in ("plugin", "both") else None,
+                )
+
+        assert queried is False, "the SDK must not be invoked"
+        write_spy.assert_not_called()  # no MCP secrets file was ever created
+        assert exc.value.is_retryable is False
+        message = str(exc.value)
+        assert "sets 'tools: []'" in message
+        for name in (["docs"] if origin != "plugin" else []) + (
+            ["plugin-srv"] if origin != "workflow" else []
+        ):
+            assert repr(name) in message
+        assert exc.value.suggestion is not None
+        assert "Remove 'tools: []'" in exc.value.suggestion
+        assert "mcp: false" in exc.value.suggestion
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("origin", ["workflow", "plugin", "both"])
+    async def test_omitted_tools_with_mcp_servers_stays_usable(self, origin: str) -> None:
+        """Negative control: omitted ``tools:`` + ``none`` + servers is the
+        supported MCP-only configuration and must reach the SDK intact."""
+        workflow = {"docs": {"type": "stdio", "command": "docs-server"}}
+        plugin = {"plugin-srv": {"type": "stdio", "command": "plugin-server"}}
         captured: dict = {}
 
         async def fake_query(**kwargs):
-            captured["tools"] = kwargs["options"].tools
-            captured["mcp"] = kwargs["options"].mcp_servers
+            options = kwargs["options"]
+            captured["tools"] = options.tools
+            captured["mode"] = options.permission_mode
+            captured["allowed"] = list(options.allowed_tools)
+            captured["mcp"] = options.mcp_servers
             yield _result(result="ok")
 
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
             provider = ClaudeAgentSdkProvider(
-                mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
+                mcp_servers=workflow if origin in ("workflow", "both") else None
             )
             await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                tools=[],
+                extra_mcp_servers=plugin if origin in ("plugin", "both") else None,
+            )
+
+        expected = sorted(
+            (["mcp__docs__*"] if origin != "plugin" else [])
+            + (["mcp__plugin-srv__*"] if origin != "workflow" else [])
+        )
+        assert captured["tools"] == []
+        assert captured["mode"] == "dontAsk"
+        assert sorted(captured["allowed"]) == expected
+        assert isinstance(captured["mcp"], str)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_empty_tools_without_mcp_servers_is_not_refused(self) -> None:
+        """The refusal is about attached servers, not ``tools: []`` itself."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["tools"] = kwargs["options"].tools
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            await ClaudeAgentSdkProvider().execute(
                 agent=AgentDef(name="t", prompt="hi", tools=[]),
                 context={},
                 rendered_prompt="hi",
@@ -2422,7 +2552,32 @@ class TestMcpOptionsWiring:
             )
 
         assert captured["tools"] == []
-        assert isinstance(captured["mcp"], str)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unsafe_server_name_is_refused_before_the_secrets_file(self) -> None:
+        """Name validation now also precedes the write, so a refused config
+        never puts resolved credentials on disk even transiently."""
+        write_spy = Mock(wraps=_write_mcp_config)
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch("conductor.providers.claude_agent_sdk._write_mcp_config", write_spy),
+        ):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"a__b": {"type": "stdio", "command": "c", "env": {"T": "x"}}}
+            )
+            with pytest.raises(ProviderError, match="cannot be granted a permission rule"):
+                await provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    tools=[],
+                )
+
+        write_spy.assert_not_called()
 
 
 class TestMcpRequiredFields:
@@ -2681,6 +2836,7 @@ class TestSkillsWiring:
         extra_mcp_servers: dict[str, Any] | None = None,
         tools: list[str] | None = None,
         setting_sources: list[str] | None = None,
+        native_tools: str = "none",
     ):
         captured: dict = {}
 
@@ -2689,7 +2845,9 @@ class TestSkillsWiring:
             yield _result(result="ok")
 
         with patch("conductor.providers.claude_agent_sdk.query", fake_query):
-            provider = ClaudeAgentSdkProvider(setting_sources=setting_sources)
+            provider = ClaudeAgentSdkProvider(
+                setting_sources=setting_sources, native_tools=native_tools
+            )
             await provider.execute(
                 agent=agent,
                 context={},
@@ -2772,9 +2930,11 @@ class TestSkillsWiring:
         assert argv[argv.index("--tools") + 1] == "Skill"
         # With no permission bypass, the SDK's allowed_tools injection is the
         # only thing permitting the tool -- assert it here, not just on the
-        # preset path where bypassPermissions would mask its absence.
+        # preset path where bypassPermissions would mask its absence. Under
+        # dontAsk that injection is load-bearing: anything unapproved is denied.
         assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
-        assert options.permission_mode is None
+        assert options.permission_mode == "dontAsk"
+        assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_explicit_no_tools_without_skills_stays_empty(self) -> None:
@@ -2785,12 +2945,29 @@ class TestSkillsWiring:
         assert argv[argv.index("--tools") + 1] == ""
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    async def test_omitted_tools_keeps_preset_with_skills(self) -> None:
+    async def test_omitted_tools_under_default_grants_only_the_skill_tool(self) -> None:
+        """Skill-only under ``native_tools: none``: the skill stays reachable,
+        and nothing else is granted to reach it with."""
         options = await self._capture_options(
             AgentDef(name="t", prompt="hi"), skill_directories=self._skill_dirs()
         )
 
+        assert options.tools == ["Skill"]
+        assert options.permission_mode == "dontAsk"
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == "Skill"
+        assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_tools_keeps_preset_with_skills_under_opt_in(self) -> None:
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"),
+            skill_directories=self._skill_dirs(),
+            native_tools="claude_code",
+        )
+
         assert options.tools == {"type": "preset", "preset": "claude_code"}
+        assert options.permission_mode == "bypassPermissions"
         argv = self._argv(options)
         assert argv[argv.index("--tools") + 1] == "default"
 
@@ -2896,15 +3073,15 @@ class TestSettingSourcesWiring:
         CLI-discovered skills never pass through ``skill_names``, so gating the
         Skill tool on that alone left a tier discovering skills the model held
         no tool to invoke. On the ``tools: []`` path ``permission_mode`` is
-        ``None``, so ``--allowedTools`` is the only thing granting it — and the
-        ``"all"`` branch emits the bare ``Skill``, not ``Skill(<name>)``.
+        ``dontAsk``, so ``--allowedTools`` is the only thing granting it — and
+        the ``"all"`` branch emits the bare ``Skill``, not ``Skill(<name>)``.
         """
         options = await self._capture_options(
             AgentDef(name="t", prompt="hi", tools=[]), setting_sources=["project"]
         )
 
         assert options.tools == ["Skill"]
-        assert options.permission_mode is None
+        assert options.permission_mode == "dontAsk"
 
         argv = self._argv(options)
         assert argv[argv.index("--allowedTools") + 1] == "Skill"
@@ -3038,15 +3215,32 @@ class TestSettingSourcesWiring:
         assert "HOOKS" not in caplog.text
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    async def test_omitted_tools_with_a_tier_keeps_the_default_preset(self) -> None:
-        """The ``claude_code`` preset path: ``tools:`` omitted means the CLI's
+    async def test_omitted_tools_with_a_tier_keeps_the_opted_in_preset(self) -> None:
+        """Under the ``claude_code`` opt-in, ``tools:`` omitted means the CLI's
         own default tool set, which a tier must not narrow."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"),
+            setting_sources=["project"],
+            native_tools="claude_code",
+        )
+
+        assert options.tools == {"type": "preset", "preset": "claude_code"}
+        assert options.permission_mode == "bypassPermissions"
+        assert options.skills == "all"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_tools_with_a_tier_under_default_grants_only_skill(self) -> None:
+        """A tier does not widen ``native_tools: none``: its skills stay
+        reachable through ``Skill``, and nothing else is granted."""
         options = await self._capture_options(
             AgentDef(name="t", prompt="hi"), setting_sources=["project"]
         )
 
-        assert options.tools == {"type": "preset", "preset": "claude_code"}
+        assert options.tools == ["Skill"]
+        assert options.permission_mode == "dontAsk"
         assert options.skills == "all"
+        argv = self._argv(options)
+        assert argv[argv.index("--allowedTools") + 1] == "Skill"
 
 
 class TestValidateConnectionProbeSetPerPlatform:
@@ -3386,9 +3580,9 @@ class TestSettingsDirAddDirs:
 
         ``conductor validate`` warns about this, but ``conductor run`` never
         calls the static validator -- the same reason the four ``_reject_*``
-        helpers exist. Without this the author gets the one effect they did
-        not ask for (the filesystem grant, which applies regardless) and no
-        diagnostic about the one they did.
+        helpers exist. Without this the author gets no diagnostic about the
+        effect they asked for. What the directory does instead depends on the
+        tool policy -- see ``test_the_tier_warning_reflects_the_tool_policy``.
         """
         target = tmp_path / "repo"
         target.mkdir()
@@ -3582,3 +3776,502 @@ class TestSettingsDirAddDirs:
         hits = [r for r in caplog.records if "no skills are discovered" in r.message]
         assert hits
         assert "requires runtime.provider itself to be 'claude-agent-sdk'" in hits[0].message
+
+    @staticmethod
+    async def _tier_warnings(
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        native_tools: str,
+        agent_tools: list[str] | None,
+        agent_skills: list[str] | None,
+    ) -> list[str]:
+        target = tmp_path / "repo"
+        target.mkdir(exist_ok=True)
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(native_tools=native_tools)  # type: ignore[arg-type]
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(
+                        name="judge",
+                        prompt="hi",
+                        settings_dir=str(target),
+                        tools=agent_tools,
+                        skills=agent_skills,
+                    ),
+                    context={},
+                    rendered_prompt="hi",
+                    tools=[],
+                )
+        return [r.getMessage() for r in caplog.records if "no skills are discovered" in r.message]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("native_tools", "agent_tools", "grant_active", "policy"),
+        [
+            # omitted tools under the default: no built-ins, nothing to widen
+            ("none", None, False, "'native_tools: none'"),
+            # omitted tools under the opt-in: the preset's file tools are widened
+            ("claude_code", None, True, None),
+            # the agent's own `tools: []` outranks the opt-in: still nothing
+            ("claude_code", [], False, "its explicit 'tools: []'"),
+            ("none", [], False, "its explicit 'tools: []'"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("agent_skills", "remedy"),
+        [
+            (None, "Enable the 'project' tier"),
+            ([], "This agent's own 'skills: []'"),
+        ],
+    )
+    async def test_the_tier_warning_reflects_the_tool_policy(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        native_tools: str,
+        agent_tools: list[str] | None,
+        grant_active: bool,
+        policy: str | None,
+        agent_skills: list[str] | None,
+        remedy: str,
+    ) -> None:
+        """The warning must describe the session that will actually run.
+
+        "Still granted to the model's built-in file tools" is only true when
+        the session carries the ``claude_code`` preset. Under
+        ``native_tools: none`` or an explicit ``tools: []`` there is no file
+        tool for ``add_dirs`` to widen, and saying otherwise sends the author
+        to remove a grant that does nothing. Both causes keep their own
+        remedy in every policy.
+        """
+        messages = await self._tier_warnings(
+            tmp_path,
+            caplog,
+            native_tools=native_tools,
+            agent_tools=agent_tools,
+            agent_skills=agent_skills,
+        )
+
+        assert len(messages) == 1, messages
+        message = messages[0]
+        assert remedy in message
+        if grant_active:
+            assert "still granted to the model's built-in file tools" in message
+            assert "no effect" not in message
+        else:
+            assert "still granted" not in message
+            assert "no built-in file tool that could use the directory" in message
+            assert "has no effect" in message
+            assert policy is not None and policy in message
+
+    @pytest.mark.asyncio
+    async def test_the_tier_warning_latch_separates_tool_policies(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Same directory, same cause, different tool policy: two accurate lines.
+
+        The latch still collapses repeats, but one agent's wording would be
+        false for the other, so the policy is part of the key.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(native_tools="claude_code")
+            with caplog.at_level(logging.WARNING):
+                for tools in (None, [], None, []):  # each policy twice
+                    await provider.execute(
+                        agent=AgentDef(
+                            name="judge", prompt="hi", settings_dir=str(target), tools=tools
+                        ),
+                        context={},
+                        rendered_prompt="hi",
+                        tools=[],
+                    )
+
+        messages = [r.getMessage() for r in caplog.records if "no skills" in r.message]
+        assert len(messages) == 2, messages
+        assert sum("still granted" in m for m in messages) == 1
+        assert sum("has no effect" in m for m in messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_tier_warning_passes_runtime_values_as_arguments(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The directory and agent name are logging arguments, never spliced
+        into the format string -- a bracketed path must survive verbatim."""
+        target = tmp_path / "[bold]repo[task1]"
+        target.mkdir()
+
+        async def fake_query(**kwargs):
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            with caplog.at_level(logging.WARNING):
+                await provider.execute(
+                    agent=AgentDef(name="judge", prompt="hi", settings_dir=str(target)),
+                    context={},
+                    rendered_prompt="hi",
+                )
+
+        records = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert len(records) == 1
+        assert str(target) not in records[0].msg  # the format string itself
+        assert str(target) in records[0].getMessage()  # but rendered verbatim
+
+
+class TestNativeToolsPolicy:
+    """``runtime.provider.native_tools`` and the permissions that pair with it.
+
+    The contract is the argv the SDK builds, so these build it from a real
+    ``ClaudeAgentOptions`` rather than stopping at the options object. Each
+    case asserts all three of available tools, allow rules and permission
+    mode together: they only mean something as a set.
+    """
+
+    _argv = staticmethod(TestSkillsWiring._argv)
+    _skill_dirs = staticmethod(TestSkillsWiring._skill_dirs)
+
+    #: The rule's shape; the server segment is checked separately below, since
+    #: a lookahead here would scan past it into the trailing ``__*``.
+    _RULE = re.compile(r"\Amcp__(?P<server>.+)__\*\Z")
+
+    @staticmethod
+    async def _run(
+        agent: AgentDef,
+        *,
+        native_tools: str = "none",
+        mcp_servers: dict[str, Any] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Execute once and capture the options plus the live MCP file's mode."""
+        captured: dict[str, Any] = {}
+
+        async def fake_query(**kwargs):
+            options = kwargs["options"]
+            captured["options"] = options
+            if isinstance(options.mcp_servers, str):
+                # Sampled while the SDK would be consuming it; it is deleted
+                # in `execute`'s finally.
+                captured["mcp_mode"] = stat.S_IMODE(os.stat(options.mcp_servers).st_mode)
+                captured["mcp_payload"] = json.loads(Path(options.mcp_servers).read_text())
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(mcp_servers=mcp_servers, native_tools=native_tools)
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=[] if agent.tools is None else list(agent.tools),
+                skill_directories=skill_directories,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+            )
+        return captured
+
+    # -- constructor ---------------------------------------------------------
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    def test_default_is_none(self) -> None:
+        assert ClaudeAgentSdkProvider()._native_tools == "none"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("bad", ["", "None", "NONE", "claude-code", "all", "preset", None])
+    def test_unknown_value_fails_closed_at_construction(self, bad: Any) -> None:
+        """Defensive: a value the schema would have refused, supplied directly,
+        must not fall through into either branch."""
+        with pytest.raises(ProviderError, match="Unknown native_tools value") as exc:
+            ClaudeAgentSdkProvider(native_tools=bad)
+        assert exc.value.is_retryable is False
+
+    # -- the matrix ------------------------------------------------------------
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_under_none_grants_nothing(self) -> None:
+        options = (await self._run(AgentDef(name="t", prompt="hi")))["options"]
+
+        assert options.tools == []
+        assert options.permission_mode == "dontAsk"
+        assert options.allowed_tools == []
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == ""
+        assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+        assert "--allowedTools" not in argv
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_omitted_under_claude_code_grants_the_preset(self) -> None:
+        options = (await self._run(AgentDef(name="t", prompt="hi"), native_tools="claude_code"))[
+            "options"
+        ]
+
+        assert options.tools == {"type": "preset", "preset": "claude_code"}
+        assert options.permission_mode == "bypassPermissions"
+        assert options.allowed_tools == []
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == "default"
+        assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("native_tools", ["none", "claude_code"])
+    async def test_explicit_empty_grants_nothing_either_way(self, native_tools: str) -> None:
+        options = (
+            await self._run(AgentDef(name="t", prompt="hi", tools=[]), native_tools=native_tools)
+        )["options"]
+
+        assert options.tools == []
+        assert options.permission_mode == "dontAsk"
+        assert options.allowed_tools == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("native_tools", ["none", "claude_code"])
+    async def test_non_empty_tools_refused_either_way(self, native_tools: str) -> None:
+        with pytest.raises(ProviderError, match="does not support workflow tool allowlists"):
+            await self._run(
+                AgentDef(name="t", prompt="hi", tools=["search"]), native_tools=native_tools
+            )
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_skill_only_under_none(self) -> None:
+        options = (
+            await self._run(AgentDef(name="t", prompt="hi"), skill_directories=self._skill_dirs())
+        )["options"]
+
+        assert options.tools == ["Skill"]
+        assert options.permission_mode == "dontAsk"
+        argv = self._argv(options)
+        assert argv[argv.index("--tools") + 1] == "Skill"
+        assert argv[argv.index("--allowedTools") + 1] == "Skill(conductor:conductor)"
+
+    # -- MCP under `none` ------------------------------------------------------
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_mcp_only_agent_gets_exact_server_scoped_rules(self) -> None:
+        """Omitted ``tools:`` + ``none`` + declared servers: MCP-only and usable."""
+        captured = await self._run(
+            AgentDef(name="t", prompt="hi"),
+            mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}},
+        )
+        options = captured["options"]
+
+        assert options.tools == []
+        assert options.permission_mode == "dontAsk"
+        assert options.allowed_tools == ["mcp__docs__*"]
+        assert options.strict_mcp_config is True
+        argv = self._argv(options)
+        assert argv[argv.index("--allowedTools") + 1] == "mcp__docs__*"
+        assert argv[argv.index("--tools") + 1] == ""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_workflow_and_plugin_servers_are_both_covered_after_merge(self) -> None:
+        captured = await self._run(
+            AgentDef(name="t", prompt="hi"),
+            mcp_servers={"workflow-srv": {"type": "stdio", "command": "wf"}},
+            extra_mcp_servers={"plugin-srv": {"type": "stdio", "command": "pl"}},
+        )
+        options = captured["options"]
+
+        assert sorted(options.allowed_tools) == ["mcp__plugin-srv__*", "mcp__workflow-srv__*"]
+        # One rule per server that is actually in the session's config, and
+        # no server in the config without a rule.
+        assert set(captured["mcp_payload"]["mcpServers"]) == {"workflow-srv", "plugin-srv"}
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_mcp_rules_preserve_the_sdk_injected_skill_grant(self) -> None:
+        """Conductor assigns ``allowed_tools``; the SDK appends its ``Skill`` grant
+        to that list. Both must survive into the argv."""
+        options = (
+            await self._run(
+                AgentDef(name="t", prompt="hi"),
+                mcp_servers={"docs": {"type": "stdio", "command": "d"}},
+                skill_directories=self._skill_dirs(),
+            )
+        )["options"]
+
+        argv = self._argv(options)
+        rules = argv[argv.index("--allowedTools") + 1].split(",")
+        assert rules == ["mcp__docs__*", "Skill(conductor:conductor)"]
+        assert options.tools == ["Skill"]
+        assert options.permission_mode == "dontAsk"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_claude_code_adds_no_mcp_rules(self) -> None:
+        """Under ``bypassPermissions`` everything is already approved; widening
+        ``allowed_tools`` there too would only add places that grant access."""
+        options = (
+            await self._run(
+                AgentDef(name="t", prompt="hi"),
+                native_tools="claude_code",
+                mcp_servers={"docs": {"type": "stdio", "command": "d"}},
+            )
+        )["options"]
+
+        assert options.allowed_tools == []
+        assert options.permission_mode == "bypassPermissions"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_mcp_config_stays_strict_and_private(self) -> None:
+        captured = await self._run(
+            AgentDef(name="t", prompt="hi"),
+            mcp_servers={"docs": {"type": "stdio", "command": "d", "env": {"TOKEN": "s3cret"}}},
+        )
+        options = captured["options"]
+
+        assert options.strict_mcp_config is True
+        # A path, never an inline mapping — which would put `env` into argv.
+        assert isinstance(options.mcp_servers, str)
+        assert "s3cret" not in " ".join(self._argv(options))
+        if os.name != "nt":
+            assert captured["mcp_mode"] == 0o600
+        # Reclaimed once the session ends.
+        assert not Path(options.mcp_servers).exists()
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "a__*,Bash",  # delimiter + joiner injection
+            "x,y",  # joiner
+            "a__b",  # the rule's own field delimiter
+            "a_",  # trailing '_' blurs the '__' boundary
+            "_a",
+            "has space",
+            "a*",
+            "a:b",
+            "srv\n",  # a `$`-anchored check would let this through
+        ],
+    )
+    @pytest.mark.parametrize("origin", ["workflow", "plugin"])
+    async def test_unsafe_server_names_fail_closed(self, name: str, origin: str) -> None:
+        queried = False
+
+        async def fake_query(**kwargs):
+            nonlocal queried
+            queried = True
+            yield _result(result="ok")
+
+        server = {name: {"type": "stdio", "command": "c"}}
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(mcp_servers=server if origin == "workflow" else None)
+            with pytest.raises(ProviderError, match="cannot be granted a permission rule") as exc:
+                await provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    tools=[],
+                    extra_mcp_servers=server if origin == "plugin" else None,
+                )
+
+        assert queried is False
+        assert exc.value.is_retryable is False
+        # Refused, not normalised: nothing was granted under a rewritten name.
+        assert exc.value.suggestion is not None
+        assert "Rename" in exc.value.suggestion
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unsafe_name_is_harmless_under_claude_code(self) -> None:
+        """No rule is built under the opt-in, so the name never reaches a
+        delimited permission value — refusing it there would be scope creep."""
+        captured = await self._run(
+            AgentDef(name="t", prompt="hi"),
+            native_tools="claude_code",
+            mcp_servers={"a__b": {"type": "stdio", "command": "c"}},
+        )
+        assert captured["options"].allowed_tools == []
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ["docs"],
+            ["a", "b.c", "d-e", "f_g"],
+            ["x" * 64],
+            ["A1", "zz9.9-9_9"],
+        ],
+    )
+    def test_every_generated_rule_is_anchored_to_one_server(self, names: list[str]) -> None:
+        from conductor.plugins.manifest import MCP_PERMISSION_SAFE_NAME
+
+        rules = ClaudeAgentSdkProvider._mcp_permission_rules(names)
+
+        assert len(rules) == len(names)
+        for name, rule in zip(names, rules, strict=True):
+            match = self._RULE.match(rule)
+            assert match, rule
+            # Anchored to exactly the declared server — not a prefix, not a
+            # wildcard, not a rewritten name.
+            assert match["server"] == name
+            assert MCP_PERMISSION_SAFE_NAME.match(match["server"])
+            assert "*" not in match["server"]
+            assert rule not in {"*", "mcp__*", "mcp__*__*"}
+            assert "," not in rule
+
+    def test_no_servers_means_no_rules(self) -> None:
+        assert ClaudeAgentSdkProvider._mcp_permission_rules([]) == []
+
+    # -- plugin subagents ------------------------------------------------------
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize(
+        ("agent_tools", "cause", "remedy"),
+        [
+            (None, "runs under 'native_tools: none'", "Set 'runtime.provider.native_tools"),
+            ([], "sets 'tools: []'", "Remove 'tools: []' from the agent"),
+        ],
+    )
+    async def test_subagents_refused_without_a_dispatch_tool(
+        self, agent_tools: list[str] | None, cause: str, remedy: str
+    ) -> None:
+        """Two ways in, two remedies — naming the wrong one sends the author to
+        a setting that is not what is denying them."""
+        with pytest.raises(ProviderError) as exc:
+            await self._run(
+                AgentDef(name="t", prompt="hi", tools=agent_tools),
+                custom_agents=[{"name": "p:rev", "description": "R.", "prompt": "R."}],
+            )
+
+        assert cause in str(exc.value)
+        assert exc.value.suggestion is not None
+        assert exc.value.suggestion.startswith(remedy)
+        # Never `agents: false` on its own: with the plugin's skills on, its
+        # root exposes the subagents again and that config is refused too.
+        suggestion = exc.value.suggestion
+        assert "'agents: false' and, if that plugin's skills are enabled" in suggestion
+        assert "'skills: false' as well" in suggestion
+        assert exc.value.is_retryable is False
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_subagents_never_implicitly_enable_the_preset(self) -> None:
+        """The refusal is the whole answer: no code path trades it for the preset."""
+        for agent_tools in (None, []):
+            with pytest.raises(ProviderError, match="unreachable"):
+                ClaudeAgentSdkProvider._resolve_tool_config(
+                    [],
+                    AgentDef(name="t", prompt="hi", tools=agent_tools),
+                    skills_enabled=True,
+                    agents_enabled=True,
+                    native_tools="none",
+                )
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_subagents_allowed_under_claude_code(self) -> None:
+        options = (
+            await self._run(
+                AgentDef(name="t", prompt="hi"),
+                native_tools="claude_code",
+                custom_agents=[{"name": "p:rev", "description": "R.", "prompt": "R."}],
+            )
+        )["options"]
+
+        assert list(options.agents) == ["p:rev"]
+        assert options.tools == {"type": "preset", "preset": "claude_code"}

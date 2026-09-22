@@ -14,7 +14,7 @@ import tempfile
 import time
 import types
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -331,13 +331,33 @@ def _build_output_format(output: dict[str, OutputField]) -> dict[str, Any]:
     }
 
 
-# Default tool preset granted when an agent omits the `tools:` list. This
-# mirrors the SDK's `claude_code` preset (filesystem, bash, web, etc.) — i.e.
-# the same behavior the user gets when running the `claude` CLI directly. It is
-# selected from the RAW ``agent.tools is None`` signal, NOT from the executor's
-# resolved list: for an agent that declares no `tools:`, the executor returns the
-# workflow-tools copy, which is empty only when the workflow declares no `tools:`.
+# Tool preset granted to an agent that omits `tools:` ONLY when the workflow
+# opted in with ``runtime.provider.native_tools: claude_code``. This mirrors the
+# SDK's `claude_code` preset (filesystem, bash, web, etc.) — the same behavior
+# the user gets when running the `claude` CLI directly. It is selected from the
+# RAW ``agent.tools is None`` signal, NOT from the executor's resolved list: for
+# an agent that declares no `tools:`, the executor returns the workflow-tools
+# copy, which is empty only when the workflow declares no `tools:`.
+#
+# The default is ``native_tools: none``, which grants no built-ins at all. An
+# omitted ``tools:`` used to reach this preset implicitly; that made every
+# agent on this provider a filesystem/shell/web agent without the workflow
+# ever saying so.
 _DEFAULT_TOOL_PRESET: dict[str, str] = {"type": "preset", "preset": "claude_code"}
+
+# Built-in Claude Code tools granted to an agent that omits ``tools:``.
+# ``"none"`` is the secure default; ``"claude_code"`` is the explicit opt-in.
+ClaudeNativeTools = Literal["none", "claude_code"]
+
+_NATIVE_TOOLS_VALUES: Final[frozenset[str]] = frozenset({"none", "claude_code"})
+
+# Permission mode paired with an empty built-in tool set. "Deny anything not
+# pre-approved by allow rules" (SDK ``query.py``), which is what makes an
+# MCP-only agent workable without ``bypassPermissions``: the declared servers
+# are pre-approved by name in ``allowed_tools`` and nothing else is. Present in
+# the SDK's ``PermissionMode`` literal since 0.1.51, well below this project's
+# ``claude-agent-sdk>=0.2.82`` floor.
+_DENY_UNAPPROVED_PERMISSION_MODE: Final[str] = "dontAsk"
 
 # Native CLI tool that loads an enabled skill on demand. An explicit
 # ``tools: []`` sends ``--tools ""`` (empty base tool set), which would leave a
@@ -920,10 +940,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``tools:`` filter has no SDK equivalent and is refused.
         mcp_tools=True,
         # Per-agent ``tools: []`` disables all *built-in* tools except the
-        # ``Skill`` loader when skills are enabled; declared MCP servers
-        # still attach (the SDK has no per-request MCP toggle), which
-        # is why the validator rejects ``tools: []`` alongside ``mcp_servers:``
-        # for this provider. Per-agent ``tools: [<names>]`` is refused loudly
+        # ``Skill`` loader when skills are enabled. The SDK has no per-agent
+        # MCP switch, so without an explicit guard declared MCP servers would
+        # attach anyway; Conductor therefore rejects ``tools: []`` whenever
+        # workflow or plugin MCP servers would attach — at ``conductor
+        # validate`` and again at run time, before the MCP configuration is
+        # written or the SDK is invoked. Per-agent ``tools: [<names>]`` is refused loudly
         # at execute time because workflow tool names do not translate to
         # Claude CLI tool IDs.
         # The capability records the strict end of that contract — when the
@@ -1009,12 +1031,30 @@ class ClaudeAgentSdkProvider(AgentProvider):
         setting_sources: Sequence[SettingSource] | None = None,
         *,
         auth_mode: ClaudeAuthMode = "auto",
+        native_tools: ClaudeNativeTools = "none",
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
                 "Claude Agent SDK not installed",
                 suggestion=f"Install with: {install_command('claude-agent-sdk')}",
             )
+
+        # Defensive: the schema constrains this field, but the provider is
+        # constructible directly (the class docstring's own example does it)
+        # and `create_provider` accepts `provider_settings=None`. An
+        # unrecognised value must fail closed rather than fall through a
+        # `== "claude_code"` test into the secure branch by accident and,
+        # worse, read as if the caller's request had been honoured.
+        if native_tools not in _NATIVE_TOOLS_VALUES:
+            raise ProviderError(
+                f"Unknown native_tools value {native_tools!r} for claude-agent-sdk.",
+                suggestion=(
+                    "Use 'none' (no built-in tools; the default) or 'claude_code' "
+                    "(the full Claude Code preset)."
+                ),
+                is_retryable=False,
+            )
+        self._native_tools: ClaudeNativeTools = native_tools
 
         # ``None`` becomes ``[]`` — load nothing ambient. Not cosmetic: the SDK
         # re-defaults an unset ``setting_sources`` to ``["user", "project"]``
@@ -1052,7 +1092,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # directory, so one key under two directories is two sessions.
         self._session_ids: dict[tuple[str, str], str] = {}
         # settings_dir values already warned about for having no `project`
-        # tier, keyed by `(resolved directory, cause)`:
+        # tier, keyed by `(resolved directory, cause, built-in file tools)`:
         #
         # - The directory, not the agent name: the engine renames a for_each
         #   member per item (`<agent>[<key>]`, engine/workflow.py), so any
@@ -1064,15 +1104,19 @@ class ClaudeAgentSdkProvider(AgentProvider):
         #   is a distinct grant the operator needs told about.
         # - Plus the cause, because the remedy below depends on it: two agents
         #   can name the same directory for different reasons, and one line
-        #   would prescribe a fix that is wrong for the other. Bounded at two
-        #   lines per directory.
+        #   would prescribe a fix that is wrong for the other.
+        # - Plus whether the session carries built-in file tools, because that
+        #   decides whether the directory is still a filesystem grant or has no
+        #   effect at all; one line would be false for the other agent. With
+        #   the cause, bounded at four lines per directory.
         #
         # The residual cost, accepted: two agents naming the same directory
-        # for the SAME reason warn once, naming only the first. The remedy is
-        # then identical for both, so the second line would add nothing.
+        # for the SAME reason under the SAME tool policy warn once, naming only
+        # the first. The message is then identical for both, so the second
+        # line would add nothing.
         #
         # Matches the `_warned` convention in claude.py and engine/workflow.py.
-        self._settings_dir_tier_warned: set[tuple[str, bool]] = set()
+        self._settings_dir_tier_warned: set[tuple[str, bool, bool]] = set()
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
         # session the first still has open — see :meth:`_claim_session_slot`.
@@ -1630,51 +1674,6 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # from the context rather than re-derived so the two cannot diverge.
         effective_sources: list[SettingSource] = list(auth_context.setting_sources)
 
-        # A settings_dir whose `project` tier is not enabled discovers no
-        # skills -- and the filesystem grant applies anyway, so the one effect
-        # the author did not ask for is the only one they get.
-        # ``conductor validate`` warns about this, but ``conductor run`` never
-        # calls the static validator, so without this the run is silent about
-        # a no-op the author is relying on. Warned rather than raised, matching
-        # validate's own choice: the workflow is not wrong, just ineffective.
-        opted_out = agent.skills == []
-        if (
-            agent.settings_dir is not None
-            and "project" not in effective_sources
-            and (agent.settings_dir, opted_out) not in self._settings_dir_tier_warned
-        ):
-            self._settings_dir_tier_warned.add((agent.settings_dir, opted_out))
-            # The remedy depends on the cause, as it does in
-            # config/validator.py: telling an author to add 'project' when
-            # their own `skills: []` is what zeroed the tier sends them to add
-            # a value that is already there, and the warning keeps firing.
-            #
-            # The other arm covers two of validator.py's causes at once -- a
-            # missing tier, and a per-agent provider override, where the tier
-            # cannot be enabled at all because the schema accepts
-            # `setting_sources` only when `runtime.provider` is
-            # 'claude-agent-sdk'. The provider does not know the
-            # workflow-level provider name, so the wording names the
-            # requirement rather than prescribing an edit that would be
-            # refused on that path.
-            remedy = (
-                "This agent's own 'skills: []' opts it out of the settings tiers "
-                "entirely; remove it to let the tier apply"
-                if opted_out
-                else "Enable the 'project' tier via runtime.provider.setting_sources, "
-                "which requires runtime.provider itself to be 'claude-agent-sdk'"
-            )
-            logger.warning(
-                "Agent '%s' sets settings_dir=%r but its session does not enable the "
-                "'project' settings tier, so no skills are discovered from that "
-                "directory. The directory is still granted to the model's built-in "
-                "file tools. %s, or remove settings_dir if the filesystem grant was "
-                "not intended.",
-                agent.name,
-                agent.settings_dir,
-                remedy,
-            )
-
         sdk_tools, permission_mode = self._resolve_tool_config(
             tools,
             agent,
@@ -1687,6 +1686,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # the model would be shown the skill and hold no tool to invoke it.
             skills_enabled=bool(skill_names) or bool(effective_sources),
             agents_enabled=bool(custom_agents),
+            native_tools=self._native_tools,
+        )
+
+        self._warn_settings_dir_without_project_tier(
+            agent,
+            effective_sources,
+            # Read off what is actually being sent, not re-derived from the
+            # settings, so the wording cannot drift from the session. Only the
+            # full preset carries built-in file tools; `[]` and `["Skill"]`
+            # carry none.
+            builtin_file_tools=sdk_tools == _DEFAULT_TOOL_PRESET,
         )
 
         session_key = agent.session_key
@@ -1747,14 +1757,20 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=auth_context.resolved_cwd,
-            # The authored ``settings_dir`` and nothing else. Two effects,
-            # and the order matters because the second is easy to miss.
+            # The authored ``settings_dir`` and nothing else. Always passed
+            # when ``settings_dir`` is set, but both of its effects are
+            # conditional, and the first is easy to miss.
             #
-            # (1) UNCONDITIONAL: per the SDK's own contract this is
-            #     "additional directories Claude can access beyond the current
-            #     working directory", so this line widens the model's built-in
-            #     Read/Edit/Bash to that tree with no settings tier enabled at
-            #     all (measured). It does NOT widen what an MCP server permits.
+            # (1) CONDITIONAL on the session having built-in file tools: per
+            #     the SDK's own contract this is "additional directories
+            #     Claude can access beyond the current working directory", so
+            #     it widens the model's built-in Read/Edit/Bash to that tree
+            #     with no settings tier enabled at all (measured) -- which
+            #     today means an agent that omits ``tools:`` under
+            #     ``native_tools: claude_code``. Under ``native_tools: none``
+            #     or an explicit ``tools: []`` there is no built-in file tool
+            #     to use the directory. It never widens what an MCP server
+            #     permits.
             #
             # (2) CONDITIONAL on ``setting_sources`` enabling the ``project``
             #     tier: the directory's ``.claude/skills`` become listed and
@@ -1884,8 +1900,36 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 refuse_mcp_server_clashes(translated, session_servers)
                 session_servers.update(translated)
             if session_servers:
+                # Every refusal below happens BEFORE the secrets file exists
+                # and before the SDK is invoked: a configuration that is going
+                # to be refused must not first write resolved credentials to
+                # disk, even though the finally would reclaim them.
+                self._refuse_explicit_no_tools_with_mcp(agent, session_servers)
+                # Pre-approve the declared servers when nothing else is.
+                # ``dontAsk`` denies whatever no allow rule covers, and an MCP
+                # tool is not a built-in, so without this an MCP-only agent
+                # would attach its servers and then be refused every call.
+                # Computed *here*, after the plugin merge, so a plugin's own
+                # servers are covered by exactly the same rule shape as the
+                # workflow's — and before the write, since it also validates
+                # every server name.
+                #
+                # Not needed under ``bypassPermissions`` (everything is already
+                # approved), and deliberately not added there: the narrower the
+                # set of places that widen permissions, the better.
+                mcp_rules = (
+                    self._mcp_permission_rules(session_servers)
+                    if permission_mode == _DENY_UNAPPROVED_PERMISSION_MODE
+                    else None
+                )
                 mcp_config_path = _write_mcp_config(session_servers)
                 options.mcp_servers = mcp_config_path
+                if mcp_rules is not None:
+                    # Assigned, not appended to: the SDK copies this list and
+                    # appends its own ``Skill`` / ``Skill(<name>)`` grants
+                    # (``_internal/transport/subprocess_cli.py``), so those
+                    # survive. Conductor sets nothing else on this option.
+                    options.allowed_tools = mcp_rules
 
             # Signal "awaiting model" before entering the SDK iterator: the
             # SDK is about to make the first model call. Dashboards use this
@@ -2247,6 +2291,184 @@ class ClaudeAgentSdkProvider(AgentProvider):
             logger.debug("Session lookup failed for %s under %s", session_id, cwd, exc_info=True)
             return False
 
+    def _warn_settings_dir_without_project_tier(
+        self,
+        agent: AgentDef,
+        effective_sources: Sequence[SettingSource],
+        *,
+        builtin_file_tools: bool,
+    ) -> None:
+        """Warn that a ``settings_dir`` discovers no skills, and say what it does do.
+
+        A settings_dir whose ``project`` tier is not enabled discovers no
+        skills. ``conductor validate`` warns about this, but ``conductor run``
+        never calls the static validator, so without this the run is silent
+        about a no-op the author is relying on. Warned rather than raised,
+        matching validate's own choice: the workflow is not wrong, just
+        ineffective.
+
+        What the directory *still* does depends on the agent's tool policy.
+        ``add_dirs`` widens the CLI's built-in file tools, so under the
+        ``claude_code`` preset the filesystem grant is the one effect the
+        author did not ask for and the only one they get. With no built-in
+        tools — ``native_tools: none``, or the agent's own ``tools: []`` —
+        there is no file tool for the grant to widen, and claiming otherwise
+        would send the author to remove a grant that has no effect.
+
+        Args:
+            agent: The agent being executed.
+            effective_sources: The session's settings tiers.
+            builtin_file_tools: Whether the session's tool set is the
+                ``claude_code`` preset, the only one carrying file tools.
+        """
+        if agent.settings_dir is None or "project" in effective_sources:
+            return
+        opted_out = agent.skills == []
+        key = (agent.settings_dir, opted_out, builtin_file_tools)
+        if key in self._settings_dir_tier_warned:
+            return
+        self._settings_dir_tier_warned.add(key)
+        # The remedy depends on the cause, as it does in config/validator.py:
+        # telling an author to add 'project' when their own `skills: []` is
+        # what zeroed the tier sends them to add a value that is already
+        # there, and the warning keeps firing.
+        #
+        # The other arm covers two of validator.py's causes at once -- a
+        # missing tier, and a per-agent provider override, where the tier
+        # cannot be enabled at all because the schema accepts
+        # `setting_sources` only when `runtime.provider` is
+        # 'claude-agent-sdk'. The provider does not know the workflow-level
+        # provider name, so the wording names the requirement rather than
+        # prescribing an edit that would be refused on that path.
+        remedy = (
+            "This agent's own 'skills: []' opts it out of the settings tiers "
+            "entirely; remove it to let the tier apply"
+            if opted_out
+            else "Enable the 'project' tier via runtime.provider.setting_sources, "
+            "which requires runtime.provider itself to be 'claude-agent-sdk'"
+        )
+        if builtin_file_tools:
+            logger.warning(
+                "Agent '%s' sets settings_dir=%r but its session does not enable the "
+                "'project' settings tier, so no skills are discovered from that "
+                "directory. The directory is still granted to the model's built-in "
+                "file tools (native_tools: claude_code). %s, or remove settings_dir "
+                "if the filesystem grant was not intended.",
+                agent.name,
+                agent.settings_dir,
+                remedy,
+            )
+            return
+        # Fixed literals chosen by code, never a runtime value: `logger` does
+        # no markup parsing, and this keeps the message shape stable anyway.
+        policy = "its explicit 'tools: []'" if agent.tools == [] else "'native_tools: none'"
+        logger.warning(
+            "Agent '%s' sets settings_dir=%r but its session does not enable the "
+            "'project' settings tier, so no skills are discovered from that "
+            "directory. Under %s the agent has no built-in file tool that could "
+            "use the directory either, so settings_dir currently has no effect. "
+            "%s, or remove settings_dir.",
+            agent.name,
+            agent.settings_dir,
+            policy,
+            remedy,
+        )
+
+    @staticmethod
+    def _refuse_explicit_no_tools_with_mcp(
+        agent: AgentDef, session_servers: Mapping[str, Any]
+    ) -> None:
+        """Refuse an explicit ``tools: []`` on an agent that would get MCP servers.
+
+        The run-time half of ``config/validator.py::_check_agent_tools``, which
+        rejects the same combination at ``conductor validate`` — but
+        ``conductor run`` never calls the validator, and without this the
+        provider would attach every server and, under ``dontAsk``, pre-approve
+        it: exactly the tools the agent declared it does not have.
+
+        Checked against the *merged* map, so a plugin's servers count as well
+        as the workflow's, and under either ``native_tools`` value: an explicit
+        opt-out is the agent's own statement and no workflow setting widens it.
+        An omitted ``tools:`` is not refused — under ``native_tools: none``
+        that is the supported MCP-only configuration.
+
+        Raises:
+            ProviderError: If ``agent.tools == []`` and ``session_servers`` is
+                non-empty.
+        """
+        if agent.tools != [] or not session_servers:
+            return
+        names = ", ".join(repr(name) for name in session_servers)
+        raise ProviderError(
+            f"Agent '{agent.name}' sets 'tools: []' (no tools), but MCP servers "
+            f"would still attach to its session ({names}). This provider has no "
+            f"per-agent switch for MCP servers, so the agent would run with tools "
+            f"it declared it does not have.",
+            suggestion=(
+                "Remove 'tools: []' so the agent omits 'tools:' (under the default "
+                "'native_tools: none' it then gets the MCP servers and no built-in "
+                "tools), or remove the MCP servers — from 'runtime.mcp_servers', or "
+                "with 'mcp: false' on the plugin that ships them."
+            ),
+            is_retryable=False,
+        )
+
+    @staticmethod
+    def _mcp_permission_rules(server_names: Iterable[str]) -> list[str]:
+        """Server-scoped ``allowed_tools`` rules for the declared MCP servers.
+
+        With no built-in tools the session runs under ``dontAsk``, which denies
+        anything not pre-approved. MCP tools are not built-ins and would be
+        denied too, so each *declared* server is pre-approved by name —
+        ``mcp__<server>__*``, the CLI's own server-scoped rule shape. Nothing
+        broader is ever produced: there is no ``*``, no ``mcp__*``, and no rule
+        that is not anchored to one literal server name, so a server the
+        workflow did not declare cannot be reached even if the CLI somehow
+        attached it (``strict_mcp_config=True`` already stops that).
+
+        The name is validated rather than escaped. ``__`` is the rule's own
+        field delimiter and ``,`` joins rules into one ``--allowedTools``
+        value, so a name carrying either would silently split into extra
+        rules — ``a__*,Bash`` would add a rule of its own, and ``a__b`` would
+        read as server ``a``. :data:`~conductor.plugins.manifest.MCP_PERMISSION_SAFE_NAME`
+        is the repository's plugin/skill ``SAFE_NAME`` charset tightened for
+        this rule's delimiter; the validator uses the same pattern, so
+        ``conductor validate`` and ``conductor run`` refuse the same names. A
+        name outside it fails closed: normalising it silently would mean the
+        rule no longer names the server the workflow declared.
+
+        Args:
+            server_names: Keys of the merged workflow + plugin MCP server map.
+
+        Returns:
+            One ``mcp__<server>__*`` rule per server, in input order.
+
+        Raises:
+            ProviderError: If a server name cannot form an unambiguous rule.
+        """
+        from conductor.plugins.manifest import MCP_PERMISSION_SAFE_NAME
+
+        rules: list[str] = []
+        for name in server_names:
+            if not MCP_PERMISSION_SAFE_NAME.match(name):
+                raise ProviderError(
+                    f"MCP server name {name!r} cannot be granted a permission rule "
+                    f"on claude-agent-sdk. With no built-in tools each declared "
+                    f"server is pre-approved as 'mcp__<server>__*', and these rules "
+                    f"are delimited by '__' and joined with ',', so this name could "
+                    f"split into a rule naming a different server or granting tools "
+                    f"the workflow never declared.",
+                    suggestion=(
+                        "Rename the server using only letters, digits, '.', '-' and "
+                        "single '_' characters, not starting or ending with '_'. It "
+                        "is declared in 'runtime.mcp_servers' or by a plugin that "
+                        "ships it."
+                    ),
+                    is_retryable=False,
+                )
+            rules.append(f"mcp__{name}__*")
+        return rules
+
     @staticmethod
     def _resolve_tool_config(
         tools: list[str] | None,
@@ -2254,6 +2476,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         *,
         skills_enabled: bool,
         agents_enabled: bool = False,
+        native_tools: ClaudeNativeTools = "none",
     ) -> tuple[Any, str | None]:
         """Resolve the SDK ``tools`` and ``permission_mode`` for an agent.
 
@@ -2274,15 +2497,29 @@ class ClaudeAgentSdkProvider(AgentProvider):
         Semantics:
 
         * ``tools`` empty (``[]`` or ``None``) and ``agent.tools is None`` —
-          the agent omitted ``tools:``. Fall back to the ``claude_code``
-          preset (filesystem, bash, web) and bypass permissions, matching
-          what the user gets from the bare ``claude`` CLI.
+          the agent omitted ``tools:``. What that grants is the workflow's
+          choice, not a default of this provider: ``native_tools="none"``
+          (the default) grants no built-ins, exactly as an explicit
+          ``tools: []`` does; ``native_tools="claude_code"`` grants the full
+          preset (filesystem, bash, web) and bypasses permissions, matching
+          what the user gets from the bare ``claude`` CLI. The preset used to
+          be unconditional here, which made every agent on this provider a
+          filesystem/shell/web agent without the workflow ever saying so.
         * ``tools`` empty and ``agent.tools == []`` — explicit "no tools"
-          request. Pass an empty list to the SDK so all tools are disabled.
-          Drop the permission bypass because there are no tools to permit.
-          When skills are enabled, grant the ``Skill`` tool back: an empty
-          base tool set would otherwise leave the declared skill unreachable,
-          silently ignoring the ``skills:`` the workflow asked for.
+          request. Pass an empty list to the SDK so all tools are disabled,
+          regardless of ``native_tools``: an explicit opt-out outranks a
+          workflow-level grant. When skills are enabled, grant the ``Skill``
+          tool back: an empty base tool set would otherwise leave the declared
+          skill unreachable, silently ignoring the ``skills:`` the workflow
+          asked for.
+
+        Both no-built-ins paths return ``"dontAsk"`` rather than ``None``.
+        ``None`` leaves the CLI on its ``default`` mode, which *prompts* for
+        anything unapproved — and a workflow run is non-interactive, so a
+        prompt is a hang rather than a question. ``"dontAsk"`` denies instead,
+        and the declared MCP servers are pre-approved by name through
+        ``allowed_tools`` (see :meth:`_mcp_permission_rules`), which is what
+        keeps an MCP-driven agent working with no built-in tools at all.
         * ``tools`` non-empty — raise ``ProviderError``. Workflow tool
           name → CLI tool ID translation is not implemented (tracked as
           a follow-up). Silently dropping the allowlist would be a
@@ -2302,26 +2539,36 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 to an explicit ``tools: []`` as its one carve-out. Without the
                 tool the CLI shows the model no skill listing at all, so a
                 tier would discover skills that can never be reached.
+            agents_enabled: Whether this agent's plugins ship subagents. With
+                no built-in tools there is no dispatch tool to reach them, so
+                this is refused rather than silently registering unreachable
+                subagents.
+            native_tools: ``runtime.provider.native_tools``. Governs the
+                omitted-``tools:`` case only.
 
         Returns:
             A ``(sdk_tools, permission_mode)`` tuple suitable for
             ``ClaudeAgentOptions``.
 
         Raises:
-            ProviderError: If ``tools`` is a non-empty list.
+            ProviderError: If ``tools`` is a non-empty list, or if the agent
+                would end up with no dispatch tool for its plugin subagents.
         """
         if not tools:
             # The executor passes [] for BOTH "omitted (no workflow tools to
             # inherit)" and explicit "tools: []". Disambiguate via the raw
             # per-agent field, which the executor's resolution erased.
-            if agent.tools is None:
-                # Omitted -> default claude_code preset (filesystem/bash/web).
+            if agent.tools is None and native_tools == "claude_code":
+                # Explicitly opted in -> claude_code preset (filesystem/bash/
+                # web) with permissions auto-approved.
                 return _DEFAULT_TOOL_PRESET, "bypassPermissions"
-            # Explicit `tools: []` -> no tools, no permission bypass. The
-            # Skill tool is the one exception, and only when skills are on:
-            # it loads declared skill content and grants nothing else. The
-            # SDK auto-allows it via `Skill(<name>)` in allowed_tools, so it
-            # does not need the permission bypass either.
+            # Everything else -> no built-in tools. Either the agent asked for
+            # that with `tools: []`, or the workflow left `native_tools` at
+            # its secure default. The Skill tool is the one exception, and
+            # only when skills are on: it loads declared skill content and
+            # grants nothing else. The SDK auto-allows it via `Skill(<name>)`
+            # in allowed_tools, so it needs no permission bypass.
+            explicit_opt_out = agent.tools is not None
             if agents_enabled:
                 # `--tools ""` leaves the model no tool to dispatch with, so
                 # the registered subagents would be unreachable — the same
@@ -2329,30 +2576,55 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 # `Skill`, this SDK exposes no verifiable identifier for the
                 # dispatch tool, so there is nothing to grant back; guessing
                 # a name is what this provider refuses to do elsewhere.
+                #
+                # Reached from two directions now, and the remedy differs:
+                # an explicit `tools: []` is the agent's own opt-out, while
+                # the default `native_tools: none` is workflow-level. Naming
+                # the wrong one sends the author to a setting that is not
+                # what is denying them.
+                cause = (
+                    "sets 'tools: []'"
+                    if explicit_opt_out
+                    else "runs under 'native_tools: none' (the default)"
+                )
+                remedy = (
+                    "Remove 'tools: []' from the agent and set "
+                    "'runtime.provider.native_tools: claude_code'"
+                    if explicit_opt_out
+                    else "Set 'runtime.provider.native_tools: claude_code'"
+                )
                 raise ProviderError(
-                    f"Agent '{agent.name}' sets 'tools: []' while its plugins ship "
-                    f"subagents. An empty tool set leaves the model no way to dispatch "
+                    f"Agent '{agent.name}' {cause} while its plugins ship subagents. "
+                    f"An empty built-in tool set leaves the model no way to dispatch "
                     f"to them, so they would be registered and unreachable.",
+                    # `agents: false` alone is not enough on this provider:
+                    # reaching a plugin's skills means registering its root,
+                    # which exposes its subagents again (the carve-out
+                    # config/validator.py refuses). So the remedy names both
+                    # switches rather than one that would be rejected next.
                     suggestion=(
-                        "Omit 'tools:' to grant the full claude_code preset, set "
-                        "'agents: false' on the plugins, or run this agent on "
-                        "'copilot'."
+                        f"{remedy} to grant the full claude_code preset; or disable "
+                        "the plugin's subagents with 'agents: false' and, if that "
+                        "plugin's skills are enabled, 'skills: false' as well "
+                        "(registering the plugin root for its skills exposes its "
+                        "subagents again); or run this agent on 'copilot'."
                     ),
                     is_retryable=False,
                 )
             if skills_enabled:
-                return [_SKILL_TOOL], None
-            return [], None
+                return [_SKILL_TOOL], _DENY_UNAPPROVED_PERMISSION_MODE
+            return [], _DENY_UNAPPROVED_PERMISSION_MODE
         raise ProviderError(
             f"Agent '{agent.name}' resolves to tools={tools!r} (declared on "
             "the agent or inherited from the workflow-level 'tools:' list), "
             "but claude-agent-sdk does not support workflow tool allowlists "
             "(workflow tool names do not translate to Claude CLI tool IDs).",
             suggestion=(
-                "Omit both the per-agent and workflow-level 'tools:' to grant "
-                "the full claude_code preset, or set 'tools: []' to disable "
-                "every built-in tool (bar the Skill loader when the agent "
-                "declares skills)."
+                "Remove both the per-agent and workflow-level 'tools:'. Built-in "
+                "tools are selected by 'runtime.provider.native_tools' "
+                "('none' by default, 'claude_code' for the full preset), and "
+                "'tools: []' disables every built-in tool (bar the Skill loader "
+                "when the agent declares skills)."
             ),
         )
 

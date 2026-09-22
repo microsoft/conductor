@@ -405,14 +405,17 @@ Because paths are normalized lexically instead of resolving to their real paths:
 ### Target-Repository Skills (`settings_dir`)
 
 `settings_dir` names a second directory whose `.claude/skills` the agent may
-use, and whose tree the model's built-in file tools may read. It carries the
-*skills* third of a Claude Code `project` settings tier and nothing else of it
-— the table below is exact about which — and the filesystem half applies
-whether or not any tier is enabled. It applies only to `claude-agent-sdk` agents.
+use, and whose tree the model's built-in file tools may read **when the agent
+has them** (`native_tools: claude_code`). It carries the *skills* third of a
+Claude Code `project` settings tier and nothing else of it — the table below is
+exact about which — and the filesystem half, where it applies, does not depend
+on any tier being enabled. It applies only to `claude-agent-sdk` agents.
 Setting it against any other provider is an **error**, reported by `conductor
 validate` and again at run time — not a silently dropped field. The skills half
 additionally requires `runtime.provider.setting_sources` to enable the `project`
-tier; the filesystem grant below applies either way.
+tier. The filesystem half requires built-in file tools: under the default
+`native_tools: none`, or an agent's own `tools: []`, there are none for the
+grant to widen — see [Native Tools](#native-tools-native_tools).
 
 ```yaml
 workflow:
@@ -459,7 +462,7 @@ Measured against the CLI:
 
 | Named via `settings_dir` | Granted? |
 |---|---|
-| **Filesystem access for the model's built-in tools** (`Read`, `Edit`, `Bash`, …) | **yes — unconditionally**, see below |
+| **Filesystem access for the model's built-in tools** (`Read`, `Edit`, `Bash`, …) | **yes, whenever the agent has built-in file tools** (`native_tools: claude_code`, `tools:` omitted) — independent of any settings tier; none under `native_tools: none` or `tools: []`. See below |
 | `.claude/skills` | **yes** — listed and invocable |
 | `CLAUDE.md` | no |
 | `.claude/rules/*.md` | no |
@@ -475,17 +478,23 @@ Measured against the CLI:
 > `permission_mode: "default"` with `setting_sources` unset: a read outside
 > cwd is refused without `settings_dir` and succeeds with it. (Later CLI
 > builds no longer accept that mode by name; Conductor never passes it
-> explicitly, so the reproduction needs the version above.) Note an agent that omits `tools:` runs
-> under `bypassPermissions`, where reads already succeed everywhere, so the
-> grant only becomes observable once permissions are in play.
+> explicitly, so the reproduction needs the version above.) Under
+> `native_tools: claude_code`, an agent that omits `tools:` runs under
+> `bypassPermissions`, where reads already succeed everywhere, so the grant
+> only becomes observable once permissions are in play. Under the default
+> `native_tools: none` the agent has no built-in file tools for the grant to
+> widen at all — see [Native Tools](#native-tools-native_tools).
 >
-> Skill discovery is the *reason* to set this field; the filesystem grant is
-> its unavoidable companion. Point it at a directory the agent is entitled to
-> read.
+> Skill discovery is the *reason* to set this field; whenever the agent has
+> built-in file tools, the filesystem grant is its unavoidable companion. Point
+> it at a directory the agent is entitled to read.
 >
 > `conductor validate` warns when `settings_dir` is set without the `project`
-> tier enabled, and so does the run itself — otherwise the only effect an
-> author would get is the one they did not ask for.
+> tier enabled, and so does the run itself. The warning names what the
+> directory still does for that agent: under `native_tools: claude_code` it
+> remains a grant to the built-in file tools — the one effect the author did
+> not ask for — while under `native_tools: none` or an explicit `tools: []` it
+> has no effect at all, since there is no built-in file tool to use it.
 
 Note this grant is for the model's **built-in** tools only. It does not widen
 what a filesystem MCP server permits — that stays cwd alone, which is the
@@ -687,6 +696,104 @@ See the [Authentication](providers/experimental.md#authentication-claude-agent-s
 section of the experimental-providers guide and the
 [configuration guide](configuration.md#field-compatibility-by-provider) for
 field compatibility across providers.
+
+### Native Tools (`native_tools`)
+
+`runtime.provider.native_tools` selects which **built-in** Claude Code tools a
+`claude-agent-sdk` agent receives when it omits `tools:`. It is valid only for
+`claude-agent-sdk`; every other provider rejects it.
+
+```yaml
+runtime:
+  provider:
+    name: claude-agent-sdk
+    native_tools: claude_code   # or: none (the default)
+```
+
+| Value | Meaning |
+|---|---|
+| `none` (default) | No built-in tools: no filesystem read/write, no shell, no web, no editing. Unapproved tool calls are denied rather than prompted for. |
+| `claude_code` | The full Claude Code preset, with permissions **approved automatically**. |
+
+The bare `provider: claude-agent-sdk` shorthand, an omitted `native_tools`, and
+YAML `native_tools: null` / `~` all mean `none`.
+
+How it combines with an agent's `tools:`:
+
+| Agent `tools:` | `native_tools` | Built-in tools | Permissions |
+|---|---|---|---|
+| omitted | `none` | none — except `Skill` when the agent has skills | unapproved calls denied |
+| omitted | `claude_code` | full `claude_code` preset | all approved automatically |
+| `[]` | either | none — except `Skill` when the agent has skills | unapproved calls denied |
+| non-empty list | either | refused — workflow tool names are not Claude tool IDs | — |
+
+`native_tools` is **not** a tool allowlist: it only decides what an omitted
+`tools:` means. An explicit `tools: []` always wins, so `claude_code` cannot
+reopen tools an agent turned off.
+
+> ⚠️ **`claude_code` is a broad grant.** It gives the agent filesystem
+> read/write, shell execution, web access and editing with no interactive
+> approval. `working_dir` only decides where relative paths resolve — it is
+> **not a sandbox**. Enable it only for workflows trusted with the machine
+> they run on. The experimental-provider banner prints a one-line warning to
+> this effect, once per run (suppressed by `--silent` like the banner itself).
+
+**MCP servers.** `runtime.mcp_servers` work under both values. Under `none`,
+each declared server — from `runtime.mcp_servers` or from a plugin — is
+pre-approved by exactly one rule, `mcp__<server>__*`, and nothing broader, so an
+agent can be MCP-only with no built-in tools at all (see
+[`examples/claude-agent-sdk-mcp.yaml`](../examples/claude-agent-sdk-mcp.yaml)).
+Two limitations follow:
+
+- Server names must use only letters, digits, `.`, `-` and single `_`
+  characters, and must not start or end with `_`. The name is embedded in a
+  `__`-delimited, comma-joined permission rule, so any other name is refused
+  (at `conductor validate` and at run time) rather than rewritten.
+- An MCP tool that requires interactive user approval may be denied, since a
+  workflow run has nobody to answer a prompt.
+
+Declaring `tools: []` on an agent that would get MCP servers — from
+`runtime.mcp_servers` or its plugins — is refused at `conductor validate` and
+again at run time, before any server config is written: the servers would still
+attach while the agent claims to have no tools. For an MCP-only agent, omit
+`tools:`.
+
+**Plugin subagents.** A plugin that ships subagents needs a dispatch tool,
+which only `claude_code` provides. Under `none` — or with an explicit
+`tools: []` — the subagents would be registered but unreachable, so the
+combination is refused at `conductor validate` and again before the run starts.
+The remedies are:
+
+- set `native_tools: claude_code`; or
+- disable the plugin's subagents with `agents: false` — **and**, if that
+  plugin's skills are enabled, `skills: false` as well. Reaching a plugin's
+  skills on this provider means registering its root, which exposes its
+  subagents again, so `agents: false` on its own is refused while the skills
+  are on (see [Plugins](#plugins)); or
+- run the agent on `copilot`.
+
+Subagents never enable the preset implicitly.
+
+**Migrating.** Before this setting existed, omitting `tools:` granted the full
+preset implicitly. A workflow that relied on that — an agent that reads files,
+runs commands or edits code — must now opt in:
+
+```yaml
+# Before: filesystem/shell/web tools were granted implicitly.
+runtime:
+  provider: claude-agent-sdk
+
+# After: the same tools, requested explicitly.
+runtime:
+  provider:
+    name: claude-agent-sdk
+    native_tools: claude_code
+```
+
+Without the opt-in such a workflow still validates, but its agents run with no
+built-in tools and will report that they could not read or change anything.
+Checkpoints and configurations written before the field existed also resolve
+to `none` on `conductor resume`.
 
 ### Sandbox Configuration (ACA)
 

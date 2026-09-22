@@ -381,12 +381,16 @@ HTTP and SSE servers are not supported with the Claude provider. If configured, 
 
 ### Claude Agent SDK Provider
 
-The Claude Agent SDK provider translates each server into the SDK's own MCP config shape and passes it to the `claude` CLI, which owns server lifecycle and tool execution. All three transport types are supported, and MCP tools attach *alongside* the built-in `claude_code` tool preset — see [`examples/claude-agent-sdk-mcp.yaml`](../examples/claude-agent-sdk-mcp.yaml).
+The Claude Agent SDK provider translates each server into the SDK's own MCP config shape and passes it to the `claude` CLI, which owns server lifecycle and tool execution. All three transport types are supported. Whether MCP tools are an agent's *only* tools or attach alongside the built-in Claude Code tools depends on `runtime.provider.native_tools`: under the default `none` an agent that omits `tools:` has MCP tools and nothing else — see [`examples/claude-agent-sdk-mcp.yaml`](../examples/claude-agent-sdk-mcp.yaml) — while `native_tools: claude_code` adds the full built-in preset (filesystem, shell, web, editing) with automatic approval.
 
-Two behaviors are specific to this provider:
+Behaviors specific to this provider:
 
 - **Per-server `tools:` filters are refused.** The SDK's MCP config has no equivalent field, so a narrowing filter cannot be enforced. Rather than forward the server unfiltered — granting more tools than the workflow declared — Conductor raises a `ProviderError` the first time an agent on this provider runs. Note `conductor validate` does not catch this today. Keep the default `tools: ["*"]`.
 - **Only declared servers are reachable.** Conductor sets `strict_mcp_config`, so a project `.mcp.json` or user-global MCP setting cannot add servers the workflow never declared.
+- **Declared servers are pre-approved by name under `native_tools: none`.** With no built-in tools the session runs in the CLI's `dontAsk` permission mode, which denies anything not pre-approved, so each declared server — from `runtime.mcp_servers` or from a plugin — gets exactly one rule, `mcp__<server>__*`. Nothing broader (`*`, `mcp__*`) is ever granted. Two consequences:
+  - Server names must use only letters, digits, `.`, `-` and single `_` characters, not starting or ending with `_`. A name is embedded in a `__`-delimited, comma-joined permission rule, so anything else could split into a rule naming a different server or granting undeclared tools; it is refused at `conductor validate` and at run time rather than rewritten.
+  - An MCP tool that itself requires interactive user approval may be **denied**, since a workflow run has nobody to answer a prompt. Conductor does not fall back to `bypassPermissions` to avoid this.
+- **An explicit `tools: []` on an agent that would get MCP servers is refused** — by `conductor validate`, and again by `conductor run` before any server config is written or the session starts — because the servers would still attach while the agent claims to have no tools. This covers servers from `runtime.mcp_servers` and from the agent's plugins, under either `native_tools` value. For an MCP-only agent, omit `tools:` and leave `native_tools` at `none`.
 
 The generated config is written to a `0600` temp file and passed to the CLI by path, so resolved `env` values and `Authorization` headers stay out of the process command line. A fresh file is written and deleted per agent execution.
 

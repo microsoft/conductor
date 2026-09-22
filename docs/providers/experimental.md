@@ -101,7 +101,7 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` (agents without a `session_key` carry no session state across a resume). Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is empty by default as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited unless a workflow opts in via `runtime.provider.setting_sources` ([#501](https://github.com/microsoft/conductor/issues/501)) — which loads the named tiers **including their hooks**, so only for repositories trusted as much as the workflow. Which directory that `project` tier reads **skills** from is chosen per agent with `settings_dir` (cwd alone governs the CLI's sole MCP root, so the two are deliberately separate) — see [Target-Repository Skills](../workflow-syntax.md#target-repository-skills-settings_dir). Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and the session map survives `conductor resume` — see [Session Continuity](../workflow-syntax.md#session-continuity-session_key). Explicit `auth_mode` values refuse `setting_sources` — see [Authentication](#authentication-claude-agent-sdk). |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` (agents without a `session_key` carry no session state across a resume). Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is empty by default as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited unless a workflow opts in via `runtime.provider.setting_sources` ([#501](https://github.com/microsoft/conductor/issues/501)) — which loads the named tiers **including their hooks**, so only for repositories trusted as much as the workflow. Which directory that `project` tier reads **skills** from is chosen per agent with `settings_dir` (cwd alone governs the CLI's sole MCP root, so the two are deliberately separate) — see [Target-Repository Skills](../workflow-syntax.md#target-repository-skills-settings_dir). Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and the session map survives `conductor resume` — see [Session Continuity](../workflow-syntax.md#session-continuity-session_key). Explicit `auth_mode` values refuse `setting_sources` — see [Authentication](#authentication-claude-agent-sdk). An agent that omits `tools:` gets **no built-in tools** unless the workflow opts in with `runtime.provider.native_tools: claude_code` — see [Native tools](#native-tools-claude-agent-sdk). |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 | `aca` | `azure-identity>=1.19.0` | `(unassigned)` | no `workflow_tools_passthrough` (the wrapped in-container `CopilotProvider` never applies the `tools:` allowlist to the SDK session), no `working_dir` (only the separate, container-relative `sandbox.working_dir` is honored — not the generic host-resolved field), `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
 
@@ -152,6 +152,33 @@ autouse fixture in `tests/conftest.py` stubs the readiness check to ready.
 Tests marked `claude_auth_readiness_mocked` execute the real readiness method
 instead, but must mock process creation themselves — the fixture replaces
 process creation with a guard that fails the test if it is reached.
+
+## Native tools (`claude-agent-sdk`)
+
+`runtime.provider.native_tools` (`"none"` default, `"claude_code"`) selects
+which built-in Claude Code tools an agent that omits `tools:` receives. The
+full contract is in
+[Native Tools](../workflow-syntax.md#native-tools-native_tools). The points
+that bear on this provider's experimental status:
+
+- **Secure by default.** Under `none`, an agent that omits `tools:` has no
+  built-in tools — no filesystem, shell, web or editing — and unapproved tool
+  calls are denied (`dontAsk`) rather than prompted for. This used to be the
+  opposite: omitting `tools:` implicitly granted the full preset.
+- **`claude_code` is an explicit, visible opt-in.** It grants the full preset
+  with permissions approved automatically. `working_dir` scopes where paths
+  resolve and is **not a sandbox**. The experimental-provider banner carries
+  a one-line warning saying so, once per run.
+- **Not an allowlist.** `workflow_tools_passthrough` stays `False`: a
+  non-empty per-agent `tools:` list is still refused in both modes, and an
+  explicit `tools: []` disables every built-in tool in both modes.
+- **MCP-only agents work under `none`.** Each declared MCP server is
+  pre-approved by one server-scoped rule, `mcp__<server>__*`, and nothing
+  broader. Server names that cannot form an unambiguous rule are refused, and
+  an MCP tool that needs interactive approval may be denied.
+- **Plugin subagents need `claude_code`.** With no built-in tools there is no
+  dispatch tool to reach them, so they are refused rather than registered
+  unreachable, at `conductor validate` and again at run time.
 
 ## See also
 

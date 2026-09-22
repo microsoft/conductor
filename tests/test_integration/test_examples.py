@@ -10,6 +10,7 @@ For testing with real LLM providers, run examples manually with the conductor CL
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -342,3 +343,125 @@ class TestSessionKeyExample:
         verify = next(a for a in config.agents if a.name == "verify")
 
         assert "investigate" in {route.to for route in verify.routes}
+
+
+class TestClaudeAgentSdkExamplesNativeTools:
+    """Each shipped claude-agent-sdk example grants each agent exactly what it needs.
+
+    Validation alone cannot catch a regression here: an example that
+    genuinely reads files still *validates* after losing its opt-in, and then
+    fails at run time with an agent that has no Read tool. So the policy is
+    pinned per **agent**, not per example — one workflow-level
+    ``native_tools: claude_code`` must not quietly widen an agent that only
+    summarises text (``setting-sources``'s ``audit``).
+    """
+
+    _EXAMPLES = Path(__file__).parent.parent.parent / "examples"
+
+    #: example -> (workflow native_tools, {agent: expected built-in policy})
+    #:   "preset"  full claude_code preset under bypassPermissions
+    #:   "skill"   the Skill loader only, under dontAsk
+    #:   "none"    no built-in tools at all, under dontAsk
+    _INTENDED: dict[str, tuple[str, dict[str, str]]] = {
+        # Genuinely need filesystem/shell access: explicit opt-in.
+        "claude-agent-sdk-repo-qa.yaml": ("claude_code", {"repo_reader": "preset"}),
+        "claude-agent-sdk-session-key.yaml": (
+            "claude_code",
+            {"investigate": "preset", "summarize": "preset"},
+        ),
+        # `work` edits the target repo; `audit` only summarises upstream text
+        # and opts out with its own `tools: []`.
+        "claude-agent-sdk-setting-sources.yaml": (
+            "claude_code",
+            {"work": "preset", "audit": "none"},
+        ),
+        # MCP-only.
+        "claude-agent-sdk-mcp.yaml": ("none", {"researcher": "none"}),
+        # Skill-only (project tier) plus an MCP server.
+        "claude-agent-sdk-settings-dir.yaml": ("none", {"review": "skill"}),
+        # Prompt-only.
+        "test-claude-agent-sdk.yaml": ("none", {"answerer": "none"}),
+        "experimental-claude-agent-sdk.yaml": ("none", {"analyze": "none", "summarize": "none"}),
+    }
+
+    _POLICIES: dict[str, tuple[Any, str]] = {
+        "preset": ({"type": "preset", "preset": "claude_code"}, "bypassPermissions"),
+        "skill": (["Skill"], "dontAsk"),
+        "none": ([], "dontAsk"),
+    }
+
+    @staticmethod
+    def _skills_enabled(config: Any, agent: Any) -> bool:
+        """Mirror of ``execute``: declared skills, or a settings tier the agent
+        has not opted out of with ``skills: []``."""
+        tiers = config.workflow.runtime.provider.setting_sources or []
+        effective_tiers = [] if agent.skills == [] else tiers
+        declared = agent.skills if agent.skills is not None else config.workflow.runtime.skills
+        return bool(declared) or bool(effective_tiers)
+
+    @pytest.mark.parametrize(("name", "intended"), sorted(_INTENDED.items()))
+    def test_each_agent_resolves_to_its_intended_policy(
+        self, name: str, intended: tuple[str, dict[str, str]]
+    ) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.config.schema import AgentDef
+        from conductor.config.validator import validate_workflow_config
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        native_tools, per_agent = intended
+        path = self._EXAMPLES / name
+        config = load_config(path)
+        validate_workflow_config(config, workflow_path=path)
+
+        assert config.workflow.runtime.provider.native_tools == native_tools
+
+        agents = {
+            a.name: a
+            for a in config.agents
+            if isinstance(a, AgentDef) and a.type in (None, "agent")
+        }
+        # Every provider-backed agent is classified, and nothing extra.
+        assert set(agents) == set(per_agent), name
+
+        for agent_name, policy in per_agent.items():
+            agent = agents[agent_name]
+            sdk_tools, mode = ClaudeAgentSdkProvider._resolve_tool_config(
+                [],
+                agent,
+                skills_enabled=self._skills_enabled(config, agent),
+                native_tools=native_tools,  # type: ignore[arg-type]
+            )
+            expected_tools, expected_mode = self._POLICIES[policy]
+            assert (sdk_tools, mode) == (expected_tools, expected_mode), (name, agent_name)
+
+    def test_the_audit_agent_is_narrower_than_its_workflow(self) -> None:
+        """The case this per-agent pinning exists for: a workflow-level opt-in
+        must not reach an agent that declared it needs nothing."""
+        config = load_config(self._EXAMPLES / "claude-agent-sdk-setting-sources.yaml")
+        audit = next(a for a in config.agents if a.name == "audit")
+
+        assert config.workflow.runtime.provider.native_tools == "claude_code"
+        assert audit.tools == []
+
+    def test_mcp_example_grants_exactly_its_declared_server(self) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        config = load_config(self._EXAMPLES / "claude-agent-sdk-mcp.yaml")
+        servers = list(config.workflow.runtime.mcp_servers)
+
+        assert ClaudeAgentSdkProvider._mcp_permission_rules(servers) == ["mcp__web-search__*"]
+
+    def test_every_claude_agent_sdk_example_is_classified(self) -> None:
+        """A new example must declare its intended policy here, not inherit
+        whatever the default happens to grant."""
+        on_provider = set()
+        for path in self._EXAMPLES.glob("*.yaml"):
+            try:
+                config = load_config(path)
+            except Exception:
+                continue
+            if config.workflow.runtime.provider.name == "claude-agent-sdk":
+                on_provider.add(path.name)
+
+        assert on_provider == set(self._INTENDED)

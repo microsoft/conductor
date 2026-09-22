@@ -826,6 +826,20 @@ def verbose_log_for_each_summary(
 _PRINTED_EXPERIMENTAL_BANNERS: set[str] = set()
 
 
+def _native_tools_claude_code_warning() -> Text:
+    """The banner line for ``runtime.provider.native_tools: claude_code``.
+
+    A function rather than a module-level ``Text`` because ``Text`` is
+    mutable and the panel body is assembled with ``join``, so a shared
+    instance could carry one render's state into the next.
+    """
+    return Text.from_markup(
+        "[bold yellow]native_tools: claude_code[/bold yellow] — agents that omit "
+        "'tools:' get filesystem read/write, shell, web and editing tools with "
+        "permissions approved automatically. working_dir is not a sandbox."
+    )
+
+
 def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
     """Print one Rich banner per unique experimental provider in the workflow.
 
@@ -901,6 +915,13 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
         body_lines = [styled("⚠ Experimental provider in use: {}", header)]
         if limitations:
             body_lines.append(Text("Limitations: " + ", ".join(limitations) + "."))
+        if meta.get("native_tools") == "claude_code":
+            # One fixed literal, parsed for its own styling only: nothing from
+            # the run is interpolated, so there is no value for the markup
+            # parser to misread. Keyed off the same banner, so it inherits the
+            # banner's run-scoped latch and `--silent` suppression rather than
+            # needing a lifecycle of its own.
+            body_lines.append(_native_tools_claude_code_warning())
         body_lines.append(
             Text.from_markup(
                 "See [link]docs/providers/experimental.md[/link] for stability policy."
