@@ -1246,6 +1246,19 @@ class TestAsksOrAnnouncesQuestion:
             # A question quoted earlier in the message keeps the dialog open
             # too: the heuristic leans that way on purpose.
             "The user asked whether this is one ticket or two?\n\nSummary: one ticket, confirmed.",
+            # A "?" right after a Markdown link or an autolink is the
+            # message's, not the URL's.
+            "Should we use [this repository](https://example.com/repo)?",
+            "Should we use <https://example.com>?",
+            "Do you mean [w](https://en.wikipedia.org/wiki/Foo_(bar))?",
+            "Try `https://example.com/a?b=c`?",
+            # ...and so is one right after a bare URL: a URL never ends on "?".
+            "Have you seen https://example.com?",
+            "Which: https://a.com/x?y=1 or https://b.com/x?y=2?",
+            # The "?" is followed by closing emphasis, so only the delimiter
+            # exclusion keeps it out of the URL.
+            "**Should we use [this](https://example.com)?**",
+            "**Should we use <https://example.com>?**",
         ],
     )
     def test_asking_or_announcing_a_question_is_detected(self, text: str) -> None:
@@ -1270,6 +1283,10 @@ class TestAsksOrAnnouncesQuestion:
             # string is not a question.
             "You raised two questions; both are answered.",
             "See https://example.com/a?b=1 for the spec.",
+            "The [spec](https://example.com/a?b=c) covers it.",
+            "The spec at <https://example.com/a?b=c> covers it.",
+            "Run `https://example.com/a?b=c` first.",
+            "Read https://en.wikipedia.org/wiki/Foo_(bar)?x=1 first.",
             # Negation is scoped to the clause it is in, wherever it falls.
             "No, that is settled. That resolves it.",
             "Not a problem, I'll ask nothing more of you.",
@@ -1292,6 +1309,12 @@ class TestReadyMarkerUnderAQuestion:
         proposed, cleaned = _extract_ready_marker(f"{tail} [READY_TO_CONTINUE]")
         assert proposed is False
         assert cleaned == tail
+
+    def test_marker_after_a_link_then_a_question_mark_is_withheld(self) -> None:
+        question = "Should we use [this repository](https://example.com/repo)?"
+        proposed, cleaned = _extract_ready_marker(f"{question} [READY_TO_CONTINUE]")
+        assert proposed is False
+        assert cleaned == question
 
     def test_marker_on_a_closing_message_is_honoured(self) -> None:
         proposed, cleaned = _extract_ready_marker(

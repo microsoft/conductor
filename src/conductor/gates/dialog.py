@@ -163,7 +163,11 @@ _NEGATION_RE = re.compile(
 )
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
 _CLAUSE_BOUNDARY_RE = re.compile(r"[,;:\u2014\u2013]")
-_URL_RE = re.compile(r"https?://\S+")
+# A URL ends before the ``)`` closing a Markdown link target or the ``>``
+# closing an autolink, and never on a ``?``, so a ``?`` that ends the token
+# stays in the text while one inside the URL's query string is removed with
+# it. A balanced ``(...)`` inside the URL is part of it.
+_URL_RE = re.compile(r"https?://(?:\([^\s()<>]*\)|[^\s()<>])*(?:\([^\s()<>]*\)|[^\s()<>?])")
 
 
 def _asks_or_announces_question(text: str) -> bool:
