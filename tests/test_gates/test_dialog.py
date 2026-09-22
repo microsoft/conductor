@@ -1715,6 +1715,72 @@ class TestAgentQuestionOutstanding:
         (completed,) = _events(emitter, "dialog_completed")
         assert completed["agent_question_outstanding"] is False
 
+    async def _dismiss_right_after_the_opening(
+        self, opening_question: str, *, web: bool
+    ) -> tuple[DialogResult, dict[str, Any]]:
+        """Run a dialog whose first user input is a dismiss keyword; no agent turn."""
+        emitter = MagicMock()
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(side_effect=AssertionError("no agent turn"))
+        if web:
+            dashboard = MagicMock()
+            dashboard.wait_for_dialog_message = AsyncMock(
+                return_value={"type": "dialog_message", "content": "done"}
+            )
+            handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard, emitter=emitter)
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question=opening_question,
+                provider=provider,
+            )
+        else:
+            handler = DialogHandler(console=MagicMock(), emitter=emitter)
+            with (
+                patch.object(
+                    handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"
+                ),
+                patch.object(
+                    handler, "_get_user_input", new_callable=AsyncMock, return_value="done"
+                ),
+            ):
+                result = await handler.handle_dialog(
+                    agent=_make_agent(),
+                    agent_output={"result": "x"},
+                    opening_question=opening_question,
+                    provider=provider,
+                )
+        (completed,) = _events(emitter, "dialog_completed")
+        return result, completed
+
+    @pytest.mark.asyncio
+    async def test_dismissal_right_after_the_opening_question_matches_on_both_paths(
+        self,
+    ) -> None:
+        """The opening question is the agent's last message on either path."""
+        opening = "Which repository should I use?"
+        cli_result, cli_completed = await self._dismiss_right_after_the_opening(opening, web=False)
+        web_result, web_completed = await self._dismiss_right_after_the_opening(opening, web=True)
+
+        assert cli_result.agent_question_outstanding is True
+        assert web_result.agent_question_outstanding is True
+        assert cli_completed["agent_question_outstanding"] is True
+        assert web_completed["agent_question_outstanding"] is True
+        assert cli_completed["user_dismissed"] is True
+        assert web_completed["user_dismissed"] is True
+        # Opening question and "done" only: the web loop was skipped, not
+        # entered and left by its own dismiss check.
+        assert cli_completed["turn_count"] == web_completed["turn_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_web_dismissal_right_after_a_closing_opening_is_not_flagged(self) -> None:
+        result, completed = await self._dismiss_right_after_the_opening(
+            "I have everything I need.", web=True
+        )
+        assert result.agent_question_outstanding is False
+        assert completed["agent_question_outstanding"] is False
+        assert completed["user_dismissed"] is True
+
     def test_result_default(self) -> None:
         assert DialogResult(dialog_id="d").agent_question_outstanding is False
 

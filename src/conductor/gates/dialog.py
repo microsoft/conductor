@@ -630,20 +630,12 @@ class DialogHandler:
         )
 
         if self._is_dismiss(user_input):
+            # Skips the loop and reaches the shared completion below, so the
+            # event and the result carry the same fields as any other exit.
             result.user_dismissed = True
-            self._emit_event(
-                "dialog_completed",
-                {
-                    "dialog_id": dialog_id,
-                    "agent_name": agent.name,
-                    "turn_count": len(result.messages),
-                    "user_dismissed": True,
-                },
-            )
-            return result
 
         # Dialog loop
-        while True:
+        while not result.user_dismissed:
             # Send to agent and get response
             history.append({"role": "user", "content": user_input})
             try:
