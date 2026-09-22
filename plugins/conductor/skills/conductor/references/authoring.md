@@ -736,9 +736,14 @@ agents:
         the user's intent, encounters ambiguous requirements,
         or needs clarification before proceeding.
         Do NOT trigger for minor uncertainties the agent can resolve on its own.
+      conversation_prompt: |
+        Ask one question at a time and offer a recommended answer with each.
+        Let the user decide when the conversation is over.
     routes:
       - to: writer
 ```
+
+`trigger_prompt` reaches only the evaluator that decides whether to open the dialog. `conversation_prompt` (optional) is the one field that reaches the agent holding the conversation; it is appended to the built-in dialog system prompt and takes precedence over its rules where they conflict.
 
 Only valid on provider-backed agents (not `script`, `human_gate`, `workflow`, or `wait`). See `examples/dialog-mode.yaml` for a complete example.
 

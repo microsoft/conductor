@@ -575,6 +575,8 @@ export interface DialogCompletedData {
   user_dismissed?: boolean;
   user_declined?: boolean;
   agent_proposed_continue?: boolean;
+  /** The dialog closed while the agent's last message still asked, or announced, a question. */
+  agent_question_outstanding?: boolean;
 }
 
 // --- Validator events (issue #220) ---

@@ -240,6 +240,7 @@ agents:
     # Conditional dialog mode (optional, only on provider-backed agents)
     dialog:
       trigger_prompt: string        # Criteria evaluated against agent output by an LLM gate
+      conversation_prompt: string   # Optional: instructions for the agent holding the conversation
 
     # Semantic output validation with retry-once (optional, provider-backed agents only)
     validator:

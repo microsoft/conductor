@@ -608,7 +608,18 @@ class DialogConfig(BaseModel):
 
     This prompt is wrapped in a system message and evaluated against
     the agent's output. The evaluator decides whether to pause and
-    start a conversation with the user.
+    start a conversation with the user. It is read only by the trigger
+    evaluator; the agent holding the conversation never sees it.
+    """
+
+    conversation_prompt: str | None = None
+    """Instructions for the agent while it holds the conversation.
+
+    Appended to the built-in dialog system prompt for every turn once the
+    dialog has opened, and stated there to take precedence over the built-in
+    rules where they conflict. This is the only field a workflow author has
+    that reaches the conversing agent -- ``trigger_prompt`` reaches the
+    evaluator alone.
     """
 
 
