@@ -5,6 +5,7 @@ This module defines the main Typer app and global options.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import os
@@ -174,7 +175,7 @@ def print_error(error: Exception) -> None:
     from conductor.exceptions import ConductorError
 
     if isinstance(error, ConductorError):
-        console.print(format_error(error))
+        panel = format_error(error)
     else:
         # For non-Conductor errors, still format nicely
         content = Text()
@@ -185,6 +186,10 @@ def print_error(error: Exception) -> None:
             border_style="red",
             padding=(1, 2),
         )
+    # stderr can be non-blocking (see _SilentAwareConsole.print in
+    # cli/run.py); a raise here would replace the real error with an
+    # unrelated BlockingIOError instead (#543).
+    with contextlib.suppress(BlockingIOError):
         console.print(panel)
 
 

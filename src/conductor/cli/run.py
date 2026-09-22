@@ -80,7 +80,11 @@ class _SilentAwareConsole(MarkupFreeConsole):
         from conductor.cli.app import is_verbose
 
         if is_verbose():
-            super().print(*args, **kwargs)
+            # stderr can be a non-blocking pipe with a slow/absent reader
+            # (same root cause as copilot.py's _fix_pipe_blocking_mode); a
+            # large panel then raises here instead of blocking (#543).
+            with contextlib.suppress(BlockingIOError):
+                super().print(*args, **kwargs)
 
 
 _verbose_console = _SilentAwareConsole(highlight=False)

@@ -2387,6 +2387,101 @@ class TestSilentAwareConsole:
 
         assert isinstance(_verbose_console, _SilentAwareConsole)
 
+    def test_print_suppresses_blocking_io_error(self) -> None:
+        """A ``BlockingIOError`` from the underlying stream must not propagate.
+
+        stderr can be a non-blocking pipe with a slow or absent reader (the
+        event loop may set ``O_NONBLOCK`` on an inherited fd, the same root
+        cause ``providers/copilot.py::_fix_pipe_blocking_mode`` documents for
+        the Copilot CLI's own pipes). A large panel, a full rendered agent
+        prompt is the reported case, then exceeds the OS pipe buffer and
+        ``write()`` raises instead of blocking. Verbose output is
+        best-effort and must not crash a workflow that is otherwise
+        succeeding, or failing for an unrelated reason (issue #543).
+        """
+        from io import StringIO
+
+        from conductor.cli.run import _SilentAwareConsole
+
+        class RaisingSink(StringIO):
+            def write(self, s: str) -> int:
+                raise BlockingIOError(11, "write could not complete without blocking")
+
+        console = _SilentAwareConsole(file=RaisingSink(), force_terminal=True, no_color=True)
+
+        token = verbose_mode.set(True)
+        try:
+            console.print("x" * 500)  # must not raise
+        finally:
+            verbose_mode.reset(token)
+
+    def test_print_does_not_suppress_other_errors(self) -> None:
+        """Only ``BlockingIOError`` is swallowed; an unrelated write failure still surfaces."""
+        from io import StringIO
+
+        from conductor.cli.run import _SilentAwareConsole
+
+        class RaisingSink(StringIO):
+            def write(self, s: str) -> int:
+                raise ValueError("some unrelated stream failure")
+
+        console = _SilentAwareConsole(file=RaisingSink(), force_terminal=True, no_color=True)
+
+        token = verbose_mode.set(True)
+        try:
+            with pytest.raises(ValueError, match="unrelated stream failure"):
+                console.print("hello")
+        finally:
+            verbose_mode.reset(token)
+
+    def test_verbose_log_section_survives_blocking_io_error_and_still_logs_to_file(
+        self,
+    ) -> None:
+        """``verbose_log_section`` must not crash, and the file console must still
+        receive the content, when the console write hits a full non-blocking pipe.
+
+        Before the fix, an unguarded ``_verbose_console.print`` raised
+        ``BlockingIOError`` straight out of ``verbose_log_section``, which also
+        skipped the following ``_file_console.print`` call in the same
+        function, losing the file log entry too, even though a real file is
+        never affected by ``O_NONBLOCK``.
+        """
+        from io import StringIO
+
+        from rich.console import Console
+
+        import conductor.cli.run as run_module
+        from conductor.cli.run import _SilentAwareConsole, verbose_log_section
+
+        class RaisingSink(StringIO):
+            def write(self, s: str) -> int:
+                raise BlockingIOError(11, "write could not complete without blocking")
+
+        file_sink = StringIO()
+        token_verbose = verbose_mode.set(True)
+        token_full = full_mode.set(True)
+        try:
+            with (
+                patch(
+                    "conductor.cli.run._verbose_console",
+                    _SilentAwareConsole(file=RaisingSink(), force_terminal=True),
+                ),
+                patch.object(
+                    run_module,
+                    "_file_console",
+                    Console(file=file_sink, force_terminal=True, no_color=True, markup=False),
+                ),
+            ):
+                verbose_log_section("Prompt for 'agent'", "x" * 500)  # must not raise
+        finally:
+            full_mode.reset(token_full)
+            verbose_mode.reset(token_verbose)
+
+        # Panel wrapping inserts newlines/borders, so count rather than match
+        # a contiguous substring (matches test_verbose_log_section_shows_
+        # full_in_full_mode's own style above).
+        assert file_sink.getvalue().count("x") == 500
+
 
 class TestConsoleEventSubscriberMcpSteps:
     """ConsoleEventSubscriber rendering of mcp step lifecycle events."""

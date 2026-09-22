@@ -308,6 +308,39 @@ class TestErrorPanelsRenderExceptionText:
         assert f"Weird{CRASHING}Type" in "".join(captured.get().split())
 
 
+class TestPrintErrorSurvivesBlockingIOError:
+    """``print_error`` must not let a stderr write failure mask the real error (#543).
+
+    stderr can be a non-blocking pipe with a slow or absent reader; error
+    teardown/recovery reusing the same unguarded console printing meant a
+    ``BlockingIOError`` from *reporting* the failure replaced the failure
+    itself.
+    """
+
+    def test_blocking_io_error_on_conductor_error_does_not_propagate(self) -> None:
+        from conductor.cli.app import print_error
+        from conductor.exceptions import ConfigurationError
+
+        with patch("conductor.cli.app.console.print", side_effect=BlockingIOError(11, "eagain")):
+            print_error(ConfigurationError("bad config"))  # must not raise
+
+    def test_blocking_io_error_on_generic_error_does_not_propagate(self) -> None:
+        from conductor.cli.app import print_error
+
+        with patch("conductor.cli.app.console.print", side_effect=BlockingIOError(11, "eagain")):
+            print_error(RuntimeError("boom"))  # must not raise
+
+    def test_other_write_errors_still_propagate(self) -> None:
+        """Only ``BlockingIOError`` is swallowed; print_error is not a blanket try/except."""
+        from conductor.cli.app import print_error
+
+        with (
+            patch("conductor.cli.app.console.print", side_effect=ValueError("unrelated")),
+            pytest.raises(ValueError, match="unrelated"),
+        ):
+            print_error(RuntimeError("boom"))
+
+
 class TestFetchedPluginMetadataRenders:
     """#398 made these strings third-party rather than the author's own YAML.
 
