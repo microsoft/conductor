@@ -1260,6 +1260,19 @@ class TestAsksOrAnnouncesQuestion:
             # exclusion keeps it out of the URL.
             "**Should we use [this](https://example.com)?**",
             "**Should we use <https://example.com>?**",
+            # A quote and a backtick are not URL characters either, so a "?"
+            # before one is the message's even when more follows it.
+            'Did you mean "https://example.com?"',
+            "Try `https://example.com/a?b=c`?!",
+            # A participle negates only after a copula; a negated participle
+            # does not negate at all; a line break ends a sentence.
+            "There's one more question I need answered before continuing.",
+            "I have one more question that needs to be addressed.",
+            "I haven't asked the next question yet.",
+            "The remaining questions have not been answered.",
+            "One more question isn't settled yet.",
+            "- No changes to CI\n- Next question: repo list",
+            "Nothing else on scope\nNext question: which repos",
         ],
     )
     def test_asking_or_announcing_a_question_is_detected(self, text: str) -> None:
@@ -1287,6 +1300,7 @@ class TestAsksOrAnnouncesQuestion:
             "The [spec](https://example.com/a?b=c) covers it.",
             "The spec at <https://example.com/a?b=c> covers it.",
             "Run `https://example.com/a?b=c` first.",
+            'Run "https://example.com/a?b=c" first.',
             "Read https://en.wikipedia.org/wiki/Foo_(bar)?x=1 first.",
             # Negation is scoped to the clause it is in, wherever it falls.
             "No, that is settled. That resolves it.",
@@ -1295,6 +1309,8 @@ class TestAsksOrAnnouncesQuestion:
             # Questions already dealt with are not questions coming.
             "The remaining questions were all answered above.",
             "Both follow-up questions are answered.",
+            "The follow-up questions have been answered.",
+            "Remaining questions all answered.",
             "",
         ],
     )

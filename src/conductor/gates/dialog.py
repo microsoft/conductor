@@ -155,19 +155,35 @@ _ANNOUNCED_QUESTION_RE = re.compile(
     ),
     re.IGNORECASE,
 )
-# A clause that negates the announcement, or talks about questions already
-# dealt with ("the remaining questions were answered above").
+# A clause that negates the announcement, or says the questions are already
+# dealt with ("the remaining questions were answered above"). The participles
+# count only after a copula or "all": "one more question I need answered" is
+# an announcement.
 _NEGATION_RE = re.compile(
-    r"\b(?:no|not|nothing|never|without|answered|resolved|addressed|settled)\b|n't\b",
+    r"\b(?:no|not|nothing|never|without)\b|n't\b"
+    r"|\b(?:is|are|was|were|been|all)\s+(?:all\s+)?(?:answered|resolved|addressed|settled)\b",
     re.IGNORECASE,
 )
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+# Negating one of those participles says the question is still open ("I
+# haven't asked the next question yet", "one more question isn't settled"),
+# so such a clause is not negated.
+_STILL_OPEN_RE = re.compile(
+    r"(?:\bnot|\bnever|n't)\s+(?:yet\s+|been\s+)?(?:asked|answered|resolved|addressed|settled)\b",
+    re.IGNORECASE,
+)
+# A line break ends a sentence too: a bullet or a heading carries no
+# terminal punctuation, and its negation must not reach the next line.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n")
 _CLAUSE_BOUNDARY_RE = re.compile(r"[,;:\u2014\u2013]")
-# A URL ends before the ``)`` closing a Markdown link target or the ``>``
-# closing an autolink, and never on a ``?``, so a ``?`` that ends the token
-# stays in the text while one inside the URL's query string is removed with
-# it. A balanced ``(...)`` inside the URL is part of it.
-_URL_RE = re.compile(r"https?://(?:\([^\s()<>]*\)|[^\s()<>])*(?:\([^\s()<>]*\)|[^\s()<>?])")
+# A URL contains no whitespace, ``<``, ``>``, ``"`` or backtick (RFC 3986), so
+# it ends before an autolink's ``>``, a closing quote or a code span's closing
+# backtick; it also ends before the ``)`` closing a Markdown link target, and
+# never on a ``?``. A ``?`` that ends the token therefore stays in the text
+# while one inside the URL's query string is removed with it. A balanced
+# ``(...)`` inside the URL is part of it.
+_URL_RE = re.compile(
+    r"https?://(?:\([^\s()<>\"`]*\)|[^\s()<>\"`])*(?:\([^\s()<>\"`]*\)|[^\s()<>\"`?])"
+)
 
 
 def _asks_or_announces_question(text: str) -> bool:
@@ -175,14 +191,16 @@ def _asks_or_announces_question(text: str) -> bool:
 
     True when the message contains a ``?`` outside a URL, or a clause in
     which :data:`_ANNOUNCED_QUESTION_RE` matches and :data:`_NEGATION_RE`
-    does not. Every paragraph counts: an agent that asks, offers its
-    recommendation and signs off with "Let me know." is still asking.
+    does not (or :data:`_STILL_OPEN_RE` does). Every paragraph counts: an agent
+    that asks, offers its recommendation and signs off with "Let me know." is
+    still asking.
     """
     text = _URL_RE.sub("", text)
     if "?" in text:
         return True
     return any(
-        _ANNOUNCED_QUESTION_RE.search(clause) and not _NEGATION_RE.search(clause)
+        _ANNOUNCED_QUESTION_RE.search(clause)
+        and (not _NEGATION_RE.search(clause) or _STILL_OPEN_RE.search(clause))
         for sentence in _SENTENCE_BOUNDARY_RE.split(text)
         for clause in _CLAUSE_BOUNDARY_RE.split(sentence)
     )
