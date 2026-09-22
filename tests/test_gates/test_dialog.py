@@ -1587,6 +1587,36 @@ class TestContinueProposalPrompt:
         assert [m.content for m in result.messages if m.role == "user"] == ["context", "done"]
 
 
+class TestEngagementPromptDispatch:
+    """The engagement prompt is the first stdin read of every terminal dialog."""
+
+    @pytest.mark.asyncio
+    async def test_engagement_prompt_reads_on_the_daemon_thread(self) -> None:
+        """Same dispatch as the main turn: a cancelled ``asyncio.to_thread``
+        would leave its worker blocked in ``input()`` holding a shared
+        executor slot (see ``read_on_daemon_thread``)."""
+        handler = DialogHandler(console=MagicMock())
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock()
+        with (
+            patch("builtins.input", return_value="2"),
+            patch("asyncio.to_thread", side_effect=AssertionError("to_thread must not be used")),
+            patch(
+                "conductor.gates.dialog.read_on_daemon_thread",
+                wraps=read_on_daemon_thread,
+            ) as dispatch,
+        ):
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+        assert result.user_declined is True
+        dispatch.assert_called_once()
+        provider.execute_dialog_turn.assert_not_awaited()
+
+
 class TestDismissKeywordsAreStated:
     """``continue``/``proceed`` stay dismiss keywords, so the banner has to say so."""
 

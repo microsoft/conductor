@@ -8,7 +8,6 @@ supports multi-turn exchanges until the user or agent concludes.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -970,7 +969,9 @@ class DialogHandler:
                 show_choices=True,
             )
 
-        choice = await asyncio.to_thread(_ask)
+        # A daemon thread for the same reason as _get_user_input: a cancelled
+        # ``asyncio.to_thread`` leaves its worker blocked in ``input()``.
+        choice = await read_on_daemon_thread(_ask)
         return "engage" if choice == "1" else "decline"
 
     async def _get_user_input(
