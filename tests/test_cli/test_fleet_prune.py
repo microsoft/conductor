@@ -172,10 +172,10 @@ class TestFailuresAreReported:
 
         real_unlink = Path.unlink
 
-        def _refuse(self: Path, *args: object, **kwargs: object) -> None:
+        def _refuse(self: Path, missing_ok: bool = False) -> None:
             if self == doomed:
                 raise PermissionError(13, "Permission denied")
-            real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+            real_unlink(self, missing_ok=missing_ok)
 
         monkeypatch.setattr(Path, "unlink", _refuse)
 
@@ -184,5 +184,5 @@ class TestFailuresAreReported:
         assert result.exit_code == 1
         assert "Nothing to prune" not in result.output
         assert "Failed to delete" in result.output
-        assert "Permission denied" in result.output
+        assert "Permission denied" in " ".join(result.output.split())
         assert doomed.exists()

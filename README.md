@@ -591,7 +591,8 @@ On Windows, use `uv` directly instead of `make`:
 
 ```powershell
 uv sync --all-extras    # instead of make dev
-uv run pytest tests/    # instead of make test
+uv run pytest -n 4 --dist loadfile -m "not real_api and not install_scripts and not performance"
+uv run pytest -n 0 -m "not real_api and not install_scripts and not performance"  # serial debugging
 uv run ruff check .     # instead of make lint
 uv run ruff format .    # instead of make format
 ```
@@ -609,8 +610,9 @@ $env:COPILOT_CLI_PATH = "C:\Users\<you>\AppData\Roaming\npm\copilot.cmd"
 ### Common Commands
 
 ```bash
-make test             # Run tests
-make test-cov         # Run tests with coverage
+make test             # Run tests in parallel (4 workers by default)
+make test-cov         # Run tests in parallel with coverage
+PYTEST_WORKERS=0 make test  # Run tests serially for debugging
 make lint             # Check linting
 make format           # Auto-fix and format code
 make typecheck        # Type check

@@ -135,6 +135,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.8.0",
     "ty>=0.0.1a0",
     # So Fleet Manager TUI pilot tests (App.run_test()) run in CI/dev without

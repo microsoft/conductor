@@ -143,8 +143,8 @@ class TestAgentExecutorBasic:
         """Regression test: the executor must render `system_prompt` and update
         the agent before passing it to the provider.
 
-        The Copilot provider concatenates `agent.system_prompt` into the prompt
-        sent to the model. If the executor leaves it as the raw template (with
+        The Copilot provider forwards `agent.system_prompt` through the native
+        system channel. If the executor leaves it as the raw template (with
         unrendered `{{ }}` placeholders), the model sees literal Jinja syntax
         and typically refuses with a "prompt template contains unfilled
         variables" message. This test asserts the agent the provider receives

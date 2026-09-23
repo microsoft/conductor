@@ -1639,6 +1639,9 @@ agents:
         Enter dialog if the agent expresses uncertainty about
         the user's intent, encounters ambiguous requirements,
         or needs clarification before proceeding.
+      conversation_prompt: |
+        Ask one question at a time and offer a recommended answer with each.
+        Let the user decide when the conversation is over.
     routes:
       - to: writer
 ```
@@ -1653,10 +1656,14 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed |
+| `dialog.trigger_prompt` | string | Yes | Criteria for the LLM evaluator to decide when dialog is needed. Read by the evaluator only; the agent holding the conversation never sees it |
+| `dialog.conversation_prompt` | string | No | Instructions for the agent while it holds the conversation. Appended to the built-in dialog system prompt and stated to take precedence over its rules where they conflict |
 
 **Behavior notes:**
 - Dialog is supported on regular `agent` type only (not `human_gate`, `questions`, `script`, `workflow`, or `wait`)
+- The agent may end its message with a `[READY_TO_CONTINUE]` marker when it believes it has enough information. The marker is withheld when the message reads as asking or announcing a question — a `?` outside a URL, or a phrase such as "next question", "question 2 of 3", "let me ask", "one more question" — so "ready for the next question when you are" keeps the dialog open. This is a heuristic biased towards keeping the dialog open; a closing message it holds open is ended with a dismiss keyword. When honoured, the prompt names the agent and says what each reply does: `yes` (or `y`) ends the dialog and lets the agent continue, a dismiss keyword ends it as a dismissal, an empty reply asks again, and anything else is sent to the agent as the next turn. That prompt reads a single line, so `done` there needs only Enter, not `/send`
+- A reply that is exactly one of the dismiss keywords — `done`, `continue`, `go ahead`, `proceed`, `that's all`, `thats all`, `resume`, `exit`, `/done`, `/continue` — ends the dialog; the opening banner lists them. Anything longer is sent to the agent, so `continue with the repo question` is a turn
+- `dialog_completed` carries `agent_question_outstanding: true` when the dialog closed while the agent's last message still asked or announced a question; in terminal mode the terminal prints a line saying so; the dashboard does not yet surface the flag
 - In an interactive terminal, a reply may span multiple lines — paste or type freely and submit the turn with `/send` on its own line. A dismiss keyword ends the dialog the same way, so `done` needs `/send` after it there; off a tty every line is already a turn, so it does not. Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows) also submits whatever lines have been entered so far, or dismisses the dialog when none have — so abandoning a part-written reply that way sends the lines already entered; press it on an empty prompt to leave without sending. An empty or whitespace-only submission is skipped rather than sent. Off a tty (a pipe or CI) replies are read one line at a time and `/send` does not apply, though a blank line is skipped rather than sent as an empty turn. The web dashboard is unaffected — its chat box takes a separate path that has always delivered each message whole, multi-line included
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped

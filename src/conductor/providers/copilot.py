@@ -1215,10 +1215,7 @@ class CopilotProvider(AgentProvider):
 
         model = agent.model or self._default_model
 
-        # Build the full prompt with system prompt if provided
         full_prompt = rendered_prompt
-        if agent.system_prompt:
-            full_prompt = f"System: {agent.system_prompt}\n\nUser: {rendered_prompt}"
 
         # Build schema description for output schema (used in prompt and recovery)
         schema_for_prompt: dict[str, Any] | None = None
@@ -1258,6 +1255,11 @@ class CopilotProvider(AgentProvider):
                 "working_directory": resolved_cwd,
                 "streaming": True,
             }
+            if agent.system_prompt:
+                session_kwargs["system_message"] = {
+                    "mode": "replace",
+                    "content": agent.system_prompt,
+                }
 
             # Note: Copilot SDK >=0.2.0 does not support temperature as a
             # session parameter. If a temperature was configured, log a warning
@@ -1378,6 +1380,11 @@ class CopilotProvider(AgentProvider):
                             "on_permission_request": self._default_permission_handler,
                             "working_directory": resolved_cwd,
                         }
+                        if agent.system_prompt:
+                            resume_kwargs["system_message"] = {
+                                "mode": "replace",
+                                "content": agent.system_prompt,
+                            }
                         if self._mcp_servers or extra_mcp_servers:
                             resume_kwargs["mcp_servers"] = self._merge_mcp_servers(
                                 resolved_cwd, extra_mcp_servers

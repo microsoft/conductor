@@ -20,9 +20,13 @@ from pydantic import SecretStr
 
 from conductor.config.schema import AgentDef, ProviderSettings, SandboxConfig, ToolOutputConfig
 from conductor.exceptions import ProviderError
-from conductor.providers.aca_protocol import RUNNER_TOKEN_HEADER, AcaExecuteRequest
 from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
 from conductor.providers.factory import create_provider
+from conductor.runner.protocol import (
+    RUNNER_PROTOCOL_VERSION,
+    RUNNER_TOKEN_HEADER,
+    RunnerAgentRequest,
+)
 
 
 class TestAcaCapabilities:
@@ -740,7 +744,7 @@ class TestAcaExecuteStreaming:
 
     @pytest.mark.asyncio
     async def test_execute_parses_cache_tokens_from_result(self) -> None:
-        """Review fix: `AcaResultData.cache_read_tokens`/`cache_write_tokens`
+        """Review fix: `RunnerAgentResult.cache_read_tokens`/`cache_write_tokens`
         must reach `AgentOutput`, not be silently dropped."""
         frames = [
             {
@@ -818,7 +822,7 @@ class TestAcaExecuteStreaming:
 
     @pytest.mark.asyncio
     async def test_execute_parses_session_seconds_from_result(self) -> None:
-        """E6-T1: `AcaResultData.session_seconds` reaches `AgentOutput`, distinct
+        """E6-T1: `RunnerAgentResult.session_seconds` reaches `AgentOutput`, distinct
         from token cost (FR7)."""
         frames = [
             {
@@ -1276,7 +1280,7 @@ class TestAcaCredentialPrecedence:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Review fix: `_resolve_inner_provider_settings` keeps the token as a
-        `SecretStr` all the way into `AcaExecuteRequest`, so `model_dump()` /
+        `SecretStr` all the way into `RunnerAgentRequest`, so `model_dump()` /
         `model_dump_json()` / `repr()` on the *request object itself* never
         expose the plaintext — only the dedicated wire-serialization step
         (`_wire_body`, exercised by `test_execute_forwards_github_token_when_no_base_url`
@@ -1500,8 +1504,8 @@ class TestAcaErrorBodyDiagnostics:
         assert len(str(error)) < 1000
 
 
-class TestAcaExecuteRequestSecretRedactionOnValidate:
-    """Review fix: `AcaExecuteRequest.inner_provider_settings` is a loosely
+class TestRunnerAgentRequestSecretRedactionOnValidate:
+    """Review fix: `RunnerAgentRequest.inner_provider_settings` is a loosely
     typed ``dict[str, Any]`` — plain construction via
     `AcaRuntimeProvider._resolve_inner_provider_settings` already wraps
     known credential keys in `SecretStr`, but that coercion previously did
@@ -1509,7 +1513,7 @@ class TestAcaExecuteRequestSecretRedactionOnValidate:
     (`model_validate` / `model_validate_json` on a raw dict/JSON payload,
     e.g. the runner's own FastAPI request parsing), so a plaintext
     credential string surviving through one of those paths would leak via
-    `repr()`/`model_dump()`. `AcaExecuteRequest._redact_inner_provider_secrets`
+    `repr()`/`model_dump()`. `RunnerAgentRequest._redact_inner_provider_secrets`
     (a `field_validator`) closes that gap."""
 
     @staticmethod
@@ -1521,7 +1525,7 @@ class TestAcaExecuteRequestSecretRedactionOnValidate:
         }
 
     def test_model_validate_dict_coerces_plain_github_token_to_secretstr(self) -> None:
-        request = AcaExecuteRequest.model_validate(
+        request = RunnerAgentRequest.model_validate(
             self._minimal_request_dict(github_token="plaintext-value")
         )
 
@@ -1534,7 +1538,7 @@ class TestAcaExecuteRequestSecretRedactionOnValidate:
         }
 
     def test_model_validate_dict_coerces_all_three_credential_keys(self) -> None:
-        request = AcaExecuteRequest.model_validate(
+        request = RunnerAgentRequest.model_validate(
             self._minimal_request_dict(
                 base_url="https://byok.example.com",
                 api_key="plain-api-key",
@@ -1564,7 +1568,7 @@ class TestAcaExecuteRequestSecretRedactionOnValidate:
         just a Python dict passed to `model_validate`."""
         body = json.dumps(self._minimal_request_dict(github_token="from-the-wire"))
 
-        request = AcaExecuteRequest.model_validate_json(body)
+        request = RunnerAgentRequest.model_validate_json(body)
 
         assert isinstance(request.inner_provider_settings["github_token"], SecretStr)
         assert request.inner_provider_settings["github_token"].get_secret_value() == "from-the-wire"
@@ -1575,7 +1579,7 @@ class TestAcaExecuteRequestSecretRedactionOnValidate:
         """Constructing directly with an already-`SecretStr` value (the
         `AcaRuntimeProvider._resolve_inner_provider_settings` call site)
         must not be double-wrapped or otherwise mangled by the validator."""
-        request = AcaExecuteRequest.model_validate(
+        request = RunnerAgentRequest.model_validate(
             self._minimal_request_dict(github_token=SecretStr("already-wrapped"))
         )
 
@@ -1584,7 +1588,7 @@ class TestAcaExecuteRequestSecretRedactionOnValidate:
         assert token.get_secret_value() == "already-wrapped"
 
     def test_model_validate_none_inner_provider_settings_stays_none(self) -> None:
-        request = AcaExecuteRequest.model_validate(
+        request = RunnerAgentRequest.model_validate(
             {"agent": {"name": "implement"}, "rendered_prompt": "hi"}
         )
 
@@ -2100,6 +2104,58 @@ class TestAcaAuthSkewWarnings:
     ) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=["not", "a", "dict"])
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            assert await provider.validate_connection() is True
+
+        assert caplog.records == []
+
+
+class TestAcaProtocolVersionSkewWarnings:
+    """`validate_connection()`'s warn-only `protocol_version` compatibility
+    check (`conductor.runner.protocol.RUNNER_PROTOCOL_VERSION`)."""
+
+    @pytest.mark.asyncio
+    async def test_warns_when_runner_protocol_version_mismatches(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: a runner advertising a wire-protocol version different
+        from the host's `RUNNER_PROTOCOL_VERSION` produces a compatibility
+        warning, never a failure — `validate_connection()` still returns True."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ready": True, "protocol_version": RUNNER_PROTOCOL_VERSION + 1},
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            caplog.at_level("WARNING", logger="conductor.providers.aca"),
+        ):
+            assert await provider.validate_connection() is True
+
+        assert any("wire-protocol version" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_silent_when_runner_protocol_version_matches(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement: an advertised `protocol_version` equal to the host's
+        constant is not a warning."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ready": True, "protocol_version": RUNNER_PROTOCOL_VERSION},
+            )
 
         provider = _make_provider()
         provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

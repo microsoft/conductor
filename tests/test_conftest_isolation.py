@@ -12,6 +12,7 @@ suite, not just the ones that already knew to isolate it.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -26,6 +27,11 @@ def test_gettempdir_is_isolated_from_the_real_system_tempdir(tmp_path: Path) -> 
     resolved = Path(tempfile.gettempdir())
     assert resolved != Path("/tmp")
     assert resolved == tmp_path
+
+
+def test_subprocess_temp_environment_is_isolated(tmp_path: Path) -> None:
+    # Requirement: subprocesses must not write Conductor artifacts to the host temp directory.
+    assert {os.environ[name] for name in ("TMPDIR", "TEMP", "TMP")} == {str(tmp_path)}
 
 
 def test_event_log_root_is_isolated(tmp_path: Path) -> None:

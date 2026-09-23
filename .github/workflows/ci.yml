@@ -166,7 +166,7 @@ jobs:
         # is ~2x headroom there and ~3x on Linux — still short enough to catch
         # a genuine hang rather than burning a full job timeout on one.
         timeout-minutes: 20
-        run: uv run pytest --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not performance"
+        run: uv run pytest -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
           # Real API tests (marked with @pytest.mark.real_api) are excluded from CI
@@ -333,7 +333,7 @@ jobs:
 
       - name: Run install-script integration tests
         timeout-minutes: 10
-        run: uv run pytest -m install_scripts -v
+        run: uv run pytest -n 0 -m install_scripts -v
 
   web-bg-smoke:
     name: Web BG Smoke (${{ matrix.os }})

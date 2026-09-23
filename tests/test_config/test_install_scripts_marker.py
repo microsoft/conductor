@@ -77,13 +77,6 @@ def test_install_scripts_skipped_with_not_performance(
 def test_install_scripts_skipped_by_ci_main_job_expression(
     install_scripts_sandbox: pytest.Pytester,
 ) -> None:
-    """CI's main test-job expression never mentions ``install_scripts``.
-
-    ``.github/workflows/ci.yml`` / ``release.yml`` run
-    ``-m "not real_api and not performance"`` for the main test job — this
-    doesn't reference ``install_scripts`` at all, so before this fix the
-    install-script E2E suite ran there too. The hook must still skip it.
-    """
     result = install_scripts_sandbox.runpytest("-m", "not real_api and not performance")
     result.assert_outcomes(passed=1, skipped=1)
 
@@ -99,13 +92,9 @@ def test_install_scripts_runs_when_explicitly_selected(
 def test_install_scripts_deselected_by_make_test_expression(
     install_scripts_sandbox: pytest.Pytester,
 ) -> None:
-    """``make test``'s ``-m`` expression must still deselect it.
-
-    ``make test`` runs ``-m "not install_scripts and not performance"``,
-    which explicitly references the marker, so pytest's own
-    marker-expression evaluation (not our hook) does the deselecting.
-    """
-    result = install_scripts_sandbox.runpytest("-m", "not install_scripts and not performance")
+    result = install_scripts_sandbox.runpytest(
+        "-m", "not real_api and not install_scripts and not performance"
+    )
     result.assert_outcomes(passed=1, deselected=1)
 
 

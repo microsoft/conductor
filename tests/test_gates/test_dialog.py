@@ -10,7 +10,16 @@ import pytest
 
 from conductor.config.schema import AgentDef, DialogConfig
 from conductor.console import styled
-from conductor.gates.dialog import DialogHandler, DialogResult
+from conductor.gates.dialog import (
+    DIALOG_AGENT_SYSTEM_PROMPT,
+    DISMISS_KEYWORDS,
+    DialogHandler,
+    DialogMessage,
+    DialogResult,
+    _asks_or_announces_question,
+    _build_system_prompt,
+    _extract_ready_marker,
+)
 from conductor.gates.human import (
     DIALOG_SUBMIT_SENTINEL,
     read_multiline_lines,
@@ -192,7 +201,8 @@ class TestDialogHandlerAgentContinue:
         provider.execute_dialog_turn = AsyncMock(
             side_effect=[
                 "I think I have enough. [READY_TO_CONTINUE]",
-                "Okay, what else?",
+                "Okay, what else?",  # the reply to "no", sent as its own turn
+                "Sure.",
             ]
         )
 
@@ -1176,3 +1186,743 @@ class TestDialogMultilineInput:
             )
         assert [m.content for m in result.messages if m.role == "user"] == ["done"]
         provider.execute_dialog_turn.assert_not_awaited()
+
+
+# --- The ready marker under a question -------------------------------------
+#
+# The agent is told to append [READY_TO_CONTINUE] when it has enough
+# information, and a model routinely appends it to "ready for the next
+# question when you are." Honouring that ended real interviews with the
+# announced questions unasked. The guard withholds the marker when the final
+# paragraph asks or announces a question; these tests pin the predicate and
+# what the dialog does with a withheld marker.
+
+_RECORDED_TAILS = [
+    "Two tickets it is. Ready to move on to the next question when you are.",
+    "Shall we move to the next question?",
+    "Next I will ask about expected repos.",
+]
+
+
+def _make_agent(name: str = "grill", conversation_prompt: str | None = None) -> AgentDef:
+    return AgentDef(
+        name=name,
+        prompt="p",
+        dialog=DialogConfig(trigger_prompt="t", conversation_prompt=conversation_prompt),
+    )
+
+
+def _events(emitter: MagicMock, event_type: str) -> list[dict[str, Any]]:
+    return [
+        call.args[0].data for call in emitter.emit.call_args_list if call.args[0].type == event_type
+    ]
+
+
+class TestAsksOrAnnouncesQuestion:
+    """The predicate behind the guard, measured on message tails."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            *_RECORDED_TAILS,
+            "Question 1 of ~3: which repos does this touch?",
+            "Great. Question 2 of 3 — where do the boundaries fall.",
+            "That settles scope. I have two more questions for you.",
+            "Noted. Let me ask about ordering next.",
+            "Understood, thanks. One more question on dependencies.",
+            "Does that sound right to you?",
+            "Good.\n\nNow, does the deliver phase own the API design?",
+            # A "no" idiom opening the sentence does not negate the announcement.
+            "No problem, next question is about the repos.",
+            "No worries, let me ask about the next thing.",
+            # Negation does not cross a sentence boundary.
+            "Not a problem. Question 2 of 3 is about ordering.",
+            # Question, recommendation, sign-off: the question is not in the
+            # final paragraph, and it is still being asked.
+            "Question 2 of 3: where do the boundaries fall?\n\nMy recommendation: ike only."
+            "\n\nLet me know.",
+            "Which repos does this touch?\n\nTake your time.",
+            "Two tickets it is. I have one more question for you before we finish."
+            "\n\nTake your time!",
+            # A question quoted earlier in the message keeps the dialog open
+            # too: the heuristic leans that way on purpose.
+            "The user asked whether this is one ticket or two?\n\nSummary: one ticket, confirmed.",
+            # A "?" right after a Markdown link or an autolink is the
+            # message's, not the URL's.
+            "Should we use [this repository](https://example.com/repo)?",
+            "Should we use <https://example.com>?",
+            "Do you mean [w](https://en.wikipedia.org/wiki/Foo_(bar))?",
+            "Try `https://example.com/a?b=c`?",
+            # ...and so is one right after a bare URL: a URL never ends on "?".
+            "Have you seen https://example.com?",
+            "Which: https://a.com/x?y=1 or https://b.com/x?y=2?",
+            # The "?" is followed by closing emphasis, so only the delimiter
+            # exclusion keeps it out of the URL.
+            "**Should we use [this](https://example.com)?**",
+            "**Should we use <https://example.com>?**",
+            # A quote and a backtick are not URL characters either, so a "?"
+            # before one is the message's even when more follows it.
+            'Did you mean "https://example.com?"',
+            "Try `https://example.com/a?b=c`?!",
+            # A participle negates only after a copula; a negated participle
+            # does not negate at all; a line break ends a sentence.
+            "There's one more question I need answered before continuing.",
+            "I have one more question that needs to be addressed.",
+            "I haven't asked the next question yet.",
+            "The remaining questions have not been answered.",
+            "One more question isn't settled yet.",
+            "- No changes to CI\n- Next question: repo list",
+            "Nothing else on scope\nNext question: which repos",
+        ],
+    )
+    def test_asking_or_announcing_a_question_is_detected(self, text: str) -> None:
+        assert _asks_or_announces_question(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "That covers everything I need.",
+            "All clear.",
+            "I think I have enough info.",
+            "I have no further questions.",
+            "I don't need to ask anything else.",
+            "Thanks, that resolves the last open point. No more questions from me.",
+            "I asked about repos earlier and you confirmed ike only. We are done.",
+            # Ordinary closings that name an action, not a question.
+            "Thanks, I have everything I need. I will move on to drafting the ticket.",
+            "Great, that settles it. Let me get to work.",
+            "Understood. I'll turn to the implementation now.",
+            "We can move on. Nothing else from me.",
+            # Counting past questions is not announcing one; a URL's query
+            # string is not a question.
+            "You raised two questions; both are answered.",
+            "See https://example.com/a?b=1 for the spec.",
+            "The [spec](https://example.com/a?b=c) covers it.",
+            "The spec at <https://example.com/a?b=c> covers it.",
+            "Run `https://example.com/a?b=c` first.",
+            'Run "https://example.com/a?b=c" first.',
+            "Read https://en.wikipedia.org/wiki/Foo_(bar)?x=1 first.",
+            # Negation is scoped to the clause it is in, wherever it falls.
+            "No, that is settled. That resolves it.",
+            "Not a problem, I'll ask nothing more of you.",
+            "I will ask no more.",
+            # Questions already dealt with are not questions coming.
+            "The remaining questions were all answered above.",
+            "Both follow-up questions are answered.",
+            "The follow-up questions have been answered.",
+            "Remaining questions all answered.",
+            "",
+        ],
+    )
+    def test_a_closing_message_is_not(self, text: str) -> None:
+        assert _asks_or_announces_question(text) is False
+
+
+class TestReadyMarkerUnderAQuestion:
+    """A trailing marker on a message that asks or announces a question is withheld."""
+
+    @pytest.mark.parametrize("tail", _RECORDED_TAILS)
+    def test_marker_is_withheld_and_stripped(self, tail: str) -> None:
+        proposed, cleaned = _extract_ready_marker(f"{tail} [READY_TO_CONTINUE]")
+        assert proposed is False
+        assert cleaned == tail
+
+    def test_marker_after_a_link_then_a_question_mark_is_withheld(self) -> None:
+        question = "Should we use [this repository](https://example.com/repo)?"
+        proposed, cleaned = _extract_ready_marker(f"{question} [READY_TO_CONTINUE]")
+        assert proposed is False
+        assert cleaned == question
+
+    def test_marker_on_a_closing_message_is_honoured(self) -> None:
+        proposed, cleaned = _extract_ready_marker(
+            "That covers everything I need. [READY_TO_CONTINUE]"
+        )
+        assert proposed is True
+        assert cleaned == "That covers everything I need."
+
+    def test_prompt_tells_the_agent_the_same_rule(self) -> None:
+        """The guard is a backstop; the instruction is the mechanism."""
+        assert "never put it in a message that asks" in DIALOG_AGENT_SYSTEM_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_cli_dialog_stays_open_when_the_marker_is_withheld(self) -> None:
+        """No Continue? prompt: the user's next reply goes to the agent."""
+        emitter = MagicMock()
+        handler = DialogHandler(console=MagicMock(), emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            side_effect=[
+                "Two tickets it is. Ready to move on to the next question when you are."
+                " [READY_TO_CONTINUE]",
+                "Which repos does this touch? I propose ike.",
+                "Noted, ike only. That covers everything I need. [READY_TO_CONTINUE]",
+            ]
+        )
+        prompts_seen: list[str] = []
+
+        async def user_input(prompt_text: Any = None) -> str:
+            prompts_seen.append(prompt_text.plain if prompt_text is not None else "<turn>")
+            return ["two tickets", "yes", "ike only", "yes"][len(prompts_seen) - 1]
+
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(handler, "_get_user_input", side_effect=user_input),
+        ):
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+
+        # The "yes" after the withheld marker was a turn, not an approval.
+        assert prompts_seen[:3] == ["<turn>", "<turn>", "<turn>"]
+        assert provider.execute_dialog_turn.await_count == 3
+        assert provider.execute_dialog_turn.await_args_list[1].kwargs["user_message"] == "yes"
+        # Only the closing message proposed continuing.
+        assert result.agent_proposed_continue is True
+        assert result.user_dismissed is False
+        assert result.agent_question_outstanding is False
+        # The withheld marker never reached the transcript or the events.
+        agent_contents = [m.content for m in result.messages if m.role == "agent"]
+        assert all("[READY_TO_CONTINUE]" not in c for c in agent_contents)
+        assert all(
+            "[READY_TO_CONTINUE]" not in e["content"] for e in _events(emitter, "dialog_message")
+        )
+
+    @pytest.mark.asyncio
+    async def test_web_dialog_stays_open_when_the_marker_is_withheld(self) -> None:
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "two tickets"},
+                {"type": "dialog_message", "content": "yes"},
+                {"type": "dialog_message", "content": "yes"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            side_effect=[
+                "Next I will ask about expected repos. [READY_TO_CONTINUE]",
+                "All set. [READY_TO_CONTINUE]",
+            ]
+        )
+
+        result = await handler.handle_dialog(
+            agent=_make_agent(),
+            agent_output={"result": "x"},
+            opening_question="Scope?",
+            provider=provider,
+        )
+
+        assert provider.execute_dialog_turn.await_count == 2
+        assert provider.execute_dialog_turn.await_args_list[1].kwargs["user_message"] == "yes"
+        assert result.agent_proposed_continue is True
+        assert all("[READY_TO_CONTINUE]" not in m.content for m in result.messages)
+
+
+class TestContinueProposalPrompt:
+    """What the operator sees, and what each reply does, once the marker is honoured."""
+
+    async def _run_cli(
+        self,
+        replies: list[str | None],
+        *,
+        agent_responses: list[str] | None = None,
+    ) -> tuple[DialogResult, MagicMock, MagicMock, list[Any]]:
+        emitter = MagicMock()
+        console = MagicMock()
+        handler = DialogHandler(console=console, emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            side_effect=agent_responses or ["All clear. [READY_TO_CONTINUE]", "Okay."]
+        )
+        prompts_seen: list[Any] = []
+        replies_iter = iter(replies)
+
+        async def user_input(prompt_text: Any = None) -> str | None:
+            prompts_seen.append(prompt_text)
+            return next(replies_iter)
+
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(handler, "_get_user_input", side_effect=user_input),
+        ):
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+        return result, provider, emitter, prompts_seen
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_proposal_name_the_agent(self) -> None:
+        """The operator can tell from the prompt alone who is asking."""
+        import io
+
+        from conductor.console import make_console
+
+        buf = io.StringIO()
+        handler = DialogHandler(console=make_console(file=buf, width=300, no_color=True))
+        handler._display_continue_proposal("grill")
+        assert "grill believes it has enough information to continue" in buf.getvalue()
+        assert "The agent believes" not in buf.getvalue()
+
+        result, _, _, prompts = await self._run_cli(["context", "yes"])
+        approval_prompt = prompts[1].plain
+        assert "Let grill continue?" in approval_prompt
+        assert "yes ends the dialog" in approval_prompt
+        assert "anything else is sent to grill" in approval_prompt
+        assert result.agent_proposed_continue is True
+
+    @pytest.mark.asyncio
+    async def test_conversational_affirmative_is_sent_to_the_agent(self) -> None:
+        result, provider, emitter, _ = await self._run_cli(
+            ["context", "yes, and ike is the repo", "done"]
+        )
+        assert provider.execute_dialog_turn.await_count == 2
+        second = provider.execute_dialog_turn.await_args_list[1].kwargs
+        assert second["user_message"] == "yes, and ike is the repo"
+        # Sent exactly once, with no two consecutive user turns in history.
+        assert second["history"] == [
+            {"role": "user", "content": "context"},
+            {"role": "assistant", "content": "All clear. [READY_TO_CONTINUE]"},
+        ]
+        # The reply is in the transcript the engine feeds back, and on the wire.
+        assert [m.content for m in result.messages if m.role == "user"] == [
+            "context",
+            "yes, and ike is the repo",
+            "done",
+        ]
+        user_events = [
+            e["content"] for e in _events(emitter, "dialog_message") if e["role"] == "user"
+        ]
+        assert user_events == ["context", "yes, and ike is the repo", "done"]
+        assert result.user_dismissed is True
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_re_asks_instead_of_approving(self) -> None:
+        result, provider, _, prompts = await self._run_cli(["context", "", "   ", "yes"])
+        assert provider.execute_dialog_turn.await_count == 1
+        # Three approval prompts: the two blank replies were re-asked.
+        assert len(prompts) == 4
+        assert result.agent_proposed_continue is True
+        assert result.user_dismissed is False
+
+    @pytest.mark.asyncio
+    async def test_dismiss_keyword_at_the_prompt_dismisses(self) -> None:
+        """``done`` under the proposal ends the dialog rather than being sent on."""
+        result, provider, emitter, _ = await self._run_cli(["context", "done"])
+        assert provider.execute_dialog_turn.await_count == 1
+        assert result.user_dismissed is True
+        (completed,) = _events(emitter, "dialog_completed")
+        assert completed["user_dismissed"] is True
+        assert completed["agent_proposed_continue"] is True
+
+    @pytest.mark.asyncio
+    async def test_padded_yes_is_still_approval(self) -> None:
+        result, provider, _, _ = await self._run_cli(["context", "  Yes "])
+        assert provider.execute_dialog_turn.await_count == 1
+        assert result.agent_proposed_continue is True
+        assert result.user_dismissed is False
+
+    @pytest.mark.asyncio
+    async def test_web_decline_at_the_proposal_is_a_dismissal(self) -> None:
+        emitter = MagicMock()
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "context"},
+                {"type": "dialog_decline"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard, emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="All clear. [READY_TO_CONTINUE]")
+        result = await handler.handle_dialog(
+            agent=_make_agent(), agent_output={"r": 1}, opening_question="Scope?", provider=provider
+        )
+        assert result.user_dismissed is True
+        (completed,) = _events(emitter, "dialog_completed")
+        assert completed["user_dismissed"] is True
+
+    @pytest.mark.asyncio
+    async def test_eof_at_the_prompt_still_ends_the_dialog(self) -> None:
+        result, _, _, _ = await self._run_cli(["context", None])
+        assert result.agent_proposed_continue is True
+        assert result.user_dismissed is False
+
+    @pytest.mark.asyncio
+    async def test_web_proposal_names_the_agent_and_dismiss_works(self) -> None:
+        emitter = MagicMock()
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "context"},
+                {"type": "dialog_message", "content": ""},
+                {"type": "dialog_message", "content": None},  # a client may send null
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard, emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="All clear. [READY_TO_CONTINUE]")
+
+        result = await handler.handle_dialog(
+            agent=_make_agent(),
+            agent_output={"result": "x"},
+            opening_question="Scope?",
+            provider=provider,
+        )
+
+        proposal = _events(emitter, "dialog_message")[-2]["content"]
+        assert dashboard.wait_for_dialog_message.await_count == 4
+        assert "grill believes it has enough information to continue" in proposal
+        assert "Reply **yes** to end the dialog" in proposal
+        assert "anything else is sent to grill" in proposal
+        assert result.user_dismissed is True
+        assert provider.execute_dialog_turn.await_count == 1
+        assert [m.content for m in result.messages if m.role == "user"] == ["context", "done"]
+
+
+class TestEngagementPromptDispatch:
+    """The engagement prompt is the first stdin read of every terminal dialog."""
+
+    @pytest.mark.asyncio
+    async def test_engagement_prompt_reads_on_the_daemon_thread(self) -> None:
+        """Same dispatch as the main turn: a cancelled ``asyncio.to_thread``
+        would leave its worker blocked in ``input()`` holding a shared
+        executor slot (see ``read_on_daemon_thread``)."""
+        handler = DialogHandler(console=MagicMock())
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock()
+        with (
+            patch("builtins.input", return_value="2"),
+            patch("asyncio.to_thread", side_effect=AssertionError("to_thread must not be used")),
+            patch(
+                "conductor.gates.dialog.read_on_daemon_thread",
+                wraps=read_on_daemon_thread,
+            ) as dispatch,
+        ):
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+        assert result.user_declined is True
+        dispatch.assert_called_once()
+        provider.execute_dialog_turn.assert_not_awaited()
+
+
+class TestDismissKeywordsAreStated:
+    """``continue``/``proceed`` stay dismiss keywords, so the banner has to say so."""
+
+    @pytest.mark.parametrize("isatty", [True, False])
+    def test_banner_lists_every_dismiss_keyword(self, isatty: bool) -> None:
+        import io
+
+        from conductor.console import make_console
+
+        buf = io.StringIO()
+        handler = DialogHandler(console=make_console(file=buf, width=300, no_color=True))
+        with patch("conductor.gates.dialog.sys.stdin.isatty", return_value=isatty):
+            handler._display_dialog_start(_make_agent(), {"out": 1}, "question?")
+        rendered = " ".join(buf.getvalue().split())
+        for keyword in DISMISS_KEYWORDS:
+            assert keyword in rendered, (keyword, rendered)
+
+
+class TestAgentQuestionOutstanding:
+    """A dialog that ends under an unanswered question says so in its output."""
+
+    @pytest.mark.asyncio
+    async def test_cli_dismiss_under_a_question_is_recorded(self) -> None:
+        import io
+
+        from conductor.console import make_console
+
+        buf = io.StringIO()
+        emitter = MagicMock()
+        handler = DialogHandler(
+            console=make_console(file=buf, width=300, no_color=True), emitter=emitter
+        )
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            return_value="Two tickets it is. Next I will ask about expected repos."
+        )
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(
+                handler, "_get_user_input", new_callable=AsyncMock, side_effect=["two", "done"]
+            ),
+        ):
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+
+        assert result.agent_question_outstanding is True
+        (completed,) = _events(emitter, "dialog_completed")
+        assert completed["agent_question_outstanding"] is True
+        assert "grill still had a question outstanding" in buf.getvalue()
+
+    @pytest.mark.asyncio
+    async def test_cli_clean_close_is_not_flagged(self) -> None:
+        emitter = MagicMock()
+        handler = DialogHandler(console=MagicMock(), emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="That covers everything I need.")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(
+                handler, "_get_user_input", new_callable=AsyncMock, side_effect=["two", "done"]
+            ),
+        ):
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+        assert result.agent_question_outstanding is False
+        (completed,) = _events(emitter, "dialog_completed")
+        assert completed["agent_question_outstanding"] is False
+
+    @pytest.mark.asyncio
+    async def test_web_dismiss_under_a_question_is_recorded(self) -> None:
+        emitter = MagicMock()
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "two"},
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard, emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="Shall we move to the next question?")
+
+        result = await handler.handle_dialog(
+            agent=_make_agent(),
+            agent_output={"result": "x"},
+            opening_question="Scope?",
+            provider=provider,
+        )
+        assert result.agent_question_outstanding is True
+        (completed,) = _events(emitter, "dialog_completed")
+        assert completed["agent_question_outstanding"] is True
+
+    @pytest.mark.asyncio
+    async def test_web_null_content_on_an_ordinary_turn_does_not_raise(self) -> None:
+        """A hand-crafted frame with ``"content": null`` is read as an empty turn."""
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "two"},
+                {"type": "dialog_message", "content": None},
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="Noted.")
+
+        result = await handler.handle_dialog(
+            agent=_make_agent(), agent_output={"r": 1}, opening_question="Scope?", provider=provider
+        )
+        assert result.user_dismissed is True
+        assert provider.execute_dialog_turn.await_args_list[1].kwargs["user_message"] == ""
+
+    @pytest.mark.asyncio
+    async def test_web_clean_close_is_not_flagged(self) -> None:
+        emitter = MagicMock()
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "two"},
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard, emitter=emitter)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="That covers everything I need.")
+
+        result = await handler.handle_dialog(
+            agent=_make_agent(),
+            agent_output={"result": "x"},
+            opening_question="Scope?",
+            provider=provider,
+        )
+        assert result.agent_question_outstanding is False
+        (completed,) = _events(emitter, "dialog_completed")
+        assert completed["agent_question_outstanding"] is False
+
+    async def _dismiss_right_after_the_opening(
+        self, opening_question: str, *, web: bool
+    ) -> tuple[DialogResult, dict[str, Any]]:
+        """Run a dialog whose first user input is a dismiss keyword; no agent turn."""
+        emitter = MagicMock()
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(side_effect=AssertionError("no agent turn"))
+        if web:
+            dashboard = MagicMock()
+            dashboard.wait_for_dialog_message = AsyncMock(
+                return_value={"type": "dialog_message", "content": "done"}
+            )
+            handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard, emitter=emitter)
+            result = await handler.handle_dialog(
+                agent=_make_agent(),
+                agent_output={"result": "x"},
+                opening_question=opening_question,
+                provider=provider,
+            )
+        else:
+            handler = DialogHandler(console=MagicMock(), emitter=emitter)
+            with (
+                patch.object(
+                    handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"
+                ),
+                patch.object(
+                    handler, "_get_user_input", new_callable=AsyncMock, return_value="done"
+                ),
+            ):
+                result = await handler.handle_dialog(
+                    agent=_make_agent(),
+                    agent_output={"result": "x"},
+                    opening_question=opening_question,
+                    provider=provider,
+                )
+        (completed,) = _events(emitter, "dialog_completed")
+        return result, completed
+
+    @pytest.mark.asyncio
+    async def test_dismissal_right_after_the_opening_question_matches_on_both_paths(
+        self,
+    ) -> None:
+        """The opening question is the agent's last message on either path."""
+        opening = "Which repository should I use?"
+        cli_result, cli_completed = await self._dismiss_right_after_the_opening(opening, web=False)
+        web_result, web_completed = await self._dismiss_right_after_the_opening(opening, web=True)
+
+        assert cli_result.agent_question_outstanding is True
+        assert web_result.agent_question_outstanding is True
+        assert cli_completed["agent_question_outstanding"] is True
+        assert web_completed["agent_question_outstanding"] is True
+        assert cli_completed["user_dismissed"] is True
+        assert web_completed["user_dismissed"] is True
+        # Opening question and "done" only: the web loop was skipped, not
+        # entered and left by its own dismiss check.
+        assert cli_completed["turn_count"] == web_completed["turn_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_web_dismissal_right_after_a_closing_opening_is_not_flagged(self) -> None:
+        result, completed = await self._dismiss_right_after_the_opening(
+            "I have everything I need.", web=True
+        )
+        assert result.agent_question_outstanding is False
+        assert completed["agent_question_outstanding"] is False
+        assert completed["user_dismissed"] is True
+
+    def test_result_default(self) -> None:
+        assert DialogResult(dialog_id="d").agent_question_outstanding is False
+
+    def test_no_agent_message_means_no_question(self) -> None:
+        assert DialogResult(dialog_id="d").last_agent_message_asks_question() is False
+        only_user = DialogResult(dialog_id="d", messages=[DialogMessage(role="user", content="?")])
+        assert only_user.last_agent_message_asks_question() is False
+
+
+class TestConversationPrompt:
+    """``dialog.conversation_prompt`` reaches the agent holding the conversation."""
+
+    @pytest.mark.asyncio
+    async def test_cli_system_prompt_carries_the_author_instructions(self) -> None:
+        handler = DialogHandler(console=MagicMock())
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(
+                handler, "_get_user_input", new_callable=AsyncMock, side_effect=["hi", "done"]
+            ),
+        ):
+            await handler.handle_dialog(
+                agent=_make_agent(conversation_prompt="Ask one question at a time. {not a slot}"),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+        system_prompt = provider.execute_dialog_turn.await_args.kwargs["system_prompt"]
+        assert "--- WORKFLOW AUTHOR INSTRUCTIONS FOR THIS CONVERSATION ---" in system_prompt
+        assert "Ask one question at a time. {not a slot}" in system_prompt
+        assert "follow the instructions" in system_prompt
+        # Placed after the built-in rules, before the output being discussed.
+        assert system_prompt.index("RULES:") < system_prompt.index("WORKFLOW AUTHOR")
+        assert system_prompt.index("WORKFLOW AUTHOR") < system_prompt.index(
+            "AGENT OUTPUT TO DISCUSS"
+        )
+
+    @pytest.mark.asyncio
+    async def test_web_system_prompt_carries_the_author_instructions(self) -> None:
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "content": "hi"},
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        await handler.handle_dialog(
+            agent=_make_agent(conversation_prompt="Confirm the repo list before closing."),
+            agent_output={"result": "x"},
+            opening_question="Scope?",
+            provider=provider,
+        )
+        system_prompt = provider.execute_dialog_turn.await_args.kwargs["system_prompt"]
+        assert "Confirm the repo list before closing." in system_prompt
+
+    @pytest.mark.parametrize("conversation_prompt", [None, "", "   \n"])
+    @pytest.mark.asyncio
+    async def test_absent_or_blank_prompt_leaves_the_built_in_prompt_alone(
+        self, conversation_prompt: str | None
+    ) -> None:
+        handler = DialogHandler(console=MagicMock())
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch.object(
+                handler, "_get_user_input", new_callable=AsyncMock, side_effect=["hi", "done"]
+            ),
+        ):
+            await handler.handle_dialog(
+                agent=_make_agent(conversation_prompt=conversation_prompt),
+                agent_output={"result": "x"},
+                opening_question="Scope?",
+                provider=provider,
+            )
+        system_prompt = provider.execute_dialog_turn.await_args.kwargs["system_prompt"]
+        assert "WORKFLOW AUTHOR" not in system_prompt
+        assert "{conversation_instructions}" not in system_prompt
+
+    def test_trigger_prompt_still_never_reaches_the_conversation(self) -> None:
+        agent = AgentDef(
+            name="a", prompt="p", dialog=DialogConfig(trigger_prompt="TRIGGER CRITERIA")
+        )
+        assert "TRIGGER CRITERIA" not in _build_system_prompt(agent, {"r": 1})
+
+
+class TestBuildSystemPrompt:
+    """The one prompt builder behind both paths."""
+
+    def test_output_json_cannot_serialise_is_rendered_with_str(self) -> None:
+        """A tuple key defeats ``json.dumps`` even with ``default=str``."""
+        agent_output: dict[Any, Any] = {("a", "b"): 1}
+        assert str(agent_output) in _build_system_prompt(_make_agent(), agent_output)

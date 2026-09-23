@@ -3,7 +3,7 @@
 Wraps a real :class:`conductor.providers.copilot.CopilotProvider` behind the
 ``POST /execute`` (streaming NDJSON) + ``GET /health`` contract consumed by
 :class:`conductor.providers.aca.AcaRuntimeProvider`. See
-:mod:`conductor.providers.aca_protocol` for the shared wire-protocol models
+:mod:`conductor.runner.protocol` for the shared wire-protocol models
 and ``docs/projects/aca/aca-provider.design.md`` for the full contract.
 
 Entry point for the runner image::

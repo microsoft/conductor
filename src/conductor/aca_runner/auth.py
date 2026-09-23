@@ -1,14 +1,14 @@
 """Transport-token gate and request-body narrowing for the runner (issue #396).
 
 A small leaf module (stdlib + Pydantic + `conductor.web.auth` +
-`conductor.providers.aca_protocol`), matching the repository's convention of
+`conductor.runner.protocol`), matching the repository's convention of
 single-purpose leaves (`rundir.py`, `console.py`, `duration.py`,
 `web/auth.py`). Keeps `server.py` focused on the wire contract while giving
 this policy a directly unit-testable surface. `RUNNER_TOKEN_HEADER` itself is
-defined in `aca_protocol.py` (a genuine leaf both sides already import) and
-re-exported here, so the runner (`server.py`) and the host provider
-(`providers/aca.py`) share the same header name without either side dragging
-the other's dependency tree in.
+defined in `conductor.runner.protocol` (the shared wire-contract module both
+sides already import) and re-exported here, so the runner (`server.py`) and
+the host provider (`providers/aca.py`) share the same header name without
+either side dragging the other's dependency tree in.
 
 Five independent hardening layers, none individually load-bearing (mirroring
 `web/auth.py`'s own framing for issue #397):
@@ -37,7 +37,7 @@ from typing import Any
 from pydantic import SecretStr
 
 from conductor.exceptions import ProviderError
-from conductor.providers.aca_protocol import RUNNER_TOKEN_HEADER
+from conductor.runner.protocol import RUNNER_TOKEN_HEADER
 from conductor.web.auth import constant_time_match
 
 __all__ = [
@@ -103,7 +103,7 @@ def resolve_allowed_base_urls() -> tuple[str, ...] | None:
 def _unwrap(value: Any) -> Any:
     """Unwrap a `SecretStr`-wrapped value to plain text for comparison.
 
-    `AcaExecuteRequest._redact_inner_provider_secrets` wraps known credential
+    `RunnerAgentRequest._redact_inner_provider_secrets` wraps known credential
     keys in `SecretStr` before the runner ever sees them; `base_url` is not a
     secret key, so it is never wrapped here, but it also arrives typed as
     `Any` — a caller can send any JSON value, not necessarily a `str` — so

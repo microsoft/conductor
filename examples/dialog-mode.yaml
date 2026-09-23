@@ -53,6 +53,11 @@ agents:
         - Makes assumptions that could lead the research in the wrong direction
         - Encounters multiple valid interpretations of the topic
         Do NOT trigger for minor uncertainties that the agent can resolve on its own.
+      # Optional. Reaches the agent holding the conversation (trigger_prompt
+      # reaches only the evaluator that decides whether to open it).
+      conversation_prompt: |
+        Ask one question at a time and offer a recommended answer with each.
+        Let the user decide when the conversation is over.
     routes:
       - to: writer
 

@@ -86,12 +86,9 @@ def test_regex_does_not_match_unrelated_marker_name(real_api_sandbox: pytest.Pyt
 
 
 def test_ci_marker_expression_still_deselects(real_api_sandbox: pytest.Pytester) -> None:
-    """CI's exact ``-m "not real_api and not performance"`` must keep deselecting it.
-
-    This expression is duplicated in ``.github/workflows/ci.yml`` and
-    ``release.yml`` — keep this test's ``-m`` string in sync if those change.
-    """
-    result = real_api_sandbox.runpytest("-m", "not real_api and not performance")
+    result = real_api_sandbox.runpytest(
+        "-m", "not real_api and not install_scripts and not performance"
+    )
     result.assert_outcomes(passed=1, deselected=1)
 
 

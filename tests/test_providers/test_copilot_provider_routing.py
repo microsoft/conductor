@@ -931,6 +931,7 @@ class TestGithubTokenAuth:
         does not thread it through any logging/event/describe path. (Runner
         + host-side redaction of the raw value in transit and in the cache
         key is covered by ``test_aca_runner/test_server.py`` and
-        ``aca_protocol.py``'s ``SecretStr`` wrapping, epic E8.)"""
+        ``conductor.runner.protocol``'s ``SecretStr`` wrapping
+        (``RunnerAgentRequest``, epic E8.)"""
         provider = _make_provider(github_token="super-secret-gh-token")
         assert provider._github_token == "super-secret-gh-token"

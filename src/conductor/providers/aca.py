@@ -22,9 +22,11 @@ from ``identifier_scope`` (DD5), acquires a cached AAD bearer token, issues a
 single streaming ``POST {pool_endpoint}/execute`` request (Branch S, DD3),
 relays the runner's NDJSON event frames verbatim to ``event_callback``, and
 parses the terminal ``result`` frame into :class:`AgentOutput`. The
-in-sandbox ``conductor-agent-runner`` itself (epic E4) is not yet built —
-this module implements only the host side of the contract defined in
-:mod:`conductor.providers.aca_protocol`.
+in-sandbox ``conductor-agent-runner`` (epic E4, shipped as the
+``conductor-agent-runner`` image via ``docker/aca-runner/Dockerfile``) speaks
+the wire contract defined in :mod:`conductor.runner.protocol`; this module
+implements the host side of that contract, plus the ACA-specific ``code`` /
+``traceId`` error fields (:class:`AcaGatewayErrorData`).
 """
 
 from __future__ import annotations
@@ -42,20 +44,23 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
 from conductor.exceptions import ProviderError
 from conductor.install_hint import install_command
-from conductor.providers.aca_protocol import (
-    RUNNER_TOKEN_HEADER,
-    AcaAgentPayload,
-    AcaErrorData,
-    AcaExecuteRequest,
-    AcaResultData,
-)
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
+from conductor.runner.protocol import (
+    RUNNER_PROTOCOL_VERSION,
+    RUNNER_TOKEN_HEADER,
+    RunnerAgentPayload,
+    RunnerAgentRequest,
+    RunnerAgentResult,
+    RunnerErrorData,
+    RunnerHealthResponse,
+    request_to_wire_body,
+)
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
@@ -110,10 +115,29 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 60.0
 # workflow before its first agent turn.
 _GH_TOKEN_TIMEOUT_SECONDS = 10.0
 
-# `AcaErrorData.message`'s placeholder, read off the model so the two can't
-# drift. Used to detect "the body told us nothing" and fall back to echoing
-# the raw response body instead.
-_DEFAULT_ACA_ERROR_MESSAGE = AcaErrorData.model_fields["message"].default
+
+class AcaGatewayErrorData(RunnerErrorData):
+    """ACA-flavoured runner error: adds the platform's diagnostic identifiers.
+
+    ``code`` / ``traceId`` arrive from error bodies emitted by the ACA
+    front-end / Management API (e.g. an HTTP 429 from the pool's own front
+    end, before the request ever reaches the runner). The neutral runner
+    itself only ever sends ``{"message": ...}`` (see
+    ``aca_runner/server.py``), so both fields default to ``None`` and the
+    default ``message`` stays the ACA-specific placeholder below.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    code: str | None = None
+    trace_id: str | None = Field(default=None, alias="traceId")
+    message: str = Field(default="aca runner reported an error")
+
+
+# `AcaGatewayErrorData.message`'s placeholder, read off the model so the two
+# can't drift. Used to detect "the body told us nothing" and fall back to
+# echoing the raw response body instead.
+_DEFAULT_ACA_ERROR_MESSAGE = AcaGatewayErrorData.model_fields["message"].default
 
 # How much of an unrecognized error body to echo into the ProviderError
 # message — enough to identify an ACA front-end error page or JSON payload
@@ -644,13 +668,13 @@ class AcaRuntimeProvider(AgentProvider):
 
         Review fix: every secret value (``api_key``/``bearer_token``/
         ``github_token``) is stored as a ``SecretStr`` instance in the
-        returned dict, not the plaintext ``str``. ``AcaExecuteRequest``'s
+        returned dict, not the plaintext ``str``. ``RunnerAgentRequest``'s
         ``inner_provider_settings`` field is ``dict[str, Any]``, so pydantic
         still recognizes and redacts these values (``"**********"``) in
         ``model_dump``/``repr``/logging — only the dedicated wire-serialization
         step in :meth:`execute` (``_wire_body``) unwraps them to plaintext,
         right before the request bytes leave the process. A second
-        review fix — ``AcaExecuteRequest._redact_inner_provider_secrets`` —
+        review fix — ``RunnerAgentRequest._redact_inner_provider_secrets`` —
         additionally enforces this ``SecretStr`` wrapping for any
         construction path that does *not* go through this method (e.g. a
         raw dict/JSON payload passed to ``model_validate``), so redaction
@@ -746,7 +770,7 @@ class AcaRuntimeProvider(AgentProvider):
         rendered_prompt: str,
         tools: list[str] | None,
         suppress_mcp_servers: bool = False,
-    ) -> AcaExecuteRequest:
+    ) -> RunnerAgentRequest:
         reasoning_effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
         working_dir = agent.sandbox.working_dir if agent.sandbox is not None else None
         output_schema = (
@@ -757,7 +781,7 @@ class AcaRuntimeProvider(AgentProvider):
             if agent.output
             else None
         )
-        agent_payload = AcaAgentPayload(
+        agent_payload = RunnerAgentPayload(
             name=agent.name,
             model=agent.model or self._default_model,
             system_prompt=agent.system_prompt,
@@ -769,7 +793,7 @@ class AcaRuntimeProvider(AgentProvider):
             retry=agent.retry.model_dump(mode="json") if agent.retry is not None else None,
             context_tier=agent.context_tier,
         )
-        return AcaExecuteRequest(
+        return RunnerAgentRequest(
             agent=agent_payload,
             rendered_prompt=rendered_prompt,
             tools=tools,
@@ -786,33 +810,25 @@ class AcaRuntimeProvider(AgentProvider):
             ),
         )
 
-    def _wire_body(self, request: AcaExecuteRequest) -> dict[str, Any]:
+    def _wire_body(self, request: RunnerAgentRequest) -> dict[str, Any]:
         """Serialize `request` into the JSON body actually sent to the runner.
 
-        Review fix: `request.model_dump(mode="json")` alone keeps any
-        `SecretStr` values held in `inner_provider_settings` redacted
-        (`"**********"`) — the correct behavior for anything that logs,
-        reprs, or otherwise dumps the request object itself (including the
-        request's own `__repr__`). This method is the one dedicated
-        wire-serialization step that unwraps those secrets back to
-        plaintext, reading them directly off `request.inner_provider_settings`
-        (not off the already-redacted dump) immediately before the bytes are
-        handed to httpx — nowhere else in the codebase sees the plaintext.
+        Thin delegate to :func:`conductor.runner.protocol.request_to_wire_body`
+        (the one dedicated wire-serialization step): it unwraps any
+        `SecretStr` values held in `inner_provider_settings` back to
+        plaintext immediately before the bytes are handed to httpx — the
+        request object's own `model_dump`/`repr` stay redacted, and nowhere
+        else in the codebase sees the plaintext. Kept as a method because
+        tests call it directly.
         """
-        body = request.model_dump(mode="json")
-        if request.inner_provider_settings is not None:
-            body["inner_provider_settings"] = {
-                key: value.get_secret_value() if isinstance(value, SecretStr) else value
-                for key, value in request.inner_provider_settings.items()
-            }
-        return body
+        return request_to_wire_body(request)
 
     # ------------------------------------------------------------------
     # Error classification (E3-T5)
     # ------------------------------------------------------------------
 
     def _error_from_frame(self, data: dict[str, Any]) -> ProviderError:
-        parsed = AcaErrorData.model_validate(data)
+        parsed = AcaGatewayErrorData.model_validate(data)
         return self._provider_error_from_parts(parsed)
 
     async def _error_from_response(self, response: httpx.Response) -> ProviderError:
@@ -831,7 +847,7 @@ class AcaRuntimeProvider(AgentProvider):
         Second fix (functional test, issue #284): an ACA data-plane error
         whose body carries *no* recognizable ``message`` (e.g. an HTTP 429
         emitted by the pool's own front end rather than the runner) fell
-        back to ``AcaErrorData``'s placeholder default, so the operator saw
+        back to ``AcaGatewayErrorData``'s placeholder default, so the operator saw
         only "aca runner reported an error" with the real body discarded —
         actively misleading, since the runner may never have been reached.
         The raw body is now preserved (truncated) whenever the parsed
@@ -849,9 +865,9 @@ class AcaRuntimeProvider(AgentProvider):
             body = {}
         error_obj = body.get("error", body) if isinstance(body, dict) else {}
         parsed = (
-            AcaErrorData.model_validate(error_obj)
+            AcaGatewayErrorData.model_validate(error_obj)
             if isinstance(error_obj, dict)
-            else AcaErrorData()
+            else AcaGatewayErrorData()
         )
         return self._provider_error_from_parts(
             parsed, status_code=response.status_code, raw_body=raw_body
@@ -859,7 +875,7 @@ class AcaRuntimeProvider(AgentProvider):
 
     def _provider_error_from_parts(
         self,
-        error: AcaErrorData,
+        error: AcaGatewayErrorData,
         status_code: int | None = None,
         raw_body: str | None = None,
     ) -> ProviderError:
@@ -883,7 +899,7 @@ class AcaRuntimeProvider(AgentProvider):
         )
 
     def _agent_output_from_result(self, data: dict[str, Any], *, interrupted: bool) -> AgentOutput:
-        result = AcaResultData.model_validate(data)
+        result = RunnerAgentResult.model_validate(data)
         input_tokens = result.input_tokens
         output_tokens = result.output_tokens
         tokens_used = (
@@ -1257,26 +1273,49 @@ class AcaRuntimeProvider(AgentProvider):
             raise await self._error_from_response(response)
 
         with contextlib.suppress(Exception):
-            health = response.json()
+            health = RunnerHealthResponse.model_validate(response.json())
             self._warn_on_version_skew(health)
             self._warn_on_auth_skew(health)
         return True
 
-    def _warn_on_version_skew(self, health: dict[str, Any]) -> None:
-        runner_version = health.get("conductor_version") if isinstance(health, dict) else None
-        if not runner_version:
-            return
-        from conductor import __version__ as host_version
+    def _warn_on_version_skew(self, health: RunnerHealthResponse) -> None:
+        """Warn (never raise) on host/runner Conductor and protocol-version skew.
 
-        if runner_version != host_version:
+        A ``conductor_version`` mismatch between host and runner is a
+        compatibility hint, not a hard failure (mirrors the "safe
+        degradation" convention of the other best-effort provider hooks in
+        ``AgentProvider``).
+
+        The runner's advertised ``protocol_version``
+        (:data:`conductor.runner.protocol.RUNNER_PROTOCOL_VERSION`) gates
+        incompatible wire-contract changes; a mismatch additionally warns,
+        still without failing the connection. A runner predating version
+        advertisement omits the key entirely, which parses to ``None`` and
+        skips the check silently — the same silent-degradation precedent as
+        :meth:`_warn_on_auth_skew`.
+        """
+        runner_version = health.conductor_version
+        if runner_version:
+            from conductor import __version__ as host_version
+
+            if runner_version != host_version:
+                logger.warning(
+                    "aca: runner Conductor version %s differs from host version %s; "
+                    "behavior may differ between host and sandbox.",
+                    runner_version,
+                    host_version,
+                )
+
+        runner_protocol = health.protocol_version
+        if runner_protocol is not None and runner_protocol != RUNNER_PROTOCOL_VERSION:
             logger.warning(
-                "aca: runner Conductor version %s differs from host version %s; "
-                "behavior may differ between host and sandbox.",
-                runner_version,
-                host_version,
+                "aca: runner wire-protocol version %s differs from host protocol "
+                "version %s; behavior may differ between host and sandbox.",
+                runner_protocol,
+                RUNNER_PROTOCOL_VERSION,
             )
 
-    def _warn_on_auth_skew(self, health: dict[str, Any]) -> None:
+    def _warn_on_auth_skew(self, health: RunnerHealthResponse) -> None:
         """Warn when the host's and runner's transport-token postures disagree.
 
         Issue #396: `/health` reports two runner-side facts —
@@ -1293,14 +1332,12 @@ class AcaRuntimeProvider(AgentProvider):
           `ACA_RUNNER_AUTH_TOKEN` isn't set there, so the header is being
           silently ignored and the gate provides no protection.
 
-        A runner predating these fields omits both keys entirely
-        (`.get(...)` returns `None`, which is falsy), so this degrades
-        silently against an old image rather than warning spuriously.
+        A runner predating these fields omits both keys entirely (they parse
+        to `None` here), so this degrades silently against an old image
+        rather than warning spuriously.
         """
-        if not isinstance(health, dict):
-            return
-        auth_required = health.get("auth_required")
-        auth_token_present = health.get("auth_token_present")
+        auth_required = health.auth_required
+        auth_token_present = health.auth_token_present
         if auth_required is None or auth_token_present is None:
             return
 

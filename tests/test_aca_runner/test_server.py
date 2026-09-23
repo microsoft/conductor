@@ -169,6 +169,10 @@ class TestHealth:
         assert body["ready"] is True
         assert body["conductor_version"] == conductor_version
         assert "runner_version" in body
+        # Requirement: /health must advertise the wire-protocol version so the
+        # host can warn on host/runner protocol skew; the key is additive, so
+        # old hosts ignore it and old runners simply omit it.
+        assert body["protocol_version"] == 1
 
 
 class TestExecuteStreaming:
@@ -707,7 +711,7 @@ class TestRunnerAuthGate:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Pinned contract (review finding B2): FastAPI validates the
-        `AcaExecuteRequest` body *before* the handler's token check ever
+        `RunnerAgentRequest` body *before* the handler's token check ever
         runs, so a malformed body with no token header returns FastAPI's own
         422 rather than the gate's 401 — the gate protects execution, not
         the parser. See `execute_endpoint`'s docstring."""

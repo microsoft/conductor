@@ -1,5 +1,9 @@
 .PHONY: install install-cli dev test test-cov lint format typecheck check clean build all build-frontend dev-frontend test-frontend changelog-draft changelog-build
 
+PYTEST_WORKERS ?= 4
+PYTEST_PARALLEL_ARGS = -n $(PYTEST_WORKERS) --dist loadfile
+PYTEST_DEFAULT_MARKERS = not real_api and not install_scripts and not performance
+
 # Default target
 all: check test
 
@@ -15,17 +19,17 @@ install-cli:
 dev:
 	uv sync --group dev
 
-# Run tests (excluding performance-threshold tests, like CI)
+# Run the isolated test suite in parallel. Set PYTEST_WORKERS=0 for a serial run.
 test:
-	uv run pytest -m "not install_scripts and not performance"
+	uv run pytest $(PYTEST_PARALLEL_ARGS) -m "$(PYTEST_DEFAULT_MARKERS)"
 
 # Run install-script integration tests (slow; builds wheels, runs install.ps1/install.sh)
 test-install-scripts:
-	uv run pytest -m install_scripts -v
+	uv run pytest -n 0 -m install_scripts -v
 
-# Run tests with coverage (excluding performance-threshold tests, like CI)
+# Run the isolated test suite in parallel with coverage.
 test-cov:
-	uv run pytest -m "not install_scripts and not performance" --cov=conductor --cov-report=term-missing
+	uv run pytest $(PYTEST_PARALLEL_ARGS) -m "$(PYTEST_DEFAULT_MARKERS)" --cov=conductor --cov-report=term-missing
 
 # Run linter and formatter check
 lint:

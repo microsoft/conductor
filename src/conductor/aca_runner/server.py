@@ -1,23 +1,26 @@
-"""FastAPI app implementing the `conductor-agent-runner` contract (epic E4).
+"""FastAPI app implementing the `conductor-agent-runner` remote runtime.
 
-Wraps a real ``CopilotProvider`` (the only supported ``inner_provider`` for
-the MVP, per *DD2* / *Open Questions*) behind the wire contract shared with
-the host-side :class:`~conductor.providers.aca.AcaRuntimeProvider`:
+`conductor-agent-runner` (built from ``docker/aca-runner/Dockerfile``) is the
+reference remote agent runtime. It wraps a real ``CopilotProvider`` (the only
+supported ``inner_provider`` for the MVP, per *DD2* / *Open Questions*) behind
+the wire contract shared with the host-side
+:class:`~conductor.providers.aca.AcaRuntimeProvider` and defined in
+:mod:`conductor.runner.protocol`:
 
-- ``GET /health`` — readiness + Conductor/runner version, so
+- ``GET /health`` — readiness + Conductor/runner/protocol version, so
   ``validate_connection()`` can detect host/runner version skew.
-- ``POST /execute`` — deserializes an
-  :class:`~conductor.providers.aca_protocol.AcaExecuteRequest`, runs the
-  inner ``CopilotProvider.execute()``, and streams the result back as
+- ``POST /execute`` — deserializes a
+  :class:`~conductor.runner.protocol.RunnerAgentRequest`, runs the inner
+  ``CopilotProvider.execute()``, and streams the result back as
   ``application/x-ndjson``: one ``{"type": ..., "data": ...}`` line per SDK
   event, terminated by a ``result`` (or ``error``) frame.
 
-Not built by this epic (see the plan's Files Affected / task table): a
-dedicated ``/interrupt`` endpoint (the host's in-stream interrupt currently
-has nothing to land on inside this runner) and a runner-side
-``max_session_seconds`` wall-clock guard (the capability is declared "as
-runner-enforced" by E3, but no E4 task assigns building the guard itself).
-Both are tracked as follow-up gaps rather than implemented here.
+Not built here: a dedicated ``/interrupt`` endpoint (the host's in-stream
+interrupt currently has nothing to land on inside this runner) and a
+runner-side ``max_session_seconds`` wall-clock guard (the capability is
+declared "as runner-enforced" by E3, but no task has assigned building the
+guard itself). Both are tracked as follow-up gaps rather than implemented
+here.
 """
 
 from __future__ import annotations
@@ -55,8 +58,13 @@ from conductor.config.schema import (
     ToolOutputConfig,
 )
 from conductor.exceptions import ProviderError
-from conductor.providers.aca_protocol import AcaAgentPayload, AcaExecuteRequest, AcaResultData
 from conductor.providers.copilot import CopilotProvider
+from conductor.runner.protocol import (
+    RUNNER_PROTOCOL_VERSION,
+    RunnerAgentPayload,
+    RunnerAgentRequest,
+    RunnerAgentResult,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -83,12 +91,12 @@ def _frame(event_type: str, data: dict[str, Any]) -> bytes:
     return (json.dumps({"type": event_type, "data": data}, default=str) + "\n").encode("utf-8")
 
 
-def _build_agent(payload: AcaAgentPayload) -> AgentDef:
+def _build_agent(payload: RunnerAgentPayload) -> AgentDef:
     """Reconstruct the minimal `AgentDef` the inner `CopilotProvider` needs.
 
-    Only the fields `AcaAgentPayload` actually carries are set — routing,
+    Only the fields `RunnerAgentPayload` actually carries are set — routing,
     dependency (`input:`), and validator configuration stay host-side (see
-    `AcaAgentPayload`'s docstring). `working_dir` is forwarded as-is: it is
+    `RunnerAgentPayload`'s docstring). `working_dir` is forwarded as-is: it is
     already container-relative (the `sandbox.working_dir` semantics, not
     `agent.working_dir`'s host-path resolution), so no path resolution
     happens here — the container filesystem *is* the working directory.
@@ -156,7 +164,7 @@ def _check_stdio_binaries(mcp_servers: dict[str, Any] | None) -> None:
 
 
 def _validate_execute_request(
-    request: AcaExecuteRequest, *, allowed_base_urls: tuple[str, ...] | None
+    request: RunnerAgentRequest, *, allowed_base_urls: tuple[str, ...] | None
 ) -> AgentDef:
     """Pre-flight checks run before the streaming response is opened.
 
@@ -189,10 +197,10 @@ def _validate_execute_request(
 def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str, Any]:
     """Build the terminal `result` frame payload (E4-T2, incl. `session_seconds`).
 
-    `session_seconds` is a field on `AcaResultData` (added by E6, which parses
-    it into `AgentOutput.session_seconds` on the host side).
+    `session_seconds` is a field on `RunnerAgentResult` (added by E6, which
+    parses it into `AgentOutput.session_seconds` on the host side).
     """
-    payload = AcaResultData(
+    payload = RunnerAgentResult(
         content=output.content,
         model=output.model,
         input_tokens=output.input_tokens,
@@ -238,8 +246,9 @@ class _InnerProviderCache:
         inner_provider_settings: dict[str, Any] | None,
         tool_output: dict[str, Any] | None,
     ) -> str:
-        # Epic E8 (aca_protocol.py's `_redact_inner_provider_secrets`) wraps
-        # known credential keys in `SecretStr` on every `AcaExecuteRequest`
+        # Epic E8 (`runner/protocol.py`'s `_redact_inner_provider_secrets`)
+        # wraps known credential keys in `SecretStr` on every
+        # `RunnerAgentRequest`
         # construction path, including this model's own FastAPI request
         # parsing — so `inner_provider_settings` may now hold `SecretStr`
         # values here. `json.dumps(..., default=str)` would otherwise call
@@ -333,7 +342,7 @@ class _InnerProviderCache:
 
 
 async def _stream_execute(
-    provider: CopilotProvider, agent: AgentDef, payload: AcaExecuteRequest
+    provider: CopilotProvider, agent: AgentDef, payload: RunnerAgentRequest
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
 
@@ -435,18 +444,24 @@ def create_app() -> FastAPI:
         and is never treated as a caller-authentication signal; the
         transport-token gate on `/execute` is the actual runner-side
         control.
+
+        `protocol_version` is the one additive wire change of the
+        ``conductor.runner.protocol`` lift: it is purely additive, so old
+        hosts ignore the unknown key and new hosts reading an old runner's
+        payload simply see the key absent.
         """
         return {
             "ready": True,
             "conductor_version": _conductor_version,
             "runner_version": RUNNER_VERSION,
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
             "auth_required": runner_token is not None,
             "auth_token_present": http_request.headers.get(RUNNER_TOKEN_HEADER) is not None,
         }
 
     @app.post("/execute")
     async def execute_endpoint(
-        payload: AcaExecuteRequest,
+        payload: RunnerAgentRequest,
         http_request: Request,
         identifier: str | None = None,
         api_version: str | None = Query(default=None, alias="api-version"),
@@ -460,7 +475,7 @@ def create_app() -> FastAPI:
         the same `{"error": {"message": ...}}` envelope
         `AcaRuntimeProvider._error_from_response` already parses, and never
         runs `_validate_execute_request` or constructs the inner Copilot
-        provider. Note FastAPI validates the `AcaExecuteRequest` body
+        provider. Note FastAPI validates the `RunnerAgentRequest` body
         parameter *before* this handler runs, so a malformed body from an
         unauthenticated caller still returns FastAPI's own 422 rather than a
         401 — the gate protects execution, not the parser. `identifier`

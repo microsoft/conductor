@@ -154,6 +154,8 @@ step-by-step checklist.
   - `template.py` - Jinja2 template rendering
   - `output.py` - JSON output parsing and schema validation. `validate_output` is deliberately **strict with no coercion** — it also validates `set` and `script` step output, where silently reshaping an authored value would be surprising. Response normalization belongs in `providers/_output_shape.py` instead. Note `parse_json_output` raises `ValidationError` for JSON *syntax* errors, so callers cannot distinguish syntax from schema failures by exception type alone.
 
+- **runner/**: The serialized wire contract between the CLI host and a remote agent runtime (issue #527) — `protocol.py` holds the Pydantic models (`RunnerAgentRequest`/`RunnerAgentPayload`, `RunnerEventFrame`, `RunnerAgentResult`, `RunnerErrorData`, `RunnerHealthResponse`), `RUNNER_TOKEN_HEADER`, `RUNNER_PROTOCOL_VERSION`, and the `request_to_wire_body` wire-serialization step (the only place credential plaintext exists — `inner_provider_settings` secrets are `SecretStr` everywhere else). Boundary: `conductor.execution` is the in-process Python backend seam (stdlib-only); `conductor.runner.protocol` is the serialized contract for a *remote* runtime whose version deploys independently of the host (response-side models `extra="ignore"`, request-side `extra="forbid"`, evolution additive-only). `__init__.py` re-exports nothing (precedent: `plugins/__init__.py`) — imports go via `from conductor.runner.protocol import ...`. Lifted de-ACA'd from `providers/aca_protocol.py`; the reference remote runtime is `conductor-agent-runner` (`docker/aca-runner/Dockerfile`).
+
 - **duration.py**: `parse_duration(value)` shared helper. Accepts plain `int`/`float` seconds, or strings with `ms`/`s`/`m`/`h` suffix. Raises `ValueError` (nests cleanly inside Pydantic `ValidationError`). Rejects booleans. Bounds enforcement (e.g. > 0, 24h cap) lives in callers so the parser can be reused.
 
 - **filesystem.py**: `stat_or_none()` / `exists_strict()` / `is_dir_strict()` / `is_file_strict()` — path probes with pre-3.14 `pathlib` error semantics (issue #540). Python 3.14 rewrote `pathlib` so `Path.exists()`/`is_dir()`/`is_file()` delegate to `os.path` and swallow *every* `OSError` — including `PermissionError` — returning `False`; on 3.13 and earlier they re-raised anything outside a small allowlist (`ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, plus winerrors 21/123/1921, mirrored here from `Lib/pathlib/_abc.py::_ignore_error`). Conductor's path diagnostics distinguish "does not exist" from "could not be read", which requires the older semantics on every interpreter — without these probes an unreadable skill/plugin path is misreported as missing, and an unreadable skills-root subdirectory is silently misfiled as a near-miss. The probes follow symlinks (matching their pathlib counterparts) and swallow `ValueError` (non-encodable path) into `None`, exactly as pathlib did. A stdlib-only leaf (like `duration.py`, `console.py`, `rundir.py`) so `skills/`, `plugins/` and `cli/` can all depend on it without an import cycle.
@@ -476,10 +478,13 @@ loop to a remote sandbox**: `AcaRuntimeProvider` is a thin host-side
 transport shim that derives a session identifier, authenticates via
 `DefaultAzureCredential`, and relays NDJSON event frames from an
 in-container `conductor-agent-runner` (which itself wraps a real
-`CopilotProvider`) verbatim to `event_callback`. Because the runner
-re-emits Conductor's own event vocabulary and forwards a real
-`CopilotProvider`'s output, this achieves **full event and output
-parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
+`CopilotProvider`) verbatim to `event_callback`. The wire contract lives
+in `conductor.runner.protocol` (issue #527), with
+`conductor.providers.aca_protocol` retained as a deprecated re-export shim
+(emits `DeprecationWarning` on import; will be removed in a future major
+release). Because the runner re-emits Conductor's own event vocabulary and
+forwards a real `CopilotProvider`'s output, this achieves **full event and
+output parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
 `reasoning_effort` are all declared `True`) — with the following carve-outs:
 
 **Inner Copilot credential (DD4).** The sandbox's Copilot session can't do
@@ -584,8 +589,10 @@ it will pick up the developer's real token (see
   see `docs/projects/aca/aca-provider.design.md`'s *Identifier as a
   capability* bullet and `docs/providers/aca.md#security`.
 
-Full architecture, the runner `/execute`/`/health` contract, the NDJSON
-frame schema, and the credential/security model are documented in
+Full architecture, the runner `/execute`/`/health` contract, the wire
+protocol (`conductor.runner.protocol` design at `docs/design/runner-protocol.md`;
+`conductor.providers.aca_protocol` is a deprecated shim), the NDJSON frame
+schema, and the credential/security model are documented in
 `docs/providers/aca.md` and the source design at
 `docs/projects/aca/aca-provider.design.md`.
 

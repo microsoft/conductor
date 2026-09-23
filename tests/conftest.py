@@ -10,6 +10,7 @@ the full rationale.
 import re
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -37,21 +38,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     process-killing ``--auto-stop`` path (issue #331). Either can collide
     with and kill a live ``conductor run --web-bg`` session.
 
-    This hook is load-bearing to different degrees per marker and per
-    invocation: a plain ``pytest`` or ``pytest -m "not performance"`` never
-    mentions either marker, so both are only caught by this hook. ``make
-    test``'s own ``-m "not install_scripts and not performance"`` (see
-    ``Makefile``) already deselects ``install_scripts`` independently via
-    pytest's native marker-expression evaluation — but it never mentions
-    ``real_api``, so that marker still relies on this hook there too.
+    A plain ``pytest`` or ``pytest -m "not performance"`` never mentions either
+    marker, so both are only caught by this hook. The official ``make test``
+    and CI commands explicitly deselect both markers as defense in depth.
 
     For each marker name, if the caller's ``-m`` expression already
     references it (e.g. ``-m real_api`` / ``-m install_scripts`` to opt in,
-    or CI's ``-m "not real_api and not performance"``), pytest's own
+    or the default suite's full exclusion expression), pytest's own
     marker-expression evaluation already produces the correct
     selection/deselection, so this hook steps aside for that marker.
     """
-    marker_expr = config.getoption("markexpr")
+    marker_expr = config.getoption("markexpr") or ""
     for mark_name in _OPT_IN_MARKER_NAMES:
         # Matches the marker name as a whole word (not merely a substring)
         # inside the `-m` expression, e.g. "install_scripts", "not
@@ -102,6 +99,8 @@ def _isolate_event_log_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     the real system temp directory.
     """
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(tmp_path))
 
 
 @pytest.fixture(autouse=True)
@@ -234,11 +233,15 @@ def _stub_claude_auth_readiness(
         monkeypatch.setattr("asyncio.create_subprocess_exec", _refuse_real_spawn)
         return
 
-    from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider, ClaudeAuthStatus
+    from conductor.providers.claude_agent_sdk import (
+        ClaudeAgentSdkProvider,
+        ClaudeAuthMode,
+        ClaudeAuthStatus,
+    )
 
     async def _always_ready(self: ClaudeAgentSdkProvider, **kwargs: object) -> ClaudeAuthStatus:
         return ClaudeAuthStatus(
-            requested_mode=self._auth_mode,
+            requested_mode=cast(ClaudeAuthMode, self._auth_mode),
             inferred_mode="subscription",
             ready=True,
         )

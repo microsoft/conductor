@@ -26,6 +26,7 @@ the source design:
 - [Architecture](#architecture)
 - [Provisioning a Pool](#provisioning-a-pool)
 - [Runner Contract](#runner-contract)
+- [Wire Protocol](#wire-protocol)
 - [NDJSON Event Frame Schema](#ndjson-event-frame-schema)
 - [Building / Extending the Runner Image](#building--extending-the-runner-image)
 - [Authentication](#authentication)
@@ -338,11 +339,14 @@ all, so gating this endpoint would break it.
   "ready": true,
   "conductor_version": "0.4.0",
   "runner_version": "0.1.0",
+  "protocol_version": 1,
   "auth_required": false,
   "auth_token_present": false
 }
 ```
 
+- `protocol_version`: integer protocol version (currently 1) used for version
+  advertisement and warn-only host compatibility checks.
 - `auth_required` — whether the runner has `ACA_RUNNER_AUTH_TOKEN`
   configured (the transport-token gate on `/execute` is opt-in — see
   below).
@@ -415,6 +419,30 @@ provider is ever constructed. Request body:
   `X-Conductor-Runner-Token` header above is the actual runner-side
   authentication control.
 
+## Wire Protocol
+
+The host and the in-sandbox runner communicate through the backend-neutral wire
+contract defined in `conductor.runner.protocol` (see
+[`docs/design/runner-protocol.md`](../design/runner-protocol.md) for the full
+specification).
+
+The wire models include:
+- `RunnerAgentRequest` and `RunnerAgentPayload` for the `/execute` request body.
+- `RunnerEventFrame` and `RunnerAgentResult` for streaming and terminal NDJSON frames.
+- `RunnerErrorData` for error frame payloads (extended by `AcaGatewayErrorData` in
+  `conductor.providers.aca` with `code` and `traceId` diagnostics).
+- `RunnerHealthResponse` for `/health` readiness and version advertisement.
+- `RUNNER_TOKEN_HEADER` (`X-Conductor-Runner-Token`) for optional transport auth.
+
+The runner's `/health` endpoint additively advertises `protocol_version`
+(`RUNNER_PROTOCOL_VERSION = 1`). When the host connects, it inspects this
+field as part of a warn-only compatibility check. If the versions differ, the
+host logs a warning and continues running.
+
+`conductor.providers.aca_protocol` is a deprecated re-export shim that emits a
+`DeprecationWarning` upon import and will be removed in a future major release.
+All external callers and integrations should import from
+`conductor.runner.protocol` instead.
 
 ## NDJSON Event Frame Schema
 
