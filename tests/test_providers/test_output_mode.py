@@ -220,6 +220,11 @@ class TestCopilotParseExhaustionNotRetryable:
             skill_directories: Any = None,
             custom_agents: Any = None,
             extra_mcp_servers: Any = None,
+            # This stub mirrors a private signature, so it must tolerate kwargs
+            # the provider gains later (e.g. ``suppress_mcp_servers``).
+            # Otherwise the TypeError fires before the body runs and the
+            # call-count assertion reports 0 rather than the real behavior.
+            **_kwargs: Any,
         ) -> Any:
             nonlocal call_count
             call_count += 1

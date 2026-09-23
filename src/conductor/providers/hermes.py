@@ -216,6 +216,7 @@ class HermesProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Execute an agent via the hermes-agent library.
 
@@ -237,6 +238,9 @@ class HermesProvider(AgentProvider):
                 so :class:`AgentExecutor` has already eager-injected the
                 skill content into ``rendered_prompt`` for this provider
                 (see :attr:`AgentProvider.supports_native_skills`).
+            suppress_mcp_servers: Ignored. Declares ``mcp_tools=False``, so
+                no MCP server ever reaches a Hermes session and there is
+                nothing to suppress.
             custom_agents: Ignored. Declares ``plugins=False``, so
                 :class:`AgentExecutor` refuses ``plugins:`` on this
                 provider before reaching here and this is always ``None``.
@@ -258,6 +262,7 @@ class HermesProvider(AgentProvider):
             ValidationError: If output doesn't match the declared schema.
         """
         del skill_directories  # Hermes relies on eager preamble injection (see docstring).
+        del suppress_mcp_servers  # No MCP surface to suppress (see docstring).
         # Resolve per-agent overrides
         resolved_model = agent.model or self._default_model
         resolved_max_iter = (

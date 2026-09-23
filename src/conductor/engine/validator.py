@@ -188,6 +188,16 @@ class OutputValidator:
                 rendered_prompt=rendered_prompt,
                 tools=[],
                 interrupt_signal=interrupt_signal,
+                # The grader reads one string and answers a fixed schema; it
+                # must reach no tool at all. ``tools: []`` alone does not say
+                # that on an MCP-capable provider, which attaches the
+                # workflow's servers regardless of the per-agent list -- so
+                # the grader would either get tools the workflow never granted
+                # it or, on claude-agent-sdk, be refused outright and fail
+                # open, silently passing every output. This is an
+                # execution-level signal rather than anything on the synthetic
+                # agent, so no authored workflow can reach it.
+                suppress_mcp_servers=True,
             )
         except asyncio.CancelledError:
             # Interrupt / cancellation must propagate — never silently pass.

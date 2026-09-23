@@ -650,7 +650,21 @@ class TestClaudeAgentSdkNativeTools:
         with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
             _validate(config, _wf_path(tmp_path))
 
-    @pytest.mark.parametrize("name", ["a__b", "a_", "_a", "x,y", "a__*,Bash", "has space"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "a__b",
+            "a_",
+            "_a",
+            "x,y",
+            "a__*,Bash",
+            "has space",
+            # Dotted names normalize to '_' in the CLI's tool names, so a
+            # dotted rule never matches -- validate must refuse them too.
+            "fs.tools-2",
+            "a.b",
+        ],
+    )
     def test_unsafe_workflow_server_name_is_refused(self, tmp_path: Path, name: str) -> None:
         config = _config(provider="claude-agent-sdk", mcp_servers={name: MCPServerDef(command="d")})
         with pytest.raises(ConfigurationError, match="cannot be granted a permission rule"):
@@ -678,7 +692,7 @@ class TestClaudeAgentSdkNativeTools:
             provider="claude-agent-sdk",
             mcp_servers={
                 "docs": MCPServerDef(command="d"),
-                "fs.tools-2": MCPServerDef(command="d"),
+                "fs-tools-2": MCPServerDef(command="d"),
                 "a_b": MCPServerDef(command="d"),
             },
         )

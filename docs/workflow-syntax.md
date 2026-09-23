@@ -745,10 +745,14 @@ agent can be MCP-only with no built-in tools at all (see
 [`examples/claude-agent-sdk-mcp.yaml`](../examples/claude-agent-sdk-mcp.yaml)).
 Two limitations follow:
 
-- Server names must use only letters, digits, `.`, `-` and single `_`
-  characters, and must not start or end with `_`. The name is embedded in a
+- Server names must use only letters, digits, `-` and single `_` characters,
+  and must not start or end with `_`. The name is embedded in a
   `__`-delimited, comma-joined permission rule, so any other name is refused
-  (at `conductor validate` and at run time) rather than rewritten.
+  (at `conductor validate` and at run time) rather than rewritten. A `.` is
+  rejected for a second reason: the CLI rewrites every character outside
+  `[A-Za-z0-9_-]` to `_` when it builds tool names, so a server configured as
+  `fs.tools-2` exposes `mcp__fs_tools-2__…` and a `mcp__fs.tools-2__*` rule
+  would never match — leaving every one of its calls denied.
 - An MCP tool that requires interactive user approval may be denied, since a
   workflow run has nobody to answer a prompt.
 

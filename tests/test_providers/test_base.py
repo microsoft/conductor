@@ -197,3 +197,92 @@ class TestModelCapabilityInfo:
         info = ModelCapabilityInfo(supported_reasoning_efforts=[])
         assert info.supported_reasoning_efforts == []
         assert info.to_dict()["supported_reasoning_efforts"] == []
+
+
+class TestSuppressMcpServersContract:
+    """``execute(suppress_mcp_servers=...)`` is part of the base contract.
+
+    ``OutputValidator`` passes it on whatever provider the graded agent uses,
+    so every provider must at least accept it, and every provider that
+    declares ``mcp_tools`` must actually honor it — otherwise the grading call
+    silently regains the workflow's tools on that provider. A provider without
+    an MCP surface may ignore it.
+    """
+
+    _PROVIDERS = (
+        ("copilot", "conductor.providers.copilot", "CopilotProvider"),
+        ("claude", "conductor.providers.claude", "ClaudeProvider"),
+        ("openai", "conductor.providers.openai", "OpenAIProvider"),
+        ("claude-agent-sdk", "conductor.providers.claude_agent_sdk", "ClaudeAgentSdkProvider"),
+        ("hermes", "conductor.providers.hermes", "HermesProvider"),
+        ("aca", "conductor.providers.aca", "AcaRuntimeProvider"),
+    )
+
+    @pytest.mark.parametrize(("name", "module", "cls_name"), _PROVIDERS)
+    def test_every_provider_accepts_the_signal(self, name: str, module: str, cls_name: str) -> None:
+        import importlib
+        import inspect
+
+        cls = getattr(importlib.import_module(module), cls_name)
+        param = inspect.signature(cls.execute).parameters.get("suppress_mcp_servers")
+
+        assert param is not None, f"{cls_name}.execute must accept suppress_mcp_servers"
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        # Default False: every authored call keeps its existing behavior, and
+        # only an explicit opt-in suppresses anything.
+        assert param.default is False
+
+    def test_the_base_declaration_matches_the_abstract_signature(self) -> None:
+        import inspect
+
+        from conductor.providers.base import AgentProvider
+
+        param = inspect.signature(AgentProvider.execute).parameters["suppress_mcp_servers"]
+        assert param.default is False
+
+    def test_copilot_honours_it(self) -> None:
+        """Copilot declares ``mcp_tools``, so it must drop both server sources."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from conductor.config.schema import AgentDef, OutputField
+        from conductor.exceptions import ProviderError
+        from conductor.providers.copilot import CopilotProvider
+
+        def session_kwargs(**execute_kwargs: object) -> dict:
+            provider = CopilotProvider(
+                mcp_servers={"workflow-srv": {"type": "stdio", "command": "wf"}}
+            )
+            captured: dict = {}
+
+            async def fake_create_session(**kwargs: object):
+                captured.update(kwargs)
+                raise RuntimeError("stop after session construction")
+
+            client = MagicMock()
+            client.create_session = AsyncMock(side_effect=fake_create_session)
+            provider._client = client
+            provider._started = True
+            agent = AgentDef(
+                name="a",
+                model="m",
+                prompt="hi",
+                output={"result": OutputField(type="string")},
+                retry={"max_attempts": 1},
+            )
+            with (
+                patch.object(provider, "_ensure_client_started", new=AsyncMock()),
+                pytest.raises(ProviderError),
+            ):
+                asyncio.run(provider.execute(agent, {}, "hi", **execute_kwargs))
+            return captured
+
+        plugin = {"plugin-srv": {"type": "stdio", "command": "pl"}}
+
+        # Control: both sources reach the session by default.
+        default = session_kwargs(extra_mcp_servers=plugin)
+        assert set(default["mcp_servers"]) == {"workflow-srv", "plugin-srv"}
+
+        # Suppressed: neither does.
+        suppressed = session_kwargs(extra_mcp_servers=plugin, suppress_mcp_servers=True)
+        assert "mcp_servers" not in suppressed or not suppressed["mcp_servers"]

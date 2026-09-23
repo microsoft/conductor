@@ -264,7 +264,10 @@ class AgentProvider(ABC):
         ...         mcp_tools=True,
         ...         ...,
         ...     )
-        ...     async def execute(self, agent, context, rendered_prompt, tools=None):
+        ...     async def execute(
+        ...         self, agent, context, rendered_prompt, *,
+        ...         tools=None, suppress_mcp_servers=False, **kwargs,
+        ...     ):
         ...         # Call SDK and return AgentOutput
         ...         pass
         ...     async def validate_connection(self):
@@ -456,6 +459,7 @@ class AgentProvider(ABC):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -499,6 +503,22 @@ class AgentProvider(ABC):
                 ``rendered_prompt`` as the next user turn; every other
                 provider ignores it and leaves
                 :attr:`AgentOutput.continuation_state` at ``None``.
+            suppress_mcp_servers: Run this execution with **no** MCP servers
+                at all — neither the provider's workflow-level
+                ``runtime.mcp_servers`` nor ``extra_mcp_servers``. For
+                synthetic, non-authored calls that must not reach tools, the
+                only current caller being
+                :class:`~conductor.engine.validator.OutputValidator`'s
+                grading agent: it asks for ``tools: []``, and a provider that
+                attaches workflow MCP servers regardless would either hand
+                the grader tools the workflow never granted it or (on
+                ``claude-agent-sdk``) refuse the call outright and fail open.
+                This is an execution-level signal rather than an agent-shaped
+                one so it cannot be spoofed by an authored workflow: nothing
+                in YAML sets it, and it defaults to ``False`` so every
+                authored call keeps its current behavior. Providers that
+                declare ``mcp_tools`` MUST honor it; providers without MCP
+                support ignore it.
 
         Returns:
             Normalized AgentOutput with structured content.

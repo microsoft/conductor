@@ -745,6 +745,7 @@ class AcaRuntimeProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None,
+        suppress_mcp_servers: bool = False,
     ) -> AcaExecuteRequest:
         reasoning_effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
         working_dir = agent.sandbox.working_dir if agent.sandbox is not None else None
@@ -772,7 +773,9 @@ class AcaRuntimeProvider(AgentProvider):
             agent=agent_payload,
             rendered_prompt=rendered_prompt,
             tools=tools,
-            mcp_servers=self._serialize_mcp_servers(),
+            # A synthetic, tool-free execution (OutputValidator's grader)
+            # forwards no servers, so the in-sandbox runner attaches none.
+            mcp_servers=None if suppress_mcp_servers else self._serialize_mcp_servers(),
             context=context,
             inner_provider=self._provider_settings.inner_provider or "copilot",
             inner_provider_settings=self._resolve_inner_provider_settings(),
@@ -1074,6 +1077,7 @@ class AcaRuntimeProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Delegate execution to the in-sandbox runner over Branch S streaming.
 
@@ -1094,6 +1098,9 @@ class AcaRuntimeProvider(AgentProvider):
         likewise ignored: the in-sandbox conversation is ephemeral, so
         `supports_continuation` is `False`, this provider never populates
         `AgentOutput.continuation_state`, and it is never handed one back.
+        `suppress_mcp_servers` IS honored -- this provider declares
+        `mcp_tools`, and the runner attaches whatever it is sent -- by
+        forwarding no servers at all for that call.
         """
         del skill_directories  # Host paths are meaningless in-sandbox (see docstring).
         del custom_agents, extra_mcp_servers  # Same: host-side plugin content.
@@ -1110,7 +1117,9 @@ class AcaRuntimeProvider(AgentProvider):
         # order.
         identifier, slot = self._acquire_wire_identifier(logical_id)
         try:
-            request = self._build_request(agent, context, rendered_prompt, tools)
+            request = self._build_request(
+                agent, context, rendered_prompt, tools, suppress_mcp_servers
+            )
             token = await self._get_access_token()
             url = self._build_url("execute")
             params = {"identifier": identifier, "api-version": self._api_version}

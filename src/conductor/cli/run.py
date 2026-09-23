@@ -2864,7 +2864,9 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             custom_agents: list[dict[str, Any]] | None = None,
             extra_mcp_servers: dict[str, Any] | None = None,
             continuation_state: object | None = None,
+            suppress_mcp_servers: bool = False,
         ) -> AgentOutput:
+            del suppress_mcp_servers  # Dry run: nothing executes, no MCP surface.
             return AgentOutput(content={}, raw_response="")
 
         async def validate_connection(self) -> bool:

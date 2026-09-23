@@ -890,6 +890,7 @@ class OpenAIProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Execute an agent using the shared Pydantic AI pipeline.
 
@@ -947,7 +948,11 @@ class OpenAIProvider(AgentProvider):
         from conductor.providers._pydantic_ai.runner import run_agent_pipeline
 
         resolved_cwd = agent.working_dir or os.getcwd()
-        manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
+        # A synthetic, tool-free execution (OutputValidator's grader) runs
+        # with no MCP toolset at all rather than the workflow's servers.
+        manager = (
+            None if suppress_mcp_servers else await self._get_mcp_manager_for_cwd(resolved_cwd)
+        )
 
         effective_model = agent.model or self._default_model
         window = await resolve_compaction_window(

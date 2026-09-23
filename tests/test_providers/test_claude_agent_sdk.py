@@ -3907,7 +3907,18 @@ class TestSettingsDirAddDirs:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The directory and agent name are logging arguments, never spliced
-        into the format string -- a bracketed path must survive verbatim."""
+        into the format string.
+
+        That is the security property: a runtime value inside a format string
+        is a runtime value inside something a renderer may parse. It is
+        asserted on ``LogRecord.args`` / ``LogRecord.msg`` rather than on the
+        rendered text, because the production logger uses ``%r`` and ``repr``
+        escapes backslashes -- so on Windows the raw ``str(path)`` is
+        deliberately *not* a substring of the rendered message, which is what
+        made the original assertion platform-dependent. The bracketed segment
+        is checked separately: ``repr`` leaves ``[`` and ``]`` alone
+        everywhere, so a markup-looking name must survive intact.
+        """
         target = tmp_path / "[bold]repo[task1]"
         target.mkdir()
 
@@ -3925,8 +3936,56 @@ class TestSettingsDirAddDirs:
 
         records = [r for r in caplog.records if "no skills are discovered" in r.message]
         assert len(records) == 1
-        assert str(target) not in records[0].msg  # the format string itself
-        assert str(target) in records[0].getMessage()  # but rendered verbatim
+        record = records[0]
+        # Neither value is in the format string ...
+        assert str(target) not in record.msg
+        assert "judge" not in record.msg
+        # ... both arrived as logging arguments instead.
+        assert record.args is not None
+        assert str(target) in record.args
+        assert "judge" in record.args
+        # The markup-looking basename survives rendering on every platform.
+        assert "[bold]repo[task1]" in record.getMessage()
+
+    @pytest.mark.parametrize(
+        "settings_dir",
+        [
+            r"C:\Users\dev\[bold]repo[task1]",  # Windows-style, backslashes
+            "/srv/[bold]repo[task1]",  # POSIX-style
+        ],
+    )
+    def test_the_tier_warning_never_interpolates_runtime_values(
+        self, caplog: pytest.LogCaptureFixture, settings_dir: str
+    ) -> None:
+        """Platform-independent counterpart, including a backslash path.
+
+        Driven through the warning helper directly so a Windows-style value is
+        exercised on POSIX too: the escaping that broke this on the Windows
+        runner is a property of ``%r``, not of the host, so it can be pinned
+        everywhere. ``repr`` doubles the backslashes, which is exactly why the
+        assertion is on ``args`` rather than on a raw substring of the
+        rendered message.
+        """
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = ClaudeAgentSdkProvider()
+        agent = AgentDef(name="judge", prompt="hi", settings_dir=settings_dir)
+
+        with caplog.at_level(logging.WARNING):
+            provider._warn_settings_dir_without_project_tier(agent, [], builtin_file_tools=False)
+
+        records = [r for r in caplog.records if "no skills are discovered" in r.message]
+        assert len(records) == 1
+        record = records[0]
+        assert settings_dir not in record.msg
+        assert "judge" not in record.msg
+        assert record.args is not None
+        assert settings_dir in record.args
+        assert "judge" in record.args
+        # Rendered through %r: the value appears in its repr form, and the
+        # bracketed segment is untouched by that escaping.
+        rendered = record.getMessage()
+        assert repr(settings_dir) in rendered
+        assert "[bold]repo[task1]" in rendered
 
 
 class TestNativeToolsPolicy:
@@ -4150,6 +4209,14 @@ class TestNativeToolsPolicy:
             "a*",
             "a:b",
             "srv\n",  # a `$`-anchored check would let this through
+            # Dots: the CLI rewrites every char outside [A-Za-z0-9_-] to '_'
+            # when it builds tool names, so `fs.tools-2` exposes
+            # `mcp__fs_tools-2__...` and a `mcp__fs.tools-2__*` rule is
+            # compared literally and never matches -- every call denied.
+            "fs.tools-2",
+            "a.b",
+            ".leading",
+            "trailing.",
         ],
     )
     @pytest.mark.parametrize("origin", ["workflow", "plugin"])
@@ -4194,9 +4261,11 @@ class TestNativeToolsPolicy:
         "names",
         [
             ["docs"],
-            ["a", "b.c", "d-e", "f_g"],
+            ["a", "b-c", "d-e", "f_g"],
             ["x" * 64],
-            ["A1", "zz9.9-9_9"],
+            # Hyphens and single underscores survive the CLI's normalization
+            # untouched, so they stay valid where '.' does not.
+            ["A1", "zz9-9-9_9"],
         ],
     )
     def test_every_generated_rule_is_anchored_to_one_server(self, names: list[str]) -> None:

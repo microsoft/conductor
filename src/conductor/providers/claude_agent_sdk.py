@@ -1497,6 +1497,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Run one agent, holding its ``session_key`` slot for the duration.
 
@@ -1509,6 +1510,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         ``continuation_state`` is ignored: the CLI owns its transcripts, so
         ``supports_continuation`` is ``False``, this provider never populates
         ``AgentOutput.continuation_state``, and it is never handed one back.
+        ``suppress_mcp_servers`` is honored (this provider declares
+        ``mcp_tools``) -- see :meth:`_execute_session`.
         """
         del continuation_state  # No continuation surface (see docstring).
         # Resolved before anything else so the session slot is known: the slot
@@ -1534,6 +1537,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 skill_directories=skill_directories,
                 custom_agents=custom_agents,
                 extra_mcp_servers=extra_mcp_servers,
+                suppress_mcp_servers=suppress_mcp_servers,
                 auth_context=auth_context,
             )
 
@@ -1550,6 +1554,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 skill_directories=skill_directories,
                 custom_agents=custom_agents,
                 extra_mcp_servers=extra_mcp_servers,
+                suppress_mcp_servers=suppress_mcp_servers,
                 auth_context=auth_context,
             )
         finally:
@@ -1631,6 +1636,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
@@ -1894,8 +1900,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # servers a registered plugin root would otherwise contribute, so
             # a plugin's servers reach the CLI only through this path — which
             # is what makes ``mcp: false`` mean something on this provider.
-            session_servers = dict(self._mcp_servers)
-            if extra_mcp_servers:
+            # ``suppress_mcp_servers`` drops BOTH sources for this call: the
+            # provider's workflow-level servers and the per-call plugin ones.
+            # Only a synthetic, non-authored execution asks for this (today,
+            # ``OutputValidator``'s grading agent, which requests ``tools: []``
+            # and must not reach a tool). ``strict_mcp_config=True`` below is
+            # untouched, so an empty set here means *no* MCP at all rather than
+            # falling back to ambient discovery.
+            session_servers: dict[str, Any] = (
+                {} if suppress_mcp_servers else dict(self._mcp_servers)
+            )
+            if extra_mcp_servers and not suppress_mcp_servers:
                 translated = _translate_mcp_servers(extra_mcp_servers)
                 refuse_mcp_server_clashes(translated, session_servers)
                 session_servers.update(translated)
@@ -2459,10 +2474,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     f"split into a rule naming a different server or granting tools "
                     f"the workflow never declared.",
                     suggestion=(
-                        "Rename the server using only letters, digits, '.', '-' and "
-                        "single '_' characters, not starting or ending with '_'. It "
-                        "is declared in 'runtime.mcp_servers' or by a plugin that "
-                        "ships it."
+                        "Rename the server using only letters, digits, '-' and "
+                        "single '_' characters, not starting or ending with '_'. A "
+                        "'.' is not allowed: the CLI rewrites it to '_' when it "
+                        "builds tool names, so a dotted rule would never match. The "
+                        "name is declared in 'runtime.mcp_servers' or by a plugin "
+                        "that ships it."
                     ),
                     is_retryable=False,
                 )

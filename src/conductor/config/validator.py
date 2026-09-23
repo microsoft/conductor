@@ -2205,8 +2205,10 @@ def _validate_provider_capabilities(
                     f"'mcp__<server>__*', and these rules are delimited by '__' and "
                     f"joined with ',', so this name could split into a rule naming a "
                     f"different server or granting tools the workflow never declared. "
-                    f"Rename it using only letters, digits, '.', '-' and single '_' "
-                    f"characters, not starting or ending with '_'."
+                    f"Rename it using only letters, digits, '-' and single '_' "
+                    f"characters, not starting or ending with '_'. A '.' is not "
+                    f"allowed: the CLI rewrites it to '_' when it builds tool names, "
+                    f"so a dotted rule would never match."
                 )
 
     def _check_agent_skills(

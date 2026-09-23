@@ -82,14 +82,25 @@ PLUGIN_DROPPED_DIRS: tuple[str, ...] = ("hooks", "commands")
 SAFE_NAME: re.Pattern[str] = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 
 # An MCP server name that can be embedded in a claude-agent-sdk
-# ``mcp__<server>__*`` permission rule without ambiguity. ``SAFE_NAME`` keeps
-# out ``,`` (the ``--allowedTools`` joiner) but still admits ``_``, and ``__``
-# is this rule's own field delimiter: ``a__b`` would read as server ``a`` with
-# a tool pattern ``b__*``, and a trailing ``_`` (``a_`` -> ``mcp__a___*``)
-# blurs the same boundary. So on top of ``SAFE_NAME``: no ``__`` anywhere, and
-# no leading or trailing ``_``. Shared by the provider (run time) and the
-# validator (``conductor validate``) so the two cannot disagree.
-MCP_PERMISSION_SAFE_NAME: re.Pattern[str] = re.compile(r"\A(?!_)(?!.*__)[A-Za-z0-9_.-]+(?<!_)\Z")
+# ``mcp__<server>__*`` permission rule and still match the tool names the CLI
+# actually generates. Narrower than ``SAFE_NAME`` in two ways:
+#
+# - **No ``.``** (and nothing else outside ``[A-Za-z0-9_-]``). The CLI builds a
+#   tool name as ``mcp__${W1(server)}__${tool}`` where
+#   ``W1(H) = H.replace(/[^a-zA-Z0-9_-]/g, "_")`` (read from the bundled CLI in
+#   claude-agent-sdk 0.2.87), so a configured ``fs.tools-2`` yields tools named
+#   ``mcp__fs_tools-2__…``. A rule written as ``mcp__fs.tools-2__*`` is compared
+#   literally and never matches, leaving every call denied under ``dontAsk``.
+#   Hyphens and single underscores survive that normalization untouched.
+# - **No ``__``, and no leading or trailing ``_``.** ``__`` is the rule's own
+#   field delimiter, so ``a__b`` would read as server ``a`` with tool pattern
+#   ``b__*``, and a trailing ``_`` (``a_`` -> ``mcp__a___*``) blurs the same
+#   boundary. ``SAFE_NAME``'s exclusion of ``,`` (the ``--allowedTools``
+#   joiner) and of whitespace and wildcards is kept.
+#
+# Shared by the provider (run time) and the validator (``conductor validate``)
+# so the two cannot disagree.
+MCP_PERMISSION_SAFE_NAME: re.Pattern[str] = re.compile(r"\A(?!_)(?!.*__)[A-Za-z0-9_-]+(?<!_)\Z")
 
 
 @dataclass(frozen=True)

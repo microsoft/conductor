@@ -822,3 +822,175 @@ class TestValidatorWorkingDirectoryInheritance:
 
         assert captured_validator_agent is not None
         assert captured_validator_agent.working_dir is None
+
+
+def _sdk_result(result: str):
+    """A minimal claude-agent-sdk ``ResultMessage`` carrying the grader's JSON."""
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype="result",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="validator-session",
+        usage=None,
+        result=result,
+        structured_output=None,
+    )
+
+
+class TestValidatorRunsWithoutMcpServers:
+    """The grading call must reach no tool, on a provider that attaches MCP.
+
+    Regression for the interaction between the validator and
+    ``claude-agent-sdk``'s ``tools: []`` + MCP refusal: the grader legitimately
+    asks for ``tools: []``, the provider still carried the workflow's MCP
+    servers, and the refusal fired on the *synthetic* agent. ``OutputValidator``
+    is fail-open, so the run then treated every graded output as valid with no
+    error surfaced -- the validator silently stopped validating.
+
+    These go through the real ``OutputValidator`` rather than the helper,
+    because the fail-open swallow is exactly what a helper-level test would
+    miss.
+    """
+
+    @staticmethod
+    def _agent() -> AgentDef:
+        return AgentDef(
+            name="writer",
+            prompt="Write it.",
+            output={"text": OutputField(type="string")},
+            validator=ValidatorConfig(criteria="Must be polite."),
+        )
+
+    @staticmethod
+    def _provider(**kwargs: Any):
+        pytest.importorskip("claude_agent_sdk")
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        return ClaudeAgentSdkProvider(
+            mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}, **kwargs
+        )
+
+    async def _grade(self, monkeypatch: pytest.MonkeyPatch, **provider_kwargs: Any):
+        """Run one real grading call and capture the session it produced."""
+        pytest.importorskip("claude_agent_sdk")
+        import conductor.providers.claude_agent_sdk as sdk
+        from conductor.engine.validator import OutputValidator
+
+        captured: dict[str, Any] = {}
+        wrote_config: list[str] = []
+
+        async def fake_query(**kwargs: Any):
+            captured["options"] = kwargs["options"]
+            yield _sdk_result('{"passed": false, "issues": ["too curt"]}')
+
+        def spy_write(servers: dict[str, Any]) -> str:
+            wrote_config.append("called")
+            raise AssertionError("no MCP config file may be written for the grader")
+
+        monkeypatch.setattr(sdk, "query", fake_query)
+        monkeypatch.setattr(sdk, "_write_mcp_config", spy_write)
+        monkeypatch.setattr(sdk, "CLAUDE_AGENT_SDK_AVAILABLE", True)
+
+        provider = self._provider(**provider_kwargs)
+        outcome = await OutputValidator().validate(
+            agent=self._agent(),
+            primary_prompt="Write it.",
+            primary_output={"text": "no."},
+            provider=provider,
+        )
+        return outcome, captured, wrote_config
+
+    async def test_grading_call_happens_and_is_parsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not fail-open: the SDK really ran and the verdict was read."""
+        outcome, captured, _ = await self._grade(monkeypatch)
+
+        assert "options" in captured, "the grading SDK call never happened"
+        assert outcome.errored is False, "fail-open swallowed the grading call"
+        assert outcome.passed is False
+        assert outcome.issues == ["too curt"]
+
+    async def test_grading_session_has_no_mcp_servers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, captured, wrote_config = await self._grade(monkeypatch)
+        options = captured["options"]
+
+        assert options.mcp_servers in (None, {}, ""), options.mcp_servers
+        assert not wrote_config, "no MCP config file should have been written"
+        # No servers means no server-scoped grants either.
+        assert list(options.allowed_tools) == []
+
+    async def test_grading_session_keeps_strict_mcp_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Suppression must not become a door to ambient MCP discovery."""
+        _, captured, _ = await self._grade(monkeypatch)
+
+        assert captured["options"].strict_mcp_config is True
+
+    async def test_grading_session_has_no_builtin_tools(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The grader keeps ``tools: []`` -- it is not handed native tools."""
+        _, captured, _ = await self._grade(monkeypatch)
+        options = captured["options"]
+
+        assert options.tools == []
+        assert options.permission_mode == "dontAsk"
+
+    async def test_holds_under_the_claude_code_opt_in_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workflow-level ``native_tools: claude_code`` must not widen the
+        grader: its own ``tools: []`` still wins, and MCP stays suppressed."""
+        _, captured, wrote_config = await self._grade(monkeypatch, native_tools="claude_code")
+        options = captured["options"]
+
+        assert options.tools == []
+        assert options.permission_mode == "dontAsk"
+        assert not wrote_config
+
+    async def test_authored_empty_tools_agent_with_mcp_is_still_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control: the refusal stays load-bearing for real agents.
+
+        An ordinary authored agent declaring ``tools: []`` alongside MCP
+        servers must still be rejected before the config file is written and
+        before the SDK is invoked -- suppression is reachable only through the
+        execution-level flag, never from YAML.
+        """
+        pytest.importorskip("claude_agent_sdk")
+        import conductor.providers.claude_agent_sdk as sdk
+        from conductor.exceptions import ProviderError
+
+        queried = False
+
+        async def fake_query(**kwargs: Any):
+            nonlocal queried
+            queried = True
+            yield _sdk_result("{}")
+
+        def spy_write(servers: dict[str, Any]) -> str:
+            raise AssertionError("no MCP config file may be written on the refusal path")
+
+        monkeypatch.setattr(sdk, "query", fake_query)
+        monkeypatch.setattr(sdk, "_write_mcp_config", spy_write)
+        monkeypatch.setattr(sdk, "CLAUDE_AGENT_SDK_AVAILABLE", True)
+
+        provider = self._provider()
+        with pytest.raises(ProviderError, match=r"sets 'tools: \[\]'"):
+            await provider.execute(
+                agent=AgentDef(name="worker", prompt="hi", tools=[]),
+                context={},
+                rendered_prompt="hi",
+                tools=[],
+            )
+
+        assert queried is False

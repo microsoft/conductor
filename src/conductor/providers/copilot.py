@@ -852,6 +852,7 @@ class CopilotProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -917,6 +918,7 @@ class CopilotProvider(AgentProvider):
             skill_directories=skill_directories,
             custom_agents=custom_agents,
             extra_mcp_servers=extra_mcp_servers,
+            suppress_mcp_servers=suppress_mcp_servers,
         )
 
     def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
@@ -966,6 +968,7 @@ class CopilotProvider(AgentProvider):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -1008,6 +1011,7 @@ class CopilotProvider(AgentProvider):
                     skill_directories=skill_directories,
                     custom_agents=custom_agents,
                     extra_mcp_servers=extra_mcp_servers,
+                    suppress_mcp_servers=suppress_mcp_servers,
                 )
                 # A successful SDK call resets the consecutive-restart budget
                 # (issue #483, Q2): the counter only bounds a death loop where
@@ -1164,6 +1168,7 @@ class CopilotProvider(AgentProvider):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -1271,7 +1276,13 @@ class CopilotProvider(AgentProvider):
             # Plugin-contributed servers merge on top for this call only:
             # ``plugins:`` is a per-agent field while providers are cached
             # per type, so they cannot live on ``self._mcp_servers``.
-            merged_servers = self._merge_mcp_servers(resolved_cwd, extra_mcp_servers)
+            # A synthetic, tool-free execution (OutputValidator's grader)
+            # gets no MCP servers from either source.
+            merged_servers = (
+                {}
+                if suppress_mcp_servers
+                else self._merge_mcp_servers(resolved_cwd, extra_mcp_servers)
+            )
             if merged_servers:
                 session_kwargs["mcp_servers"] = merged_servers
 
