@@ -9,7 +9,7 @@ import typer
 from rich.table import Table
 from rich.text import Text
 
-from conductor.console import make_console, styled
+from conductor.console import make_console, select_console_glyph, styled
 from conductor.registry.cache import clear_cache, prune_temp_dirs
 from conductor.registry.config import (
     RegistryEntry,
@@ -72,8 +72,9 @@ def _list_all_registries() -> None:
     table.add_column("Source")
     table.add_column("Default", justify="center")
 
+    default_marker = select_console_glyph(output_console, "✓", "OK")
     for reg_name, entry in config.registries.items():
-        is_default = "✓" if config.default == reg_name else ""
+        is_default = default_marker if config.default == reg_name else ""
         table.add_row(reg_name, entry.type.value, entry.source, is_default)
 
     output_console.print(table)

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import importlib
+import io
 from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
+from conductor.console import make_console
+from conductor.registry.config import RegistriesConfig, RegistryEntry, RegistryType, save_config
 from conductor.registry.index import RegistryIndex, WorkflowInfo
 
 runner = CliRunner()
+registry_module = importlib.import_module("conductor.cli.registry")
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +87,73 @@ class TestAddAndList:
         assert "myteam" in result.output
         assert "acme/workflows" in result.output
         assert "✓" in result.output  # default marker
+
+
+class TestListEncoding:
+    @staticmethod
+    def _save_registries(*, default: str | None) -> None:
+        save_config(
+            RegistriesConfig(
+                default=default,
+                registries={
+                    "primary": RegistryEntry(type=RegistryType.github, source="acme/primary"),
+                    "secondary": RegistryEntry(type=RegistryType.github, source="acme/secondary"),
+                },
+            )
+        )
+
+    @staticmethod
+    def _list_on_stream(
+        monkeypatch: pytest.MonkeyPatch, encoding: str, *, errors: str = "strict"
+    ) -> str:
+        monkeypatch.setenv("CONDUCTOR_NO_UPDATE_CHECK", "1")
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding=encoding, errors=errors, newline="")
+        monkeypatch.setattr(registry_module, "output_console", make_console(file=stream, width=200))
+        result = runner.invoke(app, ["registry", "list"])
+        stream.flush()
+        assert result.exception is None, repr(result.exception)
+        assert result.exit_code == 0
+        return buffer.getvalue().decode(encoding)
+
+    @pytest.mark.parametrize(
+        ("encoding", "errors", "marker"),
+        [
+            ("cp1252", "strict", "OK"),
+            ("cp1252", "surrogateescape", "OK"),
+            ("ascii", "strict", "OK"),
+            ("utf-8", "strict", "✓"),
+            ("gb18030", "strict", "✓"),
+        ],
+    )
+    def test_list_default_marker_uses_output_encoding(
+        self, monkeypatch: pytest.MonkeyPatch, encoding: str, errors: str, marker: str
+    ) -> None:
+        self._save_registries(default="primary")
+        output = self._list_on_stream(monkeypatch, encoding, errors=errors)
+        primary = next(line for line in output.splitlines() if "acme/primary" in line)
+        secondary = next(line for line in output.splitlines() if "acme/secondary" in line)
+        assert "primary" in primary and "github" in primary
+        assert "secondary" in secondary and "github" in secondary
+        assert primary.rsplit(primary.lstrip()[0], 2)[1].strip() == marker
+        assert output.count(marker) == 1
+        assert secondary.rsplit(secondary.lstrip()[0], 2)[1].strip() == ""
+
+    def test_list_without_default_has_blank_markers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._save_registries(default=None)
+        output = self._list_on_stream(monkeypatch, "cp1252")
+        for source in ("acme/primary", "acme/secondary"):
+            row = next(line for line in output.splitlines() if source in line)
+            assert row.rsplit(row.lstrip()[0], 2)[1].strip() == ""
+        assert "OK" not in output and "✓" not in output
+
+    def test_list_resolves_marker_again_for_each_console(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._save_registries(default="primary")
+        for encoding, marker in (("cp1252", "OK"), ("utf-8", "✓"), ("cp1252", "OK")):
+            output = self._list_on_stream(monkeypatch, encoding)
+            assert output.count(marker) == 1
 
 
 # ---------------------------------------------------------------------------
