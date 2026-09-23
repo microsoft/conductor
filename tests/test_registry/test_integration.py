@@ -6,6 +6,8 @@ Uses local path registries to avoid network dependencies.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +16,7 @@ from typer.testing import CliRunner
 
 from conductor.cli.app import app
 from conductor.config.loader import load_config as load_workflow_config
-from conductor.registry.cache import fetch_workflow
+from conductor.registry.cache import fetch_workflow, resolve_and_fetch
 from conductor.registry.config import (
     RegistryType,
     add_registry,
@@ -707,6 +709,62 @@ agents:
     routes:
       - to: $end
 """
+
+
+@pytest.mark.parametrize("named", [True, False], ids=["named", "adhoc"])
+@pytest.mark.parametrize("pinned", [True, False], ids=["full-sha", "default-branch"])
+def test_github_registry_auth_ignores_enterprise_gh_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: bool, pinned: bool
+) -> None:
+    _setup_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("GH_HOST", "github.enterprise.example")
+    environment = dict(os.environ)
+    owner, repo, sha = "acme", "workflows", "d" * 40
+    files = {
+        "index.yaml": (
+            b"workflows:\n"
+            b"  issue-triage:\n"
+            b"    description: Triage issues\n"
+            b"    path: workflows/issue-triage.yaml\n"
+        ),
+        "workflows/issue-triage.yaml": _ISSUE_TRIAGE_WORKFLOW_YAML.encode(),
+        "workflows/prompts/issue-triage.md": b"You triage issues carefully.\n",
+        "workflows/scripts/lib/deep/note.md": b"Deeply nested guidance.\n",
+    }
+    mock_get, downloaded = _make_github_http_get(
+        owner=owner, repo=repo, sha=sha, default_branch="main", files=files
+    )
+    if named:
+        add_registry("acme-wf", f"{owner}/{repo}", registry_type=RegistryType.github)
+    registry = "acme-wf" if named else f"{owner}/{repo}"
+    suffix = f"#{sha}" if pinned else ""
+    credential = "github-com-token"
+    with (
+        patch(
+            "conductor.registry.github.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, f" {credential}\n", ""),
+        ) as mock_run,
+        patch("conductor.registry.github.httpx.get", side_effect=mock_get) as mock_http,
+    ):
+        cached = resolve_and_fetch(resolve_ref(f"issue-triage@{registry}{suffix}"))
+
+    assert cached.read_bytes() == files["workflows/issue-triage.yaml"]
+    assert (cached.parent / "prompts" / "issue-triage.md").read_bytes() == (
+        files["workflows/prompts/issue-triage.md"]
+    )
+    assert "workflows/issue-triage.yaml" in downloaded
+    urls = [call.args[0] for call in mock_http.call_args_list]
+    assert any(url.startswith("https://api.github.com/") for url in urls)
+    assert any(url.startswith("https://raw.githubusercontent.com/") for url in urls)
+    assert any(url.endswith(f"/commits/{sha if pinned else 'main'}") for url in urls)
+    assert (f"https://api.github.com/repos/{owner}/{repo}" in urls) is not pinned
+    assert mock_run.call_count == mock_http.call_count
+    for call in mock_run.call_args_list:
+        assert call.args == (["gh", "auth", "token", "--hostname", "github.com"],)
+        assert call.kwargs == {"capture_output": True, "text": True, "timeout": 5}
+    for call in mock_http.call_args_list:
+        assert call.kwargs["headers"]["Authorization"] == f"Bearer {credential}"
+    assert dict(os.environ) == environment
 
 
 class TestNestedRegistryAssetsRegression:

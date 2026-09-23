@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -9,6 +11,7 @@ import pytest
 
 from conductor.registry.errors import RegistryError, RegistryNotFoundError
 from conductor.registry.github import (
+    _get_auth_token,
     fetch_file,
     fetch_file_text,
     get_default_branch,
@@ -18,6 +21,13 @@ from conductor.registry.github import (
     parse_github_source,
     resolve_ref_to_sha,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_auth_token(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    mock_run = MagicMock(return_value=subprocess.CompletedProcess([], 1, "", ""))
+    monkeypatch.setattr("conductor.registry.github.subprocess.run", mock_run)
+    return mock_run
 
 
 def _mock_response(
@@ -35,6 +45,91 @@ def _mock_response(
         resp.json.return_value = json_data
     resp.links = links or {}
     return resp
+
+
+class TestGithubAuthentication:
+    @pytest.mark.parametrize("gh_host", [None, "github.com", "github.enterprise.example"])
+    def test_token_lookup_selects_github_com_without_changing_environment(
+        self, gh_host: str | None, monkeypatch: pytest.MonkeyPatch, _stub_auth_token: MagicMock
+    ) -> None:
+        if gh_host is None:
+            monkeypatch.delenv("GH_HOST", raising=False)
+        else:
+            monkeypatch.setenv("GH_HOST", gh_host)
+        environment = dict(os.environ)
+        _stub_auth_token.return_value = subprocess.CompletedProcess(
+            [], 0, " github-com-token \n", ""
+        )
+
+        assert _get_auth_token() == "github-com-token"
+        _stub_auth_token.assert_called_once_with(
+            ["gh", "auth", "token", "--hostname", "github.com"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert dict(os.environ) == environment
+
+    @pytest.mark.parametrize(
+        ("returncode", "stdout"),
+        [(1, "github-com-token\n"), (0, ""), (0, " \n\t ")],
+    )
+    def test_unavailable_token_returns_none(
+        self, _stub_auth_token: MagicMock, returncode: int, stdout: str
+    ) -> None:
+        _stub_auth_token.return_value = subprocess.CompletedProcess([], returncode, stdout, "")
+
+        assert _get_auth_token() is None
+
+    @pytest.mark.parametrize(
+        "failure",
+        [FileNotFoundError("gh"), subprocess.TimeoutExpired(["gh", "auth", "token"], 5)],
+    )
+    def test_missing_cli_or_timeout_returns_none(
+        self, _stub_auth_token: MagicMock, failure: Exception
+    ) -> None:
+        _stub_auth_token.side_effect = failure
+
+        assert _get_auth_token() is None
+
+    @pytest.mark.parametrize("request_kind", ["api", "raw"])
+    @pytest.mark.parametrize("authenticated", [True, False])
+    def test_http_requests_use_only_the_github_com_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        _stub_auth_token: MagicMock,
+        request_kind: str,
+        authenticated: bool,
+    ) -> None:
+        monkeypatch.setenv("GH_HOST", "github.enterprise.example")
+        _stub_auth_token.return_value = subprocess.CompletedProcess(
+            [], 0 if authenticated else 1, " github-com-token \n", ""
+        )
+        with patch("conductor.registry.github.httpx.get") as mock_get:
+            mock_get.return_value = _mock_response(
+                content=b"workflow", json_data={"default_branch": "main"}
+            )
+            if request_kind == "api":
+                assert get_default_branch("owner", "repo") == "main"
+                assert mock_get.call_args.args[0] == "https://api.github.com/repos/owner/repo"
+                assert mock_get.call_args.kwargs["headers"]["Accept"] == (
+                    "application/vnd.github.v3+json"
+                )
+            else:
+                assert fetch_file("owner", "repo", "workflow.yaml") == b"workflow"
+                assert mock_get.call_args.args[0].startswith("https://raw.githubusercontent.com/")
+
+        headers = mock_get.call_args.kwargs["headers"]
+        if authenticated:
+            assert headers["Authorization"] == "Bearer github-com-token"
+        else:
+            assert "Authorization" not in headers
+        _stub_auth_token.assert_called_once_with(
+            ["gh", "auth", "token", "--hostname", "github.com"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
 
 
 # --- fetch_file ---
@@ -289,7 +384,7 @@ class TestResolveRefToSha:
             resolve_ref_to_sha("owner", "repo", "nonexistent-branch")
 
         assert exc_info.value.suggestion is not None
-        assert "gh auth login" in exc_info.value.suggestion
+        assert "gh auth login --hostname github.com" in exc_info.value.suggestion
 
     @patch("conductor.registry.github.httpx.get")
     def test_http_error(self, mock_get: MagicMock) -> None:
@@ -345,12 +440,6 @@ def _tree_response(
     entries: list[dict], *, truncated: bool = False, tree_sha: str = "sha"
 ) -> MagicMock:
     return _mock_response(json_data={"sha": tree_sha, "tree": entries, "truncated": truncated})
-
-
-@pytest.fixture(autouse=True)
-def _stub_auth_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No local ``gh`` CLI credential lookup for these tests (issue #530)."""
-    monkeypatch.setattr("conductor.registry.github._get_auth_token", lambda: None)
 
 
 class TestListFilesRecursive:
@@ -591,9 +680,6 @@ class TestListFilesRecursive:
 
     @patch("conductor.registry.github.httpx.get")
     def test_no_auth_header_needed_without_local_gh_cli(self, mock_get: MagicMock) -> None:
-        """The autouse ``_stub_auth_token`` fixture keeps this test (and
-        every other test in this class) from depending on a local ``gh``
-        CLI session — no ``Authorization`` header is sent."""
         mock_get.return_value = _tree_response([_tree_entry("workflow.yaml", "100644", "blob")])
 
         list_files_recursive("owner", "repo", "", ref=self._REF)

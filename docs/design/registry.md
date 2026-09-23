@@ -391,8 +391,15 @@ Ad-hoc references follow the same resolution rules as registry references:
 ### Authentication
 
 Ad-hoc references use the same authentication as named GitHub registries:
-- Public repos work automatically.
-- Private repos use `gh auth token` if available, otherwise fail with a clear error.
+- Public repos work without a token.
+- Private repos use `gh auth token --hostname github.com`; sign in with
+  `gh auth login --hostname github.com`. Without a GitHub.com credential,
+  private-repo requests fail with a clear error.
+
+Registry sources use `owner/repo` and target `api.github.com` and
+`raw.githubusercontent.com`. Token lookup selects GitHub.com even if `GH_HOST`
+names a GitHub Enterprise host; Conductor leaves `GH_HOST` unchanged for
+workflow scripts. This does not enable enterprise-hosted registries.
 
 ### Usage
 
@@ -456,7 +463,6 @@ example YAML.
 ## Future work
 
 - SemVer range matching.
-- Authenticated GitHub fetch (token in config or via `gh auth token`).
 - Other sources (HTTPS tarball, OCI artifacts).
 - A lockfile (`conductor.lock`) capturing exact versions used by a project.
 - Signed indexes or workflow content for trusted distribution.

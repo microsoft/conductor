@@ -1,7 +1,8 @@
 """Helpers for fetching files, tags, and directory contents from GitHub repos.
 
 Supports both public and private repos. Authentication is resolved
-automatically via the ``gh`` CLI (``gh auth token``) when available.
+automatically via the ``gh`` CLI (``gh auth token --hostname github.com``)
+when available.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ _API_HEADERS = {
 
 
 def _get_auth_token() -> str | None:
-    """Attempt to get a GitHub token from the ``gh`` CLI.
+    """Get a github.com token regardless of the caller's ``GH_HOST``.
 
     Returns:
         A token string, or ``None`` if the ``gh`` CLI is not available or
@@ -36,7 +37,7 @@ def _get_auth_token() -> str | None:
     """
     try:
         result = subprocess.run(  # noqa: S603, S607
-            ["gh", "auth", "token"],
+            ["gh", "auth", "token", "--hostname", "github.com"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -65,7 +66,10 @@ def _raise_for_status(response: httpx.Response, *, context: str) -> None:
     if status == 404:
         raise RegistryNotFoundError(
             f"{context}: not found (404). Check that the repository exists and the ref is valid.",
-            suggestion="If this is a private repo, ensure 'gh auth login' has been run.",
+            suggestion=(
+                "If this is a private repo, ensure 'gh auth login --hostname github.com' "
+                "has been run."
+            ),
         )
     if status in (403, 429):
         raise RegistryError(
