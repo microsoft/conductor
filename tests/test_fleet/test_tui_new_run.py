@@ -105,7 +105,7 @@ async def _resolve(pilot, path: Path) -> None:
     ref_input = pilot.app.screen.query_one("#workflow-ref", Input)
     ref_input.value = str(path)
     await pilot.press("ctrl+r")
-    await pilot.pause(0.3)
+    await settle(pilot)
 
 
 def _write_bg_record(run_id: str, workflow_path: Path, *, port: int = 8080) -> RunRecord:
@@ -251,7 +251,7 @@ class TestNewRunSubmission:
             verbose_checkbox.value = True
 
             await pilot.press("ctrl+s")
-            await pilot.pause(0.3)
+            await settle(pilot)
 
         launch_mock.assert_called_once()
         args, _kwargs = launch_mock.call_args
@@ -287,7 +287,7 @@ class TestNewRunSubmission:
             question_input.value = "What is Python?"
 
             await pilot.press("ctrl+s")
-            await pilot.pause(0.3)
+            await settle(pilot)
 
             assert isinstance(app.screen, RunsScreen)
 
@@ -338,7 +338,7 @@ class TestNewRunSubmission:
                 question_input.value = "What is Python?"
 
                 await pilot.press("ctrl+s")
-                await pilot.pause(0.3)
+                await settle(pilot)
 
                 assert isinstance(app.screen, RunsScreen)
 
@@ -384,7 +384,7 @@ class TestNewRunSubmission:
                 question_input.value = "What is Python?"
 
                 await pilot.press("ctrl+s")
-                await pilot.pause(0.3)
+                await settle(pilot)
 
                 assert isinstance(app.screen, RunsScreen)
 
@@ -429,7 +429,7 @@ class TestNewRunSubmission:
                 question_input.value = "What is Python?"
 
                 await pilot.press("ctrl+s")
-                await pilot.pause(0.3)
+                await settle(pilot)
 
                 assert isinstance(app.screen, RunsScreen)
 
@@ -453,7 +453,7 @@ class TestNewRunSubmission:
             # Leave the required "question" field blank.
 
             await pilot.press("ctrl+s")
-            await pilot.pause(0.3)
+            await settle(pilot)
 
             message = app.screen.query_one("#launch-message", Static)
             assert "question" in str(message.render()).lower()
@@ -483,7 +483,7 @@ class TestNewRunSubmission:
             question_input.value = "What is Python?"
 
             await pilot.press("ctrl+s")
-            await pilot.pause(0.3)
+            await settle(pilot)
 
             message = app.screen.query_one("#launch-message", Static)
             text = str(message.render())
@@ -637,7 +637,7 @@ class TestNewRunRequiredBooleanUnset:
                 # Leave the required "confirm" checkbox untouched.
 
                 await pilot.press("ctrl+s")
-                await pilot.pause(0.3)
+                await settle(pilot)
 
                 message = app.screen.query_one("#launch-message", Static)
                 assert "confirm" in str(message.render()).lower()
@@ -663,7 +663,7 @@ class TestNewRunRequiredBooleanUnset:
             await settle(pilot)
 
             await pilot.press("ctrl+s")
-            await pilot.pause(0.3)
+            await settle(pilot)
 
         launch_mock.assert_called_once()
 
@@ -722,7 +722,7 @@ class TestNewRunLaunchGuard:
             await pilot.pause()
 
             release_launch.set()
-            await pilot.pause(0.3)
+            await settle(pilot)
 
         assert call_count == 1
 
@@ -870,7 +870,7 @@ class TestNewRunLaunchDirectory:
             question_input.value = "What is Python?"
 
             await pilot.press("ctrl+s")
-            await pilot.pause(0.3)
+            await settle(pilot)
 
         launch_mock.assert_called_once()
         _args, kwargs = launch_mock.call_args
