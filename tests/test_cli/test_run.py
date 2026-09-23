@@ -11,6 +11,7 @@ This module tests:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +31,11 @@ from conductor.console import make_console
 from conductor.mcp_auth import resolve_mcp_env_vars
 
 runner = CliRunner()
+
+
+def _unwrapped(panel_text: str) -> str:
+    """Strip whitespace and panel borders so text Rich wrapped mid-token still matches."""
+    return re.sub(r"[\s│]+", "", panel_text)
 
 
 class TestScriptRouteFailureCli:
@@ -70,11 +76,18 @@ agents:
             assert "exit 2" not in result.stdout
         else:
             assert "exit 2" in result.output
-        assert "detector" in result.stderr
-        assert "{{ output.ok }}" in result.stderr
-        assert "script exit 2" in result.stderr
-        assert "stdout: empty or whitespace-only" in result.stderr
-        assert missing.name in result.stderr
+        # The error panel wraps at the console width, and the missing file's
+        # path has no spaces to break at, so on a long temp dir (Windows CI)
+        # Rich splits it mid-name. Compare with wrapping undone.
+        stderr = _unwrapped(result.stderr)
+        for expected in (
+            "detector",
+            "{{ output.ok }}",
+            "script exit 2",
+            "stdout: empty or whitespace-only",
+            missing.name,
+        ):
+            assert _unwrapped(expected) in stderr, result.stderr
         assert "Ensure variable 'dict object'" not in result.output
         assert "handled" not in result.output
 
