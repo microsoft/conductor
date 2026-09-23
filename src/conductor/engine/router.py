@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from conductor.exceptions import TemplateError
 from conductor.executor.template import TemplateRenderer
 
 if TYPE_CHECKING:
@@ -64,6 +65,9 @@ class Router:
         routes: list[RouteDef],
         current_output: dict[str, Any],
         context: dict[str, Any],
+        *,
+        source_name: str | None = None,
+        diagnostic_context: str | None = None,
     ) -> RouteResult:
         """Evaluate routes and return the first matching target.
 
@@ -74,6 +78,8 @@ class Router:
             routes: Ordered list of route definitions.
             current_output: Output from the just-executed agent.
             context: Full workflow context.
+            source_name: Name of the step whose routes are being evaluated.
+            diagnostic_context: Optional diagnostic text for a failing route.
 
         Returns:
             RouteResult with target and optional output transform.
@@ -88,19 +94,32 @@ class Router:
         }
 
         for route in routes:
-            if route.when is None:
-                # No condition = always matches
-                return RouteResult(
-                    target=route.to,
-                    output_transform=self._render_output(route.output, eval_context),
-                    matched_rule=route,
-                )
+            label = (
+                f"Route from '{source_name}' to '{route.to}'"
+                if source_name is not None
+                else f"Route to '{route.to}'"
+            )
+            if route.when is not None:
+                try:
+                    matched = self._evaluate_condition(route.when, eval_context)
+                except TemplateError as exc:
+                    self._raise_template_error(
+                        exc, f"{label} condition {route.when!r}", diagnostic_context
+                    )
+                except ValueError as exc:
+                    detail = f"; {diagnostic_context}" if diagnostic_context else ""
+                    raise ValueError(
+                        f"{label} condition {route.when!r} failed: {exc}{detail}"
+                    ) from exc
+            else:
+                matched = True
 
-            # Evaluate the condition
-            if self._evaluate_condition(route.when, eval_context):
+            if matched:
                 return RouteResult(
                     target=route.to,
-                    output_transform=self._render_output(route.output, eval_context),
+                    output_transform=self._render_output(
+                        route.output, eval_context, label, diagnostic_context
+                    ),
                     matched_rule=route,
                 )
 
@@ -109,6 +128,20 @@ class Router:
             "No matching route found. Ensure at least one route has no 'when' clause "
             "or add a catch-all route at the end."
         )
+
+    @staticmethod
+    def _raise_template_error(
+        error: TemplateError, location: str, diagnostic_context: str | None
+    ) -> None:
+        detail = f"; {diagnostic_context}" if diagnostic_context else ""
+        raise TemplateError(
+            f"{location} failed: {error.args[0]}{detail}",
+            suggestion=error.suggestion,
+            file_path=error.file_path,
+            line_number=error.line_number,
+            template_string=error.template_string,
+            undefined_variable=error.undefined_variable,
+        ) from error
 
     def _evaluate_condition(self, when: str, context: dict[str, Any]) -> bool:
         """Evaluate a 'when' condition.
@@ -186,12 +219,16 @@ class Router:
         self,
         output: dict[str, str] | None,
         context: dict[str, Any],
+        label: str,
+        diagnostic_context: str | None,
     ) -> dict[str, Any] | None:
         """Render output transformation templates.
 
         Args:
             output: Optional mapping of output keys to template expressions.
             context: Variables available for template rendering.
+            label: Source and destination of the matching route.
+            diagnostic_context: Optional diagnostic text for a failing transformation.
 
         Returns:
             Rendered output dictionary, or None if no output specified.
@@ -201,5 +238,12 @@ class Router:
 
         result: dict[str, Any] = {}
         for key, template in output.items():
-            result[key] = self.renderer.render(template, context)
+            try:
+                result[key] = self.renderer.render(template, context)
+            except TemplateError as exc:
+                self._raise_template_error(
+                    exc,
+                    f"{label} output transformation {key!r} template {template!r}",
+                    diagnostic_context,
+                )
         return result

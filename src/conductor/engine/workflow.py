@@ -5862,7 +5862,13 @@ class WorkflowEngine:
                             self.limits.check_timeout()
                             self._check_budget()
 
-                            route_result = self._evaluate_routes(agent, output_content)
+                            route_result = self._evaluate_routes(
+                                agent,
+                                output_content,
+                                diagnostic_context=self._script_route_diagnostics(
+                                    script_output, parsed_json, json_parse_error
+                                ),
+                            )
 
                             self._emit(
                                 "route_taken",
@@ -8259,7 +8265,35 @@ class WorkflowEngine:
         result = self._evaluate_routes(agent, output)
         return result.target
 
-    def _evaluate_routes(self, agent: RoutableStepBase, output: dict[str, Any]) -> RouteResult:
+    @staticmethod
+    def _script_route_diagnostics(
+        output: ScriptOutput, parsed_json: Any, json_parse_error: Exception | None
+    ) -> str:
+        if not output.stdout.strip():
+            stdout_status = "empty or whitespace-only"
+        elif json_parse_error is not None:
+            stdout_status = "invalid JSON"
+        elif isinstance(parsed_json, dict):
+            stdout_status = "JSON object"
+        else:
+            stdout_status = f"JSON {type(parsed_json).__name__} (not an object)"
+
+        diagnostic = f"script exit {output.exit_code}; stdout: {stdout_status}"
+        if output.stderr:
+            marker = "...[truncated] "
+            stderr = output.stderr.strip()
+            if len(stderr) > 2000:
+                stderr = marker + stderr[-(2000 - len(marker)) :]
+            diagnostic += f"; stderr: {stderr}"
+        return diagnostic
+
+    def _evaluate_routes(
+        self,
+        agent: RoutableStepBase,
+        output: dict[str, Any],
+        *,
+        diagnostic_context: str | None = None,
+    ) -> RouteResult:
         """Evaluate routes using the Router.
 
         Uses the Router to evaluate routing rules and determine the next agent.
@@ -8268,6 +8302,7 @@ class WorkflowEngine:
         Args:
             agent: The current agent definition.
             output: The agent's output content.
+            diagnostic_context: Optional script process details for a failing route.
 
         Returns:
             RouteResult with target and optional output transform.
@@ -8279,7 +8314,13 @@ class WorkflowEngine:
         # Build context for condition evaluation
         eval_context = self.context.get_for_template()
 
-        return self.router.evaluate(agent.routes, output, eval_context)
+        return self.router.evaluate(
+            agent.routes,
+            output,
+            eval_context,
+            source_name=agent.name,
+            diagnostic_context=diagnostic_context,
+        )
 
     def _evaluate_parallel_routes(
         self, parallel_group: ParallelGroup, output: dict[str, Any]
@@ -8303,7 +8344,9 @@ class WorkflowEngine:
         # Build context for condition evaluation
         eval_context = self.context.get_for_template()
 
-        return self.router.evaluate(parallel_group.routes, output, eval_context)
+        return self.router.evaluate(
+            parallel_group.routes, output, eval_context, source_name=parallel_group.name
+        )
 
     def _evaluate_for_each_routes(
         self, for_each_group: ForEachDef, output: dict[str, Any]
@@ -8327,7 +8370,9 @@ class WorkflowEngine:
         # Build context for condition evaluation
         eval_context = self.context.get_for_template()
 
-        return self.router.evaluate(for_each_group.routes, output, eval_context)
+        return self.router.evaluate(
+            for_each_group.routes, output, eval_context, source_name=for_each_group.name
+        )
 
     def _build_final_output(
         self, route_output_transform: dict[str, Any] | None = None

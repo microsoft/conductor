@@ -409,6 +409,67 @@ class TestTemplateRendererMissingVariables:
             renderer.render("{{ undefined_var }}", {})
         assert exc_info.value.suggestion is not None
 
+    @pytest.mark.parametrize(
+        ("template", "context", "missing"),
+        [
+            ("{{ missing }}", {}, "missing"),
+            ("{{ output }}", {}, "output"),
+        ],
+    )
+    def test_root_variable_metadata(self, template: str, context: dict, missing: str) -> None:
+        renderer = TemplateRenderer()
+        with pytest.raises(TemplateError) as exc_info:
+            renderer.render(template, context)
+        error = exc_info.value
+        assert error.template_string == template
+        assert error.undefined_variable == missing
+        assert error.suggestion == f"Ensure variable '{missing}' is defined in the context"
+        assert error.__cause__ is not None
+
+    @pytest.mark.parametrize(
+        ("template", "context"),
+        [
+            ("{{ output.ok }}", {"output": {}}),
+            ("{{ output['ok'] }}", {"output": {}}),
+            ("{{ output[4] }}", {"output": [1]}),
+        ],
+    )
+    def test_missing_member_does_not_infer_root(self, template: str, context: dict) -> None:
+        renderer = TemplateRenderer()
+        with pytest.raises(TemplateError) as exc_info:
+            renderer.render(template, context)
+        error = exc_info.value
+        assert error.template_string == template
+        assert error.undefined_variable is None
+        assert "key, attribute, or index" in error.suggestion
+        assert "dict object" not in error.suggestion
+        assert "list object" not in error.suggestion
+        assert "unknown" not in error.suggestion
+
+    def test_unrecognized_undefined_message_uses_generic_advice(self) -> None:
+        from jinja2 import UndefinedError
+
+        renderer = TemplateRenderer()
+
+        def fail(value: object) -> object:
+            raise UndefinedError("surprising 'quoted' shape")
+
+        renderer.env.filters["fail"] = fail
+        template = "{{ value | fail }}"
+        with pytest.raises(TemplateError) as exc_info:
+            renderer.render(template, {"value": 1})
+        error = exc_info.value
+        assert "surprising 'quoted' shape" in error.args[0]
+        assert error.template_string == template
+        assert error.undefined_variable is None
+        assert "available context" in error.suggestion
+
+    def test_syntax_error_has_template_metadata(self) -> None:
+        renderer = TemplateRenderer()
+        with pytest.raises(TemplateError) as exc_info:
+            renderer.render("{{ output. }}", {"output": {}})
+        assert exc_info.value.template_string == "{{ output. }}"
+
 
 class TestTemplateRendererNestedAccess:
     """Tests for accessing nested data in templates."""

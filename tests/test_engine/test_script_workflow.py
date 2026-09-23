@@ -34,7 +34,7 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ConfigurationError, ValidationError
+from conductor.exceptions import ConfigurationError, TemplateError, ValidationError
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -162,6 +162,132 @@ class TestScriptRouting:
 
         assert result["path"] == "ran success_handler"
 
+
+class TestScriptRouteDiagnostics:
+    @staticmethod
+    def _config(args: list[str], routes: list[RouteDef]) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(name="route-diagnostics", entry_point="detector"),
+            agents=[
+                ScriptStepDef(name="detector", command=sys.executable, args=args, routes=routes),
+                ScriptStepDef(
+                    name="handler",
+                    command=sys.executable,
+                    args=["-c", "print('handled')"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resume", [False, True])
+    async def test_missing_file_surfaces_raw_result_and_failure_event(
+        self, tmp_path, resume: bool
+    ) -> None:
+        missing = tmp_path / "missing.py"
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        config = self._config(
+            [str(missing)],
+            [
+                RouteDef(to="handler", when="{{ output.ok }}"),
+                RouteDef(to="$end"),
+            ],
+        )
+        engine = WorkflowEngine(config, MagicMock(), event_emitter=emitter)
+        with pytest.raises(TemplateError) as exc_info:
+            if resume:
+                await engine.resume("detector")
+            else:
+                await engine.run({})
+        error = exc_info.value
+        assert "from 'detector' to 'handler'" in str(error)
+        assert "{{ output.ok }}" in str(error)
+        assert "script exit 2" in str(error)
+        assert "stdout: empty or whitespace-only" in str(error)
+        assert "stderr:" in str(error)
+        assert missing.name in str(error)
+        assert "dict object" not in error.suggestion
+        assert error.undefined_variable is None
+        completed = next(e for e in events if e.type == "script_completed")
+        assert completed.data["exit_code"] == 2
+        assert completed.data["stdout"] == ""
+        assert missing.name in completed.data["stderr"]
+        failed = next(e for e in events if e.type == "workflow_failed")
+        assert "script exit 2" in failed.data["message"]
+        assert "{{ output.ok }}" in failed.data["message"]
+        assert "handler" not in engine.context.agent_outputs
+        assert not any(e.type == "route_taken" for e in events)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("program", "classification"),
+        [
+            ("print('not json')", "invalid JSON"),
+            ("print('[1, 2]')", "JSON list (not an object)"),
+            ("print('42')", "JSON int (not an object)"),
+            ("print('null')", "JSON NoneType (not an object)"),
+            ("print('{}')", "JSON object"),
+            ("print('   ')", "empty or whitespace-only"),
+        ],
+    )
+    async def test_stdout_classification(self, program: str, classification: str) -> None:
+        config = self._config(["-c", program], [RouteDef(to="handler", when="{{ output.ok }}")])
+        engine = WorkflowEngine(config, MagicMock())
+        with pytest.raises(TemplateError) as exc_info:
+            await engine.run({})
+        assert f"stdout: {classification}" in str(exc_info.value)
+        assert "script exit 0" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_stderr_tail_is_bounded(self) -> None:
+        program = "import sys; sys.stderr.write('a' * 3000 + 'TAIL'); sys.exit(3)"
+        config = self._config(["-c", program], [RouteDef(to="handler", when="{{ output.ok }}")])
+        engine = WorkflowEngine(config, MagicMock())
+        with pytest.raises(TemplateError) as exc_info:
+            await engine.run({})
+        diagnostic = str(exc_info.value).split("; stderr: ", 1)[1].split("\n\n", 1)[0]
+        assert len(diagnostic) == 2000
+        assert diagnostic.startswith("...[truncated] ")
+        assert diagnostic.endswith("TAIL")
+
+    @pytest.mark.asyncio
+    async def test_shadowed_fields_do_not_change_diagnostics(self) -> None:
+        program = (
+            "import sys, json; sys.stderr.write('real stderr'); "
+            "print(json.dumps({'stdout': 'fake', 'stderr': 'fake', 'exit_code': 0})); "
+            "sys.exit(4)"
+        )
+        config = self._config(["-c", program], [RouteDef(to="handler", when="{{ output.ok }}")])
+        engine = WorkflowEngine(config, MagicMock())
+        with pytest.raises(TemplateError) as exc_info:
+            await engine.run({})
+        output = engine.context.agent_outputs["detector"]
+        assert output["stdout"] == "fake"
+        assert output["stderr"] == "fake"
+        assert output["exit_code"] == 0
+        assert "script exit 4; stdout: JSON object; stderr: real stderr" in str(exc_info.value)
+        assert "fake" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_nonzero_and_guarded_fields_reach_authored_handler(self) -> None:
+        routes = [
+            RouteDef(to="handler", when="{{ output.exit_code != 0 }}"),
+            RouteDef(to="handler", when="{{ output.ok is defined and output.ok == false }}"),
+            RouteDef(to="handler", when="{{ output.ok | default(false) }}"),
+            RouteDef(to="$end"),
+        ]
+        for program in [
+            "import sys; sys.exit(2)",
+            "print('{\"ok\": false}')",
+        ]:
+            engine = WorkflowEngine(self._config(["-c", program], routes), MagicMock())
+            await engine.run({})
+            assert "handler" in engine.context.agent_outputs
+
+
+class TestScriptRoutingFailureAndJinja:
     @pytest.mark.asyncio
     async def test_route_on_exit_code_simpleeval_failure(self) -> None:
         """Test routing on non-zero exit_code using simpleeval."""

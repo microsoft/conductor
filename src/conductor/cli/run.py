@@ -310,6 +310,7 @@ def verbose_log_agent_complete(
     cost_usd: float | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    exit_code: int | None = None,
 ) -> None:
     """Log agent completion with summary info.
 
@@ -322,6 +323,7 @@ def verbose_log_agent_complete(
         cost_usd: Estimated cost in USD (if available).
         input_tokens: Input tokens used (if available).
         output_tokens: Output tokens generated (if available).
+        exit_code: Script process exit code (if available).
     """
     from conductor.cli.app import is_verbose
 
@@ -342,11 +344,14 @@ def verbose_log_agent_complete(
         parts.append(f"${cost_usd:.4f}")
     if output_keys:
         parts.append(f"→ {output_keys}")
+    if exit_code is not None and exit_code != 0:
+        parts.append(f"exit {exit_code}")
 
     text = Text()
-    text.append("└─ ", style="green")
-    text.append("✓ ", style="green")
-    text.append(agent_name, style="green")
+    style = "yellow" if exit_code is not None and exit_code != 0 else "green"
+    text.append("└─ ", style=style)
+    text.append("! " if style == "yellow" else "✓ ", style=style)
+    text.append(agent_name, style=style)
     text.append(f"  ({', '.join(parts)})", style="dim")
 
     if should_console:
@@ -1068,7 +1073,14 @@ class ConsoleEventSubscriber:
                 d.get("elapsed", 0.0),
             )
 
-        elif t in ("script_completed", "set_completed"):
+        elif t == "script_completed":
+            verbose_log_agent_complete(
+                d.get("agent_name", "?"),
+                d.get("elapsed", 0.0),
+                exit_code=d.get("exit_code"),
+            )
+
+        elif t == "set_completed":
             verbose_log_agent_complete(
                 d.get("agent_name", "?"),
                 d.get("elapsed", 0.0),

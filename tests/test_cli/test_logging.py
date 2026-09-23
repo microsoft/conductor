@@ -31,6 +31,103 @@ from conductor.cli.app import (
 runner = CliRunner()
 
 
+class TestScriptCompletionRendering:
+    @pytest.mark.parametrize(
+        ("exit_code", "expected"),
+        [(0, None), (3, "exit 3"), (-9, "exit -9"), (None, None)],
+    )
+    def test_subscriber_renders_script_exit_and_keeps_other_completions(
+        self, exit_code: int | None, expected: str | None
+    ) -> None:
+        from io import StringIO
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.console import make_console
+        from conductor.events import WorkflowEvent
+
+        output = StringIO()
+        subscriber = ConsoleEventSubscriber()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                make_console(file=output, force_terminal=False, width=120),
+            ):
+                subscriber.on_event(
+                    WorkflowEvent(
+                        type="script_completed",
+                        timestamp=0,
+                        data={
+                            "agent_name": "script[task1]",
+                            "elapsed": 1.25,
+                            "exit_code": exit_code,
+                        },
+                    )
+                )
+                subscriber.on_event(
+                    WorkflowEvent(
+                        type="set_completed",
+                        timestamp=0,
+                        data={"agent_name": "setter", "elapsed": 0.5},
+                    )
+                )
+                subscriber.on_event(
+                    WorkflowEvent(
+                        type="agent_completed",
+                        timestamp=0,
+                        data={"agent_name": "agent", "elapsed": 0.75},
+                    )
+                )
+            lines = output.getvalue().splitlines()
+            assert "script[task1]" in lines[0]
+            assert "1.25s" in lines[0]
+            assert ("! " in lines[0]) == (expected is not None)
+            assert ("✓ " in lines[0]) == (expected is None)
+            if expected is not None:
+                assert expected in lines[0]
+            else:
+                assert "exit " not in lines[0]
+            assert "✓ setter  (0.50s)" in lines[1]
+            assert "✓ agent  (0.75s)" in lines[2]
+        finally:
+            verbose_mode.reset(token)
+
+    @pytest.mark.parametrize("verbose", [True, False])
+    def test_quiet_and_silent_file_logging(self, tmp_path: Path, verbose: bool) -> None:
+        from io import StringIO
+
+        from conductor.cli.run import (
+            ConsoleEventSubscriber,
+            close_file_logging,
+            init_file_logging,
+        )
+        from conductor.console import make_console
+        from conductor.events import WorkflowEvent
+
+        output = StringIO()
+        path = tmp_path / "script.log"
+        token = verbose_mode.set(verbose)
+        try:
+            init_file_logging(path)
+            with patch(
+                "conductor.cli.run._verbose_console",
+                make_console(file=output, force_terminal=False),
+            ):
+                ConsoleEventSubscriber().on_event(
+                    WorkflowEvent(
+                        type="script_completed",
+                        timestamp=0,
+                        data={"agent_name": "script[x]", "elapsed": 2.5, "exit_code": 2},
+                    )
+                )
+            assert ("exit 2" in output.getvalue()) == verbose
+            assert "script[x]" in path.read_text()
+            assert "exit 2" in path.read_text()
+        finally:
+            close_file_logging()
+            verbose_mode.reset(token)
+
+
 class TestConsoleVerbosityEnum:
     """Tests for the ConsoleVerbosity enum."""
 

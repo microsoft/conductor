@@ -14,6 +14,7 @@ import pytest
 
 from conductor.config.schema import RouteDef
 from conductor.engine.router import Router, RouteResult
+from conductor.exceptions import TemplateError
 
 
 class TestRouteResult:
@@ -344,6 +345,116 @@ class TestRouterErrors:
 
         with pytest.raises(ValueError, match="Failed to evaluate expression"):
             router.evaluate(routes, {"score": 10}, {})
+
+    @pytest.mark.parametrize(
+        ("expression", "output", "missing"),
+        [
+            ("{{ output.ok }}", {}, None),
+            ("{{ absent }}", {}, "absent"),
+            ("{{ output. }}", {}, None),
+        ],
+    )
+    def test_jinja_condition_reports_route_and_keeps_metadata(
+        self, expression: str, output: dict, missing: str | None
+    ) -> None:
+        router = Router()
+        with pytest.raises(TemplateError) as exc_info:
+            router.evaluate(
+                [RouteDef(to="handler", when=expression), RouteDef(to="fallback")],
+                output,
+                {},
+                source_name="detector",
+                diagnostic_context="script exit 2; stdout: empty",
+            )
+        error = exc_info.value
+        assert f"from 'detector' to 'handler' condition {expression!r}" in str(error)
+        assert "script exit 2; stdout: empty" in str(error)
+        assert error.template_string == expression
+        assert error.undefined_variable == missing
+        assert isinstance(error.__cause__, TemplateError)
+        assert error.__cause__.__cause__ is not None
+        assert str(error).count("Suggestion:") == 1
+        assert "fallback" not in str(error)
+        if expression == "{{ output.ok }}":
+            assert "dict object" not in error.suggestion
+        if expression == "{{ output. }}":
+            assert "syntax error" in str(error)
+
+    @pytest.mark.parametrize("expression", ["unknown_var > 5", "score >>> 5"])
+    def test_arithmetic_condition_reports_source_and_cause(self, expression: str) -> None:
+        router = Router()
+        with pytest.raises(ValueError) as exc_info:
+            router.evaluate(
+                [RouteDef(to="handler", when=expression)],
+                {"score": 10},
+                {},
+                source_name="source",
+                diagnostic_context="script exit 1",
+            )
+        assert f"from 'source' to 'handler' condition {expression!r}" in str(exc_info.value)
+        assert "script exit 1" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    @pytest.mark.parametrize("when", [None, "{{ output.active }}"])
+    def test_output_transform_error_identifies_key_and_template(self, when: str | None) -> None:
+        router = Router()
+        template = "{{ output.missing }}"
+        with pytest.raises(TemplateError) as exc_info:
+            router.evaluate(
+                [RouteDef(to="$end", when=when, output={"bad": template, "later": "{{ absent }}"})],
+                {"active": True},
+                {},
+                source_name="producer",
+            )
+        error = exc_info.value
+        assert "from 'producer' to '$end' output transformation 'bad'" in str(error)
+        assert repr(template) in str(error)
+        assert "condition" not in error.args[0]
+        assert error.template_string == template
+        assert str(error).count("Suggestion:") == 1
+
+    def test_omitted_diagnostics_and_short_circuit(self) -> None:
+        router = Router()
+        routes = [
+            RouteDef(to="skip", when="{{ output.flag }}", output={"bad": "{{ absent }}"}),
+            RouteDef(to="go"),
+            RouteDef(to="never", when="{{ missing }}"),
+        ]
+        assert router.evaluate(routes, {"flag": False}, {}).target == "go"
+        with pytest.raises(TemplateError) as exc_info:
+            router.evaluate([RouteDef(to="bad", when="{{ missing }}")], {}, {})
+        assert "Route to 'bad'" in str(exc_info.value)
+        assert "script exit" not in str(exc_info.value)
+
+    def test_template_location_metadata_survives_route_wrapping(self) -> None:
+        from unittest.mock import patch
+
+        router = Router()
+        original = TemplateError(
+            "broken",
+            suggestion="repair",
+            file_path="workflow.yaml",
+            line_number=8,
+            template_string="{{ broken }}",
+            undefined_variable="broken",
+        )
+        with (
+            patch.object(router.renderer, "evaluate_condition", side_effect=original),
+            pytest.raises(TemplateError) as exc_info,
+        ):
+            router.evaluate(
+                [RouteDef(to="target", when="{{ broken }}")],
+                {},
+                {},
+                source_name="source",
+            )
+        error = exc_info.value
+        assert error.__cause__ is original
+        assert error.file_path == "workflow.yaml"
+        assert error.line_number == 8
+        assert error.template_string == "{{ broken }}"
+        assert error.undefined_variable == "broken"
+        assert str(error).count("Suggestion:") == 1
 
 
 class TestRouterContextAccess:

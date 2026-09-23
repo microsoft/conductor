@@ -7,6 +7,7 @@ with workflow context, including custom filters for JSON serialization.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from jinja2 import (
@@ -160,6 +161,7 @@ class TemplateRenderer:
                 suggestion="Restore the prompt file or fix the !file reference — "
                 "relative Jinja includes/imports/extends resolve against "
                 "that file's directory.",
+                template_string=template,
             )
         try:
             if isinstance(template, FileString):
@@ -188,6 +190,7 @@ class TemplateRenderer:
                 raise TemplateError(
                     f"Template not found: '{e.name}'. Searched in: {search_paths}",
                     suggestion="Check that the template file exists in the search path",
+                    template_string=template,
                 ) from e
             else:
                 raise TemplateError(
@@ -195,25 +198,36 @@ class TemplateRenderer:
                     "({% include %}, {% import %}, {% extends %}) require a file-backed prompt "
                     "via prompt: !file ...",
                     suggestion="Convert the prompt to a file-backed reference using prompt: !file",
+                    template_string=template,
                 ) from e
         except Jinja2UndefinedError as e:
-            # Extract the variable name from the error message
             error_msg = str(e)
-            # Jinja2 error messages are like "'name' is undefined"
             variable_name = self._extract_variable_name(error_msg)
+            if variable_name is not None:
+                suggestion = f"Ensure variable '{variable_name}' is defined in the context"
+            elif " has no attribute " in error_msg or " has no element " in error_msg:
+                suggestion = (
+                    "Check that the referenced key, attribute, or index exists in the output"
+                )
+            else:
+                suggestion = "Check the template expression and available context values"
             raise TemplateError(
                 f"Undefined variable in template: {e}",
-                suggestion=f"Ensure variable '{variable_name}' is defined in the context",
+                suggestion=suggestion,
+                template_string=template,
+                undefined_variable=variable_name,
             ) from e
         except TemplateSyntaxError as e:
             raise TemplateError(
                 f"Template syntax error: {e}",
                 suggestion="Check template syntax for Jinja2 compatibility",
+                template_string=template,
             ) from e
         except Exception as e:
             raise TemplateError(
                 f"Template rendering failed: {e}",
                 suggestion="Check template and context for errors",
+                template_string=template,
             ) from e
 
     def evaluate_condition(self, expression: str, context: dict[str, Any]) -> bool:
@@ -239,18 +253,14 @@ class TemplateRenderer:
         return bool(result)
 
     @staticmethod
-    def _extract_variable_name(error_msg: str) -> str:
+    def _extract_variable_name(error_msg: str) -> str | None:
         """Extract variable name from Jinja2 undefined error message.
 
         Args:
             error_msg: The error message from Jinja2.
 
         Returns:
-            The variable name, or "unknown" if extraction fails.
+            The variable name, or None if the message is not a missing root variable.
         """
-        # Jinja2 error messages are like "'name' is undefined"
-        if "'" in error_msg:
-            parts = error_msg.split("'")
-            if len(parts) >= 2:
-                return parts[1]
-        return "unknown"
+        match = re.fullmatch(r"'([^']+)' is undefined", error_msg)
+        return match.group(1) if match else None

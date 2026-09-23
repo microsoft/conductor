@@ -1168,16 +1168,27 @@ prompt: |
   Exit code: {{ run_tests.output.exit_code }}
 ```
 
-**Routing on exit code** — use `exit_code` in route conditions to branch on success or failure:
+**Routing on exit code** — a completed script step does not imply a zero exit
+code. A non-zero exit remains a routable result, but its stdout may be empty or
+may not contain the JSON fields a later route expects. Guard field access:
 
 ```yaml
 routes:
-  - to: success_handler
-    when: "exit_code == 0"           # simpleeval syntax
   - to: failure_handler
-    when: "{{ output.exit_code != 0 }}"  # Jinja2 syntax
-  - to: $end
+    when: "{{ output.exit_code != 0 }}"
+  - to: success_handler
+    when: "{{ output.ok }}"           # reached only after a zero exit
+  - to: fallback_handler
 ```
+
+For fields that are optional even on success, use `output.ok is defined` or
+`output.ok | default(false)`. With strict template evaluation, a missing field
+raises a route error rather than falling through to the next route. Parsed JSON
+keys can shadow `exit_code`, `stdout`, and `stderr` in route output; completion
+diagnostics still report the actual process exit and captured stderr. A Python
+interpreter returning non-zero because its script file does not exist is a
+completed process; a command executable that cannot be spawned instead raises
+`ExecutionError` before routing.
 
 **Restrictions** — script steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, or `validator`. Script steps also cannot be used inside `parallel` groups or `for_each` groups.
 

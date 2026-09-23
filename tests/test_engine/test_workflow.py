@@ -34,7 +34,7 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEventEmitter
-from conductor.exceptions import ExecutionError
+from conductor.exceptions import ExecutionError, TemplateError
 from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
 
@@ -1030,6 +1030,36 @@ class TestWorkflowEngineLoopBack:
 
 class TestWorkflowEngineRouterIntegration:
     """Tests for Router integration with WorkflowEngine."""
+
+    @pytest.mark.parametrize("owner", ["agent", "parallel", "for_each"])
+    def test_route_error_names_owning_step_without_script_diagnostics(self, owner: str) -> None:
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="route-owner", entry_point="agent"),
+            agents=[AgentDef(name="agent", prompt="test")],
+        )
+        engine = WorkflowEngine(config, CopilotProvider(mock_handler=lambda *args: {}))
+        route = [RouteDef(to="handler", when="{{ output.missing }}")]
+        if owner == "agent":
+            step = AgentDef(name="agent", prompt="test", routes=route)
+            evaluate = engine._evaluate_routes
+        elif owner == "parallel":
+            step = ParallelGroup(name="parallel", agents=["agent", "other"], routes=route)
+            evaluate = engine._evaluate_parallel_routes
+        else:
+            step = ForEachDef(
+                name="for_each",
+                type="for_each",
+                source="agent.output.items",
+                **{"as": "item"},
+                agent=AgentDef(name="worker", prompt="test"),
+                routes=route,
+            )
+            evaluate = engine._evaluate_for_each_routes
+        with pytest.raises(TemplateError) as exc_info:
+            evaluate(step, {})
+        assert f"from '{owner}' to 'handler'" in str(exc_info.value)
+        assert "{{ output.missing }}" in str(exc_info.value)
+        assert "script exit" not in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_route_output_transform(self) -> None:

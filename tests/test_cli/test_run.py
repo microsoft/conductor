@@ -11,6 +11,7 @@ This module tests:
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +30,53 @@ from conductor.console import make_console
 from conductor.mcp_auth import resolve_mcp_env_vars
 
 runner = CliRunner()
+
+
+class TestScriptRouteFailureCli:
+    @pytest.mark.parametrize("silent", [False, True])
+    def test_missing_script_file_reports_context(self, tmp_path: Path, silent: bool) -> None:
+        workflow_file = tmp_path / "script.yaml"
+        missing = tmp_path / "missing.py"
+        workflow_file.write_text(
+            f"""\
+workflow:
+  name: script-route-error
+  entry_point: detector
+agents:
+  - name: detector
+    type: script
+    command: {sys.executable!r}
+    args: [{str(missing)!r}]
+    routes:
+      - to: handler
+        when: "{{{{ output.ok }}}}"
+      - to: $end
+  - name: handler
+    type: script
+    command: {sys.executable!r}
+    args: ["-c", "print('handled')"]
+    routes:
+      - to: $end
+"""
+        )
+        args = (["--silent"] if silent else []) + [
+            "run",
+            str(workflow_file),
+            "--no-interactive",
+        ]
+        result = runner.invoke(app, args)
+        assert result.exit_code != 0, (result.stdout, result.stderr)
+        if silent:
+            assert "exit 2" not in result.stdout
+        else:
+            assert "exit 2" in result.output
+        assert "detector" in result.stderr
+        assert "{{ output.ok }}" in result.stderr
+        assert "script exit 2" in result.stderr
+        assert "stdout: empty or whitespace-only" in result.stderr
+        assert missing.name in result.stderr
+        assert "Ensure variable 'dict object'" not in result.output
+        assert "handled" not in result.output
 
 
 class TestCoerceValue:
