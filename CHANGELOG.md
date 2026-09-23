@@ -11,6 +11,85 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.40] - 2026-09-23
+
+### Added
+
+- **Execution profiles and execution environment documents:** decouple what an
+  executable step needs from where it runs. Workflows declare logical profile
+  names via `workflow.defaults.execution.profile` or per-step `execution.profile`
+  on executable steps (agent, script, mcp, workflow). Environment documents
+  (`.conductor/environments/<name>.yaml` discovered by walking from the workflow
+  directory to the git root, or `$CONDUCTOR_HOME/environments/<name>.yaml`) map
+  logical profile names to runner backends via whole-document shadowing without
+  merging. CLI commands `conductor run`, `conductor resume`, and `conductor
+  validate` accept `--environment <name|PATH>` to select an environment. Bare
+  `conductor validate` uses a three-level check: zero I/O when profile references
+  are absent, discovery and cross-checks when present, and explicit validation
+  with a full `Execution Resolution` report table when passed `--environment`.
+  Every run compiles a deterministic, run-invariant `ResolvedRunManifest` audit
+  record recorded in `workflow_started` metadata. See `docs/workflow-syntax.md`
+  (Execution Profiles) and `docs/configuration.md` (Execution Environments). (#527)
+- **`dialog.conversation_prompt`**: instructions for the agent holding a dialog
+  conversation, appended to the built-in dialog system prompt. Previously
+  `trigger_prompt` was the only field on a `dialog:` block, and it reaches
+  only the evaluator that decides whether to open the dialog, so a workflow
+  author had no way to instruct the conversing agent.
+
+### Fixed
+
+- **Verbose logging and error reporting no longer crash a run when stderr is a
+  non-blocking pipe**: a full agent prompt (or any other large console panel)
+  could exceed the OS pipe buffer and raise `BlockingIOError` under `--web-bg`,
+  cron, or any other piped/non-interactive invocation, taking down an otherwise
+  successful workflow. The write now blocks for the reader to drain the pipe
+  instead of failing outright. (#543)
+- **Dialog mode no longer ends an interview on "ready for the next question"**:
+  a trailing `[READY_TO_CONTINUE]` is withheld when the agent's message still
+  asks or announces a question, the agent is told not to combine the two, and
+  the continue prompt names the agent and says which replies end the dialog
+  (`yes`, or a dismiss keyword; anything else is sent to the agent, and an
+  empty reply re-asks). The opening banner lists every dismiss keyword, and
+  `dialog_completed` carries `agent_question_outstanding` when a dialog closed
+  under an unanswered question from the agent. On the web path the leave-dialog
+  control and a dismiss keyword at the continue proposal both end the dialog as
+  a dismissal, as on the terminal.
+
+### Changed
+
+- **Remote runner wire protocol lifted to `conductor.runner.protocol`**: the
+  serialized wire contract between the Conductor host and remote agent runtimes
+  is now defined in the backend-neutral `conductor.runner.protocol` package.
+  The runner `/health` endpoint additively advertises `protocol_version` for
+  host-side version advertisement and warn-only compatibility checks.
+  `conductor.providers.aca_protocol` is deprecated as a re-export shim that emits
+  a `DeprecationWarning` on import and will be removed in a future major release. (#527)
+- **Copilot agent system prompts now use the SDK's native system channel** instead
+  of being prefixed to each dynamic user prompt, improving instruction role
+  integrity and allowing static prompt prefixes to remain cacheable. (#545)
+- **Breaking (experimental `claude-agent-sdk` provider):** an agent that omits
+  `tools:` no longer receives the full Claude Code tool preset. The new
+  `runtime.provider.native_tools` setting defaults to `none` — no built-in
+  filesystem, shell, web or editing tools — including for the bare
+  `provider: claude-agent-sdk` shorthand. Workflows that relied on omitting
+  `tools:` to read files, run commands or edit code must now opt in explicitly
+  with `native_tools: claude_code`; without it they still validate, but their
+  agents run with no built-in tools. `claude_code` grants the full preset with
+  automatic approval, and the run warns once that `working_dir` is not a
+  sandbox. Under `none`, declared MCP servers stay usable through one
+  server-scoped permission rule each (`mcp__<server>__*`). Server names are
+  restricted to letters, digits, `-` and single `_` characters so the rule
+  matches the tool names the CLI actually generates; a name that cannot form a
+  matching rule, and plugin subagents that would have no dispatch tool, are
+  refused at `conductor validate` and at run time. An
+  explicit `tools: []` on an agent that would still get MCP servers, from the
+  workflow or a plugin, is now refused by `conductor run` as well as by
+  `conductor validate`, instead of running with those servers attached.
+- The default development and CI test commands now run the isolated pytest
+  suite in parallel, substantially reducing feedback time on multi-core
+  machines. Set `PYTEST_WORKERS=0` when a serial run is needed for debugging.
+
+
 ## [0.1.39] - 2026-09-21
 
 ### Added
