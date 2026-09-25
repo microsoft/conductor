@@ -14,7 +14,7 @@ import tempfile
 import time
 import types
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -40,16 +40,24 @@ if TYPE_CHECKING:
     from conductor.skills import SkillPlugin
 
 try:
+    # ``ClaudeSDKClient`` rather than the one-shot ``query()`` helper, and the
+    # reason is cleanup rather than features. ``query()`` ends its own stream
+    # from inside the ``__anext__`` the caller is awaiting -- on a parse error
+    # or a read error its ``finally`` runs the whole SDK teardown there -- so
+    # pre-empting a blocked read could cancel ``transport.close()`` half-way,
+    # leaving the CLI running but discarded from the SDK's child registry with
+    # no handle left to finish the job. The client exposes ``disconnect()``, so
+    # shutdown becomes something this provider owns and can shield.
     from claude_agent_sdk import (  # ty: ignore[unresolved-import]
         AgentDefinition,
         ClaudeAgentOptions,
-        query,
+        ClaudeSDKClient,
     )
 
     CLAUDE_AGENT_SDK_AVAILABLE = True
 except ImportError:
     CLAUDE_AGENT_SDK_AVAILABLE = False
-    query: Any = None
+    ClaudeSDKClient: Any = None
     ClaudeAgentOptions: Any = None
     AgentDefinition: Any = None
 
@@ -832,6 +840,350 @@ def _remove_mcp_config(path: str) -> None:
         )
 
 
+class _ReadOutcome:
+    """Sentinel marking why a read ended without producing a message.
+
+    A distinct object rather than ``None``: the SDK is free to yield anything,
+    so only identity can tell an outcome apart from a message.
+    """
+
+    __slots__ = ("_label",)
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<{self._label}>"
+
+
+#: The interrupt signal was set, so the caller wants partial output.
+_READ_INTERRUPTED: Final[_ReadOutcome] = _ReadOutcome("read interrupted")
+#: The absolute session deadline passed.
+_READ_TIMED_OUT: Final[_ReadOutcome] = _ReadOutcome("read timed out")
+#: The SDK iterator is exhausted (``StopAsyncIteration``).
+_READ_EXHAUSTED: Final[_ReadOutcome] = _ReadOutcome("read exhausted")
+
+
+async def _reap_shielded(
+    task: asyncio.Future[Any],
+    current: asyncio.Task[Any] | None,
+    observed: int,
+    describe: str | None = None,
+) -> tuple[asyncio.CancelledError | None, int]:
+    """Await one owned task to completion without forwarding cancellation.
+
+    Args:
+        task: The owned task to reap. For cleanup it has already been
+            cancelled; for a phase whose result the caller needs (connect,
+            disconnect) it has not, and this simply waits it out uncancellably.
+        current: The task running this cleanup, or ``None`` outside a task.
+        observed: The caller's cancellation count as of the last check.
+        describe: The phase name to log an unexpected failure under, or
+            ``None`` when the caller inspects ``task.exception()`` itself.
+            Passing a name here is what stops a teardown failure vanishing;
+            passing ``None`` is what stops this helper swallowing a result the
+            caller still has to act on.
+
+    Returns:
+        The first ``CancelledError`` that was aimed at *the caller* (``None``
+        when there was none), and the updated cancellation count.
+    """
+    caller_cancelled: asyncio.CancelledError | None = None
+
+    while True:
+        try:
+            # A fresh shield on every iteration: once a shield wrapper has
+            # been cancelled it stays cancelled, so reusing it would spin.
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            current_count = current.cancelling() if current is not None else observed
+
+            # Two independent questions. Asking only the second one -- "is the
+            # child done?" -- cannot classify a turn in which the caller was
+            # cancelled *and* the child finished, and would silently swallow
+            # the caller's cancellation.
+            #
+            # Question 1: was the caller itself cancelled? ``cancelling()`` is
+            # incremented synchronously by ``cancel()``, so it is true even
+            # when the CancelledError we just caught came from the child.
+            if current_count > observed:
+                if caller_cancelled is None:
+                    caller_cancelled = exc
+                observed = current_count
+
+            # Question 2: has the child finished?
+            if task.done():
+                break
+
+            # The caller was cancelled but the shield kept the child running.
+            # Keep waiting through a new wrapper.
+            continue
+        except Exception:
+            # Teardown failures never replace the outcome, matching the
+            # ``agen.aclose()`` cleanup in ``execute`` -- but they are not
+            # dropped either. Silently discarding one hands the caller partial
+            # output or a timeout with no sign that cleanup failed, which is
+            # the one outcome indistinguishable from success.
+            if describe is not None:
+                logger.warning(
+                    "claude-agent-sdk: %s cleanup failed; the outcome is unchanged",
+                    describe,
+                    exc_info=True,
+                )
+            break
+        else:
+            break
+
+    return caller_cancelled, observed
+
+
+async def _cancel_and_reap(
+    tasks: Iterable[asyncio.Future[Any] | None],
+    *,
+    describe: str | None = None,
+) -> None:
+    """Cancel every owned task and await its teardown.
+
+    Cancellation aimed at *this* task while the reap is in flight is absorbed
+    and re-raised only once every child has finished, so a caller that gives
+    up cannot cut short an SDK read that is still releasing its resources.
+
+    Args:
+        tasks: Owned tasks; ``None`` entries are ignored.
+        describe: The phase these tasks belong to, used to log an unexpected
+            teardown failure with context.
+
+    Raises:
+        asyncio.CancelledError: The first cancellation aimed at the caller
+            *after* this call began, re-raised once every child is reaped.
+    """
+    owned = [task for task in tasks if task is not None]
+
+    current = asyncio.current_task()
+    # The cancellation that brought us here (if any) is part of the baseline:
+    # cleanup only reacts to cancellations newer than this.
+    observed = current.cancelling() if current is not None else 0
+
+    # Cancel everything first, with no await in between, so no child is left
+    # running while another is being reaped.
+    for task in owned:
+        if not task.done():
+            task.cancel()
+
+    caller_cancelled: asyncio.CancelledError | None = None
+
+    for task in owned:
+        exc, observed = await _reap_shielded(task, current, observed, describe)
+        if exc is not None and caller_cancelled is None:
+            caller_cancelled = exc
+
+    if caller_cancelled is not None:
+        raise caller_cancelled
+
+
+async def _await_uncancellable(task: asyncio.Future[Any]) -> asyncio.CancelledError | None:
+    """Wait for ``task`` without ever cancelling it.
+
+    Used for the two phases whose cancellation would strand SDK resources:
+    ``connect()``, which has no public cleanup handle until it returns, and
+    ``disconnect()``, which *is* the cleanup. Caller cancellation is absorbed
+    (repeatedly, each at a fresh shield boundary) and handed back for the
+    caller to re-raise once the phase has finished.
+
+    ``describe`` is deliberately ``None``: the caller needs ``task.exception()``
+    itself -- a failed connect is the execution's primary error, not a cleanup
+    failure to log and drop.
+    """
+    current = asyncio.current_task()
+    observed = current.cancelling() if current is not None else 0
+    caller_cancelled, _ = await _reap_shielded(task, current, observed, None)
+    return caller_cancelled
+
+
+def _task_failure(task: asyncio.Future[Any]) -> BaseException | None:
+    """How ``task`` ended, or ``None`` if it returned normally."""
+    if task.cancelled():
+        return asyncio.CancelledError()
+    return task.exception()
+
+
+async def _shutdown_sdk_client(
+    client: Any,
+    *,
+    agent_name: str,
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Shut the SDK session down as an owned, shielded task.
+
+    ``disconnect()`` is the only public handle that reaches the transport, so
+    it is never raced against a signal and never cancelled: an interrupt, an
+    expired deadline or a caller that gave up must not be able to stop the CLI
+    being closed. It is retried **once**, sequentially, when the first attempt
+    did not return -- ``ClaudeSDKClient`` clears its ``_query`` only after
+    ``close()`` completes, so an interrupted or failed attempt leaves the client
+    re-enterable, and the pieces this provider uses are idempotent. (That is
+    private SDK state, which is why a black-box test pins it against the real
+    object rather than trusting the reading.)
+
+    No duration is bounded here, and none is claimed: the SDK's own waits,
+    including its final process wait, are not globally timeout-bounded.
+
+    Returns:
+        The failure from the last attempt (``None`` when shutdown was
+        confirmed), and the first ``CancelledError`` aimed at the caller.
+    """
+    caller_cancelled: asyncio.CancelledError | None = None
+    failure: BaseException | None = None
+
+    for attempt in (1, 2):
+        # A new task per attempt, started only once the previous one is done:
+        # two overlapping closes would re-enter the SDK's teardown concurrently.
+        task = asyncio.ensure_future(client.disconnect())
+        exc = await _await_uncancellable(task)
+        if exc is not None and caller_cancelled is None:
+            caller_cancelled = exc
+
+        failure = _task_failure(task)
+        if failure is None:
+            if attempt > 1:
+                logger.info(
+                    "claude-agent-sdk: agent %r confirmed SDK shutdown on retry",
+                    agent_name,
+                )
+            return None, caller_cancelled
+
+        logger.log(
+            logging.WARNING if attempt == 1 else logging.ERROR,
+            "claude-agent-sdk: agent %r could not confirm SDK shutdown "
+            "(phase=disconnect, attempt=%d of 2)",
+            agent_name,
+            attempt,
+            exc_info=failure,
+        )
+
+    return failure, caller_cancelled
+
+
+async def _race_signals(
+    start: Callable[[], Awaitable[Any]],
+    interrupt_signal: asyncio.Event | None,
+    deadline: float | None,
+    *,
+    describe: str,
+) -> object:
+    """Run one cancellable phase against the interrupt and the absolute deadline.
+
+    Shared by the two phases that are safe to cancel -- sending the prompt and
+    reading a message -- because in both the SDK session already exists, so
+    ``disconnect()`` still owns every resource afterwards. Connect is not one of
+    them and never comes through here.
+
+    Either signal has to be able to pre-empt work that is *already in flight*:
+    the SDK can block for as long as the model takes, so checking only between
+    phases would make both unenforceable.
+
+    Args:
+        start: Builds the awaitable for the phase. A factory rather than an
+            awaitable so the short-circuits below never create work they would
+            immediately abandon.
+        interrupt_signal: Set by the caller to ask for partial output.
+        deadline: Absolute ``time.monotonic()`` instant the session must not run
+            past, or ``None`` for no limit.
+        describe: Phase name, used when logging an unexpected teardown failure.
+
+    Returns:
+        The phase's own result, or ``_READ_INTERRUPTED`` / ``_READ_TIMED_OUT``.
+        Typed ``object`` because only identity separates the two.
+    """
+    # Neither signal starts work it would immediately abandon. Interrupt is
+    # checked first: when both are already true the caller's explicit request
+    # for partial output wins, as it did between messages.
+    if interrupt_signal is not None and interrupt_signal.is_set():
+        return _READ_INTERRUPTED
+    if deadline is not None and time.monotonic() > deadline:
+        return _READ_TIMED_OUT
+
+    # ``ensure_future`` rather than ``create_task``: ``anext`` returns a
+    # general awaitable, which ``create_task`` does not accept.
+    phase_task = asyncio.ensure_future(start())
+    interrupt_task = (
+        asyncio.ensure_future(interrupt_signal.wait()) if interrupt_signal is not None else None
+    )
+    waiters = [task for task in (phase_task, interrupt_task) if task is not None]
+
+    try:
+        done, _pending = await asyncio.wait(
+            waiters,
+            timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        # The caller gave up. Reap what we own, then let the cancellation
+        # through untranslated -- upstream unwinds on it.
+        await _cancel_and_reap((phase_task, interrupt_task), describe=describe)
+        raise
+
+    if phase_task in done:
+        await _cancel_and_reap((interrupt_task,), describe=describe)
+        # A real SDK failure outranks every signal: it reaches ``execute``'s own
+        # handling rather than being reported as an interrupt or a timeout. The
+        # caller re-checks both signals for whatever it gets back, which is what
+        # keeps the existing tie behavior.
+        return phase_task.result()
+
+    # Snapshot before cleanup: cancelling the waiters changes what ``done``
+    # would say afterwards.
+    interrupt_won = interrupt_task is not None and interrupt_task in done
+    await _cancel_and_reap((phase_task, interrupt_task), describe=describe)
+    return _READ_INTERRUPTED if interrupt_won else _READ_TIMED_OUT
+
+
+async def _next_message_or_sentinel(
+    agen: Any,
+    interrupt_signal: asyncio.Event | None,
+    deadline: float | None,
+) -> object:
+    """Read the next SDK message, racing it against interrupt and deadline.
+
+    Returns:
+        The next message, or one of the ``_READ_*`` sentinels. The loop body
+        narrows the message itself, as it already did for the SDK iterator's
+        own values.
+    """
+    try:
+        return await _race_signals(
+            lambda: anext(agen),
+            interrupt_signal,
+            deadline,
+            describe="receive",
+        )
+    except StopAsyncIteration:
+        return _READ_EXHAUSTED
+
+
+def _session_timeout_error(
+    agent_name: str,
+    max_session_seconds: float | None,
+    turn_count: int,
+) -> ProviderError:
+    """The one wording for an exceeded session deadline.
+
+    Raised from four places -- before the session starts, after connect, after
+    the send, and from the read loop -- which is exactly why it is built in one.
+
+    ``max_session_seconds`` is typed optional because that is what every caller
+    holds: a deadline exists only when a limit was configured, so it is never
+    ``None`` on a path that reaches here. Taking the caller's type states that
+    coupling once instead of forcing a narrowing assertion into four call sites.
+    """
+    limit = 0.0 if max_session_seconds is None else max_session_seconds
+    return ProviderError(
+        f"Agent '{agent_name}' exceeded maximum session "
+        f"duration of {limit:.0f}s "
+        f"after {turn_count} turn(s)",
+        is_retryable=False,
+    )
+
+
 def _resolve_skill_plugins(
     skill_directories: list[str] | None,
 ) -> tuple[list[str], list[SdkPluginConfig]]:
@@ -966,11 +1318,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # but the model still occasionally returns prose. Mark as
         # prompt-injection to keep the validator honest.
         structured_output="prompt_injection",
-        # ``interrupt_signal`` is checked between SDK messages and triggers
-        # a partial-output return.
+        # ``interrupt_signal`` pre-empts the prompt send and an in-flight
+        # read, and triggers a partial-output return. Startup is the one phase
+        # it cannot pre-empt: see ``_execute_session``'s S1.
         interrupt=True,
-        # ``max_session_seconds`` is enforced between messages via
-        # ``time.monotonic()``.
+        # ``max_session_seconds`` is one absolute ``time.monotonic()``
+        # deadline, raced against the send and the in-flight read rather than
+        # only checked between messages. Shutdown is never raced against it.
         max_session_seconds=True,
         # False even though a ``session_key`` agent's session *is* restored on
         # resume: this flag is a blanket promise the startup banner reads out,
@@ -1638,7 +1992,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         extra_mcp_servers: dict[str, Any] | None = None,
         suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
-        if query is None or ClaudeAgentOptions is None:
+        if ClaudeSDKClient is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
 
         # Resolved up front so an unloadable skill fails the run rather than
@@ -1885,12 +2239,27 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # Track pending tool_use IDs so we can pair them with ToolResultBlocks
         pending_tools: dict[str, str] = {}
         session_start = time.monotonic()
+        # One absolute deadline for the whole execution, computed once and
+        # never recomputed: a long stream of messages must not be able to
+        # push it back, and a blocked read is raced against it directly.
+        deadline = None if max_session_seconds is None else session_start + max_session_seconds
 
         # Written inside the try below, never before it: the file holds
         # resolved MCP credentials, so every path out of this method must
         # reach the finally that reclaims it.
         mcp_config_path: str | None = None
         agen: Any = None
+        client: Any = None
+        # Hoisted so the inner ``finally`` can tell a shutdown that was
+        # confirmed from one that was not: only the latter makes removing the
+        # MCP config an ordering violation worth reporting.
+        shutdown_failure: BaseException | None = None
+        # Only a run that reached the end of the loop may be reported as a
+        # success, so a shutdown that could not be confirmed has something to
+        # override. Set on the fall-through path alone -- the ``return``
+        # statements inside the try are the partial-output paths, which already
+        # own their outcome.
+        completed_normally = False
 
         try:
             # Plugin-contributed servers merge on top for this call only:
@@ -1956,8 +2325,95 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     {"turn": "awaiting_model"},
                 )
 
-            agen = query(prompt=rendered_prompt, options=options)
-            async for message in agen:
+            def _partial_output() -> AgentOutput:
+                """The interrupt return, shared by both places that take it."""
+                return self._build_output(
+                    content_parts,
+                    structured_output,
+                    agent,
+                    result_model,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens=total_cache_read_tokens,
+                    cache_write_tokens=total_cache_write_tokens,
+                    last_call_input_tokens=last_call_input_tokens,
+                    partial=True,
+                )
+
+            # S0 -- pre-flight. Nothing is constructed and no process is
+            # spawned, so there is nothing to shut down: a caller who has
+            # already given up never starts a CLI at all. Interrupt is checked
+            # before the deadline, so it wins when both are already true.
+            if interrupt_signal is not None and interrupt_signal.is_set():
+                return _partial_output()
+            if deadline is not None and time.monotonic() > deadline:
+                raise _session_timeout_error(agent.name, max_session_seconds, turn_count)
+
+            client = ClaudeSDKClient(options)
+
+            # S1 -- connect. Never cancelled by a signal, and this is the one
+            # place that asymmetry is load-bearing: the SDK adds the spawned
+            # child to its registry only *after* the process exists, and builds
+            # the ``Query`` that ``disconnect()`` closes through only after
+            # ``connect()`` returns. A cancellation landing in that window would
+            # leave a live CLI with no public handle to reach it. The cost is
+            # that a signal raised during startup is honoured once the CLI has
+            # finished starting, which the SDK does not bound.
+            connect_task = asyncio.ensure_future(client.connect())
+            connect_cancelled = await _await_uncancellable(connect_task)
+            connect_error = _task_failure(connect_task)
+
+            if connect_cancelled is not None:
+                # Outer cancellation outranks everything, including an SDK error
+                # that landed in the same window -- but that error would
+                # otherwise vanish, so it is recorded before being dropped.
+                if connect_error is not None:
+                    logger.warning(
+                        "claude-agent-sdk: agent %r failed to connect while the "
+                        "caller was cancelling (phase=connect)",
+                        agent.name,
+                        exc_info=connect_error,
+                    )
+                raise connect_cancelled
+            if connect_error is not None:
+                # An SDK error that has already happened beats a pending signal.
+                raise connect_error
+
+            # Re-checked now that startup is over: a signal raised during
+            # connect has been waiting for exactly this point.
+            if interrupt_signal is not None and interrupt_signal.is_set():
+                return _partial_output()
+            if deadline is not None and time.monotonic() > deadline:
+                raise _session_timeout_error(agent.name, max_session_seconds, turn_count)
+
+            # S2 -- send the prompt. Safe to cancel: the session exists now, so
+            # ``disconnect()`` owns cleanup, and a half-written stdin line is
+            # harmless once stdin is closed and the session abandoned.
+            sent = await _race_signals(
+                lambda: client.query(rendered_prompt, session_id=""),
+                interrupt_signal,
+                deadline,
+                describe="send",
+            )
+            if sent is _READ_INTERRUPTED:
+                return _partial_output()
+            if sent is _READ_TIMED_OUT:
+                raise _session_timeout_error(agent.name, max_session_seconds, turn_count)
+
+            # S3 -- receive. Cancelling a blocked read performs no SDK teardown,
+            # so pre-empting one strands nothing.
+            agen = client.receive_response()
+
+            while True:
+                # Reads the next message, pre-empting a blocked read when the
+                # interrupt fires or the absolute deadline passes.
+                message = await _next_message_or_sentinel(agen, interrupt_signal, deadline)
+                if message is _READ_EXHAUSTED:
+                    break
+                if message is _READ_INTERRUPTED:
+                    return _partial_output()
+                if message is _READ_TIMED_OUT:
+                    raise _session_timeout_error(agent.name, max_session_seconds, turn_count)
                 # Record before the interrupt and timeout checks below, which
                 # return: an agent cut short is worth resuming. Only
                 # conversation messages are trusted — hook and other auxiliary
@@ -1968,34 +2424,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     if message_session_id:
                         self._session_ids[(session_key, resolved_cwd)] = message_session_id
 
+                # Re-checked for the message just obtained: an interrupt that
+                # arrived together with it still beats it.
                 if interrupt_signal is not None and interrupt_signal.is_set():
-                    return self._build_output(
-                        content_parts,
-                        structured_output,
-                        agent,
-                        result_model,
-                        total_input_tokens,
-                        total_output_tokens,
-                        cache_read_tokens=total_cache_read_tokens,
-                        cache_write_tokens=total_cache_write_tokens,
-                        last_call_input_tokens=last_call_input_tokens,
-                        partial=True,
-                    )
+                    return _partial_output()
 
-                # Wall-clock session timeout. The SDK does not expose a per-call
-                # timeout, so enforce at each message boundary — the cheapest
-                # cancellation point we have. The check is between messages
-                # rather than around the full ``async for`` so we can return
-                # a clean ProviderError rather than letting asyncio raise.
-                if max_session_seconds is not None:
-                    elapsed = time.monotonic() - session_start
-                    if elapsed > max_session_seconds:
-                        raise ProviderError(
-                            f"Agent '{agent.name}' exceeded maximum session "
-                            f"duration of {max_session_seconds:.0f}s "
-                            f"after {turn_count} turn(s)",
-                            is_retryable=False,
-                        )
+                # Wall-clock session timeout, re-checked for the message just
+                # obtained: a message that arrived at or after the deadline is
+                # rejected rather than processed. The deadline itself is the
+                # same absolute instant the read above raced against.
+                if deadline is not None and time.monotonic() > deadline:
+                    raise _session_timeout_error(agent.name, max_session_seconds, turn_count)
 
                 msg_type = type(message).__name__
 
@@ -2102,6 +2541,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
                             is_retryable=_is_retryable_result(msg),
                         )
 
+            completed_normally = True
+
         except ProviderError:
             raise
         except asyncio.CancelledError:
@@ -2115,18 +2556,64 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 is_retryable=_is_retryable_exception(e),
             ) from e
         finally:
-            # Order matters: close the SDK iterator first so the `claude`
-            # subprocess is gone before its config file disappears. Abandoning
-            # the generator (the interrupt path returns mid-loop) otherwise
-            # defers teardown to the GC, and on Windows unlinking a file the
-            # live subprocess still holds open raises PermissionError.
-            if agen is not None:
-                aclose = getattr(agen, "aclose", None)
-                if aclose is not None:
-                    with contextlib.suppress(Exception):
-                        await aclose()
-            if mcp_config_path is not None:
-                _remove_mcp_config(mcp_config_path)
+            # S4 then S5. The nesting is what makes the ordering a guarantee
+            # rather than a happy path: the config file holds resolved MCP
+            # credentials, so it is reclaimed even when shutdown re-raises the
+            # caller cancellation it absorbed.
+            try:
+                # Close the iterator first, so the generator is finalized before
+                # the session underneath it goes away. Abandoning it (the
+                # interrupt path returns mid-loop) would otherwise defer that to
+                # the GC.
+                #
+                # Not shielded, and it does not need to be: the SDK's
+                # ``receive_*`` chain is async generators with no awaiting
+                # finalizer, so closing them never suspends and a pending
+                # cancellation therefore has no point at which to land and skip
+                # the shutdown below.
+                if agen is not None:
+                    aclose = getattr(agen, "aclose", None)
+                    if aclose is not None:
+                        with contextlib.suppress(Exception):
+                            await aclose()
+
+                if client is not None:
+                    shutdown_failure, shutdown_cancelled = await _shutdown_sdk_client(
+                        client, agent_name=agent.name
+                    )
+                    if shutdown_cancelled is not None:
+                        # Outer cancellation outranks every other outcome, but
+                        # only now that the CLI has actually been shut down.
+                        raise shutdown_cancelled
+                    if shutdown_failure is not None and completed_normally:
+                        # Never report success while the CLI may still be alive:
+                        # the result is discarded instead. Non-retryable because
+                        # a retry would spawn a second CLI beside the first.
+                        raise ProviderError(
+                            f"Agent '{agent.name}' completed but its Claude CLI session "
+                            f"could not be confirmed shut down after two attempts; "
+                            f"the result was discarded because the CLI may still be running",
+                            is_retryable=False,
+                        ) from shutdown_failure
+            finally:
+                # On a double shutdown failure this runs anyway: leaving
+                # resolved credentials on disk indefinitely is worse than
+                # removing a file the CLI only reads at startup. But that is a
+                # trade-off, not the intended ordering, so it is stated rather
+                # than left to be inferred from two earlier warnings.
+                if mcp_config_path is not None:
+                    if shutdown_failure is not None:
+                        logger.error(
+                            "claude-agent-sdk: agent %r could not confirm SDK shutdown "
+                            "after 2 of 2 attempts (provider=claude-agent-sdk, "
+                            "phase=disconnect); removing this execution's temporary MCP "
+                            "configuration anyway, so the intended shutdown-before-"
+                            "config-removal ordering could not be honored and the CLI "
+                            "may still be running",
+                            agent.name,
+                            exc_info=shutdown_failure,
+                        )
+                    _remove_mcp_config(mcp_config_path)
 
         return self._build_output(
             content_parts,

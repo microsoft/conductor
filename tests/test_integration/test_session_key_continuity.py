@@ -34,6 +34,10 @@ from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
 )
 from conductor.providers.registry import ProviderRegistry  # noqa: E402
+from tests.test_providers.claude_sdk_harness import (
+    ShimClient,  # noqa: E402
+    patch_sdk,  # noqa: E402
+)
 
 _WORKFLOW = """
 workflow:
@@ -134,7 +138,7 @@ class TestLoopBackContinuity:
         async with ProviderRegistry(config, mcp_servers=None) as registry:
             engine = WorkflowEngine(config, registry=registry, workflow_path=workflow_file)
             with (
-                patch("conductor.providers.claude_agent_sdk.query", fake),
+                patch_sdk(fake),
                 patch.object(
                     ClaudeAgentSdkProvider,
                     "_session_transcript_exists",
@@ -386,12 +390,13 @@ class TestConcurrentSubWorkflowGuard:
 
     async def test_overlapping_iterations_are_refused(self, fanout_workflow: Path) -> None:
         slow = _SlowQuery()
+        sessions: list[ShimClient] = []
         config = load_workflow(fanout_workflow)
 
         async with ProviderRegistry(config, mcp_servers=None) as registry:
             engine = WorkflowEngine(config, registry=registry, workflow_path=fanout_workflow)
             with (
-                patch("conductor.providers.claude_agent_sdk.query", slow),
+                patch_sdk(slow, clients=sessions),
                 patch.object(
                     ClaudeAgentSdkProvider,
                     "_session_transcript_exists",
@@ -402,8 +407,11 @@ class TestConcurrentSubWorkflowGuard:
                 await engine.run({})
 
         assert "still running" in str(exc.value)
-        # The second iteration never reached the SDK.
-        assert slow.calls == 1
+        # The second iteration never reached the SDK: exactly one session was
+        # ever opened. Counting sessions rather than sends, because the send is
+        # now a separate phase after connect and the refused sibling can fail
+        # the run before the first iteration gets that far.
+        assert len(sessions) == 1
 
     async def test_a_serial_fan_out_is_unaffected(self, fanout_workflow: Path) -> None:
         """The guard must catch overlap, not sharing: the same workflow run one
@@ -418,7 +426,7 @@ class TestConcurrentSubWorkflowGuard:
         async with ProviderRegistry(config, mcp_servers=None) as registry:
             engine = WorkflowEngine(config, registry=registry, workflow_path=fanout_workflow)
             with (
-                patch("conductor.providers.claude_agent_sdk.query", slow),
+                patch_sdk(slow),
                 patch.object(
                     ClaudeAgentSdkProvider,
                     "_session_transcript_exists",

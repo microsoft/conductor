@@ -30,6 +30,7 @@ from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
     EffectiveAuthContext,
 )
+from tests.test_providers.claude_sdk_harness import patch_sdk  # noqa: E402
 
 FAKE_CLI = Path("/fake/claude")
 
@@ -242,7 +243,7 @@ class TestReadinessAndExecutionShareOneContext:
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", probe_then_mutate_parent),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
-            patch("conductor.providers.claude_agent_sdk.query", _empty_query),
+            patch_sdk(_empty_query),
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hi")
 
@@ -311,7 +312,7 @@ class TestSettingSourcesRefusedByExplicitModes:
             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", spawn),
-            patch("conductor.providers.claude_agent_sdk.query", query),
+            patch_sdk(query),
             pytest.raises(ProviderError) as exc,
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hi")
@@ -536,7 +537,7 @@ class TestSettingSourcesParity:
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", spawn),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
-            patch("conductor.providers.claude_agent_sdk.query", _empty_query),
+            patch_sdk(_empty_query),
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hi")
         return probes, options_ctor.call_args.kwargs
@@ -621,7 +622,7 @@ class TestSettingSourcesParity:
             patch.dict(os.environ, {"PATH": "/bin"}, clear=True),
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", _cli_honouring_setting_sources(probes)),
-            patch("conductor.providers.claude_agent_sdk.query", query),
+            patch_sdk(query),
             pytest.raises(ProviderError) as exc,
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hi")
@@ -650,7 +651,7 @@ class TestSettingSourcesParity:
             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", _cli_honouring_setting_sources(probes)),
-            patch("conductor.providers.claude_agent_sdk.query", query),
+            patch_sdk(query),
         ):
             with pytest.raises(ProviderError) as exc:
                 await provider.execute(agent=agent, context={}, rendered_prompt="hi")
@@ -692,7 +693,7 @@ class TestExplicitModesRejectInheritedCloudSelectors:
             patch.dict(os.environ, env, clear=True),
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", spawn),
-            patch("conductor.providers.claude_agent_sdk.query", query),
+            patch_sdk(query),
         ):
             with pytest.raises(ProviderError) as exc:
                 await provider.execute(agent=agent, context={}, rendered_prompt="hi")
@@ -746,7 +747,7 @@ class TestExplicitModesRejectInheritedCloudSelectors:
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch("asyncio.create_subprocess_exec", spawn),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
-            patch("conductor.providers.claude_agent_sdk.query", _empty_query),
+            patch_sdk(_empty_query),
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hi")
 

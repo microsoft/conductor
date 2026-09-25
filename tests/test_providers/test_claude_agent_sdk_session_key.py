@@ -34,6 +34,7 @@ from conductor.providers.claude_agent_sdk import (  # noqa: E402
     _SESSION_KEY_NAMESPACE,
     ClaudeAgentSdkProvider,
 )
+from tests.test_providers.claude_sdk_harness import patch_sdk  # noqa: E402
 
 
 def _ck(session_key: str, cwd: str | None = None) -> str:
@@ -120,7 +121,7 @@ def _sdk(recorder: _Recorder, session_exists: bool = True):
     probe = Mock(return_value=session_exists)
     with (
         patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-        patch("conductor.providers.claude_agent_sdk.query", recorder),
+        patch_sdk(recorder),
         patch.object(ClaudeAgentSdkProvider, "_session_transcript_exists", staticmethod(probe)),
     ):
         yield probe
@@ -253,7 +254,7 @@ class TestUnresolvableSession:
         rec = _Recorder(["sess-1", "sess-2"])
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", rec),
+            patch_sdk(rec),
             patch("conductor.providers.claude_agent_sdk.get_session_info", None),
             patch("conductor.providers.claude_agent_sdk.project_key_for_directory", None),
         ):
@@ -361,11 +362,29 @@ class TestSessionIdProvenance:
         assert provider.get_session_ids() == {}
 
     async def test_session_recorded_when_interrupted(self) -> None:
-        """An interrupted agent is one whose context is worth resuming."""
+        """An interrupted agent is one whose context is worth resuming.
+
+        The interrupt arrives mid-stream, which is the case that has a session
+        to record: one already set when ``execute`` begins now returns before
+        the first read, so the SDK never reports a session id at all.
+        """
         rec = _Recorder(["sess-1"])
         interrupt = asyncio.Event()
-        interrupt.set()
-        with _sdk(rec):
+
+        def _interrupting_query(**kwargs: Any) -> Any:
+            stream = rec(**kwargs)
+
+            async def _gen() -> Any:
+                async for message in stream:
+                    interrupt.set()
+                    yield message
+
+            return _gen()
+
+        with (
+            _sdk(rec),
+            patch_sdk(_interrupting_query),
+        ):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="analyze", prompt="go", session_key="investigation")
             out = await provider.execute(

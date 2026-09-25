@@ -25,6 +25,7 @@ from conductor.providers.claude_agent_sdk import (
     _run_auth_status_subprocess,
 )
 from conductor.providers.factory import create_provider
+from tests.test_providers.claude_sdk_harness import patch_sdk
 
 FAKE_CLI = Path("/fake/claude")
 
@@ -413,7 +414,7 @@ class TestAuthPreflightSubprocessTimeout:
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=None,
             ),
-            patch("conductor.providers.claude_agent_sdk.query") as mock_query,
+            patch("conductor.providers.claude_agent_sdk.ClaudeSDKClient") as mock_client,
         ):
             interrupt.set()
             with pytest.raises(ProviderError):
@@ -423,7 +424,7 @@ class TestAuthPreflightSubprocessTimeout:
                     rendered_prompt="hello",
                     interrupt_signal=interrupt,
                 )
-            mock_query.assert_not_called()
+            mock_client.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_execute_auth_preflight_cancellation_propagates(self) -> None:
@@ -916,7 +917,7 @@ class TestAuthEnvWiredIntoOptions:
             patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=ready_status)),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hello")
 
@@ -986,7 +987,7 @@ class TestNeutralizedCredentialWarning:
             patch.dict(os.environ, environ, clear=True),
             patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=ready)),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", MagicMock()),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hello")
 
@@ -1044,7 +1045,7 @@ class TestParentEnvironNeverMutated:
             patch.dict(os.environ, environ, clear=True),
             patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=ready_status)),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", MagicMock()),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
         ):
             before = dict(os.environ)
             await provider.execute(agent=agent, context={}, rendered_prompt="hello")

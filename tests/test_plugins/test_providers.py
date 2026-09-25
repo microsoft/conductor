@@ -212,6 +212,7 @@ class TestClaudeAgentSdkDelivery:
     async def test_plugin_agents_reach_the_options_object(self) -> None:
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         options_mock = MagicMock()
 
@@ -221,7 +222,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
             _auth_ready(),
         ):
@@ -252,6 +253,7 @@ class TestClaudeAgentSdkDelivery:
         """
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         queried = False
 
@@ -263,7 +265,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider()
@@ -297,6 +299,7 @@ class TestClaudeAgentSdkDelivery:
         # meaning here, so the option stays out of the request entirely.
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         options_mock = MagicMock()
 
@@ -306,7 +309,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
             _auth_ready(),
         ):
@@ -321,6 +324,7 @@ class TestClaudeAgentSdkDelivery:
         # The only layer that runs during `conductor run` on this provider.
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         async def fake_query(**kwargs: Any) -> Any:
             if False:
@@ -328,7 +332,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider(

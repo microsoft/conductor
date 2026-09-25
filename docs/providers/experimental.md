@@ -180,6 +180,56 @@ that bear on this provider's experimental status:
   dispatch tool to reach them, so they are refused rather than registered
   unreachable, at `conductor validate` and again at run time.
 
+## Interrupt and session timeout (`claude-agent-sdk`)
+
+Interrupt and `max_session_seconds` no longer wait for another message from
+the SDK before taking effect: both pre-empt the prompt being sent and a read
+that is already in flight.
+
+`max_session_seconds` is one absolute deadline measured from the start of the
+execution; messages arriving in between do not extend it. When an interrupt
+and an expired deadline are both pending, the interrupt wins and the agent
+returns its partial output. If either is already true before the session
+starts, no CLI is started at all.
+
+**A signal raised while the CLI is starting up is honoured once startup
+finishes.** Conductor never cancels the SDK's `connect()`: between spawning the
+process and building the object that can close it there is no supported way to
+reach a half-started CLI, so cancelling there could leave one running with no
+handle to stop it. A signal raised in that window is therefore delayed for
+however long startup actually takes — usually no time at all, since startup
+normally completes promptly. What is bounded is only one step of it: the SDK
+gives the CLI's `initialize` handshake a timeout of at least 60 seconds (more
+if `CLAUDE_CODE_STREAM_CLOSE_TIMEOUT` raises it). That is a ceiling on that one
+step, not a wait the SDK always performs, and the rest of startup — spawning
+the process, launching any MCP servers — adds to the total with no limit of its
+own. The overall delay is not bounded.
+
+**Conductor owns the shutdown of the SDK session.** It is never cancelled by an
+interrupt, an expired deadline or a caller that gave up, and it is retried once
+if the first attempt does not return. Shutdown completes before the temporary
+MCP configuration for that execution is removed. If shutdown cannot be
+confirmed after both attempts, the failure is logged; on a run that would
+otherwise have succeeded the result is discarded and a non-retryable
+`ProviderError` is raised instead, because reporting success while the CLI may
+still be running would be worse than failing.
+
+**No duration is bounded.** Returning after an interrupt or a timeout may take
+additional time while the SDK finishes releasing its resources, and neither
+Conductor nor the SDK places a global limit on that. Whether the underlying
+`claude` process has actually exited is not verified — the regressions covering
+this behaviour drive the real SDK against a fake transport, never a real
+process — so no claim is made about process termination beyond that.
+
+Two behaviour changes come with this. The response stream now ends at the
+first result message rather than at process exit, and stdin is closed during
+shutdown rather than immediately after that first result. Both follow from
+using the SDK's supported client API and neither has been exercised against a
+real CLI.
+
+Compatibility with the declared minimum `claude-agent-sdk>=0.2.82` was
+established from the v0.2.82 source; the tests run against the locked version.
+
 ## See also
 
 - `AGENTS.md` — "Provider Parity" section (the rules experimental providers carve out from) and "Experimental Providers" section (rules they must still uphold)

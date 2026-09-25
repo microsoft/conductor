@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,15 @@ from conductor.exceptions import ProviderError  # noqa: E402
 from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
     ClaudeAuthStatus,
+    _cancel_and_reap,
     _remove_mcp_config,
     _resolve_skill_plugins,
     _translate_mcp_servers,
     _write_mcp_config,
+)
+from tests.test_providers.claude_sdk_harness import (  # noqa: E402
+    gated_scope,
+    patch_sdk,
 )
 
 
@@ -92,7 +98,7 @@ class TestClaudeAgentSdkProviderInitialization:
         resolver.assert_called_once_with("claude-agent-sdk")
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
+    @patch_sdk(lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     def test_init_with_defaults(self) -> None:
         provider = ClaudeAgentSdkProvider()
@@ -100,7 +106,7 @@ class TestClaudeAgentSdkProviderInitialization:
         assert provider._default_max_turns == 50
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
+    @patch_sdk(lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     def test_init_with_custom_params(self) -> None:
         provider = ClaudeAgentSdkProvider(
@@ -114,7 +120,7 @@ class TestClaudeAgentSdkProviderInitialization:
 class TestValidateConnection:
     @pytest.mark.claude_auth_readiness_mocked
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
+    @patch_sdk(lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_validate_connection_returns_true_when_bundled_cli_present(self) -> None:
         """The SDK ships a bundled CLI under ``_bundled/`` — detection should succeed.
@@ -139,7 +145,7 @@ class TestValidateConnection:
         assert await provider.validate_connection() is False
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
+    @patch_sdk(lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_validate_connection_reflects_auth_readiness(self) -> None:
         """``validate_connection`` is now a thin wrapper around ``_check_auth_readiness``.
@@ -158,7 +164,7 @@ class TestValidateConnection:
 
     @pytest.mark.claude_auth_readiness_mocked
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
+    @patch_sdk(lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_validate_connection_returns_false_when_cli_missing(self) -> None:
         """Bundled missing + not on PATH + no fallback location → False."""
@@ -189,7 +195,7 @@ class TestExecute:
                 usage={"input_tokens": 100, "output_tokens": 50},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test_agent", prompt="What is the answer?")
             output = await provider.execute(
@@ -216,7 +222,7 @@ class TestExecute:
                 usage={"input_tokens": 0, "output_tokens": 0},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(
                 name="test_agent",
@@ -251,7 +257,7 @@ class TestExecute:
 
         events: list[tuple[str, dict]] = []
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             await provider.execute(
@@ -284,7 +290,7 @@ class TestExecute:
                 usage={"input_tokens": 10, "output_tokens": 5},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             output = await provider.execute(
@@ -302,7 +308,7 @@ class TestExecute:
         async def fake_query(**kwargs):
             yield _result(is_error=True, result="API key invalid")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             with pytest.raises(ProviderError, match="API key invalid"):
@@ -319,7 +325,7 @@ class TestExecute:
             raise RuntimeError("connection refused")
             yield  # unreachable; the bare `yield` makes this an async generator
 
-        with patch("conductor.providers.claude_agent_sdk.query", failing_query):
+        with patch_sdk(failing_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             with pytest.raises(ProviderError, match="connection refused"):
@@ -346,7 +352,7 @@ class TestExecute:
             # Cumulative session total — NOT the delta from the last message.
             yield _result(usage={"input_tokens": 180, "output_tokens": 90})
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             output = await provider.execute(
@@ -370,7 +376,7 @@ class TestOutputFormatConstruction:
             yield _result(structured_output={"name": "test", "score": 5})
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", capture_query),
+            patch_sdk(capture_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", original_options),
         ):
             provider = ClaudeAgentSdkProvider()
@@ -469,7 +475,7 @@ class TestBuildOutput:
         async def fake_query(**kwargs):
             yield _result(structured_output='{"answer": "yes"}')
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(
                 name="test",
@@ -486,7 +492,7 @@ class TestBuildOutput:
         async def fake_query(**kwargs):
             yield _result(structured_output=42)
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             output = await provider.execute(agent=agent, context={}, rendered_prompt="hi")
@@ -512,7 +518,7 @@ class TestBuildOutput:
             )
             yield _result()
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(
                 name="test",
@@ -541,7 +547,7 @@ class TestMessageDispatch:
             yield FakeStreamEvent()
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             output = await provider.execute(agent=agent, context={}, rendered_prompt="hi")
@@ -559,7 +565,7 @@ class TestMessageDispatch:
             )
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="test", prompt="hi")
             await provider.execute(
@@ -582,7 +588,7 @@ class TestMessageDispatch:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider()
@@ -620,7 +626,7 @@ class TestToolResolution:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider()
@@ -640,7 +646,7 @@ class TestToolResolution:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(native_tools="claude_code")
@@ -669,7 +675,7 @@ class TestToolResolution:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(native_tools=native_tools)
@@ -694,7 +700,7 @@ class TestToolResolution:
         async def fake_query(**kwargs):
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="my_agent", prompt="hi")
             with pytest.raises(ProviderError, match="does not support workflow tool allowlists"):
@@ -740,7 +746,7 @@ class TestOmittedToolsDefaultPreset:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(native_tools="claude_code")
@@ -773,7 +779,7 @@ class TestOmittedToolsDefaultPreset:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(native_tools="claude_code")
@@ -798,7 +804,7 @@ class TestOmittedToolsDefaultPreset:
         async def fake_query(**kwargs):
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="my_agent", prompt="hi", tools=["search", "read_file"])
             with pytest.raises(ProviderError) as exc:
@@ -829,7 +835,7 @@ class TestOmittedToolsDefaultPreset:
         async def fake_query(**kwargs):
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             # Omitted per-agent tools (None), but the executor resolved a
             # non-empty list inherited from the workflow-level `tools:`.
@@ -873,7 +879,7 @@ class TestOmittedToolsDefaultPreset:
             yield _result(structured_output={"answer": "from the file"})
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(native_tools=native_tools)
@@ -915,7 +921,7 @@ class TestAgentTurnStartOrdering:
             yield _assistant(content=[TextBlock(text="hi")])
             yield _result(result="hi")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -942,7 +948,7 @@ class TestAgentTurnStartOrdering:
             yield _assistant(content=[TextBlock(text="content for turn 1")])
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -978,7 +984,7 @@ class TestAgentTurnStartOrdering:
             yield _assistant(content=[TextBlock(text="final answer")])
             yield _result(result="final answer")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1030,7 +1036,7 @@ class TestTokenAccounting:
                 usage={"input_tokens": 1500, "output_tokens": 750},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1066,7 +1072,7 @@ class TestTokenAccounting:
                 usage={"input_tokens": 999, "output_tokens": 999},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1116,7 +1122,7 @@ class TestTokenAccounting:
                 },
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1157,7 +1163,7 @@ class TestTokenAccounting:
             # No input_tokens: not a trustworthy prompt figure.
             yield _result(result="done", usage={"output_tokens": 50})
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1202,7 +1208,7 @@ class TestTokenAccounting:
             )
             # No ResultMessage: the running sum is the answer.
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1236,7 +1242,7 @@ class TestTokenAccounting:
                 usage={"input_tokens": 999, "output_tokens": 999},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1271,7 +1277,7 @@ class TestContextWindowLastCallInputTokens:
                 usage={"input_tokens": 1500, "output_tokens": 750},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1298,7 +1304,7 @@ class TestContextWindowLastCallInputTokens:
                 },
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1332,7 +1338,7 @@ class TestContextWindowLastCallInputTokens:
                 },
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1390,7 +1396,7 @@ class TestContextWindowLastCallInputTokens:
                 usage={"input_tokens": 2500, "output_tokens": 1250},
             )
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1474,7 +1480,7 @@ class TestErrorClassification:
             raise CLINotFoundError()
             yield  # make this an async generator
 
-        with patch("conductor.providers.claude_agent_sdk.query", failing_query):
+        with patch_sdk(failing_query):
             provider = ClaudeAgentSdkProvider()
             with pytest.raises(ProviderError) as exc_info:
                 await provider.execute(
@@ -1499,7 +1505,7 @@ class TestCancelledErrorPropagation:
             raise asyncio.CancelledError
             yield  # make this an async generator
 
-        with patch("conductor.providers.claude_agent_sdk.query", cancelling_query):
+        with patch_sdk(cancelling_query):
             provider = ClaudeAgentSdkProvider()
             with pytest.raises(asyncio.CancelledError):
                 await provider.execute(
@@ -1525,7 +1531,7 @@ class TestMaxSessionSeconds:
             yield _assistant(content=[TextBlock(text="part2")])
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", slow_query):
+        with patch_sdk(slow_query):
             provider = ClaudeAgentSdkProvider(max_session_seconds=0.01)
             with pytest.raises(ProviderError, match="exceeded maximum session duration"):
                 await provider.execute(
@@ -1544,7 +1550,7 @@ class TestMaxSessionSeconds:
             await asyncio.sleep(0.01)
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", query):
+        with patch_sdk(query):
             provider = ClaudeAgentSdkProvider(max_session_seconds=None)
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1659,7 +1665,7 @@ class TestRetryableClassification:
         async def fake_query(**kwargs):
             yield _result(is_error=True, result="429 rate_limit hit")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             with pytest.raises(ProviderError) as exc_info:
                 await provider.execute(
@@ -1678,7 +1684,7 @@ class TestRetryableClassification:
         async def fake_query(**kwargs):
             yield _result(is_error=True, result="401 unauthorized invalid api key")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             with pytest.raises(ProviderError) as exc_info:
                 await provider.execute(
@@ -1701,7 +1707,7 @@ class TestSchemaContractEnforcement:
         async def fake_query(**kwargs):
             yield _result(structured_output="this is not json")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(
                 name="test",
@@ -1720,7 +1726,7 @@ class TestSchemaContractEnforcement:
             yield _assistant(content=[TextBlock(text="just some prose")])
             yield _result()
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1746,7 +1752,7 @@ class TestSchemaContractEnforcement:
             interrupt.set()
             yield _assistant(content=[TextBlock(text="should not be reached")])
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(
@@ -1783,7 +1789,7 @@ class TestParityCoverage:
             )
             yield _result(result="hi", usage={"input_tokens": 1, "output_tokens": 1})
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi", model="claude-sonnet-4-5"),
@@ -1802,7 +1808,7 @@ class TestParityCoverage:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(model="claude-sonnet-4-5")  # default
@@ -1823,7 +1829,7 @@ class TestParityCoverage:
             yield _result(result="done")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
         ):
             provider = ClaudeAgentSdkProvider(max_turns=50)  # default
@@ -1863,7 +1869,7 @@ class TestParityCoverage:
             )
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1884,7 +1890,7 @@ class TestParityCoverage:
         assert all(name in {"gamma", "alpha", "beta"} for name, _ in completions)
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
-    @patch("conductor.providers.claude_agent_sdk.query", lambda **kwargs: None)
+    @patch_sdk(lambda **kwargs: None)
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     async def test_close_releases_resources(self) -> None:
         """close() is idempotent and safe to call multiple times."""
@@ -1913,7 +1919,7 @@ class TestParityCoverage:
             processed.append(2)
             yield _result(result="never reached")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             output = await provider.execute(
                 agent=AgentDef(name="test", prompt="hi"),
@@ -1948,7 +1954,7 @@ class TestPerAgentMaxSessionSeconds:
             yield _assistant(content=[TextBlock(text="should not reach")])
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", slow_query):
+        with patch_sdk(slow_query):
             # Provider default is "no timeout"; agent override trips first.
             provider = ClaudeAgentSdkProvider(max_session_seconds=None)
             with pytest.raises(ProviderError, match="exceeded maximum session duration"):
@@ -1969,7 +1975,7 @@ class TestPerAgentMaxSessionSeconds:
             yield _assistant(content=[TextBlock(text="should not reach")])
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", slow_query):
+        with patch_sdk(slow_query):
             provider = ClaudeAgentSdkProvider(max_session_seconds=0.01)
             with pytest.raises(ProviderError, match="exceeded maximum session duration"):
                 await provider.execute(
@@ -2055,7 +2061,7 @@ class TestToolResultTruncation:
             yield UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=long_result)])
             yield _result(result="done")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi"),
@@ -2081,7 +2087,7 @@ class TestSafeCallbackSwallowing:
             yield _assistant(content=[TextBlock(text="hi")])
             yield _result(result="hi")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             # Must NOT raise — _safe_callback swallows the subscriber's RuntimeError.
             output = await provider.execute(
@@ -2269,7 +2275,7 @@ class TestMcpOptionsWiring:
             seen_payload.update(json.loads(Path(options.mcp_servers).read_text()))
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
             )
@@ -2292,7 +2298,7 @@ class TestMcpOptionsWiring:
             captured["strict"] = kwargs["options"].strict_mcp_config
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
@@ -2312,7 +2318,7 @@ class TestMcpOptionsWiring:
             raise RuntimeError("sdk exploded")
             yield  # pragma: no cover - unreachable, keeps this an async generator
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
             )
@@ -2325,18 +2331,34 @@ class TestMcpOptionsWiring:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_config_file_removed_on_interrupt_return(self) -> None:
-        """The interrupt path returns early from inside the loop — still cleans up."""
+        """The interrupt path returns before any session exists — still cleans up.
+
+        An already-set interrupt short-circuits before a client is constructed,
+        so the path is recorded from the write itself rather than from an SDK
+        call that never happens. The file is still written first, which is the
+        point: a return that skips the whole session must not leave resolved
+        credentials behind.
+        """
         captured: dict = {}
         interrupt = asyncio.Event()
         interrupt.set()
 
-        async def fake_query(**kwargs):
-            captured["path"] = kwargs["options"].mcp_servers
+        async def _messages():
             yield _assistant(content=[TextBlock(text="partial")])
+
+        def fake_query(**kwargs):
+            return _messages()
+
+        real_write = _write_mcp_config
+
+        def _recording_write(servers):
+            captured["path"] = real_write(servers)
+            return captured["path"]
 
         _ready = ClaudeAuthStatus(requested_mode="auto", inferred_mode="api_key", ready=True)
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
+            patch("conductor.providers.claude_agent_sdk._write_mcp_config", _recording_write),
             patch(
                 "conductor.providers.claude_agent_sdk.ClaudeAgentSdkProvider._check_auth_readiness",
                 AsyncMock(return_value=_ready),
@@ -2390,7 +2412,7 @@ class TestMcpOptionsWiring:
             captured["payload"] = Path(options.mcp_servers).read_text(encoding="utf-8")
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={
                     "remote": {
@@ -2422,7 +2444,7 @@ class TestMcpOptionsWiring:
             assert Path(path).exists(), f"{path} deleted while still in use"
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
             )
@@ -2467,7 +2489,7 @@ class TestMcpOptionsWiring:
 
         write_spy = Mock(wraps=_write_mcp_config)
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk._write_mcp_config", write_spy),
         ):
             provider = ClaudeAgentSdkProvider(
@@ -2513,7 +2535,7 @@ class TestMcpOptionsWiring:
             captured["mcp"] = options.mcp_servers
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers=workflow if origin in ("workflow", "both") else None
             )
@@ -2543,7 +2565,7 @@ class TestMcpOptionsWiring:
             captured["tools"] = kwargs["options"].tools
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             await ClaudeAgentSdkProvider().execute(
                 agent=AgentDef(name="t", prompt="hi", tools=[]),
                 context={},
@@ -2563,7 +2585,7 @@ class TestMcpOptionsWiring:
             yield _result(result="ok")
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk._write_mcp_config", write_spy),
         ):
             provider = ClaudeAgentSdkProvider(
@@ -2628,7 +2650,7 @@ class TestWorkingDirectory:
             captured["cwd"] = kwargs["options"].cwd
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi", working_dir=str(tmp_path)),
@@ -2652,7 +2674,7 @@ class TestWorkingDirectory:
             captured["cwd"] = kwargs["options"].cwd
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
@@ -2676,7 +2698,7 @@ class TestWorkingDirectory:
             captured["cwd"] = kwargs["options"].cwd
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi", working_dir=str(link)),
@@ -2700,7 +2722,7 @@ class TestWorkingDirectory:
             captured["payload"] = json.loads(Path(options.mcp_servers).read_text())
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={"docs": {"type": "stdio", "command": "docs-server"}}
             )
@@ -2736,7 +2758,7 @@ class TestWorkingDirectory:
             seen[kwargs["prompt"]] = kwargs["options"].cwd
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await asyncio.gather(
                 *(
@@ -2763,7 +2785,7 @@ class TestWorkingDirectory:
             yield  # pragma: no cover - keeps this an async generator
 
         with (
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch(
                 "conductor.providers.claude_agent_sdk.os.getcwd",
                 side_effect=FileNotFoundError(2, "No such file or directory"),
@@ -2844,7 +2866,7 @@ class TestSkillsWiring:
             captured["options"] = kwargs["options"]
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 setting_sources=setting_sources, native_tools=native_tools
             )
@@ -3326,7 +3348,7 @@ class TestSettingsDirAddDirs:
             captured["add_dirs"] = kwargs["options"].add_dirs
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi", settings_dir=str(tmp_path)),
@@ -3350,7 +3372,7 @@ class TestSettingsDirAddDirs:
             captured["add_dirs"] = kwargs["options"].add_dirs
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
@@ -3378,7 +3400,7 @@ class TestSettingsDirAddDirs:
             captured["add_dirs"] = kwargs["options"].add_dirs
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
                 mcp_servers={
                     "filesystem": {
@@ -3419,7 +3441,7 @@ class TestSettingsDirAddDirs:
             captured["add_dirs"] = kwargs["options"].add_dirs
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(
@@ -3463,7 +3485,7 @@ class TestSettingsDirAddDirs:
             captured["add_dirs"] = kwargs["options"].add_dirs
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(
@@ -3495,7 +3517,7 @@ class TestSettingsDirAddDirs:
             captured["add_dirs"] = kwargs["options"].add_dirs
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             await provider.execute(
                 agent=AgentDef(name="t", prompt="hi", settings_dir=str(link)),
@@ -3530,7 +3552,7 @@ class TestSettingsDirAddDirs:
                 captured["options"] = kwargs["options"]
                 yield _result(result="ok")
 
-            with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            with patch_sdk(fake_query):
                 provider = ClaudeAgentSdkProvider()
                 await provider.execute(
                     agent=AgentDef(name="t", prompt="hi", settings_dir=settings_dir),
@@ -3591,7 +3613,7 @@ class TestSettingsDirAddDirs:
             yield _result(result="ok")
 
         kwargs = {} if sources is None else {"setting_sources": sources}
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(**kwargs)  # type: ignore[arg-type]
             with caplog.at_level(logging.WARNING):
                 await provider.execute(
@@ -3632,7 +3654,7 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             with caplog.at_level(logging.WARNING):
                 # Eight for_each iterations over one directory, as the engine
@@ -3675,7 +3697,7 @@ class TestSettingsDirAddDirs:
         async def remedy_for(sources: list[str] | None, skills: list[str] | None) -> str:
             caplog.clear()
             kwargs = {} if sources is None else {"setting_sources": sources}
-            with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            with patch_sdk(fake_query):
                 provider = ClaudeAgentSdkProvider(**kwargs)  # type: ignore[arg-type]
                 with caplog.at_level(logging.WARNING):
                     await provider.execute(
@@ -3717,7 +3739,7 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             with caplog.at_level(logging.WARNING):
                 await provider.execute(
@@ -3764,7 +3786,7 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             with caplog.at_level(logging.WARNING):
                 await provider.execute(
@@ -3792,7 +3814,7 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(native_tools=native_tools)  # type: ignore[arg-type]
             with caplog.at_level(logging.WARNING):
                 await provider.execute(
@@ -3884,7 +3906,7 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(native_tools="claude_code")
             with caplog.at_level(logging.WARNING):
                 for tools in (None, [], None, []):  # each policy twice
@@ -3925,7 +3947,7 @@ class TestSettingsDirAddDirs:
         async def fake_query(**kwargs):
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider()
             with caplog.at_level(logging.WARNING):
                 await provider.execute(
@@ -4027,7 +4049,7 @@ class TestNativeToolsPolicy:
                 captured["mcp_payload"] = json.loads(Path(options.mcp_servers).read_text())
             yield _result(result="ok")
 
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(mcp_servers=mcp_servers, native_tools=native_tools)
             await provider.execute(
                 agent=agent,
@@ -4229,7 +4251,7 @@ class TestNativeToolsPolicy:
             yield _result(result="ok")
 
         server = {name: {"type": "stdio", "command": "c"}}
-        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+        with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(mcp_servers=server if origin == "workflow" else None)
             with pytest.raises(ProviderError, match="cannot be granted a permission rule") as exc:
                 await provider.execute(
@@ -4344,3 +4366,808 @@ class TestNativeToolsPolicy:
 
         assert list(options.agents) == ["p:rev"]
         assert options.tools == {"type": "preset", "preset": "claude_code"}
+
+
+# ---------------------------------------------------------------------------
+# Hard interruption and absolute session timeouts
+# ---------------------------------------------------------------------------
+
+#: Generous upper bound used only to fail a hung test instead of blocking the
+#: suite. Nothing below depends on its value for correctness.
+_HANG_GUARD_SECONDS = 5.0
+
+
+def _leaked_tasks(before: set[asyncio.Task[Any]]) -> list[asyncio.Task[Any]]:
+    """Tasks that appeared since ``before`` and are still pending.
+
+    Scoped to the delta so an unrelated task already running in the loop
+    cannot make this report a leak that is not ours.
+    """
+    current = asyncio.current_task()
+    return [t for t in asyncio.all_tasks() - before if t is not current and not t.done()]
+
+
+class _ControlledStream:
+    """Controllable stand-in for the SDK's message iterator.
+
+    ``__anext__`` hands back each queued message in turn -- after
+    ``gap_seconds`` when one is configured -- and then blocks on ``release``
+    until a test lets it finish. A test that never releases is exercising an
+    indefinitely blocked read, which is the whole point of this class.
+    """
+
+    def __init__(
+        self,
+        messages: list[Any] | None = None,
+        *,
+        gap_seconds: float = 0.0,
+        on_read: Callable[[], None] | None = None,
+        raises: BaseException | None = None,
+        controlled_teardown: bool = False,
+        trace: list[str] | None = None,
+    ) -> None:
+        self._messages = list(messages or [])
+        self._gap_seconds = gap_seconds
+        self._on_read = on_read
+        self._raises = raises
+        self.controlled_teardown = controlled_teardown
+        self.trace: list[str] = trace if trace is not None else []
+        self.anext_calls = 0
+        self.aclose_calls = 0
+        self.read_cancellations = 0
+        self.read_blocked = asyncio.Event()
+        self.release = asyncio.Event()
+        self.teardown_started = asyncio.Event()
+        self.allow_teardown_to_finish = asyncio.Event()
+        self.teardown_completed = asyncio.Event()
+
+    def __aiter__(self) -> _ControlledStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        self.anext_calls += 1
+        if self._on_read is not None:
+            self._on_read()
+        if self._raises is not None:
+            raise self._raises
+        try:
+            if self._gap_seconds:
+                await asyncio.sleep(self._gap_seconds)
+            if self._messages:
+                return self._messages.pop(0)
+            self.read_blocked.set()
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.read_cancellations += 1
+            if self.controlled_teardown:
+                self.teardown_started.set()
+                # A plain await: a second cancellation delivered here would
+                # raise straight out of it, leaving ``teardown_completed``
+                # clear -- which is how a leaked cancellation is detected.
+                await self.allow_teardown_to_finish.wait()
+            self.trace.append("read_teardown")
+            self.teardown_completed.set()
+            raise
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self.trace.append("aclose")
+
+
+def _query_returning(*streams: _ControlledStream) -> Callable[..., _ControlledStream]:
+    """Patch target for ``query`` handing out each stream in call order."""
+    queued = list(streams)
+
+    def _query(**kwargs: Any) -> _ControlledStream:
+        return queued.pop(0) if len(queued) > 1 else queued[0]
+
+    return _query
+
+
+class _TeardownChild:
+    """A child task that blocks, then runs a controllable teardown.
+
+    It absorbs nothing. The single cancellation ``_cancel_and_reap`` delivers
+    is counted and re-raised; a *second* cancellation arriving while teardown
+    is blocked would raise straight out of the plain ``wait()`` below, leaving
+    ``teardown_completed`` clear.
+    """
+
+    def __init__(self) -> None:
+        self.block = asyncio.Event()
+        self.allow_teardown_to_finish = asyncio.Event()
+        self.teardown_started = asyncio.Event()
+        self.teardown_completed = asyncio.Event()
+        self.cancellations = 0
+
+    async def run(self) -> None:
+        try:
+            await self.block.wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            self.teardown_started.set()
+            await self.allow_teardown_to_finish.wait()
+            self.teardown_completed.set()
+            raise
+
+
+class TestCancelAndReap:
+    """``_cancel_and_reap`` is load-bearing: it must not forward the caller's
+    cancellation into a child that is already tearing down, and must not
+    mistake the child's own cancellation for the caller's."""
+
+    async def test_caller_cancellation_does_not_reach_a_blocked_teardown(self) -> None:
+        child = _TeardownChild()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)  # let the child reach its block
+
+        # The teardown below is shielded on purpose, so the wait_for guards are
+        # not hard bounds: without the scope's finally an assertion failing
+        # before the release line would wedge the suite instead of reporting.
+        async with gated_scope() as scope:
+            scope.watch(child)
+            scope.track(child_task)
+            runner = scope.track(asyncio.create_task(_cancel_and_reap([child_task])))
+            await asyncio.wait_for(child.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+            runner.cancel()
+            await asyncio.sleep(0)
+
+            # The shield absorbed it: the child is still tearing down, and it
+            # has seen exactly the one cancellation cleanup delivered on purpose.
+            assert child.cancellations == 1
+            assert not child_task.done()
+            assert not runner.done()
+
+            child.allow_teardown_to_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, _HANG_GUARD_SECONDS)
+
+            assert child.teardown_completed.is_set()
+            assert child_task.done()
+
+    async def test_repeated_caller_cancellation_is_absorbed_each_time(self) -> None:
+        child = _TeardownChild()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        async with gated_scope() as scope:
+            scope.watch(child)
+            scope.track(child_task)
+            runner = scope.track(asyncio.create_task(_cancel_and_reap([child_task])))
+            await asyncio.wait_for(child.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+            runner.cancel()
+            await asyncio.sleep(0)
+            runner.cancel()
+            await asyncio.sleep(0)
+
+            assert child.cancellations == 1
+            assert not child_task.done()
+            assert not runner.done()
+
+            child.allow_teardown_to_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, _HANG_GUARD_SECONDS)
+
+            assert child.teardown_completed.is_set()
+
+    @pytest.mark.parametrize("cancel_before_release", [True, False])
+    async def test_caller_cancellation_and_child_completion_in_one_turn(
+        self, cancel_before_release: bool
+    ) -> None:
+        """The case ``task.done()`` alone cannot classify.
+
+        With no ``await`` between the two actions, the caller's cancellation
+        and the child's completion land in the same event-loop turn. An
+        implementation that decides "was I cancelled?" from ``task.done()``
+        returns normally here instead of propagating.
+        """
+        before = asyncio.all_tasks()
+        child = _TeardownChild()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        async with gated_scope(before) as scope:
+            scope.watch(child)
+            scope.track(child_task)
+            runner = scope.track(asyncio.create_task(_cancel_and_reap([child_task, None])))
+            await asyncio.wait_for(child.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+            if cancel_before_release:
+                runner.cancel()
+                child.allow_teardown_to_finish.set()
+            else:
+                child.allow_teardown_to_finish.set()
+                runner.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, _HANG_GUARD_SECONDS)
+
+            assert child.cancellations == 1
+            assert child.teardown_completed.is_set()
+            assert child_task.done()
+
+    async def test_expected_child_cancellation_is_not_read_as_the_callers(self) -> None:
+        """Negative control: no caller cancellation, so none is reported."""
+        before = asyncio.all_tasks()
+        child = _TeardownChild()
+        child.allow_teardown_to_finish.set()  # teardown is not gated here
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        # Returns normally: the only CancelledError seen is the child's own.
+        await asyncio.wait_for(_cancel_and_reap([None, child_task]), _HANG_GUARD_SECONDS)
+
+        assert child.cancellations == 1
+        assert child.teardown_completed.is_set()
+        assert child_task.done()
+        assert _leaked_tasks(before) == []
+
+    async def test_an_unexpected_teardown_failure_is_logged_with_context(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A teardown that raises must not vanish.
+
+        Dropping it silently hands the caller partial output or a timeout with
+        no sign that cleanup failed, which is the one outcome that looks exactly
+        like success.
+        """
+
+        async def _explode() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise OSError("teardown exploded") from None
+
+        child = asyncio.create_task(_explode())
+        await asyncio.sleep(0)
+
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.claude_agent_sdk"):
+            await asyncio.wait_for(
+                _cancel_and_reap([child], describe="receive"),
+                _HANG_GUARD_SECONDS,
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, "the teardown failure was dropped without a trace"
+        record = warnings[0]
+        assert record.exc_info is not None, "logged without exc_info, so the cause is lost"
+        message = record.getMessage()
+        assert "receive" in message
+        assert "claude-agent-sdk" in message
+
+    async def test_expected_child_cancellation_is_not_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Negative control for the log above: the ordinary path stays quiet."""
+        child = _TeardownChild()
+        child.allow_teardown_to_finish.set()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.claude_agent_sdk"):
+            await asyncio.wait_for(
+                _cancel_and_reap([child_task], describe="receive"),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+class TestBlockedReadPreemption:
+    """Interrupt and the session deadline must pre-empt a blocked SDK read."""
+
+    async def test_interrupt_preempts_an_indefinitely_blocked_read(self) -> None:
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        stream = _ControlledStream()
+
+        async with gated_scope(before) as scope:
+            scope.watch(stream)
+            with patch_sdk(_query_returning(stream)):
+                execution = scope.track(
+                    asyncio.create_task(
+                        ClaudeAgentSdkProvider().execute(
+                            agent=AgentDef(name="t", prompt="hi"),
+                            context={},
+                            rendered_prompt="hi",
+                            interrupt_signal=interrupt,
+                        )
+                    )
+                )
+                await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+                interrupt.set()
+                output = await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+            assert output.partial is True
+            assert stream.read_cancellations == 1
+            assert stream.aclose_calls == 1
+
+    async def test_preset_interrupt_starts_no_read_at_all(self) -> None:
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        interrupt.set()
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="never")])])
+        sessions: list[Any] = []
+
+        with patch_sdk(_query_returning(stream), clients=sessions):
+            provider = ClaudeAgentSdkProvider()
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is True
+        assert stream.anext_calls == 0
+        # Not merely "no read": no session at all, so no CLI was ever started
+        # only to be shut down again.
+        assert sessions == []
+        assert _leaked_tasks(before) == []
+
+    async def test_interrupt_preserves_text_already_received(self) -> None:
+        """Text from a delivered message survives an interrupt taken later.
+
+        The interrupt is set only once the *next* read is blocked, so the
+        pre-empted read is provably the second one and the first message has
+        already been processed.
+        """
+        interrupt = asyncio.Event()
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="part one")])])
+
+        async with gated_scope() as scope:
+            scope.watch(stream)
+            with patch_sdk(_query_returning(stream)):
+                execution = scope.track(
+                    asyncio.create_task(
+                        ClaudeAgentSdkProvider().execute(
+                            agent=AgentDef(name="t", prompt="hi"),
+                            context={},
+                            rendered_prompt="hi",
+                            interrupt_signal=interrupt,
+                        )
+                    )
+                )
+                # Fires on the read *after* the message, so the first is done.
+                await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+                interrupt.set()
+                output = await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+            assert output.partial is True
+            assert "part one" in str(output.content)
+            assert stream.anext_calls == 2
+
+    async def test_timeout_preempts_an_indefinitely_blocked_read(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+
+        with patch_sdk(_query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=0.05)
+            with pytest.raises(ProviderError, match="exceeded maximum session duration") as err:
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+        assert err.value.is_retryable is False
+        assert stream.read_cancellations == 1
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_expired_deadline_starts_no_read_at_all(self) -> None:
+        # Negative so the absolute deadline is already in the past when the
+        # first read is about to start -- no sleeping and no clock patching,
+        # so the short-circuit is proven rather than raced for.
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="never")])])
+        sessions: list[Any] = []
+
+        with patch_sdk(_query_returning(stream), clients=sessions):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=-1.0)
+            with pytest.raises(ProviderError, match="exceeded maximum session duration") as err:
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+        assert err.value.is_retryable is False
+        assert "after 0 turn(s)" in str(err.value)
+        assert stream.anext_calls == 0
+        assert sessions == []
+
+    async def test_interrupt_wins_when_both_are_already_true(self) -> None:
+        interrupt = asyncio.Event()
+        interrupt.set()
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="never")])])
+        sessions: list[Any] = []
+
+        with patch_sdk(_query_returning(stream), clients=sessions):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=-1.0)
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is True
+        assert stream.anext_calls == 0
+        assert sessions == []
+
+    async def test_intermediate_messages_do_not_reset_the_deadline(self) -> None:
+        """The deadline is absolute: two gaps, each under it, still exceed it.
+
+        ``release`` is set up front so the read after the last message ends
+        the stream instead of blocking. That is what makes this discriminate:
+        a deadline restarted per message would let the stream drain and the
+        execution succeed, rather than timing out on a read that never ends.
+        """
+        stream = _ControlledStream(
+            [
+                _assistant(content=[TextBlock(text="one")]),
+                _assistant(content=[TextBlock(text="two")]),
+            ],
+            gap_seconds=0.2,
+        )
+        stream.release.set()
+
+        with patch_sdk(_query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=0.3)
+            with pytest.raises(ProviderError, match="exceeded maximum session duration") as err:
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+        # Tripped on the second read, after one turn. A per-message deadline
+        # would not have tripped at all.
+        assert "after 1 turn(s)" in str(err.value)
+
+    async def test_interrupt_still_beats_a_simultaneously_available_message(self) -> None:
+        """Tie behavior is unchanged: the in-body check owns this case."""
+        interrupt = asyncio.Event()
+        stream = _ControlledStream(
+            [_assistant(content=[TextBlock(text="arrived with the interrupt")])],
+            on_read=interrupt.set,
+        )
+
+        with patch_sdk(_query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is True
+        assert stream.anext_calls == 1
+        assert "arrived with the interrupt" not in str(output.content)
+
+    async def test_sdk_error_is_not_swallowed_into_interrupt_or_timeout(self) -> None:
+        """A genuine SDK failure outranks a signal that is true at the same time."""
+        interrupt = asyncio.Event()
+        stream = _ControlledStream(
+            raises=RuntimeError("connection refused"),
+            on_read=interrupt.set,
+        )
+
+        with patch_sdk(_query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=0.05)
+            with pytest.raises(ProviderError, match="connection refused"):
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                        interrupt_signal=interrupt,
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+    async def test_exhausted_iterator_completes_normally(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream([_result(result="done")])
+        stream.release.set()  # the read after the last message ends the stream
+
+        with patch_sdk(_query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is False
+        assert output.content == {"response": "done"}
+        assert _leaked_tasks(before) == []
+
+    async def test_outer_cancellation_propagates(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+
+        async with gated_scope(before) as scope:
+            scope.watch(stream)
+            with patch_sdk(_query_returning(stream)):
+                execution = scope.track(
+                    asyncio.create_task(
+                        ClaudeAgentSdkProvider().execute(
+                            agent=AgentDef(name="t", prompt="hi"),
+                            context={},
+                            rendered_prompt="hi",
+                        )
+                    )
+                )
+                await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+                execution.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+            assert stream.read_cancellations == 1
+            assert stream.aclose_calls == 1
+
+
+@patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+class TestGeneratorFinalization:
+    """Every exit path closes the SDK generator and leaves no owned task."""
+
+    async def _run(self, stream: _ControlledStream, **kwargs: Any) -> Any:
+        with patch_sdk(_query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(
+                max_session_seconds=kwargs.pop("max_session_seconds", None)
+            )
+            return await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                **kwargs,
+            )
+
+    async def test_finalized_on_success(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream([_result(result="done")])
+        stream.release.set()
+        await asyncio.wait_for(self._run(stream), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_interrupt(self) -> None:
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        stream = _ControlledStream()
+
+        async with gated_scope(before) as scope:
+            scope.watch(stream)
+            execution = scope.track(
+                asyncio.create_task(self._run(stream, interrupt_signal=interrupt))
+            )
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            interrupt.set()
+            output = await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert output.partial is True
+        assert stream.aclose_calls == 1
+
+    async def test_nothing_to_finalize_when_the_interrupt_precedes_the_session(self) -> None:
+        """An already-set interrupt opens no session, so there is nothing to close.
+
+        The previous implementation built the SDK iterator and then abandoned it
+        on the first check; now the short-circuit happens before a client is
+        constructed, so no CLI is started only to be torn down again.
+        """
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        interrupt.set()
+        stream = _ControlledStream()
+
+        output = await asyncio.wait_for(
+            self._run(stream, interrupt_signal=interrupt), _HANG_GUARD_SECONDS
+        )
+
+        assert output.partial is True
+        assert stream.anext_calls == 0
+        assert stream.aclose_calls == 0
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_timeout(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+        with pytest.raises(ProviderError, match="exceeded maximum session duration"):
+            await asyncio.wait_for(self._run(stream, max_session_seconds=0.05), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_sdk_error(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream(raises=RuntimeError("boom"))
+        with pytest.raises(ProviderError, match="boom"):
+            await asyncio.wait_for(self._run(stream), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_outer_cancellation(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+
+        async with gated_scope(before) as scope:
+            scope.watch(stream)
+            execution = scope.track(asyncio.create_task(self._run(stream)))
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            execution.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+            assert stream.aclose_calls == 1
+
+
+@patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+class TestTeardownOrderingAndIsolation:
+    """The MCP secrets file outlives the read task and the generator."""
+
+    _SERVERS = {"docs": {"type": "stdio", "command": "docs-server"}}
+
+    async def test_mcp_config_removed_only_after_teardown(self) -> None:
+        before = asyncio.all_tasks()
+        trace: list[str] = []
+        captured: dict[str, Any] = {}
+        interrupt = asyncio.Event()
+        stream = _ControlledStream(trace=trace)
+
+        def _query(**kwargs: Any) -> _ControlledStream:
+            captured["path"] = kwargs["options"].mcp_servers
+            return stream
+
+        with (
+            patch_sdk(_query),
+            patch(
+                "conductor.providers.claude_agent_sdk._remove_mcp_config",
+                side_effect=lambda path: trace.append("remove_mcp_config"),
+            ),
+        ):
+            provider = ClaudeAgentSdkProvider(mcp_servers=self._SERVERS)
+            execution = asyncio.create_task(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                )
+            )
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            interrupt.set()
+            await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert trace == ["read_teardown", "aclose", "remove_mcp_config"]
+        assert _leaked_tasks(before) == []
+        # The real file is gone too (the recorder above replaced the unlink).
+        Path(captured["path"]).unlink(missing_ok=True)
+
+    async def test_outer_cancellation_waits_for_a_blocked_read_teardown(self) -> None:
+        """Shield keeps the read task alive until it has finished tearing down."""
+        before = asyncio.all_tasks()
+        trace: list[str] = []
+        stream = _ControlledStream(controlled_teardown=True, trace=trace)
+
+        async with gated_scope(before) as scope:
+            scope.watch(stream)
+            with (
+                patch_sdk(_query_returning(stream)),
+                patch(
+                    "conductor.providers.claude_agent_sdk._remove_mcp_config",
+                    side_effect=lambda path: trace.append("remove_mcp_config"),
+                ),
+            ):
+                provider = ClaudeAgentSdkProvider(mcp_servers=self._SERVERS)
+                execution = scope.track(
+                    asyncio.create_task(
+                        provider.execute(
+                            agent=AgentDef(name="t", prompt="hi"),
+                            context={},
+                            rendered_prompt="hi",
+                        )
+                    )
+                )
+                await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+
+                execution.cancel()
+                await asyncio.wait_for(stream.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+                # Cancel the caller *again*, while the read is mid-teardown. The
+                # shield must absorb it: forwarding it would raise inside the
+                # read's own cleanup and lose the teardown entirely.
+                execution.cancel()
+                await asyncio.sleep(0)
+
+                # Still tearing down, and neither caller cancellation reached
+                # it: one cancellation, and nothing cleaned up yet.
+                assert stream.read_cancellations == 1
+                assert not execution.done()
+                assert trace == []
+
+                stream.allow_teardown_to_finish.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+            assert trace == ["read_teardown", "aclose", "remove_mcp_config"]
+
+    async def test_concurrent_executions_stay_independent(self) -> None:
+        before = asyncio.all_tasks()
+        paths: list[str] = []
+        interrupt_a = asyncio.Event()
+        interrupt_b = asyncio.Event()
+        stream_a = _ControlledStream()
+        stream_b = _ControlledStream([_result(result="b done")])
+        stream_b.release.set()
+        streams = {"a": stream_a, "b": stream_b}
+
+        def _query(**kwargs: Any) -> _ControlledStream:
+            paths.append(kwargs["options"].mcp_servers)
+            return streams[kwargs["prompt"]]
+
+        async with gated_scope(before) as scope:
+            scope.watch(stream_a)
+            scope.watch(stream_b)
+            with patch_sdk(_query):
+                provider = ClaudeAgentSdkProvider(mcp_servers=self._SERVERS)
+                agent = AgentDef(name="t", prompt="hi")
+                run_a = scope.track(
+                    asyncio.create_task(
+                        provider.execute(
+                            agent=agent,
+                            context={},
+                            rendered_prompt="a",
+                            interrupt_signal=interrupt_a,
+                        )
+                    )
+                )
+                await asyncio.wait_for(stream_a.read_blocked.wait(), _HANG_GUARD_SECONDS)
+                output_b = await asyncio.wait_for(
+                    provider.execute(
+                        agent=agent,
+                        context={},
+                        rendered_prompt="b",
+                        interrupt_signal=interrupt_b,
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+                # B finished untouched while A is still blocked on its own read.
+                assert output_b.partial is False
+                assert output_b.content == {"response": "b done"}
+                assert not run_a.done()
+                assert not interrupt_a.is_set()
+
+                interrupt_a.set()
+                output_a = await asyncio.wait_for(run_a, _HANG_GUARD_SECONDS)
+
+            assert output_a.partial is True
+            assert len(paths) == 2
+            assert paths[0] != paths[1]
+            assert not any(Path(p).exists() for p in paths)

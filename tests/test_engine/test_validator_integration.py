@@ -891,7 +891,9 @@ class TestValidatorRunsWithoutMcpServers:
             wrote_config.append("called")
             raise AssertionError("no MCP config file may be written for the grader")
 
-        monkeypatch.setattr(sdk, "query", fake_query)
+        from tests.test_providers.claude_sdk_harness import shim_client_factory
+
+        monkeypatch.setattr(sdk, "ClaudeSDKClient", shim_client_factory(fake_query))
         monkeypatch.setattr(sdk, "_write_mcp_config", spy_write)
         monkeypatch.setattr(sdk, "CLAUDE_AGENT_SDK_AVAILABLE", True)
 
@@ -980,7 +982,9 @@ class TestValidatorRunsWithoutMcpServers:
         def spy_write(servers: dict[str, Any]) -> str:
             raise AssertionError("no MCP config file may be written on the refusal path")
 
-        monkeypatch.setattr(sdk, "query", fake_query)
+        from tests.test_providers.claude_sdk_harness import shim_client_factory
+
+        monkeypatch.setattr(sdk, "ClaudeSDKClient", shim_client_factory(fake_query))
         monkeypatch.setattr(sdk, "_write_mcp_config", spy_write)
         monkeypatch.setattr(sdk, "CLAUDE_AGENT_SDK_AVAILABLE", True)
 
