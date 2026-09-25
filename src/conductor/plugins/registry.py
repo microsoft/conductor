@@ -124,6 +124,9 @@ class ResolvedPlugin:
     why they are not rewritten.
     """
 
+    mcp_source: Path | None = None
+    """Manifest-selected MCP file, retained only when MCP is enabled."""
+
     dropped: tuple[str, ...] = ()
     """Component directories present in the plugin that Conductor does
     not load — ``hooks`` and ``commands``.
@@ -758,6 +761,7 @@ def resolve_plugin(
         skills=tuple(skills),
         agents=tuple(agents),
         mcp_servers=mcp_servers,
+        mcp_source=manifest.mcp_source if want_mcp else None,
         dropped=_dropped_components(root),
         disabled=tuple(disabled),
     )

@@ -109,6 +109,28 @@ conductor validate examples/execution-profiles.yaml --environment demo
 conductor run examples/execution-profiles.yaml --environment demo
 ```
 
+## Run Bundles
+
+### run-bundle.yaml
+
+Demonstrates content-addressed run bundle packaging for workflow dependencies. Demonstrates:
+- Declaring static asset files under `workflow.bundle.assets`
+- External file inclusions via `!file`
+- Inspecting the offline bundle closure with `conductor validate --environment demo`
+- Building and storing the content-addressed bundle with `conductor bundle build --environment demo`
+- Provider-free execution with set and script steps
+
+```bash
+# Build the run bundle
+conductor bundle build examples/run-bundle.yaml --environment demo
+
+# Validate and view the bundle closure report
+conductor validate examples/run-bundle.yaml --environment demo
+
+# Run the workflow
+conductor run examples/run-bundle.yaml --environment demo
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml

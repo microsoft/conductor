@@ -1,0 +1,54 @@
+# Run Bundle Example
+#
+# This example demonstrates content-addressed run bundle packaging for a
+# workflow. A run bundle captures the complete statically knowable file closure:
+# the root workflow YAML, external file includes, and declared static assets.
+#
+# Usage:
+#   # Build the content-addressed run bundle
+#   conductor bundle build examples/run-bundle.yaml
+#
+#   # Build with an execution environment (records environment link)
+#   conductor bundle build examples/run-bundle.yaml --environment demo
+#
+#   # Validate and inspect the bundle closure report
+#   conductor validate examples/run-bundle.yaml --environment demo
+#
+#   # Run the workflow normally (bundle packaging is ignored by run/resume)
+#   conductor run examples/run-bundle.yaml --environment demo
+
+workflow:
+  name: run-bundle-demo
+  description: Demonstrates run bundle packaging with external includes and static assets
+  version: "1.0.0"
+  entry_point: inspect_config
+
+  defaults:
+    execution:
+      profile: shell
+
+  bundle:
+    assets:
+      - "README.md"
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: inspect_config
+    type: set
+    description: Load external environment configuration via !file include
+    value: !file .conductor/environments/demo.yaml
+    routes:
+      - to: execute_script
+
+  - name: execute_script
+    type: script
+    description: Run a shell script step using the resolved execution profile
+    command: echo
+    args: ["Bundle workflow initialized successfully"]
+    routes:
+      - to: $end
+
+output:
+  result: "{{ execute_script.output.stdout }}"

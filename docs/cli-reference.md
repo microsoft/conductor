@@ -16,6 +16,7 @@ Complete command-line reference for Conductor.
 - [`conductor guide`](#conductor-guide)
 - [`conductor checkpoint list`](#conductor-checkpoint-list)
 - [`conductor validate`](#conductor-validate)
+- [`conductor bundle build`](#conductor-bundle-build)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
 - [`conductor mcp serve`](#conductor-mcp-serve)
@@ -995,6 +996,66 @@ When validating workflow profile references, Conductor applies a three-level che
 
 **Warnings** (validation passes with notes):
 - **Undeclared dependencies in explicit mode** — agent prompt references `{{ a.output.val }}` but doesn't declare `a.output` in its `input:` list
+
+### Bundle Closure Report
+
+When `--environment` is passed, `conductor validate` computes the workflow's complete offline file closure and prints the **Bundle Closure** report.
+
+* **Complete Closure:** If all dependencies are available locally, validation prints the `bundle_digest`, total uncompressed file size, an entry count breakdown by origin kind (`workflow`, `include`, `jinja_include`, `subworkflow`, `subworkflow_registry`, `skill`, `plugin`, `asset`), authorized roots, and git repository dirty status.
+* **Incomplete Closure (Offline Plugin Misses):** `conductor validate` never uses the network. If a remote plugin source declared in `runtime.plugin_sources` is not cached locally under `$CONDUCTOR_HOME/cache/plugins/`, validation succeeds with an `incomplete` status note, reports missing cache identities, and omits the digest.
+* **Bundle Validation Errors:** Local file defects fail validation with exit code 1. These include dynamic Jinja includes (`BundleDynamicTemplateError`), root escapes (`BundleRootEscapeError`, `BundleSymlinkEscapeError`), resource limit violations (`BundleCapsError`), missing declared roots, or circular dependencies.
+
+## `conductor bundle build`
+
+Build an immutable, content-addressed run bundle for a workflow.
+
+Collects the complete statically knowable file closure of the workflow, including external file references (`!file`, `!yamlfile`), Jinja2 template partials, local and registry sub-workflows, skills, plugins, and declared assets. Publishes the resulting tree and deterministic archive to the content-addressed store at `$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`. The report and manifest retain the canonical `sha256:<hex>` digest spelling; only the directory name uses a hyphen for Windows portability.
+
+```bash
+conductor bundle build <workflow.yaml | registry-ref> [OPTIONS]
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `workflow` | Path to a local workflow YAML file or a workflow registry reference (`name`, `name@registry`, `name@registry#ref`). |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--environment <name\|PATH>` | Execution environment: a name resolved via `.conductor/environments/` (project then user level) or a path to an environment document. Defaults to the built-in local environment. |
+
+### Exit Codes
+
+* `0`: Bundle built successfully (or existing cached bundle reused) and content published to the store.
+* `1`: Build failed due to schema errors, dynamic includes, root escapes, missing dependencies, or exceeded limits.
+
+### Examples
+
+```bash
+# Build a bundle for a local workflow file
+conductor bundle build workflow.yaml
+
+# Build with a specific execution environment
+conductor bundle build workflow.yaml --environment demo
+
+# Build directly from a workflow registry reference
+conductor bundle build 'qa-bot@official#v1.2.3'
+```
+
+### Store Layout
+
+Bundles are stored under `$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`:
+
+* `bundle.json`: The serialized `BundleManifest` (readiness sentinel, written last).
+* `bundle.tar.gz`: The reproducible gzip archive containing all files and `.bundle/manifest.json`.
+* `tree/`: The staged directory hierarchy with POSIX-normalized paths (`tree/main/`, `tree/roots/`, etc.).
+
+### CI Priming
+
+`conductor bundle build` serves as the CI priming step for workflow dependencies. Unlike `conductor validate` (which runs offline), `conductor bundle build` fetches and caches any remote plugin sources declared in `runtime.plugin_sources`. After running `conductor bundle build` during a CI preparation stage, subsequent workflow runs and validations can execute in isolated, offline environments.
 
 ## `conductor doctor`
 

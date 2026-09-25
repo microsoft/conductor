@@ -16,6 +16,7 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Execution Profiles](#execution-profiles)
 - [Context Compaction](#context-compaction)
 - [External File References](#external-file-references)
+- [Run Bundles](#run-bundles)
 
 ## Workflow Configuration
 
@@ -3338,6 +3339,79 @@ Only UTF-8 text files are supported. Non-UTF-8 files produce a `ConfigurationErr
 - **No conditional includes** — File references cannot be parameterized or conditional
 - **No caching** — Each `!file` reference reads the file independently
 - **Jinja includes search root**: Relative template includes (`{% include %}`, etc.) resolve only against the prompt file's own directory, with no fallback to the workflow directory or current working directory.
+
+## Run Bundles
+
+The `workflow.bundle` block declares static asset files and extra authorized filesystem roots for run bundle packaging.
+
+A run bundle collects the complete statically knowable file closure needed to run a workflow on remote or containerized backends. This closure includes included files (`!file` and `!yamlfile`), Jinja2 template partials, sub-workflows, skills, plugins, and declared assets.
+
+```yaml
+workflow:
+  name: deployment-pipeline
+  entry_point: build
+
+  bundle:
+    assets:
+      - "scripts/*.sh"
+      - ".github/workflows/deploy.yml"
+    additional_roots:
+      - "../shared-configs"
+```
+
+### Schema Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `assets` | `list[str]` | `[]` | Glob patterns or relative paths to files that should be packaged in the bundle. Anchored to the workflow directory. |
+| `additional_roots` | `list[str]` | `[]` | Extra filesystem root directories authorized for file collection. |
+
+### Asset Paths and Glob Semantics
+
+* **Relative Paths Only:** Every entry in `assets` must be a relative path anchored to the directory containing the workflow file. Absolute paths (POSIX `/` or Windows drive paths) and paths starting with `~` are rejected with schema validation errors.
+* **Hidden Files and Directories:** Asset patterns use glob expansion with `include_hidden=False`. Standard wildcards like `*` or `scripts/*` ignore hidden files and directories. To match hidden paths, specify the dot prefix explicitly, such as `.github/**`.
+
+### Additional Roots
+
+By default, file collection is strictly confined to the workflow file's directory and pre-authorized cache locations (registry cache, plugin checkouts, and installed skills).
+
+If your workflow references external files or sub-workflows residing in parent or sibling directories (for example, `!file ../shared/prompt.md`), declare those directories in `additional_roots`. Entries in `additional_roots` may be relative paths or absolute paths.
+
+### Bundle Errors and Remedies
+
+When building a bundle or validating a closure, Conductor enforces static completeness and security boundaries:
+
+#### Dynamic Jinja Includes
+
+Jinja2 template includes inside file-backed prompt templates must resolve to static paths during collection. Dynamic expressions such as `{% include template_name %}` cannot be resolved statically and trigger `BundleDynamicTemplateError`.
+
+* **Remedy:** Replace dynamic template variables with literal template path strings, or provide a static list of candidates:
+
+```jinja2
+{# Avoid dynamic template variables #}
+{% include selected_prompt %}
+
+{# Use literal includes or static candidate lists instead #}
+{% include "prompts/fallback.md" %}
+{% include ["prompts/custom.md", "prompts/default.md"] ignore missing %}
+```
+
+#### Root Escapes
+
+If an included file, sub-workflow, or asset references a path outside the workflow directory and pre-authorized caches without authorization, collection fails with `BundleRootEscapeError` or `BundleSymlinkEscapeError`.
+
+* **Remedy:** Declare the external directory in `workflow.bundle.additional_roots`:
+
+```yaml
+workflow:
+  bundle:
+    additional_roots:
+      - "../shared-prompts"
+```
+
+### Runtime Execution Note
+
+The `workflow.bundle` section is consumed by `conductor bundle build` and `conductor validate --environment`. Standard local execution via `conductor run` and `conductor resume` ignores this block.
 
 ## Complete Example
 

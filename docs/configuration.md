@@ -1042,6 +1042,34 @@ setting — pass `--keep-last` to override the configured value for a single
 invocation, or `--dry-run` to preview what would be deleted without
 actually deleting anything.
 
+## Bundle Cache Directory (`~/.conductor/cache/bundles/`)
+
+When building content-addressed run bundles (`conductor bundle build`), Conductor stores the resulting package in a local cache directory:
+
+```
+~/.conductor/cache/bundles/
+```
+
+If `CONDUCTOR_HOME` is set, the cache path defaults to `$CONDUCTOR_HOME/cache/bundles/` instead.
+
+### Structure
+
+Each bundle is stored under a filesystem-safe encoding of its full content
+digest. The manifest keeps `sha256:<hex>`, while the directory name replaces
+the colon with a hyphen for Windows compatibility:
+
+```
+$CONDUCTOR_HOME/cache/bundles/
+  sha256-<hex>/
+    bundle.json       # Manifest sentinel certifying the staged tree
+    bundle.tar.gz     # Deterministic gzip archive of the bundle
+    tree/             # Staged file hierarchy under normalized POSIX paths
+```
+
+### Retention and Lifecycle
+
+In v1, bundle cache storage grows without automated garbage collection. Stored bundles remain in the cache until removed manually or cleared by CI teardown steps. Rebuilding a workflow whose file closure has not changed reuses the existing bundle directory immediately without re-staging files.
+
 ## See Also
 
 - [Fleet Manager](fleet.md)

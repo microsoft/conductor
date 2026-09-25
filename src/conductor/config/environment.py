@@ -31,8 +31,6 @@ inside an explicit function call.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import re
@@ -46,6 +44,7 @@ from pydantic import ValidationError as PydanticValidationError
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
+from conductor.digest import canonical_json_digest
 from conductor.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
@@ -155,13 +154,13 @@ class ResolvedEnvironment:
 def _document_digest(document: EnvironmentDocument) -> str:
     """Digest pinning an environment document's exact content.
 
-    Canonical form: JSON with sorted keys and tight separators, so the
-    digest depends on the document's data alone, never on insertion order
-    or formatting. Spelled ``sha256:<hex>``, matching the workflow-hash
-    convention in ``engine.checkpoint``.
+    Delegates to :func:`conductor.digest.canonical_json_digest` — canonical
+    form: JSON with sorted keys and tight separators, so the digest depends
+    on the document's data alone, never on insertion order or formatting.
+    Spelled ``sha256:<hex>``, matching the workflow-hash convention in
+    ``engine.checkpoint``.
     """
-    canonical = json.dumps(document.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+    return canonical_json_digest(document.model_dump(mode="json"))
 
 
 def load_environment_document(path: Path) -> EnvironmentDocument:

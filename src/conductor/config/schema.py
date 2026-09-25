@@ -7,6 +7,7 @@ workflow YAML configuration files.
 from __future__ import annotations
 
 import functools
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlparse
 
@@ -128,6 +129,52 @@ class McpConfig(BaseModel):
         """Reject a non-positive estimate rather than silently accepting one."""
         if v is not None and v <= 0:
             raise ValueError("estimated_minutes must be positive when present")
+        return v
+
+
+class BundleConfig(BaseModel):
+    """Configuration for run bundle packaging and asset inclusion.
+
+    Backs ``WorkflowDef.bundle``: declared assets and host-side root authorization
+    for run bundles. Consumed by ``conductor bundle build`` and
+    ``conductor validate --environment``, not by ``conductor run``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    assets: list[str] = Field(default_factory=list)
+    """Asset file patterns or paths relative to the workflow directory."""
+
+    additional_roots: list[str] = Field(default_factory=list)
+    """Additional filesystem roots authorized for inclusion in run bundles."""
+
+    @field_validator("assets")
+    @classmethod
+    def validate_assets(cls, v: list[str]) -> list[str]:
+        """Reject non-relative paths, '~' expansions, and empty entries."""
+        for entry in v:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError("bundle.assets entries must be non-empty strings")
+            stripped = entry.strip()
+            if (
+                stripped.startswith("~")
+                or PurePosixPath(stripped).is_absolute()
+                or PureWindowsPath(stripped).is_absolute()
+                or stripped.startswith(("\\", "/"))
+            ):
+                raise ValueError(
+                    f"bundle.assets entry '{entry}' must be a relative path "
+                    "anchored to the workflow directory, not an absolute path or '~'"
+                )
+        return v
+
+    @field_validator("additional_roots")
+    @classmethod
+    def validate_additional_roots(cls, v: list[str]) -> list[str]:
+        """Reject empty or whitespace-only additional_roots entries."""
+        for entry in v:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError("bundle.additional_roots entries must be non-empty strings")
         return v
 
 
@@ -3001,6 +3048,15 @@ class WorkflowDef(BaseModel):
     applied to executable steps (agent, script, mcp, workflow) that do not
     declare their own ``execution:`` block. Absent from the YAML behaves
     identically to an explicit empty block.
+    """
+
+    bundle: BundleConfig | None = None
+    """Run bundle packaging and asset inclusion settings.
+
+    Declares file assets and authorized filesystem roots for packaging the
+    workflow into a self-contained, content-addressed run bundle. Consumed
+    by ``conductor bundle build`` and ``conductor validate --environment``,
+    not by ``conductor run``. Absent from the YAML resolves to ``None``.
     """
 
     metadata: dict[str, Any] = Field(default_factory=dict)

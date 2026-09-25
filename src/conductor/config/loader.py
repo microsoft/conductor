@@ -7,10 +7,13 @@ Pydantic models, and resolving ``!file`` tags for external file references.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from ruamel.yaml import YAML
 from ruamel.yaml.constructor import RoundTripConstructor
@@ -22,6 +25,94 @@ from conductor.file_string import FileString
 
 # Pattern to match ${VAR} or ${VAR:-default}
 ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+
+# Tag of a recorded file read: the root workflow file, a ``!file`` include,
+# or a ``!yamlfile`` include.
+IncludedFileTag = Literal["workflow", "file", "yamlfile"]
+
+
+@dataclass(frozen=True)
+class IncludedFile:
+    """Provenance record for one file read during a workflow load.
+
+    Attributes:
+        path: Resolved absolute path of the file that was read.
+        anchored_path: Absolute parent-anchored path before symlink resolution,
+            or ``None`` for records constructed by older integrations.
+            This preserves the authored filesystem route so bundle collection can
+            retain symlink components as well as the file reached through them.
+        logical_ref: Raw reference string as written in the including YAML
+            (before resolution against the including file's directory). For
+            the root workflow file this is the path as passed to ``load()``.
+        tag: Which construct read the file — the root ``workflow`` file, a
+            ``file`` (``!file``) include, or a ``yamlfile`` (``!yamlfile``)
+            include.
+        parent: Resolved path of the file that included this one, or
+            ``None`` for the root workflow file.
+        digest: ``sha256:<hex>`` of the file's raw bytes as read from disk,
+            computed before any ``${VAR}`` expansion or newline
+            normalization.
+        size: Length of the raw bytes in bytes.
+    """
+
+    path: Path
+    logical_ref: str
+    tag: IncludedFileTag
+    parent: Path | None
+    digest: str
+    size: int
+    anchored_path: Path | None = None
+
+
+class IncludedFilesGraph:
+    """The include-provenance records of a single load, in read order.
+
+    The root workflow file is always recorded first (tag ``workflow``,
+    ``parent=None``); every ``!file``/``!yamlfile`` include read afterwards
+    is appended in the order it was read. Records are never deduplicated —
+    the same file included twice appears twice.
+    """
+
+    def __init__(self, files: tuple[IncludedFile, ...]) -> None:
+        """Initialize the graph with an immutable snapshot of the records.
+
+        Args:
+            files: The recorded ``IncludedFile`` entries in read order.
+        """
+        self._files = files
+
+    @property
+    def files(self) -> tuple[IncludedFile, ...]:
+        """The recorded entries in read order."""
+        return self._files
+
+    def __iter__(self) -> Iterator[IncludedFile]:
+        return iter(self._files)
+
+    def __len__(self) -> int:
+        return len(self._files)
+
+    def __getitem__(self, index: int) -> IncludedFile:
+        return self._files[index]
+
+
+def _sha256_digest(raw: bytes) -> str:
+    """Return the ``sha256:<hex>`` digest of raw bytes.
+
+    Spelling matches the workflow-hash convention in ``engine.run_manifest``
+    and the environment-document digest in ``config.environment``.
+    """
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _normalize_newlines(content: str) -> str:
+    """Apply universal-newline normalization to decoded text.
+
+    Reproduces the semantics of reading in text mode with ``newline=None``
+    (the previous ``read_text(encoding="utf-8")`` behavior): ``\\r\\n`` and
+    lone ``\\r`` both become ``\\n``.
+    """
+    return content.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def resolve_env_vars(value: str, max_depth: int = 10) -> str:
@@ -100,6 +191,7 @@ class _FileTagConstructorType(Protocol):
 
     _base_dir: Path
     _file_stack: list[str]
+    _included_files: list[IncludedFile]
 
 
 def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
@@ -120,18 +212,25 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
 
         _base_dir: Path = Path(".")
         _file_stack: list[str] = []
+        _included_files: list[IncludedFile] = []
 
-        def _read_included_file(self, node: Any) -> tuple[str, Path]:
+        def _read_included_file(self, node: Any, tag: IncludedFileTag) -> tuple[str, Path]:
             """Resolve a !file/!yamlfile path against the current base dir and read it.
 
+            Reads the file's raw bytes once, computes the provenance digest and
+            size over those bytes, then decodes and applies universal-newline
+            normalization — exactly reproducing the previous
+            ``read_text(encoding="utf-8")`` semantics.
+
             Raises ConfigurationError on a circular reference, a missing file, or
-            invalid UTF-8. Returns the file's raw text content and its resolved path.
+            invalid UTF-8. Returns the file's text content and its resolved path.
             """
             path_str = self.construct_scalar(node)
             cls = type(self)
 
             # Resolve path relative to the current base directory
-            file_path = (cls._base_dir / path_str).resolve()
+            anchored_path = Path(os.path.abspath(os.path.normpath(cls._base_dir / path_str)))
+            file_path = anchored_path.resolve()
             file_path_str = str(file_path)
 
             # Cycle detection (O(n) membership test, acceptable for small stacks)
@@ -144,7 +243,8 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                 )
 
             try:
-                content = file_path.read_text(encoding="utf-8")
+                raw = file_path.read_bytes()
+                content = raw.decode("utf-8")
             except FileNotFoundError as e:
                 raise ConfigurationError(
                     f"File not found: '{path_str}' (resolved to '{file_path}')",
@@ -157,7 +257,23 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
                     suggestion="Ensure the file is saved as UTF-8 text.",
                 ) from e
 
-            return content, file_path
+            # Record provenance BEFORE ${VAR} expansion (which happens later in
+            # _resolve_env_vars_recursive) and BEFORE newline normalization
+            # touches the decoded text. Digest and size are over the raw bytes.
+            parent = Path(cls._file_stack[-1]) if cls._file_stack else None
+            cls._included_files.append(
+                IncludedFile(
+                    path=file_path,
+                    anchored_path=anchored_path,
+                    logical_ref=path_str,
+                    tag=tag,
+                    parent=parent,
+                    digest=_sha256_digest(raw),
+                    size=len(raw),
+                )
+            )
+
+            return _normalize_newlines(content), file_path
 
         def construct_file_tag(self, node: Any) -> Any:
             """Resolve a !file tag: always return the file's content verbatim as text.
@@ -167,7 +283,7 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
             on whether its prose happens to parse as YAML. Use !yamlfile to
             explicitly parse a file as structured YAML.
             """
-            content, file_path = self._read_included_file(node)
+            content, file_path = self._read_included_file(node, "file")
             return FileString(content, source_path=file_path)
 
         def construct_yamlfile_tag(self, node: Any) -> Any:
@@ -177,7 +293,7 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
             if the file is not valid YAML, rather than silently falling back to
             a string the way the old !file content-sniffing did.
             """
-            content, file_path = self._read_included_file(node)
+            content, file_path = self._read_included_file(node, "yamlfile")
             cls = type(self)
 
             saved_base_dir = cls._base_dir
@@ -232,6 +348,28 @@ class ConfigLoader:
             ConfigurationError: If the file cannot be read, contains invalid
                 YAML syntax, or fails schema validation.
         """
+        config, _graph = self.load_with_graph(path)
+        return config
+
+    def load_with_graph(self, path: str | Path) -> tuple[WorkflowConfig, IncludedFilesGraph]:
+        """Load a workflow configuration and record include provenance.
+
+        Behaves exactly like :meth:`load` (same file, error, and validation
+        semantics) and additionally returns an :class:`IncludedFilesGraph`
+        describing every file read: the root workflow file first, then each
+        ``!file``/``!yamlfile`` include in read order.
+
+        Args:
+            path: Path to the YAML configuration file.
+
+        Returns:
+            A tuple of the validated WorkflowConfig object and the include
+            provenance graph for this load.
+
+        Raises:
+            ConfigurationError: If the file cannot be read, contains invalid
+                YAML syntax, or fails schema validation.
+        """
         path = Path(path)
 
         if not path.exists():
@@ -247,22 +385,43 @@ class ConfigLoader:
             )
 
         try:
-            content = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
         except OSError as e:
             raise ConfigurationError(
                 f"Failed to read workflow file '{path}': {e}",
                 suggestion="Check file permissions and ensure the file is readable.",
             ) from e
 
-        # Set !file resolution state before loading
-        resolved = path.resolve()
-        self._constructor_cls._base_dir = resolved.parent
-        self._constructor_cls._file_stack = [str(resolved)]
+        # Set !file resolution state before loading, resetting the per-load
+        # include recorder at the same point _base_dir/_file_stack are set.
+        anchored = Path(os.path.abspath(os.path.normpath(path)))
+        resolved = anchored.resolve()
+        cls = self._constructor_cls
+        cls._base_dir = resolved.parent
+        cls._file_stack = [str(resolved)]
+        cls._included_files = []
+        # Record the root workflow file first: digest over its raw bytes,
+        # before any parsing or ${VAR} expansion.
+        cls._included_files.append(
+            IncludedFile(
+                path=resolved,
+                anchored_path=anchored,
+                logical_ref=str(path),
+                tag="workflow",
+                parent=None,
+                digest=_sha256_digest(raw),
+                size=len(raw),
+            )
+        )
+        content = _normalize_newlines(raw.decode("utf-8"))
         try:
-            return self.load_string(content, source_path=path)
+            config = self.load_string(content, source_path=path)
+            graph = IncludedFilesGraph(tuple(cls._included_files))
+            return config, graph
         finally:
-            self._constructor_cls._base_dir = Path(".")
-            self._constructor_cls._file_stack = []
+            cls._base_dir = Path(".")
+            cls._file_stack = []
+            cls._included_files = []
 
     def load_string(self, content: str, source_path: Path | None = None) -> WorkflowConfig:
         """Load a workflow configuration from a YAML string.
@@ -282,10 +441,28 @@ class ConfigLoader:
         # Set !file resolution state if not already set by load()
         state_needs_reset = not self._constructor_cls._file_stack
         if state_needs_reset:
+            self._constructor_cls._included_files = []
             if source_path is not None:
-                resolved = Path(source_path).resolve()
+                anchored = Path(os.path.abspath(os.path.normpath(source_path)))
+                resolved = anchored.resolve()
                 self._constructor_cls._base_dir = resolved.parent
                 self._constructor_cls._file_stack = [str(resolved)]
+                # Record the root workflow file first. The raw bytes are not
+                # re-read here (zero extra file I/O), so the digest is over
+                # the UTF-8 encoding of the provided content; callers that
+                # need raw-byte digests should use load()/load_config().
+                encoded = content.encode("utf-8")
+                self._constructor_cls._included_files.append(
+                    IncludedFile(
+                        path=resolved,
+                        anchored_path=anchored,
+                        logical_ref=str(source_path),
+                        tag="workflow",
+                        parent=None,
+                        digest=_sha256_digest(encoded),
+                        size=len(encoded),
+                    )
+                )
             else:
                 self._constructor_cls._base_dir = Path.cwd()
                 self._constructor_cls._file_stack = []
@@ -338,6 +515,7 @@ class ConfigLoader:
             if state_needs_reset:
                 self._constructor_cls._base_dir = Path(".")
                 self._constructor_cls._file_stack = []
+                self._constructor_cls._included_files = []
 
     def _validate(self, data: dict[str, Any], source: str) -> WorkflowConfig:
         """Validate configuration data against the Pydantic schema.
@@ -393,6 +571,28 @@ def load_config(path: str | Path) -> WorkflowConfig:
     """
     loader = ConfigLoader()
     return loader.load(path)
+
+
+def load_config_with_graph(path: str | Path) -> tuple[WorkflowConfig, IncludedFilesGraph]:
+    """Load a workflow configuration and return its include provenance graph.
+
+    Behaves exactly like :func:`load_config` — same file, error, and
+    validation semantics, with zero additional file I/O — and additionally
+    returns an :class:`IncludedFilesGraph` recording the root workflow file
+    (first) and every ``!file``/``!yamlfile`` include in read order.
+
+    Args:
+        path: Path to the YAML configuration file.
+
+    Returns:
+        A tuple of the validated WorkflowConfig object and the include
+        provenance graph for this load.
+
+    Raises:
+        ConfigurationError: If loading or validation fails.
+    """
+    loader = ConfigLoader()
+    return loader.load_with_graph(path)
 
 
 def load_config_string(content: str, source_path: Path | None = None) -> WorkflowConfig:

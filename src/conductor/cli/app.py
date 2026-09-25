@@ -52,6 +52,7 @@ app = typer.Typer(
 )
 
 # Register subcommand groups
+from conductor.cli.bundle import bundle_app  # noqa: E402
 from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
 from conductor.cli.fleet import fleet_app  # noqa: E402
 from conductor.cli.gate import gate_app  # noqa: E402
@@ -65,6 +66,7 @@ app.add_typer(mcp_app, rich_help_panel="Environment")
 app.add_typer(gate_app, rich_help_panel="Interact")
 app.add_typer(checkpoint_app, rich_help_panel="State")
 app.add_typer(fleet_app, rich_help_panel="Run & Recover")
+app.add_typer(bundle_app, rich_help_panel="Author & Inspect")
 
 # Rich console for formatted output
 console = make_console(stderr=True)

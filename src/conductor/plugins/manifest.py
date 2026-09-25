@@ -147,6 +147,9 @@ class PluginManifest:
     itself is misleading (e.g. a Copilot build symlinked into a
     ``~/.claude/plugins/`` tree)."""
 
+    mcp_source: Path | None = None
+    """File that supplied ``mcp_servers``, or ``None`` for inline declarations."""
+
     def __post_init__(self) -> None:
         """Enforce the invariants the field docstrings above assert.
 
@@ -346,7 +349,9 @@ def _validate_servers(servers: dict[str, Any], source: Path) -> dict[str, Any]:
     return dict(servers)
 
 
-def _load_mcp_servers(root: Path, parsed: dict[str, Any], manifest: Path) -> dict[str, Any]:
+def _load_mcp_servers(
+    root: Path, parsed: dict[str, Any], manifest: Path
+) -> tuple[dict[str, Any], Path | None]:
     """Resolve a plugin's MCP server declarations.
 
     Three forms, in precedence order:
@@ -385,10 +390,10 @@ def _load_mcp_servers(root: Path, parsed: dict[str, Any], manifest: Path) -> dic
                 f"Plugin manifest at {manifest} points 'mcpServers' at {source}, "
                 f"which could not be read: {exc}"
             ) from exc
-        return _validate_servers(_unwrap_mcp_document(payload, source), source)
+        return _validate_servers(_unwrap_mcp_document(payload, source), source), source
 
     if isinstance(declared, dict):
-        return _validate_servers(_unwrap_mcp_document(declared, manifest), manifest)
+        return _validate_servers(_unwrap_mcp_document(declared, manifest), manifest), None
 
     if declared is not None:
         raise PluginManifestError(
@@ -403,13 +408,13 @@ def _load_mcp_servers(root: Path, parsed: dict[str, Any], manifest: Path) -> dic
         # then skip the read_text() that used to surface it, silently
         # resolving an unreadable declaration as "no servers" (issue #540).
         if not is_file_strict(fallback):
-            return {}
+            return {}, None
         payload = json.loads(fallback.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise PluginManifestError(
             f"MCP declaration at {fallback} could not be read: {exc}"
         ) from exc
-    return _validate_servers(_unwrap_mcp_document(payload, fallback), fallback)
+    return _validate_servers(_unwrap_mcp_document(payload, fallback), fallback), fallback
 
 
 def read_manifest_name(manifest: Path) -> str:
@@ -460,10 +465,12 @@ def read_plugin_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> P
         conventions = ", ".join(str(candidate) for candidate in PLUGIN_MANIFESTS)
         raise PluginManifestError(f"{root} is not a plugin: it contains none of {conventions}.")
     parsed = _parse_manifest_json(manifest)
+    mcp_servers, mcp_source = _load_mcp_servers(root, parsed, manifest)
     return PluginManifest(
         name=_read_manifest_name(manifest, parsed),
         root=root,
         path=manifest,
-        mcp_servers=_load_mcp_servers(root, parsed, manifest),
+        mcp_servers=mcp_servers,
+        mcp_source=mcp_source,
         flavor=manifest_flavor(manifest, root),
     )

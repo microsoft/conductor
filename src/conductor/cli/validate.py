@@ -7,6 +7,7 @@ without executing them, displaying detailed error information.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -116,6 +117,13 @@ def validate_workflow(
     _report_plugins(config, workflow_path, output_console)
     if manifest is not None and resolved_environment is not None:
         _report_execution_resolution(manifest, resolved_environment, output_console)
+        if not _report_bundle_closure(
+            config,
+            workflow_path,
+            resolved_environment,
+            output_console,
+        ):
+            return False, None
     _report_mcp(config, output_console)
     _report_telemetry_sdk(output_console)
 
@@ -149,6 +157,90 @@ def _report_execution_resolution(
         profiles.add_row(step, resolution.profile, resolution.backend)
     console.print(profiles)
     console.print(styled("  [dim]Audit: {}[/dim]", manifest.audit.classification))
+
+
+def _report_bundle_closure(
+    _config: WorkflowConfig,
+    workflow_path: Path,
+    environment: ResolvedEnvironment,
+    console: MarkupFreeConsole,
+) -> bool:
+    """Collect and report the workflow's offline bundle closure.
+
+    Args:
+        _config: The validated workflow configuration. The collector reloads it
+            with include provenance, so this argument documents that the report
+            belongs to the already validated configuration.
+        workflow_path: Path to the root workflow file.
+        environment: Resolved execution environment linked to the closure.
+        console: Rich console for output.
+
+    Returns:
+        ``True`` when collection completed or was deferred only by uncached
+        plugin sources; ``False`` for a validation-blocking bundle error.
+    """
+    from conductor.bundle.collector import collect_bundle
+    from conductor.bundle.errors import BundleError
+
+    warnings: list[str] = []
+    try:
+        collected = collect_bundle(
+            workflow_path,
+            environment=environment,
+            allow_network=False,
+            on_warning=warnings.append,
+        )
+    except BundleError as error:
+        display_validation_error(error, workflow_path, console)
+        return False
+
+    console.print(Text.from_markup("\n[bold]Bundle Closure[/bold]"))
+    descriptor = collected.descriptor
+    if descriptor.incomplete:
+        console.print(styled("  [yellow]Status:[/yellow] incomplete"))
+        for dependency in descriptor.incomplete:
+            console.print(styled("  [yellow]⚠[/yellow] Missing from cache: {}", dependency))
+        for warning in warnings:
+            console.print(styled("  [yellow]⚠[/yellow] {}", warning))
+        return True
+
+    console.print(styled("  [green]Status:[/green] complete"))
+    console.print(styled("  [dim]Bundle digest:[/dim] {}", descriptor.bundle_digest))
+
+    counts = Counter(entry.origin_kind for entry in collected.entries)
+    origins = Table(show_header=True, header_style="bold", box=None)
+    origins.add_column("Origin")
+    origins.add_column("Entries", justify="right")
+    for origin_kind, count in sorted(counts.items()):
+        origins.add_row(origin_kind, str(count))
+    console.print(origins)
+
+    total_size = sum(entry.size for entry in collected.entries)
+    roots = sorted({_bundle_entry_root(entry.logical_path) for entry in collected.entries})
+    console.print(styled("  [dim]Total size:[/dim] {} bytes", total_size))
+    console.print(styled("  [dim]Roots:[/dim] {}", ", ".join(roots)))
+
+    git = descriptor.provenance.git
+    if git is None:
+        console.print(Text.from_markup("  [dim]Dirty: unavailable (not a git work tree)[/dim]"))
+    elif git.dirty:
+        console.print(styled("  [yellow]Dirty:[/yellow] {}", ", ".join(git.dirty)))
+    else:
+        console.print(Text.from_markup("  [dim]Dirty: clean[/dim]"))
+
+    for warning in warnings:
+        console.print(styled("  [yellow]⚠[/yellow] {}", warning))
+    return True
+
+
+def _bundle_entry_root(logical_path: str) -> str:
+    """Return the materialization root represented by a logical bundle path."""
+    parts = logical_path.split("/")
+    if len(parts) < 3:
+        return logical_path
+    if parts[1] == "registry" and len(parts) >= 4:
+        return "/".join(parts[:4])
+    return "/".join(parts[:3])
 
 
 def _report_telemetry_sdk(console: MarkupFreeConsole) -> None:
