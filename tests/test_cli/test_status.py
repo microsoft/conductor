@@ -30,7 +30,13 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
-from conductor.cli.app import _format_started_at, _print_running_list, app
+from conductor.billing import AggregateBilling
+from conductor.cli.app import (
+    _format_started_at,
+    _format_terminal_cost,
+    _print_running_list,
+    app,
+)
 from conductor.fleet.records import RunRecord, TerminalRunRecord
 
 runner = CliRunner()
@@ -137,6 +143,8 @@ def _write_terminal(
     output: dict | None = None,
     total_tokens: int | None = None,
     total_cost_usd: float | None = None,
+    unpriced_agent_count: int = 0,
+    billing: AggregateBilling | None = None,
 ) -> TerminalRunRecord:
     """Write a terminal run record via the real ``write_terminal_record`` (E4).
 
@@ -159,10 +167,11 @@ def _write_terminal(
         error_message=error_message,
         total_tokens=total_tokens,
         total_cost_usd=total_cost_usd,
-        unpriced_agent_count=0,
+        unpriced_agent_count=unpriced_agent_count,
         event_log_path="/tmp/conductor/completed-wf.events.jsonl",
         bg_stderr_log=None,
         bg_stdout_log=None,
+        billing=billing,
     )
     write_terminal_record(record)
     return record
@@ -758,3 +767,109 @@ class TestStatusJsonCompletedRuns:
 
         payload = json.loads(result.stdout)
         assert payload["completed"] == []
+
+
+_SUBSCRIPTION = AggregateBilling({"subscription": 2})
+_UNKNOWN = AggregateBilling({"unknown": 1})
+_MIXED = AggregateBilling({"subscription": 2, "metered_api": 1})
+_METERED = AggregateBilling({"metered_api": 3})
+_UNSTATED = AggregateBilling({"unstated": 2})
+
+
+def _terminal(**overrides: object) -> TerminalRunRecord:
+    fields: dict[str, object] = {
+        "run_id": "abc12345",
+        "workflow_path": "/tmp/wf.yaml",
+        "workflow_name": "wf",
+        "started_at": "2026-03-03T00:00:00+00:00",
+        "ended_at": "2026-03-03T00:05:00+00:00",
+        "status": "success",
+        "output": {},
+        "error_type": None,
+        "error_message": None,
+        "total_tokens": 10,
+        "total_cost_usd": 0.42,
+        "unpriced_agent_count": 0,
+        "event_log_path": "",
+        "bg_stderr_log": None,
+        "bg_stdout_log": None,
+    }
+    fields.update(overrides)
+    return TerminalRunRecord(**fields)  # type: ignore[arg-type]
+
+
+class TestTerminalCostCellBilling:
+    """Exact strings the ``status`` cost cell renders for each billing state."""
+
+    @pytest.mark.parametrize(
+        ("billing", "unpriced", "expected"),
+        [
+            (None, 0, "~$0.42"),
+            (_UNSTATED, 0, "~$0.42"),
+            (_METERED, 0, "~$0.42"),
+            (_SUBSCRIPTION, 0, "~$0.42 (API-equivalent estimate)"),
+            (_UNKNOWN, 0, "~$0.42 (billing source unknown)"),
+            (_MIXED, 0, "~$0.42 (mixed billing)"),
+            (None, 2, "~$0.42 (2 unpriced)"),
+            (_METERED, 2, "~$0.42 (2 unpriced)"),
+            (_SUBSCRIPTION, 2, "~$0.42 (API-equivalent estimate) (2 unpriced)"),
+            (_UNKNOWN, 2, "~$0.42 (billing source unknown) (2 unpriced)"),
+            (_MIXED, 2, "~$0.42 (mixed billing) (2 unpriced)"),
+        ],
+    )
+    def test_cost_cell_for_each_state(
+        self, billing: AggregateBilling | None, unpriced: int, expected: str
+    ) -> None:
+        record = _terminal(billing=billing, unpriced_agent_count=unpriced)
+        assert _format_terminal_cost(record) == expected
+
+    @pytest.mark.parametrize("billing", [None, _SUBSCRIPTION, _UNKNOWN, _MIXED])
+    def test_no_figure_never_carries_a_label(self, billing: AggregateBilling | None) -> None:
+        assert _format_terminal_cost(_terminal(total_cost_usd=None, billing=billing)) == "—"
+        only_unpriced = _terminal(total_cost_usd=None, unpriced_agent_count=3, billing=billing)
+        assert _format_terminal_cost(only_unpriced) == "(3 unpriced)"
+
+    def test_status_table_renders_the_label(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir, total_tokens=10, total_cost_usd=0.42, billing=_SUBSCRIPTION)
+        result = runner.invoke(app, ["status"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0
+        assert "~$0.42 (API-equivalent estimate)" in _squash_keep_spaces(result.output)
+
+    def test_status_table_without_billing_is_unchanged(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir, total_tokens=10, total_cost_usd=0.42)
+        result = runner.invoke(app, ["status"], env={"COLUMNS": "200"})
+        assert "~$0.42" in result.output
+        assert "estimate" not in result.output and "billing" not in result.output
+
+
+def _squash_keep_spaces(text: str) -> str:
+    """Drop box-drawing characters but keep single spaces, so a cell reads as written."""
+    return re.sub(r" +", " ", re.sub(r"[\u2500-\u257f]", " ", text))
+
+
+class TestStatusJsonBilling:
+    """``status --json``'s completed entries always carry a ``billing`` key.
+
+    It is ``null`` when nothing was stated and an ``{state, breakdown}`` object otherwise,
+    never an omitted key: a machine consumer can rely on the key's presence.
+    """
+
+    def test_billing_is_null_when_not_stated(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir)
+        payload = json.loads(runner.invoke(app, ["status", "--json"]).stdout)
+        entry = payload["completed"][0]
+        assert "billing" in entry
+        assert entry["billing"] is None
+
+    def test_unstated_only_billing_is_null(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir, billing=_UNSTATED)
+        payload = json.loads(runner.invoke(app, ["status", "--json"]).stdout)
+        assert payload["completed"][0]["billing"] is None
+
+    def test_billing_carries_state_and_breakdown(self, pid_tmpdir: Path) -> None:
+        _write_terminal(pid_tmpdir, total_cost_usd=0.42, billing=_MIXED)
+        payload = json.loads(runner.invoke(app, ["status", "--json"]).stdout)
+        assert payload["completed"][0]["billing"] == {
+            "state": "mixed",
+            "breakdown": {"subscription": 2, "metered_api": 1},
+        }

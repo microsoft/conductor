@@ -38,6 +38,7 @@ from textual.screen import Screen
 from textual.timer import Timer
 from textual.widgets import DataTable, Footer, Header, Static
 
+from conductor.billing import AggregateBilling, cell_legend
 from conductor.console import styled
 from conductor.fleet.records import RunRecord
 from conductor.fleet.summary import (
@@ -47,7 +48,7 @@ from conductor.fleet.summary import (
     derive_run_detail,
     derive_run_summary,
 )
-from conductor.fleet.tui.theme import loading_text, muted, status_label
+from conductor.fleet.tui.theme import format_cost_text, loading_text, muted, status_label
 from conductor.fleet.tui.widgets import highlighted_row_key
 
 if TYPE_CHECKING:
@@ -113,12 +114,14 @@ def _format_agent_tokens(tokens: int | None) -> str:
     return f"{tokens} tok"
 
 
-def _format_agent_cost(cost_usd: float | None) -> str:
+def _format_agent_cost(cost_usd: float | None, billing: AggregateBilling | None = None) -> str:
     """Render a single agent's cost, or ``"—"`` when unavailable (no
-    completion yet, or the model was unpriced)."""
-    if cost_usd is None:
-        return "—"
-    return f"~${cost_usd:.2f}"
+    completion yet, or the model was unpriced).
+
+    A figure whose executions stated a billing source also carries the compact label; a row
+    with no dollar figure never does. ``billing=None`` is byte-identical to the old output.
+    """
+    return format_cost_text(cost_usd, 0, billing)
 
 
 def _collect_detail(record: RunRecord) -> tuple[RunSummary | None, RunDetail | None]:
@@ -283,6 +286,9 @@ class RunDetailScreen(Screen):
         yield Static(id="run-inputs")
         yield Static(loading_text(), id="detail-loading", classes="notice")
         yield DataTable(id="detail-table")
+        # Expands the compact billing labels visible in the table (``est.``, ``src?``,
+        # ``mixed``); hidden unless at least one row carries one.
+        yield Static(id="detail-cost-legend", classes="summary-bar")
         yield Static(_PLACEHOLDER_TEXT, id="detail-placeholder")
         yield Footer()
 
@@ -291,6 +297,7 @@ class RunDetailScreen(Screen):
         table.add_columns("Agent", "Type", "Status", "Elapsed", "Tokens", "Cost")
         table.cursor_type = "row"
         self.query_one("#run-inputs", Static).display = False
+        self.query_one("#detail-cost-legend", Static).display = False
         # Hidden until the first collector result lands (issue #437); the
         # title is still painted immediately from the record, since it
         # needs no I/O -- "seeded from the record, then corrected" matching
@@ -373,12 +380,15 @@ class RunDetailScreen(Screen):
             self._display_name = detail.workflow_name
         self._update_title(title)
 
+        legend_widget = self.query_one("#detail-cost-legend", Static)
+
         if detail is None or detail.topology is None or not detail.agents:
             # A missing/unreadable event log, or one with no (yet-visible)
             # workflow_started event, degrades gracefully to a placeholder
             # (E9-T5) rather than an empty table or a crash.
             table.display = False
             placeholder.display = True
+            legend_widget.display = False
             table.clear()
             self.refresh_bindings()
             return
@@ -413,6 +423,12 @@ class RunDetailScreen(Screen):
             with contextlib.suppress(Exception):
                 table.move_cursor(row=min(previous_row, table.row_count - 1))
 
+        # Built from the rows that show a dollar figure, so it lists exactly the compact
+        # codes visible in the table and appears only when at least one is.
+        legend = cell_legend(a.billing for a in detail.agents if a.cost_usd is not None)
+        legend_widget.display = legend is not None
+        legend_widget.update(Text(legend or "", style="dim"))
+
         # The row set just changed shape (agents complete, fail, or start
         # running on every poll tick), so the footer's `enter` label needs
         # re-evaluating the same way a cursor move would.
@@ -436,6 +452,6 @@ class RunDetailScreen(Screen):
             _agent_status_cell(agent.status),
             Text(_format_duration(agent.elapsed_seconds())),
             Text(_format_agent_tokens(agent.tokens)),
-            Text(_format_agent_cost(agent.cost_usd)),
+            Text(_format_agent_cost(agent.cost_usd, agent.billing)),
             key=key,
         )

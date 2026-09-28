@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from conductor.billing import BillingMode
 from conductor.exceptions import ProviderError
 
 if TYPE_CHECKING:
@@ -190,6 +191,14 @@ class AgentOutput:
     executor branches on. The value is provider-opaque: it must never be
     handed to a different provider, and it is in-memory only — it is never
     serialized to checkpoints or event logs.
+    """
+
+    billing_mode: BillingMode | None = None
+    """Where this execution's model usage is billed, when the provider can prove it.
+
+    ``None`` means the provider makes no statement (every provider except
+    ``claude-agent-sdk`` today) and renders exactly as before. ``"unknown"`` is an explicit
+    "could not be proven". Never a credential, account, or free text.
     """
 
 

@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 from rich.text import Text
 
+from conductor.billing import AggregateBilling
 from conductor.fleet.tui.theme import (
     EMPTY,
     STATUS_STYLES,
     empty_cell,
+    format_cost_text,
     mode_label,
     muted,
     shorten_home,
@@ -126,3 +128,85 @@ class TestShortenHome:
     ) -> None:
         monkeypatch.setattr(Path, "home", lambda: Path("/home/jason"))
         assert shorten_home("/home/jasonx/proj") == str(Path("/home/jasonx/proj"))
+
+
+def _previous_format_cost(total: float | None, unpriced: int) -> str:
+    """The formatter that existed before billing provenance (the oracle for byte-identity)."""
+    if total is None:
+        if unpriced > 0:
+            return f"({unpriced} unpriced)"
+        return "\u2014"
+    if unpriced > 0:
+        return f"~${total:.2f} ({unpriced} unpriced)"
+    return f"~${total:.2f}"
+
+
+_SUB = AggregateBilling({"subscription": 2})
+_UNK = AggregateBilling({"unknown": 1})
+_MIXED = AggregateBilling({"subscription": 1, "metered_api": 1})
+_METERED = AggregateBilling({"metered_api": 2})
+_UNSTATED = AggregateBilling({"unstated": 3})
+
+
+class TestFormatCostText:
+    """``format_cost_text`` is the one Fleet cost formatter (issue #265's ``~$X (N unpriced)``
+    convention, plus the compact billing label): every Fleet screen that renders a cost cell
+    calls this function rather than formatting a total itself."""
+
+    @pytest.mark.parametrize(
+        ("total", "unpriced", "billing", "expected"),
+        [
+            # no contributing event / legacy / metered: no label, ever
+            (None, 0, None, EMPTY),
+            (0.0, 0, None, "~$0.00"),
+            (0.42, 0, None, "~$0.42"),
+            (0.42, 0, _UNSTATED, "~$0.42"),
+            (0.42, 0, _METERED, "~$0.42"),
+            (0.42, 2, _UNSTATED, "~$0.42 (2 unpriced)"),
+            (0.42, 2, _METERED, "~$0.42 (2 unpriced)"),
+            # labelled, with and without unpriced executions
+            (0.42, 0, _SUB, "~$0.42 est."),
+            (0.42, 2, _SUB, "~$0.42 est. (2 unpriced)"),
+            (0.42, 0, _UNK, "~$0.42 src?"),
+            (0.42, 2, _UNK, "~$0.42 src? (2 unpriced)"),
+            (0.42, 0, _MIXED, "~$0.42 mixed"),
+            (0.42, 2, _MIXED, "~$0.42 mixed (2 unpriced)"),
+            # no dollar figure: never a label
+            (None, 2, _SUB, "(2 unpriced)"),
+            (None, 2, _UNK, "(2 unpriced)"),
+            (None, 0, _MIXED, EMPTY),
+        ],
+    )
+    def test_format_cost_text_table(
+        self, total: float | None, unpriced: int, billing: AggregateBilling | None, expected: str
+    ) -> None:
+        assert format_cost_text(total, unpriced, billing) == expected
+
+    @pytest.mark.parametrize("billing", [None, _UNSTATED, _METERED, AggregateBilling({})])
+    def test_unlabelled_output_is_byte_identical_to_the_previous_formatter(
+        self, billing: AggregateBilling | None
+    ) -> None:
+        totals = [None, 0.0, 0.004, 0.005, 0.0149, 0.42, 1.0, 12.345, 1234.5]
+        for total in totals:
+            for unpriced in (0, 1, 2, 7):
+                assert format_cost_text(total, unpriced, billing) == _previous_format_cost(
+                    total, unpriced
+                ), (total, unpriced)
+
+    def test_label_precedes_the_unpriced_suffix(self) -> None:
+        text = format_cost_text(0.42, 3, _SUB)
+        assert text.index("est.") < text.index("(3 unpriced)")
+
+    @pytest.mark.parametrize("billing", [_SUB, _UNK, _MIXED])
+    def test_label_never_added_without_a_dollar_figure(self, billing: AggregateBilling) -> None:
+        for unpriced in (0, 1, 5):
+            text = format_cost_text(None, unpriced, billing)
+            assert text == _previous_format_cost(None, unpriced)
+            assert not any(label in text for label in ("est.", "src?", "mixed"))
+
+    @pytest.mark.parametrize("billing", [_SUB, _UNK, _MIXED])
+    def test_labelled_cell_grows_by_at_most_six_characters(self, billing: AggregateBilling) -> None:
+        for unpriced in (0, 2):
+            labelled = format_cost_text(12.345, unpriced, billing)
+            plain = format_cost_text(12.345, unpriced, None)
+            assert 0 < len(labelled) - len(plain) <= 6

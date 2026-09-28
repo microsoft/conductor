@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from conductor.billing import BillingMode, aggregate_label
 from conductor.config.environment import ResolvedEnvironment, builtin_local_environment
 from conductor.config.schema import (
     AgentDef,
@@ -465,6 +466,16 @@ def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
         "answered_count": output["answered_count"],
         "skipped_count": output["skipped_count"],
     }
+
+
+def _billing_mode_field(mode: BillingMode | None) -> dict[str, BillingMode]:
+    """Event fragment carrying one execution's billing provenance.
+
+    Empty when the provider stated none, so an absent key and ``None`` mean the same thing
+    and a legacy provider's events are unchanged. ``mode`` is the value the usage tracker
+    already coerced (``UsageTracker.record``), never a raw provider attribute.
+    """
+    return {"billing_mode": mode} if mode is not None else {}
 
 
 class WorkflowEngine:
@@ -1222,6 +1233,7 @@ class WorkflowEngine:
 
         budget = result.budget_usd
         spent = result.spent_usd
+        billing_wire = summary.billing.to_wire()
 
         if result.should_emit:
             self._emit(
@@ -1231,12 +1243,16 @@ class WorkflowEngine:
                     "spent_usd": spent,
                     "budget_mode": self.limits.budget_mode,
                     "current_agent": self.limits.current_agent,
+                    **({"billing": billing_wire} if billing_wire is not None else {}),
                 },
             )
 
         if self.limits.budget_mode == "enforce":
+            billing_label = aggregate_label(summary.billing, detailed=True)
+            billing_suffix = f" ({billing_label})" if billing_label else ""
             raise BudgetExceededError(
-                f"Workflow exceeded cost budget (${budget:.2f}): spent ${spent:.2f}",
+                f"Workflow exceeded cost budget (${budget:.2f}): spent ${spent:.2f}"
+                f"{billing_suffix}",
                 budget_usd=budget,  # type: ignore[arg-type]  # non-None when exceeded
                 spent_usd=spent,
                 current_agent=self.limits.current_agent,
@@ -5115,10 +5131,12 @@ class WorkflowEngine:
         _v_elapsed = _time.time() - _v_start
 
         v_cost: float | None = None
+        v_billing_mode: BillingMode | None = None
         if outcome.output is not None:
             await self._ensure_pricing_resolved(agent, outcome.output.model)
             v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
             v_cost = v_usage.cost_usd
+            v_billing_mode = v_usage.billing_mode
 
         out = outcome.output
         _emit_v(
@@ -5133,6 +5151,7 @@ class WorkflowEngine:
                 "output_tokens": out.output_tokens if out else None,
                 "cost_usd": v_cost,
                 "elapsed": _v_elapsed,
+                **_billing_mode_field(v_billing_mode),
             },
         )
 
@@ -6384,6 +6403,7 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
+                                **_billing_mode_field(usage.billing_mode),
                                 **await self._context_window_fields(resolved_agent, output),
                             },
                         )
@@ -7433,6 +7453,7 @@ class WorkflowEngine:
                         "input_tokens": output.input_tokens,
                         "output_tokens": output.output_tokens,
                         "cost_usd": usage.cost_usd,
+                        **_billing_mode_field(usage.billing_mode),
                         **await self._context_window_fields(resolved_agent, output),
                     },
                 )
@@ -7857,6 +7878,7 @@ class WorkflowEngine:
                         },
                     )
 
+                    child_billing = child_usage.billing.to_wire()
                     self._emit(
                         "for_each_item_completed",
                         {
@@ -7867,6 +7889,7 @@ class WorkflowEngine:
                             "tokens": child_usage.total_tokens,
                             "cost_usd": child_usage.total_cost_usd or 0.0,
                             "output": output_content,
+                            **({"billing": child_billing} if child_billing is not None else {}),
                         },
                     )
                     return (key, output_content)
@@ -8034,6 +8057,7 @@ class WorkflowEngine:
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
                         "output": output.content,
+                        **_billing_mode_field(usage.billing_mode),
                     },
                 )
 
@@ -8525,6 +8549,8 @@ class WorkflowEngine:
             "live_pricing_degraded": self._pricing_hook_silent_warned,
             "unpriced_agent_count": len(usage.unpriced_agents),
             "unpriced_models": usage.unpriced_models,
+            # Always present; ``None`` when no execution stated its billing source.
+            "billing": usage.billing.to_wire(),
             "agents": [
                 {
                     "agent_name": a.agent_name,
@@ -8533,6 +8559,7 @@ class WorkflowEngine:
                     "output_tokens": a.output_tokens,
                     "cost_usd": a.cost_usd,
                     "elapsed_seconds": a.elapsed_seconds,
+                    **_billing_mode_field(a.billing_mode),
                 }
                 for a in usage.agents
             ],

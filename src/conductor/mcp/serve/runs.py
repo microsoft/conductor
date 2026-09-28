@@ -212,6 +212,9 @@ def _live_status_payload(lookup: RunLookup) -> dict[str, Any]:
         "total_tokens": summary.total_tokens,
         "total_cost_usd": summary.total_cost_usd,
         "unpriced_agent_count": summary.unpriced_agent_count,
+        # Fleet-scanner basis (the same events as ``total_cost_usd`` above), unlike the
+        # engine-basis ``billing`` on a terminal payload; never compare across sources.
+        "billing": summary.billing.to_wire() if summary.billing is not None else None,
         "url": url,
     }
     if summary.status == "at-gate" and summary.gate is not None:
@@ -255,6 +258,8 @@ def _terminal_status_payload(lookup: RunLookup) -> dict[str, Any]:
         "total_tokens": terminal.total_tokens,
         "total_cost_usd": terminal.total_cost_usd,
         "unpriced_agent_count": terminal.unpriced_agent_count,
+        # Engine basis (the terminal record), unlike the live and event-log payloads.
+        "billing": terminal.billing.to_wire() if terminal.billing is not None else None,
     }
 
 
@@ -282,6 +287,8 @@ def _event_log_status_payload(lookup: RunLookup) -> dict[str, Any]:
         "total_tokens": scan.total_tokens,
         "total_cost_usd": scan.total_cost_usd,
         "unpriced_agent_count": scan.unpriced_agent_count,
+        # Fleet-scanner basis: counted by ``_scan_events`` beside ``total_cost_usd``.
+        "billing": scan.billing.to_wire() if scan.billing is not None else None,
         "event_log_path": str(path),
         "note": (
             "No live or terminal run record exists for this run_id -- its process most "

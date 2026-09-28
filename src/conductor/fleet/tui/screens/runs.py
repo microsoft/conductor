@@ -44,6 +44,7 @@ from textual.screen import Screen
 from textual.timer import Timer
 from textual.widgets import DataTable, Header, Static
 
+from conductor.billing import AggregateBilling, aggregate_label, cell_label, estimate_note
 from conductor.console import styled
 from conductor.fleet.records import RunRecord, read_run_records
 from conductor.fleet.summary import (
@@ -75,6 +76,7 @@ from conductor.fleet.tui.notify import TransitionNotifier, emit_terminal_notific
 from conductor.fleet.tui.theme import (
     EMPTY,
     empty_cell,
+    format_cost_text,
     loading_text,
     mode_label,
     muted,
@@ -171,15 +173,11 @@ def _format_cost(summary: RunSummary) -> str:
 
     Mirrors ``WorkflowUsage``'s ``~$X (N unpriced)`` convention (issue
     #265, reused by E6-T4): an unpriced agent is surfaced as a count
-    alongside the total rather than silently summed in as zero.
+    alongside the total rather than silently summed in as zero. A figure whose
+    executions stated a billing source also carries the compact label (``est.``,
+    ``src?``, ``mixed``); see :func:`conductor.fleet.tui.theme.format_cost_text`.
     """
-    if summary.total_cost_usd is None:
-        if summary.has_unpriced:
-            return f"({summary.unpriced_agent_count} unpriced)"
-        return "—"
-    if summary.has_unpriced:
-        return f"~${summary.total_cost_usd:.2f} ({summary.unpriced_agent_count} unpriced)"
-    return f"~${summary.total_cost_usd:.2f}"
+    return format_cost_text(summary.total_cost_usd, summary.unpriced_agent_count, summary.billing)
 
 
 def _started_cell(started_at: str | None) -> Text:
@@ -324,11 +322,16 @@ def _summary_bar_text(summaries: list[RunSummary]) -> Text:
     if total_tokens > 0:
         parts.append(muted(_format_tokens(total_tokens)))
 
-    priced = [s.total_cost_usd for s in summaries if s.total_cost_usd is not None]
+    priced = [s for s in summaries if s.total_cost_usd is not None]
     if priced:
         unpriced = any(s.has_unpriced for s in summaries)
-        total = sum(priced)
-        parts.append(muted(f"~${total:.2f}{' (partial)' if unpriced else ''}"))
+        total = sum(s.total_cost_usd or 0.0 for s in priced)
+        # The label describes only the runs folded into `total` (those with a priced figure),
+        # not every run in the fleet: a run with no dollar figure contributes nothing to the
+        # sum and so must not colour the label. ``(partial)`` keeps its existing all-runs meaning.
+        label = cell_label(AggregateBilling.combine(s.billing for s in priced))
+        text = f"~${total:.2f}" + (f" {label}" if label else "")
+        parts.append(muted(text + (" (partial)" if unpriced else "")))
 
     line = Text()
     for index, part in enumerate(parts):
@@ -336,6 +339,31 @@ def _summary_bar_text(summaries: list[RunSummary]) -> Text:
             line.append("  ·  ", style="dim")
         line.append_text(part)
     return line
+
+
+def _cost_basis_section(summary: RunSummary) -> Text:
+    """Full-text provenance for the Cost cell, or empty when the cell carries no label.
+
+    The row's compact code (``est.``, ``src?``, ``mixed``) needs an explanation somewhere
+    with room, and this pane is it. Deliberately does *not* restate the amount: the pane
+    never repeats a table column. Every string comes from :mod:`conductor.billing`
+    constants plus integer counts, and ``Text.append`` treats its argument literally, so no
+    logged value can reach the markup parser.
+    """
+    out = Text()
+    if summary.total_cost_usd is None:
+        return out
+    label = aggregate_label(summary.billing, detailed=True)
+    if label is None:
+        return out
+    out.append("Cost basis", style="bold")
+    out.append("  ")
+    out.append(label)
+    note = estimate_note(summary.billing)
+    if note is not None:
+        out.append("\n")
+        out.append(note, style="dim")
+    return out
 
 
 def _gate_section(gate: GateInfo, resolvable: bool, width: int, max_prompt_lines: int) -> Text:
@@ -444,15 +472,29 @@ def _preview_text(
     score_lines = len(score.plain.splitlines()) if score.plain else 0
     progress_lines = header_lines + score_lines
 
+    # The cost-basis text lives in ``main`` (rebuilt on polls and selection changes only),
+    # never in ``score`` or the animation tick (issue #462). It is measured before the gate
+    # section so a long gate prompt is clipped to what remains rather than pushing the pane
+    # past its height.
+    cost_basis = _cost_basis_section(summary)
+    cost_lines = len(cost_basis.plain.splitlines()) if cost_basis.plain else 0
+
     gate = summary.gate
     if gate is not None:
         budget = height - progress_lines - _GATE_CHROME_LINES
         if progress_lines:
             budget -= 1  # the blank line separating the two sections
+        if cost_lines:
+            budget -= cost_lines + 1  # the section plus its separating blank line
         main.append_text(_gate_section(gate, summary.gate_resolvable, width, max(1, budget)))
 
+    if cost_basis.plain:
+        if main.plain:
+            main.append("\n\n")
+        main.append_text(cost_basis)
+
     if header.plain:
-        if gate is not None:
+        if main.plain:
             main.append("\n\n")
         main.append_text(header)
         # No trailing newline here: `main` and `score` render as two

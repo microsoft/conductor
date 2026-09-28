@@ -194,6 +194,10 @@ export interface AgentCompletedData {
   context_window_max?: number;
   output?: unknown;
   output_keys?: string[];
+  /** Billing provenance of this execution (`metered_api` | `subscription` | `unknown`).
+   * Absent when the provider makes no statement. Typed `string` because a newer writer may
+   * send a value this version does not recognize (treated as `unknown`). */
+  billing_mode?: string | null;
 }
 
 export interface AgentFailedData {
@@ -459,6 +463,10 @@ export interface ParallelAgentCompletedData {
    * total; absent/null when the provider couldn't measure it (issue #412). */
   context_window_used?: number;
   context_window_max?: number;
+  /** Billing provenance of this execution (`metered_api` | `subscription` | `unknown`).
+   * Absent when the provider makes no statement. Typed `string` because a newer writer may
+   * send a value this version does not recognize (treated as `unknown`). */
+  billing_mode?: string | null;
 }
 
 export interface ParallelAgentFailedData {
@@ -504,6 +512,12 @@ export interface ForEachItemCompletedData {
   tokens?: number;
   cost_usd?: number;
   output?: unknown;
+  /** Billing provenance of this execution (`metered_api` | `subscription` | `unknown`).
+   * Absent when the provider makes no statement. Typed `string` because a newer writer may
+   * send a value this version does not recognize (treated as `unknown`). */
+  billing_mode?: string | null;
+  /** Aggregate provenance of a `type: workflow` item's child total (`{state, breakdown}`). */
+  billing?: { state?: string; breakdown?: Record<string, number> } | null;
 }
 
 export interface ForEachItemFailedData {
@@ -606,6 +620,8 @@ export interface AgentValidatorCompleteData {
   output_tokens?: number | null;
   cost_usd?: number | null;
   elapsed?: number;
+  /** Billing provenance of the validator call; absent when the provider states none. */
+  billing_mode?: string | null;
 }
 
 export interface AgentValidationFailedData {

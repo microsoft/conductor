@@ -569,3 +569,115 @@ class TestUsageIntegration:
         for agent in summary.agents:
             assert agent.cost_usd is not None
             assert agent.cost_usd > 0
+
+
+def _billing_output(
+    mode: object = None,
+    *,
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    model: str | None = "claude-sonnet-4",
+) -> AgentOutput:
+    return AgentOutput(
+        content={},
+        raw_response="{}",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        model=model,
+        billing_mode=mode,  # type: ignore[arg-type]
+    )
+
+
+class TestBillingProvenance:
+    """``AgentUsage.billing_mode`` (per execution) and ``WorkflowUsage.billing`` (aggregate)."""
+
+    def test_agent_usage_billing_mode_defaults_none(self) -> None:
+        assert _mk_usage("a", "m", 0.1).billing_mode is None
+
+    def test_record_copies_billing_mode(self) -> None:
+        tracker = UsageTracker()
+        row = tracker.record("a", _billing_output("subscription"), elapsed=1.0)
+        assert row.billing_mode == "subscription"
+        assert tracker.get_summary().agents[0].billing_mode == "subscription"
+
+    def test_record_with_mock_output_gives_none(self) -> None:
+        from unittest.mock import Mock
+
+        row = UsageTracker().record("a", Mock(), elapsed=1.0)
+        assert row.billing_mode is None
+
+    def test_record_unrecognized_string_becomes_unknown(self) -> None:
+        row = UsageTracker().record("a", _billing_output("bedrock"), elapsed=1.0)
+        assert row.billing_mode == "unknown"
+
+    def test_record_sandbox_row_has_no_billing_mode(self) -> None:
+        assert UsageTracker().record_sandbox("a (sandbox)", 2.0).billing_mode is None
+
+    def test_billing_excludes_zero_token_rows(self) -> None:
+        tracker = UsageTracker()
+        tracker.record("real", _billing_output("subscription"), elapsed=1.0)
+        tracker.record(
+            "empty",
+            _billing_output("metered_api", input_tokens=0, output_tokens=0),
+            elapsed=1.0,
+        )
+        assert dict(tracker.get_summary().billing.breakdown) == {"subscription": 1}
+
+    def test_billing_excludes_sandbox_rows(self) -> None:
+        tracker = UsageTracker()
+        tracker.record("real", _billing_output("subscription"), elapsed=1.0)
+        tracker.record_sandbox("real (sandbox)", 30.0)
+        assert dict(tracker.get_summary().billing.breakdown) == {"subscription": 1}
+
+    def test_billing_includes_unpriced_token_rows(self) -> None:
+        tracker = UsageTracker()
+        # No model: consumed tokens but unpriced (cost_usd is None).
+        row = tracker.record("u", _billing_output("subscription", model=None), elapsed=1.0)
+        assert row.cost_usd is None
+        assert dict(tracker.get_summary().billing.breakdown) == {"subscription": 1}
+
+    def test_billing_includes_validator_rows(self) -> None:
+        tracker = UsageTracker()
+        tracker.record("writer", _billing_output("subscription"), elapsed=1.0)
+        tracker.record("writer (validator)", _billing_output("metered_api"), elapsed=1.0)
+        billing = tracker.get_summary().billing
+        assert dict(billing.breakdown) == {"subscription": 1, "metered_api": 1}
+        assert billing.state == "mixed"
+
+    def test_billing_counts_repeated_executions(self) -> None:
+        tracker = UsageTracker()
+        for _ in range(3):
+            tracker.record("loop", _billing_output("subscription"), elapsed=1.0)
+        # Counts are executions, not distinct agents.
+        assert dict(tracker.get_summary().billing.breakdown) == {"subscription": 3}
+
+    def test_billing_counts_unstated_providers(self) -> None:
+        tracker = UsageTracker()
+        tracker.record("claude", _billing_output("subscription"), elapsed=1.0)
+        tracker.record("copilot", _billing_output(None), elapsed=1.0)
+        billing = tracker.get_summary().billing
+        assert dict(billing.breakdown) == {"subscription": 1, "unstated": 1}
+        assert billing.state == "mixed"
+
+    def test_legacy_only_usage_is_unstated_and_has_no_wire_form(self) -> None:
+        tracker = UsageTracker()
+        tracker.record("a", _billing_output(None), elapsed=1.0)
+        billing = tracker.get_summary().billing
+        assert billing.stated is False
+        assert billing.to_wire() is None
+
+    def test_empty_usage_has_empty_billing(self) -> None:
+        billing = WorkflowUsage(agents=[]).billing
+        assert dict(billing.breakdown) == {}
+        assert billing.to_wire() is None
+
+    def test_billing_after_merge_covers_child_rows(self) -> None:
+        parent = UsageTracker()
+        child = UsageTracker()
+        parent.record("p", _billing_output("metered_api"), elapsed=1.0)
+        child.record("c", _billing_output("subscription"), elapsed=1.0)
+        parent.merge(child.get_summary())
+        assert dict(parent.get_summary().billing.breakdown) == {
+            "subscription": 1,
+            "metered_api": 1,
+        }

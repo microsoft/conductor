@@ -1,4 +1,5 @@
 import type { NodeData } from '@/stores/workflow-store';
+import { modeLabel } from '@/lib/billing';
 
 interface ValidatorDetailProps {
   node: NodeData;
@@ -43,7 +44,10 @@ export function ValidatorDetail({ node }: ValidatorDetailProps) {
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-[var(--text-muted)]">
           {node.validator_model && <span>model: {node.validator_model}</span>}
           {node.validator_cost_usd != null && (
-            <span>cost: ${node.validator_cost_usd.toFixed(4)}</span>
+            <span>
+              cost: ${node.validator_cost_usd.toFixed(4)}
+              {modeLabel(node.validator_billing_mode) ? ` ${modeLabel(node.validator_billing_mode)}` : ''}
+            </span>
           )}
           {node.validator_attempts != null && node.validator_attempts > 1 && (
             <span>runs: {node.validator_attempts}</span>

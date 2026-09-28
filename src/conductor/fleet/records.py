@@ -71,6 +71,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Literal, cast, get_args
 
+from conductor.billing import AggregateBilling
 from conductor.cli import pid as cli_pid
 from conductor.run_id import RUN_ID_PATTERN_SOURCE
 from conductor.run_id import is_valid_run_id as is_valid_run_id
@@ -297,6 +298,19 @@ def _coerce_dict(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field} must be an object")
     return value
+
+
+def _coerce_billing(value: Any, field: str) -> AggregateBilling | None:
+    """Coerce a nullable billing aggregate, raising ``ValueError`` for a malformed one.
+
+    Strict, like every other field of a terminal record: an absent or ``null`` value is
+    "not stated", but a present value of the wrong shape is corrupt content and is never
+    logged-and-ignored.
+    """
+    try:
+        return AggregateBilling.from_wire(value, strict=True)
+    except ValueError as exc:
+        raise ValueError(f"{field}: {exc}") from exc
 
 
 def _coerce_mode(data: dict[str, Any]) -> RunMode:
@@ -1289,6 +1303,9 @@ class TerminalRunRecord:
             log, or ``None`` for a foreground run (or an unavailable one).
         bg_stdout_log: Path to the ``--web-bg`` child's captured stdout
             log, or ``None``.
+        billing: Provenance of the executions behind ``total_cost_usd`` (engine
+            basis), or ``None`` when no execution stated it (older records,
+            providers that report nothing).
     """
 
     run_id: str
@@ -1306,6 +1323,7 @@ class TerminalRunRecord:
     event_log_path: str
     bg_stderr_log: str | None
     bg_stdout_log: str | None
+    billing: AggregateBilling | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation."""
@@ -1325,6 +1343,7 @@ class TerminalRunRecord:
             "event_log_path": self.event_log_path,
             "bg_stderr_log": self.bg_stderr_log,
             "bg_stdout_log": self.bg_stdout_log,
+            "billing": self.billing.to_wire() if self.billing is not None else None,
         }
 
     @classmethod
@@ -1366,6 +1385,7 @@ class TerminalRunRecord:
             event_log_path=_coerce_optional_str(data.get("event_log_path"), "event_log_path"),
             bg_stderr_log=_coerce_optional_str_or_none(data.get("bg_stderr_log"), "bg_stderr_log"),
             bg_stdout_log=_coerce_optional_str_or_none(data.get("bg_stdout_log"), "bg_stdout_log"),
+            billing=_coerce_billing(data.get("billing"), "billing"),
         )
 
 

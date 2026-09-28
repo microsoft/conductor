@@ -1,7 +1,8 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { Bot } from 'lucide-react';
-import { cn, formatElapsed, formatTokens, formatCost } from '@/lib/utils';
+import { cn, formatElapsed, formatTokens } from '@/lib/utils';
+import { formatCostWithBilling, nodeBillingTitle } from '@/lib/billing';
 import { NODE_STATUS_HEX, CONTEXT_WARN_PCT, CONTEXT_DANGER_PCT } from '@/lib/constants';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { useNodeLiveData } from '@/hooks/use-viewed-context';
@@ -22,6 +23,7 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) 
   const inputTokens = nd?.input_tokens;
   const outputTokens = nd?.output_tokens;
   const costUsd = nd?.cost_usd;
+  const billingMode = nd?.billing_mode;
   const iteration = nd?.iteration;
   const errorType = nd?.error_type;
   const errorMessage = nd?.error_message;
@@ -48,7 +50,8 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) 
       const parts: string[] = [];
       if (elapsed != null) parts.push(formatElapsed(elapsed));
       if (tokens != null) parts.push(`${formatTokens(tokens)} tok`);
-      if (costUsd != null) parts.push(formatCost(costUsd));
+      // Compact chip on the node; the long label is on the wrapper's `title` and the tooltip.
+      if (costUsd != null) parts.push(formatCostWithBilling(costUsd, billingMode, { compact: true }));
       return { text: parts.join(' · ') || null, className: 'text-[var(--text-muted)]' };
     }
     return { text: null, className: '' };
@@ -66,6 +69,8 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) 
           inputTokens,
           outputTokens,
           costUsd,
+          // Same gate as the wrapper title: only a completed node's figure carries its label.
+          billingMode: status === 'completed' ? billingMode : null,
           iteration,
           errorType,
           errorMessage,
@@ -79,6 +84,7 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps) 
             transitionClass,
           )}
           style={{ borderColor }}
+          title={nodeBillingTitle(status, costUsd, billingMode) ?? undefined}
         >
           <div
             className={cn(

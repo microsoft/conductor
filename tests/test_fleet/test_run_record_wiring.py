@@ -42,6 +42,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conductor.billing import AggregateBilling
 from conductor.config.schema import ProviderSettings
 from conductor.exceptions import WorkflowTerminated
 from conductor.fleet.records import read_run_records, read_terminal_record, read_terminal_records
@@ -564,6 +565,86 @@ class TestRunWorkflowAsyncTerminalRecordWiring:
         assert record.error_message == "boom"
         # No `output:` was ever rendered on this path.
         assert record.output == {}
+
+
+class TestTerminalRecordBillingWiring:
+    """``billing`` reaches the terminal record from the engine's usage summary (5.8)."""
+
+    @staticmethod
+    async def _run_clean(tmp_path: Path, usage: dict[str, Any]) -> None:
+        from conductor.cli.run import run_workflow_async
+
+        async def _fake_run(inputs: dict[str, Any]) -> dict[str, Any]:
+            return {"result": "done"}
+
+        mock_engine = MagicMock()
+        mock_engine.run = _fake_run
+        mock_engine.get_execution_summary.return_value = {"usage": usage}
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=_mock_config()),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+            await run_workflow_async(_write_workflow(tmp_path), {})
+
+    async def test_terminal_record_receives_billing_from_engine_summary(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        wire = {"state": "mixed", "breakdown": {"subscription": 2, "metered_api": 1}}
+        await self._run_clean(tmp_path, {"total_tokens": 9, "total_cost_usd": 0.5, "billing": wire})
+        (record,) = read_terminal_records()
+        assert record.billing == AggregateBilling({"subscription": 2, "metered_api": 1})
+        assert record.to_dict()["billing"] == wire
+
+    async def test_terminal_record_billing_is_none_when_summary_says_null(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        await self._run_clean(tmp_path, {"total_tokens": 9, "total_cost_usd": 0.5, "billing": None})
+        (record,) = read_terminal_records()
+        assert record.billing is None
+
+    async def test_malformed_engine_billing_never_breaks_the_writer(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        """The value is engine-built and the writer must never raise: parse non-strictly."""
+        await self._run_clean(
+            tmp_path, {"total_tokens": 9, "total_cost_usd": 0.5, "billing": "garbage"}
+        )
+        (record,) = read_terminal_records()
+        assert record.billing is None
+        assert record.total_cost_usd == 0.5
+
+    async def test_terminal_record_billing_none_without_engine(
+        self, tmp_path: Path, fleet_env: Path
+    ) -> None:
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=_mock_config()),
+            patch("conductor.cli.run.WorkflowEngine", side_effect=RuntimeError("no engine")),
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry,
+            patch(
+                "conductor.cli.run._build_mcp_servers",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pytest.raises(RuntimeError, match="no engine"),
+        ):
+            mock_registry.return_value.__aenter__ = AsyncMock(return_value=mock_registry)
+            mock_registry.return_value.__aexit__ = AsyncMock(return_value=None)
+            await run_workflow_async(_write_workflow(tmp_path), {})
+
+        (record,) = read_terminal_records()
+        assert record.status == "failed"
+        assert record.billing is None
 
 
 # ---------------------------------------------------------------------------

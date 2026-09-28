@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, type ReactNode } from 'react';
-import { cn, formatElapsed, formatCost, formatTokens } from '@/lib/utils';
+import { cn, formatElapsed, formatTokens } from '@/lib/utils';
+import { formatCostWithBilling, type BillingMode } from '@/lib/billing';
 import { NODE_STATUS_HEX, type NodeStatus } from '@/lib/constants';
 
 interface TooltipData {
@@ -10,6 +11,7 @@ interface TooltipData {
   inputTokens?: number | null;
   outputTokens?: number | null;
   costUsd?: number | null;
+  billingMode?: BillingMode | null;
   exitCode?: number | null;
   errorType?: string | null;
   errorMessage?: string | null;
@@ -102,7 +104,7 @@ export function NodeTooltip({ data, children }: NodeTooltipProps) {
               {data.costUsd != null && (
                 <>
                   <span className="text-[var(--text-muted)]">Cost</span>
-                  <span className="text-[var(--text)] font-mono">{formatCost(data.costUsd)}</span>
+                  <span className="text-[var(--text)] font-mono">{formatCostWithBilling(data.costUsd, data.billingMode)}</span>
                 </>
               )}
               {data.exitCode != null && (

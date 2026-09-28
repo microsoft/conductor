@@ -3,6 +3,7 @@ import { Wifi, WifiOff, Loader2, Coins, Hash, Clock } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { useElapsedTimer } from '@/hooks/use-elapsed-timer';
 import { cn } from '@/lib/utils';
+import { totalBillingLabel } from '@/lib/billing';
 
 export function StatusBar() {
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
@@ -11,11 +12,15 @@ export function StatusBar() {
   const totalCost = useWorkflowStore((s) => s.totalCost);
   const totalTokens = useWorkflowStore((s) => s.totalTokens);
   const unpricedCount = useWorkflowStore((s) => s.unpricedCount);
+  const billingCounts = useWorkflowStore((s) => s.billingCounts);
   const wsStatus = useWorkflowStore((s) => s.wsStatus);
   const workflowFailure = useWorkflowStore((s) => s.workflowFailure);
   const lastEventTime = useWorkflowStore((s) => s.lastEventTime);
   const iterationLimitGate = useWorkflowStore((s) => s.iterationLimitGate);
   const elapsed = useElapsedTimer();
+  // Constants chosen from the counted provenance; the breakdown goes in the tooltip.
+  const billingLabel = totalBillingLabel(totalCost, billingCounts);
+  const billingDetail = totalBillingLabel(totalCost, billingCounts, true);
 
   // "Last activity X ago" — ticks every second while running
   const [idleSeconds, setIdleSeconds] = useState<number | null>(null);
@@ -149,9 +154,9 @@ export function StatusBar() {
         <span
           className={cn('flex items-center gap-1', isFailed ? 'text-red-400/60' : 'text-[var(--text-muted)]')}
           title={
-            unpricedCount > 0
+            (unpricedCount > 0
               ? `Total cost (partial \u2014 ${unpricedCount} agent${unpricedCount === 1 ? '' : 's'} with no available pricing)`
-              : 'Total cost'
+              : 'Total cost') + (billingDetail ? ` \u2014 ${billingDetail}` : '')
           }
         >
           <Coins className="w-3 h-3" />
@@ -160,6 +165,7 @@ export function StatusBar() {
               {unpricedCount > 0 ? '~' : ''}${totalCost.toFixed(4)}
             </span>
           )}
+          {billingLabel && <span>{billingLabel}</span>}
           {unpricedCount > 0 && (
             <span className="text-amber-400">
               {totalCost > 0 ? `(${unpricedCount} unpriced)` : `${unpricedCount} unpriced`}

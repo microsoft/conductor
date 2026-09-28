@@ -253,7 +253,12 @@ class TestStreamEventLog:
                 _event("gate_resolved", {"agent_name": "a"}, ts=3.0),
                 _event(
                     "agent_completed",
-                    {"agent_name": "a", "tokens": 10, "cost_usd": 0.01},
+                    {
+                        "agent_name": "a",
+                        "tokens": 10,
+                        "cost_usd": 0.01,
+                        "billing_mode": "subscription",
+                    },
                     ts=4.0,
                 ),
                 _event("agent_started", {"agent_name": "b"}, ts=5.0),
@@ -267,7 +272,12 @@ class TestStreamEventLog:
                 ),
                 _event(
                     "parallel_agent_completed",
-                    {"group_name": "fanout", "agent_name": "c", "tokens": 3},
+                    {
+                        "group_name": "fanout",
+                        "agent_name": "c",
+                        "tokens": 3,
+                        "billing_mode": "metered_api",
+                    },
                     ts=10.0,
                 ),
                 _event("parallel_agent_failed", {"group_name": "fanout", "agent_name": "d"}),
@@ -312,6 +322,10 @@ class TestStreamEventLog:
         unfiltered = _scan_events(stream_event_log(path))
 
         assert filtered == unfiltered
+        # The billing counters ride the same prefiltered stream as the cost they label.
+        assert filtered.billing == unfiltered.billing
+        assert filtered.billing is not None
+        assert dict(filtered.billing.breakdown) == {"subscription": 1, "metered_api": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -1694,7 +1708,13 @@ class TestScanAgentDetailsPrefilterEquivalence:
                 _event("gate_resolved", {"agent_name": "a"}, ts=3.0),
                 _event(
                     "agent_completed",
-                    {"agent_name": "a", "tokens": 10, "cost_usd": 0.01, "elapsed": 5.0},
+                    {
+                        "agent_name": "a",
+                        "tokens": 10,
+                        "cost_usd": 0.01,
+                        "elapsed": 5.0,
+                        "billing_mode": "subscription",
+                    },
                     ts=4.0,
                 ),
                 _event("agent_started", {"agent_name": "b"}, ts=5.0),
@@ -1707,7 +1727,13 @@ class TestScanAgentDetailsPrefilterEquivalence:
                 ),
                 _event(
                     "parallel_agent_completed",
-                    {"group_name": "fanout", "agent_name": "c", "tokens": 3, "elapsed": 1.0},
+                    {
+                        "group_name": "fanout",
+                        "agent_name": "c",
+                        "tokens": 3,
+                        "elapsed": 1.0,
+                        "billing_mode": "metered_api",
+                    },
                     ts=9.0,
                 ),
                 _event("parallel_completed", {"group_name": "fanout"}),
@@ -1723,6 +1749,8 @@ class TestScanAgentDetailsPrefilterEquivalence:
         unfiltered = _scan_agent_details(stream_event_log(path))
 
         assert filtered == unfiltered
+        assert [a.billing for a in filtered[2]] == [a.billing for a in unfiltered[2]]
+        assert any(a.billing is not None for a in filtered[2])
 
 
 class TestDeriveRunDetailGracefulDegradation:
@@ -2295,3 +2323,473 @@ class TestDeriveStepDetailMidStreamReadFailure:
         assert detail.prompt is None
         assert detail.output is None
         assert detail.activity == []
+
+
+# ---------------------------------------------------------------------------
+# Billing provenance counters: one breakdown counter beside each cost/token total,
+# incremented by the same predicate and on the same branches as the total it describes.
+# ---------------------------------------------------------------------------
+
+
+def _completion(
+    etype: str,
+    name: str = "a",
+    *,
+    mode: object = "subscription",
+    tokens: object = 100,
+    cost: object = 0.01,
+    **extra: object,
+) -> str:
+    """A completion event; a ``mode`` of ``...`` omits ``billing_mode`` (a legacy log)."""
+    data: dict[str, Any] = {"agent_name": name, "elapsed": 1.0, **extra}
+    if tokens is not ...:
+        data["tokens"] = tokens
+    if cost is not ...:
+        data["cost_usd"] = cost
+    if mode is not ...:
+        data["billing_mode"] = mode
+    return _event(etype, data)
+
+
+def _summary_for(tmp_path: Path, lines: list[str]) -> RunSummary:
+    path = tmp_path / "run.events.jsonl"
+    _write_jsonl(path, lines)
+    return derive_run_summary(_make_record(tmp_path, event_log_path=str(path)))
+
+
+def _counts(summary: RunSummary) -> dict[str, int]:
+    return dict(summary.billing.breakdown) if summary.billing is not None else {}
+
+
+class TestFleetBillingCounters:
+    """``_scan_events``: the Runs cell / summary bar / MCP basis."""
+
+    def test_runs_billing_counts_agent_completed(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [_completion("agent_completed", "a"), _completion("agent_completed", "b")],
+        )
+        assert _counts(summary) == {"subscription": 2}
+
+    def test_runs_billing_counts_parallel_agent_completed(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("parallel_agent_completed", "a", mode="metered_api"),
+                _completion("parallel_agent_completed", "b", mode="metered_api"),
+            ],
+        )
+        assert _counts(summary) == {"metered_api": 2}
+
+    def test_runs_billing_mixed_counts_are_exact(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", "a", mode="subscription"),
+                _completion("agent_completed", "b", mode="subscription"),
+                _completion("parallel_agent_completed", "c", mode="metered_api"),
+                _completion("parallel_agent_completed", "d", mode="unknown"),
+            ],
+        )
+        assert _counts(summary) == {"subscription": 2, "metered_api": 1, "unknown": 1}
+        assert summary.billing is not None and summary.billing.state == "mixed"
+
+    @pytest.mark.parametrize(
+        ("tokens", "cost", "counted", "total_cost", "unpriced"),
+        [
+            (100, 0.01, True, 0.01, 0),  # priced
+            (100, None, True, None, 1),  # unpriced execution
+            (0, 0.0, False, 0.0, 0),  # a $0.00 zero-token member: sums 0.0, is not an execution
+            (0, None, False, None, 0),
+            (None, 0.5, True, 0.5, 0),  # hand-written log: a cost with no tokens
+            (None, None, False, None, 0),
+            (float("nan"), None, False, None, 0),  # non-finite is ignored, like the cost
+            (float("inf"), float("nan"), False, None, 0),
+            # bool is a subclass of int, but True/False are not token counts or dollars:
+            # _finite_float rejects them, so they neither sum nor count as an execution.
+            (True, None, False, None, 0),
+            (False, None, False, None, 0),
+            (None, True, False, None, 0),
+            (None, False, False, None, 0),
+            (True, True, False, None, 0),
+            (100, True, True, None, 1),  # real tokens, boolean cost: an unpriced execution
+            (100, False, True, None, 1),
+            (True, 0.5, True, 0.5, 0),  # boolean tokens ignored; the real cost still contributes
+        ],
+    )
+    def test_runs_billing_uses_the_same_predicate_as_cost(
+        self,
+        tmp_path: Path,
+        tokens: object,
+        cost: object,
+        counted: bool,
+        total_cost: float | None,
+        unpriced: int,
+    ) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [_completion("agent_completed", tokens=tokens, cost=cost, mode="subscription")],
+        )
+        # The counter and the figures it labels are asserted together so they cannot diverge.
+        assert summary.total_cost_usd == total_cost
+        assert summary.unpriced_agent_count == unpriced
+        assert _counts(summary) == ({"subscription": 1} if counted else {})
+        assert (summary.billing is not None) is counted
+
+    def test_runs_billing_zero_usage_parallel_member_not_counted(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("parallel_agent_completed", "llm", mode="subscription"),
+                # A ``set`` / ``mcp`` member: no usage row, no provenance.
+                _completion("parallel_agent_completed", "tagger", mode=..., tokens=0, cost=0.0),
+            ],
+        )
+        assert _counts(summary) == {"subscription": 1}
+        assert summary.billing is not None and summary.billing.state == "subscription"
+
+    def test_runs_billing_counts_unpriced_executions(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", "a", mode="subscription", cost=None),
+                _completion("agent_completed", "b", mode="subscription", cost=0.02),
+            ],
+        )
+        assert summary.unpriced_agent_count == 1
+        assert _counts(summary) == {"subscription": 2}
+
+    def test_runs_billing_total_equals_contributing_events(self, tmp_path: Path) -> None:
+        events = [
+            _completion("agent_completed", "a", mode="subscription"),
+            _completion("agent_completed", "b", mode=..., cost=None),
+            _completion("parallel_agent_completed", "c", mode="unknown", cost=None),
+            _completion("parallel_agent_completed", "d", mode=..., tokens=0, cost=0.0),
+            _completion("agent_completed", "e", mode="metered_api", tokens=0, cost=None),
+        ]
+        summary = _summary_for(tmp_path, events)
+        assert summary.billing is not None
+        assert summary.billing.total == 3  # a, b, c: the executions that consumed tokens
+
+    def test_runs_billing_legacy_events_are_unstated(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", mode=...),
+                _completion("agent_completed", "b", mode=...),
+            ],
+        )
+        assert _counts(summary) == {"unstated": 2}
+        assert summary.billing is not None
+        assert summary.billing.to_wire() is None
+        from conductor.billing import cell_label
+
+        assert cell_label(summary.billing) is None
+
+    def test_runs_billing_subscription_plus_legacy_is_mixed(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [_completion("agent_completed", "a"), _completion("agent_completed", "b", mode=...)],
+        )
+        assert _counts(summary) == {"subscription": 1, "unstated": 1}
+        assert summary.billing is not None and summary.billing.state == "mixed"
+
+    def test_runs_billing_null_is_unstated(self, tmp_path: Path) -> None:
+        summary = _summary_for(tmp_path, [_completion("agent_completed", mode=None)])
+        assert _counts(summary) == {"unstated": 1}
+
+    def test_runs_billing_unrecognized_string_is_unknown(self, tmp_path: Path) -> None:
+        summary = _summary_for(tmp_path, [_completion("agent_completed", mode="bedrock")])
+        assert _counts(summary) == {"unknown": 1}
+
+    @pytest.mark.parametrize("mode", [7, 1.5, True, ["subscription"], {"mode": "subscription"}])
+    def test_runs_billing_non_string_is_unstated(self, tmp_path: Path, mode: object) -> None:
+        summary = _summary_for(tmp_path, [_completion("agent_completed", mode=mode)])
+        assert _counts(summary) == {"unstated": 1}
+
+    def test_runs_billing_none_when_no_contributing_event(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _event("agent_started", {"agent_name": "a"}),
+                _completion("agent_completed", mode="subscription", tokens=0, cost=None),
+            ],
+        )
+        assert summary.billing is None
+
+    def test_runs_billing_skips_nested_subworkflow_events(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", "root", mode="metered_api"),
+                _completion(
+                    "agent_completed", "nested", mode="subscription", subworkflow_path=["child"]
+                ),
+            ],
+        )
+        assert _counts(summary) == {"metered_api": 1}
+        assert summary.total_tokens == 100  # the nested tokens are skipped too
+
+    def test_runs_billing_accumulates_across_generations(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _event("workflow_started", {"name": "wf"}),
+                _completion("agent_completed", "a", mode="subscription"),
+                _event("workflow_started", {"name": "wf"}),
+                _completion("agent_completed", "b", mode="metered_api"),
+            ],
+        )
+        assert _counts(summary) == {"subscription": 1, "metered_api": 1}
+        assert summary.total_tokens == 200  # the totals accumulate the same way
+
+    def test_runs_billing_follows_the_gate_skip_of_the_cost(self, tmp_path: Path) -> None:
+        """Synthetic: an ``agent_completed`` for the agent that owns the open gate adds nothing
+        to tokens, cost, **or** billing. This is a pre-existing quirk of ``_scan_events``'s gate
+        handling, not something the billing counter introduces: it increments on the same
+        branch as tokens and cost, so it inherits the same skip."""
+        gated = _summary_for(
+            tmp_path,
+            [
+                _event("agent_started", {"agent_name": "X"}, ts=1.0),
+                _event("gate_presented", {"agent_name": "X", "prompt": "ok?"}, ts=2.0),
+                _completion("agent_completed", "X", mode="subscription"),
+            ],
+        )
+        assert gated.total_tokens == 0
+        assert gated.total_cost_usd is None
+        assert gated.billing is None
+
+        # Control: the same completion for a different agent is counted by all three.
+        other = _summary_for(
+            tmp_path,
+            [
+                _event("agent_started", {"agent_name": "X"}, ts=1.0),
+                _event("gate_presented", {"agent_name": "X", "prompt": "ok?"}, ts=2.0),
+                _completion("agent_completed", "Y", mode="subscription"),
+            ],
+        )
+        assert other.total_tokens == 100
+        assert other.total_cost_usd == 0.01
+        assert _counts(other) == {"subscription": 1}
+
+    def test_derive_run_summary_carries_billing(self, tmp_path: Path) -> None:
+        summary = _summary_for(tmp_path, [_completion("agent_completed", mode="unknown")])
+        assert isinstance(summary, RunSummary)
+        assert summary.billing is not None
+        assert summary.billing.state == "unknown"
+
+    def test_derive_run_summary_without_a_log_has_no_billing(self, tmp_path: Path) -> None:
+        summary = derive_run_summary(_make_record(tmp_path, event_log_path=""))
+        assert summary.billing is None
+
+
+def _detail_for(tmp_path: Path, agents: list[str], lines: list[str]) -> RunDetail:
+    path = tmp_path / "run.events.jsonl"
+    _write_jsonl(path, [_workflow_started_event(agents), *lines])
+    return derive_run_detail(_make_record(tmp_path, event_log_path=str(path)))
+
+
+def _row(detail: RunDetail, name: str) -> Any:
+    return next(a for a in detail.agents if a.name == name)
+
+
+class TestRunDetailBillingCounters:
+    """``_scan_agent_details``: one cumulative counter per agent name, feeding the
+    run-detail screen's per-agent rows."""
+
+    def test_run_detail_row_billing_from_agent_completed(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["a"],
+            [
+                _event("agent_started", {"agent_name": "a"}, ts=1.0),
+                _completion("agent_completed", "a", mode="subscription"),
+            ],
+        )
+        row = _row(detail, "a")
+        assert row.billing is not None
+        assert dict(row.billing.breakdown) == {"subscription": 1}
+
+    def test_run_detail_row_billing_from_parallel_agent_completed(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["w"],
+            [
+                _event("parallel_started", {"group_name": "g"}, ts=1.0),
+                _event("parallel_agent_started", {"group_name": "g", "agent_name": "w"}, ts=2.0),
+                _completion("parallel_agent_completed", "w", mode="metered_api", group_name="g"),
+            ],
+        )
+        row = _row(detail, "w")
+        assert row.billing is not None
+        assert dict(row.billing.breakdown) == {"metered_api": 1}
+
+    def test_run_detail_row_billing_accumulates_across_attempts(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["loop"],
+            [
+                _event("agent_started", {"agent_name": "loop"}, ts=1.0),
+                _completion("agent_completed", "loop", mode="subscription", cost=0.01),
+                _event("agent_started", {"agent_name": "loop"}, ts=2.0),
+                _completion("agent_completed", "loop", mode="metered_api", cost=0.02),
+            ],
+        )
+        row = _row(detail, "loop")
+        assert row.cost_usd == pytest.approx(0.03)  # cumulative, like the billing
+        assert row.billing is not None
+        assert dict(row.billing.breakdown) == {"subscription": 1, "metered_api": 1}
+        assert row.billing.state == "mixed"
+
+    def test_run_detail_zero_usage_member_has_no_billing(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["tagger"],
+            [
+                _event("parallel_started", {"group_name": "g"}, ts=1.0),
+                _event(
+                    "parallel_agent_started", {"group_name": "g", "agent_name": "tagger"}, ts=2.0
+                ),
+                _completion("parallel_agent_completed", "tagger", mode=..., tokens=0, cost=0.0),
+            ],
+        )
+        row = _row(detail, "tagger")
+        assert row.cost_usd == 0.0
+        assert row.billing is None
+
+    def test_run_detail_pending_row_has_no_billing(self, tmp_path: Path) -> None:
+        detail = _detail_for(tmp_path, ["a", "later"], [_completion("agent_completed", "a")])
+        later = _row(detail, "later")
+        assert later.status == "pending"
+        assert later.billing is None
+
+    def test_run_detail_unpriced_row_has_billing_but_no_cost(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["a"],
+            [
+                _event("agent_started", {"agent_name": "a"}, ts=1.0),
+                _completion("agent_completed", "a", mode="subscription", cost=None),
+            ],
+        )
+        row = _row(detail, "a")
+        assert row.cost_usd is None
+        assert row.billing is not None
+        assert dict(row.billing.breakdown) == {"subscription": 1}
+
+    def test_run_detail_running_agent_keeps_its_earlier_attempts_billing(
+        self, tmp_path: Path
+    ) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["loop"],
+            [
+                _event("agent_started", {"agent_name": "loop"}, ts=1.0),
+                _completion("agent_completed", "loop", mode="subscription"),
+                _event("agent_started", {"agent_name": "loop"}, ts=2.0),
+            ],
+        )
+        row = _row(detail, "loop")
+        assert row.status == "running"
+        assert row.billing is not None
+        assert dict(row.billing.breakdown) == {"subscription": 1}
+
+    def test_run_detail_legacy_log_rows_are_unstated(self, tmp_path: Path) -> None:
+        detail = _detail_for(tmp_path, ["a"], [_completion("agent_completed", "a", mode=...)])
+        row = _row(detail, "a")
+        assert row.billing is not None
+        assert row.billing.to_wire() is None
+        assert dict(row.billing.breakdown) == {"unstated": 1}
+
+
+class TestFiniteFloat:
+    """``_finite_float`` is the one normalizer behind every Fleet total and billing counter."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, 0.0),
+            (1, 1.0),
+            (100, 100.0),
+            (-3, -3.0),
+            (0.05, 0.05),
+            (0.0, 0.0),
+        ],
+    )
+    def test_numbers_are_returned_as_floats(self, value: object, expected: float) -> None:
+        result = summary_module._finite_float(value)
+        assert result == expected
+        assert isinstance(result, float)
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_booleans_are_rejected(self, value: bool) -> None:
+        # bool is a subclass of int; without an explicit check True would become 1.0.
+        assert summary_module._finite_float(value) is None
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), None, "1", "1.5", [1], {"a": 1}, b"1"]
+    )
+    def test_non_finite_and_non_numbers_are_rejected(self, value: object) -> None:
+        assert summary_module._finite_float(value) is None
+
+    def test_history_shares_the_same_rule(self) -> None:
+        from conductor.fleet import history
+
+        for value in (True, False, float("nan"), None):
+            assert history._finite_float(value) is None
+        assert history._finite_float(2) == 2.0
+
+
+class TestBooleanUsageValuesAreIgnoredEverywhere:
+    """Boolean tokens/costs contribute to no total, count and label, on any Fleet screen."""
+
+    @pytest.mark.parametrize("etype", ["agent_completed", "parallel_agent_completed"])
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_runs_totals_ignore_booleans(self, tmp_path: Path, etype: str, flag: bool) -> None:
+        summary = _summary_for(
+            tmp_path, [_completion(etype, tokens=flag, cost=flag, mode="subscription")]
+        )
+        assert summary.total_tokens == 0
+        assert summary.total_cost_usd is None
+        assert summary.unpriced_agent_count == 0
+        assert summary.billing is None
+
+    def test_a_boolean_never_adds_to_a_real_total(self, tmp_path: Path) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", "a", tokens=100, cost=0.05, mode="subscription"),
+                _completion("agent_completed", "b", tokens=True, cost=True, mode="metered_api"),
+            ],
+        )
+        assert summary.total_tokens == 100
+        assert summary.total_cost_usd == 0.05
+        assert _counts(summary) == {"subscription": 1}  # the boolean row is not an execution
+
+    @pytest.mark.parametrize("etype", ["agent_completed", "parallel_agent_completed"])
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_run_detail_row_ignores_booleans(self, tmp_path: Path, etype: str, flag: bool) -> None:
+        lines = [_event("agent_started", {"agent_name": "a"}, ts=1.0)]
+        lines.append(_completion(etype, "a", tokens=flag, cost=flag, mode="subscription"))
+        row = _row(_detail_for(tmp_path, ["a"], lines), "a")
+        assert row.tokens is None
+        assert row.cost_usd is None
+        assert row.billing is None
+
+    def test_run_detail_boolean_does_not_add_to_a_real_attempt(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["loop"],
+            [
+                _event("agent_started", {"agent_name": "loop"}, ts=1.0),
+                _completion("agent_completed", "loop", tokens=100, cost=0.05, mode="subscription"),
+                _event("agent_started", {"agent_name": "loop"}, ts=2.0),
+                _completion("agent_completed", "loop", tokens=True, cost=True, mode="metered_api"),
+            ],
+        )
+        row = _row(detail, "loop")
+        assert row.tokens == 100
+        assert row.cost_usd == 0.05
+        assert row.billing is not None
+        assert dict(row.billing.breakdown) == {"subscription": 1}

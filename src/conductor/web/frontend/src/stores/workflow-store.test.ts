@@ -1670,3 +1670,215 @@ describe('workflow-store — mcp item-scoped branching', () => {
     expect(stateFinal.nodes.mcp_inline).toBeUndefined();
   });
 });
+
+describe('workflow-store - billing provenance', () => {
+  const startWorkflow = (agents: string[]) => {
+    useWorkflowStore.getState().processEvent(
+      event('workflow_started', {
+        name: 'root',
+        agents: agents.map((name) => ({ name })),
+        routes: [],
+        parallel_groups: [],
+        for_each_groups: [],
+        entry_point: agents[0],
+      }),
+    );
+  };
+  const complete = (name: string, extra: Record<string, unknown> = {}) => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('agent_started', { agent_name: name, iteration: 1 }));
+    processEvent(
+      event('agent_completed', { agent_name: name, elapsed: 1, tokens: 100, cost_usd: 0.05, ...extra }),
+    );
+  };
+  const counts = () => useWorkflowStore.getState().billingCounts;
+  const zero = { subscription: 0, metered_api: 0, unknown: 0, unstated: 0 };
+
+  it('starts with an empty breakdown', () => {
+    expect(counts()).toEqual(zero);
+  });
+
+  it('counts a subscription agent_completed and records the node mode', () => {
+    startWorkflow(['a']);
+    complete('a', { billing_mode: 'subscription' });
+    expect(counts()).toEqual({ ...zero, subscription: 1 });
+    expect(useWorkflowStore.getState().nodes.a?.billing_mode).toBe('subscription');
+  });
+
+  it('counts a parallel_agent_completed', () => {
+    startWorkflow(['w']);
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('parallel_agent_completed', {
+      group_name: 'g',
+      agent_name: 'w',
+      elapsed: 1,
+      tokens: 100,
+      cost_usd: 0.05,
+      billing_mode: 'metered_api',
+    }));
+    expect(counts()).toEqual({ ...zero, metered_api: 1 });
+    expect(useWorkflowStore.getState().nodes.w?.billing_mode).toBe('metered_api');
+  });
+
+  it('does not count an execution that spent no tokens (the same predicate as the total)', () => {
+    startWorkflow(['a']);
+    complete('a', { billing_mode: 'subscription', tokens: 0, cost_usd: 0 });
+    expect(counts()).toEqual(zero);
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('parallel_agent_completed', {
+      group_name: 'g', agent_name: 'set_member', elapsed: 0, tokens: 0, cost_usd: 0,
+    }));
+    expect(counts()).toEqual(zero);
+  });
+
+  it('counts an unpriced execution (tokens but no cost) like the unpriced total does', () => {
+    startWorkflow(['a']);
+    complete('a', { billing_mode: 'subscription', cost_usd: undefined });
+    expect(counts()).toEqual({ ...zero, subscription: 1 });
+    expect(useWorkflowStore.getState().unpricedCount).toBe(1);
+  });
+
+  it('a missing billing_mode is unstated', () => {
+    startWorkflow(['a']);
+    complete('a');
+    expect(counts()).toEqual({ ...zero, unstated: 1 });
+    expect(useWorkflowStore.getState().nodes.a?.billing_mode).toBeNull();
+  });
+
+  it('a null billing_mode is unstated', () => {
+    startWorkflow(['a']);
+    complete('a', { billing_mode: null });
+    expect(counts()).toEqual({ ...zero, unstated: 1 });
+  });
+
+  it('an unrecognized string is unknown, and is never stored verbatim', () => {
+    startWorkflow(['a']);
+    complete('a', { billing_mode: 'bedrock' });
+    expect(counts()).toEqual({ ...zero, unknown: 1 });
+    expect(useWorkflowStore.getState().nodes.a?.billing_mode).toBe('unknown');
+  });
+
+  it('mixed provenance is counted exactly, with no dominant mode', () => {
+    startWorkflow(['a', 'b', 'c']);
+    complete('a', { billing_mode: 'subscription' });
+    complete('b', { billing_mode: 'subscription' });
+    complete('c', { billing_mode: 'metered_api' });
+    expect(counts()).toEqual({ ...zero, subscription: 2, metered_api: 1 });
+  });
+
+  it('produces a new counts reference per counted event and never rewrites an earlier snapshot', () => {
+    startWorkflow(['a', 'b']);
+    complete('a', { billing_mode: 'subscription' });
+    const first = counts();
+    complete('b', { billing_mode: 'metered_api' });
+    const second = counts();
+    // A stable reference would keep StatusBar from re-rendering.
+    expect(second).not.toBe(first);
+    expect(first).toEqual({ ...zero, subscription: 1 });
+    expect(second).toEqual({ ...zero, subscription: 1, metered_api: 1 });
+  });
+
+  it('a loop-back iteration snapshot keeps the previous execution mode', () => {
+    startWorkflow(['a']);
+    const { processEvent } = useWorkflowStore.getState();
+    // The snapshot is only taken for a node that produced output.
+    complete('a', { billing_mode: 'subscription', output: { done: true } });
+    processEvent(event('agent_started', { agent_name: 'a', iteration: 2 }));
+    const history = useWorkflowStore.getState().nodes.a?.iterationHistory;
+    expect(history?.[0]?.billing_mode).toBe('subscription');
+  });
+
+  it('rolls a sub-workflow context count up to the root', () => {
+    startWorkflow(['delegate']);
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('subworkflow_started', { agent_name: 'delegate', workflow: 'c.yaml', iteration: 1 }));
+    processEvent(event('agent_started', { agent_name: 'inner', iteration: 1, subworkflow_path: ['delegate'] }));
+    processEvent(event('agent_completed', {
+      agent_name: 'inner',
+      elapsed: 1,
+      tokens: 100,
+      cost_usd: 0.05,
+      billing_mode: 'subscription',
+      subworkflow_path: ['delegate'],
+    }));
+    const state = useWorkflowStore.getState();
+    expect(state.subworkflowContexts[0]?.billingCounts).toEqual({ ...zero, subscription: 1 });
+    expect(state.billingCounts).toEqual({ ...zero, subscription: 1 });
+    expect(state.subworkflowContexts[0]?.nodes.inner?.billing_mode).toBe('subscription');
+  });
+
+  it('a new context starts with its own empty breakdown', () => {
+    startWorkflow(['delegate']);
+    complete('delegate', { billing_mode: 'metered_api' });
+    useWorkflowStore.getState().processEvent(
+      event('subworkflow_started', { agent_name: 'delegate', workflow: 'c.yaml', iteration: 1 }),
+    );
+    const ctx = useWorkflowStore.getState().subworkflowContexts[0];
+    expect(ctx?.billingCounts).toEqual(zero);
+  });
+
+  it('for_each_item_completed sets the item mode and, for a workflow item, its aggregate', () => {
+    startWorkflow(['finder']);
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('for_each_item_started', { group_name: 'batch', item_key: '0', index: 0 }));
+    processEvent(event('for_each_item_started', { group_name: 'batch', item_key: '1', index: 1 }));
+    processEvent(event('for_each_item_completed', {
+      group_name: 'batch', item_key: '0', index: 0, elapsed: 1, tokens: 10, cost_usd: 0.01,
+      billing_mode: 'subscription',
+    }));
+    processEvent(event('for_each_item_completed', {
+      group_name: 'batch', item_key: '1', index: 1, elapsed: 1, tokens: 10, cost_usd: 0.01,
+      billing: { state: 'mixed', breakdown: { subscription: 2, metered_api: 1 } },
+    }));
+    const items = useWorkflowStore.getState().nodes.batch?.for_each_items ?? [];
+    expect(items[0]?.billing_mode).toBe('subscription');
+    expect(items[0]?.billing_counts).toBeNull();
+    expect(items[1]?.billing_mode).toBeNull();
+    expect(items[1]?.billing_counts).toEqual({ ...zero, subscription: 2, metered_api: 1 });
+    // Plain-agent for_each items are not part of the dashboard total today, so the counter
+    // (which rides that total) stays empty.
+    expect(counts()).toEqual(zero);
+  });
+
+  it('records the validator mode on the node', () => {
+    startWorkflow(['writer']);
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('agent_validator_complete', {
+      agent_name: 'writer', passed: true, issues: [], cost_usd: 0.01, billing_mode: 'subscription',
+    }));
+    expect(useWorkflowStore.getState().nodes.writer?.validator_billing_mode).toBe('subscription');
+  });
+
+  it('labels the budget activity line only when provenance is stated', () => {
+    startWorkflow(['a']);
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('budget_exceeded', {
+      budget_usd: 5, spent_usd: 5.02, budget_mode: 'enforce', current_agent: 'a',
+      billing: { state: 'subscription', breakdown: { subscription: 1 } },
+    }));
+    processEvent(event('budget_exceeded', {
+      budget_usd: 5, spent_usd: 5.02, budget_mode: 'audit', current_agent: 'a',
+    }));
+    const messages = useWorkflowStore.getState().eventLog.map((e) => e.message);
+    expect(messages).toContain('Budget exceeded — $5.02 of $5.00 (enforce, API-equivalent estimate) at a');
+    expect(messages).toContain('Budget exceeded — $5.02 of $5.00 (audit) at a');
+  });
+
+  it('a replayed history recomputes the breakdown from scratch', () => {
+    const events = [
+      event('workflow_started', {
+        name: 'root', agents: [{ name: 'a' }, { name: 'b' }], routes: [],
+        parallel_groups: [], for_each_groups: [], entry_point: 'a',
+      }),
+      event('agent_started', { agent_name: 'a', iteration: 1 }),
+      event('agent_completed', { agent_name: 'a', tokens: 10, cost_usd: 0.01, billing_mode: 'subscription' }),
+      event('agent_started', { agent_name: 'b', iteration: 1 }),
+      event('agent_completed', { agent_name: 'b', tokens: 10, cost_usd: 0.01, billing_mode: 'metered_api' }),
+    ];
+    const { replayState } = useWorkflowStore.getState();
+    replayState(events);
+    expect(counts()).toEqual({ ...zero, subscription: 1, metered_api: 1 });
+    replayState(events); // replaying again must not double count
+    expect(counts()).toEqual({ ...zero, subscription: 1, metered_api: 1 });
+  });
+});

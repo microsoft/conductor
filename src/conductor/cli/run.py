@@ -24,6 +24,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from conductor.billing import (
+    AggregateBilling,
+    BillingMode,
+    aggregate_label,
+    coerce_billing_mode,
+    estimate_note,
+    mode_label,
+)
 from conductor.config.loader import load_config
 from conductor.config.schema import AgentDef
 from conductor.console import (
@@ -300,6 +308,16 @@ def verbose_log_agent_start(agent_name: str, iteration: int) -> None:
         _file_console.print(text)
 
 
+def _cost_with_billing(cost_usd: float, billing_mode: BillingMode | None) -> str:
+    """One execution's cost text, followed by its billing label when it has one.
+
+    ``billing_mode`` of ``None`` (a provider that states nothing) or ``"metered_api"``
+    leaves the text exactly as it was before billing provenance existed.
+    """
+    label = mode_label(billing_mode)
+    return f"${cost_usd:.4f}" + (f" {label}" if label else "")
+
+
 def verbose_log_agent_complete(
     agent_name: str,
     elapsed: float,
@@ -311,6 +329,7 @@ def verbose_log_agent_complete(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     exit_code: int | None = None,
+    billing_mode: BillingMode | None = None,
 ) -> None:
     """Log agent completion with summary info.
 
@@ -324,6 +343,7 @@ def verbose_log_agent_complete(
         input_tokens: Input tokens used (if available).
         output_tokens: Output tokens generated (if available).
         exit_code: Script process exit code (if available).
+        billing_mode: Billing provenance of this execution (if the provider stated one).
     """
     from conductor.cli.app import is_verbose
 
@@ -341,7 +361,7 @@ def verbose_log_agent_complete(
     elif tokens:
         parts.append(f"{tokens} tokens")
     if cost_usd is not None:
-        parts.append(f"${cost_usd:.4f}")
+        parts.append(_cost_with_billing(cost_usd, billing_mode))
     if output_keys:
         parts.append(f"→ {output_keys}")
     if exit_code is not None and exit_code != 0:
@@ -489,6 +509,7 @@ def verbose_log_parallel_agent_complete(
     model: str | None = None,
     tokens: int | None = None,
     cost_usd: float | None = None,
+    billing_mode: BillingMode | None = None,
 ) -> None:
     """Log parallel agent completion.
 
@@ -498,6 +519,7 @@ def verbose_log_parallel_agent_complete(
         model: Model used (if any).
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
+        billing_mode: Billing provenance of this execution (if the provider stated one).
     """
     from conductor.cli.app import is_verbose
 
@@ -512,7 +534,7 @@ def verbose_log_parallel_agent_complete(
     if tokens:
         parts.append(f"{tokens} tokens")
     if cost_usd is not None:
-        parts.append(f"${cost_usd:.4f}")
+        parts.append(_cost_with_billing(cost_usd, billing_mode))
 
     text = Text()
     text.append("  ✓ ", style="green")
@@ -598,6 +620,7 @@ def verbose_log_budget_exceeded(
     spent_usd: float,
     budget_mode: str,
     current_agent: str | None = None,
+    billing: AggregateBilling | None = None,
 ) -> None:
     """Log a cost-budget overshoot.
 
@@ -610,6 +633,7 @@ def verbose_log_budget_exceeded(
         spent_usd: Cumulative spend that crossed the budget.
         budget_mode: Active mode (``audit`` or ``enforce``).
         current_agent: Agent executing when the budget was exceeded.
+        billing: Provenance of the spend, when any execution stated it.
     """
     from conductor.cli.app import is_verbose
 
@@ -621,7 +645,12 @@ def verbose_log_budget_exceeded(
     style = "red bold" if budget_mode == "enforce" else "yellow bold"
     text = Text()
     text.append("  💸 budget exceeded ", style=style)
-    text.append(f"(${spent_usd:.2f} of ${budget_usd:.2f}, {budget_mode} mode)", style="dim")
+    billing_label = aggregate_label(billing, detailed=True)
+    billing_part = f", {billing_label}" if billing_label else ""
+    text.append(
+        f"(${spent_usd:.2f} of ${budget_usd:.2f}, {budget_mode} mode{billing_part})",
+        style="dim",
+    )
     if current_agent:
         text.append(f" at agent '{current_agent}'", style="dim")
 
@@ -722,6 +751,7 @@ def verbose_log_for_each_item_complete(
     *,
     tokens: int | None = None,
     cost_usd: float | None = None,
+    billing_mode: BillingMode | None = None,
 ) -> None:
     """Log for-each item completion.
 
@@ -730,6 +760,7 @@ def verbose_log_for_each_item_complete(
         elapsed: Elapsed time in seconds.
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
+        billing_mode: Billing provenance of this item (if the provider stated one).
     """
     from conductor.cli.app import is_verbose
 
@@ -742,7 +773,7 @@ def verbose_log_for_each_item_complete(
     if tokens:
         parts.append(f"{tokens} tokens")
     if cost_usd is not None:
-        parts.append(f"${cost_usd:.4f}")
+        parts.append(_cost_with_billing(cost_usd, billing_mode))
 
     text = Text()
     text.append("  ✓ ", style="green")
@@ -1000,6 +1031,7 @@ class ConsoleEventSubscriber:
                 cost_usd=d.get("cost_usd"),
                 input_tokens=d.get("input_tokens"),
                 output_tokens=d.get("output_tokens"),
+                billing_mode=coerce_billing_mode(d.get("billing_mode")),
             )
 
         elif t == "agent_timeout":
@@ -1023,6 +1055,7 @@ class ConsoleEventSubscriber:
                 model=d.get("model"),
                 tokens=d.get("tokens"),
                 cost_usd=d.get("cost_usd"),
+                billing_mode=coerce_billing_mode(d.get("billing_mode")),
             )
 
         elif t == "parallel_agent_failed":
@@ -1055,6 +1088,7 @@ class ConsoleEventSubscriber:
                 d.get("elapsed", 0.0),
                 tokens=d.get("tokens"),
                 cost_usd=d.get("cost_usd"),
+                billing_mode=coerce_billing_mode(d.get("billing_mode")),
             )
 
         elif t == "for_each_item_failed":
@@ -1092,6 +1126,7 @@ class ConsoleEventSubscriber:
                 d.get("spent_usd", 0.0),
                 d.get("budget_mode", "audit"),
                 d.get("current_agent"),
+                AggregateBilling.from_wire(d.get("billing")),
             )
 
         elif t == "wait_completed":
@@ -1141,7 +1176,11 @@ class ConsoleEventSubscriber:
         elif t == "agent_validator_complete":
             label = _validator_label(d)
             cost = d.get("cost_usd")
-            cost_str = f" · ${cost:.4f}" if isinstance(cost, int | float) else ""
+            cost_str = (
+                f" · {_cost_with_billing(cost, coerce_billing_mode(d.get('billing_mode')))}"
+                if isinstance(cost, int | float)
+                else ""
+            )
             if d.get("errored"):
                 verbose_log(
                     f"  Validation error for '{label}' (treated as pass){cost_str}",
@@ -1449,6 +1488,11 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
     agents = usage_data.get("agents", [])
     unpriced_count = usage_data.get("unpriced_agent_count", 0)
     unpriced_models = usage_data.get("unpriced_models", [])
+    billing = AggregateBilling.from_wire(usage_data.get("billing"))
+    billing_label = aggregate_label(billing, detailed=True)
+    billing_suffix = f" ({billing_label})" if billing_label else ""
+    billing_note = estimate_note(billing)
+    mixed_billing = billing is not None and billing.state == "mixed"
 
     def _unpriced_suffix() -> str:
         """Render e.g. ' (2 agents unpriced: gpt-5.5, claude-opus-4.8)'."""
@@ -1467,8 +1511,16 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
             agent_cost = agent.get("cost_usd")
             if agent_cost is not None and agent_cost > 0:
                 pct = (agent_cost / total_cost * 100) if total_cost > 0 else 0
+                # A uniform state is labelled once, on the total. Only a mixed total needs
+                # each row to say which of its executions is an estimate or unproven.
+                row_label = (
+                    mode_label(coerce_billing_mode(agent.get("billing_mode")))
+                    if mixed_billing
+                    else None
+                )
+                row_suffix = f" - {row_label}" if row_label else ""
                 _print(
-                    f"  {agent['agent_name']}: ${agent_cost:.4f} ({pct:.0f}%)",
+                    f"  {agent['agent_name']}: ${agent_cost:.4f} ({pct:.0f}%){row_suffix}",
                     style="dim",
                 )
 
@@ -1477,8 +1529,9 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
             # presented as complete (see #265).
             _print(
                 styled(
-                    "  [bold]Total: ~${:.4f}[/bold][yellow]{}[/yellow]",
+                    "  [bold]Total: ~${:.4f}{}[/bold][yellow]{}[/yellow]",
                     total_cost,
+                    billing_suffix,
                     _unpriced_suffix(),
                 )
             )
@@ -1488,7 +1541,9 @@ def display_usage_summary(usage_data: dict[str, Any], console: Console | None = 
                 )
             )
         else:
-            _print(styled("  [bold]Total: ${:.4f}[/bold]", total_cost))
+            _print(styled("  [bold]Total: ${:.4f}{}[/bold]", total_cost, billing_suffix))
+        if billing_note is not None:
+            _print(styled("  [dim]{}[/dim]", billing_note))
     elif total_tokens > 0:
         _print()
         if unpriced_count:
@@ -2184,6 +2239,7 @@ def _write_terminal_record_for_current_process(
     total_tokens: int | None = None
     total_cost_usd: float | None = None
     unpriced_agent_count = 0
+    billing: AggregateBilling | None = None
     if engine is not None:
         try:
             usage = engine.get_execution_summary().get("usage")
@@ -2194,6 +2250,8 @@ def _write_terminal_record_for_current_process(
             total_tokens = usage.get("total_tokens")
             total_cost_usd = usage.get("total_cost_usd")
             unpriced_agent_count = usage.get("unpriced_agent_count", 0)
+            # Non-strict: the value is engine-built and this writer must never raise.
+            billing = AggregateBilling.from_wire(usage.get("billing"))
 
     try:
         write_terminal_record(
@@ -2213,6 +2271,7 @@ def _write_terminal_record_for_current_process(
                 event_log_path=str(event_log_subscriber.path),
                 bg_stderr_log=os.environ.get("CONDUCTOR_BG_STDERR_LOG"),
                 bg_stdout_log=os.environ.get("CONDUCTOR_BG_STDOUT_LOG"),
+                billing=billing,
             )
         )
     except Exception:

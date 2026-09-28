@@ -106,6 +106,7 @@ export function useSelectedNodeData(): NodeData | undefined {
           activity: [],
           tokens: iter.totalTokens || undefined,
           cost_usd: iter.totalCost || undefined,
+          billing_counts: iter.billingCounts,
           error_message: iter.workflowFailure?.message,
           error_type: iter.workflowFailure?.error_type,
         } as NodeData;

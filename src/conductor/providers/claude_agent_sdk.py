@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
+from conductor.billing import BillingMode
 from conductor.exceptions import ProviderError
 from conductor.install_hint import install_command
 from conductor.providers._schema import (
@@ -196,6 +197,62 @@ class ClaudeAuthStatus:
     subscription_type: str | None = None
     api_key_source: str | None = None
     error: str | None = None
+
+
+# Fixture-attested only (tests/test_cli/test_doctor.py:279); not measured against a live
+# Claude CLI session. Live CLI integration coverage must confirm this value before it is
+# trusted; if a live session reports something else, derivation degrades to "unknown", never
+# silently wrong.
+_FIRST_PARTY_API_PROVIDER: Final = "firstParty"
+
+
+def _derive_billing(
+    context: EffectiveAuthContext, status: ClaudeAuthStatus
+) -> tuple[BillingMode, str]:
+    """Return ``(billing_mode, reason)`` for one execution; ``reason`` is a fixed code.
+
+    Evidence-based and conservative: a known mode is returned only when the child's actual
+    environment, settings tiers, and probe fields all point one way. ``inferred_mode`` is
+    used only to cross-check that this function and ``_check_auth_readiness`` still agree.
+    ``apiProvider`` is used only to *exclude* a non-first-party backend; it never identifies
+    how the CLI authenticated. Reads environment values for presence only; never returns,
+    logs, or stores one.
+    """
+    if not status.ready:
+        return "unknown", "not_ready"
+    env = context.finalized_child_env  # what the child really receives
+
+    def present(name: str) -> bool:
+        return bool(env.get(name, "").strip())
+
+    # Routes that bill somewhere Conductor cannot see.
+    if any(present(name) for name in _CLOUD_BACKEND_SELECTORS):
+        return "unknown", "cloud_backend_selector"
+    if present("ANTHROPIC_AUTH_TOKEN"):
+        return "unknown", "gateway_token"
+    if present("ANTHROPIC_BASE_URL"):
+        return "unknown", "custom_endpoint"
+    # A settings tier can inject a credential or backend after the child env is built.
+    if context.setting_sources:
+        return "unknown", "settings_tier"
+
+    if present("ANTHROPIC_API_KEY"):
+        if present("CLAUDE_CODE_OAUTH_TOKEN"):
+            return "unknown", "competing_credentials"  # CLI precedence not proven
+        if status.inferred_mode != "api_key":
+            return "unknown", "inferred_mode_mismatch"
+        return "metered_api", "api_key"
+
+    # No API key reaches the child: subscription only on positive login evidence.
+    if status.inferred_mode != "subscription":
+        return "unknown", "inferred_mode_mismatch"
+    if status.api_key_source is not None:
+        return "unknown", "api_key_source_reported"
+    if status.api_provider is not None and status.api_provider != _FIRST_PARTY_API_PROVIDER:
+        return "unknown", "non_first_party_backend"
+    if not (status.subscription_type or "").strip():
+        return "unknown", "no_subscription_evidence"  # e.g. a Console login
+    return "subscription", "first_party_login"
 
 
 _CLAUDE_AUTH_TIMEOUT: Final[float] = 5.0
@@ -2096,6 +2153,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 is_retryable=False,
             )
 
+        # Per-execution and immutable. A local, never instance state: one provider instance
+        # serves concurrent parallel and for_each executions.
+        billing_mode, billing_reason = _derive_billing(auth_context, auth_status)
+        logger.debug(
+            "claude-agent-sdk: agent %r billing_mode=%s (reason=%s)",
+            agent.name,
+            billing_mode,
+            billing_reason,
+        )
+
         overridden = auth_context.overridden_credentials()
         if overridden:
             logger.warning(
@@ -2338,6 +2405,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     cache_write_tokens=total_cache_write_tokens,
                     last_call_input_tokens=last_call_input_tokens,
                     partial=True,
+                    billing_mode=billing_mode,
                 )
 
             # S0 -- pre-flight. Nothing is constructed and no process is
@@ -2625,6 +2693,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             cache_read_tokens=total_cache_read_tokens,
             cache_write_tokens=total_cache_write_tokens,
             last_call_input_tokens=last_call_input_tokens,
+            billing_mode=billing_mode,
         )
 
     async def validate_connection(self) -> bool:
@@ -3269,6 +3338,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         cache_write_tokens: int = 0,
         last_call_input_tokens: int | None = None,
         partial: bool = False,
+        *,
+        billing_mode: BillingMode,
     ) -> AgentOutput:
         """Assemble the final ``AgentOutput`` from accumulated execution state.
 
@@ -3383,6 +3454,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             last_call_input_tokens=last_call_input_tokens,
             model=model,
             partial=partial,
+            billing_mode=billing_mode,
         )
 
 

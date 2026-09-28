@@ -717,6 +717,10 @@ workflow:
 
 **budget_usd** and **budget_mode**:
 - Tracks cumulative cost and acts when the budget is exceeded
+- `budget_usd` limits the estimated cost computed from token counts at API
+  rates. For subscription and mixed runs that estimate is a deterministic proxy
+  for token consumption; it is not a limit on, or a measurement of,
+  subscription quota, plan usage, or money
 - `audit` mode (default): emits a `budget_exceeded` event and logs a warning,
   but the workflow continues — use this to discover cost profiles
 - `enforce` mode: emits a `budget_exceeded` event, saves a checkpoint,

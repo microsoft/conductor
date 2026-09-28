@@ -139,8 +139,26 @@ The points that bear on this provider's experimental status:
   block, which is why `subscription` and `api_key` refuse a non-empty
   `setting_sources` at `conductor validate` and again at run time. `auto`
   keeps settings tiers available.
-- **Not billing attribution.** The readiness check shows that a credential path
-  is usable. It is not evidence of which account a model call was billed to.
+- **Readiness is not billing attribution; billing source is derived separately.**
+  The readiness check shows that a credential path is usable. On its own it is
+  not evidence of which account a model call was billed to. Conductor labels
+  each execution's billing source separately, from the environment the child
+  process actually received, the settings tiers it loads, and the probe fields,
+  and defaults to `unknown` whenever it cannot prove one. It reports
+  `subscription` only for a first-party login with a reported subscription
+  type, and `metered_api` only for an API key that reaches the child alone. It
+  reports `unknown` for an inherited cloud-backend selector (Bedrock, Vertex,
+  Foundry), a gateway token, a custom `ANTHROPIC_BASE_URL`, any settings tier,
+  both an API key and an OAuth token, an `apiKeySource` on a login, a
+  non-first-party `apiProvider`, or no subscription evidence (for example a
+  Console login). `apiProvider` is used only to exclude a non-first-party
+  backend; it never identifies how the CLI authenticated. Subscription usage
+  is shown as an **API-equivalent estimate**: token counts priced at API rates,
+  not an invoice or an additional charge. This detection currently relies on
+  CLI-reported `apiProvider` / `subscriptionType` evidence that has not yet
+  been validated against a live Claude CLI session; missing or different
+  evidence degrades safely to `unknown`. See
+  [Cost labels and billing source](../workflow-syntax.md#cost-labels-and-billing-source).
 - **Doctor scope.** `conductor doctor --check` builds the provider with its
   default configuration (`auth_mode: auto`) and does not read workflows, so it
   cannot report a workflow's explicit `auth_mode`; its output says so.

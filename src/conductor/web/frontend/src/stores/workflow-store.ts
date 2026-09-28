@@ -1,4 +1,13 @@
 import { create } from 'zustand';
+import {
+  aggregateLabel,
+  billingFromWire,
+  coerceBillingMode,
+  emptyBillingCounts,
+  withBilling,
+  type BillingCounts,
+  type BillingMode,
+} from '@/lib/billing';
 import type { NodeStatus, NodeType } from '@/lib/constants';
 import type {
   WorkflowEvent,
@@ -81,6 +90,8 @@ export interface IterationSnapshot {
   input_tokens?: number;
   output_tokens?: number;
   cost_usd?: number;
+  /** Billing provenance of this iteration's execution (null/absent: not stated). */
+  billing_mode?: BillingMode | null;
   activity: ActivityEntry[];
   error_type?: string;
   error_message?: string;
@@ -93,6 +104,10 @@ export interface ForEachItemData {
   elapsed?: number;
   tokens?: number;
   cost_usd?: number;
+  /** Billing provenance of an agent item (null/absent: not stated). */
+  billing_mode?: BillingMode | null;
+  /** Aggregate provenance of a `type: workflow` item's child total; null when not stated. */
+  billing_counts?: BillingCounts | null;
   error_type?: string;
   error_message?: string;
   prompt?: string;
@@ -121,6 +136,10 @@ export interface NodeData {
   input_tokens?: number;
   output_tokens?: number;
   cost_usd?: number;
+  /** Billing provenance of this node's execution (null/absent: not stated). */
+  billing_mode?: BillingMode | null;
+  /** Aggregate provenance behind `cost_usd` for a node standing for a whole sub-workflow run. */
+  billing_counts?: BillingCounts | null;
   output?: unknown;
   output_keys?: string[];
   prompt?: string;
@@ -192,6 +211,8 @@ export interface NodeData {
   validator_attempts?: number;
   validator_cost_usd?: number | null;
   validator_model?: string | null;
+  /** Billing provenance of the validator call (null/absent: not stated). */
+  validator_billing_mode?: BillingMode | null;
   // Terminate-specific (type: terminate steps; see issue #219)
   termination_status?: 'success' | 'failed';
   termination_reason?: string;
@@ -276,6 +297,8 @@ export interface SubworkflowContext {
   agentsCompleted: number;
   agentsTotal: number;
   totalCost: number;
+  /** Provenance of the executions behind `totalCost`, counted under the same predicate. */
+  billingCounts: BillingCounts;
   totalTokens: number;
   /** Agents that spent tokens but had no available pricing (see #265) */
   unpricedCount: number;
@@ -358,6 +381,8 @@ interface WorkflowState {
   agentsCompleted: number;
   agentsTotal: number;
   totalCost: number;
+  /** Provenance of the executions behind `totalCost`, counted under the same predicate. */
+  billingCounts: BillingCounts;
   totalTokens: number;
   /** Agents that spent tokens but had no available pricing (see #265) */
   unpricedCount: number;
@@ -587,6 +612,7 @@ function createSubworkflowContext(parentAgent: string, iteration: number, workfl
     totalCost: 0,
     totalTokens: 0,
     unpricedCount: 0,
+    billingCounts: emptyBillingCounts(),
     eventLog: [],
     activityLog: [],
     workflowOutput: null,
@@ -849,6 +875,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   totalCost: 0,
   totalTokens: 0,
   unpricedCount: 0,
+  billingCounts: emptyBillingCounts(),
   selectedNode: null,
   wsStatus: 'connecting',
   wsDisconnectedSince: null,
@@ -1025,6 +1052,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         totalCost: 0,
         totalTokens: 0,
         unpricedCount: 0,
+        billingCounts: emptyBillingCounts(),
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -1123,6 +1151,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         totalCost: 0,
         totalTokens: 0,
         unpricedCount: 0,
+        billingCounts: emptyBillingCounts(),
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -1161,6 +1190,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         totalCost: 0,
         totalTokens: 0,
         unpricedCount: 0,
+        billingCounts: emptyBillingCounts(),
         nodes: {},
         groupProgress: {},
         highlightedEdges: [],
@@ -1385,6 +1415,7 @@ function activeTarget(
   addCost: (cost: number) => void;
   addTokens: (tokens: number) => void;
   addUnpriced: () => void;
+  addBilling: (mode: BillingMode | null) => void;
   incrCompleted: () => void;
 } {
   let ctx: SubworkflowContext | null = null;
@@ -1402,6 +1433,10 @@ function activeTarget(
       addCost: (cost: number) => { ctxRef.totalCost += cost; state.totalCost += cost; },
       addTokens: (tokens: number) => { ctxRef.totalTokens += tokens; state.totalTokens += tokens; },
       addUnpriced: () => { ctxRef.unpricedCount++; state.unpricedCount++; },
+      addBilling: (mode: BillingMode | null) => {
+        ctxRef.billingCounts = withBilling(ctxRef.billingCounts, mode);
+        state.billingCounts = withBilling(state.billingCounts, mode);
+      },
       incrCompleted: () => { ctxRef.agentsCompleted++; state.agentsCompleted++; },
     };
   }
@@ -1413,6 +1448,7 @@ function activeTarget(
     addCost: (cost: number) => { state.totalCost += cost; },
     addTokens: (tokens: number) => { state.totalTokens += tokens; },
     addUnpriced: () => { state.unpricedCount++; },
+    addBilling: (mode: BillingMode | null) => { state.billingCounts = withBilling(state.billingCounts, mode); },
     incrCompleted: () => { state.agentsCompleted++; },
   };
 }
@@ -1619,6 +1655,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         input_tokens: nd.input_tokens,
         output_tokens: nd.output_tokens,
         cost_usd: nd.cost_usd,
+        billing_mode: nd.billing_mode,
         activity: nd.activity,
         error_type: nd.error_type,
         error_message: nd.error_message,
@@ -1652,6 +1689,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.input_tokens = data.input_tokens;
     nd.output_tokens = data.output_tokens;
     nd.cost_usd = data.cost_usd;
+    nd.billing_mode = coerceBillingMode(data.billing_mode);
     nd.output = data.output;
     nd.output_keys = data.output_keys;
     nd.context_window_used = data.context_window_used;
@@ -1664,6 +1702,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
     if (data.tokens && data.cost_usd == null) t.addUnpriced();
+    // Same predicate as the tokens above, so the label describes exactly the total shown.
+    if (data.tokens) t.addBilling(coerceBillingMode(data.billing_mode));
     // Capture terminate-step metadata when present (issue #219). The engine
     // emits these on agent_completed for `status: success` terminate steps so
     // the TerminateNode can render the rendered reason in its body.
@@ -2149,6 +2189,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.model = data.model;
     nd.tokens = data.tokens;
     nd.cost_usd = data.cost_usd;
+    nd.billing_mode = coerceBillingMode(data.billing_mode);
     nd.context_window_used = data.context_window_used;
     nd.context_window_max = data.context_window_max;
     if (data.context_window_used != null && data.context_window_max != null && data.context_window_max > 0) {
@@ -2159,6 +2200,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     if (data.cost_usd) t.addCost(data.cost_usd);
     if (data.tokens) t.addTokens(data.tokens);
     if (data.tokens && data.cost_usd == null) t.addUnpriced();
+    if (data.tokens) t.addBilling(coerceBillingMode(data.billing_mode));
     replaceNode(t.nodes, data.agent_name);
     replaceNode(t.nodes, data.group_name);
   },
@@ -2230,6 +2272,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         item.elapsed = data.elapsed;
         item.tokens = data.tokens;
         item.cost_usd = data.cost_usd;
+        item.billing_mode = coerceBillingMode(data.billing_mode);
+        item.billing_counts = billingFromWire(data.billing);
         item.output = data.output;
       }
     }
@@ -2751,6 +2795,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       nd.validator_state = verdict;
       nd.validator_issues = data.issues ?? [];
       nd.validator_cost_usd = data.cost_usd ?? null;
+      nd.validator_billing_mode = coerceBillingMode(data.billing_mode);
       nd.validator_model = data.model ?? nd.validator_model ?? null;
     }
     replaceNode(t.nodes, data.agent_name);
@@ -2932,11 +2977,14 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
       const budget = (d.budget_usd as number) ?? 0;
       const mode = String(d.budget_mode ?? 'audit');
       const at = d.current_agent ? ` at ${d.current_agent}` : '';
+      // The label is a constant chosen from the parsed aggregate, never event text.
+      const billingLabel = aggregateLabel(billingFromWire(d.billing), true);
+      const modeText = billingLabel ? `${mode}, ${billingLabel}` : mode;
       return {
         timestamp: ts,
         level: mode === 'enforce' ? 'error' : 'warning',
         source: 'workflow',
-        message: `Budget exceeded — $${spent.toFixed(2)} of $${budget.toFixed(2)} (${mode})${at}`,
+        message: `Budget exceeded — $${spent.toFixed(2)} of $${budget.toFixed(2)} (${modeText})${at}`,
       };
     }
 

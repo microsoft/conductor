@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from conductor.billing import AggregateBilling
 from conductor.fleet.records import (
     RunRecord,
     TerminalRunRecord,
@@ -334,3 +335,95 @@ class TestWriteTerminalRecordNeverRaises:
             runs_dir.chmod(stat.S_IRWXU)
 
         assert result is None
+
+
+class TestTerminalRecordBilling:
+    """``TerminalRunRecord.billing`` round-trips strictly and stays backward compatible:
+
+    a record written before this field existed, or one with a malformed value, parses back
+    as ``None`` rather than raising or fabricating a state.
+    """
+
+    def test_terminal_record_billing_round_trip(self) -> None:
+        billing = AggregateBilling({"subscription": 2, "metered_api": 1})
+        record = _make_terminal_record(billing=billing)
+        wire = record.to_dict()
+        assert wire["billing"] == {
+            "state": "mixed",
+            "breakdown": {"subscription": 2, "metered_api": 1},
+        }
+        assert TerminalRunRecord.from_dict(json.loads(json.dumps(wire))) == record
+
+    def test_to_dict_always_carries_billing_key(self) -> None:
+        wire = _make_terminal_record().to_dict()
+        assert "billing" in wire
+        assert wire["billing"] is None
+
+    def test_unstated_only_billing_serializes_as_null(self) -> None:
+        record = _make_terminal_record(billing=AggregateBilling({"unstated": 3}))
+        assert record.to_dict()["billing"] is None
+
+    def test_absent_billing_defaults_none(self) -> None:
+        assert TerminalRunRecord.from_dict({"run_id": "x"}).billing is None
+
+    def test_null_billing_is_none(self) -> None:
+        assert TerminalRunRecord.from_dict({"billing": None}).billing is None
+
+    def test_old_record_without_billing_loads(self) -> None:
+        legacy = _make_terminal_record().to_dict()
+        del legacy["billing"]
+        record = TerminalRunRecord.from_dict(legacy)
+        assert record.billing is None
+        assert record.total_cost_usd == 0.05
+
+    def test_constructor_without_billing_stays_valid(self) -> None:
+        assert _make_terminal_record().billing is None
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            "subscription",
+            ["subscription"],
+            7,
+            True,
+            {"breakdown": "nope"},
+            {"breakdown": ["subscription"]},
+            {"state": "mixed"},
+            {"state": 3, "breakdown": {"subscription": 1}},
+            {"breakdown": {"subscription": True}},
+            {"breakdown": {"subscription": "1"}},
+            {"breakdown": {"subscription": -1}},
+        ],
+    )
+    def test_malformed_billing_raises_value_error(self, malformed: object) -> None:
+        with pytest.raises(ValueError, match="billing"):
+            TerminalRunRecord.from_dict({"billing": malformed})
+
+    def test_unrecognized_class_counts_as_unknown(self) -> None:
+        record = TerminalRunRecord.from_dict(
+            {"billing": {"breakdown": {"subscription": 1, "bedrock": 2}}}
+        )
+        assert record.billing == AggregateBilling({"subscription": 1, "unknown": 2})
+
+    def test_state_is_recomputed_not_trusted(self) -> None:
+        record = TerminalRunRecord.from_dict(
+            {"billing": {"state": "metered_api", "breakdown": {"subscription": 2}}}
+        )
+        assert record.billing is not None
+        assert record.billing.state == "subscription"
+
+    def test_write_read_round_trip_on_disk(self, fleet_env: Path) -> None:
+        record = _make_terminal_record(billing=AggregateBilling({"subscription": 1}))
+        write_terminal_record(record)
+        assert read_terminal_record("abc123") == record
+
+    def test_record_with_malformed_billing_is_skipped_by_the_bulk_reader(
+        self, fleet_env: Path
+    ) -> None:
+        good = _make_terminal_record(run_id="good")
+        write_terminal_record(good)
+        bad_path = terminal_records_dir() / "bad.json"
+        payload = _make_terminal_record(run_id="bad").to_dict()
+        payload["billing"] = "subscription"
+        bad_path.write_text(json.dumps(payload), encoding="utf-8")
+        assert [r.run_id for r in read_terminal_records()] == ["good"]

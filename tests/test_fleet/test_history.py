@@ -31,6 +31,7 @@ import pytest
 
 import conductor.fleet.history as history_module
 import conductor.fleet.summary as summary_module
+from conductor.billing import AggregateBilling
 from conductor.fleet.history import (
     HistoryEntry,
     _CorruptEventLogError,
@@ -78,6 +79,7 @@ def _write_terminal_record(
     output: dict[str, Any] | None = None,
     error_type: str | None = None,
     error_message: str | None = None,
+    billing: AggregateBilling | None = None,
 ) -> None:
     """Write a terminal run record via the real ``write_terminal_record``,
     matching E2's ``TerminalRunRecord``/``write_terminal_record`` contract
@@ -101,6 +103,7 @@ def _write_terminal_record(
             event_log_path=f"/tmp/conductor/{run_id}.events.jsonl",
             bg_stderr_log=None,
             bg_stdout_log=None,
+            billing=billing,
         )
     )
 
@@ -1108,3 +1111,229 @@ class TestFullLogStreamsWithoutMaterializing:
 
         with pytest.raises(OSError):
             next(gen)
+
+
+# ---------------------------------------------------------------------------
+# Billing provenance: History's own event-log scan counts each entry's billing_mode
+# directly from its completion events; it never reads a terminal record's aggregate
+# (see test_history_billing_ignores_terminal_record below).
+# ---------------------------------------------------------------------------
+
+
+def _completion(
+    etype: str,
+    name: str = "a",
+    *,
+    mode: object = "subscription",
+    tokens: object = 100,
+    cost: object = 0.01,
+) -> str:
+    """A completion event; a ``mode`` of ``...`` omits ``billing_mode`` (a legacy log)."""
+    data: dict[str, Any] = {"agent_name": name, "elapsed": 1.0}
+    if tokens is not ...:
+        data["tokens"] = tokens
+    if cost is not ...:
+        data["cost_usd"] = cost
+    if mode is not ...:
+        data["billing_mode"] = mode
+    return _event(etype, data)
+
+
+def _entry_for(root: Path, lines: list[str], *, run_id: str = "deadbeef") -> HistoryEntry:
+    """Build the entry through ``build_history_entries`` so ``_build_entry``'s wiring is covered."""
+    _write_log(root, run_id=run_id, lines=lines)
+    (entry,) = build_history_entries(keep_last=5)
+    return entry
+
+
+def _counts(entry: HistoryEntry) -> dict[str, int]:
+    return dict(entry.billing.breakdown) if entry.billing is not None else {}
+
+
+class TestHistoryBilling:
+    def test_history_billing_counts_agent_completed(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [_completion("agent_completed", "a"), _completion("agent_completed", "b")],
+        )
+        assert _counts(entry) == {"subscription": 2}
+
+    def test_history_billing_counts_parallel_agent_completed(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("parallel_agent_completed", "a", mode="metered_api"),
+                _completion("parallel_agent_completed", "b", mode="metered_api"),
+            ],
+        )
+        assert _counts(entry) == {"metered_api": 2}
+
+    def test_history_billing_mixed_counts_are_exact(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("agent_completed", "a", mode="subscription"),
+                _completion("agent_completed", "b", mode="subscription"),
+                _completion("parallel_agent_completed", "c", mode="metered_api"),
+                _completion("parallel_agent_completed", "d", mode="unknown"),
+            ],
+        )
+        assert _counts(entry) == {"subscription": 2, "metered_api": 1, "unknown": 1}
+        assert entry.billing is not None and entry.billing.state == "mixed"
+
+    @pytest.mark.parametrize(
+        ("tokens", "cost", "counted", "total_cost", "unpriced"),
+        [
+            (100, 0.01, True, 0.01, 0),
+            (100, None, True, None, 1),
+            (0, 0.0, False, 0.0, 0),
+            (0, None, False, None, 0),
+            (None, 0.5, True, 0.5, 0),
+            (None, None, False, None, 0),
+            (float("nan"), None, False, None, 0),
+            # bool is a subclass of int, but True/False are not token counts or dollars:
+            # _finite_float rejects them, so they neither sum nor count as an execution.
+            (True, None, False, None, 0),
+            (False, None, False, None, 0),
+            (None, True, False, None, 0),
+            (None, False, False, None, 0),
+            (True, True, False, None, 0),
+            (100, True, True, None, 1),  # real tokens, boolean cost: an unpriced execution
+            (100, False, True, None, 1),
+            (True, 0.5, True, 0.5, 0),  # boolean tokens ignored; the real cost still contributes
+        ],
+    )
+    def test_history_billing_same_predicate_table(
+        self,
+        temp_root: Path,
+        tokens: object,
+        cost: object,
+        counted: bool,
+        total_cost: float | None,
+        unpriced: int,
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [_completion("agent_completed", tokens=tokens, cost=cost, mode="subscription")],
+        )
+        assert entry.total_cost_usd == total_cost
+        assert entry.unpriced_agent_count == unpriced
+        assert _counts(entry) == ({"subscription": 1} if counted else {})
+
+    def test_history_billing_zero_usage_member_is_not_counted(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("parallel_agent_completed", "llm", mode="subscription"),
+                _completion("parallel_agent_completed", "tagger", mode=..., tokens=0, cost=0.0),
+            ],
+        )
+        assert _counts(entry) == {"subscription": 1}
+
+    def test_history_billing_legacy_log_is_unstated(self, temp_root: Path) -> None:
+        entry = _entry_for(temp_root, [_completion("agent_completed", mode=...)])
+        assert _counts(entry) == {"unstated": 1}
+        assert entry.billing is not None and entry.billing.to_wire() is None
+
+    def test_history_billing_none_without_contributing_events(self, temp_root: Path) -> None:
+        entry = _entry_for(temp_root, [_event("workflow_started", {"name": "wf"}, ts=1.0)])
+        assert entry.billing is None
+
+    def test_history_billing_unrecognized_and_non_string(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("agent_completed", "a", mode="bedrock"),
+                _completion("agent_completed", "b", mode=7),
+            ],
+        )
+        assert _counts(entry) == {"unknown": 1, "unstated": 1}
+
+    def test_history_billing_skips_nested_subworkflow_events(self, temp_root: Path) -> None:
+        nested = json.dumps(
+            {
+                "type": "agent_completed",
+                "timestamp": 1.0,
+                "data": {
+                    "agent_name": "n",
+                    "tokens": 5,
+                    "cost_usd": 0.1,
+                    "billing_mode": "subscription",
+                    "subworkflow_path": ["child"],
+                },
+            }
+        )
+        entry = _entry_for(
+            temp_root, [_completion("agent_completed", "root", mode="metered_api"), nested]
+        )
+        assert _counts(entry) == {"metered_api": 1}
+
+    def test_history_billing_accumulates_across_generations(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("workflow_started", {"name": "wf"}, ts=1.0),
+                _completion("agent_completed", "a", mode="subscription"),
+                _event("workflow_started", {"name": "wf"}, ts=2.0),
+                _completion("agent_completed", "b", mode="metered_api"),
+            ],
+        )
+        assert _counts(entry) == {"subscription": 1, "metered_api": 1}
+
+    def test_history_has_no_gate_skip(self, temp_root: Path) -> None:
+        """History's scanner does not share the Runs screen's ``_scan_events`` gate-skip
+        quirk (see ``test_runs_billing_follows_the_gate_skip_of_the_cost`` in
+        ``test_summary.py``): the completion for the agent that owns an open gate is
+        counted here (tokens, cost and billing alike)."""
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("agent_started", {"agent_name": "X"}, ts=1.0),
+                _event("gate_presented", {"agent_name": "X", "prompt": "ok?"}, ts=2.0),
+                _completion("agent_completed", "X", mode="subscription"),
+            ],
+        )
+        assert entry.total_tokens == 100
+        assert _counts(entry) == {"subscription": 1}
+
+    def test_history_billing_ignores_terminal_record(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        """The events say metered; the matching terminal record says subscription. The row
+        stays on the events' basis (D12): the record's aggregate is engine-basis."""
+        _write_terminal_record("deadbeef", billing=AggregateBilling({"subscription": 5}))
+        entry = _entry_for(temp_root, [_completion("agent_completed", mode="metered_api")])
+        assert _counts(entry) == {"metered_api": 1}
+
+    def test_terminal_record_does_not_supply_billing_for_a_legacy_log(
+        self, temp_root: Path, terminal_env: Path
+    ) -> None:
+        _write_terminal_record("deadbeef", billing=AggregateBilling({"subscription": 5}))
+        entry = _entry_for(temp_root, [_completion("agent_completed", mode=...)])
+        assert _counts(entry) == {"unstated": 1}
+        assert entry.billing is not None and entry.billing.stated is False
+
+
+class TestHistoryBooleanUsageValues:
+    @pytest.mark.parametrize("etype", ["agent_completed", "parallel_agent_completed"])
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_history_totals_ignore_booleans(self, temp_root: Path, etype: str, flag: bool) -> None:
+        entry = _entry_for(
+            temp_root, [_completion(etype, tokens=flag, cost=flag, mode="subscription")]
+        )
+        assert entry.total_tokens == 0
+        assert entry.total_cost_usd is None
+        assert entry.unpriced_agent_count == 0
+        assert entry.billing is None
+
+    def test_a_boolean_never_adds_to_a_real_total(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("agent_completed", "a", tokens=100, cost=0.05, mode="subscription"),
+                _completion("agent_completed", "b", tokens=True, cost=True, mode="metered_api"),
+            ],
+        )
+        assert entry.total_tokens == 100
+        assert entry.total_cost_usd == 0.05
+        assert _counts(entry) == {"subscription": 1}

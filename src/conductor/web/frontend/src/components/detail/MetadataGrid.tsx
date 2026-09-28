@@ -1,4 +1,5 @@
-import { formatElapsed, formatCost, formatTokens, formatContextFull } from '@/lib/utils';
+import { formatElapsed, formatTokens, formatContextFull } from '@/lib/utils';
+import { formatCostWithBilling, type BillingMode } from '@/lib/billing';
 
 interface MetadataGridProps {
   items: Array<{ label: string; value: string | number | null | undefined }>;
@@ -32,6 +33,7 @@ export function buildAgentMetadata(nd: {
   input_tokens?: number;
   output_tokens?: number;
   cost_usd?: number;
+  billing_mode?: BillingMode | null;
   context_window_used?: number;
   context_window_max?: number;
   iteration?: number;
@@ -47,7 +49,9 @@ export function buildAgentMetadata(nd: {
   if (nd.input_tokens != null && nd.output_tokens != null) {
     items.push({ label: 'In / Out', value: `${formatTokens(nd.input_tokens)} / ${formatTokens(nd.output_tokens)}` });
   }
-  if (nd.cost_usd != null) items.push({ label: 'Cost', value: formatCost(nd.cost_usd) });
+  if (nd.cost_usd != null) {
+    items.push({ label: 'Cost', value: formatCostWithBilling(nd.cost_usd, nd.billing_mode) });
+  }
   if (nd.context_window_used != null && nd.context_window_max != null) {
     items.push({ label: 'Context', value: formatContextFull(nd.context_window_used, nd.context_window_max) });
   }

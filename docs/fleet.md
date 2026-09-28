@@ -361,6 +361,34 @@ finishes. The columns are simply labelled `Tokens`/`Cost`, with no
 in-column caveat, so a total mid-run may look lower than expected; this is
 a deliberate v1 scope decision (no live token streaming), not a bug.
 
+When a total's executions stated a billing source (currently `claude-agent-sdk`),
+the `Cost` column of Runs, Run Detail and History carries a compact label —
+`est.`, `src?` or `mixed` — after the figure. Where that expands to the long
+form depends on the screen and is scoped to the run or agent in view, not
+shown unconditionally for every row:
+
+- **Runs**: the fleet-wide summary bar carries its own compact label when the
+  runs it sums stated a billing source; the preview pane's `Cost basis` line
+  expands the *selected* run's own label to the long form.
+- **Run Detail**: the legend line expands the label for the run this screen
+  is already showing.
+- **History**: pressing Enter on a row's notification expands that row's
+  label to the long form.
+
+`est.` means an **API-equivalent estimate** (tokens priced at API rates), not
+an invoice or an additional charge. Like the workflow-syntax guide's [Cost
+labels and billing source](workflow-syntax.md#cost-labels-and-billing-source)
+section, the label follows the specific classes a total combines, never a
+majority or dominant mode: an all-`subscription` or all-`metered_api` total
+keeps that class's label; `subscription` or `metered_api` combined with
+providers that report nothing reads `mixed`; `unknown` combined only with
+providers that report nothing reads `src?`, not `mixed`. The label describes
+the same completed-agent total as the figure beside it (root-context
+`agent_completed` and `parallel_agent_completed` events only, counted by each
+screen's own scan), so it can differ from the label `conductor status` shows
+for the same run, which uses the engine's total. A log without billing data
+shows no label and is unchanged.
+
 ## Gates: display vs. resolve
 
 A human gate is derived from `gate_presented`/`gate_resolved` in the JSONL

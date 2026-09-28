@@ -669,8 +669,10 @@ not load them; the error suggests removing `setting_sources` or using
 `auth_mode: auto`, which keeps settings tiers available.
 
 The readiness check confirms that a credential path is usable before each
-agent runs. It is **not billing attribution**, and it is not evidence of which
-account a model call was billed to.
+agent runs. On its own it is not evidence of which account a model call was
+billed to. Billing source is derived separately, per execution, from the child
+environment, the settings tiers and the probe, and defaults to `unknown` when
+it cannot be proven; see [Cost labels and billing source](#cost-labels-and-billing-source).
 
 `conductor doctor --check` reports the check's result as two groups: a
 `Conductor:` line with Conductor's own `requested_mode` / `inferred_mode`, and
@@ -700,6 +702,41 @@ See the [Authentication](providers/experimental.md#authentication-claude-agent-s
 section of the experimental-providers guide and the
 [configuration guide](configuration.md#field-compatibility-by-provider) for
 field compatibility across providers.
+
+#### Cost labels and billing source
+
+A cost figure in Conductor is always an **estimate** computed from token counts
+and a price table. Each `claude-agent-sdk` execution records where its usage was
+billed, and every figure whose billing source requires clarification receives
+the matching label. Metered-API executions and providers that do not report a
+billing source keep today's unlabelled presentation.
+
+| Billing source | Label |
+|---|---|
+| none reported, or `metered_api` | *(no label; unchanged)* |
+| `subscription` | `API-equivalent estimate` |
+| `unknown` (reported, but not proven) | `billing source unknown` |
+| several sources in one total | `mixed billing` (the console summary adds the breakdown, for example `mixed billing: 2 subscription, 1 metered API`) |
+
+`API-equivalent estimate` means the tokens were priced at API rates; it is not
+an invoice or an additional charge. A total's label follows the specific
+classes it combines, never a majority or dominant mode: executions that are
+all the same single class (all `subscription`, or all `metered_api`) keep that
+class's label; a `subscription` or `metered_api` execution combined with
+providers that report nothing reads `mixed billing`; `unknown` combined only
+with providers that report nothing reads `billing source unknown`, not
+`mixed`; and a total where nothing reported a billing source carries no label
+at all. Table cells in the Fleet Manager use the compact forms `est.`,
+`src?` and `mixed`; see [Status vocabulary](fleet.md#status-vocabulary) in
+the Fleet guide for exactly where each is expanded. The label appears in
+the console usage summary, per-execution progress lines, budget messages,
+`conductor status`, the web dashboard, the Fleet Runs, Run Detail and History
+screens, and as `billing_mode` on agent completion events and `billing` in
+`conductor status --json` and MCP run-status payloads.
+
+Subscription detection currently relies on CLI-reported `apiProvider` /
+`subscriptionType` evidence that has not yet been validated against a live
+Claude CLI session. Missing or different evidence degrades safely to `unknown`.
 
 ### Native Tools (`native_tools`)
 
@@ -2030,7 +2067,10 @@ workflow:
 ### Cost Budget
 
 - `budget_usd` caps cumulative LLM cost across the run. When unset (default), no
-  budget tracking occurs.
+  budget tracking occurs. `budget_usd` limits the estimated cost computed from
+  token counts at API rates. For subscription and mixed runs that estimate is a
+  deterministic proxy for token consumption; it is not a limit on, or a
+  measurement of, subscription quota, plan usage, or money.
 - `budget_mode: audit` (default) emits a `budget_exceeded` event and logs a
   warning on first overshoot, but the workflow continues — use this to discover
   cost profiles before enforcing.

@@ -907,3 +907,219 @@ class TestStepDrilldownFooter:
 
             assert len(app.screen_stack) == before + 1
             assert isinstance(app.screen, StepDetailScreen)
+
+
+# ---------------------------------------------------------------------------
+# Billing provenance labels: the Run Detail screen's per-agent rows and its legend
+# expansion, driven by the same per-agent billing_mode counters.
+# ---------------------------------------------------------------------------
+
+
+def _completed_event(
+    etype: str = "agent_completed",
+    name: str = "a",
+    *,
+    mode: object = "subscription",
+    tokens: object = 100,
+    cost: object = 0.05,
+) -> str:
+    """A completion event; ``mode=...`` omits ``billing_mode`` (a legacy log, predating
+    this field)."""
+    data: dict[str, Any] = {"agent_name": name, "elapsed": 1.0}
+    if tokens is not ...:
+        data["tokens"] = tokens
+    if cost is not ...:
+        data["cost_usd"] = cost
+    if mode is not ...:
+        data["billing_mode"] = mode
+    return _event(etype, data)
+
+
+async def _open_detail(app: FleetApp, pilot: Any) -> RunDetailScreen:
+    await settle(pilot)
+    await pilot.press("enter")
+    await settle(pilot)
+    assert isinstance(app.screen, RunDetailScreen)
+    return app.screen
+
+
+def _seed_detail_run(tmp_path: Path, agents: list[str], lines: list[str]) -> None:
+    log_path = tmp_path / "run-a.events.jsonl"
+    _write_jsonl(log_path, [_workflow_started_event(agents), *lines])
+    _write_record(tmp_path, "run-a", workflow_name="alpha", event_log_path=str(log_path))
+
+
+def _cost_cells(screen: RunDetailScreen) -> list[str]:
+    table = screen.query_one(DataTable)
+    return [str(table.get_row_at(i)[5]) for i in range(table.row_count)]
+
+
+def _legend(screen: RunDetailScreen) -> Static:
+    return screen.query_one("#detail-cost-legend", Static)
+
+
+_LEGEND_NOTE = (
+    "Estimates are computed at API rates from token counts; not an invoice or an additional charge."
+)
+
+
+class TestRunDetailBillingLabels:
+    """The per-agent Cost cell (column 5) and the legend that expands its compact label."""
+
+    @pytest.mark.parametrize(
+        ("lines", "expected"),
+        [
+            ([_completed_event(mode=...)], "~$0.05"),  # legacy log: byte-identical
+            ([_completed_event(mode="metered_api")], "~$0.05"),
+            ([_completed_event(mode="subscription")], "~$0.05 est."),
+            ([_completed_event(mode="unknown")], "~$0.05 src?"),
+        ],
+        ids=["legacy", "metered", "subscription", "unknown"],
+    )
+    async def test_cost_cell_for_each_billing_state(
+        self, fleet_env: Path, tmp_path: Path, lines: list[str], expected: str
+    ) -> None:
+        _seed_detail_run(tmp_path, ["a"], [_event("agent_started", {"agent_name": "a"}), *lines])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == [expected]
+
+    async def test_loop_back_agent_row_reads_mixed(self, fleet_env: Path, tmp_path: Path) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a"],
+            [
+                _event("agent_started", {"agent_name": "a"}, ts=1.0),
+                _completed_event(mode="subscription", cost=0.03),
+                _event("agent_started", {"agent_name": "a"}, ts=2.0),
+                _completed_event(mode="metered_api", cost=0.02),
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["~$0.05 mixed"]
+
+    async def test_cost_cell_agent_completed_only_log(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a"],
+            [_event("agent_started", {"agent_name": "a"}), _completed_event("agent_completed")],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["~$0.05 est."]
+
+    async def test_cost_cell_parallel_only_log(self, fleet_env: Path, tmp_path: Path) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a"],
+            [
+                _event("parallel_started", {"group_name": "g"}),
+                _event("parallel_agent_started", {"group_name": "g", "agent_name": "a"}),
+                _completed_event("parallel_agent_completed"),
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["~$0.05 est."]
+
+    async def test_row_without_a_figure_has_no_label(self, fleet_env: Path, tmp_path: Path) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a", "b"],
+            [
+                _event("agent_started", {"agent_name": "a"}),
+                _completed_event(mode="subscription", cost=None),  # unpriced: no figure
+                _event("agent_started", {"agent_name": "b"}),  # running: no figure yet
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["—", "—"]
+            # Neither row shows a figure, so neither compact code is on screen to explain.
+            assert _legend(screen).display is False
+
+    async def test_legend_lists_exactly_the_visible_labels(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a", "b", "c"],
+            [
+                _event("agent_started", {"agent_name": "a"}),
+                _completed_event(name="a", mode="subscription"),
+                _event("agent_started", {"agent_name": "b"}),
+                _completed_event(name="b", mode="unknown"),
+                _event("agent_started", {"agent_name": "c"}),
+                _completed_event(name="c", mode="metered_api"),
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["~$0.05 est.", "~$0.05 src?", "~$0.05"]
+            legend = _legend(screen)
+            assert legend.display is True
+            assert str(legend.render()) == (
+                "est. = API-equivalent estimate; src? = billing source unknown. " + _LEGEND_NOTE
+            )
+
+    async def test_legend_without_estimates_carries_no_note(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a"],
+            [_event("agent_started", {"agent_name": "a"}), _completed_event(mode="unknown")],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert str(_legend(screen).render()) == "src? = billing source unknown"
+
+    @pytest.mark.parametrize("mode", [..., "metered_api"], ids=["legacy", "metered"])
+    async def test_legend_hidden_for_legacy_and_metered_logs(
+        self, fleet_env: Path, tmp_path: Path, mode: object
+    ) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a"],
+            [_event("agent_started", {"agent_name": "a"}), _completed_event(mode=mode)],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["~$0.05"]
+            assert _legend(screen).display is False
+
+    async def test_legend_hidden_on_the_placeholder(self, fleet_env: Path, tmp_path: Path) -> None:
+        _write_record(tmp_path, "run-a", workflow_name="alpha")  # empty log: no topology
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert screen.query_one("#detail-placeholder", Static).display is True
+            assert _legend(screen).display is False
+
+    async def test_hostile_billing_mode_never_renders(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["a"],
+            [
+                _event("agent_started", {"agent_name": "a"}),
+                _completed_event(mode="[bold red]INJECT[/]"),
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == ["~$0.05 src?"]
+            assert "INJECT" not in str(_legend(screen).render())

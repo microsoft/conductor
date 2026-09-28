@@ -23,6 +23,7 @@ import pytest
 from textual.binding import Binding
 from textual.widgets import DataTable, Footer, Static
 
+from conductor.billing import AggregateBilling
 from conductor.cli import pid as cli_pid
 from conductor.fleet.records import RunRecord, read_run_records, write_run_record
 from conductor.fleet.summary import GateInfo, derive_run_summary
@@ -2304,3 +2305,323 @@ class TestChangeDirBinding:
             assert app.launch_dir == original
             assert isinstance(app.screen, RunsScreen)
             assert app.screen.sub_title == original_sub_title
+
+
+# ---------------------------------------------------------------------------
+# Billing provenance labels: the Runs screen's compact cost-cell chip and summary bar,
+# plus their expansion in the selected run's preview/details.
+# ---------------------------------------------------------------------------
+
+
+def _completed_event(
+    etype: str = "agent_completed",
+    name: str = "a",
+    *,
+    mode: object = "subscription",
+    tokens: object = 100,
+    cost: object = 0.05,
+) -> str:
+    """A completion event; ``mode=...`` omits ``billing_mode`` (a legacy log, predating
+    this field)."""
+    data: dict[str, Any] = {"agent_name": name}
+    if tokens is not ...:
+        data["tokens"] = tokens
+    if cost is not ...:
+        data["cost_usd"] = cost
+    if mode is not ...:
+        data["billing_mode"] = mode
+    return _event(etype, data)
+
+
+def _seed_billing_run(
+    tmp_path: Path, run_id: str, lines: list[str], *, started_at: str = "2026-01-01T00:00:00+00:00"
+) -> None:
+    log = tmp_path / f"{run_id}.events.jsonl"
+    _write_events(log, [_event("workflow_started", {"workflow_name": "wf"}), *lines])
+    _write_record(
+        tmp_path, run_id, workflow_name=run_id, event_log_path=str(log), started_at=started_at
+    )
+
+
+async def _cost_cell(app: FleetApp, pilot: Any) -> str:
+    await settle(pilot)
+    return str(app.screen.query_one(DataTable).get_row_at(0)[5])
+
+
+class TestRunsBillingLabels:
+    """The Cost cell (column 5) carries the compact label of the Fleet scanner's own total."""
+
+    @pytest.mark.parametrize(
+        ("lines", "expected"),
+        [
+            ([_completed_event(mode=...)], "~$0.05"),  # legacy log: byte-identical
+            ([_completed_event(mode="metered_api")], "~$0.05"),
+            ([_completed_event(mode="subscription")], "~$0.05 est."),
+            ([_completed_event(mode="unknown")], "~$0.05 src?"),
+            (
+                [
+                    _completed_event(mode="subscription", cost=0.03),
+                    _completed_event(
+                        "parallel_agent_completed", "b", mode="metered_api", cost=0.02
+                    ),
+                ],
+                "~$0.05 mixed",
+            ),
+        ],
+        ids=["legacy", "metered", "subscription", "unknown", "mixed"],
+    )
+    async def test_cost_cell_for_each_billing_state(
+        self, fleet_env: Path, tmp_path: Path, lines: list[str], expected: str
+    ) -> None:
+        _seed_billing_run(tmp_path, "aaaa0001", lines)
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _cost_cell(app, pilot) == expected
+
+    async def test_cost_cell_agent_completed_only_log(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_billing_run(tmp_path, "aaaa0002", [_completed_event("agent_completed")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _cost_cell(app, pilot) == "~$0.05 est."
+
+    async def test_cost_cell_parallel_only_log(self, fleet_env: Path, tmp_path: Path) -> None:
+        _seed_billing_run(tmp_path, "aaaa0003", [_completed_event("parallel_agent_completed")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _cost_cell(app, pilot) == "~$0.05 est."
+
+    async def test_cost_cell_label_precedes_unpriced_count(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_billing_run(
+            tmp_path,
+            "aaaa0004",
+            [
+                _completed_event("agent_completed"),
+                _completed_event("agent_completed", "b", cost=None),
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _cost_cell(app, pilot) == "~$0.05 est. (1 unpriced)"
+
+    async def test_cost_cell_has_no_label_without_a_figure(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_billing_run(tmp_path, "aaaa0005", [_completed_event(cost=None)])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _cost_cell(app, pilot) == "(1 unpriced)"
+
+    async def test_hostile_billing_mode_never_renders(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_billing_run(tmp_path, "aaaa0006", [_completed_event(mode="[bold red]INJECT[/]")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _cost_cell(app, pilot) == "~$0.05 src?"
+            assert "INJECT" not in str(app.screen.query_one("#run-preview", Static).render())
+
+    async def test_preview_pane_shows_the_full_label(self, fleet_env: Path, tmp_path: Path) -> None:
+        _seed_billing_run(tmp_path, "aaaa0007", [_completed_event(mode="subscription")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            preview = str(app.screen.query_one("#run-preview", Static).render())
+        assert "Cost basis  API-equivalent estimate" in preview
+        assert "not an invoice or an additional charge" in preview
+
+    async def test_summary_bar_pilot_follows_the_summed_runs(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_billing_run(
+            tmp_path,
+            "aaaa0008",
+            [_completed_event(mode="subscription", cost=1.0)],
+            started_at="2026-01-02T00:00:00+00:00",
+        )
+        # An all-unpriced unknown run: no dollar figure, so it is not summed and must not
+        # turn the label into ``mixed``.
+        _seed_billing_run(
+            tmp_path,
+            "aaaa0009",
+            [_completed_event(mode="unknown", cost=None)],
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            bar = str(app.screen.query_one("#summary-bar", Static).render())
+        assert "~$1.00 est. (partial)" in bar
+
+    async def test_summary_bar_pilot_mixes_across_runs(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        _seed_billing_run(
+            tmp_path,
+            "aaaa0010",
+            [_completed_event(mode="subscription", cost=1.0)],
+            started_at="2026-01-02T00:00:00+00:00",
+        )
+        _seed_billing_run(
+            tmp_path,
+            "aaaa0011",
+            [_completed_event(mode="metered_api", cost=0.5)],
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            bar = str(app.screen.query_one("#summary-bar", Static).render())
+        assert "~$1.50 mixed" in bar
+        assert "partial" not in bar
+
+
+def _run_summary(
+    *,
+    total_cost_usd: float | None,
+    unpriced: int = 0,
+    billing: AggregateBilling | None = None,
+    gate: GateInfo | None = None,
+    topology: Any = None,
+    status: Any = "running",
+) -> Any:
+    from conductor.fleet.summary import RunSummary
+
+    return RunSummary(
+        run_id="r1",
+        workflow_name="wf",
+        mode="bg",
+        port=8080,
+        started_at="2026-01-01T00:00:00+00:00",
+        status=status,
+        current_step="a",
+        current_step_type="agent",
+        current_step_started_at=None,
+        total_tokens=10,
+        total_cost_usd=total_cost_usd,
+        unpriced_agent_count=unpriced,
+        gate=gate,
+        gate_resolvable=True,
+        topology=topology,
+        billing=billing,
+    )
+
+
+_SUB = AggregateBilling({"subscription": 2})
+_UNK = AggregateBilling({"unknown": 1})
+_MIXED = AggregateBilling({"subscription": 2, "metered_api": 1})
+_METERED = AggregateBilling({"metered_api": 1})
+_UNSTATED = AggregateBilling({"unstated": 2})
+
+
+class TestSummaryBarBillingLabel:
+    def test_summary_bar_label_follows_the_summed_runs(self) -> None:
+        from conductor.fleet.tui.screens.runs import _summary_bar_text
+
+        priced_sub = _run_summary(total_cost_usd=1.0, billing=_SUB)
+        unpriced_unknown = _run_summary(total_cost_usd=None, unpriced=1, billing=_UNK)
+        metered = _run_summary(total_cost_usd=0.5, billing=_METERED)
+        # B has no dollar figure, so it is neither summed nor part of the label...
+        assert "~$1.00 est. (partial)" in _summary_bar_text([priced_sub, unpriced_unknown]).plain
+        # ...but two summed runs of different provenance are mixed.
+        assert "~$1.50 mixed" in _summary_bar_text([priced_sub, metered]).plain
+
+    def test_summary_bar_is_unchanged_without_a_label(self) -> None:
+        from conductor.fleet.tui.screens.runs import _summary_bar_text
+
+        for billing in (None, _UNSTATED, _METERED):
+            plain = _summary_bar_text([_run_summary(total_cost_usd=1.0, billing=billing)]).plain
+            assert "~$1.00" in plain
+            assert not any(label in plain for label in ("est.", "src?", "mixed"))
+        partial = _summary_bar_text(
+            [_run_summary(total_cost_usd=1.0, unpriced=1, billing=_UNSTATED)]
+        ).plain
+        assert "~$1.00 (partial)" in partial
+
+    def test_summary_bar_unknown_only_label(self) -> None:
+        from conductor.fleet.tui.screens.runs import _summary_bar_text
+
+        assert (
+            "~$0.40 src?"
+            in _summary_bar_text([_run_summary(total_cost_usd=0.4, billing=_UNK)]).plain
+        )
+
+
+class TestPreviewCostBasis:
+    def _main(self, summary: Any, **kwargs: Any) -> str:
+        from conductor.fleet.tui.screens.runs import _preview_text
+
+        return _preview_text(summary, **kwargs).main.plain
+
+    def test_preview_cost_basis_text_per_state(self) -> None:
+        assert self._main(_run_summary(total_cost_usd=0.4, billing=_SUB)) == (
+            "Cost basis  API-equivalent estimate\n"
+            "Estimated at API rates from token counts; not an invoice or an additional charge."
+        )
+        assert self._main(_run_summary(total_cost_usd=0.4, billing=_UNK)) == (
+            "Cost basis  billing source unknown"
+        )
+        assert self._main(_run_summary(total_cost_usd=0.4, billing=_MIXED)) == (
+            "Cost basis  mixed billing: 2 subscription, 1 metered API\n"
+            "Includes subscription executions estimated at API rates; "
+            "not an invoice or an additional charge."
+        )
+
+    @pytest.mark.parametrize(
+        "billing", [None, _UNSTATED, _METERED], ids=["none", "legacy", "metered"]
+    )
+    def test_preview_has_no_cost_basis_without_a_label(
+        self, billing: AggregateBilling | None
+    ) -> None:
+        assert self._main(_run_summary(total_cost_usd=0.4, billing=billing)) == ""
+
+    def test_preview_has_no_cost_basis_without_a_figure(self) -> None:
+        assert self._main(_run_summary(total_cost_usd=None, unpriced=2, billing=_SUB)) == ""
+
+    def test_preview_cost_basis_is_in_main_not_score(self) -> None:
+        from conductor.fleet.summary import RunTopology, TopologyAgent
+        from conductor.fleet.tui.screens.runs import _preview_text
+
+        topology = RunTopology(entry_point="a", agents=[TopologyAgent("a", "agent", None, None)])
+        parts = _preview_text(
+            _run_summary(total_cost_usd=0.4, billing=_SUB, topology=topology), width=80, height=20
+        )
+        assert "Cost basis" in parts.main.plain
+        # Issue #462: the ~10 fps clock repaints only ``score``; the cost basis never rides it.
+        assert "Cost basis" not in parts.score.plain
+        assert "invoice" not in parts.score.plain
+        assert parts.score.plain  # the score is really there, so the assertion above bites
+
+    def test_preview_gate_budget_accounts_for_cost_basis_lines(self) -> None:
+        from conductor.fleet.summary import RunTopology, TopologyAgent
+        from conductor.fleet.tui.screens.runs import _preview_text
+
+        topology = RunTopology(entry_point="a", agents=[TopologyAgent("a", "agent", None, None)])
+        gate = GateInfo(
+            agent_name="a",
+            prompt="\n".join(f"line {i}" for i in range(200)),
+            options=[],
+            option_details=[],
+        )
+
+        def total_lines(billing: AggregateBilling | None) -> int:
+            parts = _preview_text(
+                _run_summary(
+                    total_cost_usd=0.4,
+                    billing=billing,
+                    gate=gate,
+                    topology=topology,
+                    status="at-gate",
+                ),
+                width=80,
+                height=30,
+            )
+            return len(parts.main.plain.splitlines()) + len(parts.score.plain.splitlines())
+
+        # A long gate prompt is clipped to what remains, so a labelled run occupies exactly
+        # as many lines as an unlabelled one instead of pushing the pane past its height.
+        assert total_lines(_SUB) == total_lines(None)
+        assert total_lines(_MIXED) == total_lines(None)

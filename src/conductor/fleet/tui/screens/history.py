@@ -60,12 +60,13 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
+from conductor.billing import aggregate_label, estimate_note
 from conductor.console import styled
 from conductor.fleet.history import HistoryEntry, build_history_entries
 from conductor.fleet.launch import LaunchError, launch_resume
 from conductor.fleet.resume import ResumableCheckpoint, correlate_checkpoints
 from conductor.fleet.tui.actions import report_background_launch
-from conductor.fleet.tui.theme import loading_text, status_label
+from conductor.fleet.tui.theme import format_cost_text, loading_text, status_label
 from conductor.fleet.tui.widgets import highlighted_row_key
 
 if TYPE_CHECKING:
@@ -124,18 +125,31 @@ def _format_tokens(tokens: int) -> str:
 def _format_cost(entry: HistoryEntry) -> str:
     """Render the cost cell, never presenting a partial total as complete.
 
-    Duplicated from ``conductor.fleet.tui.screens.runs``'s
-    ``_format_cost`` -- same ``~$X (N unpriced)`` convention (issue #265),
-    adapted to read from a :class:`HistoryEntry` instead of a
-    ``RunSummary``.
+    Reads the entry's totals and delegates to the shared
+    :func:`conductor.fleet.tui.theme.format_cost_text`, the same formatter the Runs
+    screen uses, so both follow the ``~$X (N unpriced)`` convention (issue #265) and
+    append the compact billing label when the entry's own events stated a billing
+    source.
+    """
+    return format_cost_text(entry.total_cost_usd, entry.unpriced_agent_count, entry.billing)
+
+
+def _cost_basis_lines(entry: HistoryEntry) -> list[str]:
+    """Full-text provenance for the Cost cell, or nothing when the cell carries no label.
+
+    Built only from :mod:`conductor.billing` constants plus integer counts, so a logged value
+    can never reach the notification text.
     """
     if entry.total_cost_usd is None:
-        if entry.has_unpriced:
-            return f"({entry.unpriced_agent_count} unpriced)"
-        return "—"
-    if entry.has_unpriced:
-        return f"~${entry.total_cost_usd:.2f} ({entry.unpriced_agent_count} unpriced)"
-    return f"~${entry.total_cost_usd:.2f}"
+        return []
+    label = aggregate_label(entry.billing, detailed=True)
+    if label is None:
+        return []
+    lines = [f"Cost basis: {label}"]
+    note = estimate_note(entry.billing)
+    if note is not None:
+        lines.append(note)
+    return lines
 
 
 class HistoryScreen(Screen):
@@ -388,6 +402,7 @@ class HistoryScreen(Screen):
             lines.insert(0, f"Failed: {reason}")
         elif entry.outcome == "completed" and entry.output:
             lines.insert(0, f"Output: {entry.output}")
+        lines.extend(_cost_basis_lines(entry))
 
         self.notify("\n".join(lines), markup=False)
 

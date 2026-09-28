@@ -5,6 +5,7 @@ and ``conductor_list_runs`` (FR6, FR7, DD11, E10).
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 from pathlib import Path
@@ -653,3 +654,159 @@ class TestConductorListRuns:
         entries = conductor_list_runs(limit=2)
 
         assert len(entries) == 2
+
+
+class TestTerminalStatusPayloadBilling:
+    """``billing`` is always present on the terminal payload (the record's engine-basis
+    aggregate, ``None`` when nothing was stated, never an omitted key)."""
+
+    def test_terminal_payload_includes_billing(self, conductor_home: Path) -> None:
+        from conductor.billing import AggregateBilling
+        from conductor.fleet.records import write_terminal_record
+
+        record = _terminal_record("bill0001")
+        billing = AggregateBilling({"subscription": 2, "metered_api": 1})
+        write_terminal_record(dataclasses.replace(record, billing=billing))
+
+        result = conductor_run_status("bill0001")
+
+        assert result["source"] == "terminal"
+        assert result["billing"] == {
+            "state": "mixed",
+            "breakdown": {"subscription": 2, "metered_api": 1},
+        }
+
+    def test_terminal_payload_billing_is_null_when_not_stated(self, conductor_home: Path) -> None:
+        from conductor.billing import AggregateBilling
+        from conductor.fleet.records import write_terminal_record
+
+        write_terminal_record(_terminal_record("bill0002"))
+        write_terminal_record(
+            dataclasses.replace(
+                _terminal_record("bill0003"), billing=AggregateBilling({"unstated": 2})
+            )
+        )
+
+        for run_id in ("bill0002", "bill0003"):
+            result = conductor_run_status(run_id)
+            assert "billing" in result
+            assert result["billing"] is None
+
+
+class TestFleetBasisStatusPayloadBilling:
+    """Live and event-log-derived payloads carry the Fleet scanner's own ``billing``
+    aggregate (``_scan_events``'s, the same one the Runs screen renders), not the
+    terminal record's."""
+
+    def test_live_status_payload_carries_billing(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.billing import AggregateBilling
+
+        write_run_record(_live_record("livebill1"))
+        billing = AggregateBilling({"subscription": 2})
+        monkeypatch.setattr(
+            "conductor.mcp.serve.runs.derive_run_summary",
+            lambda record: dataclasses.replace(
+                _summary(record.run_id, status="running"), billing=billing
+            ),
+        )
+
+        result = conductor_run_status("livebill1")
+
+        assert result["source"] == "live"
+        assert result["billing"] == {"state": "subscription", "breakdown": {"subscription": 2}}
+
+    def test_live_status_payload_billing_is_null_for_a_legacy_summary(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from conductor.billing import AggregateBilling
+
+        write_run_record(_live_record("livebill2"))
+        for billing in (None, AggregateBilling({"unstated": 2})):
+            monkeypatch.setattr(
+                "conductor.mcp.serve.runs.derive_run_summary",
+                lambda record, b=billing: dataclasses.replace(
+                    _summary(record.run_id, status="running"), billing=b
+                ),
+            )
+            result = conductor_run_status("livebill2")
+            assert "billing" in result
+            assert result["billing"] is None
+
+    def test_live_payload_is_derived_from_the_real_scanner(self, conductor_home: Path) -> None:
+        """No stubbed summary: the payload's billing comes from a real event log scan."""
+        log = conductor_home / "live.events.jsonl"
+        log.write_text(
+            _event("workflow_started", {"name": "wf"})
+            + "\n"
+            + _event(
+                "agent_completed",
+                {"agent_name": "a", "tokens": 5, "cost_usd": 0.1, "billing_mode": "subscription"},
+            )
+            + "\n"
+        )
+        record = dataclasses.replace(_live_record("livebill3"), event_log_path=str(log))
+        write_run_record(record)
+
+        result = conductor_run_status("livebill3")
+
+        assert result["source"] == "live"
+        assert result["total_cost_usd"] == 0.1
+        assert result["billing"] == {"state": "subscription", "breakdown": {"subscription": 1}}
+
+    def test_event_log_status_payload_carries_billing(
+        self, conductor_home: Path, event_log_dir: Path
+    ) -> None:
+        _write_event_log(
+            event_log_dir,
+            run_id="crashbil1",
+            lines=[
+                _event("workflow_started", {"name": "review-pr"}),
+                _event(
+                    "agent_completed",
+                    {
+                        "agent_name": "a",
+                        "tokens": 5,
+                        "cost_usd": 0.1,
+                        "billing_mode": "subscription",
+                    },
+                ),
+                _event(
+                    "parallel_agent_completed",
+                    {
+                        "agent_name": "b",
+                        "tokens": 5,
+                        "cost_usd": 0.1,
+                        "billing_mode": "metered_api",
+                    },
+                ),
+            ],
+        )
+
+        result = conductor_run_status("crashbil1")
+
+        assert result["source"] == "event_log"
+        assert result["billing"] == {
+            "state": "mixed",
+            "breakdown": {"subscription": 1, "metered_api": 1},
+        }
+
+    def test_event_log_status_payload_billing_is_null_for_a_legacy_log(
+        self, conductor_home: Path, event_log_dir: Path
+    ) -> None:
+        _write_event_log(
+            event_log_dir,
+            run_id="crashbil2",
+            lines=[
+                _event("workflow_started", {"name": "review-pr"}),
+                _event("agent_completed", {"agent_name": "a", "tokens": 5, "cost_usd": 0.1}),
+            ],
+        )
+
+        result = conductor_run_status("crashbil2")
+
+        assert result["source"] == "event_log"
+        assert result["total_cost_usd"] == 0.1
+        assert "billing" in result
+        assert result["billing"] is None

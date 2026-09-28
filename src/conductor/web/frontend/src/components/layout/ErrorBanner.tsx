@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { AlertTriangle, CheckCircle2, X, Eye, Square } from 'lucide-react';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { formatCost, formatTokens, cn } from '@/lib/utils';
+import { aggregateLabel } from '@/lib/billing';
 import { useElapsedTimer } from '@/hooks/use-elapsed-timer';
 import { nodeKey } from '@/lib/node-id';
 
@@ -131,6 +132,7 @@ export function WorkflowSuccessBanner() {
   const workflowStatus = useWorkflowStore((s) => s.workflowStatus);
   const workflowTermination = useWorkflowStore((s) => s.workflowTermination);
   const totalCost = useWorkflowStore((s) => s.totalCost);
+  const billingCounts = useWorkflowStore((s) => s.billingCounts);
   const totalTokens = useWorkflowStore((s) => s.totalTokens);
   const agentsCompleted = useWorkflowStore((s) => s.agentsCompleted);
   const agentsTotal = useWorkflowStore((s) => s.agentsTotal);
@@ -179,7 +181,10 @@ export function WorkflowSuccessBanner() {
             <span>{formatTokens(totalTokens)} tok</span>
           )}
           {totalCost > 0 && (
-            <span>{formatCost(totalCost)}</span>
+            <span title={aggregateLabel(billingCounts, true) ?? undefined}>
+              {formatCost(totalCost)}
+              {aggregateLabel(billingCounts) ? ` ${aggregateLabel(billingCounts)}` : ''}
+            </span>
           )}
         </div>
         <button

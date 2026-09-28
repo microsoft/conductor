@@ -28,6 +28,8 @@ from pathlib import Path
 
 from rich.text import Text
 
+from conductor.billing import AggregateBilling, cell_label
+
 
 @dataclass(frozen=True, slots=True)
 class StatusStyle:
@@ -129,6 +131,29 @@ EMPTY = "—"
 def empty_cell() -> Text:
     """Render the standard dim placeholder for a cell with nothing to show."""
     return Text(EMPTY, style="dim")
+
+
+def format_cost_text(
+    total_cost_usd: float | None,
+    unpriced_count: int,
+    billing: AggregateBilling | None,
+) -> str:
+    """Cost cell text: ``~$X``, then the compact billing label, then ``(N unpriced)``.
+
+    The one Fleet cost formatter: the Runs, History and Run Detail cells all delegate
+    here. A cell with no dollar figure (``—`` or ``(N unpriced)``) never carries a label,
+    because there is nothing for it to qualify. With no label the result is byte-identical
+    to the formatting that existed before billing provenance.
+    """
+    if total_cost_usd is None:
+        return f"({unpriced_count} unpriced)" if unpriced_count > 0 else EMPTY
+    parts = [f"~${total_cost_usd:.2f}"]
+    label = cell_label(billing)
+    if label is not None:
+        parts.append(label)
+    if unpriced_count > 0:
+        parts.append(f"({unpriced_count} unpriced)")
+    return " ".join(parts)
 
 
 #: The placeholder shown while a screen's first load is in flight.

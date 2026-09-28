@@ -1525,3 +1525,194 @@ class TestHistoryOutcomeDetail:
             table = app.screen.query_one(DataTable)
 
         assert len(table.columns) == 5
+
+
+# ---------------------------------------------------------------------------
+# Billing provenance labels: the History screen's compact chip and its Enter-notification
+# expansion, driven by the same HistoryEntry.billing aggregate.
+# ---------------------------------------------------------------------------
+
+
+def _completed_event(
+    etype: str = "agent_completed",
+    name: str = "a",
+    *,
+    mode: object = "subscription",
+    tokens: object = 100,
+    cost: object = 0.05,
+) -> str:
+    """A completion event; ``mode=...`` omits ``billing_mode`` (a legacy log, predating
+    this field)."""
+    data: dict[str, Any] = {"agent_name": name}
+    if tokens is not ...:
+        data["tokens"] = tokens
+    if cost is not ...:
+        data["cost_usd"] = cost
+    if mode is not ...:
+        data["billing_mode"] = mode
+    return _event(etype, data)
+
+
+def _seed_history_run(root: Path, lines: list[str], *, run_id: str = "00000001") -> Path:
+    return _write_log(
+        root,
+        name="billed-wf",
+        run_id=run_id,
+        lines=[
+            _event("workflow_started", {"name": "billed-wf"}, ts=1000.0),
+            *lines,
+            _event("workflow_completed", {"elapsed": 42.0}, ts=1042.0),
+        ],
+    )
+
+
+async def _history_cost_cell(app: FleetApp, pilot: Any) -> str:
+    await _goto_history(pilot)
+    return str(app.screen.query_one(DataTable).get_row_at(0)[4])
+
+
+class TestHistoryBillingLabels:
+    """The Cost cell (column 4) carries the compact label of History's own scan."""
+
+    @pytest.mark.parametrize(
+        ("lines", "expected"),
+        [
+            ([_completed_event(mode=...)], "~$0.05"),  # legacy log: byte-identical
+            ([_completed_event(mode="metered_api")], "~$0.05"),
+            ([_completed_event(mode="subscription")], "~$0.05 est."),
+            ([_completed_event(mode="unknown")], "~$0.05 src?"),
+            (
+                [
+                    _completed_event(mode="subscription", cost=0.03),
+                    _completed_event(
+                        "parallel_agent_completed", "b", mode="metered_api", cost=0.02
+                    ),
+                ],
+                "~$0.05 mixed",
+            ),
+        ],
+        ids=["legacy", "metered", "subscription", "unknown", "mixed"],
+    )
+    async def test_cost_cell_for_each_billing_state(
+        self, fleet_env: Path, event_log_dir: Path, lines: list[str], expected: str
+    ) -> None:
+        _seed_history_run(event_log_dir, lines)
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _history_cost_cell(app, pilot) == expected
+
+    async def test_cost_cell_agent_completed_only_log(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _seed_history_run(event_log_dir, [_completed_event("agent_completed")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _history_cost_cell(app, pilot) == "~$0.05 est."
+
+    async def test_cost_cell_parallel_only_log(self, fleet_env: Path, event_log_dir: Path) -> None:
+        _seed_history_run(event_log_dir, [_completed_event("parallel_agent_completed")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _history_cost_cell(app, pilot) == "~$0.05 est."
+
+    async def test_cost_cell_label_precedes_unpriced_count_and_needs_a_figure(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _seed_history_run(
+            event_log_dir,
+            [_completed_event(), _completed_event("agent_completed", "b", cost=None)],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _history_cost_cell(app, pilot) == "~$0.05 est. (1 unpriced)"
+
+    async def test_cost_cell_has_no_label_without_a_figure(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        _seed_history_run(event_log_dir, [_completed_event(cost=None)])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _history_cost_cell(app, pilot) == "(1 unpriced)"
+
+    async def test_cost_cell_ignores_the_terminal_record(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        """The record's engine-basis ``billing`` must not switch one row's basis (D12)."""
+        from conductor.billing import AggregateBilling
+        from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+        _seed_history_run(event_log_dir, [_completed_event(mode=...)], run_id="00000001")
+        write_terminal_record(
+            TerminalRunRecord(
+                run_id="00000001",
+                workflow_path="/tmp/billed-wf.yaml",
+                workflow_name="billed-wf",
+                started_at="2026-01-01T00:00:00+00:00",
+                ended_at="2026-01-01T00:05:00+00:00",
+                status="success",
+                output={},
+                error_type=None,
+                error_message=None,
+                total_tokens=100,
+                total_cost_usd=0.05,
+                unpriced_agent_count=0,
+                event_log_path="",
+                bg_stderr_log=None,
+                bg_stdout_log=None,
+                billing=AggregateBilling({"subscription": 3}),
+            )
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            assert await _history_cost_cell(app, pilot) == "~$0.05"
+
+    async def test_enter_notification_includes_full_label_and_note(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        log_path = _seed_history_run(event_log_dir, [_completed_event(mode="subscription")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await settle(pilot)
+
+        mock_notify.assert_called_once()
+        message = mock_notify.call_args.args[0]
+        assert message == (
+            f"Replay with: conductor replay {log_path}\n"
+            "Cost basis: API-equivalent estimate\n"
+            "Estimated at API rates from token counts; not an invoice or an additional charge."
+        )
+        assert mock_notify.call_args.kwargs["markup"] is False
+
+    async def test_enter_notification_unchanged_for_legacy_log(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        log_path = _seed_history_run(event_log_dir, [_completed_event(mode=...)])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await settle(pilot)
+
+        assert mock_notify.call_args.args[0] == f"Replay with: conductor replay {log_path}"
+
+    async def test_enter_notification_names_unknown_without_a_note(
+        self, fleet_env: Path, event_log_dir: Path
+    ) -> None:
+        log_path = _seed_history_run(event_log_dir, [_completed_event(mode="unknown")])
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await _goto_history(pilot)
+            app.screen.query_one(DataTable).move_cursor(row=0)
+            with patch.object(HistoryScreen, "notify") as mock_notify:
+                await pilot.press("enter")
+                await settle(pilot)
+
+        assert mock_notify.call_args.args[0] == (
+            f"Replay with: conductor replay {log_path}\nCost basis: billing source unknown"
+        )

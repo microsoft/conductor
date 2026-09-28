@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
+from conductor.billing import aggregate_label
 from conductor.console import clear_nonblocking_fd, make_console, styled
 from conductor.exceptions import WorkflowTerminated
 
@@ -358,14 +359,22 @@ def _format_terminal_cost(record: TerminalRunRecord) -> str:
     """Render a terminal record's cost cell, never presenting a partial
     total as a complete one (issue #265's ``~$X (N unpriced)`` convention,
     mirrored from ``fleet/tui/screens/history.py``'s ``_format_cost``).
+
+    A figure whose executions stated a billing source is followed by its label
+    (``~$0.42 (API-equivalent estimate)``); no label leaves the text as it was.
     """
     if record.total_cost_usd is None:
+        # No dollar figure, so nothing for a billing label to qualify.
         if record.unpriced_agent_count > 0:
             return f"({record.unpriced_agent_count} unpriced)"
         return "—"
+    text = f"~${record.total_cost_usd:.2f}"
+    label = aggregate_label(record.billing)
+    if label:
+        text += f" ({label})"
     if record.unpriced_agent_count > 0:
-        return f"~${record.total_cost_usd:.2f} ({record.unpriced_agent_count} unpriced)"
-    return f"~${record.total_cost_usd:.2f}"
+        text += f" ({record.unpriced_agent_count} unpriced)"
+    return text
 
 
 def _workflow_has_human_gate(workflow_path: Path) -> bool:
@@ -1664,6 +1673,7 @@ def status(
                     "duration_seconds": _terminal_duration_seconds(t),
                     "total_tokens": t.total_tokens,
                     "total_cost_usd": t.total_cost_usd,
+                    "billing": t.billing.to_wire() if t.billing else None,
                     "error_type": t.error_type,
                     "error_message": t.error_message,
                     "event_log": t.event_log_path or None,

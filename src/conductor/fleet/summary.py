@@ -53,6 +53,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from conductor.billing import AggregateBilling, BillingClass, coerce_billing_mode, count_mode
 from conductor.fleet.records import RunRecord
 
 logger = logging.getLogger(__name__)
@@ -67,21 +68,51 @@ emits hundreds of tool calls; this is a drill-down, not a log viewer."""
 
 
 def _finite_float(value: Any) -> float | None:
-    """Return ``value`` as a ``float`` iff it is a finite ``int``/``float``.
+    """Return ``value`` as a ``float`` iff it is a finite, non-boolean ``int``/``float``.
 
     ``NaN``/``Infinity``/``-Infinity`` are valid JSON values (Python's
     ``json`` module accepts them by default) but are not legitimate token
     counts or costs -- letting one through would silently poison a sum or
     crash downstream formatting (``int(nan)``/``int(inf)`` both raise).
-    Rejected the same way a wrong-shaped value already is: silently
-    ignored, not raised. Shared with :mod:`conductor.fleet.history`, which
-    already imports this module and enforces the identical rule over the
-    same engine-written event payloads.
+    ``True``/``False`` are rejected too: ``bool`` is a subclass of ``int``, so
+    without an explicit check ``True`` would be summed as ``1.0`` tokens or
+    dollars (and counted as an execution by the billing counters, which reuse
+    these normalized values). Rejected the same way a wrong-shaped value
+    already is: silently ignored, not raised. Shared with
+    :mod:`conductor.fleet.history`, which already imports this module and
+    enforces the identical rule over the same engine-written event payloads.
     """
-    if not isinstance(value, int | float):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     value = float(value)
     return value if math.isfinite(value) else None
+
+
+def _contributes_usage(tokens: float | None, cost: float | None) -> bool:
+    """True when a completion event adds usage to the figure the Fleet shows.
+
+    Tokens > 0 covers priced and unpriced executions (an unpriced one is counted in
+    ``unpriced_agent_count``); cost > 0 covers a hand-written log with a cost but no tokens.
+    A ``$0.00``, zero-token event (a ``set`` or ``mcp`` parallel member) adds nothing to the
+    total and is not an execution to label.
+    """
+    return (tokens is not None and tokens > 0) or (cost is not None and cost > 0)
+
+
+def _count_billing(
+    counts: dict[BillingClass, int],
+    data: dict[str, Any],
+    tokens: float | None,
+    cost: float | None,
+) -> None:
+    """Count one completion event's provenance if, and only if, it contributes usage.
+
+    The only function any Fleet scanner calls to count billing, so the predicate cannot
+    drift between them. ``tokens`` and ``cost`` are the values the scanner already computed
+    with :func:`_finite_float`, so the predicate sees exactly what the cost accumulator saw.
+    """
+    if _contributes_usage(tokens, cost):
+        count_mode(counts, coerce_billing_mode(data.get("billing_mode")))
 
 
 @dataclass(frozen=True)
@@ -153,6 +184,10 @@ class AgentDetail:
     cost_usd: float | None
     """Cost from this agent's own ``agent_completed`` event, or ``None`` if
     it never completed or the model was unpriced."""
+
+    billing: AggregateBilling | None = None
+    """Provenance of :attr:`cost_usd` -- the cumulative per-name total -- counted by
+    ``_scan_agent_details`` on the same events. ``None`` when no event contributed usage."""
 
     def elapsed_seconds(self, now: float | None = None) -> float | None:
         """Elapsed time for this row: live (``now - started_at``) while
@@ -279,6 +314,12 @@ class RunSummary:
     inputs: dict[str, Any] | None = None
     """The values this run was launched with, when the log records them.
     Like :attr:`topology`, taken from the latest generation."""
+
+    billing: AggregateBilling | None = None
+    """Provenance of the executions behind :attr:`total_cost_usd` and
+    :attr:`unpriced_agent_count`, counted by ``_scan_events`` on the same events. ``None``
+    when no event contributed; an all-legacy log gives an *unstated* aggregate, for which
+    every renderer shows no label."""
 
     @property
     def has_unpriced(self) -> bool:
@@ -511,6 +552,11 @@ class _ScanResult:
     workflow_name: str | None = None
     cwd: str | None = None
     inputs: dict[str, Any] | None = None
+    billing_counts: dict[BillingClass, int] = field(default_factory=dict)
+
+    @property
+    def billing(self) -> AggregateBilling | None:
+        return AggregateBilling.from_counts(self.billing_counts)
 
 
 def _close_step(open_steps: list[tuple[str, str, float]], step_type: str, name: str) -> None:
@@ -657,6 +703,7 @@ def _scan_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
                     result.total_cost_usd = (result.total_cost_usd or 0.0) + cost
                 elif tokens is not None and tokens > 0:
                     result.unpriced_agent_count += 1
+                _count_billing(result.billing_counts, data, tokens, cost)
 
         elif etype in _AGENT_FAILED_EVENT_TYPES:
             # A failed step also closes its open "agent" entry -- otherwise
@@ -777,6 +824,7 @@ def _scan_agent_details(
     # its most recent run).
     cumulative_tokens: dict[str, int] = {}
     cumulative_cost: dict[str, float | None] = {}
+    cumulative_billing: dict[str, dict[BillingClass, int]] = {}
     started_at_by_name: dict[str, float] = {}
     # Steps with a presented-but-unresolved gate. An open step that is
     # waiting on a person is not the same as one that is working, and the
@@ -848,6 +896,7 @@ def _scan_agent_details(
                         cumulative_tokens[name] = cumulative_tokens.get(name, 0) + int(tokens)
                     if cost is not None:
                         cumulative_cost[name] = (cumulative_cost.get(name) or 0.0) + cost
+                    _count_billing(cumulative_billing.setdefault(name, {}), data, tokens, cost)
                     closed[name] = (
                         "completed",
                         started_at_by_name.get(name),
@@ -940,6 +989,7 @@ def _scan_agent_details(
                     reported_elapsed_seconds=None,
                     tokens=cum_tokens,
                     cost_usd=cum_cost,
+                    billing=AggregateBilling.from_counts(cumulative_billing.get(ta.name, {})),
                 )
             )
             continue
@@ -973,6 +1023,7 @@ def _scan_agent_details(
                 reported_elapsed_seconds=reported_elapsed,
                 tokens=cum_tokens,
                 cost_usd=cum_cost,
+                billing=AggregateBilling.from_counts(cumulative_billing.get(ta.name, {})),
             )
         )
 
@@ -1040,6 +1091,7 @@ def derive_run_summary(record: RunRecord) -> RunSummary:
         topology=scan.topology,
         cwd=scan.cwd,
         inputs=scan.inputs,
+        billing=scan.billing,
     )
 
 

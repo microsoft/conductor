@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from conductor.billing import AggregateBilling, BillingMode, coerce_billing_mode
 from conductor.engine.pricing import ModelPricing, calculate_cost, get_pricing
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ class AgentUsage:
         cache_write_tokens: Tokens written to cache; a subset of ``input_tokens``.
         cost_usd: Estimated cost in USD (None if pricing unavailable).
         elapsed_seconds: Execution time in seconds.
+        billing_mode: Billing provenance for this execution, or None when not stated.
     """
 
     agent_name: str
@@ -38,6 +40,7 @@ class AgentUsage:
     cache_write_tokens: int
     cost_usd: float | None
     elapsed_seconds: float
+    billing_mode: BillingMode | None = None
 
 
 @dataclass
@@ -127,6 +130,19 @@ class WorkflowUsage:
         not wall-clock time.
         """
         return sum(a.elapsed_seconds for a in self.agents)
+
+    @property
+    def billing(self) -> AggregateBilling:
+        """Provenance of the executions behind :attr:`total_cost_usd`.
+
+        Counts an execution when it consumed tokens (``input + output > 0``), the same predicate
+        :attr:`unpriced_agents` uses: a zero-usage member (a ``set`` step, an ``mcp`` step, a
+        skipped or gated agent) contributes neither a dollar amount nor a billing-mode count,
+        so it cannot pull an otherwise-priced total toward ``mixed`` or ``unknown``.
+        """
+        return AggregateBilling.from_modes(
+            a.billing_mode for a in self.agents if (a.input_tokens + a.output_tokens) > 0
+        )
 
 
 class UsageTracker:
@@ -238,6 +254,7 @@ class UsageTracker:
             cache_write_tokens=cache_write,
             cost_usd=cost,
             elapsed_seconds=elapsed,
+            billing_mode=coerce_billing_mode(getattr(output, "billing_mode", None)),
         )
         self._agents.append(usage)
         return usage

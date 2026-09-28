@@ -5,6 +5,7 @@ import { useViewedSubworkflowContexts } from '@/hooks/use-viewed-context';
 import type { NodeData, SubworkflowContext } from '@/stores/workflow-store';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { formatElapsed, formatCost, formatTokens } from '@/lib/utils';
+import { aggregateLabel } from '@/lib/billing';
 import type { NodeStatus } from '@/lib/constants';
 
 interface SubworkflowDetailProps {
@@ -36,7 +37,10 @@ export function SubworkflowDetail({ node }: SubworkflowDetailProps) {
 
   const items: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (node.elapsed != null) items.push({ label: 'Elapsed', value: formatElapsed(node.elapsed) });
-  if (node.cost_usd != null) items.push({ label: 'Cost', value: formatCost(node.cost_usd) });
+  if (node.cost_usd != null) {
+    const label = aggregateLabel(node.billing_counts, true);
+    items.push({ label: 'Cost', value: label ? `${formatCost(node.cost_usd)} ${label}` : formatCost(node.cost_usd) });
+  }
   if (node.tokens != null) items.push({ label: 'Tokens', value: formatTokens(node.tokens) });
   if (node.iteration != null && node.iteration > 1) items.push({ label: 'Iteration', value: node.iteration });
 
@@ -127,7 +131,10 @@ function SubworkflowRunRow({
           {ctx.totalCost > 0 && (
             <span className="flex items-center gap-0.5">
               <Coins className="w-2.5 h-2.5" />
-              {formatCost(ctx.totalCost)}
+              <span title={aggregateLabel(ctx.billingCounts, true) ?? undefined}>
+                {formatCost(ctx.totalCost)}
+                {aggregateLabel(ctx.billingCounts) ? ` ${aggregateLabel(ctx.billingCounts)}` : ''}
+              </span>
             </span>
           )}
         </div>

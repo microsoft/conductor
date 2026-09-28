@@ -396,6 +396,7 @@ The dashboard URL is included because there is otherwise no supported way to rec
       "duration_seconds": 300.0,
       "total_tokens": 1234,
       "total_cost_usd": 0.05,
+      "billing": {"state": "subscription", "breakdown": {"subscription": 2}},
       "error_type": null,
       "error_message": null,
       "event_log": "/tmp/conductor/conductor-other-workflow-20260303-120000-b2c3d4e5.events.jsonl"
@@ -403,6 +404,14 @@ The dashboard URL is included because there is otherwise no supported way to rec
   ]
 }
 ```
+
+`billing` describes the executions behind `total_cost_usd`: `state` is one of
+`metered_api`, `subscription`, `unknown` or `mixed`, and `breakdown` counts
+executions per source (`subscription`, `metered_api`, `unknown`, and `unstated`
+for a provider that reports nothing). It is `null` when no execution stated a
+billing source (older records, providers that report nothing). In the table
+view the cost cell carries the label, for example `~$0.05 (API-equivalent
+estimate)`; a cost is an estimate from token counts, not an invoice.
 
 `run_id` is the join key to the run's events JSONL
 (`conductor-<name>-<ts>-<run_id>.events.jsonl` under `$TMPDIR/conductor/`);

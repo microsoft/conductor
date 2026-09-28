@@ -227,7 +227,13 @@ returning (G3, G4):
 - **`conductor_run_status(run_id)`** — status, current step, and (at a
   gate) the gate's prompt, options, and the dashboard approval URL.
   Works for a live run, a run parked at a gate, and a run whose process
-  has already exited.
+  has already exited. The payload includes `billing` — the provenance of the
+  reported `total_cost_usd` (`null` when no execution stated a billing source;
+  otherwise `{"state": ..., "breakdown": {...}}`). It is engine-based for
+  `source: "terminal"` and Fleet-scanner-based for `"live"` and `"event_log"`
+  (the same totals the Fleet Manager shows), so do not compare it across
+  sources. Cost figures are estimates from token counts at API rates, not
+  invoices.
 - **`conductor_await_run(run_id, wait_seconds=60)`** — blocks, bounded by
   `--max-wait-seconds`, returning on a terminal status **or** on reaching a
   gate; its timeout text names the approval URL as the next action.

@@ -6,6 +6,15 @@ import { ActivityStream } from './ActivityStream';
 import type { NodeData, ForEachItemData } from '@/stores/workflow-store';
 import { NODE_STATUS_HEX } from '@/lib/constants';
 import { formatElapsed, formatCost, formatTokens } from '@/lib/utils';
+import {
+  aggregateLabel,
+  billingState,
+  formatCostWithBilling,
+  modeLabel,
+  SUBSCRIPTION_SHORT,
+  UNKNOWN_SHORT,
+  type BillingCounts,
+} from '@/lib/billing';
 import { useViewedGroupProgress, useViewedSubworkflowContexts } from '@/hooks/use-viewed-context';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { NodeStatus } from '@/lib/constants';
@@ -109,6 +118,35 @@ const ITEM_STATUS_COLORS: Record<ForEachItemData['status'], string> = {
   failed: NODE_STATUS_HEX.failed!,
 };
 
+/** Compact chip for an aggregate: `est.` / `source unknown`; a mixed total has none (see title). */
+function compactAggregate(counts: BillingCounts): string | null {
+  const state = billingState(counts);
+  if (state === 'subscription') return SUBSCRIPTION_SHORT;
+  if (state === 'unknown') return UNKNOWN_SHORT;
+  return null;
+}
+
+/**
+ * An item's cost with its billing label. A `type: workflow` item's cost is a child total, so it
+ * is labelled from the child's aggregate; an agent item from its own execution's mode.
+ */
+function itemCostText(item: ForEachItemData, compact: boolean): string {
+  if (item.cost_usd == null) return '';
+  const counts = item.billing_counts;
+  if (counts) {
+    const label = compact ? compactAggregate(counts) : aggregateLabel(counts, true);
+    if (!label) return formatCost(item.cost_usd);
+    return compact ? `${formatCost(item.cost_usd)} (${label})` : `${formatCost(item.cost_usd)} ${label}`;
+  }
+  return formatCostWithBilling(item.cost_usd, item.billing_mode, { compact });
+}
+
+/** The long label, for the compact row's `title`. */
+function itemCostTitle(item: ForEachItemData): string | undefined {
+  const label = item.billing_counts ? aggregateLabel(item.billing_counts, true) : modeLabel(item.billing_mode);
+  return label ?? undefined;
+}
+
 function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachItemData }) {
   const [expanded, setExpanded] = useState(item.status === 'running');
   const color = ITEM_STATUS_COLORS[item.status];
@@ -134,7 +172,7 @@ function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachI
   const metadataItems: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (item.elapsed != null) metadataItems.push({ label: 'Elapsed', value: formatElapsed(item.elapsed) });
   if (item.tokens != null) metadataItems.push({ label: 'Tokens', value: formatTokens(item.tokens) });
-  if (item.cost_usd != null) metadataItems.push({ label: 'Cost', value: formatCost(item.cost_usd) });
+  if (item.cost_usd != null) metadataItems.push({ label: 'Cost', value: itemCostText(item, false) });
   if (item.mcp_server) metadataItems.push({ label: 'Server', value: item.mcp_server });
   if (item.mcp_tool) metadataItems.push({ label: 'Tool', value: item.mcp_tool });
   if (item.mcp_result_bytes != null) metadataItems.push({ label: 'Result Bytes', value: `${item.mcp_result_bytes}${item.mcp_truncated ? ' (truncated)' : ''}` });
@@ -180,7 +218,9 @@ function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachI
             <span className="flex items-center gap-2 text-[10px] text-[var(--text-muted)] flex-shrink-0">
               {item.elapsed != null && <span>{formatElapsed(item.elapsed)}</span>}
               {item.tokens != null && <span>{formatTokens(item.tokens)}</span>}
-              {item.cost_usd != null && <span>{formatCost(item.cost_usd)}</span>}
+              {item.cost_usd != null && (
+                <span title={itemCostTitle(item)}>{itemCostText(item, true)}</span>
+              )}
             </span>
           )}
 

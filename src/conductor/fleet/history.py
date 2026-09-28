@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from conductor.billing import AggregateBilling, BillingClass
 from conductor.fleet import summary
 from conductor.fleet.records import read_terminal_record
 from conductor.fleet.retention import event_log_root
@@ -163,6 +164,13 @@ class HistoryEntry:
     terminal record; ``None`` when the run succeeded or no terminal
     record is available."""
 
+    billing: AggregateBilling | None = None
+    """Provenance of :attr:`total_cost_usd` and :attr:`unpriced_agent_count`, counted by
+    ``_scan_history_events`` on the same events, in the same branch. **Never** taken from a
+    terminal record (whose engine-basis ``billing`` describes a different set of executions),
+    so :func:`_enrich_with_terminal_record` deliberately does not copy it. ``None`` when no
+    event contributed usage."""
+
     @property
     def has_unpriced(self) -> bool:
         """``True`` when at least one completed agent had no cost data."""
@@ -206,6 +214,11 @@ class _ScanResult:
     total_tokens: int = 0
     total_cost_usd: float | None = None
     unpriced_agent_count: int = 0
+    billing_counts: dict[BillingClass, int] = field(default_factory=dict)
+
+    @property
+    def billing(self) -> AggregateBilling | None:
+        return AggregateBilling.from_counts(self.billing_counts)
 
 
 def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
@@ -295,6 +308,7 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
                 result.total_cost_usd = (result.total_cost_usd or 0.0) + cost
             elif tokens is not None and tokens > 0:
                 result.unpriced_agent_count += 1
+            summary._count_billing(result.billing_counts, data, tokens, cost)
 
     return result
 
@@ -420,6 +434,7 @@ def _build_entry(path: Path) -> HistoryEntry:
         total_tokens=scan.total_tokens,
         total_cost_usd=scan.total_cost_usd,
         unpriced_agent_count=scan.unpriced_agent_count,
+        billing=scan.billing,
     )
 
 
@@ -465,8 +480,11 @@ def _enrich_with_terminal_record(entry: HistoryEntry) -> HistoryEntry:
     for it (see the module docstring's DD1 grounding): only `output`/
     `error_type`/`error_message` are added here, and `entry.outcome`
     (derived from the event log alone, by :func:`_scan_history_events`)
-    is left untouched. Called after :func:`_build_entry` has already
-    completed its single-pass scan, so this never re-reads or re-scans
+    is left untouched. ``billing`` is deliberately **not** copied from the
+    record: the record's aggregate is engine-basis, and the History cost
+    cell it labels is Fleet-basis (the label must describe the figure beside it).
+    Called after :func:`_build_entry` has already completed its single-pass
+    scan, so this never re-reads or re-scans
     the log itself -- issue #436's single-forward-pass constraint on
     `_scan_history_events` is unaffected.
 

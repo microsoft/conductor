@@ -2678,3 +2678,278 @@ class TestConsoleEventSubscriberMcpSteps:
             },
         )
         assert "my[bracket]server" in text
+
+
+def _log_lines_for(tmp_path: Path, run: object) -> list[str]:
+    """Run ``run()`` with file logging on (verbosity off) and return the log's lines."""
+    from conductor.cli.run import close_file_logging, init_file_logging
+
+    log_path = tmp_path / "billing.log"
+    token = verbose_mode.set(False)
+    try:
+        init_file_logging(log_path)
+        run()  # type: ignore[operator]
+    finally:
+        close_file_logging()
+        verbose_mode.reset(token)
+    return log_path.read_text(encoding="utf-8").splitlines()
+
+
+def _summary_lines(tmp_path: Path, usage: dict) -> list[str]:
+    from conductor.cli.run import display_usage_summary
+
+    return _log_lines_for(tmp_path, lambda: display_usage_summary(usage))
+
+
+def _usage(billing: object = None, *, agents: list[dict] | None = None, **extra: object) -> dict:
+    usage: dict = {
+        "total_input_tokens": 500,
+        "total_output_tokens": 200,
+        "total_tokens": 700,
+        "total_cost_usd": 1.2345,
+        "agents": agents or [{"agent_name": "a1", "cost_usd": 1.2345}],
+        **extra,
+    }
+    if billing is not _MISSING:
+        usage["billing"] = billing
+    return usage
+
+
+_MISSING = object()
+
+_SUB_NOTE = "  Estimated at API rates from token counts; not an invoice or an additional charge."
+_MIXED_NOTE = (
+    "  Includes subscription executions estimated at API rates; "
+    "not an invoice or an additional charge."
+)
+
+
+class TestBillingConsoleSummary:
+    """``display_usage_summary``'s totals, notes and per-row suffixes.
+
+    A legacy/unstated total is byte-identical to today's output; a stated total carries
+    the compact billing label plus, for subscription and mixed totals, an explanatory note
+    that the figure is an API-rate estimate, not an invoice or an additional charge.
+    """
+
+    def test_legacy_summary_is_byte_identical_whether_billing_is_absent_null_or_unstated(
+        self, tmp_path: Path
+    ) -> None:
+        baseline = _summary_lines(tmp_path, _usage(_MISSING))
+        assert "  Total: $1.2345" in baseline
+        assert _summary_lines(tmp_path, _usage(None)) == baseline
+        unstated = {"state": "unknown", "breakdown": {"unstated": 3}}
+        assert _summary_lines(tmp_path, _usage(unstated)) == baseline
+        assert not any("estimate" in line or "billing" in line for line in baseline)
+
+    def test_metered_total_is_unchanged(self, tmp_path: Path) -> None:
+        metered = {"state": "metered_api", "breakdown": {"metered_api": 3}}
+        assert _summary_lines(tmp_path, _usage(metered)) == _summary_lines(
+            tmp_path, _usage(_MISSING)
+        )
+
+    def test_subscription_total_and_note(self, tmp_path: Path) -> None:
+        lines = _summary_lines(
+            tmp_path, _usage({"state": "subscription", "breakdown": {"subscription": 2}})
+        )
+        assert "  Total: $1.2345 (API-equivalent estimate)" in lines
+        total_at = lines.index("  Total: $1.2345 (API-equivalent estimate)")
+        assert lines[total_at + 1] == _SUB_NOTE
+
+    def test_unknown_total_has_no_note(self, tmp_path: Path) -> None:
+        lines = _summary_lines(tmp_path, _usage({"state": "unknown", "breakdown": {"unknown": 2}}))
+        assert "  Total: $1.2345 (billing source unknown)" in lines
+        assert _SUB_NOTE not in lines and _MIXED_NOTE not in lines
+
+    def test_mixed_total_note_and_per_row_suffixes(self, tmp_path: Path) -> None:
+        billing = {"state": "mixed", "breakdown": {"subscription": 2, "metered_api": 1}}
+        agents = [
+            {"agent_name": "s", "cost_usd": 0.5, "billing_mode": "subscription"},
+            {"agent_name": "m", "cost_usd": 0.5, "billing_mode": "metered_api"},
+            {"agent_name": "u", "cost_usd": 0.2345, "billing_mode": "unknown"},
+            {"agent_name": "n", "cost_usd": 0.1},  # a provider that states nothing
+        ]
+        lines = _summary_lines(tmp_path, _usage(billing, agents=agents))
+        assert "  Total: $1.2345 (mixed billing: 2 subscription, 1 metered API)" in lines
+        assert _MIXED_NOTE in lines
+        assert "  s: $0.5000 (41%) - API-equivalent estimate" in lines
+        assert "  u: $0.2345 (19%) - billing source unknown" in lines
+        # Metered and unstated rows carry no suffix even inside a mixed total.
+        assert "  m: $0.5000 (41%)" in lines
+        assert "  n: $0.1000 (8%)" in lines
+
+    def test_uniform_total_does_not_repeat_the_label_on_rows(self, tmp_path: Path) -> None:
+        agents = [{"agent_name": "s", "cost_usd": 1.2345, "billing_mode": "subscription"}]
+        lines = _summary_lines(
+            tmp_path,
+            _usage({"state": "subscription", "breakdown": {"subscription": 1}}, agents=agents),
+        )
+        assert "  s: $1.2345 (100%)" in lines
+
+    @pytest.mark.parametrize(
+        ("billing", "label"),
+        [
+            (
+                {"state": "subscription", "breakdown": {"subscription": 2}},
+                "API-equivalent estimate",
+            ),
+            ({"state": "unknown", "breakdown": {"unknown": 2}}, "billing source unknown"),
+            (
+                {"state": "mixed", "breakdown": {"subscription": 1, "metered_api": 1}},
+                "mixed billing: 1 subscription, 1 metered API",
+            ),
+        ],
+    )
+    def test_label_precedes_the_unpriced_suffix(
+        self, tmp_path: Path, billing: dict, label: str
+    ) -> None:
+        lines = _summary_lines(
+            tmp_path,
+            _usage(
+                billing,
+                unpriced_agent_count=2,
+                unpriced_models=["model-a", "model-b"],
+            ),
+        )
+        assert f"  Total: ~$1.2345 ({label}) (2 agents unpriced: model-a, model-b)" in lines
+        assert any("Partial total" in line for line in lines)
+
+    def test_no_figure_means_no_label(self, tmp_path: Path) -> None:
+        usage = _usage(
+            {"state": "subscription", "breakdown": {"subscription": 1}},
+            unpriced_agent_count=1,
+            unpriced_models=["mystery"],
+        )
+        usage["total_cost_usd"] = None
+        lines = _summary_lines(tmp_path, usage)
+        assert any("Cost data unavailable" in line for line in lines)
+        assert not any("API-equivalent" in line for line in lines)
+
+    def test_hostile_wire_text_never_reaches_the_summary(self, tmp_path: Path) -> None:
+        hostile = "[bold red]INJECT[/bold red]"
+        usage = _usage(
+            {"state": hostile, "breakdown": {hostile: 1, "subscription": 1}},
+            agents=[{"agent_name": "a1", "cost_usd": 1.2345, "billing_mode": hostile}],
+        )
+        text = "\n".join(_summary_lines(tmp_path, usage))
+        assert "INJECT" not in text
+        assert "mixed billing: 1 subscription, 1 unknown" in text
+
+
+class TestBillingProgressLines:
+    """Per-execution progress lines and the budget line carry the same billing label."""
+
+    @staticmethod
+    def _event(event_type: str, **data: object) -> object:
+        from conductor.events import WorkflowEvent
+
+        return WorkflowEvent(type=event_type, timestamp=0, data=dict(data))
+
+    def _render(self, tmp_path: Path, event: object) -> str:
+        from conductor.cli.run import ConsoleEventSubscriber
+
+        return "\n".join(
+            _log_lines_for(tmp_path, lambda: ConsoleEventSubscriber().on_event(event))  # type: ignore[arg-type]
+        )
+
+    @pytest.mark.parametrize(
+        ("event_type", "base"),
+        [
+            (
+                "agent_completed",
+                {
+                    "agent_name": "a",
+                    "elapsed": 1.2,
+                    "model": "m",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                },
+            ),
+            (
+                "parallel_agent_completed",
+                {"agent_name": "a", "elapsed": 1.2, "model": "m", "tokens": 150},
+            ),
+            ("for_each_item_completed", {"item_key": "k", "elapsed": 1.2, "tokens": 150}),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("mode", "suffix"),
+        [
+            ("subscription", " API-equivalent estimate"),
+            ("unknown", " billing source unknown"),
+            ("metered_api", ""),
+            (None, ""),
+            ("bedrock", " billing source unknown"),  # a newer writer's value: unproven
+            (7, ""),  # uninterpretable: treated as not stated
+        ],
+    )
+    def test_progress_line_labels(
+        self, tmp_path: Path, event_type: str, base: dict, mode: object, suffix: str
+    ) -> None:
+        data = {**base, "cost_usd": 0.0123}
+        if mode is not None:
+            data["billing_mode"] = mode
+        text = self._render(tmp_path, self._event(event_type, **data))
+        assert f"$0.0123{suffix}" in text
+        # Nothing follows the cost but the closing parenthesis, whatever the label.
+        assert text.rstrip().endswith(f"$0.0123{suffix})")
+
+    def test_progress_line_without_billing_is_unchanged(self, tmp_path: Path) -> None:
+        text = self._render(
+            tmp_path,
+            self._event(
+                "agent_completed",
+                agent_name="a",
+                elapsed=1.2,
+                model="m",
+                input_tokens=100,
+                output_tokens=50,
+                cost_usd=0.0123,
+            ),
+        )
+        assert "(1.20s, m, 100 in/50 out, $0.0123)" in text
+
+    def test_validator_line_appends_the_label_after_the_cost(self, tmp_path: Path) -> None:
+        text = self._render(
+            tmp_path,
+            self._event(
+                "agent_validator_complete",
+                agent_name="writer",
+                passed=True,
+                cost_usd=0.0123,
+                billing_mode="subscription",
+            ),
+        )
+        assert "$0.0123 API-equivalent estimate" in text
+        plain = self._render(
+            tmp_path,
+            self._event(
+                "agent_validator_complete", agent_name="writer", passed=True, cost_usd=0.0123
+            ),
+        )
+        assert plain.rstrip().endswith("$0.0123")
+
+    def test_budget_line_names_the_label_only_when_stated(self, tmp_path: Path) -> None:
+        stated = self._render(
+            tmp_path,
+            self._event(
+                "budget_exceeded",
+                budget_usd=5.0,
+                spent_usd=5.02,
+                budget_mode="enforce",
+                current_agent="a",
+                billing={"state": "subscription", "breakdown": {"subscription": 1}},
+            ),
+        )
+        assert "($5.02 of $5.00, enforce mode, API-equivalent estimate)" in stated
+        plain = self._render(
+            tmp_path,
+            self._event(
+                "budget_exceeded",
+                budget_usd=5.0,
+                spent_usd=5.02,
+                budget_mode="enforce",
+                current_agent="a",
+            ),
+        )
+        assert "($5.02 of $5.00, enforce mode)" in plain
