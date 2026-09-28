@@ -15,6 +15,7 @@ from conductor.config.loader import (
     resolve_env_vars,
 )
 from conductor.exceptions import ConfigurationError
+from conductor.executor.template import TemplateRenderer
 
 
 class TestResolveEnvVars:
@@ -77,6 +78,39 @@ class TestResolveEnvVars:
             with pytest.raises(ConfigurationError) as exc_info:
                 resolve_env_vars("${A}")
             assert "Maximum recursion depth" in str(exc_info.value)
+
+    def test_dollar_before_jinja_expression_is_not_an_env_var(self) -> None:
+        """``${{ expr }}`` is a literal ``$`` followed by a Jinja expression."""
+        with patch.dict(os.environ, {"CURRENCY": "AUD"}, clear=True):
+            result = resolve_env_vars("${CURRENCY} ${{ workflow.input.budget }}")
+            assert result == "AUD ${{ workflow.input.budget }}"
+
+
+class TestDollarBeforeJinjaInPrompt:
+    """A prompt may put a ``$`` directly before a Jinja expression."""
+
+    def test_loads_and_renders_with_the_dollar_sign(self) -> None:
+        yaml_content = """
+workflow:
+  name: budget
+  entry_point: planner
+  input:
+    budget:
+      type: number
+
+agents:
+  - name: planner
+    model: gpt-4
+    prompt: "Plan a trip that costs at most ${{ workflow.input.budget }}."
+    routes:
+      - to: $end
+"""
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config_string(yaml_content)
+
+        prompt = config.agents[0].prompt
+        rendered = TemplateRenderer().render(prompt, {"workflow": {"input": {"budget": 500}}})
+        assert rendered == "Plan a trip that costs at most $500."
 
 
 class TestConfigLoader:

@@ -351,6 +351,12 @@ class TestResolveMcpEnvVars:
             "EXPR": "$(command)",
         }
 
+    def test_resolve_leaves_dollar_before_jinja_expression(self) -> None:
+        """``${{ expr }}`` is not an env var reference and passes through intact."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = resolve_mcp_env_vars({"PRICE": "${{ price }}"})
+            assert result == {"PRICE": "${{ price }}"}
+
 
 class TestInputCollector:
     """Tests for InputCollector class."""

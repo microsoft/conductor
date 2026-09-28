@@ -170,8 +170,9 @@ async def resolve_mcp_server_auth(
     return server_config
 
 
-# Pattern for resolving ${VAR} and ${VAR:-default} in MCP env values.
-_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+# Pattern for resolving ${VAR} and ${VAR:-default} in MCP env values. Kept in
+# step with conductor.config.loader.ENV_VAR_PATTERN: "${{ expr }}" is not a var.
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^{}:]+)(?::-([^}]*))?\}")
 
 
 def resolve_mcp_env_vars(env: dict[str, str]) -> dict[str, str]:

@@ -23,8 +23,9 @@ from conductor.config.schema import WorkflowConfig
 from conductor.exceptions import ConfigurationError
 from conductor.file_string import FileString
 
-# Pattern to match ${VAR} or ${VAR:-default}
-ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+# Pattern to match ${VAR} or ${VAR:-default}. The name excludes "{" so that
+# "${{ expr }}" (a literal "$" before a Jinja expression) is left for Jinja.
+ENV_VAR_PATTERN = re.compile(r"\$\{([^{}:]+)(?::-([^}]*))?\}")
 
 # Tag of a recorded file read: the root workflow file, a ``!file`` include,
 # or a ``!yamlfile`` include.
