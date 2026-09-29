@@ -54,6 +54,7 @@ export function AgentDetail({ node }: AgentDetailProps) {
             input_tokens: node.input_tokens,
             output_tokens: node.output_tokens,
             cost_usd: node.cost_usd,
+            billing_mode: node.billing_mode,
             activity: node.activity,
             error_type: node.error_type,
             error_message: node.error_message,

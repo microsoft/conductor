@@ -2909,6 +2909,68 @@ class TestBillingProgressLines:
         )
         assert "(1.20s, m, 100 in/50 out, $0.0123)" in text
 
+    @pytest.mark.parametrize(
+        ("billing", "suffix"),
+        [
+            (
+                {"state": "subscription", "breakdown": {"subscription": 3}},
+                " API-equivalent estimate",
+            ),
+            (
+                {"state": "mixed", "breakdown": {"subscription": 2, "metered_api": 1}},
+                " mixed billing",
+            ),
+            ({"state": "unknown", "breakdown": {"unknown": 1}}, " billing source unknown"),
+            ({"state": "metered_api", "breakdown": {"metered_api": 2}}, ""),
+        ],
+    )
+    def test_workflow_item_line_uses_the_aggregate_label(
+        self, tmp_path: Path, billing: dict, suffix: str
+    ) -> None:
+        """A ``type: workflow`` item carries ``billing`` (aggregate), not ``billing_mode``."""
+        text = self._render(
+            tmp_path,
+            self._event(
+                "for_each_item_completed",
+                item_key="k",
+                elapsed=1.2,
+                tokens=150,
+                cost_usd=0.0123,
+                billing=billing,
+            ),
+        )
+        assert f"(1.20s, 150 tokens, $0.0123{suffix})" in text
+
+    def test_workflow_item_line_without_billing_is_unchanged(self, tmp_path: Path) -> None:
+        """Legacy payloads (no provenance at all) render exactly as before."""
+        text = self._render(
+            tmp_path,
+            self._event(
+                "for_each_item_completed",
+                item_key="k",
+                elapsed=1.2,
+                tokens=150,
+                cost_usd=0.0123,
+            ),
+        )
+        assert "[k]  (1.20s, 150 tokens, $0.0123)" in text
+        for word in ("estimate", "billing", "mixed"):
+            assert word not in text
+
+    def test_agent_item_line_keeps_per_execution_mode(self, tmp_path: Path) -> None:
+        text = self._render(
+            tmp_path,
+            self._event(
+                "for_each_item_completed",
+                item_key="k",
+                elapsed=1.2,
+                tokens=150,
+                cost_usd=0.0123,
+                billing_mode="subscription",
+            ),
+        )
+        assert "(1.20s, 150 tokens, $0.0123 API-equivalent estimate)" in text
+
     def test_validator_line_appends_the_label_after_the_cost(self, tmp_path: Path) -> None:
         text = self._render(
             tmp_path,

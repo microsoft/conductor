@@ -371,3 +371,18 @@ class TestCellTier:
         assert cell_label(parsed) == "src?"
         assert cell_legend([parsed]) == "src? = billing source unknown"
         assert "CANARY" not in (cell_legend([parsed]) or "")
+
+
+class TestEstimateNoteMixedAccuracy:
+    """The subscription-specific mixed note needs an actual subscription contribution."""
+
+    @pytest.mark.parametrize("other", ["unknown", "unstated"])
+    def test_mixed_without_subscription_has_no_note(self, other: str) -> None:
+        mixed = AggregateBilling({"metered_api": 1, other: 1})  # type: ignore[dict-item]
+        assert mixed.state == "mixed"
+        assert estimate_note(mixed) is None
+
+    def test_mixed_with_subscription_keeps_the_note(self) -> None:
+        mixed = AggregateBilling({"subscription": 1, "unknown": 1})
+        assert mixed.state == "mixed"
+        assert estimate_note(mixed) == billing.MIXED_NOTE

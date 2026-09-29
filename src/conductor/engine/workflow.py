@@ -1247,9 +1247,10 @@ class WorkflowEngine:
                 },
             )
 
+        billing_label = aggregate_label(summary.billing, detailed=True)
+        billing_suffix = f" ({billing_label})" if billing_label else ""
+
         if self.limits.budget_mode == "enforce":
-            billing_label = aggregate_label(summary.billing, detailed=True)
-            billing_suffix = f" ({billing_label})" if billing_label else ""
             raise BudgetExceededError(
                 f"Workflow exceeded cost budget (${budget:.2f}): spent ${spent:.2f}"
                 f"{billing_suffix}",
@@ -1260,10 +1261,11 @@ class WorkflowEngine:
 
         if result.should_emit:
             logger.warning(
-                "Budget exceeded (audit mode): spent $%.4f of $%.2f budget%s",
+                "Budget exceeded (audit mode): spent $%.4f of $%.2f budget%s%s",
                 spent,
                 budget,
                 f" at agent '{self.limits.current_agent}'" if self.limits.current_agent else "",
+                billing_suffix,
             )
 
     def _yaml_source_field(self) -> dict[str, str]:

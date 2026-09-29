@@ -507,3 +507,43 @@ class TestBudget:
         assert _of(events, "budget_exceeded"), "audit budget must still trip on the estimate"
         usage = engine.usage_tracker.get_summary()
         assert usage.total_cost_usd is not None and usage.total_cost_usd > 0
+
+    @pytest.mark.parametrize(
+        ("breakdown", "suffix"),
+        [
+            ({"subscription": 1}, " (API-equivalent estimate)"),
+            (
+                {"subscription": 2, "metered_api": 1},
+                " (mixed billing: 2 subscription, 1 metered API)",
+            ),
+            ({"metered_api": 1}, ""),  # control: metered needs no label
+            ({}, ""),  # control: nothing stated
+        ],
+    )
+    def test_audit_warning_carries_label_only_when_needed(
+        self,
+        breakdown: dict[str, int],
+        suffix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The audit-mode ``logger.warning`` itself names the billing source."""
+        from types import SimpleNamespace
+
+        from conductor.billing import AggregateBilling
+
+        engine = WorkflowEngine(self._config("audit"), _scripted_provider({}))
+        summary = SimpleNamespace(
+            total_cost_usd=0.5,
+            total_tokens=10,
+            billing=AggregateBilling(breakdown),  # type: ignore[arg-type]
+        )
+        engine.usage_tracker.get_summary = lambda: summary  # type: ignore[method-assign]
+        engine.limits.current_agent = "a"
+
+        with caplog.at_level("WARNING", logger="conductor.engine.workflow"):
+            engine._check_budget()  # audit mode: must not raise
+
+        (record,) = [r for r in caplog.records if "audit mode" in r.getMessage()]
+        assert record.getMessage() == (
+            f"Budget exceeded (audit mode): spent $0.5000 of $0.00 budget at agent 'a'{suffix}"
+        )

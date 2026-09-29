@@ -244,7 +244,7 @@ def estimate_note(billing: AggregateBilling | None) -> str | None:
         return None
     if billing.state == "subscription":
         return SUBSCRIPTION_NOTE
-    if billing.state == "mixed":
+    if billing.state == "mixed" and billing.breakdown.get("subscription", 0) > 0:
         return MIXED_NOTE
     return None
 

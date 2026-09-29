@@ -752,6 +752,7 @@ def verbose_log_for_each_item_complete(
     tokens: int | None = None,
     cost_usd: float | None = None,
     billing_mode: BillingMode | None = None,
+    billing: AggregateBilling | None = None,
 ) -> None:
     """Log for-each item completion.
 
@@ -761,6 +762,8 @@ def verbose_log_for_each_item_complete(
         tokens: Tokens used (if any).
         cost_usd: Estimated cost in USD (if available).
         billing_mode: Billing provenance of this item (if the provider stated one).
+        billing: Aggregate provenance of a ``type: workflow`` item's child run; takes
+            precedence over ``billing_mode`` for the label.
     """
     from conductor.cli.app import is_verbose
 
@@ -773,7 +776,11 @@ def verbose_log_for_each_item_complete(
     if tokens:
         parts.append(f"{tokens} tokens")
     if cost_usd is not None:
-        parts.append(_cost_with_billing(cost_usd, billing_mode))
+        if billing is not None:
+            label = aggregate_label(billing)
+            parts.append(f"${cost_usd:.4f}" + (f" {label}" if label else ""))
+        else:
+            parts.append(_cost_with_billing(cost_usd, billing_mode))
 
     text = Text()
     text.append("  ✓ ", style="green")
@@ -1089,6 +1096,7 @@ class ConsoleEventSubscriber:
                 tokens=d.get("tokens"),
                 cost_usd=d.get("cost_usd"),
                 billing_mode=coerce_billing_mode(d.get("billing_mode")),
+                billing=AggregateBilling.from_wire(d.get("billing")),
             )
 
         elif t == "for_each_item_failed":
