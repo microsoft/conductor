@@ -175,11 +175,17 @@ def repo(tmp_path: Path) -> GateRepo:
     return GateRepo(tmp_path / "repo")
 
 
-def run_gate(repo: GateRepo, labels: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
+def run_gate(
+    repo: GateRepo,
+    labels: tuple[str, ...] = (),
+    *,
+    author_login: str = "",
+) -> subprocess.CompletedProcess[str]:
     scratch = repo.root / ".gate-tmp"
     scratch.mkdir(exist_ok=True)
     env = dict(os.environ)
     env["PR_LABELS"] = json.dumps(list(labels))
+    env["PR_AUTHOR_LOGIN"] = author_login
     env["CHANGELOG_BASE"] = "main"
     env["RUNNER_TEMP"] = str(scratch)
     env.pop("BASE_REF", None)
@@ -278,6 +284,31 @@ class TestFeatureMode:
         repo.write("CHANGELOG.md", CHANGELOG_TEMPLATE + "\nBootstrap edit.\n")
         repo.commit_all()
         assert_passed(run_gate(repo, labels=("Changelog-Not-Required",)))
+
+    def test_dependabot_author_waives_fragment_requirement(self, repo: GateRepo) -> None:
+        # Requirement: Dependabot version and security updates are maintenance
+        # changes and do not need an automatically generated fragment.
+        repo.write("uv.lock", _uv_lock_text("2.14.0"))
+        repo.commit_all()
+        proc = run_gate(repo, author_login="dependabot[bot]")
+        assert_passed(proc)
+        assert "Dependabot-authored maintenance PR" in proc.stdout
+
+    def test_dependabot_author_does_not_waive_changelog_edit(self, repo: GateRepo) -> None:
+        # Requirement: the bot exception is no broader than necessary; only a
+        # maintainer-applied label may permit a direct CHANGELOG.md edit.
+        repo.write("CHANGELOG.md", CHANGELOG_TEMPLATE + "\nUnexpected edit.\n")
+        repo.commit_all()
+        proc = run_gate(repo, author_login="dependabot[bot]")
+        assert_failed(proc, "CHANGELOG.md must not be edited")
+
+    def test_dependabot_author_still_rejects_bad_fragment_name(self, repo: GateRepo) -> None:
+        # Requirement: the author exemption does not let a broken fragment
+        # reach main and poison towncrier checks for later pull requests.
+        repo.write("changelog.d/no-prefix.added.md", "Bad name.\n")
+        repo.commit_all()
+        proc = run_gate(repo, author_login="dependabot[bot]")
+        assert_failed(proc, "Invalid fragment name 'no-prefix.added.md'")
 
     def test_nested_fragment_path_fails(self, repo: GateRepo) -> None:
         # Requirement: fragments must live directly in changelog.d/ — towncrier

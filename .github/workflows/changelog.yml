@@ -54,5 +54,9 @@ jobs:
         env:
           # Labels arrive as a JSON array, e.g. ["changelog-not-required"].
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Dependabot version and security updates are internal maintenance
+          # changes; security updates may not have a matching dependabot.yml
+          # entry from which to inherit an exemption label.
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
           BASE_REF: ${{ github.base_ref }}
         run: bash .github/scripts/enforce-changelog-contract.sh

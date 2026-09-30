@@ -113,9 +113,9 @@ dashboard when context usage exceeds 80%.
 
 The [`Changelog` workflow](../.github/workflows/changelog.yml) validates pull requests in CI:
 - Rejects PRs that modify `CHANGELOG.md` unless exempted by the maintainer-applied `changelog-not-required` label.
-- Requires at least one valid fragment in `changelog.d/` unless exempted by the same label.
+- Requires at least one valid fragment in `changelog.d/` unless exempted by the same label or the pull request was authored by Dependabot.
 - Validates the filename of every fragment present in the resulting tree, and additionally runs `towncrier check` whenever the PR adds at least one fragment (towncrier exits "No new newsfragments found" when a branch adds none, so a deletion-only change is covered by the filename scan alone).
-- The maintainer-applied `changelog-not-required` label provides a full exemption that waives both the fragment requirement and the `CHANGELOG.md` edit prohibition; any fragments present are still validated as above.
+- The maintainer-applied `changelog-not-required` label provides a full exemption that waives both the fragment requirement and the `CHANGELOG.md` edit prohibition. Dependabot authorship waives only the fragment requirement. Any fragments present are still validated as above. Dependabot is recognized from the pull request author's GitHub login rather than its labels so lockfile-only security updates are covered even when that ecosystem has no matching `dependabot.yml` entry.
 - Note that the check is designed for `pull_request` triggers and is not merge-queue-compatible (if a merge queue is ever enabled, this check must be excluded from merge-queue required checks or extended with a separate `merge_group` job).
 
 ---
