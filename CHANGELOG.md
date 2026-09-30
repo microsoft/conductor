@@ -11,6 +11,81 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.41] - 2026-09-29
+
+### Added
+
+- **Run bundles and offline closure reporting**: added `conductor bundle build`
+  to package self-contained, content-addressed workflow closures into
+  `$CONDUCTOR_HOME/cache/bundles/`, the `workflow.bundle` YAML block for declaring
+  static assets and additional authorized roots, and the offline Bundle Closure
+  section in `conductor validate --environment`.
+  (#568)
+- **Secret bindings contract**: workflows can now declare logical secret
+  requirements on executable script steps (`execution.secrets`) and MCP servers
+  (`runtime.mcp_servers.<name>.secrets`), which execution environment documents
+  bind to credential sources (`source.env`) and gate via optional `allow`
+  consumer policies. Resolved secrets are delivered via targeted environment
+  variables or HTTP headers and automatically sanitized across event streams,
+  checkpoints, logs, and diagnostics. Workflows and environments without secret
+  declarations continue to run with zero changes.
+  (#571)
+- `claude-agent-sdk` executions now record where their model usage is billed
+  from (a Claude Code subscription, a metered API key, or unknown), and cost
+  figures are labelled to match. Subscription usage is shown as an
+  **API-equivalent estimate** rather than as a charge; mixed workflows say so and
+  break the executions down; providers that do not report a billing source are
+  displayed exactly as before. The label appears in the console usage summary,
+  per-agent progress lines, budget messages, `conductor status`, the web
+  dashboard, and the Fleet Runs, Run Detail and History screens, and is carried as
+  `billing_mode` on agent completion events and as `billing` in MCP run-status
+  payloads. A billing source is only claimed when it can be proven: an inherited
+  cloud-backend selector, gateway token, custom endpoint, or settings tier gives
+  `unknown`. `limits.budget_usd` still applies to the estimated cost.
+  (#573)
+
+### Fixed
+
+- Script completion now shows non-zero exit codes, and route failures identify the
+  source step, destination, expression and bounded script diagnostics instead of
+  misidentifying missing output fields as undefined variables. (#559)
+- **GitHub registry authentication**: select the GitHub.com credential even when
+  `GH_HOST` points to a GitHub Enterprise host, without changing the environment
+  seen by workflow scripts. (#560)
+- `conductor registry list` displays `OK` instead of a checkmark for the default
+  registry when the output encoding cannot represent the checkmark, avoiding a
+  crash on legacy Windows consoles. (#561)
+- **Private-index installer recovery guidance** now safely bridges an existing
+  pip mirror into uv and recommends current system-certificate settings.
+  (#536)
+- A `$` written directly before a Jinja expression, as in
+  `${{ workflow.input.budget }}`, is no longer read as an environment variable
+  reference, so the workflow loads instead of failing with "Required environment
+  variable '{ workflow.input.budget ' is not set".
+  (#572)
+- Interrupting a `claude-agent-sdk` agent, or hitting its `max_session_seconds`
+  limit, no longer waits for the SDK to deliver another message before taking
+  effect — a run blocked waiting on the model now stops when asked. The session
+  limit is a single deadline measured from the start of the execution, so a
+  steady stream of messages can no longer extend it indefinitely.
+
+  Conductor now also owns the shutdown of the Claude CLI session rather than
+  leaving it to the SDK's own stream teardown, which an interrupt or an expired
+  deadline could previously cut short and leave a CLI process running. Shutdown
+  is never cancelled, is retried once if it does not complete, and finishes
+  before that execution's temporary MCP configuration is deleted. If it cannot
+  be confirmed, the failure is logged; on a run that would otherwise have
+  succeeded the result is discarded and a non-retryable error is raised instead
+  of reporting success while the CLI may still be running.
+
+  Two consequences are worth knowing: a signal raised while the CLI is still
+  starting up takes effect only once startup finishes, and returning after an
+  interrupt or a timeout may take additional time while the SDK releases its
+  resources. Startup is normally quick, but nothing places an overall limit on
+  either delay.
+  (#570)
+
+
 ## [0.1.40] - 2026-09-23
 
 ### Added
