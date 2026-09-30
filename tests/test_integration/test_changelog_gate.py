@@ -286,13 +286,13 @@ class TestFeatureMode:
         assert_passed(run_gate(repo, labels=("Changelog-Not-Required",)))
 
     def test_dependabot_author_waives_fragment_requirement(self, repo: GateRepo) -> None:
-        # Requirement: Dependabot version and security updates are maintenance
-        # changes and do not need an automatically generated fragment.
+        # Requirement: Dependabot-authored PRs do not need an automatically
+        # generated fragment.
         repo.write("uv.lock", _uv_lock_text("2.14.0"))
         repo.commit_all()
         proc = run_gate(repo, author_login="dependabot[bot]")
         assert_passed(proc)
-        assert "Dependabot-authored maintenance PR" in proc.stdout
+        assert "Dependabot-authored PR" in proc.stdout
 
     def test_dependabot_author_does_not_waive_changelog_edit(self, repo: GateRepo) -> None:
         # Requirement: the bot exception is no broader than necessary; only a

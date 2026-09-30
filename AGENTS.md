@@ -74,7 +74,7 @@ Conductor uses [towncrier](https://towncrier.readthedocs.io/) to manage changelo
 2. **NEVER edit `CHANGELOG.md` in feature or fix PRs.** Towncrier compiles `CHANGELOG.md` only during release preparation.
 3. **Naming is free-form.** Use the issue number when known (e.g. `392.added.md`, which towncrier renders as clickable `(#392)`), or any descriptive slug starting with `+` (e.g. `+otel-mcp-spans.added.md`). NEVER rename a fragment after opening the PR because the filename is cosmetic once validated. The only hard rule is towncrier syntax: non-numeric names must start with `+`, and the category must be one of `added`, `fixed`, `changed`, or `removed`.
 4. **CI enforces the contract.** The `Changelog` CI workflow validates fragment presence and syntax on every pull request, reporting actionable instructions on failure.
-5. **Exemptions require a maintainer label, except Dependabot fragments.** Trivial, internal, or bootstrap changes without user-facing impact are exempted by a maintainer applying the `changelog-not-required` label (not by author judgment). The label waives both the fragment requirement and the `CHANGELOG.md` edit prohibition. Dependabot-authored maintenance PRs automatically waive only the fragment requirement. Any fragments present are still validated.
+5. **Exemptions require a maintainer label, except Dependabot fragments.** Trivial, internal, or bootstrap changes without user-facing impact are exempted by a maintainer applying the `changelog-not-required` label (not by author judgment). The label waives both the fragment requirement and the `CHANGELOG.md` edit prohibition. Dependabot-authored PRs automatically waive only the fragment requirement. Any fragment changes are still validated.
 
 ## Releasing
 

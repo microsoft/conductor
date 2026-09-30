@@ -9,7 +9,7 @@
 # Environment:
 #   PR_LABELS       JSON array of the PR's label names, e.g. '["changelog-not-required"]'
 #   PR_AUTHOR_LOGIN pull request author's GitHub login, used to recognize
-#                   Dependabot-authored maintenance updates.
+#                   Dependabot-authored pull requests.
 #   BASE_REF        base branch name (e.g. "main"); diffs run against
 #                   "origin/$BASE_REF". Set CHANGELOG_BASE to a full ref to
 #                   override (the test harness uses this to point at a local
@@ -160,10 +160,9 @@ else
   # FEATURE MODE: a regular feature/fix PR.
   echo "Feature mode: no version bump in pyproject.toml."
 
-  # A maintainer exemption waives both feature-mode requirements. A
-  # Dependabot-authored maintenance PR waives only the fragment requirement;
-  # it still may not edit the compiled CHANGELOG.md. Any fragments that are
-  # present must remain valid under either exemption.
+  # A maintainer exemption waives both feature-mode requirements. Dependabot
+  # authorship waives only the fragment requirement; it still may not edit the
+  # compiled CHANGELOG.md. Fragment changes remain validated under either path.
   # GitHub label names are unique case-insensitively; match the same way so
   # a label created as e.g. 'Changelog-Not-Required' still waives.
   label_waived=0
@@ -174,7 +173,7 @@ else
   fragment_waived="$label_waived"
   if [ "$PR_AUTHOR_LOGIN" = "dependabot[bot]" ]; then
     fragment_waived=1
-    echo "Changelog fragment requirement waived for a Dependabot-authored maintenance PR."
+    echo "Changelog fragment requirement waived for a Dependabot-authored PR."
   fi
 
   # 1. CHANGELOG.md is compiled only at release time unless a maintainer
