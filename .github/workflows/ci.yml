@@ -14,6 +14,8 @@
 # - frontend: Type-checks, tests (Vitest), and builds the web dashboard
 # - install-scripts: End-to-end exercise of install.ps1 / install.sh on
 #                    Windows + Ubuntu (opt-in pytest marker; ~90s)
+# - docker-integration: Real-daemon integration lane for the Docker runner
+#                    backend (opt-in pytest marker; serialized on Ubuntu)
 # - web-bg-smoke: Real `uv tool install` + `conductor run --web-bg` launcher
 #                 smoke test on Windows + Ubuntu (issue #447)
 
@@ -166,7 +168,11 @@ jobs:
         # is ~2x headroom there and ~3x on Linux — still short enough to catch
         # a genuine hang rather than burning a full job timeout on one.
         timeout-minutes: 20
-        run: uv run pytest -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance"
+        # `docker_integration` is excluded here too even though the marker is
+        # already deselected via PYTEST_DEFAULT_MARKERS in the Makefile: this
+        # job invokes pytest directly, and the real-daemon lane must run only
+        # in the dedicated serialized docker-integration job below.
+        run: uv run pytest -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
           # Real API tests (marked with @pytest.mark.real_api) are excluded from CI
@@ -414,3 +420,38 @@ jobs:
             echo "launch gate reported the child never wrote its run record"
             exit 1
           fi
+
+  docker-integration:
+    name: Docker Integration
+    # Serialized real-daemon lane for the Docker runner backend: spike
+    # checkpoints (trailing-dot docker cp, non-root writability matrix),
+    # engine-level e2e (tag-form + digest-pinned images, stdin, env, timeout
+    # cleanup). Deliberately no matrix and no xdist: the lane mutates the
+    # daemon's container/volume state and asserts on global listings.
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Pre-pull pinned busybox reference
+        # The integration lane pins busybox by digest; pre-pulling here keeps
+        # the per-test pull off the lane's runtime and fails fast on a bad pin.
+        run: docker pull busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+
+      - name: Run Docker integration tests
+        run: uv run pytest tests/test_execution/test_docker_integration.py -m docker_integration -v

@@ -25,6 +25,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import conductor.engine.execution_resolution as execution_resolution_module
+from conductor import redaction
+from conductor.config.environment import (
+    DockerProfileOptions,
+    EnvironmentDocument,
+    ProfileDefinition,
+    ResolvedEnvironment,
+)
 from conductor.config.schema import (
     ContextConfig,
     ForEachDef,
@@ -33,6 +41,7 @@ from conductor.config.schema import (
     RouteDef,
     RuntimeConfig,
     ScriptStepDef,
+    StepExecutionConfig,
     WorkflowConfig,
     WorkflowDef,
     WorkflowStepDef,
@@ -45,6 +54,7 @@ from conductor.execution import (
     CommandResult,
     CommandSpec,
     LocalRunnerBackend,
+    ResolvedExecutionSpec,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -52,6 +62,7 @@ from conductor.execution import (
     WorkspaceLease,
 )
 from conductor.executor.script import ScriptExecutor, ScriptOutput
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 
 class RecordingBackend:
@@ -554,3 +565,325 @@ class TestFinalizationUnderCancellation:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert backend.finalize_calls == [(backend.lease, "succeeded")]
+
+
+class TestExecutionSpecThreading:
+    """The manifest's container payload threads into the backend's CommandSpec.
+
+    Requirement: ``ExecutionResolver.execution_spec_for_step`` adapts the
+    manifest audit model to the stdlib-only contract, and ``_execute_script``
+    carries the payload (plus the step name) into ``ScriptExecutor.execute``.
+    """
+
+    def _docker_environment(self) -> ResolvedEnvironment:
+        document = EnvironmentDocument(
+            default="local",
+            profiles={
+                "local": ProfileDefinition(backend="local"),
+                "container": ProfileDefinition(
+                    backend="docker",
+                    docker=DockerProfileOptions(
+                        image="python:3.12",
+                        platform="linux/amd64",
+                        user="1000",
+                    ),
+                ),
+            },
+        )
+        return ResolvedEnvironment(
+            document=document,
+            name="test",
+            source="path",
+            path=None,
+            digest="sha256:test",
+        )
+
+    def _docker_script_config(self) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="docker-threading",
+                entry_point="runner",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                ScriptStepDef(
+                    name="runner",
+                    command="recorded-docker-command",
+                    execution=StepExecutionConfig(profile="container"),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ runner.output.stdout }}"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_docker_step_payload_reaches_command_spec(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: a docker-profiled script step executes with
+        CommandSpec.execution carrying the manifest-resolved values and
+        name=step, so the container backend receives everything the profile
+        promised without re-reading the manifest."""
+
+        # Requirement: stay off the filesystem bundle path -- this test pins
+        # the kwargs threading, not bundle collection (covered in test_engine).
+        async def no_bundle(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr("conductor.engine.workflow.prepare_run_bundle", no_bundle)
+        backend = RecordingBackend()
+        monkeypatch.setitem(
+            execution_resolution_module.BACKEND_FACTORIES, "docker", lambda: backend
+        )
+        workflow_path = tmp_path / "workflow.yaml"
+        workflow_path.write_text("dummy", encoding="utf-8")
+        engine = WorkflowEngine(
+            self._docker_script_config(),
+            MagicMock(),
+            workflow_path=workflow_path,
+            execution_environment=self._docker_environment(),
+        )
+
+        result = await engine.run({})
+
+        assert result["result"] == "recorded"
+        spec, lease = backend.run_calls[0]
+        assert lease is backend.lease
+        assert spec.execution == ResolvedExecutionSpec(
+            image="python:3.12",
+            platform="linux/amd64",
+            user="1000",
+        )
+        assert spec.name == "runner"
+
+    @pytest.mark.asyncio
+    async def test_local_step_keeps_legacy_command_spec(self) -> None:
+        """Requirement: local-path byte parity -- a step without a container
+        payload produces the exact legacy CommandSpec (execution=None and
+        name=None), so existing backends and parity tests observe no change."""
+        backend = RecordingBackend()
+        engine = WorkflowEngine(_script_config(), MagicMock(), execution_backend=backend)
+
+        await engine.run({})
+
+        spec = backend.run_calls[0][0]
+        assert spec.execution is None
+        assert spec.name is None
+        assert spec == CommandSpec(
+            command="does-not-matter-recorded",
+            args=(),
+            working_dir=None,
+            env={},
+            inherit_control_environment=True,
+            stdin=None,
+            timeout=None,
+        )
+
+    def test_for_each_key_path_resolves_inline_agent_payload(self, tmp_path: Path) -> None:
+        """Requirement: the qualified for-each manifest key
+        (``for_each.<group>.agent``) resolves the inline agent's payload, and a
+        local-profiled inline agent resolves to None -- the same identity
+        helper drives both compile and runtime lookup."""
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="for-each-threading",
+                entry_point="batch",
+                runtime=RuntimeConfig(provider="copilot"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            for_each=[
+                ForEachDef(
+                    name="batch",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},
+                    max_concurrent=1,
+                    agent=ScriptStepDef(
+                        name="item",
+                        command="recorded-item-command",
+                        execution=StepExecutionConfig(profile="container"),
+                    ),
+                ),
+                ForEachDef(
+                    name="plain",
+                    type="for_each",
+                    source="workflow.input.items",
+                    **{"as": "item"},
+                    max_concurrent=1,
+                    agent=ScriptStepDef(
+                        name="plain_item",
+                        command="recorded-plain-command",
+                        execution=StepExecutionConfig(profile="local"),
+                    ),
+                ),
+            ],
+            agents=[],
+            output={"done": "1"},
+        )
+        workflow_path = tmp_path / "workflow.yaml"
+        workflow_path.write_text("dummy", encoding="utf-8")
+        engine = WorkflowEngine(
+            config,
+            MagicMock(),
+            workflow_path=workflow_path,
+            execution_environment=self._docker_environment(),
+        )
+        resolver = engine._execution_resolver
+
+        assert resolver.execution_spec_for_step("item", for_each_group="batch") == (
+            ResolvedExecutionSpec(image="python:3.12", platform="linux/amd64", user="1000")
+        )
+        assert resolver.execution_spec_for_step("plain_item", for_each_group="plain") is None
+
+    @pytest.mark.asyncio
+    async def test_subworkflow_child_resolves_payload_lazily(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: a sub-workflow child engine compiles its own manifest
+        view at reach time and resolves the docker payload through it -- the
+        root manifest never claims authority over configuration it has not
+        read, yet the child step still receives the resolved payload."""
+
+        # Requirement: the child workflow declares the docker profile; the
+        # child manifest (and its payload) exists only once the child engine
+        # is constructed at reach time.
+        sub_path = tmp_path / "sub.yaml"
+        sub_path.write_text(
+            textwrap.dedent(
+                """\
+                workflow:
+                  name: sub-with-docker-script
+                  entry_point: inner_script
+                  runtime:
+                    provider: copilot
+                  limits:
+                    max_iterations: 5
+                agents:
+                  - name: inner_script
+                    type: script
+                    command: recorded-sub-command
+                    execution:
+                      profile: container
+                    routes:
+                      - to: "$end"
+                output:
+                  result: "{{ inner_script.output.stdout }}"
+                """
+            ),
+            encoding="utf-8",
+        )
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="outer_script",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                ScriptStepDef(
+                    name="outer_script",
+                    command="recorded-parent-command",
+                    routes=[RouteDef(to="child")],
+                ),
+                WorkflowStepDef(
+                    name="child",
+                    workflow="sub.yaml",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ child.output.result }}"},
+        )
+
+        async def no_bundle(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr("conductor.engine.workflow.prepare_run_bundle", no_bundle)
+        monkeypatch.setattr(execution_resolution_module, "materialize_run_bundle", no_bundle)
+        backend = RecordingBackend()
+        monkeypatch.setitem(
+            execution_resolution_module.BACKEND_FACTORIES, "docker", lambda: backend
+        )
+        engine = WorkflowEngine(
+            config,
+            MagicMock(),
+            workflow_path=parent_path,
+            execution_environment=self._docker_environment(),
+        )
+        # Requirement: the parent's local step must not hit the real host
+        # backend either -- both steps are recorded by the one double.
+        engine._execution_session.backends["local"] = backend
+
+        result = await engine.run({})
+
+        assert result["result"] == "recorded"
+        specs_by_command = {spec.command: spec for spec, _ in backend.run_calls}
+        child_spec = specs_by_command["recorded-sub-command"]
+        # Requirement: the child's own manifest view supplied the payload.
+        assert child_spec.execution == ResolvedExecutionSpec(
+            image="python:3.12",
+            platform="linux/amd64",
+            user="1000",
+        )
+        assert child_spec.name == "inner_script"
+        # Requirement: the local parent step stays payload-free (byte parity).
+        parent_spec = specs_by_command["recorded-parent-command"]
+        assert parent_spec.execution is None
+        assert parent_spec.name is None
+        # Requirement: the child discovers the docker backend lazily at reach
+        # time and leases it against the ROOT run spec (late discovery) --
+        # one prepare per backend name, both naming the parent workflow.
+        assert len(backend.prepare_calls) == 2
+        assert all(call.workflow_name == "parent" for call in backend.prepare_calls)
+        assert [outcome for _, outcome in backend.finalize_calls] == ["succeeded"]
+        assert len(backend.finalize_calls) == 1
+
+
+class TestDiagnosticsScrub:
+    """Backend diagnostics pass through the run redactor when one is active."""
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_scrubbed_when_redactor_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: with an active run redactor, a secret value appearing
+        in backend diagnostics (e.g. pull/registry output echoing an env
+        credential) never reaches the verbose sink unredacted."""
+        messages: list[str] = []
+        monkeypatch.setattr(
+            "conductor.executor.script._verbose_log",
+            lambda message, style="dim": messages.append(message),
+        )
+        secret = "registry-credential-value"
+        redactor = RunRedactor()
+        redactor.register([secret])
+        token = redaction.set_current(redactor)
+        try:
+            sink = ScriptExecutor._make_diagnostics()
+            sink(f"pull failed while using {secret}")
+        finally:
+            redaction.reset_current(token)
+
+        assert messages == [f"pull failed while using {REDACTED_MARKER}"]
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_pass_through_without_redactor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: with no active redactor the sink output is
+        byte-identical to the backend's diagnostic text (zero-noise parity)."""
+        messages: list[str] = []
+        monkeypatch.setattr(
+            "conductor.executor.script._verbose_log",
+            lambda message, style="dim": messages.append(message),
+        )
+
+        sink = ScriptExecutor._make_diagnostics()
+        sink("pull failed while using registry-credential-value")
+
+        assert messages == ["pull failed while using registry-credential-value"]

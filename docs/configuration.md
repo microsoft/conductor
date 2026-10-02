@@ -949,6 +949,10 @@ profiles:
   isolated:
     backend: local
     inherit_control_environment: false
+  containerized:
+    backend: docker
+    docker:
+      image: alpine:3.20
 
 # Optional: secret bindings mapping logical names to credential sources
 secrets:
@@ -968,8 +972,65 @@ secrets:
 
 Each profile under `profiles` supports:
 
-- `backend` (required): The runner backend implementing this profile (for example, `local`).
-- `inherit_control_environment` (optional, boolean): Controls whether subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while future remote runner backends default to effective `false`.
+- `backend` (required): The runner backend implementing this profile (`local` or `docker`).
+- `inherit_control_environment` (optional, boolean): Controls whether subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while the `docker` backend defaults to effective `false`. Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to daemon administrators.
+- `docker` (optional, object): Configuration options required when `backend: docker` is selected. Rejected when `backend: local`.
+
+#### Docker Profile Configuration (`docker`)
+
+When a profile uses `backend: docker`, the `docker` block configures the container execution parameters:
+
+```yaml
+profiles:
+  # Minimal frictionless configuration
+  build:
+    backend: docker
+    docker:
+      image: node:20
+
+  # Fully hardened configuration
+  secure_runner:
+    backend: docker
+    docker:
+      image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      platform: linux/amd64
+      network: none
+      user: "65532:65532"
+      init: true
+      read_only: true
+      cap_drop_all: true
+      no_new_privileges: true
+      tmpfs: "512m"
+      resources:
+        cpu: 2.0
+        memory: "1g"
+        pids: 256
+```
+
+| Field | Type | Default | Validation Bounds and Description |
+|-------|------|---------|-----------------------------------|
+| `image` | string (required) | (none) | Container image reference (tag or digest). Must be a non-empty string without whitespace. |
+| `platform` | string (optional) | `None` | Target platform: `linux/amd64` or `linux/arm64`. When omitted, the platform is auto-resolved by Docker. |
+| `network` | string (optional) | `None` | Container network mode: `none`, `bridge`, or `host`. `None` keeps the daemon default. `host` triggers a validation warning. |
+| `user` | string (optional) | `None` | Container user in Docker syntax `<name\|uid>[:<group\|gid>]`. When omitted, uses the image `USER`. |
+| `init` | boolean (optional) | `false` | When `true`, enables Docker's init process (`docker --init`) to reap zombie subprocesses. |
+| `read_only` | boolean (optional) | `false` | When `true`, mounts the container root filesystem as read-only. Setting `read_only: true` without `tmpfs` triggers a validation warning. |
+| `cap_drop_all` | boolean (optional) | `false` | When `true`, drops all Linux capabilities (`--cap-drop=ALL`). |
+| `no_new_privileges` | boolean (optional) | `false` | When `true`, disables privilege escalation (`--security-opt=no-new-privileges`). |
+| `tmpfs` | boolean or string (optional) | `false` | Tmpfs mount at `/tmp`. `false` disables tmpfs, `true` mounts standard tmpfs, or a size string like `"512m"` or `"1g"`. |
+| `resources` | object (optional) | `{}` | Resource ceilings for the container (see below). |
+
+##### Docker Resources (`resources`)
+
+The `resources` mapping configures resource constraints on the container:
+
+| Field | Type | Default | Bounds and Description |
+|-------|------|---------|------------------------|
+| `cpu` | float (optional) | `None` | CPU limit in cores. Bounded between `0.1` and `64.0` cores (e.g. `0.5`, `2.0`). |
+| `memory` | string (optional) | `None` | Memory limit formatted as `<number>[m\|g]`. Bounded between `16m` and `64g` (e.g. `"512m"`, `"2g"`). |
+| `pids` | integer (optional) | `None` | Process limit. Bounded between `16` and `65536`. |
+
+When omitted, resource constraints are not set on the container and it shares host resources unconstrained. On shared CI environments, setting resource bounds is recommended.
 
 #### Secret Bindings
 

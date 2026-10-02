@@ -333,6 +333,13 @@ def validate_workflow_config(
     errors.extend(profile_errors)
     warnings.extend(profile_warnings)
 
+    docker_errors, docker_warnings = _validate_docker_profiles(
+        config,
+        _environment_context,
+    )
+    errors.extend(docker_errors)
+    warnings.extend(docker_warnings)
+
     if _has_secret_references(config):
         secret_errors, secret_warnings = _validate_secret_references(
             config,
@@ -1935,6 +1942,118 @@ def _validate_profile_references(
                 f"execution profile '{reference}' is absent from environment(s): "
                 f"{', '.join(missing)}"
             )
+    return errors, warnings
+
+
+def _executable_steps(config: WorkflowConfig) -> list[tuple[str, ExecutableStepBase]]:
+    steps: list[tuple[str, ExecutableStepBase]] = []
+    for step in config.agents:
+        if isinstance(step, ExecutableStepBase):
+            steps.append((step.name, step))
+    for group in config.for_each:
+        if isinstance(group.agent, ExecutableStepBase):
+            steps.append((f"for_each.{group.name}.agent", group.agent))
+    return steps
+
+
+def _validate_docker_profiles(
+    config: WorkflowConfig,
+    context: _EnvironmentValidationContext,
+) -> tuple[list[str], list[str]]:
+    if not context["explicit"] and not _profile_references(config):
+        return [], []
+
+    environments = context["environments"] or {}
+    if not environments:
+        return [], []
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    steps = _executable_steps(config)
+    workflow_profile = (
+        config.workflow.defaults.execution.profile
+        if config.workflow.defaults.execution is not None
+        else None
+    )
+
+    for environment_name in sorted(environments):
+        environment = environments[environment_name]
+        if environment is None:
+            continue
+
+        resolved: list[tuple[str, ExecutableStepBase, str, str]] = []
+        for key, step in steps:
+            step_profile = step.execution.profile if step.execution is not None else None
+            profile_name = step_profile or workflow_profile or environment.document.default
+            if profile_name is None:
+                continue
+            definition = environment.document.profiles.get(profile_name)
+            if definition is None:
+                continue
+            resolved.append((key, step, profile_name, definition.backend))
+            if definition.backend == "docker" and not isinstance(step, ScriptStepDef):
+                errors.append(
+                    f"Step '{key}' resolves to backend 'docker' in environment "
+                    f"'{environment_name}', but backend 'docker' is available for script steps "
+                    "only; agent execution realms arrive in step 7."
+                )
+
+        script_backends = {
+            backend for _, step, _, backend in resolved if isinstance(step, ScriptStepDef)
+        }
+        if "local" in script_backends and "docker" in script_backends:
+            assignments = ", ".join(
+                f"{key} ({backend})"
+                for key, step, _, backend in resolved
+                if isinstance(step, ScriptStepDef) and backend in {"local", "docker"}
+            )
+            warnings.append(
+                f"environment '{environment_name}' mixes local and docker script backends: "
+                f"{assignments}. Docker steps see the bundle snapshot collected before the run, "
+                "not host filesystem mutations made by local steps."
+            )
+
+        used_docker_profiles = {
+            profile_name for _, _, profile_name, backend in resolved if backend == "docker"
+        }
+        explicit_users = {
+            profile_name: docker.user
+            for profile_name in sorted(used_docker_profiles)
+            if (docker := environment.document.profiles[profile_name].docker) is not None
+            and docker.user is not None
+        }
+        if len(set(explicit_users.values())) > 1:
+            assignments = ", ".join(
+                f"{profile_name} ({user})" for profile_name, user in explicit_users.items()
+            )
+            warnings.append(
+                f"environment '{environment_name}' uses docker profiles with incompatible "
+                f"explicit users: {assignments}. The workspace volume is staged once under "
+                "the first resolved user, so later profile users may not be able to write it; "
+                "align user across docker profiles or split them across runs or environments."
+            )
+        for profile_name in sorted(used_docker_profiles):
+            definition = environment.document.profiles[profile_name]
+            docker = definition.docker
+            assert docker is not None
+            prefix = f"docker profile '{profile_name}' in environment '{environment_name}'"
+            if definition.inherit_control_environment is True:
+                warnings.append(
+                    f"{prefix} sets inherit_control_environment: true, forwarding the whole host "
+                    "environment into container metadata visible to Docker daemon administrators; "
+                    "remove the field or set it to false."
+                )
+            if docker.read_only and docker.tmpfs is False:
+                warnings.append(
+                    f"{prefix} sets read_only: true without tmpfs, which often breaks software "
+                    "that writes temporary files; set tmpfs: true if the workload needs /tmp."
+                )
+            if docker.network == "host":
+                warnings.append(
+                    f"{prefix} uses network: host, which removes container network isolation and "
+                    "is not portable to Docker Desktop or remote Docker daemons."
+                )
+
     return errors, warnings
 
 

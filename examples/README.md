@@ -109,6 +109,22 @@ conductor validate examples/execution-profiles.yaml --environment demo
 conductor run examples/execution-profiles.yaml --environment demo
 ```
 
+### docker-script.yaml
+
+Demonstrates containerized script step execution on the Docker runner backend. Demonstrates:
+- Executing script steps inside short-lived containers
+- Sharing workspace state across steps via the run-scoped `/workspace` volume
+- Accessing staged bundle closure files under `/workspace/main/`
+- Resolving Docker execution profile settings from `examples/.conductor/environments/docker-demo.yaml`
+
+```bash
+# Validate against the docker-demo environment
+conductor validate examples/docker-script.yaml --environment docker-demo
+
+# Run the workflow inside Docker containers (requires Docker daemon)
+conductor run examples/docker-script.yaml --environment docker-demo
+```
+
 ## Run Bundles
 
 ### run-bundle.yaml

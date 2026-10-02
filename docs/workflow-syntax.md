@@ -3094,6 +3094,64 @@ When resolving a step's execution profile, Conductor applies a three-tier preced
 
 If none of these three tiers provides a profile, Conductor raises a validation error for that step.
 
+### Docker Execution Profiles for Script Steps
+
+When an execution profile resolves to `backend: docker`, script steps (`type: script`) execute inside short-lived containers against a run-scoped named volume:
+
+```yaml
+workflow:
+  name: containerized-build
+  entry_point: run_in_docker
+
+  defaults:
+    execution:
+      profile: container_build
+
+agents:
+  - name: run_in_docker
+    type: script
+    command: make
+    args: ["test"]
+    working_dir: scripts
+    routes:
+      - to: $end
+```
+
+#### Working Directory Mapping (`working_dir`)
+
+For script steps running on a Docker profile, `working_dir` resolves against the `/workspace` volume:
+
+* **Omitted (`None`)**: Defaults to the workspace root `/workspace`.
+* **Relative paths** (e.g. `scripts` or `build/out`): Resolved relative to `/workspace/main/` (for example, `/workspace/main/scripts`).
+* **POSIX absolute paths** (e.g. `/tmp` or `/app`): Passed verbatim to the container.
+* **Rejected paths**: Windows drive paths (such as `C:\app`), paths containing backslashes (`scripts\test.sh`), empty path strings, and relative paths using `..` to escape `/workspace/main/` are rejected with configuration errors.
+
+#### Mixed-Backend Workflow Warnings
+
+Workflows may combine `local` and `docker` script steps. When an environment document resolves script steps to both backends, `conductor validate` and the runtime engine emit a warning disclosing the snapshot boundary:
+
+```
+environment 'demo' mixes local and docker script backends: host_step (local), container_step (docker). Docker steps see the bundle snapshot collected before the run, not host filesystem mutations made by local steps.
+```
+
+Docker steps execute against the pre-staged content-addressed run bundle in the named volume. Changes made to the host filesystem by earlier local script steps are not automatically mirrored into the container volume.
+
+#### Non-Script Steps Reserved Errors
+
+In this release, `backend: docker` is available for `type: script` steps only. Assigning a Docker execution profile to LLM agents (`type: agent`), direct MCP tool steps (`type: mcp`), or sub-workflows (`type: workflow`) fails validation and manifest compilation:
+
+```
+Step '<name>' resolves to backend 'docker' in environment '<env>', but backend 'docker' is available for script steps only; agent execution realms arrive in step 7.
+```
+
+#### Environment Inheritance (`inherit_control_environment`)
+
+The `inherit_control_environment` setting behaves differently depending on the backend:
+
+* **Local backend**: Defaults to effective `true` (subprocesses inherit the host `os.environ`).
+* **Docker backend**: Defaults to effective `false` (containers do not inherit the host environment; only declared secret deliveries and step `env` entries are passed).
+* **Validation warning**: Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to Docker daemon administrators via `docker inspect`.
+
 ### Engine-Local Steps
 
 Engine-local step types do not execute on a runner backend. They reject the `execution:` block with a schema error:

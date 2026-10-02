@@ -1016,11 +1016,30 @@ When validating workflow secret references (`execution.secrets` or MCP server `s
 - **Invalid secret delivery transports** — header delivery on script steps or stdio MCP servers
 - **Secret delivery name collisions** — colliding literal and secret environment variables or HTTP headers within the same consumer
 - **Secret allow list violations** — consumer scope disallowed by the binding's `allow` policy under `--environment`
+- **Non-script step resolving to Docker backend** — assigning a Docker execution profile to an LLM agent, MCP step, or sub-workflow step (reserved until step 7)
 
 **Warnings** (validation passes with notes):
 - **Undeclared dependencies in explicit mode** — agent prompt references `{{ a.output.val }}` but doesn't declare `a.output` in its `input:` list
 - **Unset secret sources** — secret binding source environment variable is unset on the current validation machine when running with `--environment`
 - **Ambiguous or missing ambient secret bindings** — secret references not present in all discovered environment documents during bare validation
+- **Mixed script backends** — environment resolves script steps to both local and Docker backends
+- **Incompatible Docker user staging** — environment uses multiple Docker profiles with different explicit user settings on a shared volume
+- **Inherited environment on Docker profile** — Docker profile sets `inherit_control_environment: true`
+- **Read-only Docker profile without tmpfs** — Docker profile sets `read_only: true` with `tmpfs: false`
+- **Host network mode on Docker profile** — Docker profile sets `network: host`
+
+### Docker Profile Report Section
+
+When validating against an environment document that defines profiles using `backend: docker`, `conductor validate --environment <name|PATH>` prints a dedicated **Docker Profile** detail section for each configured Docker profile:
+
+* **Image reference**: The configured container image tag or digest.
+* **Platform, Network, User**: Displays the configured string or `Docker default` when omitted.
+* **Hardening and Init flags**: Displays `true` or `false` for `Init`, `Read-only`, `Cap-drop-all`, and `No-new-privileges`.
+* **Tmpfs mount**: Displays `false`, `true`, or the configured size string (such as `512m` or `1g`).
+* **Resource bounds**: Displays the configured limits for `CPU`, `Memory`, and `PIDs`, or `—` when unset.
+* **Informational digest recommendation**: When the image is specified by tag without a `@sha256:` digest, prints an informational note recommending digest pinning for reproducible CI runs.
+
+Validation runs completely offline and never contacts the Docker daemon, network, or image registries.
 
 ### Bundle Closure Report
 

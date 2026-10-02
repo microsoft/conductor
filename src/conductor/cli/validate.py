@@ -161,6 +161,54 @@ def _report_execution_resolution(
     console.print(profiles)
     console.print(styled("  [dim]Audit: {}[/dim]", manifest.audit.classification))
 
+    docker_profiles = {
+        name: profile
+        for name, profile in environment.document.profiles.items()
+        if profile.backend == "docker"
+    }
+    if not docker_profiles:
+        return
+
+    console.print(
+        Text.from_markup(
+            "  [dim]Docker runs require a complete bundle closure; "
+            "conductor bundle build primes the cache.[/dim]"
+        )
+    )
+    for name, profile in sorted(docker_profiles.items()):
+        docker = profile.docker
+        assert docker is not None
+        resources = docker.resources
+        console.print(styled("\n[bold]Docker Profile: {}[/bold]", name))
+        profile_details = Table(show_header=False, box=None, padding=(0, 2))
+        profile_details.add_column("Key", style="dim")
+        profile_details.add_column("Value")
+        profile_details.add_row("Image", docker.image)
+        profile_details.add_row("Platform", docker.platform or "Docker default")
+        profile_details.add_row("Network", docker.network or "Docker default")
+        profile_details.add_row("User", docker.user or "Docker default")
+        profile_details.add_row("Init", "true" if docker.init else "false")
+        profile_details.add_row("Read-only", "true" if docker.read_only else "false")
+        profile_details.add_row("Cap-drop-all", "true" if docker.cap_drop_all else "false")
+        profile_details.add_row(
+            "No-new-privileges", "true" if docker.no_new_privileges else "false"
+        )
+        profile_details.add_row(
+            "Tmpfs",
+            docker.tmpfs if isinstance(docker.tmpfs, str) else str(docker.tmpfs).lower(),
+        )
+        profile_details.add_row("CPU", str(resources.cpu) if resources.cpu is not None else "—")
+        profile_details.add_row("Memory", resources.memory or "—")
+        profile_details.add_row("PIDs", str(resources.pids) if resources.pids is not None else "—")
+        console.print(profile_details)
+        if "@sha256:" not in docker.image:
+            console.print(
+                Text.from_markup(
+                    "  [dim]For reproducible CI, pin this image by digest "
+                    "(for example, image@sha256:...).[/dim]"
+                )
+            )
+
 
 def _report_bundle_closure(
     _config: WorkflowConfig,

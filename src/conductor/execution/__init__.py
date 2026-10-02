@@ -10,9 +10,11 @@ on it.
 from conductor.execution.backend import RunnerBackend
 from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import (
+    BundleRef,
     CommandOutcome,
     CommandResult,
     CommandSpec,
+    ResolvedExecutionSpec,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -22,10 +24,12 @@ from conductor.execution.types import (
 )
 
 __all__ = [
+    "BundleRef",
     "CommandOutcome",
     "CommandResult",
     "CommandSpec",
     "LocalRunnerBackend",
+    "ResolvedExecutionSpec",
     "RunOutcome",
     "RunSpec",
     "RunnerBackend",

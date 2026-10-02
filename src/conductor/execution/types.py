@@ -35,6 +35,74 @@ executor chains today: a missing resolved command vs. any other OS error."""
 
 
 @dataclass(frozen=True)
+class BundleRef:
+    """Reference to a published content-addressed run bundle.
+
+    Attributes:
+        digest: The full bundle content digest (e.g. ``"sha256:<hex>"``).
+        store_path: Absolute host path to the published bundle directory in
+            the bundle store. Backends derive sub-trees (e.g. ``tree/main``
+            and ``tree/roots/``) from this root path.
+    """
+
+    digest: str
+    store_path: str
+
+
+@dataclass(frozen=True)
+class ResolvedExecutionSpec:
+    """Resolved container execution specification for execution backends.
+
+    This carries only resolved immutable values needed to configure the
+    execution container (e.g. image, platform, resource constraints, security
+    settings), never profile names or backend-specific interpretation text.
+
+    Values of ``None`` or ``False`` indicate that the corresponding platform
+    flag is omitted, preserving platform-native daemon defaults rather than
+    substituting Conductor-level defaults.
+
+    Attributes:
+        image: Container image reference as authored (tag or digest).
+        platform: Optional target platform (e.g. ``"linux/amd64"``).
+            ``None`` omits the platform flag for daemon auto-resolution.
+        network: Optional network mode (e.g. ``"none"``, ``"bridge"``,
+            ``"host"``). ``None`` omits the network flag.
+        user: Optional container user specification (``"<name|uid>[:<group|gid>]"``).
+            ``None`` omits the user flag to use the image default USER.
+        init: When true, run an init inside the container to forward signals
+            and reap processes (``--init``). ``False`` omits the flag.
+        read_only: When true, mount the container's root filesystem as read-only
+            (``--read-only``). ``False`` omits the flag.
+        cap_drop_all: When true, drop all Linux capabilities (``--cap-drop ALL``).
+            ``False`` omits the flag.
+        no_new_privileges: When true, disable gaining additional privileges
+            (``--security-opt no-new-privileges``). ``False`` omits the flag.
+        tmpfs: Tmpfs mount configuration. ``False`` omits the mount; ``True``
+            mounts tmpfs at ``/tmp``; a size string (e.g. ``"1g"``) mounts tmpfs
+            at ``/tmp`` with the specified size limit.
+        cpu: Optional CPU limit in fractions of a core (e.g. ``1.5``).
+            ``None`` omits CPU limits.
+        memory: Optional memory limit string (e.g. ``"512m"``, ``"2g"``).
+            ``None`` omits memory limits.
+        pids: Optional maximum number of processes/threads.
+            ``None`` omits PID limits.
+    """
+
+    image: str
+    platform: str | None = None
+    network: str | None = None
+    user: str | None = None
+    init: bool = False
+    read_only: bool = False
+    cap_drop_all: bool = False
+    no_new_privileges: bool = False
+    tmpfs: bool | str = False
+    cpu: float | None = None
+    memory: str | None = None
+    pids: int | None = None
+
+
+@dataclass(frozen=True)
 class CommandSpec:
     """A single command to execute, fully rendered by the caller.
 
@@ -53,6 +121,12 @@ class CommandSpec:
             caller's stdin; ``b""`` means immediate EOF.
         timeout: Per-command wall-clock timeout in seconds, or ``None`` for
             no timeout.
+        execution: Resolved execution specification for containerized execution
+            realms (e.g. Docker), or ``None`` for default execution. The
+            manifest guarantees backend/payload consistency; local backend
+            ignores this field.
+        name: Optional step identity for realm-side labels/names. Local
+            backend ignores this field.
     """
 
     command: str
@@ -62,6 +136,8 @@ class CommandSpec:
     inherit_control_environment: bool = True
     stdin: bytes | None = None
     timeout: float | None = None
+    execution: ResolvedExecutionSpec | None = None
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,10 +236,13 @@ class RunSpec:
     Attributes:
         run_id: The workflow run's identifier; also the natural lease key.
         workflow_name: Optional workflow name, for realm-side labeling.
+        bundle: Optional bundle reference containing the published run bundle
+            for containerized execution realms, or ``None``.
     """
 
     run_id: str
     workflow_name: str | None = None
+    bundle: BundleRef | None = None
 
 
 @dataclass(frozen=True)

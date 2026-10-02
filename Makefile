@@ -2,7 +2,7 @@
 
 PYTEST_WORKERS ?= 4
 PYTEST_PARALLEL_ARGS = -n $(PYTEST_WORKERS) --dist loadfile
-PYTEST_DEFAULT_MARKERS = not real_api and not install_scripts and not performance
+PYTEST_DEFAULT_MARKERS = not real_api and not install_scripts and not performance and not docker_integration
 
 # Default target
 all: check test

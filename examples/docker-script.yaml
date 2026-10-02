@@ -1,0 +1,58 @@
+# Docker Script Step Example
+#
+# This example demonstrates script steps running inside container environments
+# using the Docker execution backend.
+#
+# The workflow:
+# 1. Reads a file from /workspace/main to verify bundle closure staging
+# 2. Writes a marker file to the shared /workspace volume
+# 3. Reads the marker back in a subsequent container step, proving shared volume state
+#
+# Usage:
+#   # Validate against the docker-demo environment
+#   conductor validate examples/docker-script.yaml --environment docker-demo
+#
+#   # Run the workflow inside Docker containers (requires Docker daemon)
+#   conductor run examples/docker-script.yaml --environment docker-demo
+
+workflow:
+  name: docker-script-demo
+  description: Demonstrates script steps running on the Docker execution backend
+  version: "1.0.0"
+  entry_point: verify_staged_bundle
+
+  defaults:
+    execution:
+      profile: docker_shell
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: verify_staged_bundle
+    type: script
+    description: Read the staged workflow file from /workspace/main
+    command: cat
+    args: ["/workspace/main/docker-script.yaml"]
+    routes:
+      - to: write_shared_marker
+
+  - name: write_shared_marker
+    type: script
+    description: Write a marker file to the shared workspace volume
+    command: sh
+    args: ["-c", "echo 'container-workspace-ok' > /workspace/marker.txt"]
+    routes:
+      - to: read_shared_marker
+
+  - name: read_shared_marker
+    type: script
+    description: Read the marker file created by the previous container step
+    command: cat
+    args: ["/workspace/marker.txt"]
+    routes:
+      - to: $end
+
+output:
+  staged_verified: "{{ verify_staged_bundle.output.exit_code == 0 }}"
+  shared_marker: "{{ read_shared_marker.output.stdout | trim }}"

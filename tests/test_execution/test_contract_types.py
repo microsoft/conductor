@@ -18,9 +18,11 @@ from typing import Any, Literal, get_args
 import pytest
 
 from conductor.execution import (
+    BundleRef,
     CommandOutcome,
     CommandResult,
     CommandSpec,
+    ResolvedExecutionSpec,
     RunnerBackend,
     RunnerCapabilities,
     RunOutcome,
@@ -270,3 +272,119 @@ def test_aliases_are_typing_literals() -> None:
     # exception subclasses — house style, see RunMode in fleet/records.py.
     assert CommandOutcome.__origin__ is Literal  # type: ignore[attr-defined]
     assert RunOutcome.__origin__ is Literal  # type: ignore[attr-defined]
+
+
+class TestResolvedExecutionSpecAndBundleRef:
+    """Requirement: ResolvedExecutionSpec and BundleRef contract types and extensions."""
+
+    def test_bundle_ref_fields_and_immutability(self) -> None:
+        # Requirement: BundleRef holds digest and store_path as frozen data.
+        bundle = BundleRef(
+            digest="sha256:abc123",
+            store_path="/var/conductor/cache/bundles/sha256-abc123",
+        )
+        assert bundle.digest == "sha256:abc123"
+        assert bundle.store_path == "/var/conductor/cache/bundles/sha256-abc123"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            bundle.digest = "sha256:def456"  # type: ignore[misc]
+
+    def test_resolved_execution_spec_defaults_and_immutability(self) -> None:
+        # Requirement: ResolvedExecutionSpec omits all flags by default (None/False),
+        # preserving platform-native daemon defaults.
+        spec = ResolvedExecutionSpec(image="alpine:3.20")
+        assert spec.image == "alpine:3.20"
+        assert spec.platform is None
+        assert spec.network is None
+        assert spec.user is None
+        assert spec.init is False
+        assert spec.read_only is False
+        assert spec.cap_drop_all is False
+        assert spec.no_new_privileges is False
+        assert spec.tmpfs is False
+        assert spec.cpu is None
+        assert spec.memory is None
+        assert spec.pids is None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.image = "busybox"  # type: ignore[misc]
+
+    def test_resolved_execution_spec_populated(self) -> None:
+        # Requirement: ResolvedExecutionSpec holds fully populated container configuration.
+        spec = ResolvedExecutionSpec(
+            image="alpine@sha256:1234567890abcdef",
+            platform="linux/amd64",
+            network="none",
+            user="1000:1000",
+            init=True,
+            read_only=True,
+            cap_drop_all=True,
+            no_new_privileges=True,
+            tmpfs="1g",
+            cpu=2.0,
+            memory="512m",
+            pids=100,
+        )
+        assert spec.image == "alpine@sha256:1234567890abcdef"
+        assert spec.platform == "linux/amd64"
+        assert spec.network == "none"
+        assert spec.user == "1000:1000"
+        assert spec.init is True
+        assert spec.read_only is True
+        assert spec.cap_drop_all is True
+        assert spec.no_new_privileges is True
+        assert spec.tmpfs == "1g"
+        assert spec.cpu == 2.0
+        assert spec.memory == "512m"
+        assert spec.pids == 100
+
+    def test_command_spec_new_fields_defaults_and_population(self) -> None:
+        # Requirement: CommandSpec new fields (execution, name) default to None,
+        # ensuring backward compatibility, and accept explicit values.
+        default_spec = CommandSpec(command="echo")
+        assert default_spec.execution is None
+        assert default_spec.name is None
+
+        exec_spec = ResolvedExecutionSpec(image="alpine:latest")
+        populated_spec = CommandSpec(
+            command="python",
+            args=("-c", "print(1)"),
+            execution=exec_spec,
+            name="step-1",
+        )
+        assert populated_spec.execution == exec_spec
+        assert populated_spec.name == "step-1"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            populated_spec.execution = None  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            populated_spec.name = "step-2"  # type: ignore[misc]
+
+    def test_run_spec_bundle_default_and_population(self) -> None:
+        # Requirement: RunSpec bundle field defaults to None and accepts BundleRef.
+        default_spec = RunSpec(run_id="run-123")
+        assert default_spec.bundle is None
+
+        bundle_ref = BundleRef(digest="sha256:abc", store_path="/path/to/bundle")
+        populated_spec = RunSpec(run_id="run-123", workflow_name="wf", bundle=bundle_ref)
+        assert populated_spec.bundle == bundle_ref
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            populated_spec.bundle = None  # type: ignore[misc]
+
+    def test_backward_compatibility_and_equality_parity(self) -> None:
+        # Requirement: Old-style constructions of CommandSpec and RunSpec behave
+        # exactly as before with full equality and positional/keyword parity.
+        spec1 = CommandSpec("echo")
+        spec2 = CommandSpec(
+            command="echo",
+            args=(),
+            working_dir=None,
+            env={},
+            inherit_control_environment=True,
+            stdin=None,
+            timeout=None,
+            execution=None,
+            name=None,
+        )
+        assert spec1 == spec2
+
+        run1 = RunSpec("run-1")
+        run2 = RunSpec(run_id="run-1", workflow_name=None, bundle=None)
+        assert run1 == run2

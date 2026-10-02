@@ -52,10 +52,9 @@ logger = logging.getLogger(__name__)
 WarningSink = Callable[[str], None]
 """Sink for non-fatal diagnostics, mirroring ``skills.registry.WarningSink``."""
 
-# Execution backends compiled into this build of Conductor. Step 2 ships the
-# local subprocess backend only; the registry is a module constant so later
-# backends widen it in one place.
-AVAILABLE_BACKEND_NAMES = frozenset({"local"})
+# Execution backends compiled into this build of Conductor.
+# Widened to include "docker" runner backend.
+AVAILABLE_BACKEND_NAMES = frozenset({"local", "docker"})
 
 # Environment names map directly to ``<name>.yaml``, so the charset excludes
 # path separators and dots; anything outside it must be written as a path.
@@ -67,6 +66,12 @@ _SECRET_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 
 # Environment variable names for secret bindings must be valid shell identifiers.
 _ENV_VAR_NAME_PATTERN = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+# Docker user syntax pattern: <name|uid>[:<group|gid>]
+_DOCKER_USER_PATTERN = re.compile(r"\A[0-9a-zA-Z_][0-9a-zA-Z_.-]*(:[0-9a-zA-Z_][0-9a-zA-Z_.-]*)?\Z")
+
+# Size unit pattern for memory and tmpfs limits (\d+[mg])
+_SIZE_PATTERN = re.compile(r"\A(\d+)([mg])\Z")
 
 # Project-level environment documents live here, relative to each walked
 # ancestor of the workflow file.
@@ -134,6 +139,128 @@ class SecretBinding(BaseModel):
     """
 
 
+class DockerResources(BaseModel):
+    """Resource limits for container execution.
+
+    All limits are optional: an unset limit means no daemon-level ceiling
+    is configured (the container shares host resources with other processes).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cpu: float | None = Field(default=None, ge=0.1, le=64.0)
+    """CPU limit in cores (e.g. 0.5, 2.0). Bounded between 0.1 and 64 cores."""
+
+    memory: str | None = None
+    """Memory limit formatted as '<number>[m|g]' (e.g. '512m', '2g').
+
+    Bounded between 16 MiB (16m) and 65,536 MiB (64g).
+    """
+
+    pids: int | None = Field(default=None, ge=16, le=65536)
+    """Process limit. Bounded between 16 and 65536."""
+
+    @field_validator("memory")
+    @classmethod
+    def _validate_memory(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip().lower()
+        match = _SIZE_PATTERN.match(stripped)
+        if not match:
+            raise ValueError(
+                f"Invalid memory limit '{value}': must match pattern \\d+[mg] (e.g. '512m', '2g')"
+            )
+        num = int(match.group(1))
+        unit = match.group(2)
+        mib = num * 1024 if unit == "g" else num
+        if mib < 16 or mib > 65536:
+            raise ValueError(
+                f"Memory limit '{value}' out of bounds: must be between 16m and 64g (65536m)"
+            )
+        return stripped
+
+
+class DockerProfileOptions(BaseModel):
+    """Configuration options for a Docker execution profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: str
+    """Container image reference (tag or digest)."""
+
+    platform: Literal["linux/amd64", "linux/arm64"] | None = None
+    """Target platform for the container image (None = auto-resolved by Docker)."""
+
+    network: Literal["none", "bridge", "host"] | None = None
+    """Container network mode (None = daemon default)."""
+
+    user: str | None = None
+    """Container user in docker syntax '<name|uid>[:<group|gid>]' (None = image USER)."""
+
+    init: bool = False
+    """Whether to use a container init process (docker --init)."""
+
+    read_only: bool = False
+    """Whether to mount the container's root filesystem as read-only."""
+
+    cap_drop_all: bool = False
+    """Whether to drop all Linux capabilities (docker --cap-drop=ALL)."""
+
+    no_new_privileges: bool = False
+    """Whether to prevent the container from gaining additional privileges."""
+
+    tmpfs: bool | str = False
+    """Tmpfs mount configuration: False = disabled, True = /tmp, or size string (e.g. '1g')."""
+
+    resources: DockerResources = Field(default_factory=DockerResources)
+    """Resource constraints for container execution."""
+
+    @field_validator("image")
+    @classmethod
+    def _validate_image(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped or bool(re.search(r"\s", stripped)):
+            raise ValueError("image must be a non-empty string without whitespace")
+        return stripped
+
+    @field_validator("user")
+    @classmethod
+    def _validate_user(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped or _DOCKER_USER_PATTERN.match(stripped) is None:
+            raise ValueError(
+                f"Invalid user '{value}': must match docker user syntax <name|uid>[:<group|gid>] "
+                f"and pattern {_DOCKER_USER_PATTERN.pattern}"
+            )
+        return stripped
+
+    @field_validator("tmpfs", mode="before")
+    @classmethod
+    def _validate_tmpfs(cls, value: Any) -> bool | str:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip().lower()
+            match = _SIZE_PATTERN.match(stripped)
+            if not match:
+                raise ValueError(
+                    f"Invalid tmpfs size '{value}': must be a boolean or match pattern \\d+[mg] "
+                    "(e.g. '512m', '1g')"
+                )
+            num = int(match.group(1))
+            unit = match.group(2)
+            mib = num * 1024 if unit == "g" else num
+            if mib < 1 or mib > 16384:
+                raise ValueError(
+                    f"tmpfs size '{value}' out of bounds: must be between 1m and 16g (16384m)"
+                )
+            return stripped
+        raise ValueError("tmpfs must be a boolean or size string (e.g. '1g', '512m')")
+
+
 class ProfileDefinition(BaseModel):
     """One named execution profile inside an environment document."""
 
@@ -150,6 +277,9 @@ class ProfileDefinition(BaseModel):
     default to effective ``False``).
     """
 
+    docker: DockerProfileOptions | None = None
+    """Docker execution options, required if and only if backend is 'docker'."""
+
     @field_validator("backend")
     @classmethod
     def _backend_must_be_available(cls, value: str) -> str:
@@ -161,6 +291,19 @@ class ProfileDefinition(BaseModel):
             )
         return value
 
+    @model_validator(mode="after")
+    def _validate_docker_options(self) -> ProfileDefinition:
+        if self.backend == "docker" and self.docker is None:
+            raise ValueError(
+                "profile with backend 'docker' requires a 'docker' configuration block"
+            )
+        if self.backend != "docker" and self.docker is not None:
+            raise ValueError(
+                f"profile with backend '{self.backend}' cannot specify a "
+                "'docker' configuration block"
+            )
+        return self
+
     def model_dump(
         self,
         *args: Any,
@@ -169,6 +312,8 @@ class ProfileDefinition(BaseModel):
         dump = super().model_dump(*args, **kwargs)
         if dump.get("inherit_control_environment") is None:
             dump.pop("inherit_control_environment", None)
+        if dump.get("docker") is None:
+            dump.pop("docker", None)
         return dump
 
 
@@ -229,8 +374,11 @@ class EnvironmentDocument(BaseModel):
         if dump.get("secrets") is None:
             dump.pop("secrets", None)
         for p in dump.get("profiles", {}).values():
-            if isinstance(p, dict) and p.get("inherit_control_environment") is None:
-                p.pop("inherit_control_environment", None)
+            if isinstance(p, dict):
+                if p.get("inherit_control_environment") is None:
+                    p.pop("inherit_control_environment", None)
+                if p.get("docker") is None:
+                    p.pop("docker", None)
         return dump
 
 
@@ -271,8 +419,11 @@ def _document_digest(document: EnvironmentDocument) -> str:
     if dump.get("secrets") is None:
         dump.pop("secrets", None)
     for p in dump.get("profiles", {}).values():
-        if isinstance(p, dict) and p.get("inherit_control_environment") is None:
-            p.pop("inherit_control_environment", None)
+        if isinstance(p, dict):
+            if p.get("inherit_control_environment") is None:
+                p.pop("inherit_control_environment", None)
+            if p.get("docker") is None:
+                p.pop("docker", None)
     return canonical_json_digest(dump)
 
 

@@ -37,6 +37,7 @@ from conductor.config.schema import (
     WorkflowStepDef,
 )
 from conductor.duration import parse_duration
+from conductor.engine.bundle_prep import prepare_run_bundle
 from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
 from conductor.engine.execution_resolution import ExecutionResolver, ExecutionResolverSession
@@ -44,7 +45,7 @@ from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
-from conductor.engine.run_manifest import executable_step_identity
+from conductor.engine.run_manifest import executable_step_identity, script_step_backends
 from conductor.engine.secrets import SecretValueCache
 from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
@@ -63,7 +64,7 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
-from conductor.execution import RunnerBackend, RunOutcome, RunSpec, WorkspaceLease
+from conductor.execution import BundleRef, RunnerBackend, RunOutcome, RunSpec, WorkspaceLease
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -830,6 +831,7 @@ class WorkflowEngine:
         # the nesting level.
         self._bg_mode = self._run_context.bg_mode or _inherited_bg_mode
         self._system_metadata: dict[str, Any] = {}
+        self._run_bundle: BundleRef | None = None
 
         # When True, ``_execute_loop`` skips its ``workflow_started`` emit.
         # Set by :meth:`suppress_workflow_started_emit` from the CLI resume
@@ -1336,6 +1338,11 @@ class WorkflowEngine:
         }
         if self._execution_resolver.publish_manifest:
             system["execution_manifest"] = self._execution_resolver.manifest.model_dump(mode="json")
+            if self._run_bundle is not None:
+                system["bundle"] = {
+                    "digest": self._run_bundle.digest,
+                    "store_path": self._run_bundle.store_path,
+                }
 
         # Conditional fields — only when dashboard is active
         if self._dashboard_port is not None:
@@ -1892,6 +1899,10 @@ class WorkflowEngine:
                 lease=lease,
                 backend=backend,
                 secret_env=secret_env,
+                execution=self._execution_resolver.execution_spec_for_step(
+                    agent.name,
+                    for_each_group=for_each_group,
+                ),
                 inherit_control_environment=self._execution_resolver.inherit_env_for_step(
                     agent.name,
                     for_each_group=for_each_group,
@@ -3463,15 +3474,36 @@ class WorkflowEngine:
         outcome: RunOutcome = "failed"
         redaction_token = None
         try:
+            backend_names = {
+                profile.backend for profile in self._execution_resolver.manifest.profiles.values()
+            }
+            await self._execution_session.ensure_backends(backend_names)
             if self._subworkflow_depth == 0:
                 if self._execution_session.owns_secrets:
                     self._execution_session.reset_secrets()
                     self._execution_resolver.refresh_secret_uses()
+                bundle = await prepare_run_bundle(
+                    self._execution_resolver.manifest,
+                    self.workflow_path,
+                    self._execution_session.environment,
+                )
+                self._run_bundle = bundle
+                backends = script_step_backends(self._execution_resolver.manifest)
+                if len(backends) > 1:
+                    message = "Workflow uses mixed script execution backends: " + ", ".join(
+                        sorted(backends)
+                    )
+                    logger.warning(message)
+                    from conductor.cli.run import verbose_log
+
+                    verbose_log(message, style="yellow")
                 await self._execution_session.prepare_leases(
                     RunSpec(
                         run_id=self._run_id,
                         workflow_name=self.config.workflow.name,
-                    )
+                        bundle=bundle,
+                    ),
+                    workflow_path=self.workflow_path,
                 )
                 self._workspace_lease = self._execution_session.lease_for_backend("local")
                 set_redactor = getattr(self._event_emitter, "set_redactor", None)
@@ -3548,15 +3580,36 @@ class WorkflowEngine:
         outcome: RunOutcome = "failed"
         redaction_token = None
         try:
+            backend_names = {
+                profile.backend for profile in self._execution_resolver.manifest.profiles.values()
+            }
+            await self._execution_session.ensure_backends(backend_names)
             if self._subworkflow_depth == 0:
                 if self._execution_session.owns_secrets:
                     self._execution_session.reset_secrets()
                     self._execution_resolver.refresh_secret_uses()
+                bundle = await prepare_run_bundle(
+                    self._execution_resolver.manifest,
+                    self.workflow_path,
+                    self._execution_session.environment,
+                )
+                self._run_bundle = bundle
+                backends = script_step_backends(self._execution_resolver.manifest)
+                if len(backends) > 1:
+                    message = "Workflow uses mixed script execution backends: " + ", ".join(
+                        sorted(backends)
+                    )
+                    logger.warning(message)
+                    from conductor.cli.run import verbose_log
+
+                    verbose_log(message, style="yellow")
                 await self._execution_session.prepare_leases(
                     RunSpec(
                         run_id=self._run_id,
                         workflow_name=self.config.workflow.name,
-                    )
+                        bundle=bundle,
+                    ),
+                    workflow_path=self.workflow_path,
                 )
                 self._workspace_lease = self._execution_session.lease_for_backend("local")
                 set_redactor = getattr(self._event_emitter, "set_redactor", None)

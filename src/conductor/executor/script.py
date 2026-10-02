@@ -16,14 +16,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from conductor.exceptions import ExecutionError
+from conductor.exceptions import ConfigurationError, ExecutionError
 from conductor.execution import (
     CommandResult,
     CommandSpec,
     LocalRunnerBackend,
+    ResolvedExecutionSpec,
     RunnerBackend,
     WorkspaceLease,
 )
+from conductor.execution.errors import ExecutionSpecError
 from conductor.executor.template import TemplateRenderer
 
 
@@ -93,6 +95,7 @@ class ScriptExecutor:
         lease: WorkspaceLease | None = None,
         backend: RunnerBackend | None = None,
         secret_env: dict[str, str] | None = None,
+        execution: ResolvedExecutionSpec | None = None,
         inherit_control_environment: bool = True,
     ) -> ScriptOutput:
         """Execute a script step.
@@ -115,6 +118,17 @@ class ScriptExecutor:
                 variable name → plaintext value) merged verbatim into the
                 command's environment. ``None`` (the default) keeps the
                 pre-secrets behavior exactly.
+            execution: Optional resolved container execution payload for the
+                command, or ``None`` for default (local) execution. The
+                executor only carries the payload into :class:`CommandSpec`;
+                the compiled run manifest guarantees backend/payload
+                consistency. The local backend ignores the payload. When a
+                container backend receives ``None`` (a manifest/engine wiring
+                mismatch), it raises
+                :class:`~conductor.execution.errors.ExecutionSpecError`, which
+                this method translates into
+                :class:`~conductor.exceptions.ConfigurationError` so engine
+                and CLI layers keep their familiar error vocabulary.
             inherit_control_environment: Effective inheritance policy from the
                 compiled run manifest. When False, the backend runs the command
                 on a minimal environment plus ``env`` instead of merging over
@@ -189,12 +203,23 @@ class ScriptExecutor:
             inherit_control_environment=inherit_control_environment,
             stdin=stdin_payload,
             timeout=agent.timeout,
+            execution=execution,
+            # Step identity travels with the payload as one unit: a local run
+            # must produce the byte-identical legacy spec (name=None), while a
+            # container run gets the step name for realm-side labels/names.
+            name=agent.name if execution is not None else None,
         )
-        result = await execution_backend.run_command(
-            spec,
-            lease,
-            diagnostics=self._make_diagnostics(),
-        )
+        try:
+            result = await execution_backend.run_command(
+                spec,
+                lease,
+                diagnostics=self._make_diagnostics(),
+            )
+        except ExecutionSpecError as exc:
+            # The execution leaf speaks its own specification-error type; the
+            # engine/CLI boundary translates it into the familiar
+            # ConfigurationError while preserving the original as __cause__.
+            raise ConfigurationError(str(exc)) from exc
 
         if result.outcome == "command_not_found":
             cause = self._reconstruct_start_error(result)

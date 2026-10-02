@@ -158,6 +158,7 @@ markers = [
     "real_api: marks tests that make real API calls to external services (deselect with '-m \"not real_api\"')",
     "install_scripts: marks tests that exercise install.ps1/install.sh end-to-end (slow; opt-in via '-m install_scripts')",
     "claude_auth_readiness_mocked: runs the real claude-agent-sdk auth preflight; real process creation is refused, so the test must mock it",
+    "docker_integration: marks tests requiring a real Docker daemon (deselect with '-m \"not docker_integration\"')",
 ]
 
 [tool.towncrier]
