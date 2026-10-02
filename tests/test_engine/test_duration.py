@@ -6,6 +6,8 @@ tolerance, and rejection of malformed / unsupported values.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from conductor.duration import parse_duration
@@ -118,3 +120,12 @@ class TestParseDurationRejects:
     def test_number_then_garbage(self) -> None:
         with pytest.raises(ValueError):
             parse_duration("5 minutes")
+
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_nonfinite_number(self, value: float) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            parse_duration(value)
+
+    def test_overflowing_string_number(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            parse_duration("9" * 400)
