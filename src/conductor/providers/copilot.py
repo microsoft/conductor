@@ -1255,6 +1255,12 @@ class CopilotProvider(AgentProvider):
                 "working_directory": resolved_cwd,
                 "streaming": True,
             }
+            # Enforce the resolved tool allowlist on the SDK session whenever one
+            # is declared (agent-level, or inherited from workflow-level tools).
+            # Only when neither level declares tools does the CLI keep its default
+            # catalog; ``tools: []`` yields a session with no tools at all.
+            if agent.tools is not None or tools:
+                session_kwargs["available_tools"] = list(tools or [])
             if agent.system_prompt:
                 session_kwargs["system_message"] = {
                     "mode": "replace",
@@ -1380,6 +1386,8 @@ class CopilotProvider(AgentProvider):
                             "on_permission_request": self._default_permission_handler,
                             "working_directory": resolved_cwd,
                         }
+                        if agent.tools is not None or tools:
+                            resume_kwargs["available_tools"] = list(tools or [])
                         if agent.system_prompt:
                             resume_kwargs["system_message"] = {
                                 "mode": "replace",
