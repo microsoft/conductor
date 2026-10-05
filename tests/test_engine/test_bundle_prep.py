@@ -156,6 +156,26 @@ async def test_docker_bundle_is_published_and_reused(
 
 
 @pytest.mark.asyncio
+async def test_registry_root_bundle_ref_uses_collected_logical_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker_environment: ResolvedEnvironment,
+) -> None:
+    # Requirement: materialization identifies the root from collector mapping, not main's presence.
+    home = tmp_path / "home"
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+    root = "registry/team/aaaaaaaaaaaa/nested"
+    (home / "cache/registries/team/aaaaaaaaaaaa/nested").mkdir(parents=True)
+    workflow = _write_script_workflow(
+        home / "cache/registries/team/aaaaaaaaaaaa/nested/workflow.yaml", profile="docker"
+    )
+    bundle = await bundle_prep.materialize_run_bundle(workflow, docker_environment)
+
+    assert bundle.root == root
+    assert (Path(bundle.store_path) / "tree" / root / "workflow.yaml").is_file()
+
+
+@pytest.mark.asyncio
 async def test_environment_without_docker_profile_performs_zero_bundle_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

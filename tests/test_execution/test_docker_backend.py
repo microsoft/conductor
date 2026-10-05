@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict, cast
@@ -14,6 +15,7 @@ from typing import TypedDict, cast
 import pytest
 
 from conductor.execution.docker import (
+    _CLI_TIMEOUT_RC,
     DockerRunnerBackend,
     _copy_tree_preserving_symlinks,
     _map_working_dir,
@@ -56,6 +58,8 @@ class _Record(TypedDict):
     argv: list[str]
     env: dict[str, str]
     stdin: str
+    env_file_content: str
+    env_file_mode: int
 
 
 def _records(log: Path) -> list[_Record]:
@@ -107,7 +111,7 @@ async def test_missing_cli_is_command_not_found(tmp_path: Path) -> None:
 async def test_minimal_create_argv_and_secret_env(
     fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Requirement: default create argv stays minimal and secrets travel only in process env.
+    # Requirement: secrets travel only through a protected temporary container env file.
     backend, log = fake_docker
     lease = await _lease(backend)
     secret = "top-secret-value"
@@ -125,10 +129,15 @@ async def test_minimal_create_argv_and_secret_env(
     assert result.outcome == "completed" and result.exit_code == 0
     create = next(row for row in _records(log) if row["argv"][0] == "create")
     argv = create["argv"]
-    assert argv[-3:] == ["alpine:3.20", "printf", "ok"]
-    assert [argv[index + 1] for index, value in enumerate(argv) if value == "--env"] == ["TOKEN"]
+    assert argv[-4:] == ["--entrypoint", "printf", "alpine:3.20", "ok"]
+    assert "--env" not in argv
+    assert "--env-file" in argv
     assert secret not in json.dumps(argv)
-    assert create["env"]["TOKEN"] == secret
+    assert create["env_file_content"] == f"TOKEN={secret}\n"
+    assert "TOKEN" not in create["env"]
+    assert not Path(argv[argv.index("--env-file") + 1]).exists()
+    if sys.platform != "win32":
+        assert create["env_file_mode"] == 0o600
     for forbidden in (
         "--init",
         "--read-only",
@@ -145,6 +154,143 @@ async def test_minimal_create_argv_and_secret_env(
     ):
         assert forbidden not in argv
     assert not any(value == "run" or value == "--rm" for value in argv)
+
+
+@pytest.mark.asyncio
+async def test_create_entrypoint_replaces_image_defaults(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+) -> None:
+    # Requirement: the authored executable precedes the image as --entrypoint, never as an arg.
+    backend, log = fake_docker
+    lease = await _lease(backend)
+    result = await backend.run_command(
+        CommandSpec(command="python3", args=("-c", "print(1)"), execution=_minimal()), lease
+    )
+    assert result.outcome == "completed"
+    argv = next(row["argv"] for row in _records(log) if row["argv"][0] == "create")
+    assert argv[argv.index("--entrypoint") + 1 :] == [
+        "python3",
+        "alpine:3.20",
+        "-c",
+        "print(1)",
+    ]
+    assert argv.count("python3") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variable", ["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "HOME"])
+async def test_payload_docker_settings_do_not_change_cli_environment(
+    fake_docker: tuple[DockerRunnerBackend, Path], variable: str
+) -> None:
+    # Requirement: Docker client settings supplied as payload never redirect any Docker CLI call.
+    backend, log = fake_docker
+    control = backend._cli_env.get(variable)
+    lease = await _lease(backend)
+    payload = f"payload-{variable}"
+    result = await backend.run_command(
+        CommandSpec(command="true", env={variable: payload}, execution=_minimal()), lease
+    )
+    assert result.outcome == "completed"
+    await backend.finalize_run(lease, "succeeded")
+    rows = _records(log)
+    assert rows
+    assert all(row["env"].get(variable) == control for row in rows)
+    assert all(payload not in json.dumps(row["argv"]) for row in rows)
+    create = next(row for row in rows if row["argv"][0] == "create")
+    assert f"{variable}={payload}\n" in create["env_file_content"]
+    assert not Path(create["argv"][create["argv"].index("--env-file") + 1]).exists()
+
+
+@pytest.mark.asyncio
+async def test_container_environment_without_inheritance(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+) -> None:
+    # Requirement: disabling control inheritance passes only declared variables to the container.
+    backend, log = fake_docker
+    lease = await _lease(backend)
+    result = await backend.run_command(
+        CommandSpec(
+            command="true",
+            env={"ONLY_PAYLOAD": "value"},
+            inherit_control_environment=False,
+            execution=_minimal(),
+        ),
+        lease,
+    )
+    assert result.outcome == "completed"
+    create = next(row for row in _records(log) if row["argv"][0] == "create")
+    assert create["env_file_content"] == "ONLY_PAYLOAD=value\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [("BAD-NAME", "secret"), ("TOKEN", "secret\nsecond-line"), ("TOKEN", "secret\x00tail")],
+)
+async def test_invalid_container_environment_fails_without_disclosing_value(
+    fake_docker: tuple[DockerRunnerBackend, Path], variable: str, value: str
+) -> None:
+    # Requirement: unrepresentable env-file entries fail before create without leaking values.
+    backend, log = fake_docker
+    lease = await _lease(backend)
+    result = await backend.run_command(
+        CommandSpec(
+            command="true",
+            env={variable: value},
+            inherit_control_environment=False,
+            execution=_minimal(),
+        ),
+        lease,
+    )
+    assert result.outcome == "start_failed"
+    assert result.start_error is not None
+    assert variable in result.start_error.message
+    assert "secret" not in result.start_error.message
+    assert not any(row["argv"][0] == "create" for row in _records(log))
+
+
+@pytest.mark.asyncio
+async def test_create_failure_removes_container_env_file(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: failed docker create removes its temporary env file before returning.
+    _backend, log = fake_docker
+    monkeypatch.setenv("FAKE_DOCKER_SCENARIO", "createfail")
+    backend = DockerRunnerBackend("docker")
+    lease = await _lease(backend)
+    result = await backend.run_command(
+        CommandSpec(command="true", env={"TOKEN": "private"}, execution=_minimal()), lease
+    )
+    assert result.outcome == "start_failed"
+    create = next(row for row in _records(log) if row["argv"][0] == "create")
+    assert not Path(create["argv"][create["argv"].index("--env-file") + 1]).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancel_create_removes_container_env_file(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Requirement: cancelling docker create removes the env file after its subprocess is reaped.
+    _backend, log = fake_docker
+    marker = tmp_path / "creating"
+    monkeypatch.setenv("FAKE_DOCKER_DELAY_COMMAND", "create --name conductor-run_")
+    monkeypatch.setenv("FAKE_DOCKER_DELAY_MARKER", str(marker))
+    monkeypatch.setenv("FAKE_DOCKER_DELAY", "30")
+    backend = DockerRunnerBackend("docker")
+    lease = await _lease(backend)
+    task = asyncio.create_task(
+        backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    )
+    for _ in range(300):
+        if marker.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert marker.exists()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    create = next(row for row in _records(log) if row["argv"][0] == "create")
+    assert not Path(create["argv"][create["argv"].index("--env-file") + 1]).exists()
 
 
 @pytest.mark.asyncio
@@ -273,6 +419,66 @@ async def test_cancel_propagates_after_cleanup(
     assert "kill" in commands and "rm" in commands
 
 
+@pytest.mark.asyncio
+async def test_cancel_during_final_removal_drains_before_propagating(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: cancellation at final rm waits for removal and never returns completed data.
+    backend, _log = fake_docker
+    lease = await _lease(backend)
+    original = backend._run_docker
+    removing = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def delayed_rm(argv: Sequence[str], **kwargs: object) -> tuple[int, str, str]:
+        if argv[:2] == ("rm", "-f"):
+            removing.set()
+            await release.wait()
+            result = await original(argv)
+            finished.set()
+            return result
+        return await original(argv)
+
+    monkeypatch.setattr(backend, "_run_docker", delayed_rm)
+    task = asyncio.create_task(
+        backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    )
+    await asyncio.wait_for(removing.wait(), 10)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_timeout_with_unconfirmed_termination_warns_and_preserves_outcome(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement: failed kill and rm leave timeout data intact and identify the live container.
+    _backend, log = fake_docker
+    monkeypatch.setenv("FAKE_DOCKER_SCENARIO", "termination-fails")
+    monkeypatch.setenv("FAKE_DOCKER_DELAY_COMMAND", "start --attach")
+    monkeypatch.setenv("FAKE_DOCKER_DELAY", "30")
+    backend = DockerRunnerBackend("docker")
+    lease = await _lease(backend)
+    result = await backend.run_command(
+        CommandSpec(command="sleep", timeout=0.05, execution=_minimal()), lease
+    )
+    name = next(row["argv"][-1] for row in _records(log) if row["argv"][0] == "start")
+    assert result.outcome == "timed_out"
+    assert "kill denied" in caplog.text and "remove denied" in caplog.text
+    assert f"container={name}" in caplog.text
+    assert f"docker rm -f {name}" in caplog.text
+    assert name in json.loads(Path(os.environ["FAKE_DOCKER_STATE"]).read_text())["containers"]
+    assert sum(row["argv"][:2] == ["rm", "-f"] for row in _records(log)) >= 2
+
+
 @pytest.mark.parametrize(
     ("value", "mapped"),
     [
@@ -298,7 +504,7 @@ def test_working_dir_refusals(value: str) -> None:
 async def test_staging_layout_archive_copy_and_reentry(
     fake_docker: tuple[DockerRunnerBackend, Path], tmp_path: Path
 ) -> None:
-    # Requirement: bundle main/roots are copied once via archive-preserving trailing-dot cp.
+    # Requirement: the bundle tree is copied once via archive-preserving trailing-dot cp.
     backend, log = fake_docker
     store = tmp_path / "store"
     (store / "tree/main").mkdir(parents=True)
@@ -315,6 +521,27 @@ async def test_staging_layout_archive_copy_and_reentry(
     assert cp_rows[0]["argv"][2].endswith("/.")
     assert cp_rows[0]["argv"][3].endswith(":/workspace")
     assert sum(row["argv"][:2] == ["volume", "create"] for row in records) == 1
+
+
+@pytest.mark.asyncio
+async def test_scratch_create_has_placeholder_entrypoint(
+    fake_docker: tuple[DockerRunnerBackend, Path], tmp_path: Path
+) -> None:
+    # Requirement: scratch creation does not require image CMD or ENTRYPOINT defaults.
+    backend, log = fake_docker
+    store = tmp_path / "store"
+    (store / "tree/main").mkdir(parents=True)
+    (store / "tree/main/file.txt").write_text("payload", encoding="utf-8")
+    lease = await _lease(backend, bundle=BundleRef("sha256:test", str(store)))
+    result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    assert result.outcome == "completed"
+    scratch = next(
+        row["argv"]
+        for row in _records(log)
+        if row["argv"][0] == "create"
+        and row["argv"][row["argv"].index("--name") + 1].startswith("conductor-stage-")
+    )
+    assert scratch[-3:] == ["--entrypoint", "/conductor-staging-placeholder", "alpine:3.20"]
 
 
 def test_symlink_walker_preserves_internal_and_rejects_escape(tmp_path: Path) -> None:
@@ -375,6 +602,65 @@ def test_staging_walker_preserves_forward_slash_link_without_following_it(
         assert (staging / "main/shared").read_text(encoding="utf-8") == "shared"
 
 
+def test_staging_copies_every_bundle_namespace(tmp_path: Path) -> None:
+    # Requirement: local roots retain registry children, plugins, skills, and additional roots.
+    tree = tmp_path / "store/tree"
+    paths = (
+        "main/workflow.yaml",
+        "roots/00/asset.txt",
+        "registry/team/aaaaaaaaaaaa/child.yaml",
+        "plugins/helper/plugin.json",
+        "skills/review/SKILL.md",
+    )
+    for relative in paths:
+        file = tree / relative
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(relative, encoding="utf-8")
+    staging = tmp_path / "staging"
+    DockerRunnerBackend._build_staging_tree(BundleRef("sha256:test", str(tree.parent)), staging)
+    for relative in paths:
+        assert (staging / relative).read_text(encoding="utf-8") == relative
+
+
+def test_staging_rejects_missing_tree(tmp_path: Path) -> None:
+    # Requirement: missing bundle trees fail independently of the optional main namespace.
+    with pytest.raises(ExecutionSpecError, match="bundle tree does not exist"):
+        DockerRunnerBackend._build_staging_tree(
+            BundleRef("sha256:test", str(tmp_path)), tmp_path / "staging"
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_root_without_main_stages_and_maps_working_dir(
+    fake_docker: tuple[DockerRunnerBackend, Path], tmp_path: Path
+) -> None:
+    # Requirement: a registry-root bundle without main stages and maps relative cwd safely.
+    backend, log = fake_docker
+    store = tmp_path / "store"
+    root = "registry/team/aaaaaaaaaaaa"
+    workflow = store / "tree" / root / "workflow.yaml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("workflow", encoding="utf-8")
+    lease = await _lease(backend, bundle=BundleRef("sha256:test", str(store), root=root))
+    result = await backend.run_command(
+        CommandSpec(command="true", working_dir="scripts", execution=_minimal()), lease
+    )
+    assert result.outcome == "completed"
+    create = next(
+        row["argv"]
+        for row in _records(log)
+        if row["argv"][0] == "create"
+        and "--entrypoint" in row["argv"]
+        and row["argv"][row["argv"].index("--entrypoint") + 1] == "true"
+    )
+    assert create[create.index("-w") + 1] == "/workspace/registry/team/aaaaaaaaaaaa/scripts"
+    staging = tmp_path / "staging"
+    DockerRunnerBackend._build_staging_tree(BundleRef("sha256:test", str(store), root), staging)
+    assert (staging / root / "workflow.yaml").read_text(encoding="utf-8") == "workflow"
+    with pytest.raises(ExecutionSpecError, match="escape"):
+        _map_working_dir("../escape", root)
+
+
 @pytest.mark.asyncio
 async def test_finalize_is_idempotent_and_backend_can_prepare_again(
     fake_docker: tuple[DockerRunnerBackend, Path],
@@ -408,6 +694,129 @@ async def test_incarnation_mismatch_recreates_volume(
     records = _records(log)
     assert sum(row["argv"][:3] == ["volume", "rm", "-f"] for row in records) == 1
     assert sum(row["argv"][:2] == ["volume", "create"] for row in records) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "detail"),
+    [
+        ("inspect-error", "Cannot connect to the Docker daemon"),
+        ("inspect-no-such-host", "no such host"),
+        ("inspect-malformed", "malformed labels"),
+        ("inspect-nondict", "non-dict labels"),
+    ],
+)
+async def test_volume_inspect_failure_aborts_staging(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    detail: str,
+) -> None:
+    # Requirement: unverifiable volume labels stop staging instead of creating a replacement.
+    _backend, log = fake_docker
+    monkeypatch.setenv("FAKE_DOCKER_SCENARIO", scenario)
+    backend = DockerRunnerBackend("docker")
+    lease = await _lease(backend)
+    result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    assert result.outcome == "start_failed"
+    assert result.start_error is not None
+    assert f"Docker volume conductor-ws-{lease.lease_id}" in result.start_error.message
+    assert detail in result.start_error.message
+    assert [row["argv"][:2] for row in _records(log)] == [["volume", "inspect"]]
+
+
+@pytest.mark.asyncio
+async def test_volume_inspect_timeout_with_absence_text_is_not_missing(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: a CLI timeout cannot confirm absence even if its stderr mentions "no such".
+    backend, _log = fake_docker
+    original = backend._run_docker
+
+    async def timed_out_inspect(
+        argv: Sequence[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        timeout: float | None = 300.0,
+        diagnostics: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        if argv[:2] == ["volume", "inspect"]:
+            return _CLI_TIMEOUT_RC, "", "no such volume (CLI timed out)"
+        return await original(
+            argv, stdin_bytes=stdin_bytes, timeout=timeout, diagnostics=diagnostics
+        )
+
+    monkeypatch.setattr(backend, "_run_docker", timed_out_inspect)
+    lease = await _lease(backend)
+    result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    assert result.outcome == "start_failed"
+    assert result.start_error is not None
+    assert "no such volume (CLI timed out)" in result.start_error.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "detail"),
+    [
+        ("inspect-error", "Cannot connect to the Docker daemon"),
+        ("inspect-no-such-host", "no such host"),
+        ("inspect-malformed", "malformed labels"),
+        ("inspect-nondict", "non-dict labels"),
+    ],
+)
+async def test_volume_inspect_failure_warns_on_finalize(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: str,
+    detail: str,
+) -> None:
+    # Requirement: unverifiable volume labels retain storage and emit a cleanup warning.
+    backend, log = fake_docker
+    lease = await _lease(backend)
+    result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    assert result.outcome == "completed"
+    monkeypatch.setenv("FAKE_DOCKER_SCENARIO", scenario)
+    backend._cli_env = dict(os.environ)
+    await backend.finalize_run(lease, "succeeded")
+    assert f"Docker cleanup failed for run_id={lease.lease_id}" in caplog.text
+    assert detail in caplog.text
+    assert not any(row["argv"][:3] == ["volume", "rm", "-f"] for row in _records(log))
+    state = json.loads(Path(os.environ["FAKE_DOCKER_STATE"]).read_text(encoding="utf-8"))
+    assert backend._volume_name(lease) in state["volumes"]
+
+
+@pytest.mark.asyncio
+async def test_volume_inspect_timeout_warns_on_finalize(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement: a timed-out volume inspection leaves storage intact and warns on cleanup.
+    backend, log = fake_docker
+    lease = await _lease(backend)
+    result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    assert result.outcome == "completed"
+    original = backend._run_docker
+
+    async def timed_out_inspect(
+        argv: Sequence[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        timeout: float | None = 300.0,
+        diagnostics: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        if argv[:2] == ["volume", "inspect"]:
+            return _CLI_TIMEOUT_RC, "", "Docker CLI command timed out"
+        return await original(
+            argv, stdin_bytes=stdin_bytes, timeout=timeout, diagnostics=diagnostics
+        )
+
+    monkeypatch.setattr(backend, "_run_docker", timed_out_inspect)
+    await backend.finalize_run(lease, "succeeded")
+    assert "Docker cleanup failed" in caplog.text
+    assert "Docker CLI command timed out" in caplog.text
+    assert not any(row["argv"][:3] == ["volume", "rm", "-f"] for row in _records(log))
 
 
 @pytest.mark.asyncio
@@ -476,6 +885,68 @@ async def test_finalize_cancels_inflight_staging_before_volume_cleanup(
         index for index, row in enumerate(records) if delayed in " ".join(row["argv"])
     )
     assert delayed_index < volume_rm_index
+
+
+@pytest.mark.asyncio
+async def test_finalize_during_scratch_removal_cleans_host_staging(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Requirement: cancelling staging at scratch rm drains cleanup and removes its host tree.
+    _backend, log = fake_docker
+    store = tmp_path / "store"
+    (store / "tree/main").mkdir(parents=True)
+    (store / "tree/main/file.txt").write_text("payload", encoding="utf-8")
+    marker = tmp_path / "scratch-removal-started"
+    monkeypatch.setenv("FAKE_DOCKER_DELAY_COMMAND", "rm -f conductor-stage-")
+    monkeypatch.setenv("FAKE_DOCKER_DELAY_MARKER", str(marker))
+    monkeypatch.setenv("FAKE_DOCKER_DELAY", "30")
+    backend = DockerRunnerBackend("docker")
+    lease = await _lease(backend, bundle=BundleRef("sha256:test", str(store)))
+    command = asyncio.create_task(
+        backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    )
+    for _ in range(300):
+        if marker.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert marker.exists()
+    source = next(row["argv"][2] for row in _records(log) if row["argv"][0] == "cp")
+    staging = Path(source.removesuffix("/."))
+    assert staging.exists()
+    await backend.finalize_run(lease, "cancelled")
+    with pytest.raises(asyncio.CancelledError):
+        await command
+    assert not staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancel_finalize_drains_resources_and_propagates(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: caller cancellation during finalization waits for owned cleanup, then propagates.
+    backend, _log = fake_docker
+    lease = await _lease(backend)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def delayed_resources(_lease: object) -> None:
+        entered.set()
+        await release.wait()
+        finished.set()
+
+    monkeypatch.setattr(backend, "_finalize_resources", delayed_resources)
+    task = asyncio.create_task(backend.finalize_run(lease, "cancelled"))
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert finished.is_set()
 
 
 @pytest.mark.asyncio
@@ -599,10 +1070,10 @@ async def test_engine_routes_docker_step_through_fake_cli(
     assert any(
         argv[0] == "cp" and argv[1] == "-a" and argv[3].endswith(":/workspace") for argv in commands
     )
-    # Requirement: the exec (non-scratch) container create carries the rendered
-    # command and args after the image reference.
+    # Requirement: the exec (non-scratch) create uses the rendered command as
+    # entrypoint, with only args after the image reference.
     create = next(
         argv for argv in commands if argv[0] == "create" and "--name" in argv and "echo" in argv
     )
-    assert create[-2:] == ["echo", "hello-from-container"]
+    assert create[-4:] == ["--entrypoint", "echo", "alpine:3.20", "hello-from-container"]
     assert any(argv[0] == "start" for argv in commands)

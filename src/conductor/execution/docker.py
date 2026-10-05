@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import cast
@@ -50,6 +50,7 @@ _WINDOWS_SHARING_DELAY_SECONDS = 0.05
 _WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 5.0
 _WINDOWS_SHARING_ERRORS = {errno.EACCES, errno.EPERM}
 _CONTAINER_NAME = re.compile(r"\A/?conductor-[A-Za-z0-9_-]+\Z")
+_ENV_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 _WINDOWS_PATH = re.compile(r"\A([A-Za-z]:|\\\\)")
 
 # Spike finding (see docs/design/docker-backend.md, "Spike Findings and
@@ -156,6 +157,23 @@ def _remove_tree_with_retry(path: Path) -> None:
             time.sleep(_WINDOWS_SHARING_DELAY_SECONDS * (attempt + 1))
 
 
+def _unlink_with_retry(path: Path) -> None:
+    # Windows may keep a short-lived handle on the env file after the Docker
+    # CLI exits (wrapper shims, indexers), so deletion follows the same
+    # bounded sharing-violation retry as the staging tree removal.
+    for attempt in range(_WINDOWS_SHARING_RETRIES):
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            sharing_violation = sys.platform == "win32" and exc.errno in _WINDOWS_SHARING_ERRORS
+            if not sharing_violation or attempt == _WINDOWS_SHARING_RETRIES - 1:
+                raise
+            time.sleep(_WINDOWS_SHARING_DELAY_SECONDS * (attempt + 1))
+
+
 def _resolve_symlink_within_root(source: Path, root: Path, target: str) -> str | None:
     """Resolve a link target lexically, returning None when it escapes root."""
     if os.path.isabs(target):
@@ -209,7 +227,7 @@ def _copy_tree_preserving_symlinks(
                 shutil.copy2(src, dst)
 
 
-def _map_working_dir(value: str | None) -> str:
+def _map_working_dir(value: str | None, root: str = "main") -> str:
     if value is None:
         return "/workspace"
     stripped = value.strip()
@@ -223,11 +241,10 @@ def _map_working_dir(value: str | None) -> str:
         raise ExecutionSpecError(f"working_dir must not be a Windows drive or UNC path: {value!r}")
     if posixpath.isabs(stripped):
         return stripped
-    mapped = posixpath.normpath(posixpath.join("/workspace/main", stripped))
-    if not mapped.startswith("/workspace/main/") and mapped != "/workspace/main":
-        raise ExecutionSpecError(
-            f"working_dir must not escape /workspace/main with '..': {value!r}"
-        )
+    base = posixpath.join("/workspace", root)
+    mapped = posixpath.normpath(posixpath.join(base, stripped))
+    if not mapped.startswith(f"{base}/") and mapped != base:
+        raise ExecutionSpecError(f"working_dir must not escape {base} with '..': {value!r}")
     return mapped
 
 
@@ -297,7 +314,6 @@ class DockerRunnerBackend:
         stdin_bytes: bytes | None = None,
         timeout: float | None = _AUXILIARY_TIMEOUT_SECONDS,
         diagnostics: Callable[[str], None] | None = None,
-        env: Mapping[str, str] | None = None,
     ) -> tuple[int, str, str]:
         """Run one Docker CLI command with bounded diagnostics and safe teardown."""
         binary = self._resolved_binary()
@@ -309,7 +325,7 @@ class DockerRunnerBackend:
             stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=dict(env) if env is not None else self._cli_env,
+            env=self._cli_env,
         )
         communicate_task = asyncio.create_task(process.communicate(input=stdin_bytes))
         try:
@@ -339,14 +355,27 @@ class DockerRunnerBackend:
         if object_type == "volume":
             argv.append("inspect")
         argv.extend(("--format", format_value, identifier))
-        rc, stdout, _stderr = await self._run_docker(argv)
+        rc, stdout, stderr = await self._run_docker(argv)
         if rc != 0:
-            return None
+            # Tolerate only an object-specific confirmed absence. A broad
+            # "no such" match would also swallow unrelated daemon errors such
+            # as "no such host" and misreport the object as missing.
+            if rc != _CLI_TIMEOUT_RC and f"no such {object_type}" in stderr.lower():
+                return None
+            raise _DockerFailure(
+                f"could not inspect Docker {object_type} {identifier}: {_bounded(stderr)}"
+            )
         try:
             labels = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None
-        return labels if isinstance(labels, dict) else None
+        except json.JSONDecodeError as exc:
+            raise _DockerFailure(
+                f"Docker {object_type} {identifier} returned malformed labels: {_bounded(stdout)}"
+            ) from exc
+        if not isinstance(labels, dict):
+            raise _DockerFailure(
+                f"Docker {object_type} {identifier} returned non-dict labels: {_bounded(stdout)}"
+            )
+        return labels
 
     async def _ensure_staged(
         self,
@@ -430,7 +459,15 @@ class DockerRunnerBackend:
             create_scratch.extend(("--platform", execution.platform))
         if execution.user is not None:
             create_scratch.extend(("--user", execution.user))
-        create_scratch.extend(("-v", f"{volume}:/workspace", execution.image))
+        create_scratch.extend(
+            (
+                "-v",
+                f"{volume}:/workspace",
+                "--entrypoint",
+                "/conductor-staging-placeholder",
+                execution.image,
+            )
+        )
         staging = Path(tempfile.mkdtemp(prefix=f"conductor-stage-{lease.lease_id[:8]}-"))
         try:
             self._build_staging_tree(bundle, staging)
@@ -447,23 +484,35 @@ class DockerRunnerBackend:
             if rc != 0:
                 raise _DockerFailure(f"docker cp staging failed: {_bounded(stderr)}")
         finally:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(self._run_docker(("rm", "-f", scratch)))
+
+            async def cleanup_staging() -> None:
+                try:
+                    with contextlib.suppress(Exception):
+                        await self._run_docker(("rm", "-f", scratch))
+                finally:
+                    try:
+                        _remove_tree_with_retry(staging)
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not remove Docker staging directory %s for run_id=%s: %s",
+                            staging,
+                            lease.lease_id,
+                            exc,
+                        )
+
+            cleanup_task = asyncio.create_task(cleanup_staging())
             try:
-                _remove_tree_with_retry(staging)
-            except OSError as exc:
-                logger.warning("Could not remove Docker staging directory %s: %s", staging, exc)
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
+                raise
 
     @staticmethod
     def _build_staging_tree(bundle: BundleRef, staging: Path) -> None:
         tree = Path(bundle.store_path) / "tree"
-        main = tree / "main"
-        if not main.is_dir():
-            raise ExecutionSpecError(f"bundle main tree does not exist: {main}")
-        _copy_tree_preserving_symlinks(main, staging / "main", allowed_root=tree)
-        roots = tree / "roots"
-        if roots.is_dir():
-            _copy_tree_preserving_symlinks(roots, staging / "roots", allowed_root=tree)
+        if not tree.is_dir():
+            raise ExecutionSpecError(f"bundle tree does not exist: {tree}")
+        _copy_tree_preserving_symlinks(tree, staging, allowed_root=tree)
 
     def _next_attempt(self, lease: WorkspaceLease) -> int:
         key = self._lease_key(lease)
@@ -477,7 +526,7 @@ class DockerRunnerBackend:
         # Linux env is case-sensitive; a spec.env key differing from a host
         # variable only by case replaces it here (see the Windows environment
         # case-semantics section of docs/design/docker-backend.md).
-        env = dict(snapshot)
+        env = dict(snapshot) if spec.inherit_control_environment else {}
         if sys.platform == "win32":
             overridden = {key.casefold() for key in spec.env}
             env = {key: value for key, value in env.items() if key.casefold() not in overridden}
@@ -485,11 +534,28 @@ class DockerRunnerBackend:
         return env
 
     @staticmethod
-    def _environment_names(spec: CommandSpec, snapshot: Mapping[str, str]) -> list[str]:
-        names = set(spec.env)
-        if spec.inherit_control_environment:
-            names.update(snapshot)
-        return sorted(names)
+    @contextlib.contextmanager
+    def _container_env_file(env: Mapping[str, str]) -> Iterator[str]:
+        for name, value in env.items():
+            if _ENV_NAME.fullmatch(name) is None:
+                raise ExecutionSpecError(f"invalid container environment variable name: {name}")
+            if "\0" in value or "\n" in value or "\r" in value:
+                raise ExecutionSpecError(f"invalid container environment variable value for {name}")
+        path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", prefix="conductor-env-", delete=False
+            ) as stream:
+                path = stream.name
+                for name, value in env.items():
+                    stream.write(f"{name}={value}\n")
+            yield path
+        finally:
+            if path is not None:
+                try:
+                    _unlink_with_retry(Path(path))
+                except OSError as exc:
+                    logger.warning("Could not remove Docker container env file %s: %s", path, exc)
 
     def _create_argv(
         self,
@@ -498,6 +564,7 @@ class DockerRunnerBackend:
         execution: ResolvedExecutionSpec,
         name: str,
         attempt: int,
+        env_file: str,
     ) -> list[str]:
         labels = self._labels(lease, "exec") | {
             "io.conductor.step": spec.name or spec.command,
@@ -527,12 +594,15 @@ class DockerRunnerBackend:
             if value is not None:
                 argv.extend((flag, value))
         argv.extend(("-v", f"{self._volume_name(lease)}:/workspace"))
-        argv.extend(("-w", _map_working_dir(spec.working_dir)))
-        for env_name in self._environment_names(spec, self._cli_env):
-            argv.extend(("--env", env_name))
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is None:
+            raise ExecutionSpecError("Docker lease was not prepared by this backend")
+        root = state.run.bundle.root if state.run.bundle is not None else "main"
+        argv.extend(("-w", _map_working_dir(spec.working_dir, root)))
+        argv.extend(("--env-file", env_file))
         if spec.stdin is not None:
             argv.append("--interactive")
-        argv.extend((execution.image, spec.command, *spec.args))
+        argv.extend(("--entrypoint", spec.command, execution.image, *spec.args))
         return argv
 
     async def run_command(
@@ -576,10 +646,10 @@ class DockerRunnerBackend:
                 await self._ensure_staged(lease, execution, diagnostics)
                 await self._ensure_image(execution, diagnostics)
                 create_env = self._create_environment(spec, self._cli_env)
-                rc, _stdout, stderr = await self._run_docker(
-                    self._create_argv(spec, lease, execution, name, attempt),
-                    env=create_env,
-                )
+                with self._container_env_file(create_env) as env_file:
+                    rc, _stdout, stderr = await self._run_docker(
+                        self._create_argv(spec, lease, execution, name, attempt, env_file)
+                    )
                 if rc != 0:
                     return self._start_failed(
                         name, self._version_hint(stderr) or _bounded(stderr), started_at
@@ -596,8 +666,16 @@ class DockerRunnerBackend:
                     diagnostics=diagnostics,
                 )
                 if start_rc == _CLI_TIMEOUT_RC:
-                    await self._cleanup_container(name, kill=True)
-                    created = False
+                    cleanup_task = asyncio.create_task(
+                        self._cleanup_container(lease, name, kill=True)
+                    )
+                    try:
+                        removed = await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
+                        created = not cleanup_task.result()
+                        raise
+                    created = not removed
                     return CommandResult(
                         outcome="timed_out",
                         resolved_command=spec.command,
@@ -629,7 +707,7 @@ class DockerRunnerBackend:
                     resolved_command=spec.command,
                     duration_seconds=time.monotonic() - started_at,
                 )
-            except _DockerFailure as exc:
+            except (_DockerFailure, ExecutionSpecError) as exc:
                 return self._start_failed(name, str(exc), started_at)
             except OSError as exc:
                 return self._start_failed(name, str(exc), started_at, exc)
@@ -637,15 +715,19 @@ class DockerRunnerBackend:
                 return self._start_failed(name, str(exc), started_at)
         except asyncio.CancelledError:
             cleanup_task = asyncio.create_task(
-                self._cleanup_container(name, kill=created or started)
+                self._cleanup_container(lease, name, kill=created or started)
             )
             await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
-            created = False
+            created = not cleanup_task.result()
             raise
         finally:
             if created:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await asyncio.shield(self._cleanup_container(name, kill=False))
+                cleanup_task = asyncio.create_task(self._cleanup_container(lease, name, kill=False))
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
+                    raise
 
     @staticmethod
     def _start_failed(
@@ -667,12 +749,36 @@ class DockerRunnerBackend:
             duration_seconds=time.monotonic() - started_at,
         )
 
-    async def _cleanup_container(self, name: str, *, kill: bool) -> None:
+    async def _cleanup_container(self, lease: WorkspaceLease, name: str, *, kill: bool) -> bool:
+        failures: list[str] = []
+        absent = False
         if kill:
-            with contextlib.suppress(Exception):
-                await self._run_docker(("kill", name))
-        with contextlib.suppress(Exception):
-            await self._run_docker(("rm", "-f", name))
+            try:
+                rc, _stdout, stderr = await self._run_docker(("kill", name))
+                if rc != 0:
+                    absent = rc != _CLI_TIMEOUT_RC and "no such container" in stderr.lower()
+                    if not absent:
+                        failures.append(f"kill: {_bounded(stderr)} (exit {rc})")
+            except Exception as exc:
+                failures.append(f"kill: {_bounded(str(exc))}")
+        try:
+            rc, _stdout, stderr = await self._run_docker(("rm", "-f", name))
+            removed = rc == 0 or (rc != _CLI_TIMEOUT_RC and "no such container" in stderr.lower())
+            if not removed:
+                failures.append(f"rm -f: {_bounded(stderr)} (exit {rc})")
+        except Exception as exc:
+            removed = False
+            failures.append(f"rm -f: {_bounded(str(exc))}")
+        if not removed and not absent:
+            logger.warning(
+                "Docker cleanup unconfirmed for run_id=%s container=%s: %s. "
+                "Manual cleanup: docker rm -f %s",
+                lease.lease_id,
+                name,
+                _bounded("; ".join(failures)),
+                name,
+            )
+        return removed or absent
 
     async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
         """Fail-closed cleanup of containers and the run-scoped workspace volume."""
@@ -680,11 +786,26 @@ class DockerRunnerBackend:
         key = self._lease_key(lease)
         self._closed_leases.add(key)
         task = self._staged.pop(key, None)
+        caller = asyncio.current_task()
+        cancelling_before = caller.cancelling() if caller is not None else 0
         if task is not None and not task.done():
             task.cancel()
             await _await_task_cleanup(cast(asyncio.Task[object], task))
+        cancelled = caller is not None and caller.cancelling() > cancelling_before
         self._attempts.pop(key, None)
         self._lease_states.pop(key, None)
+        cleanup_task = asyncio.create_task(self._finalize_resources(lease))
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
+            cancelled = True
+        except Exception as exc:
+            self._warn_cleanup(lease, str(exc))
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _finalize_resources(self, lease: WorkspaceLease) -> None:
         try:
             rc, stdout, stderr = await self._run_docker(
                 (
@@ -702,7 +823,7 @@ class DockerRunnerBackend:
                 for candidate in stdout.split():
                     await self._finalize_container(lease, candidate)
             await self._finalize_volume(lease)
-        except (Exception, asyncio.CancelledError) as exc:
+        except Exception as exc:
             self._warn_cleanup(lease, str(exc))
 
     async def _finalize_container(self, lease: WorkspaceLease, candidate: str) -> None:
@@ -710,7 +831,7 @@ class DockerRunnerBackend:
             ("inspect", "--format", "{{json .}}", candidate)
         )
         if rc != 0:
-            if "no such" not in stderr.lower():
+            if "no such container" not in stderr.lower():
                 self._warn_cleanup(
                     lease, f"could not inspect container {candidate}: {_bounded(stderr)}"
                 )
@@ -731,12 +852,16 @@ class DockerRunnerBackend:
             self._warn_cleanup(lease, f"container {candidate} failed label/name verification")
             return
         rc, _stdout, stderr = await self._run_docker(("rm", "-f", candidate))
-        if rc != 0 and "no such" not in stderr.lower():
+        if rc != 0 and "no such container" not in stderr.lower():
             self._warn_cleanup(lease, f"could not remove container {candidate}: {_bounded(stderr)}")
 
     async def _finalize_volume(self, lease: WorkspaceLease) -> None:
         volume = self._volume_name(lease)
-        labels = await self._inspect_labels("volume", volume)
+        try:
+            labels = await self._inspect_labels("volume", volume)
+        except _DockerFailure as exc:
+            self._warn_cleanup(lease, str(exc))
+            return
         if labels is None:
             return
         expected = self._labels(lease, "workspace")
@@ -744,7 +869,7 @@ class DockerRunnerBackend:
             self._warn_cleanup(lease, f"volume {volume} failed label verification")
             return
         rc, _stdout, stderr = await self._run_docker(("volume", "rm", "-f", volume))
-        if rc != 0 and "no such" not in stderr.lower():
+        if rc != 0 and "no such volume" not in stderr.lower():
             self._warn_cleanup(lease, f"could not remove volume {volume}: {_bounded(stderr)}")
 
     @staticmethod

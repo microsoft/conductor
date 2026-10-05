@@ -466,6 +466,72 @@ async def test_e2e_digest_pinned_image_reproducibility(
 
 
 @pytest.mark.asyncio
+async def test_e2e_authored_command_overrides_image_entrypoint(
+    docker_daemon: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: an image ENTRYPOINT cannot turn the authored executable into its first arg.
+    del docker_daemon
+    image = _unique("entrypoint")
+    try:
+        rc, _stdout, stderr = await _docker(
+            "build",
+            "-t",
+            image,
+            "-",
+            stdin=f'FROM {PINNED_BUSYBOX}\nENTRYPOINT ["sh"]\n'.encode(),
+        )
+        assert rc == 0, stderr
+        result = await _run_docker_e2e(
+            tmp_path,
+            monkeypatch,
+            name="e2e-entrypoint",
+            image=image,
+            step_fields='command: sh\nargs: [-c, "echo ENTRYPOINT-OVERRIDDEN"]',
+        )
+        assert result["result"].strip() == "ENTRYPOINT-OVERRIDDEN"
+    finally:
+        await _docker("image", "rm", "-f", image)
+
+
+@pytest.mark.asyncio
+async def test_e2e_staging_image_without_command_defaults(
+    docker_daemon: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: staging works for images without CMD or ENTRYPOINT when a binary exists.
+    del docker_daemon
+    image = _unique("no-defaults")
+    try:
+        rc, _stdout, stderr = await _docker(
+            "build",
+            "-t",
+            image,
+            "-",
+            stdin=f"FROM {PINNED_BUSYBOX}\nENTRYPOINT []\nCMD []\n".encode(),
+        )
+        assert rc == 0, stderr
+        rc, stdout, stderr = await _docker(
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Entrypoint}}|{{json .Config.Cmd}}",
+            image,
+        )
+        assert rc == 0, stderr
+        entrypoint, command = stdout.strip().split("|")
+        assert entrypoint in {"null", "[]"} and command in {"null", "[]"}
+        result = await _run_docker_e2e(
+            tmp_path,
+            monkeypatch,
+            name="e2e-no-defaults",
+            image=image,
+            step_fields='command: sh\nargs: [-c, "echo NO-DEFAULTS-OK"]',
+        )
+        assert result["result"].strip() == "NO-DEFAULTS-OK"
+    finally:
+        await _docker("image", "rm", "-f", image)
+
+
+@pytest.mark.asyncio
 async def test_e2e_stdin_payload_reaches_container_command(
     docker_daemon: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

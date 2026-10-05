@@ -95,13 +95,14 @@ _OriginKind = Literal[
 
 @dataclass(frozen=True)
 class CollectedBundle:
-    """A bundle manifest, descriptor, and materialization payload."""
+    """A bundle manifest, descriptor, payload, and root directory relative to ``tree/``."""
 
     entries: tuple[BundleEntry, ...]
     manifest: BundleManifest
     descriptor: BundleDescriptor
     files: Mapping[str, bytes]
     links: Mapping[str, str]
+    root: str
 
 
 @dataclass(frozen=True)
@@ -216,12 +217,14 @@ class _Collector:
             incomplete=sorted(set(self.incomplete)),
             warnings=list(self.warnings),
         )
+        root_logical_path, _ = self._local_logical_path(self.root_workflow)
         return CollectedBundle(
             entries=ordered,
             manifest=manifest,
             descriptor=descriptor,
             files=MappingProxyType(dict(self.files)),
             links=MappingProxyType(dict(self.links)),
+            root=PurePosixPath(root_logical_path).parent.relative_to("tree").as_posix(),
         )
 
     def _walk_subworkflows(

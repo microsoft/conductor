@@ -41,12 +41,15 @@ class BundleRef:
     Attributes:
         digest: The full bundle content digest (e.g. ``"sha256:<hex>"``).
         store_path: Absolute host path to the published bundle directory in
-            the bundle store. Backends derive sub-trees (e.g. ``tree/main``
-            and ``tree/roots/``) from this root path.
+            the bundle store. Backends stage its entire ``tree/`` namespace.
+        root: Logical directory of the root workflow relative to ``tree/``
+            (e.g. ``main`` or ``registry/name/sha``). Defaults to ``main``
+            for existing callers.
     """
 
     digest: str
     store_path: str
+    root: str = "main"
 
 
 @dataclass(frozen=True)

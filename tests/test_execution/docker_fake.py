@@ -45,6 +45,11 @@ def _record(log_path: Path, argv: list[str], stdin: bytes) -> None:
         "env": dict(os.environ),
         "stdin": stdin.decode("utf-8", errors="replace"),
     }
+    if argv and argv[0] == "create" and "--env-file" in argv:
+        path = _option(argv, "--env-file")
+        assert path is not None
+        record["env_file_content"] = Path(path).read_text(encoding="utf-8")
+        record["env_file_mode"] = Path(path).stat().st_mode & 0o777
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record) + "\n")
 
@@ -85,6 +90,18 @@ def main() -> int:
         print(name)
         return 0
     if argv[:2] == ["volume", "inspect"]:
+        if scenario == "inspect-error":
+            print("Cannot connect to the Docker daemon", file=sys.stderr)
+            return 1
+        if scenario == "inspect-no-such-host":
+            print("lookup docker.example: no such host", file=sys.stderr)
+            return 1
+        if scenario == "inspect-malformed":
+            print("{invalid")
+            return 0
+        if scenario == "inspect-nondict":
+            print("null")
+            return 0
         name = argv[-1]
         labels = state["volumes"].get(name)
         if labels is None:
@@ -144,8 +161,14 @@ def main() -> int:
             print(name)
         return 0
     if argv and argv[0] == "kill":
+        if scenario == "termination-fails":
+            print("kill denied", file=sys.stderr)
+            return 1
         return 0
     if argv[:2] == ["rm", "-f"]:
+        if scenario == "termination-fails":
+            print("remove denied", file=sys.stderr)
+            return 1
         state["containers"].pop(argv[-1], None)
         _save(state_path, state)
         return 0

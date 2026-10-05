@@ -172,6 +172,7 @@ async def materialize_run_bundle(
     return BundleRef(
         digest=collected.manifest.bundle_digest,
         store_path=str(store_path),
+        root=collected.root,
     )
 
 

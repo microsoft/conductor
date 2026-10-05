@@ -204,6 +204,7 @@ class TestLocalDockerCommandResultParity:
             CommandSpec(
                 command="print",
                 args=("parity-payload",),
+                inherit_control_environment=False,
                 execution=ResolvedExecutionSpec(image="busybox:latest"),
                 name="step",
             ),
