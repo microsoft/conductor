@@ -43,19 +43,26 @@ The Docker runner backend uses a single named volume per workflow run:
 ```
 conductor-ws-<run_id>
   └── /workspace/
-        ├── main/        # Root workflow directory and co-located files
-        └── roots/       # Additional roots and cached dependencies
-              ├── 00/    # First additional root
-              └── ...
+        ├── <root>/      # Root workflow logical directory: main/ for a local
+        │                # workflow, registry/<registry>/<sha>/ for a
+        │                # registry-hosted root workflow
+        ├── roots/       # Additional declared roots
+        │     ├── 00/    # First additional root
+        │     └── ...
+        ├── registry/    # Registry-cached sub-workflows (per registry and sha)
+        ├── plugins/     # Collected plugin namespaces
+        └── skills/      # Collected skill namespaces
 ```
 
 ### Directory Layout
 
 Conductor stages the complete content-addressed bundle `tree/` into the named volume root `/workspace`.
 
-* `/workspace/main/`: Contains the root workflow file and assets relative to the workflow directory.
-* `/workspace/roots/<NN>/`: Contains external directories declared in `workflow.bundle.additional_roots` or cached registries and plugins.
-* **Symlink integrity**: The volume layout mirrors the content-addressed store `tree/` structure byte for byte. Relative symlinks pointing from `main/` to `../roots/<NN>/` resolve correctly inside the container without path translation.
+* `/workspace/<root>/`: The root workflow's logical bundle directory — `main/` for a local workflow, `registry/<registry>/<sha>/` for a registry-hosted root workflow. Contains the root workflow file and assets relative to the workflow directory.
+* `/workspace/roots/<NN>/`: Contains external directories declared in `workflow.bundle.additional_roots`.
+* `/workspace/registry/<registry>/<sha>/`: Registry-cached sub-workflows referenced by the root workflow.
+* `/workspace/plugins/`, `/workspace/skills/`: Plugin and skill namespaces collected into the bundle.
+* **Symlink integrity**: The volume layout mirrors the content-addressed store `tree/` structure byte for byte. Relative symlinks pointing from `<root>/` to `../roots/<NN>/` or a sibling namespace resolve correctly inside the container without path translation.
 
 ### Working Directory Resolution
 
@@ -64,7 +71,7 @@ Step working directories resolve against the container volume:
 | Value in YAML | Resolved Container Path | Behavior |
 |---|---|---|
 | `None` (omitted) | `/workspace` | Defaults to the workspace root. |
-| Relative path (e.g. `src`) | `/workspace/main/src` | Anchored inside `/workspace/main/`. Traversal escaping `main/` with `..` is rejected. |
+| Relative path (e.g. `src`) | `/workspace/<root>/src` | Anchored inside the root workflow's logical directory (`main/` for local workflows, `registry/<registry>/<sha>/` for registry-hosted roots). Traversal escaping `<root>/` with `..` is rejected. |
 | POSIX absolute path (e.g. `/app`) | `/app` | Passed verbatim to the container. |
 
 Windows drive letters, backslashes, and empty path strings are rejected during validation and preflight.
@@ -91,8 +98,12 @@ Conductor stages the run bundle before executing the first Docker step in a run.
    docker create --name conductor-stage-<run_id[:8]>-<uuid6> \
      --user <resolved_user> \
      -v conductor-ws-<run_id>:/workspace \
+     --entrypoint /conductor-staging-placeholder \
      <image>
    ```
+   The placeholder entrypoint is never executed (the scratch container is
+   removed without being started); it exists so images with no `CMD` or
+   `ENTRYPOINT` of their own are accepted by `docker create`.
 4. **Archive copy**: Conductor runs `docker cp -a <staged_tree>/. <container>:/workspace` to transfer files into the volume.
 5. **Scratch cleanup**: Conductor immediately removes the scratch container with `docker rm -f`.
 
@@ -200,13 +211,13 @@ The profile schema enforces these exclusions with strict Pydantic models (`extra
 ### Operator Trust and Credentials
 
 * **Docker group membership**: Access to the Docker daemon socket grants root-equivalent control over the host system.
-* **Secret injection hygiene**: Secrets are injected into containers via name-only `--env NAME` flags. Plaintext secret values never appear in container command-line arguments or process argv.
+* **Secret injection hygiene**: The effective container environment (declared `env:` overrides merged over the host snapshot only when the step inherits the control environment) is written to a protected temporary file (mode `0600` on POSIX) and passed to `docker create` via `--env-file`. The Docker CLI control environment stays identical for every invocation, so payload variables such as `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, or `HOME` can never redirect container creation to a different daemon or alter client configuration. Plaintext secret values never appear in command-line arguments, process argv, or log output, and the temporary file is removed once `create` completes. Names must match `[A-Za-z_][A-Za-z0-9_]*` and values must not contain NUL or newline characters — the env-file line format cannot represent them, and such entries are rejected before `create` names the variable (never its value).
 * **Inspect visibility**: Environment variables passed to containers are visible in `docker inspect` output to authorized daemon administrators.
 * **Volume quotas**: Enforcing disk storage quotas on `/workspace` named volumes is the responsibility of the host operator and storage driver.
 
 ### Windows Environment Variable Case Semantics
 
-Environment variable names are case-insensitive on a Windows host but case-sensitive inside the Linux container. When a script step's `env:` key differs from an inherited host variable only by case (for example `path` versus `PATH`), Conductor's environment overlay drops the host variable from the Docker CLI subprocess environment before applying the step's value, so the declared key deterministically wins the collision. Two consequences follow:
+Environment variable names are case-insensitive on a Windows host but case-sensitive inside the Linux container. When a script step's `env:` key differs from an inherited host variable only by case (for example `path` versus `PATH`), Conductor's environment overlay drops the host variable from the **container payload environment** (the content of the temporary `--env-file`) before applying the step's value, so the declared key deterministically wins the collision. The Docker CLI subprocess environment itself is never modified. Two consequences follow:
 
 * Both case variants can never reach the same container from a Windows host — the declared `env:` key replaces the host variable rather than coexisting with it the way the two names would inside the container.
 * The same workflow on a POSIX host forwards both variants independently, so a workflow relying on case-distinct variable names behaves differently across host platforms. Declare `env:` keys in the exact casing the container payload reads, and avoid case-only duplicates of host variables.
@@ -245,34 +256,90 @@ When a workflow run concludes (whether successfully, on failure, or upon cancell
 3. Conductor removes the named volume `conductor-ws-<run_id>`.
 4. Finalization is fail-closed: it verifies exact label matches and name prefixes before issuing removal commands.
 
+Cleanup is idempotent by `run_id` at three lifecycle levels: attached step cleanup,
+backend-native run finalization, and manual recovery of orphaned resources. Only
+the orphaned level needs an operator recipe; never sweep resources belonging to
+other runs on a shared daemon.
+
 ### Orphaned Resource Cleanup
 
-If a workflow process is killed abruptly with `SIGKILL`, Docker containers and volumes may remain on the daemon. Operators can clean up orphaned resources using Conductor labels:
+If a workflow process is killed abruptly with `SIGKILL`, running containers and
+the named workspace volume may remain. First confirm that this particular run
+has been abandoned and will not be resumed or finalized by a live process.
+While it is live, `conductor status --json` exposes its identifier under
+`running[].run_id` (alongside `workflow`, `pid`, and `event_log`); record that
+value in the CI job before the process exits. For an already-dead run, recover
+the identifier from its event log filename under `$TMPDIR/conductor/`:
+`conductor-<workflow_name>-<YYYYMMDD-HHMMSS>-<run_id>.events.jsonl`.
+Confirm the identifier against the intended run before setting `RUN_ID`; do
+not infer it from a list of unrelated runs. A resumed run may reuse the same
+identifier, so check that no resumed process still owns it.
+
+Set `RUN_ID` to that known, confirmed-abandoned identifier, then list, kill,
+and remove only its containers (including stopped scratch containers), remove
+its named volume explicitly, and verify that both are gone:
 
 ```bash
-# List orphaned Conductor containers
-docker ps -a --filter label=io.conductor.managed=true
+set -euo pipefail
+: "${RUN_ID:?Set RUN_ID to the confirmed-abandoned run id}"
+docker ps -a --filter label=io.conductor.managed=true \
+  --filter "label=io.conductor.run_id=${RUN_ID}"
+docker ps -q --filter label=io.conductor.managed=true \
+  --filter "label=io.conductor.run_id=${RUN_ID}" |
+  while IFS= read -r container; do docker kill "$container"; done
+docker ps -aq --filter label=io.conductor.managed=true \
+  --filter "label=io.conductor.run_id=${RUN_ID}" |
+  while IFS= read -r container; do docker rm -f "$container"; done
+if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
+  docker volume rm -f "conductor-ws-${RUN_ID}"
+fi
 
-# List orphaned Conductor volumes
-docker volume ls --filter label=io.conductor.managed=true
-
-# Remove all orphaned Conductor containers
-docker container prune --filter label=io.conductor.managed=true --force
-
-# Remove all orphaned Conductor volumes
-docker volume prune --filter label=io.conductor.managed=true --force
+# Both checks must succeed: no containers and no named workspace volume.
+test -z "$(docker ps -aq --filter label=io.conductor.managed=true \
+  --filter "label=io.conductor.run_id=${RUN_ID}")"
+if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
+  printf '%s\n' 'Workspace volume still exists' >&2
+  exit 1
+fi
 ```
+
+Do not substitute `docker container prune` or `docker volume prune` for this
+recipe: container prune removes only stopped containers, leaving a running
+orphan; on Docker API 1.42+, volume prune without `--all` removes only
+anonymous volumes, while this backend creates named workspace volumes.
+Label-wide `managed=true` removal and daemon-wide pruning can destroy OTHER
+Conductor runs' state on a shared daemon; use daemon-wide cleanup only on a
+dedicated, disposable daemon with no other runs.
 
 #### Sample CI Cleanup Step
 
-Add this step to your CI teardown workflow:
+Before teardown, save the job's `running[].run_id` from `conductor status
+--json` while its run record still exists: match the record to this job's
+workflow and PID rather than selecting the first entry on a shared runner.
+Persist the value as `CONFIRMED_ABANDONED_RUN_ID` only after confirming that
+the recorded run has terminated and will not be resumed; `if: always()` alone
+does not establish abandonment. Supply that variable to the step below.
 
 ```yaml
 - name: Clean up Conductor Docker resources
-  if: always()
+  if: env.CONFIRMED_ABANDONED_RUN_ID != ''
+  env:
+    RUN_ID: ${{ env.CONFIRMED_ABANDONED_RUN_ID }}
   run: |
-    docker ps -aq --filter label=io.conductor.managed=true | xargs -r docker rm -f
-    docker volume ls -q --filter label=io.conductor.managed=true | xargs -r docker volume rm -f
+    set -euo pipefail
+    : "${RUN_ID:?Missing confirmed-abandoned run id}"
+    docker ps -aq --filter label=io.conductor.managed=true \
+      --filter "label=io.conductor.run_id=${RUN_ID}" |
+      while IFS= read -r container; do docker rm -f "$container"; done
+    if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
+      docker volume rm -f "conductor-ws-${RUN_ID}"
+    fi
+    test -z "$(docker ps -aq --filter label=io.conductor.managed=true \
+      --filter "label=io.conductor.run_id=${RUN_ID}")"
+    if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
+      printf '%s\n' 'Workspace volume still exists' >&2
+      exit 1
+    fi
 ```
 
 ## Resume Semantics and Seeding Asymmetry
