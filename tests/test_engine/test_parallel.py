@@ -428,14 +428,18 @@ async def test_parallel_agents_execute_concurrently(mock_provider):
         output={"done": "true"},
     )
 
-    # Track execution timing
-    execution_times = []
+    # Requirement: parallel group members must run concurrently, so both
+    # executions have to reach the barrier before either one may finish. A
+    # sequential engine deadlocks here and hits the guard timeout instead of
+    # racing an arbitrary wall-clock budget on a loaded CI runner.
+    started: list[str] = []
+    both_started = asyncio.Event()
 
-    async def mock_execute_with_delay(agent, context, **kwargs):
-        start = asyncio.get_event_loop().time()
-        await asyncio.sleep(0.1)  # Simulate work
-        end = asyncio.get_event_loop().time()
-        execution_times.append((agent.name, start, end))
+    async def mock_execute_with_barrier(agent, context, **kwargs):
+        started.append(agent.name)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=10)
         return AgentOutput(
             content={"result": f"Result from {agent.name}"},
             raw_response={},
@@ -443,25 +447,13 @@ async def test_parallel_agents_execute_concurrently(mock_provider):
             tokens_used=100,
         )
 
-    mock_provider.execute.side_effect = mock_execute_with_delay
-
-    import time
-
-    overall_start = time.time()
+    mock_provider.execute.side_effect = mock_execute_with_barrier
 
     engine = WorkflowEngine(workflow, mock_provider)
     await engine.run({})
 
-    overall_end = time.time()
-    overall_duration = overall_end - overall_start
-
-    # If agents ran sequentially, it would take ~0.2s
-    # If parallel, it should take ~0.1s
-    # Allow some overhead, but should be much less than 0.2s
-    assert overall_duration < 0.18, "Agents should execute in parallel"
-
     # Verify both agents executed
-    assert len(execution_times) == 2
+    assert sorted(started) == ["agent1", "agent2"]
 
 
 @pytest.mark.asyncio
