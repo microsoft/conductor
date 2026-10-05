@@ -103,6 +103,7 @@ class TemplateRenderer:
         """Register custom filters on the Jinja2 environment."""
         env.filters["json"] = self._json_filter
         env.filters["default"] = self._default_filter
+        env.filters["fromjson"] = self._fromjson_filter
 
     @staticmethod
     def _json_filter(value: Any, indent: int = 2) -> str:
@@ -116,6 +117,36 @@ class TemplateRenderer:
             Formatted JSON string.
         """
         return json.dumps(value, indent=indent, default=str)
+
+    @staticmethod
+    def _fromjson_filter(value: Any) -> Any:  # noqa: ANN401
+        """Parse a JSON string into native data.
+
+        Inverse of the ``json`` filter: MCP step results and other JSON text
+        payloads (e.g. ``output.content[0].text``) can be parsed in templates
+        to build arguments for downstream steps.
+
+        Args:
+            value: JSON string to parse.
+
+        Returns:
+            The parsed JSON value (dict, list, str, int, float, bool, None).
+
+        Raises:
+            TemplateError: If the value is not a string or holds invalid JSON.
+        """
+        if not isinstance(value, str):
+            raise TemplateError(
+                f"fromjson filter expects a JSON string, got {type(value).__name__}",
+                suggestion="Apply fromjson to a text field such as output.content[0].text",
+            )
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise TemplateError(
+                f"fromjson filter received invalid JSON: {e}",
+                suggestion="Check that the source field holds a JSON document",
+            ) from e
 
     @staticmethod
     def _default_filter(value: Any, default: Any = "", boolean: bool = False) -> Any:
@@ -223,6 +254,15 @@ class TemplateRenderer:
                 suggestion="Check template syntax for Jinja2 compatibility",
                 template_string=template,
             ) from e
+        except TemplateError as e:
+            # A filter raised a TemplateError carrying its own specific
+            # suggestion (e.g. ``fromjson`` on non-string input or invalid
+            # JSON) — preserve that contract instead of burying it under the
+            # generic wrapper below. Attach the rendered template for context
+            # when the filter had none.
+            if e.template_string is None:
+                e.template_string = template
+            raise
         except Exception as e:
             raise TemplateError(
                 f"Template rendering failed: {e}",

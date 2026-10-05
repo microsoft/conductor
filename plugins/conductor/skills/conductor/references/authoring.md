@@ -1116,6 +1116,7 @@ Previous: {{ previous_agent.output.result }}
 {{ value | default("fallback") }}   # Default value
 {{ items | join(", ") }}            # Join array
 {{ data | json }}                   # JSON serialize
+{{ text | fromjson }}               # Parse a JSON string into native data
 ```
 
 ## Output Schema

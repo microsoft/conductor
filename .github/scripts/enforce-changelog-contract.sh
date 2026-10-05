@@ -8,6 +8,8 @@
 #
 # Environment:
 #   PR_LABELS       JSON array of the PR's label names, e.g. '["changelog-not-required"]'
+#   PR_AUTHOR_LOGIN pull request author's GitHub login, used to recognize
+#                   Dependabot-authored pull requests.
 #   BASE_REF        base branch name (e.g. "main"); diffs run against
 #                   "origin/$BASE_REF". Set CHANGELOG_BASE to a full ref to
 #                   override (the test harness uses this to point at a local
@@ -48,6 +50,7 @@ fail() {
 
 BASE="${CHANGELOG_BASE:-origin/${BASE_REF:?BASE_REF or CHANGELOG_BASE must be set}}"
 PR_LABELS="${PR_LABELS:-[]}"
+PR_AUTHOR_LOGIN="${PR_AUTHOR_LOGIN:-}"
 
 WORK_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/changelog-gate.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -157,8 +160,9 @@ else
   # FEATURE MODE: a regular feature/fix PR.
   echo "Feature mode: no version bump in pyproject.toml."
 
-  # A maintainer exemption waives both feature-mode requirements,
-  # but any fragments that are present must still be valid.
+  # A maintainer exemption waives both feature-mode requirements. Dependabot
+  # authorship waives only the fragment requirement; it still may not edit the
+  # compiled CHANGELOG.md. Fragment changes remain validated under either path.
   # GitHub label names are unique case-insensitively; match the same way so
   # a label created as e.g. 'Changelog-Not-Required' still waives.
   label_waived=0
@@ -166,20 +170,24 @@ else
     label_waived=1
     echo "Feature-mode requirements waived by the 'changelog-not-required' label."
   fi
+  fragment_waived="$label_waived"
+  if [ "$PR_AUTHOR_LOGIN" = "dependabot[bot]" ]; then
+    fragment_waived=1
+    echo "Changelog fragment requirement waived for a Dependabot-authored PR."
+  fi
 
-  # 1. CHANGELOG.md is compiled only at release time unless a
-  #    maintainer explicitly waived the requirement.
+  # 1. CHANGELOG.md is compiled only at release time unless a maintainer
+  #    explicitly waived the requirement.
   if [ "$label_waived" -eq 0 ] && grep -qx 'CHANGELOG.md' "$CHANGED_FILES"; then
     fail "Feature mode: CHANGELOG.md must not be edited in a feature/fix PR — it is compiled only during release preparation. Describe your change as a fragment instead: add changelog.d/+describe-your-change.added.md — or <issue>.added.md if you have an issue number. A maintainer may exempt this PR with the 'changelog-not-required' label. Contract: changelog.d/README.md"
   fi
 
-  # 2. At least one new fragment, unless a maintainer waived the
-  #    requirement. README.md is permanent contract documentation,
-  #    not a changelog fragment.
+  # 2. At least one new fragment, unless this PR is exempt. README.md is
+  #    permanent contract documentation, not a changelog fragment.
   NEW_FRAGMENTS_FILE="$WORK_DIR/new-fragments.txt"
   git diff --name-only --diff-filter=A "$BASE"...HEAD -- changelog.d/ ':(exclude)changelog.d/README.md' > "$NEW_FRAGMENTS_FILE" || true
   new_fragments=$(cat "$NEW_FRAGMENTS_FILE")
-  if [ -z "$new_fragments" ] && [ "$label_waived" -eq 0 ]; then
+  if [ -z "$new_fragments" ] && [ "$fragment_waived" -eq 0 ]; then
     fail "No changelog fragment found. Add one, e.g.: changelog.d/+describe-your-change.added.md — or <issue>.added.md if you have an issue number (categories: added|fixed|changed|removed). Contract: changelog.d/README.md"
   fi
 

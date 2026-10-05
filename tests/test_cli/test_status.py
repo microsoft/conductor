@@ -21,6 +21,7 @@ terminates, never prunes" property above is unaffected by any of it.
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 from datetime import UTC, datetime
@@ -37,7 +38,13 @@ from conductor.cli.app import (
     _print_running_list,
     app,
 )
+from conductor.console import make_console
 from conductor.fleet.records import RunRecord, TerminalRunRecord
+
+# ``conductor.cli.__init__`` binds the name ``app`` to the Typer instance, so
+# a plain ``import conductor.cli.app as _app_module`` resolves to that instead
+# of the module; importlib returns the module itself.
+_app_module = importlib.import_module("conductor.cli.app")
 
 runner = CliRunner()
 
@@ -800,6 +807,16 @@ def _terminal(**overrides: object) -> TerminalRunRecord:
 
 class TestTerminalCostCellBilling:
     """Exact strings the ``status`` cost cell renders for each billing state."""
+
+    @pytest.fixture(autouse=True)
+    def _fixed_width(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The CLI's console is a module-level global, so it takes its width at
+        # import time and a per-invocation COLUMNS override cannot reach it
+        # (in the observed xdist environment the worker starts with COLUMNS=80,
+        # which folds the billing label mid-cell regardless of the env= on the
+        # invoke). Pin the width explicitly, as test_markup_injection.py and
+        # test_doctor.py already do.
+        monkeypatch.setattr(_app_module, "console", make_console(stderr=True, width=200))
 
     @pytest.mark.parametrize(
         ("billing", "unpriced", "expected"),

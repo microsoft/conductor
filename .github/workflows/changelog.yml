@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "latest"
           enable-cache: true
@@ -54,5 +54,8 @@ jobs:
         env:
           # Labels arrive as a JSON array, e.g. ["changelog-not-required"].
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Author identity covers security updates that may not have a matching
+          # dependabot.yml entry from which to inherit an exemption label.
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
           BASE_REF: ${{ github.base_ref }}
         run: bash .github/scripts/enforce-changelog-contract.sh

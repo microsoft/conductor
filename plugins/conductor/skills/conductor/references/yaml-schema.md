@@ -763,6 +763,7 @@ output:
 {{ value | length }}                # Length
 {{ value | join(", ") }}            # Join array
 {{ value | json }}                  # JSON serialize
+{{ value | fromjson }}              # Parse a JSON string into native data
 ```
 
 ## Route Conditions
