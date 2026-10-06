@@ -11,6 +11,34 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.42] - 2026-10-06
+
+### Added
+
+- **Template filter `fromjson`**: added a `fromjson` Jinja filter that parses
+  JSON text into native values, the inverse of the existing `json` filter. MCP
+  step results (for example `output.content[0].text`) can now be parsed inside
+  templates to build arguments for downstream steps. (#579)
+- **Docker execution backend for containerized script steps**: executes `type: script`
+  workflow steps inside short-lived containers against a run-scoped shared named
+  volume (`conductor-ws-<run_id>`). Execution environment documents declare `docker`
+  profiles with configurable container image, target platform, network mode,
+  container user, init process, read-only root filesystem, Linux capability drops,
+  privilege escalation blocks, memory-backed `/tmp` tmpfs mounts, and CPU, memory,
+  and PID resource constraints. Conductor automatically collects the workflow's
+  content-addressed run bundle closure and stages it into the shared volume before
+  execution, isolating script steps while preserving shared workspace state across
+  steps within the run. (#584)
+- Opt-in live-validation harness and operator runbook for Claude subscription
+  billing mode. (#586)
+
+### Changed
+
+- **Dependabot-authored pull requests no longer require changelog fragments**:
+  the check recognizes Dependabot from the pull request author while continuing
+  to reject direct `CHANGELOG.md` edits and validate any fragment changes. (#578)
+
+
 ## [0.1.41] - 2026-09-29
 
 ### Added
