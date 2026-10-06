@@ -225,12 +225,19 @@ async def test_container_environment_without_inheritance(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("variable", "value"),
-    [("BAD-NAME", "secret"), ("TOKEN", "secret\nsecond-line"), ("TOKEN", "secret\x00tail")],
+    [
+        ("BAD=NAME", "secret"),
+        ("#COMMENTED", "secret"),
+        ("BAD\nNAME", "secret"),
+        ("TOKEN", "secret\nsecond-line"),
+        ("TOKEN", "secret\x00tail"),
+    ],
 )
 async def test_invalid_container_environment_fails_without_disclosing_value(
     fake_docker: tuple[DockerRunnerBackend, Path], variable: str, value: str
 ) -> None:
-    # Requirement: unrepresentable env-file entries fail before create without leaking values.
+    # Requirement: env-file entries the line format cannot represent fail before
+    # create without leaking values.
     backend, log = fake_docker
     lease = await _lease(backend)
     result = await backend.run_command(
@@ -244,9 +251,28 @@ async def test_invalid_container_environment_fails_without_disclosing_value(
     )
     assert result.outcome == "start_failed"
     assert result.start_error is not None
-    assert variable in result.start_error.message
+    assert variable.split("\n")[0].split("=")[0] in result.start_error.message
     assert "secret" not in result.start_error.message
     assert not any(row["argv"][0] == "create" for row in _records(log))
+
+
+@pytest.mark.asyncio
+async def test_representable_non_identifier_names_pass_to_env_file(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: env names the env-file line format can represent (e.g. the
+    # Windows host's "CommonProgramFiles(x86)") reach the container through the
+    # inherited host snapshot even though they are not shell identifiers.
+    _backend, log = fake_docker
+    # The backend snapshots os.environ at construction, so the variable must be
+    # set before the backend is built — the same pattern as the scenario tests below.
+    monkeypatch.setenv("CommonProgramFiles(x86)", r"C:\Program Files (x86)")
+    backend = DockerRunnerBackend("docker")
+    lease = await _lease(backend)
+    result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    assert result.outcome == "completed"
+    create = next(row for row in _records(log) if row["argv"][0] == "create")
+    assert "CommonProgramFiles(x86)=C:\\Program Files (x86)\n" in create["env_file_content"]
 
 
 @pytest.mark.asyncio

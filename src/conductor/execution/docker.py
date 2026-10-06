@@ -50,7 +50,16 @@ _WINDOWS_SHARING_DELAY_SECONDS = 0.05
 _WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 5.0
 _WINDOWS_SHARING_ERRORS = {errno.EACCES, errno.EPERM}
 _CONTAINER_NAME = re.compile(r"\A/?conductor-[A-Za-z0-9_-]+\Z")
-_ENV_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+# The env-file line format is KEY=VALUE split on the first "="; a line whose
+# name starts with '#' is treated as a comment by Docker's parser and silently
+# dropped. The only names and values the format cannot represent are therefore
+# an empty name, a name containing "=", a line break, or NUL, or starting with
+# '#', and a value containing a line break or NUL. Windows hosts set variables
+# such as "CommonProgramFiles(x86)" whose names are not shell identifiers but
+# are perfectly representable (and valid in a Linux container env), so
+# validating shell-identifier shape here would reject the inherited host
+# snapshot on every Windows run.
+_ENV_NAME_FORBIDDEN = re.compile(r"[=\n\r\0]")
 _WINDOWS_PATH = re.compile(r"\A([A-Za-z]:|\\\\)")
 
 # Spike finding (see docs/design/docker-backend.md, "Spike Findings and
@@ -537,7 +546,7 @@ class DockerRunnerBackend:
     @contextlib.contextmanager
     def _container_env_file(env: Mapping[str, str]) -> Iterator[str]:
         for name, value in env.items():
-            if _ENV_NAME.fullmatch(name) is None:
+            if not name or name.startswith("#") or _ENV_NAME_FORBIDDEN.search(name) is not None:
                 raise ExecutionSpecError(f"invalid container environment variable name: {name}")
             if "\0" in value or "\n" in value or "\r" in value:
                 raise ExecutionSpecError(f"invalid container environment variable value for {name}")

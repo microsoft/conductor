@@ -211,7 +211,7 @@ The profile schema enforces these exclusions with strict Pydantic models (`extra
 ### Operator Trust and Credentials
 
 * **Docker group membership**: Access to the Docker daemon socket grants root-equivalent control over the host system.
-* **Secret injection hygiene**: The effective container environment (declared `env:` overrides merged over the host snapshot only when the step inherits the control environment) is written to a protected temporary file (mode `0600` on POSIX) and passed to `docker create` via `--env-file`. The Docker CLI control environment stays identical for every invocation, so payload variables such as `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, or `HOME` can never redirect container creation to a different daemon or alter client configuration. Plaintext secret values never appear in command-line arguments, process argv, or log output, and the temporary file is removed once `create` completes. Names must match `[A-Za-z_][A-Za-z0-9_]*` and values must not contain NUL or newline characters — the env-file line format cannot represent them, and such entries are rejected before `create` names the variable (never its value).
+* **Secret injection hygiene**: The effective container environment (declared `env:` overrides merged over the host snapshot only when the step inherits the control environment) is written to a protected temporary file (mode `0600` on POSIX) and passed to `docker create` via `--env-file`. The Docker CLI control environment stays identical for every invocation, so payload variables such as `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, or `HOME` can never redirect container creation to a different daemon or alter client configuration. Plaintext secret values never appear in command-line arguments, process argv, or log output, and the temporary file is removed once `create` completes. Names must not be empty, must not contain `=`, a line break, or NUL, and must not start with `#` (which Docker's env-file parser treats as a comment and silently drops); values must not contain NUL or a line break. These are exactly the entries the env-file line format cannot represent, and they are rejected before `create` names the variable (never its value). Names outside the shell-identifier shape — including host variables every Windows machine sets, such as `CommonProgramFiles(x86)` — are representable and pass through to the container unchanged.
 * **Inspect visibility**: Environment variables passed to containers are visible in `docker inspect` output to authorized daemon administrators.
 * **Volume quotas**: Enforcing disk storage quotas on `/workspace` named volumes is the responsibility of the host operator and storage driver.
 
@@ -322,7 +322,7 @@ does not establish abandonment. Supply that variable to the step below.
 
 ```yaml
 - name: Clean up Conductor Docker resources
-  if: env.CONFIRMED_ABANDONED_RUN_ID != ''
+  if: always() && env.CONFIRMED_ABANDONED_RUN_ID != ''
   env:
     RUN_ID: ${{ env.CONFIRMED_ABANDONED_RUN_ID }}
   run: |
