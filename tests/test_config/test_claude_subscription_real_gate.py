@@ -12776,8 +12776,7 @@ class TestRunbookStatements:
         assert RUNBOOK_STATUS_STATEMENT in text  # the complete contract is pinned in H14
 
     def test_the_changelog_describes_a_harness_not_a_validation_that_ran(self) -> None:
-        fragment = REPO_ROOT / "changelog.d" / "+claude-agent-sdk-subscription-validation.added.md"
-        text = fragment.read_text(encoding="utf-8")
+        text = subscription_changelog_text()
         assert len(text.strip().split("\n\n")) == 1  # one concise entry, wrapped
         assert max(len(line) for line in text.splitlines()) <= 80
         assert text.startswith("Opt-in live-validation harness and operator runbook")
@@ -17253,6 +17252,7 @@ EXAMPLE_FILE = REPO_ROOT / "examples" / "claude-agent-sdk-subscription.yaml"
 CHANGELOG_FRAGMENT = (
     REPO_ROOT / "changelog.d" / "+claude-agent-sdk-subscription-validation.added.md"
 )
+CHANGELOG_PATH = REPO_ROOT / "CHANGELOG.md"
 POST_EVIDENCE_CLAUSE = (
     "This detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence; a prior "
     "readiness-plus-inference run observed a first-party subscription login and subscription "
@@ -17288,6 +17288,48 @@ NOTHING_PUSHED_SENTENCE = (
 PRECEDENCE_SENTENCE = "Auto-mode credential precedence is unproven and out of scope."
 
 
+def subscription_changelog_text(
+    fragment_path: Path = CHANGELOG_FRAGMENT,
+    changelog_path: Path = CHANGELOG_PATH,
+) -> str:
+    """Read the entry before or after towncrier consumes its fragment."""
+    if fragment_path.is_file():
+        return fragment_path.read_text(encoding="utf-8")
+
+    lines = changelog_path.read_text(encoding="utf-8").splitlines()
+    prefix = "- Opt-in live-validation harness and operator runbook"
+    for index, line in enumerate(lines):
+        if not line.startswith(prefix):
+            continue
+        entry = [line.removeprefix("- ")]
+        for continuation in lines[index + 1 :]:
+            if not continuation.startswith("  "):
+                break
+            entry.append(continuation.removeprefix("  "))
+        return "\n".join(entry)
+    raise AssertionError("Claude subscription validation changelog entry is missing")
+
+
+def test_subscription_changelog_text_after_towncrier_consumes_fragment(tmp_path: Path) -> None:
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        "## 0.1.42\n\n"
+        "- Opt-in live-validation harness and operator runbook for the Claude Agent SDK\n"
+        "  subscription billing mode. (#586)\n",
+        encoding="utf-8",
+    )
+
+    text = subscription_changelog_text(
+        fragment_path=tmp_path / "consumed.added.md",
+        changelog_path=changelog,
+    )
+
+    assert text == (
+        "Opt-in live-validation harness and operator runbook for the Claude Agent SDK\n"
+        "subscription billing mode. (#586)"
+    )
+
+
 def status_table_rows(text: str) -> list[list[str]]:
     """The rows of the first table after the ``## Status table`` heading."""
     after = text.split("## Status table", 1)[1]
@@ -17306,7 +17348,7 @@ def user_facing_texts() -> dict[str, str]:
         "runbook": RUNBOOK_PATH.read_text(encoding="utf-8"),
         "experimental": EXPERIMENTAL_PATH.read_text(encoding="utf-8"),
         "example": EXAMPLE_FILE.read_text(encoding="utf-8"),
-        "changelog": CHANGELOG_FRAGMENT.read_text(encoding="utf-8"),
+        "changelog": subscription_changelog_text(),
         "docstring": lm.__doc__ or "",
     }
 
