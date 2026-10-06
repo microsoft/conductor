@@ -272,7 +272,10 @@ async def test_representable_non_identifier_names_pass_to_env_file(
     result = await backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
     assert result.outcome == "completed"
     create = next(row for row in _records(log) if row["argv"][0] == "create")
-    assert "CommonProgramFiles(x86)=C:\\Program Files (x86)\n" in create["env_file_content"]
+    # The host env is case-insensitive on Windows: os.environ may hand the
+    # snapshot back in a different case, so compare the whole line case-insensitively.
+    lines = {line.casefold() for line in create["env_file_content"].splitlines()}
+    assert r"commonprogramfiles(x86)=c:\program files (x86)" in lines
 
 
 @pytest.mark.asyncio
