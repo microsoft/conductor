@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conductor.plugins.errors import PluginNotFoundError, PluginSourceError
+from conductor.plugins.manifest import is_plugin_root
 from conductor.plugins.marketplace import find_marketplace_manifest, read_marketplace
 
 from .conftest import make_marketplace, make_plugin
@@ -430,3 +431,24 @@ class TestDualCatalogFlavorResolution:
         marketplace = read_marketplace(tmp_path, name="acme", plugin="solo")
 
         assert marketplace.plugins == {"solo": tmp_path / "dist" / "copilot" / "solo"}
+
+
+class TestShippedMarketplace:
+    """The marketplace this repository ships to Claude Code must install."""
+
+    def test_claude_catalog_sources_exist_under_the_repo_root(self) -> None:
+        # Claude Code resolves a relative `source` from the marketplace root
+        # (the directory holding `.claude-plugin/`) and ignores
+        # `metadata.pluginRoot` for a `./` path, so a source written relative
+        # to `pluginRoot` fails at install time with "Source path does not
+        # exist" (issue #587).
+        repo_root = Path(__file__).resolve().parents[2]
+        catalog = json.loads(
+            (repo_root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+        )
+
+        assert catalog["plugins"]
+        for entry in catalog["plugins"]:
+            source = entry["source"]
+            assert isinstance(source, str) and source.startswith("./"), entry["name"]
+            assert is_plugin_root(repo_root / source), f"{entry['name']}: {source}"

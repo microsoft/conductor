@@ -7,13 +7,10 @@
     "name": "Microsoft",
     "email": "opensource@microsoft.com"
   },
-  "metadata": {
-    "pluginRoot": "./plugins"
-  },
   "plugins": [
     {
       "name": "conductor",
-      "source": "./conductor",
+      "source": "./plugins/conductor",
       "description": "Validate, run, and execute Conductor multi-agent YAML workflows. Adds the conductor skill that knows the workflow schema, CLI commands, and execution model.",
       "author": { "name": "Microsoft" },
       "homepage": "https://github.com/microsoft/conductor",
