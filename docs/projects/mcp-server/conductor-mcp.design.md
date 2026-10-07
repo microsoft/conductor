@@ -322,8 +322,9 @@ independent of building a server — see DD0 for the empirical result.
    a registry is large.
 8. **G8** — Every exposed workflow is pinned to an immutable identity at
    session start, and drift is reported rather than silently applied.
-9. **G9** — Server startup does not depend on the network when the registry
-   cache is warm.
+9. **G9** — A warm registry cache supports an explicitly cache-only build
+   without network access and a fallback for failed online ref resolution;
+   normal server startup checks floating defaults online (issue #595).
 10. **G10** — Every governance control a workflow author declared still applies
     when the caller is a model: gates gate, budgets cap, schemas validate. The
     server adds a caller, not an exemption.
@@ -377,7 +378,7 @@ independent of building a server — see DD0 for the empirical result.
 
 | ID | Requirement |
 |---|---|
-| NFR1 | Cold-start to first `tools/list` response ≤ 2s with a warm registry cache, with **zero network I/O**. |
+| NFR1 | Cold-start to first `tools/list` response ≤ 2s with a warm registry cache in an explicitly cache-only build, with **zero network I/O**. **Issue #595 amendment:** ordinary online server startup re-resolves each GitHub registry's floating default ref even with a warm cache; this network resolution is outside the schema-resolution deadline. On resolution failure, a recorded SHA provides a cached fallback. |
 | NFR2 | A workflow whose schema cannot be resolved is exposed with a permissive schema and a description saying so — never silently dropped. |
 | NFR3 | No tool **accepts** a filesystem path, URL, or registry source as a parameter. (Returning a path *outward*, as DD12's `resource_link`s do, is the opposite direction and is not constrained by this rule.) |
 | NFR4 | Any YAML-authored text reaching a tool `description` is sanitized and length-capped. |
@@ -479,7 +480,10 @@ achievable:
 2. **SHA-keyed parse cache** — a parsed, normalized tool definition stored
    beside the existing mirror under
    `$CONDUCTOR_HOME/cache/registries/<registry>/_meta/<sha[:12]>/`. A SHA-keyed
-   entry is immutable, so a warm cache makes startup a no-network operation.
+   entry is immutable, so a warm cache avoids re-parsing or fetching at the
+   selected SHA. Online startup still checks the default ref first; explicitly
+   cache-only catalogue builds use the recorded pointer with no network I/O
+   (issue #595).
    This reuses `registry/cache.py`'s existing layout, sentinel convention, and
    `CACHE_LAYOUT_VERSION` invalidation rather than inventing a second cache.
 3. **Fetch and parse**, under a startup deadline. On failure — including the
@@ -1449,8 +1453,11 @@ terminal record alongside its event log, DD13), `registry/index.py` and
   them.
 
 **Performance.** Startup is the sensitive path (hosts respawn stdio servers
-aggressively). Warm cache: local reads only, no network (NFR1). Cold cache: one
-index fetch plus one fetch per unresolved workflow, under a deadline, with
+aggressively). A warm cache permits zero-network explicitly cache-only builds,
+and supplies a fallback when online default-ref resolution fails; ordinary
+online startup still resolves the default branch before reusing any SHA-keyed
+index or schema cache (issue #595). Cold cache: one index fetch plus one fetch
+per unresolved workflow, with a deadline for schema resolution and
 degraded-schema fallback. Per-invocation cost is one process fork plus the
 existing three-stage health gate — the same cost `conductor run --web-bg`
 already pays. `conductor_run_status` on a live run is a bounded tail read of
