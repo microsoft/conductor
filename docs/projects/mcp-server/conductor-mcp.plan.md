@@ -73,7 +73,7 @@ and test churn are accepted. Consequences propagated:
 **R2 — A floating registry ref resolves offline through a
 `_meta/_refs/<ref-slug>.json` pointer in `registry/cache.py`.** *(affects E5)*
 
-NFR1 ("zero network I/O" to first `tools/list` on a warm cache) and DD6 (every
+NFR1 ("zero network I/O" in explicitly cache-only builds on a warm cache) and DD6 (every
 exposed workflow pinned to an immutable identity) were **unsatisfiable together**
 against the current code. Verified: `registry/cache.py` keys everything by SHA
 (`_meta/<sha[:12]>/`), and the only way to learn what a floating ref (`latest`,
@@ -88,8 +88,11 @@ fallback has a checkout to choose (`AGENTS.md`, *Git-backed plugin sources*:
 "without a record of what a floating ref last meant, the offline fallback has no
 checkout to choose"). The registry cache gains the same shape, written on every
 successful online resolution and read when a caller declares the network
-off-limits. Startup is then genuinely zero-network on a warm cache, and DD6's
-interval drift re-check is what refreshes the pointer.
+off-limits. **Issue #595 amendment:** explicitly cache-only builds are
+zero-network on a warm cache; ordinary online startup re-resolves the default
+branch and refreshes the pointer on success. Resolution failure falls back to
+the recorded SHA. Interval drift checks only report drift; they do not refresh
+the pointer or mutate an existing catalogue.
 
 ---
 
@@ -190,7 +193,8 @@ about run state: an offline-answerable registry, and a typed `mcp:` block.
 **Exit criteria**
 - [ ] A warm registry cache answers "what is this workflow's `input:` and
       `mcp:` block, at what SHA" with **zero** network calls, proven by a test
-      that patches `registry/github.py` to raise on any call (NFR1, G9, R2).
+      that patches `registry/github.py` to raise on any call in an explicitly
+      cache-only build (NFR1, G9, R2); online startup checks the ref first.
 - [ ] A floating ref resolves offline through the `_meta/_refs/` pointer, and
       a cold cache still resolves online exactly as today (R2).
 - [ ] `workflow.mcp:` parses, validates, and is reported by `conductor
@@ -205,7 +209,8 @@ No protocol, no process launching — pure functions over the registry.
 
 **Exit criteria**
 - [ ] `build_catalogue(...)` returns an immutable catalogue from a fixture
-      registry in under 2s with the network patched to raise (NFR1).
+      registry in under 2s with the network patched to raise and
+      `allow_network=False` (NFR1); default online startup re-resolves refs.
 - [ ] The four-rung exposure ladder (`--deny` > `--allow` > `mcp.expose` >
       default-on) is exercised in every ordering that distinguishes the rungs
       (FR2, DD4).
@@ -511,9 +516,9 @@ single-forward-pass constraint is untouched.
 
 ### E5 — Registry index fields, offline ref pointer, and parse cache (P4, NFR1, G9, R2) — DONE (completed 2026-08-22)
 
-**Goal.** Make the catalogue answerable from a warm cache with zero network
-I/O — the three-tier schema ladder's first two tiers (*Key Components → 1*) —
-and close the NFR1/DD6 conflict R2 resolves.
+**Goal.** Make an explicitly cache-only catalogue answerable from a warm cache
+with zero network I/O — the three-tier schema ladder's first two tiers
+(*Key Components → 1*) — and close the NFR1/DD6 conflict R2 resolves.
 
 **Prerequisites.** E6 (for `McpConfig`, which E5-T1 imports); otherwise
 independent of E1–E4.
@@ -536,7 +541,7 @@ API, so a floating ref cannot be resolved offline — the gap R2 closes.
 | E5-T5 | TEST | Index round-trip with and without the new fields; an old index loads unchanged; a new index loads on a build that ignores the fields. Ref pointer write/read, slug safety, and atomicity. Parse-cache hit avoids re-parse; `CACHE_LAYOUT_VERSION` bump invalidates. **The load-bearing test:** with every function in `registry/github.py` patched to raise, a warm cache still resolves a GitHub registry's workflows to schemas and SHAs (NFR1, G9, R2). | `tests/test_registry/test_index.py`, `tests/test_registry/test_cache.py` | DONE |
 
 **Acceptance criteria**
-- [x] A warm cache answers "input schema + `mcp:` block + pinned SHA" for every workflow with the network patched to raise, including for a floating ref.
+- [x] An explicitly cache-only build answers "input schema + `mcp:` block + pinned SHA" from a warm cache with the network patched to raise, including for a floating ref. Ordinary online startup re-resolves that ref first (issue #595).
 - [x] Existing registries and indexes work unchanged.
 - [x] A cold cache still resolves online exactly as today, and writes the pointer as a side effect.
 
@@ -603,11 +608,12 @@ process launching.
 | E7-T6 | IMPL | `build_catalogue(...)`: enumerate → filter by the four-rung ladder (`--deny` > `--allow` > `mcp.expose` > default-on, with `--registry` selecting the candidate set one level above it) → resolve schemas through the three-tier ladder under a startup deadline → pin → sanitize → qualify collisions → decide direct-tools vs discovery. Return an immutable `Catalogue`. Reject a workflow whose `input:` collides with `_wait_seconds`, logging the reason per FR10. On any parse failure — including the `${VAR}`-missing and parent-directory `!file` cases from P4 — expose with `{"type": "object"}` and an explanatory description (NFR2). | `src/conductor/mcp/serve/catalogue.py` | DONE |
 | E7-T7 | TEST | Naming and sanitizing: slug charset and length, prefixing, both-sides collision qualification, control-character stripping, length cap. | `tests/test_mcp/test_serve_naming.py` | DONE |
 | E7-T8 | TEST | Tool generation: all five input types; `required`/`default`/`description` survive; `_wait_seconds` present and documented; no `outputSchema`; a workflow declaring `_wait_seconds` is rejected. | `tests/test_mcp/test_serve_toolgen.py` | DONE |
-| E7-T9 | TEST | Catalogue: every ladder ordering that distinguishes a rung (`--deny` beats `--allow`; `--allow` overrides `mcp.expose: false`; `--registry` excludes non-candidates entirely); the schema ladder's three tiers; NFR1 (network patched to raise, warm cache, under 2s); NFR2 for both parse-failure modes; the discovery threshold decision. | `tests/test_mcp/test_serve_catalogue.py` | DONE |
+| E7-T9 | TEST | Catalogue: every ladder ordering that distinguishes a rung (`--deny` beats `--allow`; `--allow` overrides `mcp.expose: false`; `--registry` excludes non-candidates entirely); the schema ladder's three tiers; NFR1 (network patched to raise, warm cache, `allow_network=False`, under 2s); NFR2 for both parse-failure modes; the discovery threshold decision. Online builds re-resolve floating defaults (issue #595). | `tests/test_mcp/test_serve_catalogue.py` | DONE |
 | E7-T10 | TEST | Pinning: SHA for GitHub, content hash for path, drift detected and reported without the catalogue changing. | `tests/test_mcp/test_serve_pinning.py` | DONE |
 
 **Acceptance criteria**
-- [x] A frozen catalogue is built from a fixture registry with zero network I/O.
+- [x] A frozen catalogue is built from a fixture registry with zero network I/O
+      in cache-only mode; ordinary online startup re-resolves floating refs.
 - [x] The exposure ladder behaves exactly as FR2 specifies in every distinguishing case.
 - [x] No workflow is ever silently dropped for an environmental reason.
 - [x] Two registries publishing one slug yield two qualified names.

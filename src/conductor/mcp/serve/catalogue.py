@@ -11,9 +11,9 @@ Pipeline, in order:
 1. Enumerate the registries selected by ``--registry`` (one level above
    the exposure ladder — a registry outside this set is never a
    candidate, full stop).
-2. For each registry, load its index — for a GitHub registry, through the
-   E5 offline-capable ref-pointer + SHA-keyed cache path, so a warm cache
-   never touches the network (NFR1).
+2. For each registry, load its index — online GitHub builds resolve the
+   current default ref before consulting the SHA-keyed cache; explicitly
+   cache-only builds use the recorded ref pointer without network I/O.
 3. Filter each workflow through the four-rung exposure ladder (``--deny``
    > ``--allow`` > ``mcp.expose`` > default-on, DD4).
 4. Resolve each surviving workflow's schema through the three-tier ladder
@@ -72,9 +72,9 @@ from conductor.registry.version_resolver import materialize_to_sha, resolve_ref
 
 logger = logging.getLogger(__name__)
 
-# NFR1: cold-start to first `tools/list` response <= 2s with a warm cache.
 # This bounds tier-3 (fetch-and-parse) attempts specifically -- a tier-1 or
-# tier-2 hit never reaches this check. A workflow whose tier-3 resolution
+# tier-2 hit never reaches this check. Online default-ref resolution is not
+# covered by this deadline. A workflow whose tier-3 resolution
 # would blow the deadline degrades (NFR2) rather than stalling startup.
 DEFAULT_SCHEMA_RESOLUTION_DEADLINE_SECONDS = 2.0
 
@@ -276,11 +276,12 @@ def build_catalogue(
             ``registry.config.load_config()`` (``~/.conductor/registries.toml``);
             overridable so tests and embedders can supply a fixture set
             without touching disk-backed configuration.
-        allow_network: When ``False``, every registry resolution is
-            answered entirely from the local cache — no GitHub API calls
-            — matching NFR1. A cache miss under this constraint degrades
-            that workflow (or, for a whole unreachable registry, skips
-            it) rather than raising.
+        allow_network: When ``True`` (default), GitHub registries resolve
+            their current default branch on every build, then reuse the
+            SHA-keyed index cache when valid. A resolution failure falls
+            back to the recorded pointer. When ``False``, resolution is
+            cache-only with no GitHub API calls; a missing index skips the
+            registry rather than aborting the build.
         schema_resolution_deadline: Wall-clock seconds, from this call's
             start, budgeted for tier-3 (fetch-and-parse) schema
             resolution. Exceeding it degrades the remaining unresolved
@@ -550,8 +551,8 @@ def _validated_cached_index(
 def _resolve_registry_index(
     registry_name: str, entry: RegistryEntry, *, allow_network: bool
 ) -> tuple[RegistryIndex, str | None]:
-    """Load a registry's index, honoring the E5 offline/warm-cache path
-    for GitHub registries. Returns ``(index, sha)`` — ``sha`` is ``None``
+    """Load a registry's index, resolving online or using the E5 cache-only
+    path for GitHub registries. Returns ``(index, sha)`` — ``sha`` is ``None``
     for path registries, which have no ref/SHA concept.
 
     Reuses ``registry/cache.py``'s E5 primitives directly (its own module
@@ -561,25 +562,26 @@ def _resolve_registry_index(
     if entry.type == RegistryType.path:
         return load_index(entry), None
 
-    # NFR1: consult the warm cache first -- network is used only on a cold
-    # miss (no recorded ref pointer yet, or the index isn't cached for the
-    # pointer's SHA), even when allow_network=True. Resolving the ref
-    # online unconditionally would touch the network on every build, warm
-    # cache or not.
+    # An online build checks the floating default on every start. Only a
+    # resolution error falls back to the last recorded SHA; an index fetch
+    # failure for a newly resolved SHA must not publish an older catalogue.
     if allow_network:
+        using_fallback = False
         try:
-            offline_sha = registry_cache._resolve_sha_offline(registry_name, None)
+            resolved_ref = resolve_ref(entry, None)
+            sha = materialize_to_sha(entry, resolved_ref)
         except RegistryError:
-            offline_sha = None
-        if offline_sha is not None:
-            meta = registry_cache._meta_dir(registry_name, offline_sha)
-            cached_index = _validated_cached_index(meta, registry_name, entry, offline_sha)
-            if cached_index is not None:
-                return cached_index, offline_sha
-
-        resolved_ref = resolve_ref(entry, None)
-        sha = materialize_to_sha(entry, resolved_ref)
-        registry_cache._write_ref_pointer(registry_name, None, sha)
+            sha = registry_cache._read_ref_pointer(registry_name, None)
+            if sha is None:
+                raise
+            using_fallback = True
+            logger.warning(
+                "Could not resolve default ref for registry %r; falling back to recorded SHA %s",
+                registry_name,
+                sha,
+            )
+        else:
+            registry_cache._write_ref_pointer(registry_name, None, sha)
     else:
         sha = registry_cache._resolve_sha_offline(registry_name, None)
 
@@ -587,6 +589,14 @@ def _resolve_registry_index(
     cached_index = _validated_cached_index(meta, registry_name, entry, sha)
     if cached_index is not None:
         return cached_index, sha
+
+    if allow_network and using_fallback:
+        metadata = registry_cache._read_source_metadata(meta)
+        if metadata is not None and not registry_cache._metadata_matches(metadata, entry, sha):
+            raise RegistryError(
+                f"Recorded SHA {sha} for registry {registry_name!r} has cached metadata "
+                "from a different source; refusing to use that index."
+            )
 
     if not allow_network:
         raise RegistryError(

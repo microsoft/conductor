@@ -112,6 +112,14 @@ narrows which *registries* are even considered before the ladder runs.
 `--workflow-dir <path>` (repeatable) adds workflows from a local directory
 alongside, or instead of, any registry.
 
+At every server start, configured GitHub registries check the current default
+branch and pin the catalogue to its commit SHA. Content already cached at that
+SHA is reused; if default-ref resolution fails, the server falls back to the
+last recorded SHA (subject to cache source validation). A running catalogue
+stays frozen at its startup SHA and tool list: restart the server to adopt
+registry changes. `conductor doctor mcp` uses an offline, cache-only snapshot,
+not the online default-ref check performed by server startup.
+
 The startup summary the server prints to stderr (see
 [Startup Summary](#startup-summary)) names every workflow it *does*
 expose, its source registry, and its pinned identity — a workflow
