@@ -444,17 +444,35 @@ def index_config(config: WorkflowConfig, cache: SecretValueCache) -> SecretUseIn
             )
 
     server_uses: dict[str, list[IndexedSecretUse]] = {}
+    agent_server_uses: list[IndexedSecretUse] = []
     for name, server in config.workflow.runtime.mcp_servers.items():
         for ref in server.secrets:
             cache.resolve(
                 ref.ref,
-                consumer_class="mcp",
+                consumer_class=ref.scope,
                 consumer_label=f"MCP server '{name}'",
             )
             kind, delivery_name = _delivery_parts(ref)
+            if ref.scope == "agent":
+                agent_server_uses.append(
+                    IndexedSecretUse(ref=ref.ref, delivery_kind=kind, delivery_name=delivery_name)
+                )
+                continue
             server_uses.setdefault(name, []).append(
                 IndexedSecretUse(ref=ref.ref, delivery_kind=kind, delivery_name=delivery_name)
             )
+
+    if agent_server_uses:
+        from conductor.config.schema import AgentDef
+        from conductor.providers.resolution import provider_type_for_agent
+
+        for key, step in _iter_executable_steps(config):
+            if (
+                isinstance(step, AgentDef)
+                and step.tools != []
+                and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+            ):
+                step_uses.setdefault(key, []).extend(agent_server_uses)
 
     return SecretUseIndex(
         step_uses={key: tuple(uses) for key, uses in step_uses.items()},

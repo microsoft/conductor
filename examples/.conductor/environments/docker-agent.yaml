@@ -1,0 +1,16 @@
+default: docker_agent
+profiles:
+  docker_agent:
+    backend: docker
+    docker:
+      image: busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+      runner_image: conductor-agent-runner@sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+  aca_sandbox:
+    backend: aca
+    aca:
+      pool_endpoint: https://my-session-pool.eastus.dynamicsessions.io
+      api_version: "2025-07-01"
+      identifier_scope: agent
+      egress: enabled
+      lifecycle: timed
+      auth: azure_default

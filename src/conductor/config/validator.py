@@ -1685,19 +1685,95 @@ def _validate_secret_references(
     # environment, mirroring the manifest compiler's fail-fast order.
     references: list[tuple[str, str, str]] = []
     consumers = effective_mcp_consumer_providers(config)
+    from conductor.engine.run_manifest import (
+        LOCAL_AGENT_SCOPE_ERROR,
+        agent_has_stdio_mcp,
+        agent_scope_stdio_error,
+        agent_secret_name_error,
+    )
+
+    environment = (
+        next(
+            (item for item in (context["environments"] or {}).values() if item is not None),
+            None,
+        )
+        if context["explicit"]
+        else None
+    )
+    workflow_profile = (
+        config.workflow.defaults.execution.profile
+        if config.workflow.defaults.execution is not None
+        else None
+    )
+
+    def backend_for(key: str, step: ExecutableStepBase) -> str | None:
+        if environment is None:
+            return None
+        name = (
+            (step.execution.profile if step.execution is not None else None)
+            or workflow_profile
+            or environment.document.default
+        )
+        definition = environment.document.profiles.get(name) if name is not None else None
+        return definition.backend if definition is not None else None
+
+    local_mcp_consumer = any(
+        isinstance(step, AgentDef)
+        and step.tools != []
+        and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+        and backend_for(key, step) == "local"
+        for key, step in _executable_steps(config)
+    )
 
     for key, step in _secret_step_consumers(config):
         assert step.execution is not None
         secrets = step.execution.secrets
-        if not isinstance(step, ScriptStepDef) or any(
-            secret.scope == "agent" for secret in secrets
-        ):
-            errors.append(
-                f"Step '{key}' requests secret delivery, but agent-scope delivery is "
-                "reserved until agent execution realms (step 7)."
-            )
-            continue
         for secret in secrets:
+            if isinstance(step, AgentDef):
+                if secret.scope != "agent":
+                    errors.append(
+                        f"Agent step '{key}' cannot consume secret '{secret.ref}' with scope "
+                        f"'{secret.scope}'; this position requires scope 'agent'."
+                    )
+                    continue
+                if secret.delivery.env is not None and (
+                    error := agent_secret_name_error(secret.delivery.env)
+                ):
+                    errors.append(error)
+                    continue
+                backend = backend_for(key, step)
+                if backend == "local":
+                    errors.append(f"Agent step '{key}': {LOCAL_AGENT_SCOPE_ERROR}.")
+                    continue
+                if secret.delivery.env is None:
+                    errors.append(
+                        f"Agent step '{key}' requires delivery.env for secret '{secret.ref}': "
+                        "env_overlay reaches the spawn-env of in-realm stdio MCP processes "
+                        "per call, never the model SDK environment."
+                    )
+                    continue
+                if backend is None:
+                    warnings.append(
+                        f"Agent step '{key}' agent-scope delivery requires a remote execution "
+                        "profile; run conductor validate --environment <name> "
+                        "for the full cross-check"
+                    )
+                elif not agent_has_stdio_mcp(config, step):
+                    errors.append(agent_scope_stdio_error(key))
+                    continue
+                references.append((secret.ref, secret.scope, key))
+                continue
+            if not isinstance(step, ScriptStepDef):
+                errors.append(
+                    f"Step '{key}' does not support secret delivery; use an agent or script step."
+                )
+                continue
+            if secret.scope == "agent":
+                errors.append(
+                    f"Script step '{key}' cannot consume secret '{secret.ref}' with scope "
+                    "'agent'; this position requires scope 'script'."
+                )
+                continue
             if secret.delivery.header is not None:
                 errors.append(
                     f"Script step '{key}' requests header delivery for secret "
@@ -1714,7 +1790,7 @@ def _validate_secret_references(
         errors.extend(
             _delivery_collision_errors(
                 key,
-                literal_env=step.env,
+                literal_env=step.env if isinstance(step, ScriptStepDef) else (),
                 literal_headers=(),
                 secrets=secrets,
             )
@@ -1731,10 +1807,29 @@ def _validate_secret_references(
                 continue
         for secret in server.secrets:
             if secret.scope == "agent":
-                errors.append(
-                    f"MCP server '{server_name}' requests agent-scope delivery, but "
-                    "agent-scope delivery is reserved until agent execution realms (step 7)."
-                )
+                if secret.delivery.env is not None and (
+                    error := agent_secret_name_error(secret.delivery.env)
+                ):
+                    errors.append(error)
+                    continue
+                if local_mcp_consumer:
+                    errors.append(f"MCP server '{server_name}': {LOCAL_AGENT_SCOPE_ERROR}.")
+                    continue
+                if secret.delivery.env is None or server.type != "stdio":
+                    errors.append(
+                        f"MCP server '{server_name}' requires stdio and delivery.env for "
+                        f"agent-scope secret '{secret.ref}': env_overlay reaches the spawn-env "
+                        "of in-realm stdio MCP processes per call, never the model SDK "
+                        "environment."
+                    )
+                    continue
+                if environment is None:
+                    warnings.append(
+                        f"MCP server '{server_name}' agent-scope delivery requires all consuming "
+                        "agents in remote realms; run conductor validate --environment <name> "
+                        "for the full cross-check"
+                    )
+                references.append((secret.ref, secret.scope, consumer))
                 continue
             if secret.scope != "mcp":
                 errors.append(
@@ -1770,6 +1865,39 @@ def _validate_secret_references(
                 secrets=server.secrets,
             )
         )
+
+    agent_server_secrets = [
+        secret
+        for server in config.workflow.runtime.mcp_servers.values()
+        for secret in server.secrets
+        if secret.scope == "agent"
+    ]
+    literal_mcp_env = {
+        name
+        for server in config.workflow.runtime.mcp_servers.values()
+        if server.type == "stdio"
+        for name in server.env
+    }
+    for key, step in _executable_steps(config):
+        if (
+            isinstance(step, AgentDef)
+            and step.tools != []
+            and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+        ):
+            step_secrets = (
+                [secret for secret in step.execution.secrets if secret.scope == "agent"]
+                if step.execution is not None
+                else []
+            )
+            if step_secrets or agent_server_secrets:
+                errors.extend(
+                    _delivery_collision_errors(
+                        key,
+                        literal_env=literal_mcp_env,
+                        literal_headers=(),
+                        secrets=[*step_secrets, *agent_server_secrets],
+                    )
+                )
 
     context["refs_found"] = True
     if context["explicit"]:
@@ -1960,6 +2088,8 @@ def _validate_docker_profiles(
     config: WorkflowConfig,
     context: _EnvironmentValidationContext,
 ) -> tuple[list[str], list[str]]:
+    from conductor.engine.run_manifest import _require_agent_backend_capability
+
     if not context["explicit"] and not _profile_references(config):
         return [], []
 
@@ -1991,11 +2121,21 @@ def _validate_docker_profiles(
             if definition is None:
                 continue
             resolved.append((key, step, profile_name, definition.backend))
-            if definition.backend == "docker" and not isinstance(step, ScriptStepDef):
+            if isinstance(step, AgentDef):
+                try:
+                    _require_agent_backend_capability(
+                        key,
+                        definition.backend,
+                        definition,
+                        agent=step,
+                        runtime=config.workflow.runtime,
+                    )
+                except ConfigurationError as exc:
+                    errors.append(f"environment '{environment_name}': {exc}")
+            elif definition.backend != "local" and not isinstance(step, ScriptStepDef):
                 errors.append(
-                    f"Step '{key}' resolves to backend 'docker' in environment "
-                    f"'{environment_name}', but backend 'docker' is available for script steps "
-                    "only; agent execution realms arrive in step 7."
+                    f"Step '{key}' resolves to backend '{definition.backend}' in environment "
+                    f"'{environment_name}', but this step requires the local backend."
                 )
 
         script_backends = {

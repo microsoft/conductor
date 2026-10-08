@@ -326,8 +326,8 @@ def test_mcp_scope_conflicts_with_script_scope() -> None:
     ],
 )
 def test_agent_secret_scope_is_reserved_until_step_7(config: WorkflowConfig) -> None:
-    # Requirement: non-script use-sites and explicit agent scope fail at runtime until step 7.
-    with pytest.raises(ConfigurationError, match=r"agent-scope.*step 7"):
+    # Requirement: each use-site rejects an incompatible secret scope or local delivery.
+    with pytest.raises(ConfigurationError, match=r"scope|scoped delivery"):
         compile_run_manifest(config, workflow_path=None, environment=_environment())
 
 

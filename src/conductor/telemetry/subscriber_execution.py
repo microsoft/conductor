@@ -57,6 +57,7 @@ def parallel_agent_started(state: SpanState, event: WorkflowEvent) -> None:
     )
     state.parallel_keys[(path, group, agent)] = key
     _record_span_provider(state, key, event)
+    _record_span_realm(state, key, event)
 
 
 def parallel_agent_completed(state: SpanState, event: WorkflowEvent) -> None:
@@ -105,6 +106,7 @@ def item_agent_started(state: SpanState, event: WorkflowEvent) -> None:
     if key in state.open_spans and agent:
         state.open_spans[key].set_attribute(GEN_AI_AGENT_NAME, agent)
         _record_span_provider(state, key, event)
+        _record_span_realm(state, key, event)
 
 
 def item_completed(state: SpanState, event: WorkflowEvent) -> None:
@@ -132,6 +134,7 @@ def agent_started(state: SpanState, event: WorkflowEvent) -> None:
     )
     state.agent_keys.setdefault((path, agent), deque()).append(key)
     _record_span_provider(state, key, event)
+    _record_span_realm(state, key, event)
 
 
 def agent_completed(state: SpanState, event: WorkflowEvent) -> None:
@@ -366,7 +369,9 @@ def _finish_parallel_member(state: SpanState, event: WorkflowEvent, *, failed: b
     group = event_text(event, "group_name")
     agent = event_text(event, "agent_name")
     if group is not None and agent is not None:
-        state.end(state.parallel_keys.get((path, group, agent)), event, failed=failed)
+        key = state.parallel_keys.get((path, group, agent))
+        _record_span_realm(state, key, event)
+        state.end(key, event, failed=failed)
 
 
 def _finish_item(state: SpanState, event: WorkflowEvent, *, failed: bool) -> None:
@@ -376,6 +381,7 @@ def _finish_item(state: SpanState, event: WorkflowEvent, *, failed: bool) -> Non
         event_text(event, "item_key"),
         event_number(event, "index"),
     )
+    _record_span_realm(state, key, event)
     state.end(key, event, failed=failed)
 
 
@@ -383,7 +389,23 @@ def _finish_agent(state: SpanState, event: WorkflowEvent, *, failed: bool) -> No
     path = event_path(event, "subworkflow_path")
     agent = event_text(event, "agent_name")
     if agent is not None:
-        state.end(state.latest_agent(path, agent), event, failed=failed)
+        key = state.latest_agent(path, agent)
+        _record_span_realm(state, key, event)
+        state.end(key, event, failed=failed)
+
+
+def _record_span_realm(state: SpanState, key: SpanKey | None, event: WorkflowEvent) -> None:
+    """Project present realm identity fields onto an open agent span."""
+    span = state.open_spans.get(key) if key is not None else None
+    if span is None:
+        return
+    for field, attribute in (
+        ("execution_backend", "conductor.execution.backend"),
+        ("realm_image", "conductor.realm.image"),
+    ):
+        value = event_text(event, field)
+        if value is not None:
+            span.set_attribute(attribute, value)
 
 
 def _record_span_provider(state: SpanState, key: SpanKey, event: WorkflowEvent) -> None:

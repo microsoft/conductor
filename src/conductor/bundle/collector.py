@@ -103,6 +103,8 @@ class CollectedBundle:
     files: Mapping[str, bytes]
     links: Mapping[str, str]
     root: str
+    source_roots: tuple[tuple[str, str], ...]
+    agent_paths: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,7 @@ class _Collector:
         self.files: dict[str, bytes] = {}
         self.links: dict[str, str] = {}
         self.host_paths: dict[Path, str] = {}
+        self.agent_paths: dict[Path, str] = {}
         self.skills_topology: dict[str, str] = {}
         self.skill_claims: dict[
             str, tuple[Literal["declared", "discovered", "plugin"], ResolvedSkill]
@@ -225,6 +228,25 @@ class _Collector:
             files=MappingProxyType(dict(self.files)),
             links=MappingProxyType(dict(self.links)),
             root=PurePosixPath(root_logical_path).parent.relative_to("tree").as_posix(),
+            source_roots=(
+                *(
+                    (
+                        str(node.path.parent),
+                        PurePosixPath(self._local_logical_path(node.path)[0])
+                        .parent.relative_to("tree")
+                        .as_posix(),
+                    )
+                    for node in self.nodes
+                ),
+                *(
+                    (str(root.path), root.namespace.removeprefix("tree/"))
+                    for root in self.additional_roots
+                ),
+            ),
+            agent_paths=tuple(
+                (str(host), logical.removeprefix("tree/"))
+                for host, logical in sorted(self.agent_paths.items(), key=lambda item: str(item[0]))
+            ),
         )
 
     def _walk_subworkflows(
@@ -556,6 +578,7 @@ class _Collector:
 
     def _collect_skill(self, skill: ResolvedSkill) -> None:
         namespace = f"tree/skills/{skill.name}"
+        self.agent_paths[Path(os.path.abspath(skill.directory))] = namespace
         self.dependency_roots.add(skill.directory)
         detail = f"skill-discovery:{skill.name}" if skill.discovered else f"skill:{skill.name}"
         self._collect_dependency_tree(
@@ -597,6 +620,7 @@ class _Collector:
             raise BundleError(f"Resolved plugin {plugin.name!r} has no manifest at {plugin.root}")
         actual_flavor = manifest_flavor(manifest, plugin.root)
         namespace = f"tree/plugins/{plugin.name}"
+        self.agent_paths[Path(os.path.abspath(plugin.root))] = namespace
         self.dependency_roots.add(plugin.root)
         matching_source = next(
             (
@@ -644,6 +668,7 @@ class _Collector:
             )
         for skill in plugin.skills:
             skill_namespace = f"{namespace}/{skill.directory.relative_to(plugin.root).as_posix()}"
+            self.agent_paths[Path(os.path.abspath(skill.directory))] = skill_namespace
             self._collect_dependency_tree(
                 skill.directory,
                 skill_namespace,

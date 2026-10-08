@@ -125,6 +125,38 @@ conductor validate examples/docker-script.yaml --environment docker-demo
 conductor run examples/docker-script.yaml --environment docker-demo
 ```
 
+### docker-agent-realm.yaml
+
+Demonstrates running an agent step inside an isolated Docker runner container using an execution profile. Demonstrates:
+- Executing an agent inside a long-lived runner container
+- Colocating the agent loop, stdio MCP processes, and workspace state
+- Pinned `runner_image` reference by digest in `examples/.conductor/environments/docker-agent.yaml`
+- Communication over the internal bridge without publishing container ports to the host
+
+```bash
+# Validate against the docker-agent environment
+conductor validate examples/docker-agent-realm.yaml --environment examples/.conductor/environments/docker-agent.yaml
+
+# Bare validation checks profile placement against discovered environments
+conductor validate examples/docker-agent-realm.yaml
+```
+
+### aca-profile.yaml
+
+Demonstrates running an agent step inside an Azure Container Apps (ACA) dynamic session sandbox using an execution profile. Demonstrates:
+- Decoupling the model provider (`copilot`) from the execution backend (`aca`)
+- Configuring ACA pool connection and session parameters in an environment profile
+- Sequential session reuse based on `identifier_scope: agent`
+- Running agents without requiring bundle staging on the host
+
+```bash
+# Validate against the docker-agent environment
+conductor validate examples/aca-profile.yaml --environment examples/.conductor/environments/docker-agent.yaml
+
+# Bare validation checks profile references
+conductor validate examples/aca-profile.yaml
+```
+
 ## Run Bundles
 
 ### run-bundle.yaml

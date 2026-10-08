@@ -972,9 +972,10 @@ secrets:
 
 Each profile under `profiles` supports:
 
-- `backend` (required): The runner backend implementing this profile (`local` or `docker`).
+- `backend` (required): The runner backend implementing this profile (`local`, `docker`, or `aca`).
 - `inherit_control_environment` (optional, boolean): Controls whether subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while the `docker` backend defaults to effective `false`. Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to daemon administrators.
-- `docker` (optional, object): Configuration options required when `backend: docker` is selected. Rejected when `backend: local`.
+- `docker` (optional, object): Configuration options required when `backend: docker` is selected. Rejected when `backend` is not `docker`.
+- `aca` (optional, object): Configuration options required when `backend: aca` is selected. Rejected when `backend` is not `aca`.
 
 #### Docker Profile Configuration (`docker`)
 
@@ -987,6 +988,13 @@ profiles:
     backend: docker
     docker:
       image: node:20
+
+  # Agent realm configuration
+  agent_runner:
+    backend: docker
+    docker:
+      image: alpine:3.20
+      runner_image: conductor-agent-runner@sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 
   # Fully hardened configuration
   secure_runner:
@@ -1010,6 +1018,7 @@ profiles:
 | Field | Type | Default | Validation Bounds and Description |
 |-------|------|---------|-----------------------------------|
 | `image` | string (required) | (none) | Container image reference (tag or digest). Must be a non-empty string without whitespace. |
+| `runner_image` | string (optional) | `None` | OCI reference of the agent-realm runtime image (an image with Conductor installed). When set, the profile becomes agent-capable. Script steps keep using `image`. |
 | `platform` | string (optional) | `None` | Target platform: `linux/amd64` or `linux/arm64`. When omitted, the platform is auto-resolved by Docker. |
 | `network` | string (optional) | `None` | Container network mode: `none`, `bridge`, or `host`. `None` keeps the daemon default. `host` triggers a validation warning. |
 | `user` | string (optional) | `None` | Container user in Docker syntax `<name\|uid>[:<group\|gid>]`. When omitted, uses the image `USER`. |
@@ -1031,6 +1040,43 @@ The `resources` mapping configures resource constraints on the container:
 | `pids` | integer (optional) | `None` | Process limit. Bounded between `16` and `65536`. |
 
 When omitted, resource constraints are not set on the container and it shares host resources unconstrained. On shared CI environments, setting resource bounds is recommended.
+
+#### ACA Profile Configuration (`aca`)
+
+When a profile uses `backend: aca`, the `aca` block configures connection and session settings for Azure Container Apps dynamic sessions:
+
+```yaml
+profiles:
+  azure_sandbox:
+    backend: aca
+    aca:
+      pool_endpoint: https://my-session-pool.eastus.dynamicsessions.io
+      api_version: "2025-07-01"
+      identifier_scope: agent
+      egress: enabled
+      lifecycle: timed
+      auth: azure_default
+```
+
+| Field | Type | Default | Validation Bounds and Description |
+|-------|------|---------|-----------------------------------|
+| `pool_endpoint` | string (required) | (none) | ACA dynamic-sessions pool management endpoint. Must be an `https://` URL with a hostname and no query string or fragment. |
+| `api_version` | string (optional) | `None` | ACA management API version. |
+| `identifier_scope` | string (optional) | `"agent"` | Granularity for sequential session reuse: `workflow`, `agent`, `item`, or `none`. |
+| `egress` | string (optional) | `None` | Advisory pool egress mode: `enabled` or `disabled`. |
+| `lifecycle` | string (optional) | `None` | Advisory session lifecycle policy: `timed` or `on_container_exit`. |
+| `auth` | string (optional) | `"azure_default"` | Session Executor authentication strategy. |
+
+##### Identifier Scope Semantics (`identifier_scope`)
+
+The `identifier_scope` field controls how Conductor reuses dynamic session sandboxes across sequential agent steps:
+
+* `agent` (default): Reuses the session across repeated invocations of the same agent step.
+* `workflow`: Shares a single sandbox across all agent steps within the workflow run.
+* `item`: Allocates a distinct sandbox for each item in a for-each loop.
+* `none`: Disables session reuse entirely, provisioning a fresh sandbox for each agent call.
+
+Concurrent branches always allocate separate sessions regardless of this setting. Conductor derives distinct session identifiers for parallel tasks to prevent concurrent executions from writing over each other's workspace files.
 
 #### Secret Bindings
 

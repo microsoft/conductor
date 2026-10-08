@@ -29,24 +29,19 @@ Compatibility rules
 - Request-side models (``RunnerAgentPayload``, ``RunnerAgentRequest``) are
   strict ``extra="forbid"`` so a sender cannot smuggle undeclared fields past
   a receiver's validation.
-- ``RUNNER_PROTOCOL_VERSION`` is advertised on ``/health``; bump it only on
-  an incompatible change (see its docstring).
+- ``RUNNER_PROTOCOL_VERSION`` is advertised on ``/health``. A v1 runner
+  rejects even optional v2 request keys via ``extra="forbid"``, so hosts must
+  pre-flight against ``/health`` before sending a v2 request.
 
-History
--------
-Lifted de-ACA'd from ``conductor.providers.aca_protocol`` (issue #284); the
-field names, aliases, defaults, validators, and ``ConfigDict`` modes are
-byte-identical in meaning — only the class names and module identity changed
-to make the contract backend-neutral. ``conductor-agent-runner`` (shipped via
-``docker/aca-runner/Dockerfile``) is the reference remote runtime speaking
-this contract.
+The reference remote runtime is ``conductor-agent-runner``, shipped via
+``docker/aca-runner/Dockerfile``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_serializer, field_validator
 
 # The one definition of the transport-token header name (issue #396),
 # imported by both the runner and the host transport adapter so the two
@@ -54,11 +49,10 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 RUNNER_TOKEN_HEADER = "X-Conductor-Runner-Token"
 
 # Wire-protocol version advertised by the runner on /health (and understood
-# by the host). Evolution of this contract is additive-only (response-side
-# extra="ignore"); bump this constant ONLY on an incompatible change — a
-# host and runner disagreeing on it is a compatibility warning, never a
-# hard failure.
-RUNNER_PROTOCOL_VERSION: int = 1
+# by the host). Request-side extra="forbid" means even additive v2 keys
+# are incompatible with v1 runners. The host must pre-flight /health and
+# negotiate a v1-shaped request or reject the runner before execution.
+RUNNER_PROTOCOL_VERSION: int = 2
 
 # `inner_provider_settings` keys that carry a credential (as opposed to
 # `base_url`, which is not secret). Kept in one place so the redaction
@@ -124,7 +118,7 @@ class RunnerAgentRequest(BaseModel):
 
     The envelope is backend-neutral, but the concrete dict of credential keys
     (``_INNER_PROVIDER_SECRET_KEYS``) is the vocabulary of today's single
-    inner provider (Copilot); a new inner provider extends the list.
+    inner providers. Credential keys are distinct from MCP spawn environment.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -135,7 +129,8 @@ class RunnerAgentRequest(BaseModel):
     """Per-agent tool allowlist. ``None`` = all workflow tools, ``[]`` = none."""
 
     mcp_servers: dict[str, Any] | None = None
-    """Full ``runtime.mcp_servers`` definitions (not just names) — the
+    """Full ``runtime.mcp_servers`` definitions (not just names). None
+    attaches no servers (including when a caller suppresses MCP). The
     runner-image contract requires stdio binaries to already be baked into
     the image; remote (HTTP/SSE) servers require runtime egress."""
 
@@ -143,7 +138,7 @@ class RunnerAgentRequest(BaseModel):
     """Accumulated workflow context needed to reconstruct the agent's view."""
 
     inner_provider: str = "copilot"
-    """SDK the runner should drive. MVP: ``"copilot"`` only."""
+    """SDK the runner should drive: copilot, openai, or claude."""
 
     inner_provider_settings: dict[str, Any] | None = None
     """Credential precedence — either BYOK settings (``base_url`` + optional
@@ -214,6 +209,38 @@ class RunnerAgentRequest(BaseModel):
     Forwarded so the runner's inner provider applies the same per-result MCP
     tool-output size limit (``max_chars``/``spill_to_file``/``spill_dir``) the
     host would have applied for an on-host provider. ``None`` when unset."""
+
+    skill_directories: list[str] | None = None
+    """Skill directories staged within the selected execution realm."""
+
+    custom_agents: list[dict[str, Any]] | None = None
+    """Parsed custom agent specs, not host filesystem paths."""
+
+    env_overlay: dict[str, str] | None = None
+    """Per-call stdio MCP spawn environment, never the model SDK environment.
+
+    Values are redacted in dumps and repr; only the dedicated wire serializer
+    unwraps them immediately before transport.
+    """
+
+    @field_validator("env_overlay", mode="after")
+    @classmethod
+    def _redact_env_overlay(cls, value: dict[str, str] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {key: SecretStr(raw) if isinstance(raw, str) else raw for key, raw in value.items()}
+
+    @field_serializer("env_overlay")
+    def _serialize_env_overlay(self, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        return {
+            key: str(raw) if isinstance(raw, SecretStr) else str(SecretStr(raw))
+            for key, raw in value.items()
+        }
+
+    execution_id: str | None = None
+    """Identity of this invocation for a future targeted interrupt."""
 
 
 class RunnerEventFrame(BaseModel):
@@ -304,6 +331,7 @@ class RunnerHealthResponse(BaseModel):
     protocol_version: int | None = None
     auth_required: bool | None = None
     auth_token_present: bool | None = None
+    features: list[str] | None = None
 
 
 def request_to_wire_body(request: RunnerAgentRequest) -> dict[str, Any]:
@@ -320,9 +348,19 @@ def request_to_wire_body(request: RunnerAgentRequest) -> dict[str, Any]:
     codebase sees the plaintext.
     """
     body = request.model_dump(mode="json")
+    # Legacy ACA callers construct no v2 fields; omitting their null defaults
+    # keeps their requests acceptable to v1 runners with extra="forbid".
+    for key in ("skill_directories", "custom_agents", "env_overlay", "execution_id"):
+        if body[key] is None:
+            del body[key]
     if request.inner_provider_settings is not None:
         body["inner_provider_settings"] = {
             key: value.get_secret_value() if isinstance(value, SecretStr) else value
             for key, value in request.inner_provider_settings.items()
+        }
+    if request.env_overlay is not None:
+        body["env_overlay"] = {
+            key: value.get_secret_value() if isinstance(value, SecretStr) else value
+            for key, value in request.env_overlay.items()
         }
     return body

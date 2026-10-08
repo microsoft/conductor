@@ -1,4 +1,4 @@
-"""Prepare content-addressed run bundles for Docker-backed script steps.
+"""Prepare content-addressed run bundles for Docker-backed steps.
 
 Bundle materialization is an execution preflight concern, not an execution
 backend concern: this module may depend on ``conductor.bundle`` while the leaf
@@ -32,7 +32,6 @@ from conductor.engine.run_manifest import (
     ResolvedRunManifest,
     effective_profile_name,
     executable_step_identity,
-    script_step_backends,
 )
 from conductor.exceptions import ConfigurationError
 from conductor.execution import BundleRef
@@ -41,7 +40,7 @@ from conductor.filesystem import stat_or_none
 logger = logging.getLogger(__name__)
 
 _PROGRAMMATIC_BUNDLE_ERROR = (
-    "docker-backed script steps require a workflow file on disk for bundle collection; "
+    "docker-backed steps require a workflow file on disk for bundle collection; "
     "programmatic engine construction cannot collect a run bundle"
 )
 _CACHE_REMEDY = "run conductor plugin fetch / conductor bundle build to prime the cache"
@@ -173,6 +172,8 @@ async def materialize_run_bundle(
         digest=collected.manifest.bundle_digest,
         store_path=str(store_path),
         root=collected.root,
+        source_roots=collected.source_roots,
+        agent_paths=collected.agent_paths,
     )
 
 
@@ -191,9 +192,7 @@ async def prepare_run_bundle(
     if not any(profile.backend == "docker" for profile in environment.document.profiles.values()):
         return None
 
-    # Membership-only gate: docker presence in the answer is identical under
-    # both script_step_backends modes (script-only and legacy all-backends).
-    needs_bundle = "docker" in script_step_backends(manifest)
+    needs_bundle = any(profile.backend == "docker" for profile in manifest.profiles.values())
     if not needs_bundle:
         if workflow_path is None:
             raise ConfigurationError(_PROGRAMMATIC_BUNDLE_ERROR)

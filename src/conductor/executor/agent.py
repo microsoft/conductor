@@ -12,14 +12,23 @@ import dataclasses
 import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, get_args
+from uuid import uuid4
 
-from conductor.exceptions import ExecutionError, ValidationError
+from conductor.exceptions import ConfigurationError, ExecutionError, ValidationError
+from conductor.execution import (
+    AgentResult,
+    AgentSpec,
+    LocalRunnerBackend,
+    ResolvedExecutionSpec,
+    RunnerBackend,
+    WorkspaceLease,
+)
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
 from conductor.mcp_auth import resolve_mcp_servers
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.context_tier import ContextTier
-from conductor.providers.reasoning import ReasoningEffort
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 from conductor.skills import BYTES_PER_TOKEN_ESTIMATE
 from conductor.templating import is_jinja_template
 
@@ -347,6 +356,11 @@ class AgentExecutor:
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         continuation_state: object | None = None,
+        execution_backend: RunnerBackend | None = None,
+        workspace_lease: WorkspaceLease | None = None,
+        resolved_execution: ResolvedExecutionSpec | None = None,
+        agent_env_overlay: Mapping[str, str] | None = None,
+        realm_credential_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -563,19 +577,96 @@ class AgentExecutor:
                 f"{len(extra_mcp_servers or {})} MCP server(s) forwarded"
             )
 
-        # Execute via provider
-        output = await self.provider.execute(
-            agent=agent,
-            context=context,
-            rendered_prompt=rendered_prompt,
-            tools=resolved_tools,
-            interrupt_signal=interrupt_signal,
-            event_callback=event_callback,
-            skill_directories=skill_dirs,
-            custom_agents=custom_agents,
-            extra_mcp_servers=extra_mcp_servers,
-            continuation_state=continuation_state,
-        )
+        # No profile keeps the direct provider call and builds no transport spec.
+        if (
+            execution_backend is not None
+            and type(execution_backend) is not LocalRunnerBackend
+            and not execution_backend.capabilities().agent
+        ):
+            raise ConfigurationError(
+                f"Execution backend {type(execution_backend).__name__!r} cannot run agents.",
+                suggestion="Select an agent-capable execution profile.",
+            )
+
+        async def execute_provider() -> AgentOutput:
+            return await self.provider.execute(
+                agent=agent,
+                context=context,
+                rendered_prompt=rendered_prompt,
+                tools=resolved_tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_dirs,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+                continuation_state=continuation_state,
+            )
+
+        if execution_backend is None:
+            output = await execute_provider()
+        elif type(execution_backend) is LocalRunnerBackend:
+            local_output: AgentOutput | None = None
+
+            async def execute_local() -> AgentResult:
+                nonlocal local_output
+                local_output = await execute_provider()
+                return AgentResult(
+                    content=local_output.content,
+                    model=local_output.model,
+                    input_tokens=local_output.input_tokens,
+                    output_tokens=local_output.output_tokens,
+                    cache_read_tokens=local_output.cache_read_tokens,
+                    cache_write_tokens=local_output.cache_write_tokens,
+                    last_call_input_tokens=local_output.last_call_input_tokens,
+                    session_seconds=local_output.session_seconds,
+                    partial=local_output.partial,
+                    raw_response=local_output.raw_response,
+                    continuation_state=local_output.continuation_state,
+                )
+
+            await execution_backend.run_agent(
+                AgentSpec(
+                    name=agent.name,
+                    execution_id=uuid4().hex,
+                    model_provider=agent.provider
+                    or type(self.provider).__module__.rsplit(".", 1)[-1],
+                    model=agent.model,
+                    rendered_prompt=rendered_prompt,
+                ),
+                workspace_lease,
+                on_event=event_callback,
+                interrupt_signal=interrupt_signal,
+                execute_local=execute_local,
+            )
+            assert local_output is not None
+            output = local_output
+        else:
+            spec = self.build_realm_spec(
+                agent,
+                rendered_prompt,
+                context,
+                tools=resolved_tools,
+                skill_directories=skill_dirs,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+                execution=resolved_execution,
+                env_overlay=agent_env_overlay,
+                credential_resolver=realm_credential_resolver,
+                backend_name=workspace_lease.backend if workspace_lease is not None else None,
+            )
+
+            def on_event(event_type: str, data: Mapping[str, Any]) -> None:
+                if event_callback is not None:
+                    event_callback(event_type, dict(data))
+
+            result = await execution_backend.run_agent(
+                spec,
+                workspace_lease,
+                on_event=on_event if event_callback is not None else None,
+                interrupt_signal=interrupt_signal,
+                execute_local=None,
+            )
+            output = self.output_from_realm_result(result)
 
         # Ensure output.content is a dict
         if not isinstance(output.content, dict):
@@ -591,6 +682,113 @@ class AgentExecutor:
             validate_output(output.content, agent.output, warn_undeclared_keys=True)
 
         return output
+
+    @staticmethod
+    def output_from_realm_result(result: AgentResult) -> AgentOutput:
+        """Convert a remote result without restoring provider-owned state."""
+        return AgentOutput(
+            content=dict(result.content),
+            raw_response=None,
+            tokens_used=(
+                result.input_tokens + result.output_tokens
+                if result.input_tokens is not None and result.output_tokens is not None
+                else None
+            ),
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_write_tokens=result.cache_write_tokens,
+            last_call_input_tokens=result.last_call_input_tokens,
+            model=result.model,
+            session_seconds=result.session_seconds,
+            partial=result.partial,
+            continuation_state=None,
+        )
+
+    def build_realm_spec(
+        self,
+        agent: AgentDef,
+        rendered_prompt: str,
+        context: dict[str, Any],
+        *,
+        tools: list[str] | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        execution: ResolvedExecutionSpec | None = None,
+        env_overlay: Mapping[str, str] | None = None,
+        credential_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        backend_name: str | None = None,
+    ) -> AgentSpec:
+        """Build one transport-neutral invocation from effective provider values."""
+        if (
+            backend_name == "aca"
+            and agent.sandbox is not None
+            and agent.sandbox.identifier_scope is not None
+        ):
+            raise ConfigurationError(
+                "sandbox.identifier_scope is not supported on an ACA execution profile; "
+                "set it on the profile's aca block"
+            )
+        provider_name = agent.provider or type(self.provider).__module__.rsplit(".", 1)[-1]
+        servers = (
+            getattr(self.provider, "_mcp_servers", None)
+            or getattr(self.provider, "_mcp_servers_config", None)
+            or {}
+        )
+        merged_servers = {**servers, **(extra_mcp_servers or {})}
+        tool_output = getattr(self.provider, "_tool_output_config", None)
+        default_seconds = getattr(self.provider, "_default_max_session_seconds", None)
+        if default_seconds is None:
+            idle_config = getattr(self.provider, "_idle_recovery_config", None)
+            default_seconds = getattr(idle_config, "max_session_seconds", None)
+        return AgentSpec(
+            name=agent.name,
+            execution_id=uuid4().hex,
+            model_provider=provider_name,
+            model=agent.model or getattr(self.provider, "_default_model", None),
+            rendered_prompt=rendered_prompt,
+            system_prompt=agent.system_prompt,
+            output_schema=(
+                {
+                    name: field.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+                    for name, field in agent.output.items()
+                }
+                if agent.output
+                else None
+            ),
+            tools=tuple(tools) if tools is not None else None,
+            mcp_servers=(
+                {
+                    name: cfg.model_dump(mode="json") if hasattr(cfg, "model_dump") else cfg
+                    for name, cfg in merged_servers.items()
+                }
+                or None
+            ),
+            context=context,
+            skill_directories=tuple(skill_directories or ()),
+            custom_agents=tuple(custom_agents or ()),
+            env_overlay=env_overlay,
+            provider_credentials=(
+                credential_resolver(provider_name) if credential_resolver else None
+            ),
+            tool_output=tool_output.model_dump(mode="json") if tool_output else None,
+            reasoning_effort=resolve_reasoning_effort(
+                agent, getattr(self.provider, "_default_reasoning_effort", None)
+            ),
+            max_agent_iterations=(
+                agent.max_agent_iterations
+                or getattr(self.provider, "_default_max_agent_iterations", None)
+            ),
+            max_session_seconds=agent.max_session_seconds or default_seconds,
+            working_dir=(agent.sandbox.working_dir if agent.sandbox is not None else None)
+            if backend_name == "aca"
+            else agent.working_dir,
+            retry=agent.retry.model_dump(mode="json") if agent.retry else None,
+            context_tier=agent.context_tier
+            or getattr(self.provider, "_default_context_tier", None),
+            execution=execution,
+        )
 
     def render_prompt(self, agent: AgentDef, context: dict[str, Any]) -> str:
         """Render an agent's prompt template including workspace instructions.

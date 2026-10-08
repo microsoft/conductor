@@ -1,11 +1,8 @@
 # ACA (Azure Container Apps) Provider Documentation
 
-> **Experimental Provider** — `aca` delegates the entire agentic loop to a
-> remote Azure Container Apps (ACA) dynamic-sessions sandbox instead of
-> running it on the host. `conductor validate` catches workflows that
-> depend on unsupported features, and the CLI prints a one-time banner at
-> runtime. See [Experimental Providers](./experimental.md) for the
-> stability policy and promotion criteria.
+> **Deprecation Notice**: `provider: aca` is deprecated. Use `provider: copilot` (or another supported model provider) with an ACA execution profile configured in your environment document. Running a workflow with `provider: aca` emits a one-time deprecation warning per run:
+> `provider: aca is deprecated; use provider: copilot with an ACA execution profile`
+> Existing workflows continue to work through a compatibility facade. See [Deprecation and Migration Guide](#deprecation-and-migration-guide) below.
 
 The `aca` provider is a thin host-side transport shim
 (`AcaRuntimeProvider`) that relocates an agent's *entire* execution — the
@@ -22,6 +19,7 @@ the source design:
 
 ## Table of Contents
 
+- [Deprecation and Migration Guide](#deprecation-and-migration-guide)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
 - [Provisioning a Pool](#provisioning-a-pool)
@@ -33,10 +31,110 @@ the source design:
   - [Inner Copilot Authentication](#inner-copilot-authentication)
 - [Workflow Configuration](#workflow-configuration)
 - [Capability Carve-outs](#capability-carve-outs)
-  - [Known Gaps (Runner MVP)](#known-gaps-runner-mvp)
+  - [Known Gaps and Image Versioning](#known-gaps-and-image-versioning)
 - [Cost Note](#cost-note)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
+
+## Deprecation and Migration Guide
+
+The `provider: aca` syntax is deprecated. Use a standard model provider (such as `copilot`, `openai`, or `claude`) along with an ACA execution profile.
+
+### Why Migrate?
+
+In earlier releases, selecting ACA entangled the model provider with the execution location. Choosing `provider: aca` forced Copilot inside the sandbox and mixed pool credentials into the workflow YAML.
+
+Execution profiles decouple what runs from where it runs. Workflows specify the model provider directly, while environment documents configure the ACA pool. This keeps credentials out of workflow definitions and makes running locally or in Azure a matter of passing `--environment`.
+
+Running a workflow with `provider: aca` prints a one-time deprecation warning:
+
+```
+provider: aca is deprecated; use provider: copilot with an ACA execution profile
+```
+
+### Migration Example
+
+#### Before: Legacy Provider Form
+
+```yaml
+workflow:
+  name: aca-coding-agent
+  runtime:
+    provider:
+      name: aca
+      pool_endpoint: https://my-pool.eastus.dynamicsessions.io
+      api_version: "2025-07-01"
+      inner_provider: copilot
+```
+
+#### After: Profile Form
+
+In your workflow file:
+
+```yaml
+workflow:
+  name: aca-coding-agent
+  runtime:
+    provider: copilot
+
+  defaults:
+    execution:
+      profile: azure_sandbox
+
+agents:
+  - name: implement
+    prompt: Implement feature
+    routes:
+      - to: $end
+```
+
+In your environment document (`.conductor/environments/azure.yaml`):
+
+```yaml
+default: azure_sandbox
+profiles:
+  azure_sandbox:
+    backend: aca
+    aca:
+      pool_endpoint: https://my-pool.eastus.dynamicsessions.io
+      api_version: "2025-07-01"
+      identifier_scope: agent
+      egress: enabled
+      lifecycle: timed
+      auth: azure_default
+```
+
+### Settings Mapping Table
+
+Use the following table to map fields from `runtime.provider` in legacy workflows to the `aca:` block in environment profiles:
+
+| Legacy Provider Field (`runtime.provider`) | Modern Environment Field (`profiles.<name>.aca`) |
+|---|---|
+| `pool_endpoint` | `pool_endpoint` |
+| `api_version` | `api_version` |
+| `identifier_scope` | `identifier_scope` |
+| `egress` | `egress` |
+| `lifecycle` | `lifecycle` |
+| `auth` | `auth` |
+| `inner_provider` | Set as the workflow or step `provider:` (e.g. `copilot`, `openai`, `claude`) |
+
+### `sandbox.*` Behavior Changes
+
+The `sandbox:` configuration block changes slightly under execution profiles:
+
+* **`sandbox.working_dir`**: Remains supported. It sets the working directory inside the container filesystem relative to `/workspace`.
+* **`sandbox.identifier_scope`**: Not allowed on agent steps that use an ACA execution profile. Configure `identifier_scope` on the profile's `aca` block in the environment document instead. Setting it on the agent step produces a validation error:
+  ```
+  Agent step '<name>' cannot set sandbox.identifier_scope on an ACA profile; set it on the profile's aca block.
+  ```
+
+### Legacy Preservation Notes
+
+Legacy workflows continue to run unchanged through a compatibility facade:
+
+1. **Exact Behavioral Equivalence**: The facade translates legacy configuration into the runner backend seam without altering request payloads, session identifiers, or event frames.
+2. **Protocol v1 Negotiated Compatibility**: When talking to older runner images reporting protocol version 1, the facade omits version 2 fields, ensuring zero compatibility regressions on existing deployments.
+3. **Graceful Interrupts on Rebuilt Images**: If you rebuild your runner image with protocol version 2, graceful interrupts revive for legacy workflows. Targeted interrupt signals reach the runner directly without destroying the remote sandbox session.
 
 ## Quick Start
 
@@ -324,38 +422,41 @@ you set as `runtime.provider.pool_endpoint` in your workflow YAML.
 ## Runner Contract
 
 The in-container `conductor-agent-runner` (`src/conductor/aca_runner/server.py`,
-shipped in-package with `conductor-cli` — no separate runner package)
-exposes two HTTP endpoints:
+shipped in-package with `conductor-cli`, with no separate runner package)
+exposes three HTTP endpoints:
 
 ### `GET /health`
 
-Readiness + version probe, used by `validate_connection()` to detect
-host/runner version skew and by the image's own `HEALTHCHECK`. Deliberately
-unauthenticated (issue #396) — the image's `HEALTHCHECK` sends no header at
-all, so gating this endpoint would break it.
+Readiness and version probe, used by `validate_connection()` to verify
+runner readiness and by the image's own `HEALTHCHECK`. Deliberately
+unauthenticated (issue #396), because the image's `HEALTHCHECK` sends no header,
+so gating this endpoint would break health checks.
 
 ```json
 {
   "ready": true,
   "conductor_version": "0.4.0",
   "runner_version": "0.1.0",
-  "protocol_version": 1,
+  "protocol_version": 2,
+  "features": ["interrupt"],
   "auth_required": false,
   "auth_token_present": false
 }
 ```
 
-- `protocol_version`: integer protocol version (currently 1) used for version
-  advertisement and warn-only host compatibility checks.
-- `auth_required` — whether the runner has `ACA_RUNNER_AUTH_TOKEN`
-  configured (the transport-token gate on `/execute` is opt-in — see
-  below).
-- `auth_token_present` — whether *a* `X-Conductor-Runner-Token` header
-  arrived on **this** request, never whether it matched. This is what
-  actually detects a gateway that strips custom headers: the caller already
-  knows whether it sent a header, so this leaks nothing and cannot be used
-  as a brute-force oracle. `validate_connection()` warns when this
-  disagrees with the host's own configured posture in either direction.
+- `protocol_version`: integer protocol version (currently 2, defined by
+  `RUNNER_PROTOCOL_VERSION` in `conductor.runner.protocol`) used for protocol
+  handshakes and version verification.
+- `features`: advertised capabilities list, including `"interrupt"` when the
+  runner supports targeted interruption.
+- `auth_required`: whether the runner has `ACA_RUNNER_AUTH_TOKEN`
+  configured (the transport-token gate on `/execute` is opt-in, see below).
+- `auth_token_present`: whether a `X-Conductor-Runner-Token` header
+  arrived on this request, never whether it matched. This detects a gateway
+  that strips custom headers. The caller already knows whether it sent a header,
+  so this leaks nothing and cannot be used as a brute-force oracle.
+  `validate_connection()` warns when this disagrees with the host's own
+  configured posture in either direction.
 
 ### `POST /execute?identifier=<id>&api-version=<v>`
 
@@ -419,6 +520,14 @@ provider is ever constructed. Request body:
   `X-Conductor-Runner-Token` header above is the actual runner-side
   authentication control.
 
+### `POST /interrupt`
+
+Signals an in-flight agent execution without cancelling its streaming response.
+New callers provide `execution_id` in a JSON request body for targeted
+signaling across concurrent tasks (handled in `aca_runner/server.py`).
+The legacy ACA gateway routes an empty POST by `identifier` query parameter
+to its active session.
+
 ## Wire Protocol
 
 The host and the in-sandbox runner communicate through the backend-neutral wire
@@ -434,15 +543,14 @@ The wire models include:
 - `RunnerHealthResponse` for `/health` readiness and version advertisement.
 - `RUNNER_TOKEN_HEADER` (`X-Conductor-Runner-Token`) for optional transport auth.
 
-The runner's `/health` endpoint additively advertises `protocol_version`
-(`RUNNER_PROTOCOL_VERSION = 1`). When the host connects, it inspects this
-field as part of a warn-only compatibility check. If the versions differ, the
-host logs a warning and continues running.
+The runner's `/health` endpoint advertises `protocol_version`
+(`RUNNER_PROTOCOL_VERSION = 2`). When the host connects, it inspects this
+field as part of the handshake. Docker agent realms require version 2, while
+the ACA adapter negotiates version 1 format when communicating with older images.
 
-`conductor.providers.aca_protocol` is a deprecated re-export shim that emits a
-`DeprecationWarning` upon import and will be removed in a future major release.
-All external callers and integrations should import from
-`conductor.runner.protocol` instead.
+Conductor has removed the obsolete `conductor.providers.aca_protocol` shim. All
+callers and integrations import wire models directly from
+`conductor.runner.protocol`.
 
 ## NDJSON Event Frame Schema
 
@@ -629,7 +737,7 @@ degraded mode and no in-sandbox failure.
 | `name` | `"aca"` | — | Selects the ACA provider. |
 | `pool_endpoint` | `str` | *(required)* | ACA dynamic-sessions pool management endpoint. **Must be `https://`** with a hostname and no query string / fragment — AAD bearer tokens and forwarded provider credentials (`inner_provider_settings`) are sent to this endpoint on every request, and `identifier` / `api-version` / the request path are appended to it; `conductor validate` rejects a plain-`http://` value, a bare `https://` with no host, or one that already carries `?query` / `#fragment`. |
 | `api_version` | `str` | `"2025-07-01"` | ACA management API version. |
-| `inner_provider` | `"copilot"` | `copilot` | SDK the in-sandbox runner drives. **MVP: `copilot` only** — `claude-agent-sdk` inside is a future extension; the bare `claude` (Anthropic-API) provider has no in-process tool runtime and is not valid here. |
+| `inner_provider` | `"copilot" \| "openai" \| "claude"` | `copilot` | SDK the in-sandbox runner drives. Supported inner providers: `copilot`, `openai`, and `claude`. Other providers (such as `claude-agent-sdk` or `hermes`) require follow-up implementations. |
 | `identifier_scope` | `workflow \| agent \| item \| none` | `agent` | Default granularity for *sequential* session reuse (see [Architecture](#architecture)). Concurrent units always diverge regardless. |
 | `egress` | `enabled \| disabled` | — | Advisory mirror of the pool's own `sessionNetworkConfiguration.status` (the pool governs actual egress). |
 | `lifecycle` | `timed \| on_container_exit` | — | Advisory mirror of the pool's session lifecycle mode. |
@@ -665,8 +773,8 @@ agents:
 | `agent_reasoning_events` | ✅ `True` | Runner forwards reasoning frames from the inner provider. |
 | `reasoning_effort` | ✅ Copilot's full tuple | Inner provider (Copilot) translates reasoning effort natively. |
 | `structured_output` | `prompt_injection` | Inherits the real `CopilotProvider` — Copilot has no native JSON mode. |
-| `interrupt` | ✅ `True` | Host-side: a real in-flight-stream interrupt is attempted, with a best-effort `DELETE {endpoint}/session` (session-deletion) call as a hard-abort fallback if the interrupt itself fails to send. **Known runner gap**: the shipped `conductor-agent-runner` (epic E4 MVP) does not yet expose the `/interrupt` endpoint the host calls, and ACA's session-delete data-plane operation is documented as unsupported for custom-container pools — so today neither fallback actually stops the *remote* execution. The host eventually gives up waiting on the stream and reports the turn `partial`, but this is **not instantaneous**: both cleanup calls use an explicit 10-second per-call timeout (overriding the client's longer connect/write/pool defaults), not a guaranteed immediate return. Either way, the sandbox call keeps running server-side until it finishes naturally or `max_session_seconds` elapses. See [Known Gaps](#known-gaps-runner-mvp). |
-| `max_session_seconds` | ✅ `True` | Best-effort only: the value is forwarded into the wrapped `CopilotProvider`'s own `IdleRecoveryConfig` wall-clock check inside the container, which is Copilot-internal timeout behavior, not a runner-enforced guarantee of remote termination. There is no *separate* runner-level guard watching the request. If the inner call hangs in a way that check doesn't catch, there is no independent runner-side backstop in the MVP. See [Known Gaps](#known-gaps-runner-mvp). |
+| `interrupt` | ✅ `True` | The in-container runner implements `POST /interrupt` with per-execution targeting. On protocol version 2 images, graceful in-flight interrupt revives for remote agents. On older protocol version 1 images lacking the `/interrupt` feature, the host degrades to aborting stream reads with a single warning. |
+| `max_session_seconds` | ✅ `True` | Best-effort only: the value is forwarded into the wrapped provider's wall-clock check inside the container, which is Copilot-internal timeout behavior, not a runner-enforced guarantee of remote termination. There is no separate runner-level guard watching the request. If the inner call hangs in a way that check doesn't catch, there is no independent runner-side backstop. See [Known Gaps](#known-gaps-and-image-versioning). |
 | `checkpoint_resume` | ❌ **`False`** | Sessions are ephemeral with no volume mount; `conductor resume` re-runs the agent rather than restoring in-sandbox state. |
 | `usage_tracking` | ✅ `True` | The runner returns token counts (and `session_seconds`) on the terminal result frame. |
 | `concurrent_safe` | ✅ `True` | Mandatory concurrency discriminator in identifier derivation. |
@@ -687,38 +795,14 @@ non-premium ACA ingress (Phase 0 spike, issue #312). This is comfortably
 above the expected length of a single agent turn, but a turn that runs
 longer will still hit the cap — plan `max_session_seconds` accordingly.
 
-### Known Gaps (Runner MVP)
+### Known Gaps and Image Versioning
 
-The host-side `AcaRuntimeProvider` (epic E3) implements real interrupt
-signaling and declares `max_session_seconds` support, but the shipped
-`conductor-agent-runner` (epic E4 MVP) does not fully back either one
-yet:
+The runner supports graceful interrupts when running on protocol version 2 images:
 
-- **No `/interrupt` endpoint.** The host's in-stream interrupt (Esc /
-  Ctrl+G, or a dashboard Stop) POSTs to `<pool>/interrupt`, but the
-  runner doesn't implement that route, so the POST itself fails and the
-  host falls back to a best-effort `DELETE {endpoint}/session`
-  (session-deletion) call — which ACA documents as unsupported for
-  custom-container pools, so it's expected to fail too. Either way, the
-  host then gives up waiting on the stream and reports the turn
-  `partial`, but this handoff is **not immediate** — both cleanup calls
-  (the interrupt POST and the session-delete fallback) use an explicit
-  10-second per-call timeout rather than returning instantly. In practice, stopping an
-  `aca`-backed agent today eventually stops the *host* from waiting on
-  the stream but does **not** stop the sandbox from continuing to run
-  the turn server-side.
-- **No dedicated runner-level `max_session_seconds` guard.** The
-  declared value is forwarded straight into the wrapped
-  `CopilotProvider`'s own `IdleRecoveryConfig` wall-clock enforcement —
-  a **best-effort, Copilot-internal timeout**, not a runner-enforced
-  guarantee that the remote sandbox call actually terminates. There is
-  no independent runner-level timeout watching the `/execute` request
-  as a backstop if that inner enforcement doesn't fire (or is bypassed).
+- **Runner `/interrupt` support**: Protocol version 2 runner images implement `POST /interrupt` with per-execution targeting. When an interrupt is triggered, the runner signals the active inner provider and frames a partial result cleanly. On older protocol version 1 runner images lacking the `/interrupt` endpoint, the host falls back to aborting the stream read with a warning.
+- **No dedicated runner-level `max_session_seconds` guard**: The declared value is forwarded into the wrapped provider's wall-clock check inside the container. This operates as an inner SDK timeout rather than an independent runner-level watchdog.
 
-Both are tracked as follow-up work on the runner image, not the host
-transport. Until they land, plan conservative `max_session_seconds`
-values and treat a stopped `aca` workflow as "the host stopped waiting,"
-not "the sandbox stopped computing."
+When deploying custom runner images, rebuild from current Conductor sources to ensure protocol version 2 and the `/interrupt` feature are present.
 
 See [Experimental Providers](./experimental.md) for the general carve-out
 policy and promotion criteria.
@@ -968,18 +1052,11 @@ sessions to hit their cooldown. Note a 429 comes from the pool's front
 end, so the runner may never have been reached — the error message
 includes the raw response body to make that distinguishable.
 
-### Stopping the workflow doesn't stop the sandbox from running
+### Stopping the workflow on older runner images
 
-Expected for the MVP runner: interrupting an `aca`-backed agent eventually
-stops the host from waiting on the result — but not instantly; cleanup uses
-an explicit 10-second per-call timeout (for both the interrupt POST and the
-session-delete fallback, overriding the client's longer connect/write/pool
-defaults) since the shipped runner image has no `/interrupt` endpoint yet and its
-session-deletion fallback is documented as unsupported for custom-container
-pools. Either way, the remote sandbox call itself keeps running until it
-finishes naturally or Copilot's own best-effort, in-container
-`max_session_seconds` timeout catches it — there is no runner-side guarantee
-of remote termination. See [Known Gaps](#known-gaps-runner-mvp).
+On protocol version 2 runner images, interrupting an `aca`-backed agent sends a targeted request to `POST /interrupt` that halts the in-flight execution and frames partial results immediately.
+
+On older protocol version 1 runner images that lack the `/interrupt` endpoint, the host logs a warning and aborts reading from the response stream. In that case, the remote container execution may continue running until its inner SDK timeout expires. Rebuilding the runner image from the current Conductor release resolves this and enables graceful interrupt signaling.
 
 ### `working_dir` (or `sandbox.working_dir`) fails with a not-found error
 

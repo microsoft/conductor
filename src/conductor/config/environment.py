@@ -38,6 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError as PydanticValidationError
@@ -53,8 +54,7 @@ WarningSink = Callable[[str], None]
 """Sink for non-fatal diagnostics, mirroring ``skills.registry.WarningSink``."""
 
 # Execution backends compiled into this build of Conductor.
-# Widened to include "docker" runner backend.
-AVAILABLE_BACKEND_NAMES = frozenset({"local", "docker"})
+AVAILABLE_BACKEND_NAMES = frozenset({"local", "docker", "aca"})
 
 # Environment names map directly to ``<name>.yaml``, so the charset excludes
 # path separators and dots; anything outside it must be written as a path.
@@ -189,6 +189,11 @@ class DockerProfileOptions(BaseModel):
     image: str
     """Container image reference (tag or digest)."""
 
+    runner_image: str | None = None
+    """OCI reference of the agent-realm runtime image (an image with the conductor runner
+    installed); when set, the profile is agent-capable; script steps keep using ``image``.
+    """
+
     platform: Literal["linux/amd64", "linux/arm64"] | None = None
     """Target platform for the container image (None = auto-resolved by Docker)."""
 
@@ -222,6 +227,16 @@ class DockerProfileOptions(BaseModel):
         stripped = value.strip()
         if not stripped or bool(re.search(r"\s", stripped)):
             raise ValueError("image must be a non-empty string without whitespace")
+        return stripped
+
+    @field_validator("runner_image")
+    @classmethod
+    def _validate_runner_image(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped or bool(re.search(r"\s", stripped)):
+            raise ValueError("runner_image must be a non-empty string without whitespace")
         return stripped
 
     @field_validator("user")
@@ -261,6 +276,30 @@ class DockerProfileOptions(BaseModel):
         raise ValueError("tmpfs must be a boolean or size string (e.g. '1g', '512m')")
 
 
+class AcaProfileOptions(BaseModel):
+    """Connection and session policy for an ACA execution profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pool_endpoint: str
+    api_version: str | None = None
+    identifier_scope: Literal["workflow", "agent", "item", "none"] = "agent"
+    egress: Literal["enabled", "disabled"] | None = None
+    lifecycle: Literal["timed", "on_container_exit"] | None = None
+    auth: Literal["azure_default"] = "azure_default"
+
+    @field_validator("pool_endpoint")
+    @classmethod
+    def _validate_pool_endpoint(cls, value: str) -> str:
+        endpoint = value.strip()
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
+            raise ValueError(
+                "pool_endpoint must be an https:// URL with a hostname and no query or fragment"
+            )
+        return endpoint
+
+
 class ProfileDefinition(BaseModel):
     """One named execution profile inside an environment document."""
 
@@ -279,6 +318,9 @@ class ProfileDefinition(BaseModel):
 
     docker: DockerProfileOptions | None = None
     """Docker execution options, required if and only if backend is 'docker'."""
+
+    aca: AcaProfileOptions | None = None
+    """ACA execution options, required if and only if backend is 'aca'."""
 
     @field_validator("backend")
     @classmethod
@@ -302,6 +344,12 @@ class ProfileDefinition(BaseModel):
                 f"profile with backend '{self.backend}' cannot specify a "
                 "'docker' configuration block"
             )
+        if self.backend == "aca" and self.aca is None:
+            raise ValueError("profile with backend 'aca' requires an 'aca' configuration block")
+        if self.backend != "aca" and self.aca is not None:
+            raise ValueError(
+                f"profile with backend '{self.backend}' cannot specify an 'aca' configuration block"
+            )
         return self
 
     def model_dump(
@@ -314,6 +362,8 @@ class ProfileDefinition(BaseModel):
             dump.pop("inherit_control_environment", None)
         if dump.get("docker") is None:
             dump.pop("docker", None)
+        if dump.get("aca") is None:
+            dump.pop("aca", None)
         return dump
 
 
@@ -379,6 +429,10 @@ class EnvironmentDocument(BaseModel):
                     p.pop("inherit_control_environment", None)
                 if p.get("docker") is None:
                     p.pop("docker", None)
+                elif isinstance(p["docker"], dict) and p["docker"].get("runner_image") is None:
+                    p["docker"].pop("runner_image", None)
+                if p.get("aca") is None:
+                    p.pop("aca", None)
         return dump
 
 
@@ -424,6 +478,10 @@ def _document_digest(document: EnvironmentDocument) -> str:
                 p.pop("inherit_control_environment", None)
             if p.get("docker") is None:
                 p.pop("docker", None)
+            elif isinstance(p["docker"], dict) and p["docker"].get("runner_image") is None:
+                p["docker"].pop("runner_image", None)
+            if p.get("aca") is None:
+                p.pop("aca", None)
     return canonical_json_digest(dump)
 
 

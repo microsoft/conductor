@@ -7,11 +7,15 @@ import contextlib
 import os
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import cast
 from uuid import uuid4
 
+from conductor.exceptions import ConfigurationError
 from conductor.execution.types import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     CommandResult,
     CommandSpec,
     RunnerCapabilities,
@@ -82,6 +86,7 @@ class LocalRunnerBackend:
             sessions=False,
             shared_workspace=True,
             snapshots=False,
+            agent=True,
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
@@ -100,6 +105,27 @@ class LocalRunnerBackend:
         backends use this lifecycle point to clean up their execution realm.
         """
         del lease, outcome
+
+    async def run_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease | None,
+        *,
+        on_event: AgentEventSink | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+    ) -> AgentResult:
+        """Delegate an agent invocation to its in-process closure.
+
+        The closure already captures the event and interrupt signals, so this
+        backend deliberately does not consume on_event or interrupt_signal
+        itself. The returned result is passed through by identity without
+        serialization or reconstruction.
+        """
+        del spec, lease
+        if execute_local is None:
+            raise ConfigurationError("local agent execution requires execute_local")
+        return await execute_local()
 
     async def run_command(
         self,

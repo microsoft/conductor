@@ -212,15 +212,15 @@ class TestScopeVsPosition:
             _validate_explicit(config, _alpha_beta_environment(), tmp_path)
 
     def test_agent_step_with_secrets_is_reserved_until_step_7(self, tmp_path: Path) -> None:
-        # Requirement: any secret on a non-script step errors, mentioning step 7.
+        # Requirement: an agent cannot consume a script-scoped secret.
         config = _agent_config(_secret("alpha", "script", env="TOKEN"))
-        with pytest.raises(ConfigurationError, match=r"agent-scope delivery is reserved.*step 7"):
+        with pytest.raises(ConfigurationError, match="position requires scope 'agent'"):
             _validate_explicit(config, _alpha_beta_environment(), tmp_path)
 
     def test_script_step_rejects_agent_scope(self, tmp_path: Path) -> None:
-        # Requirement: explicit agent scope anywhere errors, mentioning step 7.
+        # Requirement: script steps cannot consume an agent-scoped secret.
         config = _script_config(_secret("alpha", "agent", env="TOKEN"))
-        with pytest.raises(ConfigurationError, match=r"agent-scope delivery is reserved.*step 7"):
+        with pytest.raises(ConfigurationError, match="position requires scope 'script'"):
             _validate_explicit(config, _alpha_beta_environment(), tmp_path)
 
     def test_mcp_server_rejects_script_scope(self, tmp_path: Path) -> None:
@@ -230,9 +230,11 @@ class TestScopeVsPosition:
             _validate_explicit(_mcp_config(server), _alpha_beta_environment(), tmp_path)
 
     def test_mcp_server_rejects_agent_scope(self, tmp_path: Path) -> None:
-        # Requirement: agent scope on an MCP server errors, mentioning step 7.
+        # Requirement: local MCP consumers cannot receive agent-scoped delivery.
         server = MCPServerDef(command="server", secrets=[_secret("alpha", "agent", env="TOKEN")])
-        with pytest.raises(ConfigurationError, match=r"agent-scope delivery is reserved.*step 7"):
+        with pytest.raises(
+            ConfigurationError, match="local agent runtime inherits the control environment"
+        ):
             _validate_explicit(_mcp_config(server), _alpha_beta_environment(), tmp_path)
 
     def test_script_step_rejects_header_delivery(self, tmp_path: Path) -> None:
@@ -287,7 +289,9 @@ class TestScopeVsPosition:
             ],
             output={"result": "{{ start.output.value }}"},
         )
-        with pytest.raises(ConfigurationError, match=r"for_each\.batch\.agent.*step 7"):
+        with pytest.raises(
+            ConfigurationError, match=r"for_each\.batch\.agent.*requires scope 'agent'"
+        ):
             _validate_explicit(config, _alpha_beta_environment(), tmp_path)
 
 

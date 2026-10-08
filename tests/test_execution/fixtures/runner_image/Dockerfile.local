@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+COPY pyproject.toml README.md /src/
+COPY src /src/src
+COPY plugins /src/plugins
+RUN pip install --no-cache-dir /src
+RUN useradd --create-home runner && mkdir /workspace && chown runner:runner /workspace
+COPY tests/test_execution/fixtures/runner_image/sitecustomize.py /opt/realm-fixture/sitecustomize.py
+ENV PYTHONPATH=/opt/realm-fixture
+WORKDIR /workspace
+USER runner

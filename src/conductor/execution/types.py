@@ -13,8 +13,9 @@ the original exception for ``raise ... from ...`` chaining.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 CommandOutcome = Literal["completed", "command_not_found", "start_failed", "timed_out"]
 """Outcome of a single command execution.
@@ -45,11 +46,19 @@ class BundleRef:
         root: Logical directory of the root workflow relative to ``tree/``
             (e.g. ``main`` or ``registry/name/sha``). Defaults to ``main``
             for existing callers.
+        source_roots: Ephemeral host directory and staged namespace pairs used
+            to translate agent working directories. Never part of a bundle digest.
+        agent_paths: Ephemeral host dependency directory and staged namespace
+            pairs used to verify agent components against the collected closure.
     """
 
     digest: str
     store_path: str
     root: str = "main"
+    source_roots: tuple[tuple[str, str], ...] = ()
+    """Host directory and staged namespace pairs for runtime path translation."""
+    agent_paths: tuple[tuple[str, str], ...] = ()
+    """Host skill/plugin directory and its collected staged namespace."""
 
 
 @dataclass(frozen=True)
@@ -261,9 +270,71 @@ class RunnerCapabilities:
             caller (a lease may be threaded through).
         snapshots: The backend can snapshot and restore workspaces
             (reserved for a later contract revision).
+        agent: The backend can execute one agent invocation.
+        interrupt: The backend can interrupt an in-flight agent invocation.
     """
 
     batch: bool
     sessions: bool
     shared_workspace: bool
     snapshots: bool
+    agent: bool = False
+    interrupt: bool = False
+
+
+AgentEventSink = Callable[[str, Mapping[str, Any]], None]
+"""Synchronous sink for an agent event name and its structured payload."""
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    """Resolved, transport-neutral inputs for one agent invocation.
+
+    Fields are additive-only. Backends declare through their capabilities which
+    fields they honor; placement-specific transport details belong in adapters,
+    not in this contract.
+    """
+
+    name: str
+    execution_id: str
+    model_provider: str
+    model: str | None
+    rendered_prompt: str
+    system_prompt: str | None = None
+    output_schema: Mapping[str, Any] | None = None
+    tools: tuple[str, ...] | None = None
+    mcp_servers: Mapping[str, Any] | None = None
+    context: Mapping[str, Any] = field(default_factory=dict)
+    skill_directories: tuple[str, ...] = ()
+    custom_agents: tuple[Mapping[str, Any], ...] = ()
+    env_overlay: Mapping[str, str] | None = field(default=None, repr=False)
+    provider_credentials: Mapping[str, Any] | None = field(default=None, repr=False)
+    tool_output: Mapping[str, Any] | None = None
+    reasoning_effort: str | None = None
+    max_agent_iterations: int | None = None
+    max_session_seconds: float | None = None
+    working_dir: str | None = None
+    retry: Mapping[str, Any] | None = None
+    context_tier: str | None = None
+    execution: ResolvedExecutionSpec | None = None
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    """Data-shaped result of one agent invocation.
+
+    ``raw_response`` and ``continuation_state`` are opaque, local-only values;
+    neither is part of any serialized contract.
+    """
+
+    content: Mapping[str, Any]
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    last_call_input_tokens: int | None = None
+    session_seconds: float | None = None
+    partial: bool = False
+    raw_response: object | None = field(default=None, repr=False)
+    continuation_state: object | None = None

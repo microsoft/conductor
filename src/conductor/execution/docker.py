@@ -21,14 +21,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePath
 from typing import cast
 from uuid import uuid4
 
+from conductor.exceptions import ConfigurationError
+from conductor.execution.docker_agent import stream_agent
+from conductor.execution.docker_paths import map_agent_paths
 from conductor.execution.errors import ExecutionSpecError
 from conductor.execution.types import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     BundleRef,
     CommandResult,
     CommandSpec,
@@ -79,6 +85,12 @@ class _LeaseState:
     run: RunSpec
 
 
+@dataclass(frozen=True)
+class _RunnerState:
+    name: str
+    features: frozenset[str]
+
+
 class _DockerFailure(RuntimeError):
     pass
 
@@ -87,6 +99,13 @@ def _bounded(value: str) -> str:
     if len(value) <= _BOUNDED_OUTPUT_CHARS:
         return value
     return value[-_BOUNDED_OUTPUT_CHARS:]
+
+
+def _runner_rebuild_error(image: str, detail: str) -> ConfigurationError:
+    return ConfigurationError(
+        f"Docker runner image {image!r} {detail}. Protocol 2 is required. "
+        "Rebuild the runner image from this Conductor version."
+    )
 
 
 def _decode(value: bytes) -> str:
@@ -257,6 +276,34 @@ def _map_working_dir(value: str | None, root: str = "main") -> str:
     return mapped
 
 
+def _container_options(execution: ResolvedExecutionSpec) -> list[str]:
+    """Build the shared creation flags for script and agent containers."""
+    argv: list[str] = []
+    if execution.init:
+        argv.append("--init")
+    if execution.read_only:
+        argv.append("--read-only")
+    if execution.cap_drop_all:
+        argv.append("--cap-drop=ALL")
+    if execution.no_new_privileges:
+        argv.append("--security-opt=no-new-privileges")
+    if execution.tmpfs is True:
+        argv.extend(("--tmpfs", "/tmp"))
+    elif isinstance(execution.tmpfs, str):
+        argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
+    for flag, value in (
+        ("--network", execution.network),
+        ("--platform", execution.platform),
+        ("--user", execution.user),
+        ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
+        ("--memory", execution.memory),
+        ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
+    ):
+        if value is not None:
+            argv.extend((flag, value))
+    return argv
+
+
 class DockerRunnerBackend:
     """Run commands in short-lived containers over a run-scoped named volume."""
 
@@ -268,14 +315,246 @@ class DockerRunnerBackend:
         self._staged: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._closed_leases: set[tuple[str, str]] = set()
         self._attempts: dict[tuple[str, str], int] = {}
+        self._runners: dict[tuple[tuple[str, str], str, str], asyncio.Task[_RunnerState]] = {}
+        self._runner_cleanup: dict[tuple[tuple[str, str], str, str], asyncio.Task[None]] = {}
+        self._warned_missing_interrupt: set[str] = set()
 
     def capabilities(self) -> RunnerCapabilities:
-        """Declare Docker batch execution with a shared named-volume workspace."""
+        """Advertise interrupt only after every active runner confirmed the feature."""
+        interrupt = bool(self._runners) and all(
+            task.done()
+            and not task.cancelled()
+            and task.exception() is None
+            and "interrupt" in task.result().features
+            for task in self._runners.values()
+        )
         return RunnerCapabilities(
             batch=True,
             sessions=False,
             shared_workspace=True,
             snapshots=False,
+            agent=True,
+            interrupt=interrupt,
+        )
+
+    async def run_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease | None,
+        *,
+        on_event: AgentEventSink | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+    ) -> AgentResult:
+        """Execute against a lease-owned runner, invalidating it on cancellation."""
+        if execute_local is not None:
+            raise ConfigurationError("Docker agent execution does not accept a local closure")
+        if lease is None or lease.backend != "docker" or spec.execution is None:
+            raise ConfigurationError(
+                "Docker agent execution requires a Docker lease and runner image"
+            )
+        lease_state = self._lease_states.get(self._lease_key(lease))
+        if lease_state is None or lease_state.run.bundle is None:
+            raise ConfigurationError("Docker agent realm requires a published run bundle")
+        key = self._runner_key(lease, spec.execution)
+        try:
+            runner = await self._ensure_runner(lease, spec.execution)
+            return await self._execute_agent(spec, lease, runner, on_event, interrupt_signal)
+        except asyncio.CancelledError:
+            cleanup = self._runner_cleanup.get(key)
+            if cleanup is None:
+                cleanup = asyncio.create_task(self._invalidate_runner(lease, key))
+                self._runner_cleanup[key] = cleanup
+            await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+            raise
+
+    @staticmethod
+    def _runner_key(
+        lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> tuple[tuple[str, str], str, str]:
+        options = json.dumps(asdict(execution), sort_keys=True, separators=(",", ":"))
+        return (
+            DockerRunnerBackend._lease_key(lease),
+            execution.image,
+            hashlib.sha256(options.encode()).hexdigest(),
+        )
+
+    async def _ensure_runner(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> _RunnerState:
+        key = self._runner_key(lease, execution)
+        cleanup = self._runner_cleanup.get(key)
+        if cleanup is not None:
+            await asyncio.shield(cleanup)
+            if self._runner_cleanup.get(key) is cleanup:
+                self._runner_cleanup.pop(key, None)
+        if key[0] in self._closed_leases:
+            raise ConfigurationError("Docker lease is finalizing")
+        task = self._runners.get(key)
+        if task is None:
+            task = asyncio.create_task(self._start_runner(lease, execution))
+            self._runners[key] = task
+        try:
+            return await asyncio.shield(task)
+        except Exception:
+            if self._runners.get(key) is task:
+                self._runners.pop(key, None)
+            raise
+
+    async def _start_runner(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> _RunnerState:
+        await self._ensure_staged(lease, execution, None)
+        await self._ensure_image(execution, None)
+        name = f"conductor-{lease.lease_id[:8]}-runner-{uuid4().hex[:8]}"
+        argv = [
+            "create",
+            "--name",
+            name,
+            *self._label_args(self._labels(lease, "runner")),
+            *_container_options(execution),
+        ]
+        argv.extend(
+            (
+                "-v",
+                f"{self._volume_name(lease)}:/workspace",
+                "-w",
+                "/workspace",
+                "-e",
+                "ACA_RUNNER_HOST=127.0.0.1",
+                "-e",
+                "ACA_RUNNER_PORT=8080",
+                "--entrypoint",
+                "python",
+                execution.image,
+                "-m",
+                "conductor.aca_runner",
+            )
+        )
+        created = False
+        try:
+            rc, _stdout, stderr = await self._run_docker(argv)
+            if rc != 0:
+                raise ConfigurationError(f"Docker runner create failed: {_bounded(stderr)}")
+            created = True
+            rc, _stdout, stderr = await self._run_docker(("start", name))
+            if rc != 0:
+                raise ConfigurationError(f"Docker runner start failed: {_bounded(stderr)}")
+            health = await self._bridge_health(name, execution.image)
+            version = health.get("protocol_version")
+            if version != 2:
+                raise _runner_rebuild_error(execution.image, f"reports protocol {version!r}")
+            if health.get("ready") is not True:
+                raise ConfigurationError(
+                    f"Docker runner image {execution.image!r} failed its readiness check. "
+                    "Check runner logs and rebuild or pull the runner image."
+                )
+            features = health.get("features")
+            return _RunnerState(
+                name=name,
+                features=frozenset(feature for feature in features if isinstance(feature, str))
+                if isinstance(features, list)
+                else frozenset(),
+            )
+        except BaseException:
+            if created:
+                cleanup = asyncio.create_task(self._cleanup_container(lease, name, kill=True))
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+            raise
+
+    async def _invalidate_runner(
+        self, lease: WorkspaceLease, key: tuple[tuple[str, str], str, str]
+    ) -> None:
+        task = self._runners.pop(key, None)
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            await _await_task_cleanup(cast(asyncio.Task[object], task))
+        if (
+            not task.cancelled()
+            and task.exception() is None
+            and not await self._cleanup_container(lease, task.result().name, kill=True)
+        ):
+            raise _DockerFailure("Previous Docker runner could not be removed")
+
+    async def _bridge_health(self, name: str, image: str) -> dict[str, object]:
+        rc, stdout, stderr = await self._run_docker(
+            ("exec", "-i", name, "python", "-m", "conductor.runner.bridge", "--health"),
+            stdin_bytes=b"",
+        )
+        if rc != 0:
+            if rc == _CLI_TIMEOUT_RC or any(
+                marker in stderr.lower()
+                for marker in (
+                    "cannot connect to the docker daemon",
+                    "error during connect",
+                    "is the docker daemon running",
+                )
+            ):
+                raise ConfigurationError(
+                    f"Docker runner health check failed for image {image!r}: {_bounded(stderr)}. "
+                    "Check Docker connectivity, then rebuild or pull the runner image."
+                )
+            raise _runner_rebuild_error(image, "has no usable protocol 2 bridge")
+        try:
+            health = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise _runner_rebuild_error(image, "returned invalid health JSON") from exc
+        if not isinstance(health, dict):
+            raise _runner_rebuild_error(image, "returned invalid health JSON")
+        return health
+
+    async def _execute_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease,
+        runner: _RunnerState,
+        on_event: AgentEventSink | None,
+        interrupt_signal: asyncio.Event | None,
+    ) -> AgentResult:
+        binary = self._resolved_binary()
+        if binary is None:
+            raise ConfigurationError("Docker CLI was not found")
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is None:
+            raise ConfigurationError("Docker lease was not prepared by this backend")
+        mapped = map_agent_paths(spec, state.run.bundle)
+
+        async def send_interrupt(execution_id: str) -> None:
+            rc, _stdout, stderr = await self._run_docker(
+                (
+                    "exec",
+                    "-i",
+                    runner.name,
+                    "python",
+                    "-m",
+                    "conductor.runner.bridge",
+                    "--interrupt",
+                    execution_id,
+                ),
+                stdin_bytes=b"",
+                timeout=15,
+            )
+            if rc != 0:
+                logger.warning("Docker runner interrupt failed: %s", _bounded(stderr))
+
+        if (
+            interrupt_signal is not None
+            and "interrupt" not in runner.features
+            and runner.name not in self._warned_missing_interrupt
+        ):
+            logger.warning("Docker runner does not advertise interrupt; stopping the stream only")
+            self._warned_missing_interrupt.add(runner.name)
+        return await stream_agent(
+            binary,
+            self._cli_env,
+            runner.name,
+            mapped,
+            on_event,
+            interrupt_signal,
+            "interrupt" in runner.features,
+            send_interrupt,
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
@@ -579,29 +858,7 @@ class DockerRunnerBackend:
             "io.conductor.step": spec.name or spec.command,
             "io.conductor.attempt": str(attempt),
         }
-        argv = ["create", "--name", name, *self._label_args(labels)]
-        if execution.init:
-            argv.append("--init")
-        if execution.read_only:
-            argv.append("--read-only")
-        if execution.cap_drop_all:
-            argv.append("--cap-drop=ALL")
-        if execution.no_new_privileges:
-            argv.append("--security-opt=no-new-privileges")
-        if execution.tmpfs is True:
-            argv.extend(("--tmpfs", "/tmp"))
-        elif isinstance(execution.tmpfs, str):
-            argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
-        for flag, value in (
-            ("--network", execution.network),
-            ("--platform", execution.platform),
-            ("--user", execution.user),
-            ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
-            ("--memory", execution.memory),
-            ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
-        ):
-            if value is not None:
-                argv.extend((flag, value))
+        argv = ["create", "--name", name, *self._label_args(labels), *_container_options(execution)]
         argv.extend(("-v", f"{self._volume_name(lease)}:/workspace"))
         state = self._lease_states.get(self._lease_key(lease))
         if state is None:
@@ -794,6 +1051,14 @@ class DockerRunnerBackend:
         del outcome
         key = self._lease_key(lease)
         self._closed_leases.add(key)
+        for runner_key, cleanup in tuple(self._runner_cleanup.items()):
+            if runner_key[0] == key:
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+                self._runner_cleanup.pop(runner_key, None)
+        for runner_key in tuple(self._runners):
+            if runner_key[0] == key:
+                cleanup = asyncio.create_task(self._invalidate_runner(lease, runner_key))
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
         task = self._staged.pop(key, None)
         caller = asyncio.current_task()
         cancelling_before = caller.cancelling() if caller is not None else 0
@@ -855,7 +1120,7 @@ class DockerRunnerBackend:
             self._warn_cleanup(lease, f"container {candidate} returned unverifiable metadata")
             return
         expected = self._labels(lease, cast(str, labels.get("io.conductor.resource")))
-        valid_resource = labels.get("io.conductor.resource") in {"exec", "scratch"}
+        valid_resource = labels.get("io.conductor.resource") in {"exec", "scratch", "runner"}
         valid_labels = valid_resource and all(labels.get(k) == v for k, v in expected.items())
         if not valid_labels or not isinstance(name, str) or _CONTAINER_NAME.match(name) is None:
             self._warn_cleanup(lease, f"container {candidate} failed label/name verification")

@@ -1,7 +1,6 @@
 """Tests for ``conductor.runner.protocol`` — the backend-neutral runner wire contract.
 
-These tests are the golden guard for the lift out of
-``conductor.providers.aca_protocol``: the wire format is FROZEN, so the
+These tests are the golden guard for the legacy wire format, so the
 key-set assertions below pin the exact ``model_dump(mode="json")`` shape of
 every model, and the cross-parse tests prove that renaming the classes did
 not change the on-the-wire field names either side already speaks.
@@ -66,10 +65,9 @@ class TestConstants:
     def test_runner_token_header_value(self) -> None:
         assert RUNNER_TOKEN_HEADER == "X-Conductor-Runner-Token"
 
-    # Requirement: the wire protocol starts at version 1 — version
-    # advertisement was introduced together with this module.
-    def test_protocol_version_is_one(self) -> None:
-        assert RUNNER_PROTOCOL_VERSION == 1
+    # Requirement: request-side forbid requires a v2 pre-flight before new keys.
+    def test_protocol_version_is_two(self) -> None:
+        assert RUNNER_PROTOCOL_VERSION == 2
 
 
 class TestRoundTrips:
@@ -120,6 +118,20 @@ class TestRoundTrips:
         reparsed = RunnerAgentRequest.model_validate(request_to_wire_body(request))
         assert reparsed == request
 
+    # Requirement: existing ACA host calls with no v2 values stay valid on v1 images.
+    def test_legacy_host_request_does_not_send_null_v2_keys(self) -> None:
+        body = request_to_wire_body(_sample_request())
+        assert set(body) == {
+            "agent",
+            "rendered_prompt",
+            "tools",
+            "mcp_servers",
+            "context",
+            "inner_provider",
+            "inner_provider_settings",
+            "tool_output",
+        }
+
 
 class TestWireGoldenKeySets:
     """Frozen exact key sets of ``model_dump(mode="json")`` — the wire format.
@@ -157,6 +169,10 @@ class TestWireGoldenKeySets:
             "inner_provider",
             "inner_provider_settings",
             "tool_output",
+            "skill_directories",
+            "custom_agents",
+            "env_overlay",
+            "execution_id",
         }
 
     # Requirement: RunnerAgentResult serializes to exactly these keys — the
@@ -214,6 +230,7 @@ class TestWireGoldenKeySets:
             "protocol_version",
             "auth_required",
             "auth_token_present",
+            "features",
         }
 
     # Requirement: the default error message is the neutral runner wording,
@@ -224,7 +241,7 @@ class TestWireGoldenKeySets:
 
 class TestCrossParseLegacyWireNames:
     """A JSON literal written with the LEGACY wire field names (the exact
-    field names of ``conductor.providers.aca_protocol``) validates against
+    field names of the legacy ACA request validates against
     the new models — proving that renaming the classes did not change the
     wire."""
 
@@ -397,8 +414,19 @@ class TestSecretRedaction:
         body = request_to_wire_body(request)
         dump = request.model_dump(mode="json")
         for key in dump:
-            if key != "inner_provider_settings":
+            if key in body and key not in ("inner_provider_settings", "env_overlay"):
                 assert body[key] == dump[key]
+
+    # Requirement: a per-call overlay remains secret in every diagnostic dump.
+    def test_env_overlay_is_redacted_until_wire_serialization(self) -> None:
+        request = RunnerAgentRequest(
+            agent=_sample_payload(),
+            rendered_prompt="p",
+            env_overlay={"TOKEN": "spawn-only-secret"},
+        )
+        assert "spawn-only-secret" not in repr(request)
+        assert "spawn-only-secret" not in json.dumps(request.model_dump(mode="json"))
+        assert request_to_wire_body(request)["env_overlay"] == {"TOKEN": "spawn-only-secret"}
 
 
 class TestStrictnessModes:

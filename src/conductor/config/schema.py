@@ -2092,12 +2092,10 @@ class ProviderSettings(BaseModel):
     """ACA management API version (e.g. ``"2025-07-01"``). Aca-only."""
 
     inner_provider: Literal["copilot", "claude-agent-sdk"] | None = None
-    """SDK the in-sandbox runner drives. Aca-only.
+    """Legacy ACA provider's inner SDK selection; defaults to ``copilot``.
 
-    Defaults to ``"copilot"`` when ``name: aca`` and unset. **MVP: ``copilot``
-    only.** Claude-inside requires the containerizable ``claude-agent-sdk``
-    CLI; the bare ``claude`` (Anthropic-API) provider has no in-process tool
-    runtime and is not a valid inner provider.
+    In the profile form, ``aca`` selects placement rather than the model:
+    the agent's provider (copilot, openai, or claude) supplies the SDK.
     """
 
     identifier_scope: Literal["workflow", "agent", "item", "none"] | None = None

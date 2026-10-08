@@ -1,8 +1,7 @@
 """FastAPI app implementing the `conductor-agent-runner` remote runtime.
 
 `conductor-agent-runner` (built from ``docker/aca-runner/Dockerfile``) is the
-reference remote agent runtime. It wraps a real ``CopilotProvider`` (the only
-supported ``inner_provider`` for the MVP, per *DD2* / *Open Questions*) behind
+reference remote agent runtime. It hosts the selected model provider behind
 the wire contract shared with the host-side
 :class:`~conductor.providers.aca.AcaRuntimeProvider` and defined in
 :mod:`conductor.runner.protocol`:
@@ -11,16 +10,14 @@ the wire contract shared with the host-side
   ``validate_connection()`` can detect host/runner version skew.
 - ``POST /execute`` — deserializes a
   :class:`~conductor.runner.protocol.RunnerAgentRequest`, runs the inner
-  ``CopilotProvider.execute()``, and streams the result back as
+  ``AgentProvider.execute()``, and streams the result back as
   ``application/x-ndjson``: one ``{"type": ..., "data": ...}`` line per SDK
   event, terminated by a ``result`` (or ``error``) frame.
 
-Not built here: a dedicated ``/interrupt`` endpoint (the host's in-stream
-interrupt currently has nothing to land on inside this runner) and a
-runner-side ``max_session_seconds`` wall-clock guard (the capability is
-declared "as runner-enforced" by E3, but no task has assigned building the
-guard itself). Both are tracked as follow-up gaps rather than implemented
-here.
+- ``POST /interrupt`` — signals a named in-flight agent invocation; its
+  partial result uses the existing terminal result frame.
+
+The runner-side ``max_session_seconds`` wall-clock guard remains a follow-up.
 """
 
 from __future__ import annotations
@@ -32,13 +29,15 @@ import json
 import logging
 import shutil
 import time
-from collections.abc import AsyncIterator
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic import ValidationError as PydanticValidationError
 
 from conductor import __version__ as _conductor_version
@@ -58,7 +57,11 @@ from conductor.config.schema import (
     ToolOutputConfig,
 )
 from conductor.exceptions import ProviderError
+from conductor.providers.base import AgentProvider
+from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider
+from conductor.providers.openai import OpenAIProvider
+from conductor.redaction import RunRedactor
 from conductor.runner.protocol import (
     RUNNER_PROTOCOL_VERSION,
     RunnerAgentPayload,
@@ -79,6 +82,10 @@ logger = logging.getLogger(__name__)
 # `conductor-cli` releases (the runner ships as a base image, not a wheel
 # release train).
 RUNNER_VERSION = "0.1.0"
+
+
+class _InterruptRequest(BaseModel):
+    execution_id: str = Field(min_length=1)
 
 
 def _frame(event_type: str, data: dict[str, Any]) -> bytes:
@@ -124,6 +131,7 @@ def _build_agent(payload: RunnerAgentPayload) -> AgentDef:
         output=output,
         max_agent_iterations=payload.max_agent_iterations,
         max_session_seconds=payload.max_session_seconds,
+        timeout_seconds=None,
         reasoning=reasoning,
         working_dir=payload.working_dir,
         retry=retry,
@@ -151,7 +159,7 @@ def _check_stdio_binaries(mcp_servers: dict[str, Any] | None) -> None:
             missing.append(f"{name!r} (command={command!r})")
     if missing:
         raise ProviderError(
-            "aca runner: declared stdio MCP server binary not found in the runner "
+            "runner: declared stdio MCP server binary not found in the runner "
             f"image: {'; '.join(missing)}.",
             suggestion=(
                 "Extend the conductor-agent-runner base image (`FROM "
@@ -180,10 +188,11 @@ def _validate_execute_request(
     mid-stream failure from) `_build_agent` a second time after the response
     has already started streaming.
     """
-    if request.inner_provider != "copilot":
+    if request.inner_provider not in ("copilot", "openai", "claude"):
         raise ProviderError(
-            f"aca runner: unsupported inner_provider {request.inner_provider!r}; "
-            "the MVP runner only drives 'copilot'.",
+            f"runner: unsupported inner_provider {request.inner_provider!r}; "
+            "supported providers: copilot, openai, claude. "
+            "Other providers require a follow-up implementation.",
             provider_name="aca",
             is_retryable=False,
         )
@@ -192,6 +201,36 @@ def _validate_execute_request(
         request.inner_provider_settings, allowed_base_urls=allowed_base_urls
     )
     return _build_agent(request.agent)
+
+
+def _mcp_servers_for_request(request: RunnerAgentRequest) -> dict[str, Any] | None:
+    """Copy stdio configurations and add only this call's MCP spawn environment."""
+    servers = request.mcp_servers
+    overlay = request.env_overlay
+    if not overlay:
+        return servers
+    if not servers or not any(
+        isinstance(config, dict) and config.get("type", "stdio") == "stdio"
+        for config in servers.values()
+    ):
+        raise ProviderError(
+            "runner: env_overlay requires at least one stdio MCP server in this request",
+            provider_name="aca",
+            is_retryable=False,
+        )
+    values = {
+        name: value.get_secret_value() if isinstance(value, SecretStr) else value
+        for name, value in overlay.items()
+    }
+    return {
+        name: {
+            **config,
+            "env": {**(config.get("env") or {}), **values},
+        }
+        if isinstance(config, dict) and config.get("type", "stdio") == "stdio"
+        else config
+        for name, config in servers.items()
+    }
 
 
 def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str, Any]:
@@ -214,76 +253,106 @@ def _result_frame_data(output: AgentOutput, session_seconds: float) -> dict[str,
     return payload
 
 
+@dataclass
+class _ProviderEntry:
+    provider: AgentProvider
+    active: int = 0
+
+
 class _InnerProviderCache:
-    """Constructs/reuses the inner `CopilotProvider` across `/execute` calls.
+    """Keep provider instances by complete config until idle eviction.
 
-    Reconstructing a `CopilotProvider` on every call would spawn a fresh
-    nested `copilot` process per request. `mcp_servers` / `inner_provider_settings`
-    / `tool_output` are only settable at construction time (unlike per-agent
-    `tools:`, which `execute()` takes per-call), so this caches by those three
-    fields and only rebuilds the provider when one of them actually changes
-    between requests — closing the stale instance first.
-
-    `get()` is guarded by an `asyncio.Lock` (review fix): concurrent
-    `/execute` requests that land while the cached settings are changing
-    would otherwise race on the read-check-close-rebuild sequence below —
-    each concurrent caller sees the same stale `self._provider`/`self._key`,
-    so more than one would call `close()` on the same instance (a double
-    close) and/or construct a provider that never gets tracked (and thus
-    never closed). The lock serializes the whole check-and-maybe-rebuild
-    critical section so only one coroutine at a time can decide whether a
-    rebuild is needed and perform it.
+    Concurrent requests with different overlays cannot share an instance,
+    nor can changing settings close a provider with an active execution.
     """
 
+    _MAX_IDLE_ENTRIES = 16
+
     def __init__(self) -> None:
-        self._provider: CopilotProvider | None = None
-        self._key: str | None = None
+        self._entries: OrderedDict[str, _ProviderEntry] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._idle = asyncio.Condition(self._lock)
+        self._closing = False
 
     @staticmethod
     def _key_for(
         mcp_servers: dict[str, Any] | None,
         inner_provider_settings: dict[str, Any] | None,
         tool_output: dict[str, Any] | None,
+        *,
+        inner_provider: str = "copilot",
+        env_overlay: dict[str, str] | None = None,
     ) -> str:
-        # Epic E8 (`runner/protocol.py`'s `_redact_inner_provider_secrets`)
-        # wraps known credential keys in `SecretStr` on every
-        # `RunnerAgentRequest`
-        # construction path, including this model's own FastAPI request
-        # parsing — so `inner_provider_settings` may now hold `SecretStr`
-        # values here. `json.dumps(..., default=str)` would otherwise call
-        # `str()` on them, which is the same masked "**********" for every
-        # distinct credential — collapsing different requests' distinct
-        # credentials onto the same cache key and wrongly reusing a stale
-        # provider built with a *different* credential. Unwrap to the real
-        # secret value first so the key still reflects the actual credential.
-        unwrapped_settings = (
-            {
-                key: value.get_secret_value() if isinstance(value, SecretStr) else value
-                for key, value in inner_provider_settings.items()
-            }
-            if inner_provider_settings is not None
-            else None
-        )
+        def unwrap(value: Any) -> Any:
+            if isinstance(value, SecretStr):
+                return value.get_secret_value()
+            if isinstance(value, dict):
+                return {key: unwrap(item) for key, item in value.items()}
+            return value
+
         canonical = json.dumps(
             {
-                "mcp_servers": mcp_servers,
-                "inner_provider_settings": unwrapped_settings,
+                "inner_provider": inner_provider,
+                "mcp_servers": unwrap(mcp_servers),
+                "inner_provider_settings": unwrap(inner_provider_settings),
                 "tool_output": tool_output,
+                "env_overlay": unwrap(env_overlay),
             },
             sort_keys=True,
             default=str,
         )
-        # Review fix: `self._key` (below) is a long-lived instance attribute,
-        # not a local that goes out of scope after this call — retaining the
-        # canonical JSON verbatim would keep the plaintext credential resident
-        # in process memory for the cache's whole lifetime (readable by
-        # anything with introspection access to this object, e.g. a debugger
-        # or a future logging call that reprs the cache). Hash it instead so
-        # only a one-way digest is ever stored; distinct credentials still
-        # produce distinct keys (cache correctness is preserved) but neither
-        # plaintext value is recoverable from `self._key`.
+        # Retain only a digest of credentials and MCP spawn environment.
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _construct_provider(
+        inner_provider: str,
+        mcp_servers: dict[str, Any] | None,
+        inner_provider_settings: dict[str, Any] | None,
+        tool_output: dict[str, Any] | None,
+    ) -> AgentProvider:
+        settings = dict(inner_provider_settings or {})
+        github_token_value = settings.pop("github_token", None)
+        if github_token_value is not None and inner_provider != "copilot":
+            raise ProviderError(
+                "runner: github_token is only supported by the copilot inner provider",
+                provider_name="aca",
+                is_retryable=False,
+            )
+        github_token = (
+            github_token_value.get_secret_value()
+            if isinstance(github_token_value, SecretStr)
+            else github_token_value
+        )
+        provider_settings = (
+            ProviderSettings.model_validate({"name": inner_provider, **settings})
+            if settings
+            else None
+        )
+        tool_config = ToolOutputConfig(**tool_output) if tool_output else None
+        api_key = settings.get("api_key")
+        api_key_text = api_key.get_secret_value() if isinstance(api_key, SecretStr) else api_key
+        factories = {
+            "copilot": lambda: CopilotProvider(
+                mcp_servers=mcp_servers,
+                provider_settings=provider_settings,
+                tool_output=tool_config,
+                github_token=github_token,
+            ),
+            "openai": lambda: OpenAIProvider(
+                api_key=api_key_text,
+                base_url=settings.get("base_url"),
+                mcp_servers=mcp_servers,
+                tool_output=tool_config,
+            ),
+            "claude": lambda: ClaudeProvider(
+                api_key=api_key_text,
+                base_url=settings.get("base_url"),
+                mcp_servers=mcp_servers,
+                tool_output=tool_config,
+            ),
+        }
+        return factories[inner_provider]()
 
     async def get(
         self,
@@ -291,58 +360,76 @@ class _InnerProviderCache:
         mcp_servers: dict[str, Any] | None,
         inner_provider_settings: dict[str, Any] | None,
         tool_output: dict[str, Any] | None,
-    ) -> CopilotProvider:
-        key = self._key_for(mcp_servers, inner_provider_settings, tool_output)
+        inner_provider: str = "copilot",
+        env_overlay: dict[str, str] | None = None,
+        reserve: bool = False,
+    ) -> AgentProvider:
+        key = self._key_for(
+            mcp_servers,
+            inner_provider_settings,
+            tool_output,
+            inner_provider=inner_provider,
+            env_overlay=env_overlay,
+        )
         async with self._lock:
-            if self._provider is not None and key == self._key:
-                return self._provider
-            if self._provider is not None:
-                await self._provider.close()
+            if self._closing:
+                raise ProviderError("runner: provider cache is shutting down", provider_name="aca")
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _ProviderEntry(
+                    self._construct_provider(
+                        inner_provider, mcp_servers, inner_provider_settings, tool_output
+                    )
+                )
+                self._entries[key] = entry
+            self._entries.move_to_end(key)
+            if reserve:
+                entry.active += 1
+            await self._evict_idle(protected_key=key)
+            return entry.provider
 
-            # `inner_provider_settings` carries the credential forwarded by the
-            # host's `AcaRuntimeProvider._resolve_inner_provider_settings`
-            # (epic E8, DD4): either BYOK `base_url`/`api_key`/`bearer_token`
-            # (the existing Copilot custom-routing fields, unchanged), or a
-            # `github_token` for Copilot-capacity auth. `github_token` isn't a
-            # `ProviderSettings` field (it authenticates the SDK client itself,
-            # not per-session model routing), so it's popped out here and
-            # forwarded to `CopilotProvider`'s own `github_token` param (E9),
-            # which in turn passes it in memory on each `create_session` /
-            # `resume_session` call (see `CopilotProvider._apply_github_token`)
-            # rather than at `CopilotClient` construction. The remaining dict
-            # (if any) still builds the BYOK `ProviderSettings`, unchanged.
-            remaining_settings = dict(inner_provider_settings) if inner_provider_settings else {}
-            github_token_value = remaining_settings.pop("github_token", None)
-            github_token = (
-                github_token_value.get_secret_value()
-                if isinstance(github_token_value, SecretStr)
-                else github_token_value
+    async def _evict_idle(self, *, protected_key: str | None = None) -> None:
+        while len(self._entries) > self._MAX_IDLE_ENTRIES:
+            idle_key = next(
+                (
+                    key
+                    for key, entry in self._entries.items()
+                    if not entry.active and key != protected_key
+                ),
+                None,
             )
-            provider_settings = (
-                ProviderSettings(name="copilot", **remaining_settings)
-                if remaining_settings
-                else None
-            )
-            tool_output_config = ToolOutputConfig(**tool_output) if tool_output else None
-            self._provider = CopilotProvider(
-                mcp_servers=mcp_servers,
-                provider_settings=provider_settings,
-                tool_output=tool_output_config,
-                github_token=github_token,
-            )
-            self._key = key
-            return self._provider
+            if idle_key is None:
+                return
+            entry = self._entries.pop(idle_key)
+            await entry.provider.close()
+
+    async def release(self, provider: AgentProvider) -> None:
+        async with self._lock:
+            for entry in self._entries.values():
+                if entry.provider is provider:
+                    entry.active -= 1
+                    break
+            await self._evict_idle()
+            self._idle.notify_all()
 
     async def close(self) -> None:
-        async with self._lock:
-            if self._provider is not None:
-                await self._provider.close()
-                self._provider = None
-                self._key = None
+        async with self._idle:
+            self._closing = True
+            await self._idle.wait_for(
+                lambda: all(entry.active == 0 for entry in self._entries.values())
+            )
+            for entry in self._entries.values():
+                await entry.provider.close()
+            self._entries.clear()
 
 
 async def _stream_execute(
-    provider: CopilotProvider, agent: AgentDef, payload: RunnerAgentRequest
+    provider: AgentProvider,
+    agent: AgentDef,
+    payload: RunnerAgentRequest,
+    provider_cache: _InnerProviderCache,
+    interrupt_signal: asyncio.Event | None,
+    mark_terminal: Callable[[], None] | None = None,
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
 
@@ -358,9 +445,35 @@ async def _stream_execute(
     """
     queue: asyncio.Queue[Any] = asyncio.Queue()
     sentinel = object()
+    redactor = RunRedactor()
+    redactor.register(
+        value.get_secret_value() if isinstance(value, SecretStr) else value
+        for value in (payload.env_overlay or {}).values()
+    )
+    redactor.register(
+        value.get_secret_value()
+        for value in (payload.inner_provider_settings or {}).values()
+        if isinstance(value, SecretStr)
+    )
+    for server in (payload.mcp_servers or {}).values():
+        if not isinstance(server, dict):
+            continue
+        environment = server.get("env")
+        if isinstance(environment, dict):
+            redactor.register(
+                value.get_secret_value() if isinstance(value, SecretStr) else value
+                for value in environment.values()
+            )
+        headers = server.get("headers")
+        if server.get("type") in ("http", "sse") and isinstance(headers, dict):
+            redactor.register(
+                value.get_secret_value() if isinstance(value, SecretStr) else value
+                for name, value in headers.items()
+                if isinstance(name, str) and name.lower() == "authorization"
+            )
 
     def emit(event_type: str, data: dict[str, Any]) -> None:
-        queue.put_nowait(_frame(event_type, data))
+        queue.put_nowait(_frame(event_type, redactor.scrub(data)))
 
     async def run() -> None:
         start = time.monotonic()
@@ -371,13 +484,24 @@ async def _stream_execute(
                 payload.rendered_prompt,
                 tools=payload.tools,
                 event_callback=emit,
+                interrupt_signal=interrupt_signal,
+                skill_directories=payload.skill_directories,
+                custom_agents=payload.custom_agents,
+                extra_mcp_servers=None,
+                suppress_mcp_servers=payload.mcp_servers is None,
             )
         except Exception as exc:  # broad: forwarded as an error frame, never swallowed
-            logger.exception("aca runner: execute failed for agent %r", agent.name)
-            await queue.put(_frame("error", {"message": str(exc)}))
+            logger.error("runner: execute failed for agent %r (%s)", agent.name, type(exc).__name__)
+            frame = _frame("error", {"message": redactor.scrub(str(exc))})
+            if mark_terminal is not None:
+                mark_terminal()
+            await queue.put(frame)
         else:
             session_seconds = time.monotonic() - start
-            await queue.put(_frame("result", _result_frame_data(output, session_seconds)))
+            frame = _frame("result", redactor.scrub(_result_frame_data(output, session_seconds)))
+            if mark_terminal is not None:
+                mark_terminal()
+            await queue.put(frame)
         finally:
             await queue.put(sentinel)
 
@@ -391,8 +515,11 @@ async def _stream_execute(
     finally:
         if not task.done():
             task.cancel()
-        with contextlib.suppress(Exception):
-            await task
+        try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        finally:
+            await asyncio.shield(provider_cache.release(provider))
 
 
 def create_app() -> FastAPI:
@@ -407,6 +534,8 @@ def create_app() -> FastAPI:
     `monkeypatch` before calling `create_app()`.
     """
     provider_cache = _InnerProviderCache()
+    active_executions: dict[str, asyncio.Event] = {}
+    terminal_executions: set[str] = set()
     runner_token = resolve_runner_token()
     allowed_base_urls = resolve_allowed_base_urls()
 
@@ -445,16 +574,18 @@ def create_app() -> FastAPI:
         transport-token gate on `/execute` is the actual runner-side
         control.
 
-        `protocol_version` is the one additive wire change of the
-        ``conductor.runner.protocol`` lift: it is purely additive, so old
-        hosts ignore the unknown key and new hosts reading an old runner's
-        payload simply see the key absent.
+        Realm adapters enable interrupt only with protocol v2 and the
+        advertised interrupt feature. A v1/missing-feature handshake means
+        interrupt=False: interrupt-requiring configurations must be refused
+        before dispatch. Legacy ACA retains abort-read and its existing
+        version-skew warning. The consuming adapters implement that policy.
         """
         return {
             "ready": True,
             "conductor_version": _conductor_version,
             "runner_version": RUNNER_VERSION,
             "protocol_version": RUNNER_PROTOCOL_VERSION,
+            "features": ["interrupt"],
             "auth_required": runner_token is not None,
             "auth_token_present": http_request.headers.get(RUNNER_TOKEN_HEADER) is not None,
         }
@@ -494,21 +625,97 @@ def create_app() -> FastAPI:
         if not token_gate(presented, runner_token):
             return JSONResponse(
                 status_code=401,
-                content={"error": {"message": "aca runner: missing or invalid runner auth token"}},
+                content={"error": {"message": "runner: missing or invalid runner auth token"}},
             )
 
         try:
             agent = _validate_execute_request(payload, allowed_base_urls=allowed_base_urls)
+            mcp_servers = _mcp_servers_for_request(payload)
             provider = await provider_cache.get(
-                mcp_servers=payload.mcp_servers,
+                mcp_servers=mcp_servers,
                 inner_provider_settings=payload.inner_provider_settings,
                 tool_output=payload.tool_output,
+                inner_provider=payload.inner_provider,
+                env_overlay=payload.env_overlay,
+                reserve=True,
             )
         except (ProviderError, PydanticValidationError) as exc:
             return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
 
+        # Legacy ACA identifies an invocation by its gateway session identifier.
+        execution_id = payload.execution_id or identifier
+        if payload.execution_id is None and identifier is not None:
+            # An ACA gateway identifier names a reusable session, not a
+            # permanently unique invocation; completed sessions may run again.
+            terminal_executions.discard(identifier)
+        if execution_id is not None and (
+            execution_id in active_executions or execution_id in terminal_executions
+        ):
+            await provider_cache.release(provider)
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": "runner: execution_id already used"}},
+            )
+        interrupt_signal = asyncio.Event() if execution_id is not None else None
+        if execution_id is not None and interrupt_signal is not None:
+            active_executions[execution_id] = interrupt_signal
+
+        async def stream() -> AsyncIterator[bytes]:
+            def mark_terminal() -> None:
+                if execution_id is not None:
+                    terminal_executions.add(execution_id)
+
+            try:
+                async for frame in _stream_execute(
+                    provider, agent, payload, provider_cache, interrupt_signal, mark_terminal
+                ):
+                    yield frame
+            finally:
+                if execution_id is not None:
+                    _ = active_executions.pop(execution_id, None)
+                    terminal_executions.add(execution_id)
+
         return StreamingResponse(
-            _stream_execute(provider, agent, payload), media_type="application/x-ndjson"
+            stream(),
+            media_type="application/x-ndjson",
         )
+
+    @app.post("/interrupt")
+    async def interrupt_endpoint(
+        http_request: Request,
+        payload: _InterruptRequest | None = None,
+        identifier: str | None = None,
+        api_version: str | None = Query(default=None, alias="api-version"),
+    ) -> Response:
+        """Signal one agent without cancelling its streaming response.
+
+        New callers supply execution_id in JSON. The legacy ACA gateway
+        instead routes an empty POST by identifier to its active session.
+        """
+        presented = http_request.headers.get(RUNNER_TOKEN_HEADER)
+        if not token_gate(presented, runner_token):
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": "runner: missing or invalid runner auth token"}},
+            )
+        execution_id = payload.execution_id if payload is not None else identifier
+        if execution_id is None:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"message": "runner: execution_id is required"}},
+            )
+        signal = active_executions.get(execution_id)
+        if signal is None and execution_id not in terminal_executions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"message": "runner: execution_id not found"}},
+            )
+        if execution_id in terminal_executions or signal is None or signal.is_set():
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": "runner: execution already interrupted or terminal"}},
+            )
+        signal.set()
+        return Response(status_code=200)
 
     return app

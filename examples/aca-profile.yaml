@@ -1,0 +1,44 @@
+# ACA Execution Profile Example
+#
+# This example demonstrates running an agent step inside an Azure Container Apps
+# (ACA) dynamic session using an execution profile. This decouples the model
+# provider (copilot) from the remote execution backend (aca).
+#
+# Usage:
+#   # Validate against the docker-agent environment:
+#   conductor validate examples/aca-profile.yaml --environment examples/.conductor/environments/docker-agent.yaml
+#
+#   # Bare validation:
+#   conductor validate examples/aca-profile.yaml
+
+workflow:
+  name: aca-profile-demo
+  description: Demonstrates an agent executing inside an ACA dynamic session
+  version: "1.0.0"
+  entry_point: sandbox_worker
+
+  defaults:
+    execution:
+      profile: aca_sandbox
+
+  limits:
+    max_iterations: 10
+
+  runtime:
+    provider: copilot
+
+agents:
+  - name: sandbox_worker
+    description: Executes inside a remote ACA session sandbox
+    prompt: |
+      You are running inside an Azure Container Apps dynamic session sandbox.
+      Confirm that the session environment is active and describe its configuration.
+    output:
+      status:
+        type: string
+        description: Status of the sandbox environment
+    routes:
+      - to: $end
+
+output:
+  status: "{{ sandbox_worker.output.status }}"

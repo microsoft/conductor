@@ -367,8 +367,8 @@ def test_legacy_payload_without_script_steps_uses_all_backends_fallback() -> Non
     ids=["agent", "workflow", "mcp"],
 )
 def test_reserved_non_script_docker_profiles_fail(step: Any) -> None:
-    # Requirement: Docker remains reserved to scripts until agent realms arrive.
-    with pytest.raises(ConfigurationError, match="script steps only.*step 7"):
+    # Requirement: Docker agents need runner_image; workflow and MCP steps stay local.
+    with pytest.raises(ConfigurationError, match="docker.runner_image|requires the local backend"):
         compile_run_manifest(
             _config(step),
             workflow_path=None,

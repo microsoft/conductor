@@ -9,15 +9,30 @@ Skip discipline: every test depends on the ``docker_daemon`` fixture, which
 probes ``docker info`` once per module and skips with a clear reason when no
 daemon is available. A test that fails against a live daemon always FAILS --
 only the absence of the daemon itself may produce a skip.
+
+Local development: push the branch first, then build the base image with::
+
+    docker build --build-arg CONDUCTOR_VERSION=<pushed-sha> \
+      -t conductor-agent-realm:ci docker/aca-runner
+
+Set
+``CONDUCTOR_TEST_RUNNER_IMAGE=conductor-agent-realm:ci`` before running this module. The
+CI lane uses the pushed PR head SHA, never GitHub's synthetic merge commit.
+For an unpublished checkout, omit CONDUCTOR_TEST_RUNNER_IMAGE; the fixture
+builds fixtures/runner_image/Dockerfile.local with ``pip install /src`` from
+this checkout. That local variant does not prove the git-ref CI lane.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import os
 import subprocess
 import textwrap
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,9 +43,16 @@ import pytest
 from conductor.config.environment import resolve_environment
 from conductor.config.loader import load_config
 from conductor.engine.workflow import WorkflowEngine
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError
 from conductor.execution.docker import _STAGING_COPY_MODE, DockerRunnerBackend
-from conductor.execution.types import CommandSpec, ResolvedExecutionSpec, RunSpec
+from conductor.execution.types import (
+    AgentSpec,
+    BundleRef,
+    CommandSpec,
+    ResolvedExecutionSpec,
+    RunSpec,
+)
 
 # Pinned digest, resolved 2026-10-01 from docker.io/library/busybox:latest via
 # `docker pull busybox:latest` + `docker inspect --format '{{index .RepoDigests 0}}'`
@@ -43,6 +65,49 @@ BUSYBOX_TAG = "busybox:latest"
 pytestmark = pytest.mark.docker_integration
 
 _CLI_TIMEOUT_SECONDS = 180.0
+
+
+@pytest.fixture(scope="module")
+def runner_image(docker_daemon: str) -> Generator[str, None, None]:
+    """Build the test-only provider layer over the CI's SHA-pinned runner."""
+    del docker_daemon
+    base = os.environ.get("CONDUCTOR_TEST_RUNNER_IMAGE")
+    image = _unique("agent-fixture")
+    fixture_dir = Path(__file__).parent / "fixtures" / "runner_image"
+    if base:
+        command = [
+            "docker",
+            "build",
+            "-t",
+            image,
+            "--build-arg",
+            f"BASE_IMAGE={base}",
+            str(fixture_dir),
+        ]
+    else:
+        command = [
+            "docker",
+            "build",
+            "-t",
+            image,
+            "-f",
+            str(fixture_dir / "Dockerfile.local"),
+            str(Path(__file__).parents[2]),
+        ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"build test runner from {base or 'local context'}: {result.stderr}"
+    )
+    try:
+        yield image
+    finally:
+        subprocess.run(["docker", "image", "rm", "-f", image], capture_output=True, check=False)
 
 
 @pytest.fixture(scope="module")
@@ -602,3 +667,281 @@ async def test_e2e_timed_out_script_cleans_up_container_and_volume(
     assert volumes_after == volumes_before, (
         f"workspace volume leaked: before={volumes_before} after={volumes_after}"
     )
+
+
+def _agent_bundle(tmp_path: Path) -> tuple[BundleRef, Path]:
+    """Publish a minimal skill topology into the actual Docker staging layout."""
+    store = tmp_path / "bundle"
+    (store / "tree/main").mkdir(parents=True)
+    staged_skill = store / "tree/skills/review/SKILL.md"
+    staged_skill.parent.mkdir(parents=True)
+    text = "---\nname: review\ndescription: Runtime skill\n---\nSKILL_FROM_BUNDLE"
+    staged_skill.write_text(text, encoding="utf-8")
+    skill = tmp_path / "skills/review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(text, encoding="utf-8")
+    (store / "bundle.json").write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "logical_path": "tree/skills/review/SKILL.md",
+                        "digest": "sha256:" + hashlib.sha256(text.encode()).hexdigest(),
+                    }
+                ],
+                "skills_topology": {"review": "tree/skills/review/SKILL.md"},
+                "plugins_topology": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return (
+        BundleRef(
+            digest="sha256:realm-test",
+            store_path=str(store),
+            source_roots=((str(tmp_path), "main"),),
+            agent_paths=((str(skill), "skills/review"),),
+        ),
+        skill,
+    )
+
+
+async def _assert_realm_resources_gone(run_id: str) -> None:
+    for argv in (
+        ("ps", "-aq", "--filter", f"label=io.conductor.run_id={run_id}"),
+        ("volume", "ls", "-q", "--filter", f"label=io.conductor.run_id={run_id}"),
+    ):
+        rc, stdout, stderr = await _docker(*argv)
+        assert rc == 0, stderr
+        assert not stdout.strip(), f"orphaned Docker resource for {run_id}: {stdout}"
+
+
+@pytest.mark.asyncio
+async def test_agent_runner_reuses_container_and_reads_staged_skill_and_script_output(
+    docker_daemon: str, runner_image: str, tmp_path: Path
+) -> None:
+    # Requirement: script and agent share a volume; the agent opens the staged skill twice
+    # on the same persistent runner, and finalization leaves no labeled resources.
+    del docker_daemon
+    run_id = _unique("agent-volume")
+    bundle, skill = _agent_bundle(tmp_path)
+    backend = DockerRunnerBackend("docker")
+    lease = await backend.prepare_run(RunSpec(run_id=run_id, bundle=bundle))
+    try:
+        script = await backend.run_command(
+            CommandSpec(
+                command="sh",
+                args=("-c", "printf ARTIFACT_FROM_SCRIPT > /workspace/main/artifact.txt"),
+                execution=ResolvedExecutionSpec(image=PINNED_BUSYBOX),
+                inherit_control_environment=False,
+            ),
+            lease,
+        )
+        assert script.outcome == "completed" and script.exit_code == 0, (
+            script.start_error,
+            script.stderr,
+        )
+        spec = AgentSpec(
+            name="probe",
+            execution_id="first",
+            model_provider="copilot",
+            model=None,
+            rendered_prompt="read:",
+            execution=ResolvedExecutionSpec(image=runner_image),
+            skill_directories=(str(skill),),
+        )
+        first = await backend.run_agent(spec, lease)
+        runners = await _docker(
+            "ps",
+            "-q",
+            "--filter",
+            f"label=io.conductor.run_id={run_id}",
+            "--filter",
+            "label=io.conductor.resource=runner",
+        )
+        assert runners[0] == 0 and len(runners[1].splitlines()) == 1
+        runner = runners[1].strip()
+        rc, health, stderr = await _docker(
+            "exec", runner, "python", "-m", "conductor.runner.bridge", "--health"
+        )
+        assert rc == 0, stderr
+        assert json.loads(health)["protocol_version"] == 2
+        second = await backend.run_agent(
+            AgentSpec(
+                name="probe",
+                execution_id="second",
+                model_provider="copilot",
+                model=None,
+                rendered_prompt="read:",
+                execution=ResolvedExecutionSpec(image=runner_image),
+                skill_directories=(str(skill),),
+            ),
+            lease,
+        )
+        assert first.content == second.content
+        assert "ARTIFACT_FROM_SCRIPT" in first.content["answer"]
+        assert "SKILL_FROM_BUNDLE" in first.content["answer"]
+        assert (await _docker("ps", "-q", "--filter", f"id={runner}"))[1].strip() == runner
+    finally:
+        await backend.finalize_run(lease, "succeeded")
+    await _assert_realm_resources_gone(run_id)
+
+
+@pytest.mark.asyncio
+async def test_agent_interrupt_and_cancel_remove_owned_resources(
+    docker_daemon: str, runner_image: str, tmp_path: Path
+) -> None:
+    # Requirement: the bridge interrupt returns a partial result; outer cancellation
+    # invalidates its runner and a label-filtered sweep finds no orphaned resources.
+    del docker_daemon
+    run_id = _unique("agent-cancel")
+    bundle, _skill = _agent_bundle(tmp_path)
+    backend = DockerRunnerBackend("docker")
+    lease = await backend.prepare_run(RunSpec(run_id=run_id, bundle=bundle))
+    signal = asyncio.Event()
+    streamed = asyncio.Event()
+    spec = AgentSpec(
+        name="probe",
+        execution_id="interrupt-me",
+        model_provider="copilot",
+        model=None,
+        rendered_prompt="interrupt:",
+        execution=ResolvedExecutionSpec(image=runner_image),
+    )
+    try:
+        task = asyncio.create_task(
+            backend.run_agent(
+                spec, lease, interrupt_signal=signal, on_event=lambda _kind, _data: streamed.set()
+            )
+        )
+        await asyncio.wait_for(streamed.wait(), 30)
+        signal.set()
+        result = await asyncio.wait_for(task, 30)
+        assert result.partial is True and result.content == {"answer": "interrupted"}
+
+        streamed.clear()
+        task = asyncio.create_task(
+            backend.run_agent(
+                AgentSpec(
+                    name="probe",
+                    execution_id="cancel-me",
+                    model_provider="copilot",
+                    model=None,
+                    rendered_prompt="interrupt:",
+                    execution=ResolvedExecutionSpec(image=runner_image),
+                ),
+                lease,
+                on_event=lambda _kind, _data: streamed.set(),
+            )
+        )
+        await asyncio.wait_for(streamed.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await backend.finalize_run(lease, "cancelled")
+    await _assert_realm_resources_gone(run_id)
+
+
+@pytest.mark.asyncio
+async def test_agent_for_each_calls_overlap_on_one_runner(
+    docker_daemon: str,
+    runner_image: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: two for_each agents actually overlap (the fake waits for both
+    # arrivals before either may complete), using one persistent Docker runner.
+    del docker_daemon
+    from conductor.providers.copilot import CopilotProvider
+
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "fixture-credential")
+    environment_dir = tmp_path / ".conductor/environments"
+    environment_dir.mkdir(parents=True)
+    (environment_dir / "itest.yaml").write_text(
+        "default: local\nprofiles:\n  local:\n    backend: local\n"
+        "  container:\n    backend: docker\n    docker:\n"
+        f"      image: {PINNED_BUSYBOX}\n      runner_image: {runner_image}\n",
+        encoding="utf-8",
+    )
+    workflow = tmp_path / "overlap.yaml"
+    workflow.write_text(
+        "workflow:\n  name: overlap\n  entry_point: loop\n"
+        "  runtime:\n    provider: copilot\n"
+        "agents: []\nfor_each:\n  - name: loop\n    type: for_each\n"
+        "    source: workflow.input.items\n    as: item\n    max_concurrent: 2\n"
+        "    agent:\n      name: worker\n      prompt: 'overlap: {{ item }}'\n"
+        "      output:\n        answer:\n          type: string\n"
+        "      execution:\n        profile: container\n"
+        "    routes:\n      - to: $end\n"
+        "output:\n  count: '{{ loop.outputs | length }}'\n",
+        encoding="utf-8",
+    )
+    emitter = WorkflowEventEmitter()
+    events: list[WorkflowEvent] = []
+    emitter.subscribe(events.append)
+    engine = WorkflowEngine(
+        load_config(workflow),
+        CopilotProvider(mock_handler=lambda *_: {"answer": "HOST_FALLBACK"}),
+        workflow_path=workflow,
+        execution_environment=resolve_environment("itest", workflow_dir=tmp_path),
+        event_emitter=emitter,
+    )
+    volumes_before = await _workspace_volume_ids()
+    result = await asyncio.wait_for(engine.run({"items": ["a", "b"]}), 60)
+    assert result["count"] == 2
+    completed = [event for event in events if event.type == "for_each_item_completed"]
+    assert len(completed) == 2
+    assert all("HOST_FALLBACK" not in str(event.data) for event in completed)
+    assert await _workspace_volume_ids() == volumes_before
+    rc, containers, stderr = await _docker(
+        "ps", "-aq", "--filter", "label=io.conductor.resource=runner"
+    )
+    assert rc == 0 and not containers.strip(), stderr
+
+
+@pytest.mark.asyncio
+async def test_agent_realm_works_on_remote_docker_host(
+    docker_daemon: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: a remote daemon needs neither a published runner port nor a host bind mount.
+    del docker_daemon
+    remote = os.environ.get("CONDUCTOR_TEST_REMOTE_DOCKER_HOST")
+    if not remote:
+        pytest.skip("CONDUCTOR_TEST_REMOTE_DOCKER_HOST is not set")
+    monkeypatch.setenv("DOCKER_HOST", remote)
+    base = os.environ.get("CONDUCTOR_TEST_REMOTE_RUNNER_IMAGE", "conductor-agent-realm:ci")
+    image = _unique("remote-agent-image")
+    fixture_dir = Path(__file__).parent / "fixtures/runner_image"
+    rc, _stdout, stderr = await _docker(
+        "build",
+        "-t",
+        image,
+        "--build-arg",
+        f"BASE_IMAGE={base}",
+        str(fixture_dir),
+        timeout=300,
+    )
+    assert rc == 0, stderr
+    run_id = _unique("remote-agent")
+    bundle, _skill = _agent_bundle(tmp_path)
+    backend = DockerRunnerBackend("docker")
+    lease = await backend.prepare_run(RunSpec(run_id=run_id, bundle=bundle))
+    try:
+        result = await backend.run_agent(
+            AgentSpec(
+                name="probe",
+                execution_id="remote",
+                model_provider="copilot",
+                model=None,
+                rendered_prompt="read:",
+                execution=ResolvedExecutionSpec(image=image),
+            ),
+            lease,
+        )
+        assert result.content == {"answer": "|"}
+    finally:
+        await backend.finalize_run(lease, "succeeded")
+        await _docker("image", "rm", "-f", image)
+    await _assert_realm_resources_gone(run_id)

@@ -17,9 +17,10 @@ import tempfile
 import time as _time
 import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from conductor import redaction
 from conductor.billing import BillingMode, aggregate_label
@@ -44,6 +45,7 @@ from conductor.engine.execution_resolution import ExecutionResolver, ExecutionRe
 from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
+from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.run_manifest import executable_step_identity, script_step_backends
 from conductor.engine.secrets import SecretValueCache
@@ -64,7 +66,15 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
-from conductor.execution import BundleRef, RunnerBackend, RunOutcome, RunSpec, WorkspaceLease
+from conductor.execution import (
+    AgentSpec,
+    BundleRef,
+    ResolvedExecutionSpec,
+    RunnerBackend,
+    RunOutcome,
+    RunSpec,
+    WorkspaceLease,
+)
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -108,7 +118,7 @@ MAX_SUBWORKFLOW_DEPTH = 10
 
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Mapping
+    from collections.abc import Callable, Coroutine, Mapping
 
     from conductor.config.schema import (
         ForEachDef,
@@ -137,6 +147,40 @@ class RunContext:
     log_file: str = ""
     dashboard_port: int | None = None
     bg_mode: bool = False
+
+
+@dataclass(frozen=True)
+class AgentRealm:
+    """Placement fixed for an agent, its grader, and all re-executions."""
+
+    backend: RunnerBackend
+    lease: WorkspaceLease | None
+    execution: ResolvedExecutionSpec | None
+    env_overlay: Mapping[str, str]
+    credential_resolver: Callable[[str], Mapping[str, Any] | None]
+    image: str | None
+    name: str
+
+
+class _RealmKwargs(TypedDict, total=False):
+    execution_backend: RunnerBackend
+    workspace_lease: WorkspaceLease | None
+    resolved_execution: ResolvedExecutionSpec | None
+    agent_env_overlay: Mapping[str, str]
+    realm_credential_resolver: Callable[[str], Mapping[str, Any] | None]
+
+
+def _realm_kwargs(realm: AgentRealm | None) -> _RealmKwargs:
+    """Leave the historical call shape untouched for local agents."""
+    if realm is None:
+        return {}
+    return {
+        "execution_backend": realm.backend,
+        "workspace_lease": realm.lease,
+        "resolved_execution": realm.execution,
+        "agent_env_overlay": realm.env_overlay,
+        "realm_credential_resolver": realm.credential_resolver,
+    }
 
 
 @dataclass(frozen=True)
@@ -1850,6 +1894,40 @@ class WorkflowEngine:
                 "No provider configured for workflow execution",
                 suggestion="Provide either a provider or registry to WorkflowEngine",
             )
+
+    def _agent_realm(self, name: str, *, for_each_group: str | None = None) -> AgentRealm | None:
+        """Resolve placement once, retaining the identity for every follow-up."""
+        key = executable_step_identity(name, for_each_group=for_each_group)
+        profile = self._execution_resolver.manifest.profiles[key]
+        if profile.backend == "local":
+            return None
+        backend = self._execution_resolver.backend_for_step(name, for_each_group=for_each_group)
+        if not backend.capabilities().agent:
+            raise ConfigurationError(
+                f"Execution backend '{profile.backend}' does not support agent steps.",
+                suggestion="Use an agent-capable execution profile.",
+            )
+        execution = self._execution_resolver.execution_spec_for_step(
+            name, for_each_group=for_each_group
+        )
+        image = execution.image if execution is not None else None
+        if image is None and profile.backend == "docker":
+            docker = self._execution_session.environment.document.profiles[profile.profile].docker
+            image = docker.runner_image if docker is not None else None
+        return AgentRealm(
+            backend=backend,
+            lease=self._execution_session.lease_for_backend(profile.backend),
+            execution=execution,
+            env_overlay=self._execution_resolver.secret_env_for_step(
+                name, for_each_group=for_each_group
+            ),
+            credential_resolver=partial(
+                resolve_realm_credentials,
+                settings=self.config.workflow.runtime.provider,
+            ),
+            image=image,
+            name=profile.backend,
+        )
 
     async def _execute_script(
         self,
@@ -4986,6 +5064,7 @@ class WorkflowEngine:
         guidance_section: str | None,
         executor: AgentExecutor,
         agent_start_time: float,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput:
         """Handle partial output from a mid-agent interrupt.
 
@@ -5036,13 +5115,22 @@ class WorkflowEngine:
         self.add_user_guidance(interrupt_result.guidance, source="interrupt")
 
         # Try Copilot follow-up if provider supports it
-        followup = await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
+        followup = (
+            await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
+            if realm is None
+            else None
+        )
         if followup is not None:
             return followup
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
-        return await executor.execute(agent, agent_context, guidance_section=new_guidance_section)
+        return await executor.execute(
+            agent,
+            agent_context,
+            guidance_section=new_guidance_section,
+            **_realm_kwargs(realm),
+        )
 
     async def _handle_dialog(
         self,
@@ -5050,6 +5138,7 @@ class WorkflowEngine:
         output: AgentOutput,
         agent_context: dict[str, Any],
         executor: AgentExecutor,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput:
         """Handle dialog mode evaluation and conversation for an agent.
 
@@ -5117,7 +5206,10 @@ class WorkflowEngine:
             guidance_section += dialog_guidance
 
             new_output = await executor.execute(
-                agent, agent_context, guidance_section=guidance_section
+                agent,
+                agent_context,
+                guidance_section=guidance_section,
+                **_realm_kwargs(realm),
             )
             return new_output
 
@@ -5143,6 +5235,7 @@ class WorkflowEngine:
         guidance_section: str | None,
         event_callback: EventCallback | None,
         usage_label: str | None = None,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput:
         """Run an agent's ``validator:`` and, on failure, re-run the primary once.
 
@@ -5231,13 +5324,46 @@ class WorkflowEngine:
         # workflow — failing open on timeout rather than hanging. A direct
         # ``wait_for`` is used (not ``_execute_with_agent_timeout``) to avoid
         # emitting a misleading ``agent_timeout`` event for the primary agent.
-        validate_coro = self._output_validator.validate(
-            agent,
-            primary_prompt,
-            output.content,
-            provider,
-            interrupt_signal=self._interrupt_event,
-        )
+        if realm is None:
+            validate_coro = self._output_validator.validate(
+                agent,
+                primary_prompt,
+                output.content,
+                provider,
+                interrupt_signal=self._interrupt_event,
+            )
+        else:
+
+            def grader_spec(grader: AgentDef, prompt: str) -> AgentSpec:
+                grader_agent = (
+                    grader.model_copy(update={"sandbox": agent.sandbox})
+                    if realm.name == "aca"
+                    else grader
+                )
+                return replace(
+                    executor.build_realm_spec(
+                        grader_agent,
+                        prompt,
+                        {},
+                        tools=[],
+                        execution=realm.execution,
+                        env_overlay=realm.env_overlay,
+                        credential_resolver=realm.credential_resolver,
+                        backend_name=realm.lease.backend if realm.lease is not None else None,
+                    ),
+                    mcp_servers=None,
+                )
+
+            validate_coro = self._output_validator.validate(
+                agent,
+                primary_prompt,
+                output.content,
+                provider,
+                interrupt_signal=self._interrupt_event,
+                execution_backend=realm.backend,
+                workspace_lease=realm.lease,
+                spec_factory=grader_spec,
+            )
         try:
             if agent.timeout_seconds is not None:
                 outcome = await asyncio.wait_for(validate_coro, timeout=agent.timeout_seconds)
@@ -5316,6 +5442,7 @@ class WorkflowEngine:
                     continuation_state=continuation_state,
                     interrupt_signal=self._interrupt_event,
                     event_callback=event_callback,
+                    **_realm_kwargs(realm),
                 ),
             )
         except asyncio.CancelledError:
@@ -5624,6 +5751,7 @@ class WorkflowEngine:
                         resolved_agent: AgentDef | None = None
                         if isinstance(agent, AgentDef):
                             resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
+                        agent_realm = self._agent_realm(agent.name) if resolved_agent else None
                         event_provider = (
                             self._provider_name_for(resolved_agent)
                             if resolved_agent is not None
@@ -5652,6 +5780,9 @@ class WorkflowEngine:
                         }
                         if resolved_agent is not None:
                             started_payload["working_dir"] = resolved_agent.working_dir
+                            if agent_realm is not None:
+                                started_payload["execution_backend"] = agent_realm.name
+                                started_payload["realm_image"] = agent_realm.image
                             # Emitted alongside working_dir because it is a
                             # trust decision: settings_dir loads another
                             # repository's conventions and, when the session
@@ -6419,6 +6550,7 @@ class WorkflowEngine:
                                 guidance_section=guidance_section,
                                 interrupt_signal=self._interrupt_event,
                                 event_callback=event_callback,
+                                **_realm_kwargs(agent_realm),
                             ),
                         )
                         _agent_elapsed = _time.time() - _agent_start
@@ -6479,6 +6611,7 @@ class WorkflowEngine:
                                     guidance_section,
                                     executor,
                                     _agent_start,
+                                    agent_realm,
                                 )
                                 _agent_elapsed = _time.time() - _agent_start
 
@@ -6489,6 +6622,7 @@ class WorkflowEngine:
                                 output,
                                 agent_context,
                                 executor,
+                                agent_realm,
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
@@ -6502,6 +6636,7 @@ class WorkflowEngine:
                                 executor,
                                 guidance_section,
                                 event_callback,
+                                realm=agent_realm,
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
@@ -6529,6 +6664,14 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
+                                **(
+                                    {
+                                        "execution_backend": agent_realm.name,
+                                        "realm_image": agent_realm.image,
+                                    }
+                                    if agent_realm
+                                    else {}
+                                ),
                                 **_billing_mode_field(usage.billing_mode),
                                 **await self._context_window_fields(resolved_agent, output),
                             },
@@ -7511,6 +7654,7 @@ class WorkflowEngine:
                         "in a parallel group"
                     )
                 resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
+                realm = self._agent_realm(agent.name)
 
                 # LLM-only per-member start event: emitted only here (after the
                 # per-agent resolution) so ``working_dir`` is the resolved value;
@@ -7527,6 +7671,11 @@ class WorkflowEngine:
                         "native_otel_spans_active": self._native_otel_spans_active_for(
                             event_provider
                         ),
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                     },
                 )
 
@@ -7541,6 +7690,7 @@ class WorkflowEngine:
                         agent_context,
                         guidance_section=guidance_section,
                         event_callback=event_callback,
+                        **_realm_kwargs(realm),
                     ),
                 )
                 output_for_error = output
@@ -7556,6 +7706,7 @@ class WorkflowEngine:
                         executor,
                         guidance_section,
                         event_callback,
+                        realm=realm,
                     )
                     output_for_error = output
                     _agent_elapsed = _time.time() - _agent_start
@@ -7579,6 +7730,11 @@ class WorkflowEngine:
                         "input_tokens": output.input_tokens,
                         "output_tokens": output.output_tokens,
                         "cost_usd": usage.cost_usd,
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                         **_billing_mode_field(usage.billing_mode),
                         **await self._context_window_fields(resolved_agent, output),
                     },
@@ -8096,6 +8252,7 @@ class WorkflowEngine:
                 # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
                 # the path resolves to this iteration's value.
                 qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
+                realm = self._agent_realm(inline_agent.name, for_each_group=for_each_group.name)
 
                 # LLM-only per-item start event: emitted only here (after the
                 # per-item resolution) so ``working_dir`` is the resolved value;
@@ -8114,6 +8271,11 @@ class WorkflowEngine:
                         "provider": event_provider,
                         "native_otel_spans_active": self._native_otel_spans_active_for(
                             event_provider
+                        ),
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
                         ),
                     },
                 )
@@ -8145,6 +8307,7 @@ class WorkflowEngine:
                         agent_context,
                         guidance_section=guidance_section,
                         event_callback=event_callback,
+                        **_realm_kwargs(realm),
                     ),
                 )
                 _item_elapsed = _time.time() - _item_start
@@ -8160,6 +8323,7 @@ class WorkflowEngine:
                         guidance_section,
                         event_callback,
                         usage_label=f"{for_each_group.name}[{key}]",
+                        realm=realm,
                     )
                     _item_elapsed = _time.time() - _item_start
 
@@ -8183,6 +8347,11 @@ class WorkflowEngine:
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
                         "output": output.content,
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                         **_billing_mode_field(usage.billing_mode),
                     },
                 )
