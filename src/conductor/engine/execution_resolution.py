@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -37,6 +37,7 @@ from conductor.execution import (
     RunnerBackend,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 from conductor.execution.docker import DockerRunnerBackend
@@ -105,6 +106,10 @@ class ExecutionResolverSession:
         self.leases: dict[str, WorkspaceLease] = {}
         self._root_run_spec: RunSpec | None = None
         self._root_workflow_path: Path | None = None
+        self._resume_identities: Mapping[str, WorkspaceIdentity] | None = None
+        self._expect_staged: Mapping[str, bool] | None = None
+        self._claim_active = False
+        self._executed_backends: set[str] = set()
         self._ensure_lock = asyncio.Lock()
         self._owns_secrets = secret_cache is None
         if secret_cache is not None:
@@ -190,7 +195,27 @@ class ExecutionResolverSession:
                         )
                         run_spec = replace(run_spec, bundle=bundle)
                         self._root_run_spec = run_spec
-                    lease = await backend.prepare_run(run_spec)
+                    backend_spec = replace(
+                        run_spec,
+                        workspace_persistence=(
+                            run_spec.workspace_persistence
+                            if backend.capabilities().retained_workspace
+                            else None
+                        ),
+                    )
+                    identity = (self._resume_identities or {}).get(name)
+                    if identity is not None:
+                        lease = await backend.attach_run(
+                            backend_spec,
+                            identity,
+                            expect_staged=(self._expect_staged or {}).get(name, False),
+                        )
+                    else:
+                        if self._resume_identities is not None and not self._claim_active:
+                            raise ConfigurationError(
+                                f"Cannot prepare late backend {name!r} without a workspace claim."
+                            )
+                        lease = await backend.prepare_run(backend_spec)
                     self.leases[name] = lease
                 self.backends[name] = backend
 
@@ -199,8 +224,19 @@ class ExecutionResolverSession:
         run_spec: RunSpec,
         *,
         workflow_path: Path | None = None,
+        resume_identities: Mapping[str, WorkspaceIdentity] | None = None,
+        expect_staged: Mapping[str, bool] | None = None,
+        claim_active: bool = False,
     ) -> None:
-        """Prepare one lease per distinct backend, idempotently."""
+        """Prepare or attach one lease per distinct backend, idempotently."""
+        unknown = set(resume_identities or {}).difference(self.backends | BACKEND_FACTORIES)
+        if unknown:
+            raise ConfigurationError(
+                f"Workspace identities refer to unknown backends: {', '.join(sorted(unknown))}."
+            )
+        self._resume_identities = resume_identities
+        self._expect_staged = expect_staged
+        self._claim_active = claim_active
         self._root_run_spec = run_spec
         self._root_workflow_path = workflow_path
         leases_by_backend: dict[int, WorkspaceLease] = {
@@ -209,7 +245,23 @@ class ExecutionResolverSession:
         for name, backend in self.backends.items():
             lease = leases_by_backend.get(id(backend))
             if lease is None:
-                lease = await backend.prepare_run(run_spec)
+                backend_spec = replace(
+                    run_spec,
+                    workspace_persistence=(
+                        run_spec.workspace_persistence
+                        if backend.capabilities().retained_workspace
+                        else None
+                    ),
+                )
+                identity = (resume_identities or {}).get(name)
+                if identity is not None:
+                    lease = await backend.attach_run(
+                        backend_spec,
+                        identity,
+                        expect_staged=(expect_staged or {}).get(name, False),
+                    )
+                else:
+                    lease = await backend.prepare_run(backend_spec)
                 leases_by_backend[id(backend)] = lease
             self.leases[name] = lease
 
@@ -217,7 +269,32 @@ class ExecutionResolverSession:
         """Return the prepared lease for ``name``, if one exists."""
         return self.leases.get(name)
 
-    async def finalize_leases(self, outcome: RunOutcome) -> None:
+    def record_backend_execution(self, name: str) -> None:
+        """Remember a backend that executed a step in this run."""
+        self._executed_backends.add(name)
+
+    def executed_backends(self) -> frozenset[str]:
+        """Return the accumulated executed backend names."""
+        return frozenset(self._executed_backends)
+
+    def restore_executed_backends(self, names: Iterable[str]) -> None:
+        """Merge checkpoint history without erasing work in this process."""
+        self._executed_backends.update(names)
+
+    def workspace_identities(self) -> dict[str, WorkspaceIdentity]:
+        """Describe leases belonging to backends that support retention."""
+        return {
+            name: WorkspaceIdentity(
+                backend=lease.backend,
+                lease_id=lease.lease_id,
+                incarnation=lease.incarnation,
+                location=lease.location,
+            )
+            for name, lease in self.leases.items()
+            if self.backends[name].capabilities().retained_workspace
+        }
+
+    async def finalize_leases(self, outcome: RunOutcome, *, retain: bool = False) -> None:
         """Best-effort finalize every prepared lease without masking outcomes.
 
         Leases are detached before cleanup starts, preventing a repeated run
@@ -235,7 +312,9 @@ class ExecutionResolverSession:
             if id(backend) in finalized_backends:
                 continue
             finalized_backends.add(id(backend))
-            finalize_task = asyncio.ensure_future(backend.finalize_run(lease, outcome))
+            finalize_task = asyncio.ensure_future(
+                backend.finalize_run(lease, outcome, retain=retain)
+            )
             while True:
                 try:
                     await asyncio.shield(finalize_task)

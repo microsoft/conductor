@@ -201,4 +201,4 @@ profiles:
     code, output = _invoke(workflow)
     assert code == 0
     assert "mixes local and docker script backends" in output
-    assert "bundle snapshot collected before the run" in output
+    assert "bundle snapshot collected before the run" in " ".join(output.split())

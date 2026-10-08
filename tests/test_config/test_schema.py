@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -16,6 +18,7 @@ from conductor.config.schema import (
     LimitsConfig,
     OutputField,
     ReasoningConfig,
+    RestartConfig,
     RouteDef,
     RuntimeConfig,
     ScriptStepDef,
@@ -27,10 +30,86 @@ from conductor.config.schema import (
     WaitStepDef,
     WorkflowConfig,
     WorkflowDef,
+    WorkflowDefaults,
     WorkflowStepDef,
+    WorkspaceConfig,
 )
 
 _STEP_DEF_ADAPTER = TypeAdapter(StepDef)
+
+
+class TestWorkspaceAndRestartConfig:
+    """Requirement: workspace and restart policies parse only at their declared positions."""
+
+    def test_workspace_and_restart_parse_in_workflow_defaults_and_step(self) -> None:
+        # Requirement: workflow policy, defaults, and executable-step overrides are all parsed.
+        workflow = WorkflowDef.model_validate(
+            {
+                "name": "demo",
+                "entry_point": "a",
+                "workspace": {"mode": "isolated", "persistence": "durable"},
+                "defaults": {"restart": {"mode": "reuse"}},
+            }
+        )
+        defaults = WorkflowDefaults.model_validate({"restart": {"mode": "fail"}})
+        step = ScriptStepDef.model_validate(
+            {"name": "run", "command": "echo ok", "restart": {"mode": "reuse"}}
+        )
+        assert workflow.workspace is not None
+        assert (workflow.workspace.mode, workflow.workspace.persistence) == ("isolated", "durable")
+        assert workflow.defaults.restart is not None and workflow.defaults.restart.mode == "reuse"
+        assert defaults.restart is not None and defaults.restart.mode == "fail"
+        assert step.restart is not None and step.restart.mode == "reuse"
+
+    def test_defaults_and_legacy_dump_have_no_new_policy_keys(self) -> None:
+        # Requirement: omitted nullable policies preserve legacy dumps without workspace/restart.
+        workflow = WorkflowDef(name="legacy", entry_point="a")
+        dumped = workflow.model_dump(exclude_none=True)
+        assert workflow.workspace is None
+        assert not {"workspace", "restart"}.intersection(dumped)
+        assert "restart" not in WorkflowDefaults().model_dump(exclude_none=True)
+        assert "restart" not in ScriptStepDef(name="run", command="echo ok").model_dump(
+            exclude_none=True
+        )
+
+    @pytest.mark.parametrize(
+        ("model", "payload"),
+        [
+            (WorkspaceConfig, {"mode": "unknown"}),
+            (WorkspaceConfig, {"persistence": "unknown"}),
+            (WorkspaceConfig, {"extra": True}),
+            (RestartConfig, {"mode": "unknown"}),
+            (RestartConfig, {"extra": True}),
+        ],
+    )
+    def test_invalid_policy_value_or_extra_key_rejected(
+        self, model: type[Any], payload: dict[str, Any]
+    ) -> None:
+        # Requirement: invalid literals and unrecognized policy keys raise ValidationError.
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+
+    @pytest.mark.parametrize("workspace", ["shared", [], 3])
+    def test_workspace_null_and_wrong_types_rejected(self, workspace: Any) -> None:
+        # Requirement: an explicit workspace block must be a valid object, not null or another type.
+        with pytest.raises(ValidationError):
+            WorkflowDef.model_validate({"name": "demo", "entry_point": "a", "workspace": workspace})
+
+    def test_explicit_null_workspace_matches_omission(self) -> None:
+        # Requirement: null workspace is the legacy path, equivalent to an omitted block.
+        without = WorkflowDef.model_validate({"name": "demo", "entry_point": "a"})
+        with_null = WorkflowDef.model_validate(
+            {"name": "demo", "entry_point": "a", "workspace": None}
+        )
+        assert with_null.workspace is None
+        assert with_null == without
+
+    def test_explicit_null_restart_matches_omission(self) -> None:
+        # Requirement: null restart policies are equivalent to omitted policies at both scopes.
+        defaults = WorkflowDefaults.model_validate({"restart": None})
+        step = ScriptStepDef.model_validate({"name": "run", "command": "echo ok", "restart": None})
+        assert defaults == WorkflowDefaults()
+        assert step.restart is None
 
 
 def _assert_extra_forbidden(exc_info: pytest.ExceptionInfo[ValidationError], field: str) -> None:

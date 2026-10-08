@@ -125,6 +125,8 @@ conductor validate examples/docker-script.yaml --environment docker-demo
 conductor run examples/docker-script.yaml --environment docker-demo
 ```
 
+- [docker-workspace-retention.yaml](docker-workspace-retention.yaml) demonstrates Docker workspace retention on failure with a pinned image digest and restart policy.
+
 ## Run Bundles
 
 ### run-bundle.yaml

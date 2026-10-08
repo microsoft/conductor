@@ -20,8 +20,15 @@ from conductor.execution.docker import (
     _copy_tree_preserving_symlinks,
     _map_working_dir,
 )
-from conductor.execution.errors import ExecutionSpecError
-from conductor.execution.types import BundleRef, CommandSpec, ResolvedExecutionSpec, RunSpec
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
+from conductor.execution.types import (
+    BundleRef,
+    CommandSpec,
+    ResolvedExecutionSpec,
+    RunSpec,
+    WorkspaceIdentity,
+    WorkspaceLease,
+)
 
 
 def _write_fake(bin_dir: Path) -> str:
@@ -545,10 +552,11 @@ async def test_staging_layout_archive_copy_and_reentry(
     await asyncio.gather(backend.run_command(spec, lease), backend.run_command(spec, lease))
     records = _records(log)
     cp_rows = [row for row in records if row["argv"][0] == "cp"]
-    assert len(cp_rows) == 1
+    assert len(cp_rows) == 2
     assert cp_rows[0]["argv"][1] == "-a"
     assert cp_rows[0]["argv"][2].endswith("/.")
     assert cp_rows[0]["argv"][3].endswith(":/workspace")
+    assert cp_rows[1]["argv"][3].endswith(":/workspace/.conductor-staged")
     assert sum(row["argv"][:2] == ["volume", "create"] for row in records) == 1
 
 
@@ -1106,3 +1114,462 @@ async def test_engine_routes_docker_step_through_fake_cli(
     )
     assert create[-4:] == ["--entrypoint", "echo", "alpine:3.20", "hello-from-container"]
     assert any(argv[0] == "start" for argv in commands)
+
+
+@pytest.fixture
+def stateful_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[DockerRunnerBackend, Path, Path, str]:
+    """Use a disk-backed fake Docker daemon shared across backend instances."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    helper = Path(__file__).with_name("docker_fake_stateful.py")
+    if sys.platform == "win32":
+        wrapper = bin_dir / "docker.cmd"
+        wrapper.write_text(f'@"{sys.executable}" "{helper}" %*\n', encoding="utf-8")
+    else:
+        wrapper = bin_dir / "docker"
+        wrapper.write_text(
+            f"#!{sys.executable}\nexec(open({str(helper)!r}).read())\n", encoding="utf-8"
+        )
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    log = tmp_path / "stateful.jsonl"
+    store = tmp_path / "daemon"
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
+    monkeypatch.setenv("FAKE_DOCKER_STORE", str(store))
+    return DockerRunnerBackend(wrapper.name), log, store, wrapper.name
+
+
+def _stateful_commands(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def _stateful_bundle(tmp_path: Path, digest: str = "sha256:one") -> BundleRef:
+    tree = tmp_path / "bundle/tree/main"
+    tree.mkdir(parents=True)
+    (tree / "payload").write_text("payload", encoding="utf-8")
+    return BundleRef(digest, str(tmp_path / "bundle"))
+
+
+@pytest.mark.asyncio
+async def test_retain_attach_marker_across_backend_instances(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str], tmp_path: Path
+) -> None:
+    # Requirement: a new process verifies the stored marker without recopying
+    # or deleting retained data.
+    backend, log, _store, binary = stateful_docker
+    run = RunSpec("retained", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    spec = CommandSpec("true", execution=_minimal(), attempt_id="dispatch-uuid")
+    assert (await backend.run_command(spec, lease)).outcome == "completed"
+    await backend.finalize_run(lease, "succeeded", retain=True)
+    before = len(_stateful_commands(log))
+    second = DockerRunnerBackend(binary)
+    identity = WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+    attached = await second.attach_run(run, identity, expect_staged=True)
+    assert (await second.run_command(spec, attached)).outcome == "completed"
+    commands = _stateful_commands(log)[before:]
+    cp = [argv for argv in commands if argv[0] == "cp"]
+    assert len(cp) == 1 and cp[0][1].endswith(":/workspace/.conductor-staged")
+    assert not any(argv[:2] == ["volume", "create"] for argv in commands)
+    assert not any(argv[:2] == ["volume", "rm"] for argv in commands)
+    exec_create = next(argv for argv in commands if argv[0] == "create" and "--env-file" in argv)
+    assert "io.conductor.attempt_id=dispatch-uuid" in exec_create
+    assert "io.conductor.attempt=1" in exec_create
+    assert all(argv[0] != "cp" or argv[1] != "-a" for argv in commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expect_staged", [False, True])
+async def test_attach_missing_marker_policy(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+    tmp_path: Path,
+    expect_staged: bool,
+) -> None:
+    # Requirement: only an uncommitted owned workspace may be staged on first use.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec(
+        "missing-marker", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable"
+    )
+    lease = await backend.prepare_run(run)
+    second = DockerRunnerBackend(binary)
+    attached = await second.attach_run(
+        run,
+        WorkspaceIdentity("docker", lease.lease_id, lease.incarnation),
+        expect_staged=expect_staged,
+    )
+    before = len(_stateful_commands(log))
+    if expect_staged:
+        with pytest.raises(WorkspaceAttachError, match="marker"):
+            await second.run_command(CommandSpec("true", execution=_minimal()), attached)
+        commands = _stateful_commands(log)[before:]
+        assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
+    else:
+        result = await second.run_command(CommandSpec("true", execution=_minimal()), attached)
+        assert result.outcome == "completed"
+        assert (store / "volumes/conductor-ws-missing-marker/.conductor-staged").read_text() == (
+            run.bundle.digest if run.bundle is not None else ""
+        )
+        commands = _stateful_commands(log)[before:]
+        assert any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
+    assert not any(argv[:2] == ["volume", "rm"] for argv in commands)
+    assert not any(argv[:2] == ["volume", "create"] for argv in commands)
+    if not expect_staged:
+        assert (store / "volumes/conductor-ws-missing-marker/main/payload").read_text() == (
+            "payload"
+        )
+
+
+@pytest.mark.asyncio
+async def test_eager_retention_and_legacy_labels(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+) -> None:
+    # Requirement: retained workspaces exist before a command; legacy ones stay lazy and unlabeled.
+    backend, log, store, _binary = stateful_docker
+    lease = await backend.prepare_run(RunSpec("eager", workspace_persistence="on-failure"))
+    assert lease.incarnation
+    assert (store / "volumes/conductor-ws-eager/labels.json").exists()
+    commands = _stateful_commands(log)
+    assert not any(argv[0] == "cp" for argv in commands)
+    create = next(argv for argv in commands if argv[:2] == ["volume", "create"])
+    assert "io.conductor.retention=on-failure" in create
+    assert f"io.conductor.incarnation={lease.incarnation}" in create
+    await backend.prepare_run(RunSpec("legacy"))
+    assert not (store / "volumes/conductor-ws-legacy").exists()
+    legacy = await backend.prepare_run(RunSpec("legacy-argv"))
+    await backend.run_command(CommandSpec("true", execution=_minimal()), legacy)
+    legacy_create = next(
+        argv
+        for argv in _stateful_commands(log)
+        if argv[:2] == ["volume", "create"] and argv[-1] == "conductor-ws-legacy-argv"
+    )
+    assert not any("io.conductor.retention=" in arg for arg in legacy_create)
+    legacy_exec = next(
+        argv for argv in _stateful_commands(log) if argv[0] == "create" and "--env-file" in argv
+    )
+    assert not any("io.conductor.attempt_id=" in arg for arg in legacy_exec)
+
+
+@pytest.mark.asyncio
+async def test_eager_retention_never_replaces_another_incarnation(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+) -> None:
+    # Requirement: preparing a retained run cannot delete an existing incarnation.
+    backend, log, store, binary = stateful_docker
+    await backend.prepare_run(RunSpec("eager-collision", workspace_persistence="durable"))
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="label mismatch"):
+        await DockerRunnerBackend(binary).prepare_run(
+            RunSpec("eager-collision", workspace_persistence="durable")
+        )
+    assert not any(
+        argv[:2] in (["volume", "create"], ["volume", "rm"])
+        for argv in _stateful_commands(log)[before:]
+    )
+    assert (store / "volumes/conductor-ws-eager-collision").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["fail-tree-once", "fail-marker-once"])
+async def test_staging_retries_without_early_marker(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str], tmp_path: Path, failure: str
+) -> None:
+    # Requirement: failed tree or marker copy leaves no committed marker,
+    # and a later command retries.
+    backend, log, store, _binary = stateful_docker
+    run = RunSpec("retry", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    (store / failure).touch()
+    spec = CommandSpec("true", execution=_minimal())
+    assert (await backend.run_command(spec, lease)).outcome == "start_failed"
+    assert not (store / "volumes/conductor-ws-retry/.conductor-staged").exists()
+    assert (await backend.run_command(spec, lease)).outcome == "completed"
+    cp = [argv for argv in _stateful_commands(log) if argv[0] == "cp"]
+    assert sum(argv[1] == "-a" and argv[-1].endswith(":/workspace") for argv in cp) == 2
+    assert sum(argv[1] == "-a" and argv[-1].endswith("/.conductor-staged") for argv in cp) == (
+        1 if failure == "fail-tree-once" else 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_attach_mismatch_and_missing_never_replace(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str], tmp_path: Path
+) -> None:
+    # Requirement: unknown identity, missing volume, and label drift fail without mutation.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec("identity", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    identity = WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+    second = DockerRunnerBackend(binary)
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="identity"):
+        await second.attach_run(run, WorkspaceIdentity("local", lease.lease_id, lease.incarnation))
+    with pytest.raises(WorkspaceAttachError, match="identity"):
+        await second.attach_run(run, WorkspaceIdentity("docker", "other", lease.incarnation))
+    with pytest.raises(WorkspaceAttachError, match="label mismatch"):
+        await second.attach_run(run, WorkspaceIdentity("docker", lease.lease_id, "other"))
+    labels = store / "volumes/conductor-ws-identity/labels.json"
+    original = labels.read_text()
+    labels.write_text(original.replace(lease.incarnation, "wrong"))
+    with pytest.raises(WorkspaceAttachError, match="label mismatch"):
+        await second.attach_run(run, identity)
+    labels.write_text(
+        original.replace('io.conductor.run_id": "identity', 'io.conductor.run_id": "wrong')
+    )
+    with pytest.raises(WorkspaceAttachError, match="label mismatch"):
+        await second.attach_run(run, identity)
+    labels.write_text(original)
+    required = {
+        key: value
+        for key, value in json.loads(original).items()
+        if key
+        in {
+            "io.conductor.managed",
+            "io.conductor.run_id",
+            "io.conductor.resource",
+            "io.conductor.incarnation",
+        }
+    }
+    labels.write_text(json.dumps(required))
+    assert await second.attach_run(run, identity) == lease
+    labels.write_text(original)
+    # An absent volume is a distinct failure once the run id matches.
+    missing_run = RunSpec("never-created", workspace_persistence="durable")
+    with pytest.raises(WorkspaceAttachError, match="missing"):
+        await second.attach_run(missing_run, WorkspaceIdentity("docker", "never-created", "token"))
+    assert not any(
+        argv[:2] in (["volume", "rm"], ["volume", "create"])
+        for argv in _stateful_commands(log)[before:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_attach_digest_mismatch_is_fatal(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str], tmp_path: Path
+) -> None:
+    # Requirement: a committed marker with another digest is never overwritten,
+    # even if staging is allowed.
+    backend, log, _store, binary = stateful_docker
+    run = RunSpec("digest", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    await backend.run_command(CommandSpec("true", execution=_minimal()), lease)
+    assert run.bundle is not None
+    changed = replace(run, bundle=BundleRef("sha256:other", run.bundle.store_path))
+    second = DockerRunnerBackend(binary)
+    attached = await second.attach_run(
+        changed, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+    )
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
+        await second.run_command(CommandSpec("true", execution=_minimal()), attached)
+    assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in _stateful_commands(log)[before:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expect_staged", [False, True])
+async def test_attached_command_rechecks_marker_after_tampering(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+    tmp_path: Path,
+    expect_staged: bool,
+) -> None:
+    # Requirement: every command on an attached lease rejects a marker changed after staging.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec("tamper", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    spec = CommandSpec("true", execution=_minimal())
+    assert (await backend.run_command(spec, lease)).outcome == "completed"
+    attached_backend = DockerRunnerBackend(binary)
+    attached = await attached_backend.attach_run(
+        run,
+        WorkspaceIdentity("docker", lease.lease_id, lease.incarnation),
+        expect_staged=expect_staged,
+    )
+    assert (await attached_backend.run_command(spec, attached)).outcome == "completed"
+    marker = store / "volumes/conductor-ws-tamper/.conductor-staged"
+    marker.write_text("sha256:foreign", encoding="utf-8")
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
+        await attached_backend.run_command(spec, attached)
+    commands = _stateful_commands(log)[before:]
+    assert sum(argv[0] == "cp" and argv[1].endswith("/.conductor-staged") for argv in commands) == 1
+    assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
+    assert not any(argv[0] == "create" and "--env-file" in argv for argv in commands)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_callback_only_after_attached_precreate_checks(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    # Requirement: one callback per Docker create, none when marker verification refuses it.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec(
+        "dispatch-notify", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable"
+    )
+    lease = await backend.prepare_run(run)
+    spec = CommandSpec("true", execution=_minimal())
+    dispatched: list[str] = []
+
+    def notify() -> None:
+        dispatched.append("create")
+
+    assert (await backend.run_command(spec, lease, on_dispatch=notify)).outcome == "completed"
+    assert dispatched == ["create"]
+    attached_backend = DockerRunnerBackend(binary)
+    attached = await attached_backend.attach_run(
+        run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation), expect_staged=True
+    )
+    marker = store / "volumes/conductor-ws-dispatch-notify/.conductor-staged"
+    marker.write_text("sha256:foreign", encoding="utf-8")
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
+        await attached_backend.run_command(spec, attached, on_dispatch=notify)
+    assert dispatched == ["create"]
+    assert not any(
+        argv[0] == "create" and "--env-file" in argv for argv in _stateful_commands(log)[before:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_attached_commands_probe_marker_independently(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: an attached command cannot inherit another command's in-flight marker read.
+    owner, log, store, binary = stateful_docker
+    run = RunSpec("concurrent", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await owner.prepare_run(run)
+    spec = CommandSpec("true", execution=_minimal())
+    assert (await owner.run_command(spec, lease)).outcome == "completed"
+    backend = DockerRunnerBackend(binary)
+    attached = await backend.attach_run(
+        run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation), expect_staged=True
+    )
+    original_probe = backend._probe_marker
+    original_ensure = backend._ensure_staged
+    first_probed = asyncio.Event()
+    second_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    probe_calls = 0
+    ensure_calls = 0
+
+    async def paused_probe(
+        current_lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> str | None:
+        nonlocal probe_calls
+        marker = await original_probe(current_lease, execution)
+        probe_calls += 1
+        if probe_calls == 1:
+            first_probed.set()
+            await release_first.wait()
+        return marker
+
+    async def signaled_ensure(
+        current_lease: WorkspaceLease,
+        execution: ResolvedExecutionSpec,
+        diagnostics: Callable[[str], None] | None,
+    ) -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+        if ensure_calls == 2:
+            second_entered.set()
+        await original_ensure(current_lease, execution, diagnostics)
+
+    monkeypatch.setattr(backend, "_probe_marker", paused_probe)
+    monkeypatch.setattr(backend, "_ensure_staged", signaled_ensure)
+    before = len(_stateful_commands(log))
+    first = asyncio.create_task(backend.run_command(spec, attached))
+    try:
+        await asyncio.wait_for(first_probed.wait(), 10)
+        (store / "volumes/conductor-ws-concurrent/.conductor-staged").write_text(
+            "sha256:foreign", encoding="utf-8"
+        )
+        second = asyncio.create_task(backend.run_command(spec, attached))
+        await asyncio.wait_for(second_entered.wait(), 10)
+    finally:
+        release_first.set()
+    await asyncio.wait_for(first, 10)
+    with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
+        await asyncio.wait_for(second, 10)
+    commands = _stateful_commands(log)[before:]
+    assert sum(argv[0] == "cp" and argv[1].endswith("/.conductor-staged") for argv in commands) == 2
+    assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
+
+
+@pytest.mark.asyncio
+async def test_attach_marker_probe_error_never_stages(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str], tmp_path: Path
+) -> None:
+    # Requirement: a failed marker read is not mistaken for an absent marker.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec("probe", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    attached_backend = DockerRunnerBackend(binary)
+    attached = await attached_backend.attach_run(
+        run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+    )
+    (store / "fail-probe-once").touch()
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="probe failed"):
+        await attached_backend.run_command(CommandSpec("true", execution=_minimal()), attached)
+    commands = _stateful_commands(log)[before:]
+    assert any(argv[0] == "cp" and argv[1].endswith("/.conductor-staged") for argv in commands)
+    assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
+    assert not any(argv[:2] in (["volume", "create"], ["volume", "rm"]) for argv in commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["drift", "gone", "auto-create"])
+async def test_attach_drift_or_loss_before_first_command(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    # Requirement: a retained lease never replaces a missing or relabeled
+    # volume on command dispatch.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec("race", workspace_persistence="durable")
+    lease = await backend.prepare_run(run)
+    attached_backend = DockerRunnerBackend(binary)
+    attached = await attached_backend.attach_run(
+        run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+    )
+    volume = store / "volumes/conductor-ws-race"
+    if change == "drift":
+        (volume / "labels.json").write_text("{}")
+    elif change == "gone":
+        import shutil
+
+        shutil.rmtree(volume)
+    else:
+        monkeypatch.setenv("FAKE_DOCKER_DROP_ON_EXEC_CREATE", "1")
+        attached_backend._cli_env = dict(os.environ)
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="missing|mismatch"):
+        await attached_backend.run_command(CommandSpec("true", execution=_minimal()), attached)
+    commands = _stateful_commands(log)[before:]
+    assert not any(argv[:2] in (["volume", "create"], ["volume", "rm"]) for argv in commands)
+    assert not any(argv[0] == "cp" for argv in commands)
+    if change == "auto-create":
+        assert any(argv[:2] == ["rm", "-f"] for argv in commands)
+        assert json.loads((volume / "labels.json").read_text()) == {}
+    else:
+        assert not any(argv[0] == "create" for argv in commands)
+
+
+@pytest.mark.asyncio
+async def test_retain_skips_volume_removal_but_reclaims_containers(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+) -> None:
+    # Requirement: retain only the owned volume; orphaned managed containers are still removed.
+    backend, log, store, _binary = stateful_docker
+    lease = await backend.prepare_run(RunSpec("keep", workspace_persistence="durable"))
+    await backend._run_docker(backend._scratch_argv(lease, _minimal(), "conductor-orphan"))
+    before = len(_stateful_commands(log))
+    await backend.finalize_run(lease, "failed", retain=True)
+    commands = _stateful_commands(log)[before:]
+    assert any(argv[:3] == ["rm", "-f", "conductor-orphan"] for argv in commands)
+    assert not any(argv[:2] == ["volume", "rm"] for argv in commands)
+    assert (store / "volumes/conductor-ws-keep").exists()

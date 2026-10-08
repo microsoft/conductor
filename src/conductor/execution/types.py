@@ -130,6 +130,8 @@ class CommandSpec:
             ignores this field.
         name: Optional step identity for realm-side labels/names. Local
             backend ignores this field.
+        attempt_id: Fresh UUID for each dispatch; it does not imply exactly-once
+            execution. The local backend ignores this field.
     """
 
     command: str
@@ -141,6 +143,7 @@ class CommandSpec:
     timeout: float | None = None
     execution: ResolvedExecutionSpec | None = None
     name: str | None = None
+    attempt_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +236,26 @@ class WorkspaceLease:
 
 
 @dataclass(frozen=True)
+class WorkspaceIdentity:
+    """Serializable identity of a retained workspace resource.
+
+    This checkable identity is written into checkpoints and is distinct from
+    ``WorkspaceLease``, which is an opaque handle belonging to one process.
+
+    Attributes:
+        backend: Name of the backend that owns the workspace.
+        lease_id: Stable identifier of the workspace lease.
+        incarnation: Token identifying this specific workspace incarnation.
+        location: Optional backend-specific location hint.
+    """
+
+    backend: str
+    lease_id: str
+    incarnation: str
+    location: str | None = None
+
+
+@dataclass(frozen=True)
 class RunSpec:
     """What a backend needs to know to prepare a run's workspace.
 
@@ -241,11 +264,14 @@ class RunSpec:
         workflow_name: Optional workflow name, for realm-side labeling.
         bundle: Optional bundle reference containing the published run bundle
             for containerized execution realms, or ``None``.
+        workspace_persistence: Retention policy for the workspace, or ``None``
+            for legacy ephemeral behavior.
     """
 
     run_id: str
     workflow_name: str | None = None
     bundle: BundleRef | None = None
+    workspace_persistence: Literal["durable", "on-failure"] | None = None
 
 
 @dataclass(frozen=True)
@@ -261,9 +287,12 @@ class RunnerCapabilities:
             caller (a lease may be threaded through).
         snapshots: The backend can snapshot and restore workspaces
             (reserved for a later contract revision).
+        retained_workspace: The backend can attach to retained workspaces across
+            process lifetimes.
     """
 
     batch: bool
     sessions: bool
     shared_workspace: bool
     snapshots: bool
+    retained_workspace: bool = False

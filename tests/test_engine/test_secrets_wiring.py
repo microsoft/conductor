@@ -84,8 +84,11 @@ class RecordingBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Any = None,
     ) -> CommandResult:
         del diagnostics
+        if on_dispatch is not None:
+            on_dispatch()
         self.run_calls.append((spec, lease))
         return CommandResult(
             outcome="completed",
@@ -96,7 +99,9 @@ class RecordingBackend:
             duration_seconds=0.0,
         )
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         self.finalize_calls.append((lease, outcome))
 
 

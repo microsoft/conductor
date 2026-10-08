@@ -44,6 +44,7 @@ from conductor.config.schema import (
     WorkflowDef,
     WorkflowDefaults,
 )
+from conductor.digest import canonical_json_digest
 from conductor.engine import run_manifest
 from conductor.engine.run_manifest import (
     AuditInfo,
@@ -51,6 +52,7 @@ from conductor.engine.run_manifest import (
     ResolvedStepProfile,
     WorkflowIdentity,
     compile_run_manifest,
+    manifest_semantic_digest,
 )
 from conductor.exceptions import ConfigurationError
 from conductor.execution.types import (
@@ -126,10 +128,13 @@ class _NoBatchBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics=None,
+        on_dispatch=None,
     ) -> CommandResult:
         raise NotImplementedError
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         raise NotImplementedError
 
 
@@ -544,3 +549,31 @@ def test_capability_registry_seeds_local_with_batch() -> None:
     # declares batch — the assumption script steps rely on at compile time.
     backend = run_manifest.BACKEND_CAPABILITY_PROVIDERS["local"]
     assert backend.capabilities().batch is True
+
+
+def test_semantic_digest_excludes_only_producer_metadata() -> None:
+    # Requirement: producer version and audit labels do not change execution semantics.
+    manifest = compile_run_manifest(
+        _single_agent_config(), workflow_path=None, environment=builtin_local_environment()
+    )
+    payload = manifest.model_dump(mode="json")
+    payload.pop("conductor_version")
+    payload.pop("audit")
+
+    assert manifest_semantic_digest(manifest) == canonical_json_digest(payload)
+    assert manifest_semantic_digest(manifest) == manifest_semantic_digest(
+        manifest.model_copy(update={"conductor_version": "another-build"})
+    )
+    assert manifest_semantic_digest(manifest) == manifest_semantic_digest(manifest)
+
+
+def test_absent_workspace_is_omitted_from_every_manifest_dump() -> None:
+    # Requirement: an undeclared policy cannot change the legacy manifest payload or digest.
+    manifest = compile_run_manifest(
+        _single_agent_config(), workflow_path=None, environment=builtin_local_environment()
+    )
+    for dump in (manifest.model_dump(), manifest.model_dump(mode="json")):
+        assert "workspace" not in dump
+    assert "workspace" not in manifest.model_dump_json()
+    assert "workspace" not in manifest.model_dump(exclude={"audit"})
+    assert "workspace" not in manifest.model_dump_json(exclude={"audit"})

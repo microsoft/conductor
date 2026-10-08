@@ -321,7 +321,38 @@ When called with a workflow file (`conductor resume workflow.yaml`) or without a
 
 ### Execution Environment on Resume
 
-When resuming with `--environment`, resume re-resolves execution profiles against the given environment and does not compare with the original run's manifest (manifest comparison is a future step). If `--environment` is omitted, resume resolves execution profiles against the built-in `local/default` environment — it does **not** restore or rediscover the environment selected for the original run. Repeat the original `--environment` value when the workflow depends on profiles that are not present in the built-in environment.
+When resuming with `--environment`, resume resolves execution profiles against the specified environment document or file path. Always supply the matching `--environment` when resuming workflows that use non-default environments or containerized backends.
+
+Resuming also validates capability cross-checks. If a workflow declares retained workspace persistence (`durable` or `on-failure`), the resolved environment must configure runner backends that support persistent workspaces (such as the `docker` runner backend).
+
+### Resume Digest-Gate
+
+When resuming a workflow configured with retained workspace persistence, Conductor enforces an honest resume digest gate before attaching or altering the retained Docker volume. The engine verifies the checkpoint against the current configuration:
+
+1. **Workflow Digest**: Compares the root workflow digest against recorded `resume_contract.workflow_digest`.
+2. **Environment Identity**: Compares the environment name and digest against `resume_contract.environment_name` and `resume_contract.environment_digest`.
+3. **Manifest Semantic Digest**: Compares the compiled manifest semantic digest against recorded `resume_contract.manifest_digest` (computed by `manifest_semantic_digest()` in `src/conductor/engine/run_manifest.py`).
+4. **Bundle Digest**: When `bundle_digest` is present in `resume_contract`, compares it against the current bundle hash. If the checkpoint recorded a null bundle digest, a currently computed non-null bundle is not rejected.
+5. **Workspace Policy**: Confirms that `workspace.policy` matches the active persistence policy.
+
+#### Failure Modes and Remedies
+
+* **Checkpoint Predates Lifecycle**: If a checkpoint was created by an older version of Conductor (lacking the `resume_contract` lifecycle block) while the current workflow defines retained workspace persistence (`durable` or `on-failure`), resume is refused.
+  * *Remedy*: Run a fresh execution with `conductor run` instead of resuming from the older checkpoint.
+* **Digest Mismatch**: If workflow definitions, environment settings, or manifest configuration changed since the checkpoint was written, or if a non-null recorded bundle digest differs from the current bundle, resume fails closed. Conductor reports the exact mismatch (such as `manifest_digest` or `bundle_digest`), displaying the recorded digest versus the current digest.
+  * *Remedy*: Restore the matching git commit or environment configuration, or start a fresh execution with `conductor run`.
+
+### Interrupted Step and Attempt Tracking
+
+When a failure checkpoint is written, Conductor records details about the active step in `checkpoint_saved.interrupted_step`:
+
+* **`name`**: The step that was actively running when failure occurred.
+* **`status`**: Set to `"unknown"`, because external container actions cannot be verified after an interruption.
+* **`attempt_id`**: The attempt identifier active when execution halted.
+
+On resume, the engine evaluates the step's `restart:` policy:
+* If configured with `mode: rerun` (the default), Conductor re-executes the interrupted step from the top.
+* If configured with `mode: fail`, Conductor aborts the resumption attempt immediately, preventing non-idempotent actions from re-running.
 
 ### Examples
 

@@ -20,6 +20,7 @@ import subprocess
 import textwrap
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -27,6 +28,10 @@ import pytest
 
 from conductor.config.environment import resolve_environment
 from conductor.config.loader import load_config
+from conductor.engine import workflow as workflow_module
+from conductor.engine.checkpoint import CheckpointManager
+from conductor.engine.context import WorkflowContext
+from conductor.engine.limits import LimitEnforcer
 from conductor.engine.workflow import WorkflowEngine
 from conductor.exceptions import ExecutionError
 from conductor.execution.docker import _STAGING_COPY_MODE, DockerRunnerBackend
@@ -602,3 +607,73 @@ async def test_e2e_timed_out_script_cleans_up_container_and_volume(
     assert volumes_after == volumes_before, (
         f"workspace volume leaked: before={volumes_before} after={volumes_after}"
     )
+
+
+@pytest.mark.asyncio
+async def test_retained_failure_then_resumed_success_removes_volume(
+    docker_daemon: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: the real daemon keeps a failed retained workspace and removes it on resume.
+    del docker_daemon
+    workflow = _write_docker_e2e_workflow(
+        tmp_path,
+        name="retained-daemon",
+        image=PINNED_BUSYBOX,
+        step_fields='command: sh\nargs: [-c, "echo RETAINED"]',
+    )
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8").replace(
+            "  entry_point: probe",
+            "  entry_point: probe\n  workspace:\n    persistence: on-failure",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    environment = resolve_environment("itest", workflow_dir=workflow.parent)
+    run_id = _unique("retained")
+    volume = f"conductor-ws-{run_id}"
+    try:
+        engine = WorkflowEngine(
+            load_config(workflow),
+            None,
+            workflow_path=workflow,
+            execution_environment=environment,
+            run_context=workflow_module.RunContext(run_id=run_id),
+        )
+        with (
+            mock.patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            mock.patch.object(
+                engine.context, "store", side_effect=RuntimeError("after docker dispatch")
+            ),
+            pytest.raises(RuntimeError, match="after docker dispatch"),
+        ):
+            await engine.run({})
+        assert engine._last_checkpoint_path is not None
+        checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert checkpoint.workspace is not None
+        assert checkpoint.workspace["executed_backends"] == ["docker"]
+        rc, _stdout, stderr = await _docker("volume", "inspect", volume)
+        assert rc == 0, stderr
+
+        resumed = WorkflowEngine(
+            load_config(workflow),
+            None,
+            workflow_path=workflow,
+            execution_environment=environment,
+            run_context=workflow_module.RunContext(run_id=run_id),
+        )
+        resumed.set_context(WorkflowContext.from_dict(checkpoint.context))
+        resumed.set_limits(
+            LimitEnforcer.from_dict(
+                checkpoint.limits,
+                timeout_seconds=resumed.config.workflow.limits.timeout_seconds,
+                budget_usd=resumed.config.workflow.limits.budget_usd,
+                budget_mode=resumed.config.workflow.limits.budget_mode,
+            )
+        )
+        result = await resumed.resume(checkpoint.current_agent, checkpoint=checkpoint)
+        assert result["result"].strip() == "RETAINED"
+        rc, _stdout, stderr = await _docker("volume", "inspect", volume)
+        assert rc != 0 and "no such volume" in stderr.lower()
+    finally:
+        await _remove_volume(volume)

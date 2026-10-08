@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import cast
 from uuid import uuid4
 
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
     CommandResult,
     CommandSpec,
@@ -18,6 +19,7 @@ from conductor.execution.types import (
     RunOutcome,
     RunSpec,
     StartError,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -86,6 +88,8 @@ class LocalRunnerBackend:
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         """Create an opaque local workspace handle for a run."""
+        if run.workspace_persistence is not None:
+            raise ExecutionSpecError("local backend does not support retained workspaces")
         return WorkspaceLease(
             lease_id=run.run_id,
             backend="local",
@@ -93,13 +97,22 @@ class LocalRunnerBackend:
             location=None,
         )
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
+        """Reject attach without mutating anything; local workspaces cannot be retained."""
+        del run, identity, expect_staged
+        raise WorkspaceAttachError("local backend does not support retained workspaces")
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         """Finalize a local run.
 
-        Local execution owns no run-scoped resources to release. Remote
-        backends use this lifecycle point to clean up their execution realm.
+        Local execution owns no run-scoped resources, so ``retain`` is ignored.
+        Remote backends use this lifecycle point to clean up their execution realm.
         """
-        del lease, outcome
+        del lease, outcome, retain
 
     async def run_command(
         self,
@@ -107,6 +120,7 @@ class LocalRunnerBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         """Run one command locally and return its data-shaped outcome."""
         del lease
@@ -144,6 +158,8 @@ class LocalRunnerBackend:
                 diagnostics(f"  Script stdin: {len(spec.stdin)} bytes")
 
         try:
+            if on_dispatch is not None:
+                on_dispatch()
             process = await asyncio.create_subprocess_exec(
                 resolved_command,
                 *spec.args,

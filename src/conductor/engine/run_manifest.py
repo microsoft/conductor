@@ -55,9 +55,17 @@ import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_serializer,
+    field_validator,
+    model_serializer,
+)
 
 from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
@@ -66,15 +74,23 @@ from conductor.config.schema import (
     StepSecretRef,
     WorkflowConfig,
     WorkflowDefaults,
+    WorkflowStepDef,
 )
+from conductor.digest import canonical_json_digest
 from conductor.exceptions import ConfigurationError
-from conductor.execution import LocalRunnerBackend, RunnerBackend
+from conductor.execution import LocalRunnerBackend
 from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.types import RunnerCapabilities
 from conductor.providers.resolution import (
     effective_mcp_consumer_providers,
     format_claude_agent_sdk_remote_env_error,
     format_remote_mcp_stdio_only_error,
 )
+
+
+class BackendCapabilityProvider(Protocol):
+    def capabilities(self) -> RunnerCapabilities: ...
+
 
 # Capability-introspection registry: backend name -> a backend instance asked
 # only for its static ``capabilities()`` declaration. The instances are
@@ -82,7 +98,7 @@ from conductor.providers.resolution import (
 # on when it is asked, because the manifest compiler asks at compile time and
 # the run may ask again later. ``LocalRunnerBackend`` satisfies this today (it
 # has no instance state at all); any future backend registered here must too.
-BACKEND_CAPABILITY_PROVIDERS: dict[str, RunnerBackend] = {
+BACKEND_CAPABILITY_PROVIDERS: dict[str, BackendCapabilityProvider] = {
     "local": LocalRunnerBackend(),
     # DockerRunnerBackend's constructor is I/O-free (it only stores the binary
     # name and an environment snapshot), so a module-level instance is safe to
@@ -182,6 +198,15 @@ class AuditInfo(BaseModel):
     classification: Literal["non-hermetic-compatibility"]
 
 
+class WorkspacePolicy(BaseModel):
+    """Run-global workspace mode and retention policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: str
+    persistence: str
+
+
 class ResolvedRunManifest(BaseModel):
     """The compiled, run-invariant execution manifest for one workflow run."""
 
@@ -197,6 +222,7 @@ class ResolvedRunManifest(BaseModel):
     with a handle to it may mutate execution resolution after compilation.
     Serialization still yields a plain ``dict`` (see the field serializer)."""
     secrets: tuple[ResolvedSecretUse, ...] = ()
+    workspace: WorkspacePolicy | None = None
     conductor_version: str
     audit: AuditInfo
     script_steps: tuple[str, ...] = Field(default=(), exclude=True)
@@ -235,12 +261,31 @@ class ResolvedRunManifest(BaseModel):
         """
         return dict(value)
 
+    @model_serializer(mode="wrap")
+    def _serialize_workspace(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        dump = handler(self)
+        if dump.get("workspace") is None:
+            dump.pop("workspace", None)
+        return dump
+
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         dump = super().model_dump(*args, **kwargs)
+        if dump.get("workspace") is None:
+            dump.pop("workspace", None)
         for profile in dump.get("profiles", {}).values():
             if isinstance(profile, dict) and profile.get("execution") is None:
                 profile.pop("execution", None)
         return dump
+
+
+def manifest_semantic_digest(manifest: ResolvedRunManifest) -> str:
+    """Digest workflow, environment, profiles, secret references and workspace policy.
+
+    This does not prove the dynamic sub-workflow closure or image bytes selected by a tag.
+    """
+    return canonical_json_digest(
+        manifest.model_dump(mode="json", exclude={"conductor_version", "audit"})
+    )
 
 
 def executable_step_identity(name: str, *, for_each_group: str | None = None) -> str:
@@ -663,10 +708,45 @@ def compile_run_manifest(
             the chain, names an undefined profile, or (for script steps)
             resolves to a backend without batch capability.
     """
+    workspace = config.workflow.workspace
+    if workspace is not None and workspace.mode == "isolated":
+        raise ConfigurationError(
+            "workspace.mode: isolated is reserved until the isolated workspace follow-up."
+        )
+    defaults_restart = config.workflow.defaults.restart
+    if defaults_restart is not None and defaults_restart.mode == "reuse":
+        raise ConfigurationError(
+            "workflow.defaults.restart.mode: reuse is reserved until the restart follow-up."
+        )
+
+    if workflow_path is not None:
+        for key, step in _iter_executable_steps(config):
+            if not isinstance(step, WorkflowStepDef):
+                continue
+            child_path = workflow_path.parent / step.workflow
+            if not child_path.is_file():
+                continue  # Registry and dynamic references are resolved at reach time.
+            from conductor.config.loader import load_config
+
+            try:
+                child = load_config(child_path)
+            except ConfigurationError:
+                # Broken children still fail at reach time, preserving subworkflow_failed events.
+                continue
+            if child.workflow.workspace is not None:
+                raise ConfigurationError(
+                    f"Sub-workflow '{key}' declares workflow.workspace; workspace policy is "
+                    "inherited from the root workflow and cannot be overridden."
+                )
+
     profiles: dict[str, ResolvedStepProfile] = {}
     script_keys: list[str] = []
     secrets: list[ResolvedSecretUse] = []
     for key, step in _iter_executable_steps(config):
+        if step.restart is not None and step.restart.mode == "reuse":
+            raise ConfigurationError(
+                f"Step '{key}' restart.mode: reuse is reserved until the restart follow-up."
+            )
         profile_name = effective_profile_name(
             step,
             key,
@@ -684,6 +764,16 @@ def compile_run_manifest(
                 "point the step at one of the defined profiles.",
             )
         backend_name = definition.backend
+        if workspace is not None and workspace.persistence != "ephemeral":
+            provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
+            if provider is not None and not provider.capabilities().retained_workspace:
+                raise ConfigurationError(
+                    f"Step '{key}': {backend_name} backend does not support retained workspaces; "
+                    "use docker profiles for every executable step or drop persistence; "
+                    "local retained workspace arrives in a later delivery. Until the agent "
+                    "realm follow-up, retained policy is available only for docker script "
+                    "workflows."
+                )
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)
@@ -727,6 +817,11 @@ def compile_run_manifest(
         ),
         profiles=profiles,
         secrets=tuple(secrets),
+        workspace=(
+            WorkspacePolicy(mode=workspace.mode, persistence=workspace.persistence)
+            if workspace is not None
+            else None
+        ),
         conductor_version=_conductor_version(),
         audit=AuditInfo(hermetic=False, classification="non-hermetic-compatibility"),
         script_steps=tuple(script_keys),

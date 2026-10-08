@@ -1,0 +1,40 @@
+workflow:
+  name: docker-workspace-retention
+  description: "Demonstrates workspace retention on failure using the Docker runner backend (warning: requires --environment for capability check)"
+  version: "1.0.0"
+  entry_point: prepare_workspace
+
+  workspace:
+    mode: shared
+    persistence: on-failure
+
+  defaults:
+    execution:
+      profile: docker_shell
+    restart:
+      mode: rerun
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: prepare_workspace
+    type: script
+    description: Create build assets in the shared workspace volume
+    command: sh
+    args: ["-c", "echo 'build-output-v1' > /workspace/build.log && mkdir -p /workspace/artifacts"]
+    routes:
+      - to: verify_workspace
+
+  - name: verify_workspace
+    type: script
+    description: Confirm build assets exist before continuing
+    command: cat
+    args: ["/workspace/build.log"]
+    restart:
+      mode: rerun
+    routes:
+      - to: $end
+
+output:
+  build_log: "{{ verify_workspace.output.stdout | trim }}"

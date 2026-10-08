@@ -1161,3 +1161,213 @@ class TestFindLatestByCreatedAt:
             latest = CheckpointManager.find_latest_checkpoint(wf)
 
         assert latest == newest
+
+
+class TestLifecycleCheckpointBlocks:
+    def test_lifecycle_blocks_round_trip(self, tmp_path: Path) -> None:
+        # Requirement: all lifecycle blocks survive a version-one save and load.
+        wf = _write_workflow(tmp_path)
+        workspace = {
+            "policy": "ephemeral",
+            "identities": {"local": {"id": "run-42"}},
+            "executed_backends": ["local"],
+        }
+        contract = {
+            "workflow_digest": "sha256:workflow",
+            "environment_name": "dev",
+            "environment_digest": "sha256:environment",
+            "manifest_digest": "sha256:manifest",
+            "bundle_digest": None,
+        }
+        interrupted = {"name": "build", "status": "unknown", "attempt_id": None}
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf,
+                _make_context(),
+                _make_limits(),
+                "build",
+                RuntimeError("stopped"),
+                {},
+                workspace=workspace,
+                resume_contract=contract,
+                interrupted_step=interrupted,
+            )
+        assert path is not None
+        loaded = CheckpointManager.load_checkpoint(path)
+        assert loaded.version == CheckpointManager.CHECKPOINT_VERSION == 1
+        assert loaded.workspace == workspace
+        assert loaded.resume_contract == contract
+        assert loaded.interrupted_step == interrupted
+        assert json.loads(path.read_text())["workspace"] == workspace
+
+    def test_legacy_checkpoint_bytes_and_load_unchanged(self, tmp_path: Path) -> None:
+        # Requirement: default save matches the old ordered JSON envelope byte for byte.
+        wf = _write_workflow(tmp_path)
+        ctx = _make_context()
+        limits = _make_limits()
+        fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz: Any = None) -> datetime:
+                return fixed_now
+
+        with (
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            patch("secrets.token_hex", return_value="aabbccdd"),
+            patch("time.strftime", return_value="20260101-000000"),
+            patch("conductor.engine.checkpoint.datetime", _FixedDatetime),
+        ):
+            path = CheckpointManager.save_checkpoint(
+                wf, ctx, limits, "build", RuntimeError("stopped"), {}
+            )
+        assert path is not None
+        old_envelope = {
+            "version": 1,
+            "workflow_path": str(wf.resolve()),
+            "workflow_hash": CheckpointManager.compute_workflow_hash(wf),
+            "created_at": fixed_now.isoformat(),
+            "trigger": "failure",
+            "failure": {
+                "error_type": "RuntimeError",
+                "message": "stopped",
+                "agent": "build",
+                "iteration": 0,
+            },
+            "inputs": {},
+            "current_agent": "build",
+            "context": ctx.to_dict(),
+            "limits": limits.to_dict(),
+            "copilot_session_ids": {},
+            "copilot_session_cwds": {},
+            "system": {},
+            "instructions_preamble": None,
+            "run_id": "",
+            "event_log_path": "",
+        }
+        expected_bytes = json.dumps(old_envelope, indent=2).encode("utf-8")
+        assert path.read_bytes() == expected_bytes
+        loaded = CheckpointManager.load_checkpoint(path)
+        assert loaded.workspace is None
+        assert loaded.resume_contract is None
+        assert loaded.interrupted_step is None
+        assert path.read_bytes() == expected_bytes
+
+    @pytest.mark.parametrize(
+        ("block", "field"),
+        [
+            (
+                {"resume_contract": {"workflow_digest": "sha256:a"}},
+                "resume_contract.environment_name",
+            ),
+            (
+                {
+                    "resume_contract": {
+                        "workflow_digest": "",
+                        "environment_name": "dev",
+                        "environment_digest": "sha256:e",
+                        "manifest_digest": "sha256:m",
+                    }
+                },
+                "resume_contract.workflow_digest",
+            ),
+            ({"workspace": {"identities": {"docker": {"id": "ws"}}}}, "workspace.identities"),
+            (
+                {"interrupted_step": {"name": "build", "status": "running", "attempt_id": "one"}},
+                "interrupted_step.status",
+            ),
+            (
+                {"interrupted_step": {"name": 42, "status": "unknown", "attempt_id": None}},
+                "interrupted_step.name",
+            ),
+            (
+                {"interrupted_step": {"name": "build", "status": "unknown"}},
+                "interrupted_step.attempt_id",
+            ),
+            (
+                {"interrupted_step": {"name": "build", "status": "unknown", "attempt_id": 2}},
+                "interrupted_step.attempt_id",
+            ),
+        ],
+    )
+    def test_corrupt_partial_lifecycle_block_names_field(
+        self, tmp_path: Path, block: dict[str, Any], field: str
+    ) -> None:
+        # Requirement: incomplete lifecycle metadata fails at load with its field named.
+        payload = {
+            "version": 1,
+            "workflow_path": "/x.yaml",
+            "workflow_hash": "sha256:a",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "failure": {},
+            "current_agent": "build",
+            "context": {},
+            "limits": {},
+            **block,
+        }
+        path = tmp_path / "corrupt.json"
+        path.write_text(json.dumps(payload))
+        with pytest.raises(CheckpointError, match=f"corrupt: partial lifecycle block {field}"):
+            CheckpointManager.load_checkpoint(path)
+
+    @pytest.mark.parametrize(
+        ("bundle_digest", "should_fail"),
+        [(42, True), ("", True), (None, False), ("sha256:bundle", False)],
+    )
+    def test_bundle_digest_type_and_nullability(
+        self, tmp_path: Path, bundle_digest: Any, should_fail: bool
+    ) -> None:
+        # Requirement: bundle_digest is nullable, otherwise a non-empty string.
+        payload = {
+            "version": 1,
+            "workflow_path": "/x.yaml",
+            "workflow_hash": "sha256:a",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "failure": {},
+            "current_agent": "build",
+            "context": {},
+            "limits": {},
+            "resume_contract": {
+                "workflow_digest": "sha256:w",
+                "environment_name": "dev",
+                "environment_digest": "sha256:e",
+                "manifest_digest": "sha256:m",
+                "bundle_digest": bundle_digest,
+            },
+        }
+        path = tmp_path / "lifecycle.json"
+        path.write_text(json.dumps(payload))
+        if should_fail:
+            with pytest.raises(
+                CheckpointError,
+                match="corrupt: partial lifecycle block resume_contract.bundle_digest",
+            ):
+                CheckpointManager.load_checkpoint(path)
+        else:
+            loaded = CheckpointManager.load_checkpoint(path)
+            assert loaded.resume_contract is not None
+            assert loaded.resume_contract["bundle_digest"] == bundle_digest
+
+    def test_bundle_digest_can_be_absent(self, tmp_path: Path) -> None:
+        # Requirement: legacy lifecycle contracts may omit bundle_digest.
+        payload = {
+            "version": 1,
+            "workflow_path": "/x.yaml",
+            "workflow_hash": "sha256:a",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "failure": {},
+            "current_agent": "build",
+            "context": {},
+            "limits": {},
+            "resume_contract": {
+                "workflow_digest": "sha256:w",
+                "environment_name": "dev",
+                "environment_digest": "sha256:e",
+                "manifest_digest": "sha256:m",
+            },
+        }
+        path = tmp_path / "legacy-lifecycle.json"
+        path.write_text(json.dumps(payload))
+        loaded = CheckpointManager.load_checkpoint(path)
+        assert loaded.resume_contract is not None
+        assert "bundle_digest" not in loaded.resume_contract

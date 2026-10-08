@@ -55,6 +55,9 @@ _CHECKPOINT_PROTOCOL_KEYS: frozenset[str] = frozenset(
         "instructions_preamble",
         "run_id",
         "event_log_path",
+        "workspace",
+        "resume_contract",
+        "interrupted_step",
         # ``failure`` block
         "error_type",
         "message",
@@ -261,6 +264,58 @@ class CheckpointData:
     exception/cancellation) or ``"periodic"`` (milestone/time-based save at a
     step boundary). Defaults to ``"failure"`` for checkpoints written before
     this field was introduced, and for any unrecognized on-disk value."""
+    workspace: dict[str, Any] | None = None
+    """Workspace state: {policy, identities: {backend: WorkspaceIdentity-dict},
+    executed_backends: list[str]}; absent in legacy checkpoints."""
+    resume_contract: dict[str, Any] | None = None
+    """Resume contract: {workflow_digest, environment_name, environment_digest,
+    manifest_digest, bundle_digest (nullable)}; absent in legacy checkpoints."""
+    interrupted_step: dict[str, Any] | None = None
+    """Interrupted step: {name, status: "unknown", attempt_id}; absent in
+    legacy checkpoints. attempt_id may be null."""
+
+
+def _validate_lifecycle_blocks(checkpoint: dict[str, Any]) -> None:
+    """Reject incomplete lifecycle metadata before constructing a checkpoint."""
+    contract = checkpoint.get("resume_contract")
+    if "resume_contract" in checkpoint:
+        required = (
+            "workflow_digest",
+            "environment_name",
+            "environment_digest",
+            "manifest_digest",
+        )
+        if not isinstance(contract, dict):
+            raise CheckpointError("corrupt: partial lifecycle block resume_contract")
+        for name in required:
+            if not isinstance(contract.get(name), str) or not contract[name]:
+                raise CheckpointError(f"corrupt: partial lifecycle block resume_contract.{name}")
+        bundle_digest = contract.get("bundle_digest")
+        if bundle_digest is not None and (not isinstance(bundle_digest, str) or not bundle_digest):
+            raise CheckpointError("corrupt: partial lifecycle block resume_contract.bundle_digest")
+
+    workspace = checkpoint.get("workspace")
+    if "workspace" in checkpoint:
+        if not isinstance(workspace, dict):
+            raise CheckpointError("corrupt: partial lifecycle block workspace")
+        identities = workspace.get("identities", {})
+        if not isinstance(identities, dict):
+            raise CheckpointError("corrupt: partial lifecycle block workspace.identities")
+        if identities and "resume_contract" not in checkpoint:
+            raise CheckpointError("corrupt: partial lifecycle block workspace.identities")
+
+    step = checkpoint.get("interrupted_step")
+    if "interrupted_step" in checkpoint:
+        if not isinstance(step, dict):
+            raise CheckpointError("corrupt: partial lifecycle block interrupted_step")
+        if not isinstance(step.get("name"), str):
+            raise CheckpointError("corrupt: partial lifecycle block interrupted_step.name")
+        if step.get("status") != "unknown":
+            raise CheckpointError("corrupt: partial lifecycle block interrupted_step.status")
+        if "attempt_id" not in step or not (
+            step["attempt_id"] is None or isinstance(step["attempt_id"], str)
+        ):
+            raise CheckpointError("corrupt: partial lifecycle block interrupted_step.attempt_id")
 
 
 class CheckpointManager:
@@ -314,6 +369,9 @@ class CheckpointManager:
         trigger: CheckpointTrigger = "failure",
         *,
         redactor: RunRedactor | None = None,
+        workspace: dict[str, Any] | None = None,
+        resume_contract: dict[str, Any] | None = None,
+        interrupted_step: dict[str, Any] | None = None,
     ) -> Path | None:
         """Serialize workflow state to a checkpoint file.
 
@@ -361,6 +419,9 @@ class CheckpointManager:
                 and the caller's ``inputs`` mapping are never mutated. When
                 ``None`` or inactive, output is byte-identical to an
                 unredacted save.
+            workspace: Optional workspace policy, backend identities, and executed backends.
+            resume_contract: Optional workflow, environment, manifest, and bundle digests.
+            interrupted_step: Optional step name, unknown status, and attempt ID.
 
         Returns:
             Path to the saved checkpoint file, or ``None`` if saving failed.
@@ -408,6 +469,12 @@ class CheckpointManager:
                 "run_id": run_id,
                 "event_log_path": event_log_path,
             }
+            if workspace is not None:
+                checkpoint["workspace"] = _make_json_serializable(workspace)
+            if resume_contract is not None:
+                checkpoint["resume_contract"] = _make_json_serializable(resume_contract)
+            if interrupted_step is not None:
+                checkpoint["interrupted_step"] = _make_json_serializable(interrupted_step)
 
             # Scrub registered secrets from the payload as a copy before
             # serialization — fixed protocol keys keep their names (only
@@ -518,6 +585,7 @@ class CheckpointManager:
                     suggestion="The checkpoint file may be corrupted or incomplete",
                     checkpoint_path=str(checkpoint_path),
                 )
+        _validate_lifecycle_blocks(data)
 
         return CheckpointData(
             version=data["version"],
@@ -541,6 +609,9 @@ class CheckpointManager:
             # honest: anything other than "periodic" (missing, None, empty, a
             # value from a newer Conductor) loads as "failure".
             trigger="periodic" if data.get("trigger") == "periodic" else "failure",
+            workspace=data.get("workspace"),
+            resume_contract=data.get("resume_contract"),
+            interrupted_step=data.get("interrupted_step"),
         )
 
     @staticmethod

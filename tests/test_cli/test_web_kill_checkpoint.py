@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 import pytest
@@ -29,7 +30,16 @@ from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError
+from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.types import RunOutcome
 from conductor.providers.copilot import CopilotProvider
+from tests.test_execution.test_workspace_retention import (
+    bundle,
+    commands,
+    lifecycle_engine,
+)
+
+pytest_plugins = ["tests.test_execution.test_workspace_retention"]
 
 
 class _StopAfter:
@@ -99,3 +109,108 @@ async def test_kill_mid_step_writes_checkpoint(tmp_path: Path) -> None:
     # The checkpoint resumes from the in-flight wait step.
     cp = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
     assert cp.current_agent == "pause"
+
+
+@pytest.mark.asyncio
+async def test_retained_cancel_finalizes_before_failed_checkpoint_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Requirement: a failed stop checkpoint warns after retaining, regardless of a stale path.
+    wf_path = tmp_path / "workflow.yaml"
+    wf_path.write_text("name: kill-checkpoint\n", encoding="utf-8")
+    engine = WorkflowEngine(
+        _wait_workflow(),
+        CopilotProvider(mock_handler=lambda a, p, c: {}),
+        workflow_path=wf_path,
+    )
+    engine._run_id = "retain-on-cancel"
+    engine._last_checkpoint_path = tmp_path / "stale.json"
+    started = asyncio.Event()
+    order: list[str] = []
+
+    async def pause(*_args: object) -> None:
+        started.set()
+        await asyncio.Future()
+
+    async def finalize(_outcome: str, *, retain: bool = False) -> None:
+        assert retain is True
+        order.append("finalize")
+
+    def failed_write(_error: BaseException) -> None:
+        order.append("checkpoint")
+        return None
+
+    class StopOnStart:
+        async def wait_for_stop(self) -> None:
+            await started.wait()
+
+    with (
+        patch.object(engine, "_workspace_persistence", return_value="on-failure"),
+        patch.object(engine, "_execute_wait", side_effect=pause),
+        patch.object(engine._execution_session, "finalize_leases", side_effect=finalize),
+        patch.object(engine, "_save_checkpoint_on_failure", side_effect=failed_write),
+        patch("conductor.engine.workflow.acquire_workspace_claim") as claim,
+        pytest.raises(ExecutionError, match="stopped by user"),
+    ):
+        await _run_with_stop_signal(engine, {}, StopOnStart())
+
+    assert order == ["finalize", "checkpoint"]
+    assert "retain-on-cancel" in caplog.text
+    assert "docker volume rm conductor-ws-retain-on-cancel" in caplog.text
+    claim.return_value.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_cancel_keeps_fake_docker_volume_on_failed_checkpoint(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement: stop retains Docker before reporting a failed current checkpoint write.
+    _backend, _binary, store, log = docker_processes
+    engine = lifecycle_engine(tmp_path, entry="pause")
+    engine._last_checkpoint_path = tmp_path / "stale-checkpoint.json"
+    started = asyncio.Event()
+    volume = store / "volumes" / "conductor-ws-retention-engine"
+    order: list[str] = []
+
+    async def paused(*_args: object) -> None:
+        started.set()
+        await asyncio.Future()
+
+    class StopWhenPaused:
+        async def wait_for_stop(self) -> None:
+            await started.wait()
+
+    original_finalize = engine._execution_session.finalize_leases
+    original_stop = engine.handle_dashboard_stop
+
+    async def finalize(outcome: RunOutcome, *, retain: bool = False) -> None:
+        assert retain is True
+        order.append("finalize")
+        await original_finalize(outcome, retain=retain)
+
+    def stopped(message: str) -> None:
+        assert order == ["finalize"]
+        assert volume.exists()
+        order.append("stop")
+        original_stop(message)
+
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=mock.AsyncMock,
+            return_value=bundle(tmp_path),
+        ),
+        patch.object(engine, "_execute_wait", side_effect=paused),
+        patch.object(engine._execution_session, "finalize_leases", side_effect=finalize),
+        patch.object(engine, "handle_dashboard_stop", side_effect=stopped),
+        patch.object(CheckpointManager, "save_checkpoint", return_value=None),
+        pytest.raises(ExecutionError, match="stopped by user"),
+    ):
+        await _run_with_stop_signal(engine, {}, StopWhenPaused())
+    assert order == ["finalize", "stop"]
+    assert volume.exists()
+    assert not any(argv[:2] == ["volume", "rm"] for argv in commands(log))
+    assert "retention-engine" in caplog.text
+    assert "docker volume rm conductor-ws-retention-engine" in caplog.text
