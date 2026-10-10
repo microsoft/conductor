@@ -2259,6 +2259,20 @@ agents:
       - arxiv_search
 ```
 
+What an agent gets depends on both levels:
+
+| agent `tools:` | workflow `tools:` | the agent gets |
+|---|---|---|
+| `[]` | anything | no tools at all |
+| `[web_search]` | must include `web_search` | exactly `web_search` |
+| omitted | `[web_search, calculator]` | the workflow list |
+| omitted | omitted or `[]` | the provider's default tools |
+
+An agent that must not touch the filesystem, shell or network, such as a reviewer that
+should reason only over its prompt, should declare `tools: []` explicitly rather than
+omit the field. A provider that cannot honour a declared list refuses it at
+`conductor validate` rather than ignoring it; see the provider's documentation.
+
 **Note**: Tool implementation depends on your provider. See provider documentation for available tools.
 
 ### MCP Servers

@@ -16,7 +16,7 @@ import os
 import random
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard
 
@@ -277,6 +277,45 @@ class SDKResponse:
     last_call_input_tokens: int | None = None
     partial: bool = False
     resolved_model: str | None = None
+
+
+def copilot_tool_allowlist(
+    agent_tools: list[str] | None,
+    resolved_tools: list[str] | None,
+    mcp_server_names: Iterable[str],
+) -> list[str] | None:
+    """Translate an agent's resolved ``tools:`` into the SDK's ``available_tools``.
+
+    Explicit agent tool lists, including ``tools: []``, are enforced. When agent
+    tools are omitted, a non-empty workflow tool list is inherited; an empty
+    workflow list retains the SDK's default tools, signalled by returning ``None``.
+
+    Conductor names MCP tools ``server__tool``, but the Copilot runtime registers
+    them as ``server-tool``, so a name passed through unchanged matches nothing
+    and the tool is hidden. Names whose prefix is a configured MCP server are
+    therefore rewritten to the SDK's source-qualified ``mcp:server-tool``; every
+    other name (built-in tools) is forwarded unchanged. Server names are matched
+    longest first, so a server whose own name contains ``__`` still resolves.
+
+    Args:
+        agent_tools: The agent's declared ``tools:`` (``None`` when omitted).
+        resolved_tools: The list the executor resolved for this agent.
+        mcp_server_names: Names of the MCP servers attached to this session.
+
+    Returns:
+        The ``available_tools`` list, or ``None`` to keep the default catalog.
+    """
+    if agent_tools is None and not resolved_tools:
+        return None
+    servers = sorted(set(mcp_server_names), key=len, reverse=True)
+    allowlist: list[str] = []
+    for name in resolved_tools or []:
+        server = next((s for s in servers if name.startswith(f"{s}__")), None)
+        if server is not None and len(name) > len(server) + 2:
+            allowlist.append(f"mcp:{server}-{name[len(server) + 2 :]}")
+        else:
+            allowlist.append(name)
+    return allowlist
 
 
 class CopilotProvider(AgentProvider):
@@ -1255,12 +1294,13 @@ class CopilotProvider(AgentProvider):
                 "working_directory": resolved_cwd,
                 "streaming": True,
             }
-            # Enforce the resolved tool allowlist on the SDK session whenever one
-            # is declared (agent-level, or inherited from workflow-level tools).
-            # Only when neither level declares tools does the CLI keep its default
-            # catalog; ``tools: []`` yields a session with no tools at all.
-            if agent.tools is not None or tools:
-                session_kwargs["available_tools"] = list(tools or [])
+            # One allowlist for both the new-session and the resume path, so the
+            # two cannot drift apart. ``None`` keeps the CLI's default catalog.
+            allowlist = copilot_tool_allowlist(
+                agent.tools, tools, {*(self._mcp_servers or {}), *(extra_mcp_servers or {})}
+            )
+            if allowlist is not None:
+                session_kwargs["available_tools"] = list(allowlist)
             if agent.system_prompt:
                 session_kwargs["system_message"] = {
                     "mode": "replace",
@@ -1386,8 +1426,8 @@ class CopilotProvider(AgentProvider):
                             "on_permission_request": self._default_permission_handler,
                             "working_directory": resolved_cwd,
                         }
-                        if agent.tools is not None or tools:
-                            resume_kwargs["available_tools"] = list(tools or [])
+                        if allowlist is not None:
+                            resume_kwargs["available_tools"] = list(allowlist)
                         if agent.system_prompt:
                             resume_kwargs["system_message"] = {
                                 "mode": "replace",
