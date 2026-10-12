@@ -9,6 +9,7 @@ from __future__ import annotations
 import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -779,6 +780,121 @@ workflows:
         else:
             load.assert_called_once_with(self._config().registries["official"], ref=_NEW_SHA)
 
+    @pytest.mark.parametrize("b_schema_source", ["parse-cache", "workflow-file"])
+    def test_refresh_advances_lower_tier_schema_with_the_pin(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch, b_schema_source: str
+    ) -> None:
+        """The same workflow key at A and B, with no schema metadata in
+        either index, so the schema comes from tier 2 or 3. B changes the
+        required inputs; the advertised schema must come from B, matching
+        the pin -- never A's parameters with execution pinned to B."""
+        from conductor.config.schema import InputDef, McpConfig
+
+        index_without_schema = """\
+workflows:
+  review-pr:
+    description: ""
+    path: workflows/review-pr.yaml
+"""
+        self._warm(conductor_home, _FAKE_SHA, index_without_schema)
+        registry_cache.save_parsed_tools(
+            "official",
+            _FAKE_SHA,
+            {
+                "review-pr": registry_cache.ParsedToolInfo(
+                    description="A's schema",
+                    input={"question": InputDef(type="string", required=True)},
+                    mcp=McpConfig(),
+                    name="review-pr",
+                )
+            },
+        )
+        populate_github_warm_cache(
+            conductor_home,
+            registry_name="official",
+            sha=_NEW_SHA,
+            registry_source=self._SOURCE,
+            index_yaml=index_without_schema,
+            workflow_files={"workflows/review-pr.yaml": _REVIEW_PR_YAML.encode()},
+        )
+        if b_schema_source == "parse-cache":
+            registry_cache.save_parsed_tools(
+                "official",
+                _NEW_SHA,
+                {
+                    "review-pr": registry_cache.ParsedToolInfo(
+                        description="B's schema",
+                        input={"pr_number": InputDef(type="number", required=True)},
+                        mcp=McpConfig(),
+                        name="review-pr",
+                    )
+                },
+            )
+        else:
+            meta_dir = registry_cache._meta_dir("official", _NEW_SHA)
+            write_workflow_ready_marker(meta_dir, "review-pr")
+            # Tier 3 runs online here, so `fetch_workflow` re-materializes
+            # the already-immutable SHA; answer that without the network.
+            monkeypatch.setattr(
+                "conductor.registry.cache.materialize_to_sha", lambda _entry, ref: ref
+            )
+        # The fixture moved the pointer to B; restore the stale default.
+        registry_cache._write_ref_pointer("official", None, _FAKE_SHA)
+        self._resolvers(monkeypatch, _NEW_SHA)
+        monkeypatch.setattr(
+            "conductor.mcp.serve.catalogue.load_index",
+            Mock(side_effect=AssertionError("B's index is already cached")),
+        )
+
+        catalogue = build_catalogue(ServeOptions(), registries_config=self._config())
+
+        assert [item.workflow for item in catalogue.entries] == ["review-pr"]
+        exposed = catalogue.entries[0]
+        expected_tier = "cache" if b_schema_source == "parse-cache" else "parsed"
+        assert exposed.resolution_tier == expected_tier
+        assert exposed.pin.value == _NEW_SHA
+        properties = exposed.tool.inputSchema["properties"]
+        assert "question" not in properties
+        assert properties["pr_number"]["type"] == "number"
+        assert "pr_number" in exposed.tool.inputSchema["required"]
+
+    def test_slow_ref_lookup_does_not_consume_local_schema_budget(
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A warm-cache online build whose ref lookup outlasts the whole
+        schema budget must still parse the `--workflow-dir` files after
+        it: their schemas resolve and `mcp.expose: false` is honored,
+        rather than degrading to a permissive, exposed entry."""
+        import conductor.mcp.serve.catalogue as catalogue_module
+
+        self._warm(conductor_home)
+        ref, _ = self._resolvers(monkeypatch, _FAKE_SHA)
+        clock = [1_000.0]
+        monkeypatch.setattr(catalogue_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+        def slow_lookup(*_args: object) -> str:
+            clock[0] += 10.0
+            return "main"
+
+        ref.side_effect = slow_lookup
+        workflow_dir = tmp_path / "local"
+        workflow_dir.mkdir()
+        (workflow_dir / "review-pr.yaml").write_text(_REVIEW_PR_YAML, encoding="utf-8")
+        (workflow_dir / "hidden.yaml").write_text(_unexposed_yaml("hidden"), encoding="utf-8")
+
+        catalogue = build_catalogue(
+            ServeOptions(workflow_dirs=(workflow_dir,)),
+            registries_config=self._config(),
+            schema_resolution_deadline=2.0,
+        )
+
+        assert clock[0] >= 1_010.0, "the slow lookup did not run"
+        by_workflow = {item.workflow: item for item in catalogue.entries}
+        assert set(by_workflow) == {"old", "review-pr"}
+        local = by_workflow["review-pr"]
+        assert local.resolution_tier == "parsed"
+        assert local.tool.inputSchema["properties"]["pr_number"]["type"] == "number"
+
     def test_unchanged_sha_resolves_twice_but_reuses_index(
         self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -828,7 +944,7 @@ workflows:
     ) -> None:
         self._warm(conductor_home)
         ref, materialize = self._resolvers(monkeypatch)
-        error = RegistryError("remote unavailable")
+        error = RegistryError("remote unavailable", suggestion="Run 'gh auth login' to refresh")
         (ref if stage == "resolve" else materialize).side_effect = error
         write = Mock(side_effect=AssertionError("pointer rewritten on failure"))
         monkeypatch.setattr(registry_cache, "_write_ref_pointer", write)
@@ -838,6 +954,10 @@ workflows:
         assert catalogue.entries[0].pin.value == _FAKE_SHA
         assert catalogue.failed_registries == ()
         assert "official" in caplog.text and _FAKE_SHA in caplog.text
+        # The operator must learn *why* the server is serving an older
+        # catalogue, and how to restore refreshing.
+        assert "remote unavailable" in caplog.text
+        assert "Run 'gh auth login' to refresh" in caplog.text
         assert registry_cache._read_ref_pointer("official", None) == _FAKE_SHA
         write.assert_not_called()
 
@@ -879,8 +999,9 @@ workflows:
         assert registry_cache._read_ref_pointer("official", None) == _FAKE_SHA
         load.assert_not_called()
 
+    @pytest.mark.parametrize("recovery_fetch", ["succeeds", "fails"])
     def test_new_sha_index_failure_does_not_rollback(
-        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
+        self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch, recovery_fetch: str
     ) -> None:
         self._warm(conductor_home)
         self._resolvers(monkeypatch)
@@ -892,6 +1013,40 @@ workflows:
         assert catalogue.entries == ()
         assert "new index unavailable" in catalogue.failed_registries[0].reason
         assert registry_cache._read_ref_pointer("official", None) == _NEW_SHA
+
+        # Next startup: ref resolution itself now fails while the pointer
+        # names B and B's index was never cached. The fallback must fetch
+        # the recorded B index -- not require it to be cached already, and
+        # never revert to A's warm index.
+        ref, _ = self._resolvers(monkeypatch)
+        ref.side_effect = RegistryError("remote unavailable")
+        write = Mock(side_effect=AssertionError("pointer rewritten on fallback"))
+        monkeypatch.setattr(registry_cache, "_write_ref_pointer", write)
+        if recovery_fetch == "succeeds":
+            load = Mock(
+                return_value=RegistryIndex.model_validate(
+                    {"workflows": {"new": {"path": "workflows/new.yaml", "input": {}, "mcp": {}}}}
+                )
+            )
+        else:
+            load = Mock(side_effect=RegistryError("B index still unavailable"))
+        monkeypatch.setattr("conductor.mcp.serve.catalogue.load_index", load)
+
+        recovered = build_catalogue(ServeOptions(), registries_config=self._config())
+
+        load.assert_called_once_with(self._config().registries["official"], ref=_NEW_SHA)
+        write.assert_not_called()
+        assert registry_cache._read_ref_pointer("official", None) == _NEW_SHA
+        assert "old" not in [item.workflow for item in recovered.entries]
+        if recovery_fetch == "succeeds":
+            assert [item.workflow for item in recovered.entries] == ["new"]
+            assert recovered.entries[0].pin.value == _NEW_SHA
+            assert recovered.failed_registries == ()
+        else:
+            assert recovered.entries == ()
+            assert len(recovered.failed_registries) == 1
+            assert recovered.failed_registries[0].registry == "official"
+            assert "B index still unavailable" in recovered.failed_registries[0].reason
 
     def test_new_build_does_not_mutate_earlier_catalogue(
         self, conductor_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -907,6 +1062,30 @@ workflows:
         assert first.entries[0].pin.value == _FAKE_SHA
         assert [item.workflow for item in second.entries] == ["new"]
         assert second.entries[0].pin.value == _NEW_SHA
+
+
+class TestSchemaBudget:
+    def test_paused_time_is_not_charged_and_remaining_budget_carries_over(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import conductor.mcp.serve.catalogue as catalogue_module
+
+        clock = [0.0]
+        monkeypatch.setattr(catalogue_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        budget = catalogue_module._SchemaBudget(2.0)
+
+        clock[0] += 0.5  # schema work: charged
+        with budget.paused():
+            clock[0] += 30.0  # registry index resolution: not charged
+        assert budget.remaining() == pytest.approx(1.5)
+
+        with pytest.raises(RegistryError), budget.paused():
+            clock[0] += 30.0
+            raise RegistryError("index unreachable")
+        assert budget.remaining() == pytest.approx(1.5)
+
+        clock[0] += 1.5
+        assert budget.remaining() <= 0
 
 
 # ---------------------------------------------------------------------------

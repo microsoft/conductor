@@ -37,10 +37,11 @@ The result is immutable for the server process's lifetime (DD3).
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import fnmatch
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -73,10 +74,47 @@ from conductor.registry.version_resolver import materialize_to_sha, resolve_ref
 logger = logging.getLogger(__name__)
 
 # This bounds tier-3 (fetch-and-parse) attempts specifically -- a tier-1 or
-# tier-2 hit never reaches this check. Online default-ref resolution is not
-# covered by this deadline. A workflow whose tier-3 resolution
-# would blow the deadline degrades (NFR2) rather than stalling startup.
+# tier-2 hit never reaches this check. Registry index resolution (including
+# online default-ref resolution) is excluded from the budget via
+# `_SchemaBudget.paused()`, so a slow ref lookup cannot starve later
+# registries or `--workflow-dir` files of their schema budget. A workflow
+# whose tier-3 resolution would blow the budget degrades (NFR2) rather than
+# stalling startup.
 DEFAULT_SCHEMA_RESOLUTION_DEADLINE_SECONDS = 2.0
+
+
+class _SchemaBudget:
+    """Wall-clock budget shared by every tier-3 schema resolution in one
+    catalogue build.
+
+    The budget only counts time spent resolving schemas. Work that is not
+    schema resolution -- notably resolving a registry's index, which for an
+    online GitHub build checks the floating default ref every start -- runs
+    inside :meth:`paused`, which pushes the deadline back by however long
+    that work took. Whatever budget remains therefore carries across
+    registries and on to ``--workflow-dir`` files. Without this, a slow ref
+    lookup would expire the budget before any later workflow was parsed,
+    degrading its schema and (since a degraded entry falls back to
+    ``McpConfig(expose=True)``) exposing a workflow that declared
+    ``mcp.expose: false``.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self._deadline = time.monotonic() + seconds
+
+    def remaining(self) -> float:
+        """Seconds left for schema resolution (negative once exhausted)."""
+        return self._deadline - time.monotonic()
+
+    @contextlib.contextmanager
+    def paused(self) -> Iterator[None]:
+        """Exclude the wrapped block's wall-clock time from the budget."""
+        start = time.monotonic()
+        try:
+            yield
+        finally:
+            self._deadline += time.monotonic() - start
+
 
 # Non-recursive: only files directly under a `--workflow-dir` are exposed,
 # mirroring the "expand a root into its immediate children" convention used
@@ -282,10 +320,12 @@ def build_catalogue(
             back to the recorded pointer. When ``False``, resolution is
             cache-only with no GitHub API calls; a missing index skips the
             registry rather than aborting the build.
-        schema_resolution_deadline: Wall-clock seconds, from this call's
-            start, budgeted for tier-3 (fetch-and-parse) schema
-            resolution. Exceeding it degrades the remaining unresolved
-            workflows (NFR2) rather than stalling startup (NFR1).
+        schema_resolution_deadline: Wall-clock seconds budgeted for
+            tier-3 (fetch-and-parse) schema resolution across the whole
+            build. Time spent resolving registry indexes (including online
+            default-ref checks) is not charged against it. Exceeding it
+            degrades the remaining unresolved workflows (NFR2) rather than
+            stalling startup (NFR1).
 
     Returns:
         An immutable :class:`Catalogue`.
@@ -293,7 +333,7 @@ def build_catalogue(
     if registries_config is None:
         registries_config = load_registries_config()
 
-    deadline = time.monotonic() + schema_resolution_deadline
+    budget = _SchemaBudget(schema_resolution_deadline)
 
     candidates: list[_Candidate] = []
     rejected: list[RejectedWorkflow] = []
@@ -306,14 +346,14 @@ def build_catalogue(
             entry,
             options,
             allow_network=allow_network,
-            deadline=deadline,
+            budget=budget,
             candidates=candidates,
             failed_registries=failed_registries,
         )
 
     for workflow_dir in options.workflow_dirs:
         _collect_workflow_dir_candidates(
-            workflow_dir, options, deadline=deadline, candidates=candidates
+            workflow_dir, options, budget=budget, candidates=candidates
         )
 
     # Reject a workflow whose input collides with the reserved
@@ -453,12 +493,15 @@ def _collect_registry_candidates(
     options: ServeOptions,
     *,
     allow_network: bool,
-    deadline: float,
+    budget: _SchemaBudget,
     candidates: list[_Candidate],
     failed_registries: list[FailedRegistry],
 ) -> None:
     try:
-        index, sha = _resolve_registry_index(registry_name, entry, allow_network=allow_network)
+        # Index resolution is not schema resolution: keep its (possibly
+        # online) time out of the shared tier-3 budget.
+        with budget.paused():
+            index, sha = _resolve_registry_index(registry_name, entry, allow_network=allow_network)
     except RegistryError as exc:
         # A whole registry being unreachable is an environmental failure
         # like any single workflow's parse failure -- log and skip rather
@@ -488,7 +531,7 @@ def _collect_registry_candidates(
             sha,
             parsed_cache=parsed_cache,
             allow_network=allow_network,
-            deadline=deadline,
+            budget=budget,
         )
         if resolved.tier == "parsed" and sha is not None and workflow_key not in parsed_cache:
             parsed_cache[workflow_key] = ParsedToolInfo(
@@ -570,15 +613,20 @@ def _resolve_registry_index(
         try:
             resolved_ref = resolve_ref(entry, None)
             sha = materialize_to_sha(entry, resolved_ref)
-        except RegistryError:
+        except RegistryError as exc:
             sha = registry_cache._read_ref_pointer(registry_name, None)
             if sha is None:
                 raise
             using_fallback = True
+            # Name the cause (auth, rate limit, timeout, ...) and its
+            # suggestion: the server is about to serve an older catalogue
+            # for its whole lifetime, and the operator needs to know why.
             logger.warning(
-                "Could not resolve default ref for registry %r; falling back to recorded SHA %s",
+                "Could not resolve default ref for registry %r; falling back to recorded "
+                "SHA %s: %s",
                 registry_name,
                 sha,
+                exc,
             )
         else:
             registry_cache._write_ref_pointer(registry_name, None, sha)
@@ -624,7 +672,7 @@ def _resolve_registry_workflow_schema(
     *,
     parsed_cache: dict[str, ParsedToolInfo],
     allow_network: bool,
-    deadline: float,
+    budget: _SchemaBudget,
 ) -> _ResolvedSchema:
     """Resolve one registry workflow's schema through the three-tier
     ladder. Never raises for an environmental failure (NFR2) — a tier-3
@@ -649,7 +697,7 @@ def _resolve_registry_workflow_schema(
         sha,
         parsed_cache=parsed_cache,
         allow_network=allow_network,
-        deadline=deadline,
+        budget=budget,
     )
     return _ResolvedSchema(
         description=info.description if info.input is not None else lower.description,
@@ -704,7 +752,7 @@ def _resolve_lower_tier_schema(
     *,
     parsed_cache: dict[str, ParsedToolInfo],
     allow_network: bool,
-    deadline: float,
+    budget: _SchemaBudget,
 ) -> _ResolvedSchema:
     """Resolve a workflow's full schema through tiers 2-3, for whichever
     field(s) the index did not declare."""
@@ -720,8 +768,8 @@ def _resolve_lower_tier_schema(
             name=parsed.name,
         )
 
-    # Tier 3: fetch and parse, under the startup deadline.
-    remaining = deadline - time.monotonic()
+    # Tier 3: fetch and parse, under the startup budget.
+    remaining = budget.remaining()
     if remaining <= 0:
         return _ResolvedSchema(
             description=_DEGRADED_DEADLINE_DESCRIPTION,
@@ -805,7 +853,7 @@ def _path_registry_workflow_path(entry: RegistryEntry, info: WorkflowInfo) -> Pa
 
 
 def _collect_workflow_dir_candidates(
-    directory: Path, options: ServeOptions, *, deadline: float, candidates: list[_Candidate]
+    directory: Path, options: ServeOptions, *, budget: _SchemaBudget, candidates: list[_Candidate]
 ) -> None:
     """Expose every workflow file directly under a ``--workflow-dir``
     (FR2), non-recursively. There is no index or cache for an ad-hoc
@@ -825,8 +873,8 @@ def _collect_workflow_dir_candidates(
     basename (and a same-named file within them) still produce distinct
     identities instead of one candidate silently overwriting the other.
 
-    Bounded by ``deadline`` (NFR1) — a file reached after the startup
-    deadline degrades without being parsed, rather than adding unbounded
+    Bounded by ``budget`` (NFR1) — a file reached after the startup
+    budget is exhausted degrades without being parsed, rather than adding unbounded
     parse time on top of an already-exhausted budget.
     """
     if not directory.is_dir():
@@ -844,7 +892,7 @@ def _collect_workflow_dir_candidates(
             continue
 
         name: str | None = None
-        remaining = deadline - time.monotonic()
+        remaining = budget.remaining()
         if remaining <= 0:
             description = (
                 "This workflow's parameters could not be resolved: the catalogue "

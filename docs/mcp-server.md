@@ -115,10 +115,13 @@ alongside, or instead of, any registry.
 At every server start, configured GitHub registries check the current default
 branch and pin the catalogue to its commit SHA. Content already cached at that
 SHA is reused; if default-ref resolution fails, the server falls back to the
-last recorded SHA (subject to cache source validation). A running catalogue
-stays frozen at its startup SHA and tool list: restart the server to adopt
-registry changes. `conductor doctor mcp` uses an offline, cache-only snapshot,
-not the online default-ref check performed by server startup.
+last recorded SHA (subject to cache source validation) and logs a warning
+naming the resolution error, so an authentication failure or rate limit is
+visible rather than silently serving an older catalogue. Time spent on this
+check does not count against the startup schema-resolution budget. A running
+catalogue stays frozen at its startup SHA and tool list: restart the server to
+adopt registry changes. `conductor doctor mcp` uses an offline, cache-only
+snapshot, not the online default-ref check performed by server startup.
 
 The startup summary the server prints to stderr (see
 [Startup Summary](#startup-summary)) names every workflow it *does*
