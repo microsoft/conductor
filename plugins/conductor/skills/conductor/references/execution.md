@@ -24,7 +24,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--web-bg` | Run in background, print dashboard URL, exit |
 | `--web-port PORT` | Port for web dashboard (0 = auto) |
 | `--no-interactive` | Disable Esc-to-interrupt capability |
-| `--log-file`, `-l PATH` | Write full debug output to file (`auto` for auto-generated) |
+| `--log-file`, `-l <auto\|PATH>` | Write full debug output to file; overrides `runtime.log_file` when supplied |
 | `--workspace-instructions` | Auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (only files marked `applyTo: "**"`) and prepend them to every agent prompt |
 | `--instructions PATH` | Path to a specific instruction file to prepend (repeatable) |
 
@@ -198,7 +198,7 @@ conductor resume --from <checkpoint.json> [OPTIONS]
 | `--provider`, `-p PROVIDER` | Override provider for the resumed run |
 | `--metadata`, `-m KEY=VALUE` | Workflow metadata, merged on top of YAML metadata (repeatable) |
 | `--skip-gates` | Auto-select first option at human gates |
-| `--log-file`, `-l PATH` | Write debug output to file |
+| `--log-file`, `-l <auto\|PATH>` | Write debug output to file; overrides `runtime.log_file` when supplied |
 | `--no-interactive` | Disable Esc-to-interrupt |
 | `--web` | Start real-time web dashboard for the resumed run |
 | `--web-port PORT` | Port for the dashboard (0 = auto) |
@@ -414,7 +414,21 @@ conductor run workflow.yaml --log-file auto
 conductor -s run workflow.yaml --log-file debug.log
 ```
 
-Capture full debug output to a file. Combine with `--silent` for quiet terminal with full logging. Auto mode generates files in `$TMPDIR/conductor/`.
+Set a workflow default so the flag does not need to be repeated:
+
+```yaml
+workflow:
+  runtime:
+    log_file: auto  # Or ./logs/run.log
+```
+
+Both the YAML field and CLI option accept `auto`, which creates a timestamped
+file in the OS temporary directory's `conductor/` subdirectory, or an explicit
+file path. Relative paths are resolved from the Conductor process's current
+working directory. The YAML setting applies to both `run` and `resume`; an
+explicit CLI `--log-file` value takes precedence. If neither is set, debug file
+logging is disabled. Combine with `--silent` for a quiet terminal with file
+logging enabled.
 
 ### Dry Run
 
