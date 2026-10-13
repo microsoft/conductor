@@ -12,12 +12,16 @@ import dataclasses
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, get_args
 
 import pytest
 
 from conductor.execution import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     BundleRef,
     CommandOutcome,
     CommandResult,
@@ -118,14 +122,83 @@ class TestProtocolShape:
         assert getattr(RunnerBackend, "_is_protocol", False) is True
 
     def test_protocol_declares_exactly_four_methods(self) -> None:
-        # Requirement: the seam stays minimal — no run_agent/open_mcp/cancel,
-        # no close(), no context manager "for symmetry".
+        # Requirement: step 7 adds run_agent while open_mcp/cancel/close and
+        # context-manager symmetry methods remain outside the seam.
         method_names = {
             name
             for name, member in vars(RunnerBackend).items()
             if callable(member) and not name.startswith("_")
         }
-        assert method_names == {"capabilities", "prepare_run", "run_command", "finalize_run"}
+        assert method_names == {
+            "capabilities",
+            "prepare_run",
+            "run_command",
+            "run_agent",
+            "finalize_run",
+        }
+
+    @pytest.mark.asyncio
+    async def test_local_protocol_rejects_missing_execute_local(self) -> None:
+        # Requirement: in-process invocation requires an explicit local closure.
+        from conductor.exceptions import ConfigurationError
+        from conductor.execution.local import LocalRunnerBackend
+
+        spec = AgentSpec("agent", "exec-1", "copilot", None, "prompt")
+        with pytest.raises(ConfigurationError, match="requires execute_local"):
+            await LocalRunnerBackend().run_agent(spec, None)
+
+
+class TestAgentContracts:
+    """Requirement: agent invocation contracts are frozen and default safely."""
+
+    def test_agent_spec_and_result_are_frozen(self) -> None:
+        # Requirement: callers cannot mutate invocation inputs or results.
+        spec = AgentSpec("agent", "exec-1", "copilot", None, "prompt")
+        result = AgentResult(content={"answer": "ok"})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.name = "other"  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.content = {}  # type: ignore[misc]
+
+    def test_capability_defaults_preserve_old_construction(self) -> None:
+        # Requirement: the two trailing capabilities default off for old callers.
+        legacy = RunnerCapabilities(
+            batch=True, sessions=False, shared_workspace=True, snapshots=False
+        )
+        explicit = RunnerCapabilities(
+            batch=True,
+            sessions=False,
+            shared_workspace=True,
+            snapshots=False,
+            agent=False,
+            interrupt=False,
+        )
+        assert legacy == explicit
+
+    def test_credential_values_are_omitted_from_repr(self) -> None:
+        # Requirement: credential-bearing fields are not exposed by repr().
+        spec = AgentSpec(
+            "agent",
+            "exec-1",
+            "copilot",
+            None,
+            "prompt",
+            env_overlay={"TOKEN": "overlay-secret"},
+            provider_credentials={"api_key": "provider-secret"},
+        )
+        result = AgentResult(content={}, raw_response="raw-secret")
+        rendered = repr(spec) + repr(result)
+        assert "overlay-secret" not in rendered
+        assert "provider-secret" not in rendered
+        assert "raw-secret" not in rendered
+
+    def test_agent_event_sink_is_structural(self) -> None:
+        # Requirement: callbacks accept an event name and structured data payload.
+        def sink(_name: str, _payload: Mapping[str, Any]) -> None:
+            return None
+
+        typed_sink: AgentEventSink = sink
+        typed_sink("agent_started", {})
 
 
 class TestLeafPurity:
@@ -180,9 +253,20 @@ class TestLeafPurity:
                 is_self = imported == "conductor.execution" or imported.startswith(
                     "conductor.execution."
                 )
-                if not is_self:
+                # Requirement: run_agent's contract raises conductor.exceptions.ConfigurationError;
+                # conductor.exceptions is a stdlib-only leaf, so the layer-hygiene guarantee
+                # (no cli/engine/executor/pydantic pulls) is unchanged.
+                if not is_self and imported != "conductor.exceptions":
                     offenders.append(f"{source_path.name}:{node.lineno}:{imported}")
         assert offenders == []
+
+    def test_agent_contract_fields_do_not_expose_transport_vocabulary(self) -> None:
+        # Requirement: core agent contracts stay neutral for future backends.
+        source = (
+            Path(__file__).resolve().parents[2] / "src/conductor/execution/types.py"
+        ).read_text(encoding="utf-8")
+        agent_types = source[source.index("class AgentSpec:") :]
+        assert not any(word in agent_types.lower() for word in ("http", "docker", "aca"))
 
 
 class TestLiteralVocabularies:
@@ -272,6 +356,39 @@ def test_aliases_are_typing_literals() -> None:
     # exception subclasses — house style, see RunMode in fleet/records.py.
     assert CommandOutcome.__origin__ is Literal  # type: ignore[attr-defined]
     assert RunOutcome.__origin__ is Literal  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_local_run_agent_preserves_result_identity() -> None:
+    # Requirement: local delegation returns the original opaque provider result.
+    from conductor.execution.local import LocalRunnerBackend
+
+    expected = AgentResult(content={"answer": "ok"}, continuation_state=object())
+
+    async def execute_local() -> AgentResult:
+        return expected
+
+    actual = await LocalRunnerBackend().run_agent(
+        AgentSpec("agent", "exec-1", "copilot", None, "prompt"),
+        None,
+        execute_local=execute_local,
+    )
+    assert actual is expected
+
+
+@pytest.mark.asyncio
+async def test_docker_agent_stub_reports_unavailable_realm() -> None:
+    # Requirement: Docker agent calls cannot run without a lease and runner image.
+    from conductor.exceptions import ConfigurationError
+    from conductor.execution.docker import DockerRunnerBackend
+
+    with pytest.raises(
+        ConfigurationError,
+        match="requires a Docker lease and runner image",
+    ):
+        await DockerRunnerBackend("docker").run_agent(
+            AgentSpec("agent", "exec-1", "copilot", None, "prompt"), None
+        )
 
 
 class TestResolvedExecutionSpecAndBundleRef:

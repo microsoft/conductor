@@ -80,7 +80,7 @@ def _validate_explicit(config: WorkflowConfig, environment: ResolvedEnvironment)
 
 
 def test_non_script_docker_profile_uses_reserved_step_7_error() -> None:
-    # Requirement: Docker remains script-only until agent execution realms arrive.
+    # Requirement: an agent on Docker needs a runner image, even during explicit validation.
     config = _config(
         AgentDef(
             name="agent",
@@ -93,12 +93,12 @@ def test_non_script_docker_profile_uses_reserved_step_7_error() -> None:
         )
     )
 
-    with pytest.raises(ConfigurationError, match="script steps only.*step 7"):
+    with pytest.raises(ConfigurationError, match="docker.runner_image"):
         _validate_explicit(config, _environment({"container": _docker()}))
 
 
 def test_bare_validate_rejects_non_script_docker_profile_from_discovery(tmp_path: Path) -> None:
-    # Requirement: ambient validation applies the script-only Docker rule to every discovery.
+    # Requirement: discovered environments also reject an agent without a runner image.
     config = _config(
         AgentDef(
             name="agent",
@@ -115,7 +115,7 @@ def test_bare_validate_rejects_non_script_docker_profile_from_discovery(tmp_path
             "conductor.config.environment.discover_all_environments",
             return_value={"dev": _environment({"container": _docker()}, name="dev")},
         ),
-        pytest.raises(ConfigurationError, match="environment 'dev'.*script steps only"),
+        pytest.raises(ConfigurationError, match="environment 'dev'.*docker.runner_image"),
     ):
         validate_workflow_config(config, workflow_path=tmp_path / "workflow.yaml")
 

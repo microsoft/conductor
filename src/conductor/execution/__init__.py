@@ -10,6 +10,9 @@ on it.
 from conductor.execution.backend import RunnerBackend
 from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     BundleRef,
     CommandOutcome,
     CommandResult,
@@ -24,6 +27,9 @@ from conductor.execution.types import (
 )
 
 __all__ = [
+    "AgentEventSink",
+    "AgentResult",
+    "AgentSpec",
     "BundleRef",
     "CommandOutcome",
     "CommandResult",

@@ -11,8 +11,10 @@ from pydantic import ValidationError
 
 from conductor.config.environment import (
     AVAILABLE_BACKEND_NAMES,
+    DockerProfileOptions,
     EnvironmentDocument,
     ProfileDefinition,
+    _document_digest,
     builtin_local_environment,
     discover_all_environments,
     is_path_reference,
@@ -64,12 +66,12 @@ class TestProfileDefinition:
 
     def test_unknown_backend_names_available(self) -> None:
         # Requirement: an unavailable backend is rejected with a message naming
-        # the backend and the available set — 'podman' must name 'docker, local'.
+        # the backend and the available set — 'podman' must name 'aca, docker, local'.
         with pytest.raises(ValidationError) as exc_info:
             ProfileDefinition(backend="podman")
         message = str(exc_info.value)
         assert "execution backend 'podman' is not available in this build of Conductor" in message
-        assert "available: docker, local" in message
+        assert "available: aca, docker, local" in message
 
     def test_extra_field_forbidden(self) -> None:
         # Requirement: profiles carry exactly the specified fields — no
@@ -511,3 +513,84 @@ class TestDiscoverAll:
         # error — bare validation then warns that refs could not be checked.
         workflow_dir = _repo_with_marker(tmp_path)
         assert discover_all_environments(workflow_dir) == {}
+
+
+class TestDockerRunnerImage:
+    """Requirements for agent-realm image references and digest stability."""
+
+    def test_docker_digest_unchanged_when_runner_image_is_unset(self) -> None:
+        # Requirement: the optional field must not rewrite existing Docker digests.
+        document = EnvironmentDocument.model_validate(
+            {
+                "default": "docker",
+                "profiles": {
+                    "docker": {
+                        "backend": "docker",
+                        "docker": {"image": "python:3.12"},
+                    }
+                },
+            }
+        )
+        assert document.model_dump(mode="json")["profiles"]["docker"]["docker"] == {
+            "image": "python:3.12",
+            "platform": None,
+            "network": None,
+            "user": None,
+            "init": False,
+            "read_only": False,
+            "cap_drop_all": False,
+            "no_new_privileges": False,
+            "tmpfs": False,
+            "resources": {"cpu": None, "memory": None, "pids": None},
+        }
+        assert _document_digest(document) == (
+            "sha256:876f5d8360ba9ba44d8fbf0f3f3bd89fd8618a59919943b764ca0ef1a68fdb1d"
+        )
+
+    def test_runner_image_is_parsed_and_included_in_digest(self, tmp_path: Path) -> None:
+        # Requirement: an authored runner image is retained in canonical data and therefore pinned.
+        path = _write(
+            tmp_path / "runner.yaml",
+            """\
+            default: docker
+            profiles:
+              docker:
+                backend: docker
+                docker:
+                  image: python:3.12
+                  runner_image: registry.example/conductor-runner:1
+            """,
+        )
+        document = load_environment_document(path)
+        docker = document.profiles["docker"].docker
+        assert docker is not None
+        assert docker.runner_image == "registry.example/conductor-runner:1"
+        assert (
+            document.model_dump(mode="json")["profiles"]["docker"]["docker"]["runner_image"]
+            == "registry.example/conductor-runner:1"
+        )
+        resolved = resolve_environment(str(path), workflow_dir=tmp_path)
+        assert resolved.digest.startswith("sha256:")
+        assert resolved.digest == _document_digest(document)
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_runner_image_rejects_empty_or_whitespace(self, value: str) -> None:
+        # Requirement: a configured runner image must be non-empty and contain no whitespace.
+        with pytest.raises(ValidationError, match="runner_image must be a non-empty string"):
+            DockerProfileOptions(image="python:3.12", runner_image=value)
+
+    def test_yaml_integer_runner_image_is_a_type_error(self, tmp_path: Path) -> None:
+        # Requirement: YAML scalars of the wrong type are not coerced into image references.
+        path = _write(
+            tmp_path / "bad-runner.yaml",
+            """\
+            profiles:
+              docker:
+                backend: docker
+                docker:
+                  image: python:3.12
+                  runner_image: 42
+            """,
+        )
+        with pytest.raises(ConfigurationError, match="valid string"):
+            load_environment_document(path)

@@ -1,0 +1,44 @@
+# Docker Agent Execution Realm Example
+#
+# This example demonstrates running an LLM agent step inside a Docker runner
+# container using an execution profile. The agent loop, its stdio MCP child
+# processes, and its session state execute colocated in the container realm.
+#
+# Usage:
+#   # Validate against the docker-agent environment:
+#   conductor validate examples/docker-agent-realm.yaml --environment examples/.conductor/environments/docker-agent.yaml
+#
+#   # Bare validation:
+#   conductor validate examples/docker-agent-realm.yaml
+
+workflow:
+  name: docker-agent-realm-demo
+  description: Demonstrates an agent executing inside a Docker runner container
+  version: "1.0.0"
+  entry_point: research_worker
+
+  defaults:
+    execution:
+      profile: docker_agent
+
+  limits:
+    max_iterations: 10
+
+  runtime:
+    provider: copilot
+
+agents:
+  - name: research_worker
+    description: Answers questions from within the container execution realm
+    prompt: |
+      You are running inside a containerized agent execution realm.
+      Summarize the benefits of running agents in isolated container environments.
+    output:
+      summary:
+        type: string
+        description: Summary of container isolation benefits
+    routes:
+      - to: $end
+
+output:
+  summary: "{{ research_worker.output.summary }}"

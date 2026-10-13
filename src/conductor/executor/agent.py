@@ -12,14 +12,23 @@ import dataclasses
 import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, get_args
+from uuid import uuid4
 
-from conductor.exceptions import ExecutionError, ValidationError
+from conductor.exceptions import ConfigurationError, ExecutionError, ValidationError
+from conductor.execution import (
+    AgentResult,
+    AgentSpec,
+    LocalRunnerBackend,
+    ResolvedExecutionSpec,
+    RunnerBackend,
+    WorkspaceLease,
+)
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
 from conductor.mcp_auth import resolve_mcp_servers
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.context_tier import ContextTier
-from conductor.providers.reasoning import ReasoningEffort
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 from conductor.skills import BYTES_PER_TOKEN_ESTIMATE
 from conductor.templating import is_jinja_template
 
@@ -47,12 +56,15 @@ if TYPE_CHECKING:
     from conductor.config.schema import (
         AgentDef,
         PluginDef,
+        ProviderName,
+        RuntimeConfig,
         SkillDiscoveryConfig,
         SkillInjectionConfig,
     )
     from conductor.plugins.marketplace import Marketplace
     from conductor.plugins.registry import ResolvedPlugin
     from conductor.providers.base import AgentProvider
+    from conductor.providers.capabilities import ProviderCapabilities
     from conductor.skills import ResolvedSkill
 
 
@@ -193,7 +205,7 @@ class AgentExecutor:
 
     def __init__(
         self,
-        provider: AgentProvider,
+        provider: AgentProvider | None,
         workflow_tools: list[str] | None = None,
         instructions_preamble: str | None = None,
         workflow_skills: list[str] | None = None,
@@ -203,11 +215,17 @@ class AgentExecutor:
         workflow_plugins: list[PluginDef] | None = None,
         plugin_marketplaces: Mapping[str, Marketplace] | None = None,
         declared_plugin_sources: Iterable[str] | None = None,
+        remote_provider_type: ProviderName | None = None,
+        remote_runtime: RuntimeConfig | None = None,
+        remote_mcp_servers: dict[str, Any] | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
         Args:
-            provider: The agent provider to use for execution.
+            provider: Local agent provider; None when a remote provider is described statically.
+            remote_provider_type: Provider identity resolved before dispatch into a remote realm.
+            remote_runtime: Effective runtime used to configure the remote provider.
+            remote_mcp_servers: MCP servers the registry would give that provider locally.
             workflow_tools: Tools defined at workflow level. Defaults to empty list.
             instructions_preamble: Optional workspace instructions text to prepend
                 to every agent's rendered prompt.
@@ -239,7 +257,29 @@ class AgentExecutor:
                 so a reference to one that failed to fetch is told to
                 fetch rather than told the marketplace does not exist.
         """
+        if provider is None and (remote_provider_type is None or remote_runtime is None):
+            raise ValueError("Remote executor requires provider identity and runtime configuration")
         self.provider = provider
+        self._remote_provider_type = remote_provider_type
+        self._remote_runtime = remote_runtime
+        self._remote_mcp_servers = remote_mcp_servers
+        self._remote_capabilities: ProviderCapabilities | None = None
+        self._remote_native_skills: bool | None = None
+        self._remote_plugin_root: bool | None = None
+        if remote_provider_type is not None:
+            from conductor.providers.capabilities import (
+                get_capabilities,
+                requires_plugin_root_for_skills,
+                uses_native_skills,
+            )
+
+            self._remote_capabilities = get_capabilities(remote_provider_type)
+            self._remote_native_skills = uses_native_skills(remote_provider_type)
+            self._remote_plugin_root = requires_plugin_root_for_skills(remote_provider_type)
+            if self._remote_native_skills is None or self._remote_plugin_root is None:
+                raise ConfigurationError(
+                    f"Provider '{remote_provider_type}' has no statically resolvable skill surface."
+                )
         self.workflow_tools = workflow_tools or []
         self.instructions_preamble = instructions_preamble
         self._workflow_skills: list[str] = list(workflow_skills or [])
@@ -278,6 +318,31 @@ class AgentExecutor:
             list[ResolvedPlugin],
         ] = {}
         self.renderer = TemplateRenderer()
+
+    @property
+    def _capabilities(self) -> ProviderCapabilities | None:
+        if self._remote_provider_type is not None:
+            return self._remote_capabilities
+        return getattr(type(self.provider), "CAPABILITIES", None)
+
+    @property
+    def _native_skills(self) -> bool:
+        if self._remote_provider_type is not None:
+            return self._remote_native_skills is True
+        return bool(getattr(self.provider, "supports_native_skills", False))
+
+    @property
+    def _plugin_root(self) -> bool:
+        if self._remote_provider_type is not None:
+            return self._remote_plugin_root is True
+        assert self.provider is not None
+        return self.provider.skills_require_plugin_root
+
+    @property
+    def _provider_label(self) -> str:
+        if self._remote_provider_type is not None:
+            return self._remote_provider_type
+        return type(self.provider).__name__
 
     def set_plugin_marketplaces(self, marketplaces: Mapping[str, Marketplace]) -> None:
         """Replace the marketplace table plugin entries resolve against.
@@ -347,6 +412,11 @@ class AgentExecutor:
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         continuation_state: object | None = None,
+        execution_backend: RunnerBackend | None = None,
+        workspace_lease: WorkspaceLease | None = None,
+        resolved_execution: ResolvedExecutionSpec | None = None,
+        agent_env_overlay: Mapping[str, str] | None = None,
+        realm_credential_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -449,10 +519,10 @@ class AgentExecutor:
             # all live in that state, so this run sends only the follow-up
             # turn. A provider that hands back state it cannot resume would
             # otherwise reduce the model's input to the bare follow-up text.
-            if not self.provider.supports_continuation:
+            if self.provider is None or not self.provider.supports_continuation:
                 raise ExecutionError(
                     f"Agent '{agent.name}': provider "
-                    f"'{type(self.provider).__name__}' returned continuation state "
+                    f"'{self._provider_label}' returned continuation state "
                     f"it cannot resume (supports_continuation=False). Continuing "
                     f"would send the model only the follow-up turn, without the "
                     f"original task prompt.",
@@ -540,7 +610,7 @@ class AgentExecutor:
         # rendered_prompt above and ignore this).
         skill_dirs: list[str] | None = None
         effective_skills: list[ResolvedSkill] = []
-        if getattr(self.provider, "supports_native_skills", False):
+        if self._native_skills:
             effective_skills = self._merge_skills_and_plugin_skills(agent, plugin_skills)
             if effective_skills:
                 skill_dirs = [str(item.directory) for item in effective_skills]
@@ -563,19 +633,98 @@ class AgentExecutor:
                 f"{len(extra_mcp_servers or {})} MCP server(s) forwarded"
             )
 
-        # Execute via provider
-        output = await self.provider.execute(
-            agent=agent,
-            context=context,
-            rendered_prompt=rendered_prompt,
-            tools=resolved_tools,
-            interrupt_signal=interrupt_signal,
-            event_callback=event_callback,
-            skill_directories=skill_dirs,
-            custom_agents=custom_agents,
-            extra_mcp_servers=extra_mcp_servers,
-            continuation_state=continuation_state,
-        )
+        # No profile keeps the direct provider call and builds no transport spec.
+        if (
+            execution_backend is not None
+            and type(execution_backend) is not LocalRunnerBackend
+            and not execution_backend.capabilities().agent
+        ):
+            raise ConfigurationError(
+                f"Execution backend {type(execution_backend).__name__!r} cannot run agents.",
+                suggestion="Select an agent-capable execution profile.",
+            )
+
+        async def execute_provider() -> AgentOutput:
+            if self.provider is None:
+                raise ConfigurationError("Remote executor cannot execute an agent on the host.")
+            return await self.provider.execute(
+                agent=agent,
+                context=context,
+                rendered_prompt=rendered_prompt,
+                tools=resolved_tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_dirs,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+                continuation_state=continuation_state,
+            )
+
+        if execution_backend is None:
+            output = await execute_provider()
+        elif type(execution_backend) is LocalRunnerBackend:
+            local_output: AgentOutput | None = None
+
+            async def execute_local() -> AgentResult:
+                nonlocal local_output
+                local_output = await execute_provider()
+                return AgentResult(
+                    content=local_output.content,
+                    model=local_output.model,
+                    input_tokens=local_output.input_tokens,
+                    output_tokens=local_output.output_tokens,
+                    cache_read_tokens=local_output.cache_read_tokens,
+                    cache_write_tokens=local_output.cache_write_tokens,
+                    last_call_input_tokens=local_output.last_call_input_tokens,
+                    session_seconds=local_output.session_seconds,
+                    partial=local_output.partial,
+                    raw_response=local_output.raw_response,
+                    continuation_state=local_output.continuation_state,
+                )
+
+            await execution_backend.run_agent(
+                AgentSpec(
+                    name=agent.name,
+                    execution_id=uuid4().hex,
+                    model_provider=agent.provider
+                    or type(self.provider).__module__.rsplit(".", 1)[-1],
+                    model=agent.model,
+                    rendered_prompt=rendered_prompt,
+                ),
+                workspace_lease,
+                on_event=event_callback,
+                interrupt_signal=interrupt_signal,
+                execute_local=execute_local,
+            )
+            assert local_output is not None
+            output = local_output
+        else:
+            spec = self.build_realm_spec(
+                agent,
+                rendered_prompt,
+                context,
+                tools=resolved_tools,
+                skill_directories=skill_dirs,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+                execution=resolved_execution,
+                env_overlay=agent_env_overlay,
+                credential_resolver=realm_credential_resolver,
+                backend_name=workspace_lease.backend if workspace_lease is not None else None,
+            )
+
+            def on_event(event_type: str, data: Mapping[str, Any]) -> None:
+                if event_callback is not None:
+                    event_callback(event_type, dict(data))
+
+            result = await execution_backend.run_agent(
+                spec,
+                workspace_lease,
+                on_event=on_event if event_callback is not None else None,
+                interrupt_signal=interrupt_signal,
+                execute_local=None,
+            )
+            output = self.output_from_realm_result(result)
 
         # Ensure output.content is a dict
         if not isinstance(output.content, dict):
@@ -591,6 +740,149 @@ class AgentExecutor:
             validate_output(output.content, agent.output, warn_undeclared_keys=True)
 
         return output
+
+    @staticmethod
+    def output_from_realm_result(result: AgentResult) -> AgentOutput:
+        """Convert a remote result without restoring provider-owned state."""
+        return AgentOutput(
+            content=dict(result.content),
+            raw_response=None,
+            tokens_used=(
+                result.input_tokens + result.output_tokens
+                if result.input_tokens is not None and result.output_tokens is not None
+                else None
+            ),
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_write_tokens=result.cache_write_tokens,
+            last_call_input_tokens=result.last_call_input_tokens,
+            model=result.model,
+            session_seconds=result.session_seconds,
+            partial=result.partial,
+            continuation_state=None,
+        )
+
+    def build_realm_spec(
+        self,
+        agent: AgentDef,
+        rendered_prompt: str,
+        context: dict[str, Any],
+        *,
+        tools: list[str] | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        execution: ResolvedExecutionSpec | None = None,
+        env_overlay: Mapping[str, str] | None = None,
+        credential_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        backend_name: str | None = None,
+    ) -> AgentSpec:
+        """Build one transport-neutral invocation from effective provider values."""
+        if (
+            backend_name == "aca"
+            and agent.sandbox is not None
+            and agent.sandbox.identifier_scope is not None
+        ):
+            raise ConfigurationError(
+                "sandbox.identifier_scope is not supported on an ACA execution profile; "
+                "set it on the profile's aca block"
+            )
+        if self._remote_provider_type is not None:
+            if agent.provider is not None and agent.provider != self._remote_provider_type:
+                raise ConfigurationError(
+                    f"Agent '{agent.name}' provider '{agent.provider}' differs from its "
+                    f"resolved remote provider '{self._remote_provider_type}'."
+                )
+            assert self._remote_runtime is not None
+            provider_name = self._remote_provider_type
+            servers = self._remote_mcp_servers or {}
+            runtime = self._remote_runtime
+            default_model = runtime.default_model
+            default_effort = runtime.default_reasoning_effort
+            temperature = runtime.temperature
+            if temperature is not None and self._remote_capabilities is not None:
+                ceiling = self._remote_capabilities.max_temperature
+                if ceiling is not None and temperature > ceiling:
+                    raise ValidationError(
+                        f"Provider '{provider_name}' only supports temperatures up to "
+                        f"{ceiling}; received {temperature!r}."
+                    )
+            if provider_name == "copilot" and runtime.max_tokens is not None:
+                raise ConfigurationError(
+                    "Remote copilot does not support runtime.max_tokens; remove the output "
+                    "token limit or use a provider that enforces it."
+                )
+            max_tokens = runtime.max_tokens if provider_name != "copilot" else None
+            default_iterations = runtime.max_agent_iterations
+            default_seconds = runtime.max_session_seconds
+            default_tier = runtime.default_context_tier if provider_name == "copilot" else None
+            tool_output = runtime.tool_output
+        else:
+            assert self.provider is not None
+            provider_name = agent.provider or type(self.provider).__module__.rsplit(".", 1)[-1]
+            servers = (
+                getattr(self.provider, "_mcp_servers", None)
+                or getattr(self.provider, "_mcp_servers_config", None)
+                or {}
+            )
+            tool_output = getattr(self.provider, "_tool_output_config", None)
+            default_seconds = getattr(self.provider, "_default_max_session_seconds", None)
+            if default_seconds is None:
+                idle_config = getattr(self.provider, "_idle_recovery_config", None)
+                default_seconds = getattr(idle_config, "max_session_seconds", None)
+            default_model = getattr(self.provider, "_default_model", None)
+            default_effort = getattr(self.provider, "_default_reasoning_effort", None)
+            temperature = getattr(
+                self.provider, "_default_temperature", getattr(self.provider, "_temperature", None)
+            )
+            max_tokens = getattr(self.provider, "_default_max_tokens", None)
+            default_iterations = getattr(self.provider, "_default_max_agent_iterations", None)
+            default_tier = getattr(self.provider, "_default_context_tier", None)
+        merged_servers = {**servers, **(extra_mcp_servers or {})}
+        return AgentSpec(
+            name=agent.name,
+            execution_id=uuid4().hex,
+            model_provider=provider_name,
+            model=agent.model or default_model,
+            rendered_prompt=rendered_prompt,
+            system_prompt=agent.system_prompt,
+            output_schema=(
+                {
+                    name: field.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+                    for name, field in agent.output.items()
+                }
+                if agent.output
+                else None
+            ),
+            tools=tuple(tools) if tools is not None else None,
+            mcp_servers=(
+                {
+                    name: cfg.model_dump(mode="json") if hasattr(cfg, "model_dump") else cfg
+                    for name, cfg in merged_servers.items()
+                }
+                or None
+            ),
+            context=context,
+            skill_directories=tuple(skill_directories or ()),
+            custom_agents=tuple(custom_agents or ()),
+            env_overlay=env_overlay,
+            provider_credentials=(
+                credential_resolver(provider_name) if credential_resolver else None
+            ),
+            tool_output=tool_output.model_dump(mode="json") if tool_output else None,
+            reasoning_effort=resolve_reasoning_effort(agent, default_effort),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_agent_iterations=agent.max_agent_iterations or default_iterations,
+            max_session_seconds=agent.max_session_seconds or default_seconds,
+            working_dir=(agent.sandbox.working_dir if agent.sandbox is not None else None)
+            if backend_name == "aca"
+            else agent.working_dir,
+            retry=agent.retry.model_dump(mode="json") if agent.retry else None,
+            context_tier=agent.context_tier or default_tier,
+            execution=execution,
+        )
 
     def render_prompt(self, agent: AgentDef, context: dict[str, Any]) -> str:
         """Render an agent's prompt template including workspace instructions.
@@ -742,14 +1034,14 @@ class AgentExecutor:
             ExecutionError: If a plugin disables agents while enabling
                 skills on such a provider.
         """
-        if not self.provider.skills_require_plugin_root:
+        if not self._plugin_root:
             return
         for entry in entries:
             if entry.skills and not entry.agents:
                 raise ExecutionError(
                     f"Agent '{agent.name}': plugin {entry.name!r} sets 'agents: false' "
                     f"with skills enabled, which provider "
-                    f"'{type(self.provider).__name__}' cannot honour — its only skill "
+                    f"'{self._provider_label}' cannot honour — its only skill "
                     f"surface is registering the plugin root, which also contributes "
                     f"every subagent the plugin ships.",
                     agent_name=agent.name,
@@ -775,8 +1067,8 @@ class AgentExecutor:
                 capabilities at all, or declares plugin support it cannot
                 deliver.
         """
-        provider = type(self.provider).__name__
-        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        provider = self._provider_label
+        capabilities = self._capabilities
         supported = getattr(capabilities, "plugins", False) if capabilities is not None else False
         if not supported:
             named = ", ".join(repr(entry.name) for entry in entries)
@@ -801,7 +1093,7 @@ class AgentExecutor:
         # component. Without this the skills half is dropped on the floor by
         # the ``supports_native_skills`` gate below while agents and MCP are
         # still forwarded, and the run reports success.
-        if not self.provider.supports_native_skills:
+        if not self._native_skills:
             raise ExecutionError(
                 f"Agent '{agent.name}': provider '{provider}' declares "
                 f"capabilities.plugins=True but has no native skill surface, so the "
@@ -839,7 +1131,7 @@ class AgentExecutor:
         # Derived from the provider's capability descriptor, not stored
         # separately — see the ``_plugin_cache`` docstring in ``__init__``
         # for why this is safe to omit from the cache key.
-        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        capabilities = self._capabilities
         flavor = getattr(capabilities, "plugin_flavor", None) if capabilities is not None else None
 
         resolved = resolve_plugins(
@@ -860,7 +1152,7 @@ class AgentExecutor:
         for plugin in plugins:
             message = describe_dropped_components(
                 plugin,
-                root_is_registered=bool(plugin.skills) and self.provider.skills_require_plugin_root,
+                root_is_registered=bool(plugin.skills) and self._plugin_root,
             )
             if message is not None:
                 _verbose_log(f"  Plugins: {message}", style="yellow")
@@ -884,10 +1176,10 @@ class AgentExecutor:
             ExecutionError: If discovery is enabled for this agent and the
                 provider has no native skill surface.
         """
-        if getattr(self.provider, "supports_native_skills", False):
+        if self._native_skills:
             return
         raise ExecutionError(
-            f"Agent '{agent.name}': provider '{type(self.provider).__name__}' has no "
+            f"Agent '{agent.name}': provider '{self._provider_label}' has no "
             f"native skill surface, but 'runtime.skill_discovery' is enabled "
             f"(sources={list(discovery.sources)!r}). Discovered skills would be injected "
             f"in full into every prompt, and the discovered set varies by machine, so "
@@ -970,7 +1262,7 @@ class AgentExecutor:
         limits = self._skill_injection
         size = len(content.encode("utf-8"))
         approx_tokens = size // BYTES_PER_TOKEN_ESTIMATE
-        provider = type(self.provider).__name__
+        provider = self._provider_label
         if limits.max_bytes is not None and size > limits.max_bytes:
             raise ExecutionError(
                 f"Agent '{agent.name}': eagerly injected skill content is "
@@ -1064,7 +1356,7 @@ class AgentExecutor:
         parts: list[str] = []
         if self.instructions_preamble:
             parts.append(self.instructions_preamble)
-        if not getattr(self.provider, "supports_native_skills", False):
+        if not self._native_skills:
             resolved = self._resolve_skills_for_agent(agent)
             if resolved:
                 from conductor.skills import load_skill_content
@@ -1106,7 +1398,7 @@ class AgentExecutor:
             ExecutionError: If the provider declares
                 ``capabilities.skills=False``.
         """
-        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        capabilities = self._capabilities
         if capabilities is None or capabilities.skills:
             return
         if skill_entries:
@@ -1117,7 +1409,7 @@ class AgentExecutor:
             remedy = "Disable runtime.skill_discovery, or override the "
         raise ExecutionError(
             f"Agent '{agent.name}' {cause} but provider "
-            f"'{type(self.provider).__name__}' does not support skills "
+            f"'{self._provider_label}' does not support skills "
             f"(capabilities.skills=False).",
             agent_name=agent.name,
             suggestion=(
@@ -1151,12 +1443,12 @@ class AgentExecutor:
         """
         if agent.session_key is None:
             return
-        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        capabilities = self._capabilities
         if capabilities is None or capabilities.session_continuity:
             return
         raise ExecutionError(
             f"Agent '{agent.name}' declares session_key={agent.session_key!r} but "
-            f"provider '{type(self.provider).__name__}' does not support session "
+            f"provider '{self._provider_label}' does not support session "
             f"continuity (capabilities.session_continuity=False), so every "
             f"execution would start a fresh session.",
             agent_name=agent.name,
@@ -1193,12 +1485,12 @@ class AgentExecutor:
         """
         if agent.settings_dir is None:
             return
-        capabilities = getattr(type(self.provider), "CAPABILITIES", None)
+        capabilities = self._capabilities
         if capabilities is None or capabilities.settings_dir:
             return
         raise ExecutionError(
             f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} but "
-            f"provider '{type(self.provider).__name__}' does not apply it "
+            f"provider '{self._provider_label}' does not apply it "
             f"(capabilities.settings_dir=False), so the agent would load "
             f"whatever conventions its working directory supplies instead.",
             agent_name=agent.name,

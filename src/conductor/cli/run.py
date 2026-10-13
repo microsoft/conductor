@@ -982,6 +982,13 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
         header = join(" ", header_bits)
 
         body_lines = [styled("⚠ Experimental provider in use: {}", header)]
+        if provider_name == "aca":
+            body_lines.append(
+                Text(
+                    "The legacy provider: aca form is deprecated. Use provider: copilot "
+                    "with execution.profile pointing to an aca environment profile."
+                )
+            )
         if limitations:
             body_lines.append(Text("Limitations: " + ", ".join(limitations) + "."))
         if meta.get("native_tools") == "claude_code":

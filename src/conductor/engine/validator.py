@@ -33,8 +33,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from conductor.config.schema import AgentDef, OutputField
+from conductor.exceptions import ConfigurationError
+from conductor.executor.agent import AgentExecutor
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from conductor.execution import AgentSpec, RunnerBackend, WorkspaceLease
     from conductor.providers.base import AgentOutput, AgentProvider
 
 logger = logging.getLogger(__name__)
@@ -143,8 +148,12 @@ class OutputValidator:
         agent: AgentDef,
         primary_prompt: str,
         primary_output: dict[str, Any],
-        provider: AgentProvider,
+        provider: AgentProvider | None,
         interrupt_signal: asyncio.Event | None = None,
+        *,
+        execution_backend: RunnerBackend | None = None,
+        workspace_lease: WorkspaceLease | None = None,
+        spec_factory: Callable[[AgentDef, str], AgentSpec] | None = None,
     ) -> ValidationOutcome:
         """Validate ``primary_output`` against ``agent.validator.criteria``.
 
@@ -162,6 +171,8 @@ class OutputValidator:
         """
         if agent.validator is None:  # defensive; callers guard on this
             return ValidationOutcome(passed=True)
+        if provider is None and (execution_backend is None or spec_factory is None):
+            raise ConfigurationError("Validator requires a provider or a remote spec factory.")
 
         try:
             # ``ensure_ascii=False`` keeps non-ASCII text literal so the fixed
@@ -182,23 +193,27 @@ class OutputValidator:
         )
 
         try:
-            output = await provider.execute(
-                agent=validator_agent,
-                context={},
-                rendered_prompt=rendered_prompt,
-                tools=[],
-                interrupt_signal=interrupt_signal,
-                # The grader reads one string and answers a fixed schema; it
-                # must reach no tool at all. ``tools: []`` alone does not say
-                # that on an MCP-capable provider, which attaches the
-                # workflow's servers regardless of the per-agent list -- so
-                # the grader would either get tools the workflow never granted
-                # it or, on claude-agent-sdk, be refused outright and fail
-                # open, silently passing every output. This is an
-                # execution-level signal rather than anything on the synthetic
-                # agent, so no authored workflow can reach it.
-                suppress_mcp_servers=True,
-            )
+            if execution_backend is not None and spec_factory is not None:
+                spec = spec_factory(validator_agent, rendered_prompt)
+                result = await execution_backend.run_agent(
+                    spec,
+                    workspace_lease,
+                    on_event=None,
+                    interrupt_signal=interrupt_signal,
+                    execute_local=None,
+                )
+                output = AgentExecutor.output_from_realm_result(result)
+            else:
+                assert provider is not None
+                output = await provider.execute(
+                    agent=validator_agent,
+                    context={},
+                    rendered_prompt=rendered_prompt,
+                    tools=[],
+                    interrupt_signal=interrupt_signal,
+                    # An authored tools: [] alone does not suppress workflow MCP.
+                    suppress_mcp_servers=True,
+                )
         except asyncio.CancelledError:
             # Interrupt / cancellation must propagate — never silently pass.
             raise

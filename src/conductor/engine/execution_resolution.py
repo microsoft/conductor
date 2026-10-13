@@ -14,11 +14,13 @@ import logging
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from conductor.config.environment import ResolvedEnvironment
+from conductor.config.environment import AcaProfileOptions, ResolvedEnvironment
 from conductor.config.schema import WorkflowConfig
 from conductor.engine.bundle_prep import materialize_run_bundle
 from conductor.engine.run_manifest import (
+    BACKEND_CAPABILITY_PROVIDERS,
     ManifestExecutionSpec,
     ResolvedRunManifest,
     compile_run_manifest,
@@ -42,7 +44,28 @@ from conductor.execution import (
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.redaction import RunRedactor
 
+if TYPE_CHECKING:
+    from conductor.engine.aca_execution import AcaGateway
+
 logger = logging.getLogger(__name__)
+
+
+def _aca_transport(options: AcaProfileOptions) -> AcaGateway:
+    from conductor.config.schema import ProviderSettings
+    from conductor.providers.aca import AcaRuntimeProvider
+
+    return AcaRuntimeProvider(
+        provider_settings=ProviderSettings(
+            name="aca", **options.model_dump(mode="python", exclude_none=True)
+        )
+    )
+
+
+def _aca_backend() -> RunnerBackend:
+    # The optional ACA SDK is consulted only when this backend is first used.
+    from conductor.engine.aca_execution import AcaRunnerBackend
+
+    return AcaRunnerBackend(transport_factory=_aca_transport)
 
 
 BACKEND_FACTORIES: dict[str, Callable[[], RunnerBackend]] = {
@@ -51,7 +74,11 @@ BACKEND_FACTORIES: dict[str, Callable[[], RunnerBackend]] = {
     # name and an environment snapshot), so registering the factory here is
     # safe: no daemon contact happens until a docker-backed command runs.
     "docker": DockerRunnerBackend,
+    "aca": _aca_backend,
 }
+
+# A capability lookup must not import the optional HTTP or Azure SDK.
+BACKEND_CAPABILITY_PROVIDERS.setdefault("aca", _aca_backend())
 
 
 def _spec_to_contract(spec: ManifestExecutionSpec) -> ResolvedExecutionSpec:
@@ -103,6 +130,7 @@ class ExecutionResolverSession:
             "local": default_backend or BACKEND_FACTORIES["local"](),
         }
         self.leases: dict[str, WorkspaceLease] = {}
+        self._aca_profiles: dict[str, RunnerBackend] = {}
         self._root_run_spec: RunSpec | None = None
         self._root_workflow_path: Path | None = None
         self._ensure_lock = asyncio.Lock()
@@ -181,9 +209,23 @@ class ExecutionResolverSession:
                     )
 
                 backend = factory()
+                if name == "aca":
+                    from conductor.engine.aca_execution import AcaRunnerBackend
+
+                    profiles = {
+                        profile_name: profile.aca
+                        for profile_name, profile in sorted(
+                            self.environment.document.profiles.items()
+                        )
+                        if profile.backend == "aca" and profile.aca is not None
+                    }
+                    if isinstance(backend, AcaRunnerBackend):
+                        self._aca_profiles.update(backend.bind_profiles(profiles))
+                    else:
+                        self._aca_profiles.update(dict.fromkeys(profiles, backend))
                 run_spec = self._root_run_spec
                 if run_spec is not None and name != "local":
-                    if run_spec.bundle is None:
+                    if run_spec.bundle is None and backend.capabilities().shared_workspace:
                         bundle = await materialize_run_bundle(
                             self._root_workflow_path,
                             self.environment,
@@ -296,6 +338,9 @@ class ExecutionResolver:
         """Return the backend resolved for a top-level or inline step."""
         key = executable_step_identity(name, for_each_group=for_each_group)
         backend_name = self._manifest.profiles[key].backend
+        if backend_name == "aca":
+            profile = self._manifest.profiles[key].profile
+            return self._session._aca_profiles[profile]
         return self._session.backends[backend_name]
 
     def refresh_secret_uses(self) -> None:

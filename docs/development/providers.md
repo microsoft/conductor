@@ -266,7 +266,7 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
   session identifier, authenticates with `DefaultAzureCredential`, and relays NDJSON frames from the
   in-container runner (`src/conductor/aca_runner/server.py`, which wraps a real `CopilotProvider`)
   verbatim to `event_callback`. The wire contract is `src/conductor/runner/protocol.py`;
-  `src/conductor/providers/aca_protocol.py` is a deprecated re-export shim that warns on import.
+  the former ACA-specific protocol shim has been removed.
 - Inner credential precedence (`_resolve_inner_provider_settings`): `COPILOT_PROVIDER_BASE_URL`
   (BYOK, with optional `COPILOT_PROVIDER_API_KEY`/`COPILOT_PROVIDER_BEARER_TOKEN`), then
   `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`, then `gh auth token` (`_resolve_gh_cli_token`,
