@@ -8,8 +8,8 @@ bundle ready before execution starts. ``ExecutionResolverSession`` repeats the
 same materialization defensively when a backend is discovered only at child
 construction time.
 
-Every resume materializes a fresh run lease and reuses or republishes the
-content-addressed bundle; retained workspaces are intentionally out of scope.
+Every resume reuses or republishes the content-addressed bundle. Ephemeral
+workspaces prepare fresh leases; retained workspaces attach their prior leases.
 The CLI builds its seeded resume ``workflow_started`` event before
 ``WorkflowEngine.resume()``, so that seeded event cannot contain the bundle
 metadata prepared here. The engine's normal resume emit is suppressed.

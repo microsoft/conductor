@@ -40,7 +40,7 @@ def _option(argv: list[str], name: str) -> str | None:
 
 
 def _record(log_path: Path, argv: list[str], stdin: bytes) -> None:
-    record = {
+    record: dict[str, Any] = {
         "argv": argv,
         "env": dict(os.environ),
         "stdin": stdin.decode("utf-8", errors="replace"),
@@ -50,8 +50,30 @@ def _record(log_path: Path, argv: list[str], stdin: bytes) -> None:
         assert path is not None
         record["env_file_content"] = Path(path).read_text(encoding="utf-8")
         record["env_file_mode"] = Path(path).stat().st_mode & 0o777
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record) + "\n")
+    # Each CLI invocation is a separate process; text append can split a JSON line on Windows.
+    with log_path.with_suffix(".lock").open("a+b") as lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+        finally:
+            if sys.platform == "win32":
+                import msvcrt
+
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def main() -> int:

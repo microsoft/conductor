@@ -147,6 +147,11 @@ Esc/Ctrl+G interrupt listener).
 - Any new top-level checkpoint key or `to_dict()` key MUST be added to
   `src/conductor/engine/checkpoint.py::_CHECKPOINT_PROTOCOL_KEYS`, or secret scrubbing can rename
   it and make the checkpoint unloadable (`tests/test_engine/test_checkpoint_redaction.py`).
+- Workspace lifecycle fields (`workspace`, `resume_contract`, `interrupted_step`) are additive
+  and omitted for legacy runs. On retained resume, `WorkflowEngine.resume(checkpoint=...)`
+  validates workflow, environment, manifest and bundle digests before attaching a workspace or
+  dispatching a step; `src/conductor/cli/run.py::resume_workflow_async` must pass the checkpoint
+  through, including the background-run path.
 
 ### LimitEnforcer resume state
 

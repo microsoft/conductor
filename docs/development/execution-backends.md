@@ -57,6 +57,10 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 - Finalization is fail-closed: only resources whose labels (and container name) verify are
   removed; anything unverifiable is left in place with a warning that prints the manual cleanup
   command. Cleanup is shielded and re-raises an absorbed cancellation afterward.
+- Retained volumes use marker protocol v2: publish `.conductor-staged` with the bundle digest
+  in a separate `docker cp` only after copying the tree. On attached leases, verify the volume
+  identity and marker before execution; a missing or mismatched marker after prior execution
+  must fail closed, never restage or replace the retained volume.
 - Staging symlinks (`_copy_tree_preserving_symlinks`): a link escaping its declared root is an
   `ExecutionSpecError`. The directory bit comes from the lexically resolved target
   (`_resolve_symlink_within_root`), never by following the link, so a Linux-authored target stages
@@ -80,6 +84,13 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   prepare fresh leases, never reuse finalized ones), finalizes each backend once, shields each
   `finalize_run` from cancellation, logs (never raises) backend failures so the run outcome is not
   masked, and re-raises cancellation only after every backend finalized.
+- Retained workspace policy is passed only to backends declaring `retained_workspace`; technical
+  local leases in Docker-backed runs must receive `workspace_persistence=None` in both
+  `prepare_leases` and `ensure_backends`. On resume, retained identities go through
+  `attach_run`, never a fresh `prepare_run` for the same backend.
+- `src/conductor/engine/workspace_claim.py::WorkspaceClaim` fences concurrent resume on the
+  local machine. Its advisory lock serializes acquisition and token-checked release; Windows
+  locking covers the same fixed one-byte range on both operations.
 - An injected `(secret_cache, redactor)` pair must belong together (the cache's redactor); a
   mismatched pair is rejected at construction.
 

@@ -395,3 +395,97 @@ class TestSaveCheckpointRedaction:
         )
         data = json.loads(path.read_text())
         assert data["context"]["workflow_inputs"]["api_key"] == secret
+
+
+class TestLifecycleProtocolKeysRedaction:
+    def test_lifecycle_key_names_survive_while_values_are_scrubbed(self, tmp_path: Path) -> None:
+        # Requirement: lifecycle envelope keys survive secrets matching their names;
+        # secret values in those blocks are scrubbed without changing digests.
+        redactor = RunRedactor()
+        redactor.register(["workspace", "resume_contract", "interrupted_step"])
+        wf = _write_workflow(tmp_path)
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf,
+                _make_context(),
+                _make_limits(),
+                "build",
+                RuntimeError("stopped"),
+                {},
+                workspace={
+                    "policy": "ephemeral",
+                    "identities": {},
+                    "executed_backends": [],
+                    "note": "workspace",
+                },
+                resume_contract={
+                    "workflow_digest": "sha256:abc",
+                    "environment_name": "dev",
+                    "environment_digest": "sha256:def",
+                    "manifest_digest": "sha256:ghi",
+                    "bundle_digest": None,
+                    "note": "resume_contract",
+                },
+                interrupted_step={
+                    "name": "build",
+                    "status": "unknown",
+                    "attempt_id": "one",
+                    "note": "interrupted_step",
+                },
+                redactor=redactor,
+            )
+        assert path is not None
+        data = json.loads(path.read_text())
+        for key in ("workspace", "resume_contract", "interrupted_step"):
+            assert data[key]["note"] == REDACTED_MARKER
+        assert data["resume_contract"]["workflow_digest"] == "sha256:abc"
+        assert data["resume_contract"]["manifest_digest"] == "sha256:ghi"
+        loaded = CheckpointManager.load_checkpoint(path)
+        assert loaded.interrupted_step is not None
+        assert loaded.interrupted_step["status"] == "unknown"
+
+    def test_digest_valued_secret_scrubs_values_but_preserves_lifecycle_keys(
+        self, tmp_path: Path
+    ) -> None:
+        # Requirement: digest-valued secrets scrub values, not lifecycle keys.
+        secret = "sha256:abc123secret"
+        redactor = RunRedactor()
+        redactor.register([secret])
+        wf = _write_workflow(tmp_path)
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf,
+                _make_context({"digest": secret}),
+                _make_limits(),
+                "build",
+                RuntimeError("stopped"),
+                {"digest": secret},
+                workspace={
+                    "policy": "durable",
+                    "identities": {
+                        "docker": {
+                            "backend": "docker",
+                            "lease_id": "run",
+                            "incarnation": secret,
+                        }
+                    },
+                    "executed_backends": [],
+                },
+                resume_contract={
+                    "workflow_digest": secret,
+                    "environment_name": "dev",
+                    "environment_digest": "sha256:environment",
+                    "manifest_digest": "sha256:manifest",
+                    "bundle_digest": None,
+                },
+                interrupted_step={"name": "build", "status": "unknown", "attempt_id": secret},
+                redactor=redactor,
+            )
+        assert path is not None
+        data = json.loads(path.read_text())
+        assert {"workspace", "resume_contract", "interrupted_step"} <= data.keys()
+        assert data["resume_contract"]["workflow_digest"] == REDACTED_MARKER
+        assert data["workspace"]["identities"]["docker"]["incarnation"] == REDACTED_MARKER
+        assert data["interrupted_step"]["attempt_id"] == REDACTED_MARKER
+        assert data["context"]["workflow_inputs"]["digest"] == REDACTED_MARKER
+        assert secret not in path.read_text()

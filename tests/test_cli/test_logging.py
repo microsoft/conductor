@@ -2262,7 +2262,7 @@ class TestConsoleEventSubscriberCompaction:
         try:
             with patch(
                 "conductor.cli.run._verbose_console",
-                Console(file=output, force_terminal=True, no_color=True),
+                Console(file=output, force_terminal=True, no_color=True, width=160),
             ):
                 event = WorkflowEvent(
                     type="agent_compaction_complete",
@@ -2352,7 +2352,7 @@ class TestConsoleEventSubscriberCompaction:
         try:
             with patch(
                 "conductor.cli.run._verbose_console",
-                Console(file=output, force_terminal=True, no_color=True),
+                Console(file=output, force_terminal=True, no_color=True, width=160),
             ):
                 event = WorkflowEvent(
                     type="agent_compaction_complete",

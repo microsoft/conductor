@@ -725,7 +725,9 @@ class TestResumeWorkflowAsyncRunRecordWiring:
 
         seen: dict[str, Any] = {}
 
-        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+        async def _fake_resume(
+            current_agent: str, *, checkpoint: object | None = None
+        ) -> dict[str, Any]:
             records = read_run_records()
             assert len(records) == 1
             seen["record"] = records[0]
@@ -778,7 +780,9 @@ class TestResumeWorkflowAsyncRunRecordWiring:
             terminated_by="term",
         )
 
-        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+        async def _fake_resume(
+            current_agent: str, *, checkpoint: object | None = None
+        ) -> dict[str, Any]:
             assert len(read_run_records()) == 1
             raise terminate_exc
 
@@ -817,7 +821,9 @@ class TestResumeWorkflowAsyncRunRecordWiring:
         wf_path, cp_path = _write_checkpoint_and_config(tmp_path)
         mock_config = _mock_config(agent_names=["a"])
 
-        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+        async def _fake_resume(
+            current_agent: str, *, checkpoint: object | None = None
+        ) -> dict[str, Any]:
             assert len(read_run_records()) == 1
             raise RuntimeError("boom")
 
@@ -861,7 +867,9 @@ class TestResumeWorkflowAsyncRunRecordWiring:
         seen: dict[str, Any] = {}
         dashboard = _mock_dashboard(port=8223)
 
-        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+        async def _fake_resume(
+            current_agent: str, *, checkpoint: object | None = None
+        ) -> dict[str, Any]:
             records = read_run_records()
             assert len(records) == 1
             seen["record"] = records[0]
@@ -931,7 +939,9 @@ class TestResumeWorkflowAsyncRunRecordWiring:
         seen: dict[str, Any] = {}
         dashboard = _mock_dashboard(port=8224)
 
-        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+        async def _fake_resume(
+            current_agent: str, *, checkpoint: object | None = None
+        ) -> dict[str, Any]:
             records = read_run_records()
             assert len(records) == 1
             seen["record"] = records[0]
@@ -1018,7 +1028,9 @@ class TestResumeWorkflowAsyncTerminalRecordWiring:
             )
         )
 
-        async def _fake_resume(current_agent: str) -> dict[str, Any]:
+        async def _fake_resume(
+            current_agent: str, *, checkpoint: object | None = None
+        ) -> dict[str, Any]:
             return {"result": "resumed"}
 
         mock_engine = MagicMock()

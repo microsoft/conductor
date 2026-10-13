@@ -426,7 +426,8 @@ jobs:
     # Serialized real-daemon lane for the Docker runner backend: spike
     # checkpoints (trailing-dot docker cp, non-root writability matrix),
     # engine-level e2e (tag-form + digest-pinned images, stdin, env, timeout
-    # cleanup). Deliberately no matrix and no xdist: the lane mutates the
+    # cleanup, retained failure/resume lifecycle). Deliberately no matrix and
+    # no xdist: the lane mutates the
     # daemon's container/volume state and asserts on global listings.
     runs-on: ubuntu-latest
     needs: [lint, typecheck]

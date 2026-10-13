@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,18 +21,23 @@ from conductor.config.schema import (
     ForEachDef,
     MCPStepDef,
     OutputField,
+    RestartConfig,
     RouteDef,
     ScriptStepDef,
     StepExecutionConfig,
     WorkflowConfig,
     WorkflowDef,
+    WorkflowDefaults,
     WorkflowStepDef,
+    WorkspaceConfig,
 )
+from conductor.digest import canonical_json_digest
 from conductor.engine.run_manifest import (
     BACKEND_CAPABILITY_PROVIDERS,
     ManifestExecutionSpec,
     ResolvedRunManifest,
     compile_run_manifest,
+    manifest_semantic_digest,
     script_step_backends,
 )
 from conductor.exceptions import ConfigurationError
@@ -50,10 +56,12 @@ class _BatchBackend:
     async def prepare_run(self, run: Any) -> Any:
         raise NotImplementedError
 
-    async def run_command(self, spec: Any, lease: Any, *, diagnostics: Any = None) -> Any:
+    async def run_command(
+        self, spec: Any, lease: Any, *, diagnostics: Any = None, on_dispatch: Any = None
+    ) -> Any:
         raise NotImplementedError
 
-    async def finalize_run(self, lease: Any, outcome: Any) -> None:
+    async def finalize_run(self, lease: Any, outcome: Any, *, retain: bool = False) -> None:
         raise NotImplementedError
 
 
@@ -425,3 +433,158 @@ def test_docker_script_checks_registered_batch_capability(
         environment=_environment(docker=DockerProfileOptions(image="busybox")),
     )
     assert manifest.profiles["run"].backend == "docker"
+
+
+class TestWorkspaceManifest:
+    def test_legacy_bytes_and_digest_are_unchanged(self) -> None:
+        # Requirement: absent workspace keeps the pre-policy manifest byte-for-byte stable.
+        payload = {
+            "version": 1,
+            "workflow": {"name": "old", "digest": None},
+            "environment": {"name": "test", "source": "path", "digest": "sha256:x"},
+            "profiles": {},
+            "secrets": [],
+            "conductor_version": "old",
+            "audit": {"hermetic": False, "classification": "non-hermetic-compatibility"},
+        }
+        manifest = ResolvedRunManifest.model_validate(payload)
+        expected = json.dumps(payload, separators=(",", ":")).encode()
+        assert (
+            json.dumps(manifest.model_dump(mode="json"), separators=(",", ":")).encode() == expected
+        )
+        assert manifest.model_dump_json().encode() == expected
+        assert canonical_json_digest(manifest.model_dump(mode="json")) == canonical_json_digest(
+            payload
+        )
+        assert canonical_json_digest(manifest.model_dump(mode="json")) == (
+            "sha256:90cbc54ea127c0cd6a12c66223e5613dc6e53b21c607393eddf28b967ccface7"
+        )
+        assert "workspace" not in manifest.model_dump(exclude={"audit"})
+
+    def test_workspace_is_recorded_and_affects_semantic_digest(self) -> None:
+        # Requirement: a declared policy is audited and changes the semantic identity.
+        plain = compile_run_manifest(
+            _config(_script("run", "default")),
+            workflow_path=None,
+            environment=builtin_local_environment(),
+        )
+        config = _config(_script("run", "default"))
+        config.workflow.workspace = WorkspaceConfig(mode="shared", persistence="ephemeral")
+        manifest = compile_run_manifest(
+            config, workflow_path=None, environment=builtin_local_environment()
+        )
+        assert manifest.model_dump(mode="json")["workspace"] == {
+            "mode": "shared",
+            "persistence": "ephemeral",
+        }
+        assert manifest_semantic_digest(manifest) != manifest_semantic_digest(plain)
+        assert manifest_semantic_digest(manifest) == manifest_semantic_digest(manifest)
+        assert manifest_semantic_digest(
+            manifest.model_copy(update={"conductor_version": "new"})
+        ) == (manifest_semantic_digest(manifest))
+        assert manifest_semantic_digest(
+            manifest.model_copy(
+                update={"audit": manifest.audit.model_copy(update={"classification": "changed"})}
+            )
+        ) == manifest_semantic_digest(manifest)
+
+    @pytest.mark.parametrize(
+        ("workspace", "defaults", "step_restart", "error"),
+        [
+            (WorkspaceConfig(mode="isolated"), None, None, "isolated.*follow-up"),
+            (None, RestartConfig(mode="reuse"), None, "reuse.*follow-up"),
+            (None, None, RestartConfig(mode="reuse"), "reuse.*follow-up"),
+            (WorkspaceConfig(persistence="durable"), None, None, "local backend.*retained"),
+        ],
+        ids=["isolated", "reuse_default", "reuse_step", "retained_local"],
+    )
+    def test_reserved_and_unsupported_policies_fail_compilation(
+        self,
+        workspace: WorkspaceConfig | None,
+        defaults: RestartConfig | None,
+        step_restart: RestartConfig | None,
+        error: str,
+    ) -> None:
+        # Requirement: compiler refuses unsupported policies before the run starts.
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="policy",
+                entry_point="run",
+                workspace=workspace,
+                defaults=WorkflowDefaults(restart=defaults),
+            ),
+            agents=[ScriptStepDef(name="run", command="true", timeout=None, restart=step_restart)],
+        )
+        with pytest.raises(ConfigurationError, match=error):
+            compile_run_manifest(
+                config, workflow_path=None, environment=builtin_local_environment()
+            )
+
+    def test_retention_uses_registered_backend_capability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: retention selection follows capabilities, not backend name.
+        class RetainingBackend(_BatchBackend):
+            def capabilities(self) -> RunnerCapabilities:
+                return RunnerCapabilities(
+                    batch=True,
+                    sessions=False,
+                    shared_workspace=False,
+                    snapshots=False,
+                    retained_workspace=True,
+                )
+
+        monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "docker", RetainingBackend())
+        config = _config(_script("run", "container"))
+        config.workflow.workspace = WorkspaceConfig(persistence="durable")
+        manifest = compile_run_manifest(
+            config,
+            workflow_path=None,
+            environment=_environment(docker=DockerProfileOptions(image="busybox")),
+        )
+        assert manifest.workspace is not None
+        assert manifest.workspace.persistence == "durable"
+
+    def test_local_child_workspace_is_rejected(self, tmp_path: Path) -> None:
+        # Requirement: a statically resolved child inherits the root policy.
+        child = tmp_path / "child.yaml"
+        child.write_text(
+            "workflow:\n  name: child\n  entry_point: run\n  workspace:\n"
+            "    persistence: durable\nagents:\n  - name: run\n    type: script\n"
+            "    command: 'true'\n"
+        )
+        config = _config(WorkflowStepDef(name="child", workflow="child.yaml", max_depth=None))
+        with pytest.raises(ConfigurationError, match="inherited from the root"):
+            compile_run_manifest(
+                config,
+                workflow_path=tmp_path / "root.yaml",
+                environment=builtin_local_environment(),
+            )
+
+    def test_legacy_manifest_digest_matches_fixed_golden(self) -> None:
+        # Requirement: a missing workspace leaves the existing canonical digest unchanged.
+        payload = {
+            "version": 1,
+            "workflow": {"name": "old", "digest": None},
+            "environment": {"name": "test", "source": "path", "digest": "sha256:x"},
+            "profiles": {},
+            "secrets": [],
+            "conductor_version": "old",
+            "audit": {"hermetic": False, "classification": "non-hermetic-compatibility"},
+        }
+        manifest = ResolvedRunManifest.model_validate(payload)
+        assert canonical_json_digest(manifest.model_dump(mode="json")) == (
+            "sha256:90cbc54ea127c0cd6a12c66223e5613dc6e53b21c607393eddf28b967ccface7"
+        )
+
+    def test_retained_docker_script_policy_compiles(self) -> None:
+        # Requirement: a backend advertising retention accepts a durable script workspace.
+        config = _config(_script("run", "container"))
+        config.workflow.workspace = WorkspaceConfig(persistence="durable")
+        manifest = compile_run_manifest(
+            config,
+            workflow_path=None,
+            environment=_environment(docker=DockerProfileOptions(image="busybox")),
+        )
+        assert manifest.workspace is not None
+        assert manifest.workspace.persistence == "durable"

@@ -340,6 +340,18 @@ def validate_workflow_config(
     errors.extend(docker_errors)
     warnings.extend(docker_warnings)
 
+    if _subworkflow_depth and config.workflow.workspace is not None:
+        errors.append(
+            "Sub-workflow declares workflow.workspace; workspace policy is inherited "
+            "from the root workflow and cannot be overridden."
+        )
+    else:
+        workspace_errors, workspace_warnings = _validate_workspace_policy(
+            config, _environment_context
+        )
+        errors.extend(workspace_errors)
+        warnings.extend(workspace_warnings)
+
     if _has_secret_references(config):
         secret_errors, secret_warnings = _validate_secret_references(
             config,
@@ -1954,6 +1966,64 @@ def _executable_steps(config: WorkflowConfig) -> list[tuple[str, ExecutableStepB
         if isinstance(group.agent, ExecutableStepBase):
             steps.append((f"for_each.{group.name}.agent", group.agent))
     return steps
+
+
+def _validate_workspace_policy(
+    config: WorkflowConfig,
+    context: _EnvironmentValidationContext,
+) -> tuple[list[str], list[str]]:
+    """Check reserved modes and resolved backend retention without contacting a daemon."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    workspace = config.workflow.workspace
+    if workspace is not None and workspace.mode == "isolated":
+        errors.append(
+            "workspace.mode: isolated is reserved until the isolated workspace follow-up."
+        )
+    defaults_restart = config.workflow.defaults.restart
+    if defaults_restart is not None and defaults_restart.mode == "reuse":
+        errors.append(
+            "workflow.defaults.restart.mode: reuse is reserved until the restart follow-up."
+        )
+    for key, step in _executable_steps(config):
+        if step.restart is not None and step.restart.mode == "reuse":
+            errors.append(
+                f"Step '{key}' restart.mode: reuse is reserved until the restart follow-up."
+            )
+
+    if workspace is None or workspace.persistence == "ephemeral":
+        return errors, warnings
+    if not context["explicit"]:
+        warnings.append(
+            "workspace persistence capability cross-check requires "
+            "conductor validate --environment <name>"
+        )
+        return errors, warnings
+
+    # Import after config initialization; the engine package imports the config loader.
+    from conductor.engine.run_manifest import BACKEND_CAPABILITY_PROVIDERS
+
+    for _environment_name, environment in sorted((context["environments"] or {}).items()):
+        if environment is None:
+            continue
+        default_execution = config.workflow.defaults.execution
+        default_profile = default_execution.profile if default_execution is not None else None
+        for key, step in _executable_steps(config):
+            profile = step.execution.profile if step.execution is not None else None
+            profile_name = profile or default_profile or environment.document.default
+            definition = environment.document.profiles.get(profile_name) if profile_name else None
+            if definition is None:
+                continue  # Profile resolution already reports the missing profile.
+            provider = BACKEND_CAPABILITY_PROVIDERS.get(definition.backend)
+            if provider is not None and not provider.capabilities().retained_workspace:
+                errors.append(
+                    f"Step '{key}': {definition.backend} backend does not support retained "
+                    "workspaces; use docker profiles for every executable step or drop "
+                    "persistence; local retained workspace arrives in a later delivery. "
+                    "Until the agent realm follow-up, retained policy is available only "
+                    "for docker script workflows."
+                )
+    return errors, warnings
 
 
 def _validate_docker_profiles(

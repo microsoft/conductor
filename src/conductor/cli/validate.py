@@ -146,6 +146,9 @@ def _report_execution_resolution(
     details.add_row("Environment", manifest.environment.name)
     details.add_row("Source", manifest.environment.source)
     details.add_row("Default profile", environment.document.default or "—")
+    if manifest.workspace is not None:
+        details.add_row("Workspace mode", manifest.workspace.mode)
+        details.add_row("Workspace persistence", manifest.workspace.persistence)
     console.print(details)
     console.print(
         styled("  [dim]Path:[/dim] {}", environment.path if environment.path is not None else "—"),

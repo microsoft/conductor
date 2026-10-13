@@ -8,6 +8,7 @@ on it.
 """
 
 from conductor.execution.backend import RunnerBackend
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import (
     BundleRef,
@@ -20,6 +21,7 @@ from conductor.execution.types import (
     RunSpec,
     StartError,
     StartErrorKind,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -28,6 +30,7 @@ __all__ = [
     "CommandOutcome",
     "CommandResult",
     "CommandSpec",
+    "ExecutionSpecError",
     "LocalRunnerBackend",
     "ResolvedExecutionSpec",
     "RunOutcome",
@@ -37,4 +40,6 @@ __all__ = [
     "StartError",
     "StartErrorKind",
     "WorkspaceLease",
+    "WorkspaceIdentity",
+    "WorkspaceAttachError",
 ]
