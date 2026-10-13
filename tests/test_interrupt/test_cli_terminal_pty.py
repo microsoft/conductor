@@ -24,6 +24,15 @@ from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 from tests.test_interrupt.test_listener_pty import _replace_stdin_with_pty  # noqa: E402
 
 
+def _without_pendin(attrs: list) -> list:
+    """Drop ``PENDIN`` from ``lflag``: BSD/macOS kernels set it themselves when
+    ICANON is re-enabled, until pending input is read, so it is not a setting
+    the restore path controls."""
+    attrs = list(attrs)
+    attrs[3] &= ~getattr(termios, "PENDIN", 0)
+    return attrs
+
+
 def _write_wait_workflow(path: Path) -> Path:
     workflow = path / "wait.yaml"
     workflow.write_text(
@@ -76,7 +85,7 @@ async def test_run_restores_after_provider_teardown(
         ):
             await run_workflow_async(_write_wait_workflow(tmp_path), {})
 
-        assert termios.tcgetattr(0) == baseline
+        assert _without_pendin(termios.tcgetattr(0)) == _without_pendin(baseline)
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True], ids=["success", "failure"])

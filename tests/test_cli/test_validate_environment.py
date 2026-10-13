@@ -66,7 +66,8 @@ output:
 
 
 def _invoke_validate(path: Path, *args: str) -> tuple[int, str]:
-    result = runner.invoke(app, ["validate", str(path), *args])
+    # Wide enough that long tmp paths (macOS, xdist) are not hard-wrapped mid-name.
+    result = runner.invoke(app, ["validate", str(path), *args], env={"COLUMNS": "200"})
     return result.exit_code, result.output
 
 

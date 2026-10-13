@@ -231,7 +231,9 @@ async def test_inherit_control_environment_false_runs_minimal_environment(
     assert _SENTINEL_VAR not in keys
     # ``LC_CTYPE`` is excluded: CPython adds it to its OWN os.environ via
     # PEP 538 locale coercion — it is not inherited from the control process.
-    assert keys - {"LC_CTYPE"} == {"PYTHONUTF8", "DELIVERED_TOKEN"}
+    # ``__CF_USER_TEXT_ENCODING`` likewise: macOS CoreFoundation sets it in
+    # every process at startup, even one launched with ``env -i``.
+    assert keys - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"} == {"PYTHONUTF8", "DELIVERED_TOKEN"}
 
     inherit_result = await backend.run_command(
         CommandSpec(
