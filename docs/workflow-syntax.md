@@ -33,10 +33,12 @@ workflow:
     tracker: ado                    # surfaced in the workflow_started event
     project_url: https://...        # CLI --metadata / -m can add or override
 
-  instructions:                     # Optional: extra instruction files (paths)
-    - ./docs/conventions.md         # prepended to every agent prompt
-    - ./AGENTS.md                   # also auto-discoverable via
-                                    # --workspace-instructions (see CLI ref)
+  instructions:                     # Optional: instruction text prepended to
+                                    # every agent prompt. Entries are literal
+                                    # text; load a file's contents with !file
+                                    # (path relative to this workflow file).
+    - !file ./docs/conventions.md
+    - "Always respond in English."
 
   limits:
     max_iterations: 10              # Default: 10, max: 500
@@ -89,7 +91,7 @@ workflow:
 
 **Workflow metadata** is included verbatim in the `workflow_started` event and lets downstream consumers (dashboards, queue runners, observability tools) adapt without parsing the YAML. CLI `--metadata key=value` flags merge on top of YAML metadata (CLI wins on conflicts).
 
-**Instructions files** are loaded once and prepended to every agent's rendered prompt. They are inherited by sub-workflows and persisted in checkpoints so resume continues to use the same instructions. Use the YAML `instructions:` list for workflow-pinned context, or pass `--workspace-instructions` on the CLI to auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (recursive; only files marked `applyTo: "**"` in YAML frontmatter are loaded — see the [Workspace Instructions section in the CLI reference](cli-reference.md#workspace-instructions) for full details) by walking from CWD up to the git root.
+**Instructions** are loaded once and prepended to every agent's rendered prompt. They are inherited by sub-workflows and persisted in checkpoints so resume continues to use the same instructions. Each YAML `instructions:` entry is literal text; use a [`!file` include](#text-includes-file) to load a file's contents (a plain path string is sent as the path text itself). For files chosen at run time, pass `--instructions PATH` on the CLI, or pass `--workspace-instructions` to auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` by walking from CWD up to the git root. Scoped `.github/instructions/` files are included when their `applyTo` glob overlaps the launch directory — see the [Workspace Instructions section in the CLI reference](cli-reference.md#workspace-instructions) for the exact rules.
 
 ### Context Modes
 

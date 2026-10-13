@@ -379,7 +379,7 @@ Route the Claude provider through a custom Anthropic-compatible endpoint or prox
 conductor run examples/claude-custom-endpoint.yaml --input question="What is Python?"
 ```
 
-See [Claude Provider](../docs/providers/claude.md) for setup details.
+See [Claude Provider](../docs/providers/claude-provider.md) for setup details.
 
 ## Step Types
 

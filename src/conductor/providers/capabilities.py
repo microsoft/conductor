@@ -71,18 +71,17 @@ class ProviderCapabilities(BaseModel):
     Capability values are **contracts**: the provider MUST honor what it
     declares. Lying in the descriptor undermines the whole framework — if
     a capability claim cannot be honored under all conditions, declare the
-    weaker value. The AGENTS.md "Experimental Providers" section lists
-    which carve-outs are permitted for experimental providers.
-
-    See ``docs/providers/experimental.md`` for promotion criteria and the
-    stability disclaimer.
+    weaker value. ``docs/providers/experimental.md`` lists which carve-outs
+    are permitted for experimental providers, the promotion criteria, and the
+    stability disclaimer; ``docs/development/providers.md`` holds the shared
+    parity rules.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     tier: ProviderTier
     """Stability tier. ``experimental`` allows specific parity carve-outs
-    (see AGENTS.md); ``stable`` may not."""
+    (see ``docs/providers/experimental.md``); ``stable`` may not."""
 
     mcp_tools: bool
     """``True`` when the provider forwards workflow-level ``mcp_servers``

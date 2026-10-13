@@ -25,7 +25,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--web-port PORT` | Port for web dashboard (0 = auto) |
 | `--no-interactive` | Disable Esc-to-interrupt capability |
 | `--log-file`, `-l PATH` | Write full debug output to file (`auto` for auto-generated) |
-| `--workspace-instructions` | Auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (only files marked `applyTo: "**"`) and prepend them to every agent prompt |
+| `--workspace-instructions` | Auto-discover `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (`applyTo: "**"`, or a glob overlapping the launch directory) and prepend them to every agent prompt |
 | `--instructions PATH` | Path to a specific instruction file to prepend (repeatable) |
 
 **Global options** (before the subcommand):

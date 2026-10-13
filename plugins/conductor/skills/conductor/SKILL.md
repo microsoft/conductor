@@ -110,7 +110,7 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `retry` | Per-agent retry policy for transient `provider_error` / `timeout` failures |
 | `metadata` | Arbitrary YAML or `--metadata`/`-m` key-values surfaced in `workflow_started` events |
 | `instructions` | Workflow-level workspace context (inline strings or `!file` includes) prepended to every prompt |
-| `--workspace-instructions` | CLI flag to auto-discover AGENTS.md / CLAUDE.md / `.github/copilot-instructions.md` / `.github/instructions/**/*.instructions.md` (only `applyTo: "**"` files) |
+| `--workspace-instructions` | CLI flag to auto-discover AGENTS.md / CLAUDE.md / `.github/copilot-instructions.md` / `.github/instructions/**/*.instructions.md` (`applyTo: "**"`, or a glob overlapping the launch directory) |
 | `!file` tag | Include external file content in YAML (`prompt: !file prompt.md`) |
 | `context.mode` | How agents share data (accumulate, last_only, explicit) |
 | `limits` | Safety bounds (max_iterations up to 500, timeout_seconds) |

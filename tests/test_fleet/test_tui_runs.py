@@ -2271,7 +2271,7 @@ class TestChangeDirBinding:
             await settle(pilot)
             await pilot.press("d")
             # Two keypresses resolving one modal -- must use a plain
-            # `pilot.pause()`, never `settle()` (AGENTS.md test caution):
+            # `pilot.pause()`, never `settle()` (docs/development/fleet-tui.md):
             # `settle` awaits `workers.wait_for_complete()`, and the
             # suspended `action_change_dir` worker cannot finish until the
             # second keypress below.

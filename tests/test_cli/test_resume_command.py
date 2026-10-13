@@ -418,8 +418,8 @@ class TestResumeCommand:
         """Issue #435: resume --web-bg must surface the same "could not register
         itself for discovery" note as a fresh ``run --web-bg`` — see
         ``app.py``'s duplicated verbose bg-launch block, which is exactly the
-        kind of copy-paste omission the parity rule in AGENTS.md exists to
-        catch."""
+        kind of copy-paste omission the run/resume parity rule in
+        ``docs/development/cli-and-runs.md`` exists to catch."""
         from conductor.cli.bg_runner import BackgroundLaunch
 
         wf_path = _write_workflow(tmp_path)

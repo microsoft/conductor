@@ -3416,8 +3416,9 @@ class WorkflowEngine:
         session tier) is untrustworthy — both are dropped to ``None`` rather
         than shown misleadingly. Every occurrence is logged at debug level;
         the first occurrence in a run is also logged at warning level (see
-        ``AGENTS.md``'s "not logged at debug where nothing would reach the
-        user" rule) since this indicates a real provider/config bug — a
+        ``AGENTS.md``'s "Surface failures" rule: a problem the operator must
+        act on is never logged only at debug) since this indicates a real
+        provider/config bug — a
         stale or mismatched context-window cap, or an incorrect
         provider-reported token count — that would otherwise silently
         disable the dashboard's context-window bar with no operator-facing

@@ -1,7 +1,7 @@
 # Experimental Providers
 
-Conductor ships **stable** providers that uphold every parity rule in
-`AGENTS.md`, and **experimental** providers that delegate part of the
+Conductor ships **stable** providers that uphold every parity rule in the
+[provider development guide](../development/providers.md), and **experimental** providers that delegate part of the
 agentic loop to an upstream SDK or framework and therefore cannot honor
 every rule. This page documents what "experimental" means, what carve-outs
 are allowed, and how a provider moves from experimental to stable.
@@ -85,8 +85,10 @@ requires ALL of:
    0.x with no breaking minor releases for ≥6 months.
 5. At least one non-trivial workflow in `examples/` that exercises the
    provider end-to-end.
-6. AGENTS.md "Experimental Providers" section updated to remove the
-   provider from the experimental table.
+6. The provider is removed from the
+   [current experimental providers](#current-experimental-providers) table
+   below, and the [provider development guide](../development/providers.md)
+   no longer lists it as experimental.
 
 ## Stability disclaimer
 
@@ -261,7 +263,7 @@ established from the v0.2.82 source; the tests run against the locked version.
 
 ## See also
 
-- `AGENTS.md` — "Provider Parity" section (the rules experimental providers carve out from) and "Experimental Providers" section (rules they must still uphold)
+- [Provider development guide](../development/providers.md) — the shared parity rules experimental providers carve out from, and the rules they must still uphold
 - `src/conductor/providers/capabilities.py` — `ProviderCapabilities` schema
 - Issue [#241](https://github.com/microsoft/conductor/issues/241) — design rationale
 - [`docs/providers/aca.md`](./aca.md) — `aca` provider documentation (issue [#284](https://github.com/microsoft/conductor/issues/284))

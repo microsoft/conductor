@@ -591,10 +591,11 @@ def _immediate_result(
             "(plugin fetch, MCP server startup, provider connection) -- check the "
             "dashboard URL above."
         )
-    # The detached child's captured stdio, which `AGENTS.md`'s "Debugging
-    # --web-bg failures" names as the first place to look when a background
-    # run misbehaves silently. Only the immediate return carries these: on
-    # any other path the run has produced a status worth reporting instead.
+    # The detached child's captured stdio, which the CLI reference's
+    # "Debugging background launches" (docs/cli-reference.md) names as the
+    # first place to look when a background run misbehaves silently. Only the
+    # immediate return carries these: on any other path the run has produced
+    # a status worth reporting instead.
     handle["logs"] = {"stderr": str(launch.stderr_log), "stdout": str(launch.stdout_log)}
     port = handle["port"]
     port_line = f" (port {port})" if port is not None else ""

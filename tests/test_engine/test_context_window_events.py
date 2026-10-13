@@ -359,8 +359,7 @@ class TestAgentCompletedUsesLastCallInputTokens:
         )
         # The first occurrence in a run is also surfaced at warning level so
         # it doesn't go unnoticed (nothing reads debug logs in production;
-        # see AGENTS.md's "not logged at debug where nothing would reach the
-        # user" rule).
+        # see AGENTS.md's "Surface failures" rule).
         assert any(
             record.levelno == logging.WARNING
             and "a1" in record.getMessage()

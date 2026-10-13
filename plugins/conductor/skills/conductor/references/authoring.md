@@ -59,7 +59,7 @@ workflow:
     - "Always respond in English."  # Inline string
     # For workflows distributed via registry, prefer the --workspace-instructions
     # CLI flag (auto-discovers AGENTS.md / CLAUDE.md / .github/copilot-instructions.md
-    # / .github/instructions/**/*.instructions.md with applyTo: "**") so target-repo
+    # / scoped .github/instructions/**/*.instructions.md) so target-repo
     # context is loaded at run time instead of being baked into the YAML.
 ```
 
@@ -780,7 +780,7 @@ Prepend workspace context to every agent prompt. Three options:
        - "Always respond in English."
    ```
 
-2. **`--workspace-instructions` CLI flag** — auto-discovers files by walking from CWD to the git root: `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (only files with `applyTo: "**"` in YAML frontmatter; scoped or absent-`applyTo` files are skipped per the GitHub Copilot convention). Best for workflows distributed via registry/skills where the YAML lives far from the target repo.
+2. **`--workspace-instructions` CLI flag** — auto-discovers files by walking from CWD to the git root: `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md`. An instructions file loads when its `applyTo` is `"**"` or a glob whose path prefix overlaps the launch directory (from the repo root, every scoped file loads); files without a string `applyTo` are skipped. Files are read as raw text — `@path` imports and Markdown links are not followed. Best for workflows distributed via registry/skills where the YAML lives far from the target repo.
 
 3. **`--instructions PATH` CLI flag** — explicit path to a file (repeatable).
 

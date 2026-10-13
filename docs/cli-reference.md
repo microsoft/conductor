@@ -215,6 +215,37 @@ The same behavior applies to `conductor resume --web-bg`.
 
 Background workflows can be stopped with `conductor stop` (see below) or via the stop button in the web dashboard.
 
+##### Debugging background launches
+
+When a `conductor run --web-bg` (or `resume --web-bg`) child dies before its
+dashboard becomes reachable, or crashes mid-run, check these in order:
+
+1. **The captured stderr log.** Its path is printed with the dashboard URL,
+   included (with a bounded tail of its contents) in every launch-failure
+   message, recorded as `system.bg_stderr_log` in the run's
+   `workflow_started` event, and shown in the dashboard. Python's
+   `faulthandler` is enabled at import time, so a native crash also leaves a
+   stack trace here (issue #116).
+2. **The matching events log.** It is in the same `$TMPDIR/conductor/`
+   directory, named `conductor-<name>-<ts>-<run_id>.events.jsonl`; the
+   `.bg.stderr.log` and `.bg.stdout.log` files share the same timestamp and
+   run id, so the three sort together.
+3. **A silent crash.** Search the events log for `workflow_failed`. Its
+   `is_base_exception` flag shows whether the failure escaped normal
+   `Exception` handling, for example a library calling `SystemExit`.
+4. **"The workflow has not reported starting yet."** This is a note, not a
+   failure: the child is alive and listening but had not emitted
+   `workflow_started` before `CONDUCTOR_WEB_BG_START_TIMEOUT` elapsed. Check
+   the dashboard or stderr log for slow startup (plugin fetch, MCP server
+   startup, provider connection), or raise the timeout (`0` disables the
+   wait).
+5. **"could not confirm termination of PID(s) ..."** instead of "The
+   background process was terminated." (issue #447). The launcher's
+   process-tree kill could not confirm that every known process exited,
+   usually because of a permission error. The survivor is not silently
+   abandoned: find and stop it with `conductor status` or
+   `conductor stop --port <port>`.
+
 #### Automation Mode
 
 ```bash
@@ -267,15 +298,26 @@ The directory convention follows GitHub Copilot's documented format
   Use four-space indentation.
   ```
 
-- `applyTo: "**"` → loaded as always-on (matches Copilot's "always applied").
-- `applyTo: "<other glob>"` → **skipped** (the convention scopes these per-file
-  in the chat; conductor has no equivalent per-agent file scoping).
-- `applyTo` absent → **skipped** (the convention says these are manual-attach
-  only, never auto-applied).
+- `applyTo: "**"` → always loaded (Copilot's "always applied").
+- `applyTo: "<other glob>"` → loaded when the glob's literal path prefix
+  overlaps the launch directory in either direction, resolved relative to the
+  directory that owns that `.github/instructions/` tree. Conductor has no
+  per-file activation, so this is deliberately conservative: from the
+  repository root every scoped file overlaps and is loaded, while a launch
+  from `docs/` loads `applyTo: "docs/**"` but not `applyTo: "src/**"`. A glob
+  whose first segment is a wildcard (`**/*.py`) overlaps every directory.
+  Separate multiple globs with `,` or `;`.
+- `applyTo` absent, or not a string → **skipped** (manual-attach only).
 
-This conservative interpretation matches the documented semantics exactly. To
-include unscoped instructions today, use the explicit `--instructions PATH`
-flag.
+Run with `--print-loaded-instructions` to list each discovered file and why it
+was included. To include any other file, use the explicit
+`--instructions PATH` flag.
+
+Conductor reads every discovered file as raw text: it does not expand
+Markdown links or `@path` imports, so a file that `CLAUDE.md` imports with
+`@AGENTS.md` is included only because `AGENTS.md` is itself discovered. The
+assembled instructions are persisted in checkpoints, so `conductor resume`
+reuses the instructions of the original run even if the files have changed.
 
 #### Complex Inputs
 
@@ -416,7 +458,7 @@ estimate)`; a cost is an estimate from token counts, not an invoice.
 `run_id` is the join key to the run's events JSONL
 (`conductor-<name>-<ts>-<run_id>.events.jsonl` under `$TMPDIR/conductor/`);
 `stderr_log`/`stdout_log` are the paths to the child's captured console
-output (see [Debugging `--web-bg` failures](../AGENTS.md#debugging---web-bg-failures)).
+output (see [Debugging background launches](#debugging-background-launches)).
 All three are `null` — never `""` — for a PID file written before this field
 existed. A resumed run whose checkpoint carried no usable run id still gets
 a freshly-minted `run_id` (and matching log paths), not `null`.

@@ -68,9 +68,9 @@ async def settle(pilot: Any) -> None:
     assertion.
 
     Bounded because this project has no ``pytest-timeout``: without a
-    deadline the documented ``push_screen_wait`` misuse (see
-    ``AGENTS.md``'s test caution) hangs the entire run rather than failing
-    one test.
+    deadline the documented ``push_screen_wait`` misuse (see the test
+    caution in ``docs/development/fleet-tui.md``) hangs the entire run rather
+    than failing one test.
 
     Not usable between the two keypresses of a modal interaction -- see
     that same caution.

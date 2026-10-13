@@ -407,7 +407,7 @@ _PRICING_SOURCE_CELLS: dict[str, Text] = {
 resolution itself failed). Built as module-level constants to avoid
 re-parsing the same markup literal on every table row — each markup argument
 is still a literal template, not an interpolated value, keeping this inside
-the repo's console rules (see AGENTS.md "Console Output"). Every value here
+the repo's console rules (see ``docs/development/console-output.md``). Every value here
 is pure ASCII, so no fallback applies: a property of these four literals,
 not a rule that anything outside :class:`_Glyphs` is safe to print."""
 

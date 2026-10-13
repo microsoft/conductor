@@ -455,7 +455,7 @@ workflow:
 
 The `aca` provider delegates an agent's entire agentic loop, tools, and MCP calls to a remote **Azure Container Apps dynamic-sessions sandbox** instead of running it on the host — useful for untrusted or isolation-sensitive agents (e.g. running arbitrary generated code). Unlike the other providers, `aca` requires the structured `provider:` form with a `pool_endpoint` pointing at an operator-provisioned ACA session pool (`scripts/aca/provision-pool.sh`) and `azure-identity` for authentication. Resolves its inner Copilot credential automatically via `COPILOT_PROVIDER_BASE_URL` → `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token`, so a `gh`-authenticated operator needs no ACA-specific setup. See [`examples/aca-coding-agent.yaml`](examples/aca-coding-agent.yaml) for a full end-to-end example.
 
-**See also:** [OpenAI Documentation](docs/providers/openai.md) | [Claude Documentation](docs/providers/claude.md) | [Hermes Documentation](docs/providers/hermes.md) | [ACA Documentation](docs/providers/aca.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
+**See also:** [OpenAI Documentation](docs/providers/openai.md) | [Claude Documentation](docs/providers/claude-provider.md) | [Hermes Documentation](docs/providers/hermes.md) | [ACA Documentation](docs/providers/aca.md) | [Provider Comparison](docs/providers/comparison.md) | [Migration Guide](docs/providers/migration.md)
 
 ### Using a Local / Custom LLM Endpoint (Ollama, vLLM, Azure OpenAI, ...)
 
@@ -592,12 +592,15 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [Parallel Execution](./docs/parallel-execution.md) | Static parallel groups |
 | [Dynamic Parallel](./docs/dynamic-parallel.md) | For-each groups and array processing |
 | [OpenAI Provider](./docs/providers/openai.md) | OpenAI setup and configuration |
-| [Claude Provider](./docs/providers/claude.md) | Claude setup and configuration |
+| [Claude Provider](./docs/providers/claude-provider.md) | Claude setup and configuration |
 | [Hermes Provider](./docs/providers/hermes.md) | Hermes setup and configuration |
 | [ACA Provider](./docs/providers/aca.md) | Azure Container Apps sandboxed execution setup and configuration |
 | [Provider Comparison](./docs/providers/comparison.md) | Copilot vs Claude vs Hermes decision guide |
 
 ## Development
+
+Contributor guides covering each subsystem's invariants, change checklists, and
+regression tests live in [docs/development/](docs/development/README.md).
 
 ### Prerequisites
 

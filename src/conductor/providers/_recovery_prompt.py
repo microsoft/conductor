@@ -3,12 +3,13 @@
 Copilot and Hermes correct an unusable structured response the same way: send
 the model a follow-up message carrying the error, a snippet of what it
 returned, and the schema it was supposed to match. That wording is covered by
-the provider-parity rule in AGENTS.md, so it lives here rather than in two
-copies free to drift apart.
+the provider-parity rule in ``docs/development/providers.md``, so it lives
+here rather than in two copies free to drift apart.
 
-Claude is deliberately not a caller. It re-prompts through its ``emit_output``
-tool and never echoes the schema back, so its instruction text is genuinely
-different and stays in ``claude.py``.
+The Pydantic AI providers (``claude``, ``openai``) are deliberately not
+callers. They correct output through Pydantic AI's own output-tool retries
+(``AgentRetries(output=...)`` in ``_pydantic_ai/agent_builder.py``), so that
+library owns their correction text.
 """
 
 from __future__ import annotations

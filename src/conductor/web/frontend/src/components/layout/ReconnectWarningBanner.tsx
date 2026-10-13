@@ -16,8 +16,8 @@ import { cn, formatElapsed } from '@/lib/utils';
  * JSONL event log (`*.events.jsonl`, written by `EventLogSubscriber` for
  * every run regardless of flags — unrelated to the separate `--log-file`
  * debug-output flag), else a generic hint to check the terminal that
- * launched `conductor run` (see the "Debugging --web-bg failures" section
- * of AGENTS.md).
+ * launched `conductor run` (see "Debugging background launches" in
+ * docs/cli-reference.md).
  *
  * Only clears when the connection actually recovers (`wsDisconnectedSince`
  * resets in the store) — not on a timer — so a refresh isn't the only way

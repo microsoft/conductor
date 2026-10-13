@@ -1256,8 +1256,9 @@ class TestHistoryResume:
                 await pilot.press("r")
                 # Not `settle`: the launch worker is genuinely blocked on
                 # `release_launch`, so this must observe the in-flight
-                # state rather than wait it out (see AGENTS.md's test
-                # caution about `settle` deadlocking on a suspended worker).
+                # state rather than wait it out (see the test caution in
+                # docs/development/fleet-tui.md about `settle` deadlocking on
+                # a suspended worker).
                 await pilot.pause()
 
                 assert app.screen._resuming is True

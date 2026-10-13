@@ -128,7 +128,7 @@ workflow:
 
 **Models**: `claude-sonnet-4.5`, `claude-haiku-4.5`, `claude-opus-4.5`
 
-**See**: [Claude Provider Documentation](providers/claude.md)
+**See**: [Claude Provider Documentation](providers/claude-provider.md)
 
 ### Hermes Provider (Experimental)
 
@@ -1185,7 +1185,7 @@ In v1, bundle cache storage grows without automated garbage collection. Stored b
 
 - [Fleet Manager](fleet.md)
 - [MCP Tools](mcp-tools.md)
-- [Claude Provider Documentation](providers/claude.md)
+- [Claude Provider Documentation](providers/claude-provider.md)
 - [Provider Comparison](providers/comparison.md)
 - [Migration Guide](providers/migration.md)
 - [Workflow Syntax](workflow-syntax.md)
