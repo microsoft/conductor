@@ -301,6 +301,12 @@ async def create_provider(
                 ),
                 auth_mode=auth_mode,
                 native_tools=native_tools,
+                system_prompt_preset=(
+                    provider_settings.system_prompt_preset
+                    if provider_settings is not None
+                    and provider_settings.name == "claude-agent-sdk"
+                    else None
+                ),
             )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:

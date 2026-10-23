@@ -2028,6 +2028,30 @@ class ProviderSettings(BaseModel):
             native_tools: claude_code
     """
 
+    system_prompt_preset: Literal["claude_code"] | None = None
+    """System prompt every session starts from. ``claude-agent-sdk`` only.
+
+    Unset (the default), a session gets the SDK's minimal prompt -- tool
+    calling and nothing else, no coding or safety guidance -- and an agent's
+    ``system_prompt:`` replaces even that. ``"claude_code"`` starts every
+    session from the Claude Code CLI's own system prompt, the one ``claude
+    -p`` uses, and an agent's ``system_prompt:`` is *appended* to it rather
+    than replacing it. The per-machine part of that prompt is moved into the
+    first user message (``exclude_dynamic_sections``), so all agents of a
+    workflow share one cacheable system prompt.
+
+    This selects the prompt only. Tools stay with ``native_tools``, and
+    ``CLAUDE.md`` stays with ``setting_sources``: the preset loads neither.
+
+    Example::
+
+        runtime:
+          provider:
+            name: claude-agent-sdk
+            native_tools: claude_code
+            system_prompt_preset: claude_code
+    """
+
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
@@ -2265,6 +2289,12 @@ class ProviderSettings(BaseModel):
                 "tools an agent that omits 'tools:' receives, which no other "
                 "provider grants."
             )
+        if self.system_prompt_preset is not None and self.name != "claude-agent-sdk":
+            raise ValueError(
+                "'system_prompt_preset' is only supported when name='claude-agent-sdk' "
+                f"(got name={self.name!r}). It selects the Claude Code CLI's own "
+                "system prompt, which only that provider runs."
+            )
         if self.name != "aca":
             extras = sorted(k for k, v in aca_only_fields.items() if v is not None)
             if extras:
@@ -2488,6 +2518,7 @@ class ProviderSettings(BaseModel):
             # `provider: claude-agent-sdk` round-trip as an object and break
             # the shorthand contract. Same reasoning as `auth_mode` above.
             or self.native_tools == "claude_code"
+            or self.system_prompt_preset is not None
         )
 
     @model_serializer(mode="wrap")

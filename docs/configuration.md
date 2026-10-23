@@ -255,6 +255,14 @@ neither env var. Only `base_url` falls back on its own.
 | `setting_sources` | Rejected | Rejected | Supported |
 | `auth_mode` | Rejected | Rejected | Supported |
 | `native_tools` | Rejected | Rejected | Supported |
+| `system_prompt_preset` | Rejected | Rejected | Supported |
+
+`system_prompt_preset` (unset default / `"claude_code"`) selects the system
+prompt a `claude-agent-sdk` session starts from. Unset, it is the SDK's
+minimal prompt (tool calling only, no coding or safety guidance) and an
+agent's `system_prompt:` replaces it; under `claude_code` it is the Claude
+Code CLI's own prompt and an agent's `system_prompt:` is appended to it. See
+[System prompt](providers/experimental.md#system-prompt-claude-agent-sdk).
 
 `native_tools` (`"none"` default / `"claude_code"`) selects which built-in
 Claude Code tools a `claude-agent-sdk` agent receives when it omits `tools:`.

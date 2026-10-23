@@ -211,6 +211,36 @@ that bear on this provider's experimental status:
   dispatch tool to reach them, so they are refused rather than registered
   unreachable, at `conductor validate` and again at run time.
 
+## System prompt (`claude-agent-sdk`)
+
+`runtime.provider.system_prompt_preset` (unset default, `"claude_code"`)
+selects the system prompt every session on this provider starts from.
+
+- **Unset: the SDK's minimal prompt.** An unset `ClaudeAgentOptions.system_prompt`
+  reaches the CLI as `--system-prompt ""`: tool calling works, but the Claude
+  Code tool guidance, coding instructions and safety instructions are absent.
+  An agent's `system_prompt:` replaces the prompt outright. This is unchanged
+  behaviour.
+- **`claude_code`: the CLI's own prompt.** Sessions start from the prompt
+  `claude -p` uses, and an agent's `system_prompt:` becomes the preset's
+  `append` -- added after it, nothing removed. The Agent SDK documentation
+  recommends this starting point for coding agents, unattended ones included.
+- **One cacheable prompt per workflow.** `exclude_dynamic_sections` is always
+  set with the preset: the per-machine part (the auto-memory location) moves
+  into the first user message, so every agent, on every machine, shares the
+  same system prompt. Set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the
+  environment if sessions should not keep auto memory at all.
+- **Prompt only.** Tools stay with `native_tools`, `CLAUDE.md` and settings
+  with `setting_sources`; the preset loads neither.
+
+```yaml
+runtime:
+  provider:
+    name: claude-agent-sdk
+    native_tools: claude_code
+    system_prompt_preset: claude_code
+```
+
 ## Interrupt and session timeout (`claude-agent-sdk`)
 
 Interrupt and `max_session_seconds` no longer wait for another message from

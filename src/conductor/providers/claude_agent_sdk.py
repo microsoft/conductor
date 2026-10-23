@@ -439,6 +439,16 @@ ClaudeNativeTools = Literal["none", "claude_code"]
 
 _NATIVE_TOOLS_VALUES: Final[frozenset[str]] = frozenset({"none", "claude_code"})
 
+# System prompt a session starts from. ``None`` keeps the SDK's minimal
+# default (an unset ``system_prompt`` reaches the CLI as ``--system-prompt
+# ""``), and an agent's ``system_prompt:`` replaces it outright.
+# ``"claude_code"`` starts every session from the Claude Code CLI's own prompt
+# -- tool guidance, safety and coding instructions -- and turns an agent's
+# ``system_prompt:`` into the preset's ``append`` instead of a replacement.
+ClaudeSystemPromptPreset = Literal["claude_code"]
+
+_SYSTEM_PROMPT_PRESET_VALUES: Final[frozenset[str]] = frozenset({"claude_code"})
+
 # Permission mode paired with an empty built-in tool set. "Deny anything not
 # pre-approved by allow rules" (SDK ``query.py``), which is what makes an
 # MCP-only agent workable without ``bypassPermissions``: the declared servers
@@ -1778,6 +1788,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         auth_mode: ClaudeAuthMode = "auto",
         native_tools: ClaudeNativeTools = "none",
         default_reasoning_effort: ReasoningEffort | None = None,
+        system_prompt_preset: ClaudeSystemPromptPreset | None = None,
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
@@ -1801,6 +1812,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 is_retryable=False,
             )
         self._native_tools: ClaudeNativeTools = native_tools
+
+        # Same fail-closed reasoning as ``native_tools``: an unknown preset
+        # must not fall through to the minimal default and read as honoured.
+        if system_prompt_preset is not None and (
+            system_prompt_preset not in _SYSTEM_PROMPT_PRESET_VALUES
+        ):
+            raise ProviderError(
+                f"Unknown system_prompt_preset value {system_prompt_preset!r} "
+                "for claude-agent-sdk.",
+                suggestion=(
+                    "Use 'claude_code' (the Claude Code CLI's system prompt), or omit "
+                    "it to keep the SDK's minimal default."
+                ),
+                is_retryable=False,
+            )
+        self._system_prompt_preset: ClaudeSystemPromptPreset | None = system_prompt_preset
 
         # ``None`` becomes ``[]`` — load nothing ambient. Not cosmetic: the SDK
         # re-defaults an unset ``setting_sources`` to ``["user", "project"]``
@@ -2662,7 +2689,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # rather than being pinned to one by Conductor.
             effort=effort,
             settings=effort_settings,
-            system_prompt=agent.system_prompt,
+            system_prompt=self._session_system_prompt(agent.system_prompt),
             resume=resume_session_id,
             # Explicit though it matches the SDK default: forking would mint a
             # new session id and a new transcript on every execution, so the
@@ -3427,6 +3454,33 @@ class ClaudeAgentSdkProvider(AgentProvider):
             cwd,
         )
         return session_id
+
+    def _session_system_prompt(self, agent_prompt: str | None) -> str | dict[str, Any] | None:
+        """Value for ``ClaudeAgentOptions.system_prompt``.
+
+        Without ``runtime.provider.system_prompt_preset`` this is the agent's
+        own ``system_prompt:`` (or ``None``), exactly as before: the SDK sends
+        a string as the whole prompt and ``None`` as an empty one.
+
+        With ``system_prompt_preset: claude_code`` the session starts from the
+        CLI's own prompt and the agent's text becomes ``append``. An empty
+        string is dropped rather than sent: the SDK keys the
+        ``--append-system-prompt`` flag on the key's presence, not its value.
+        ``exclude_dynamic_sections`` is always on: it moves the per-machine
+        part of the preset (the auto-memory location) into the first user
+        message, so every agent of a workflow, on every machine, shares one
+        cacheable system prompt instead of a per-checkout one.
+        """
+        if self._system_prompt_preset is None:
+            return agent_prompt
+        prompt: dict[str, Any] = {
+            "type": "preset",
+            "preset": self._system_prompt_preset,
+            "exclude_dynamic_sections": True,
+        }
+        if agent_prompt:
+            prompt["append"] = agent_prompt
+        return prompt
 
     @staticmethod
     def _session_transcript_exists(session_id: str, cwd: str, *, exact_only: bool = False) -> bool:
