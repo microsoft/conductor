@@ -78,6 +78,7 @@ class TestRemoteSessionDetectionWiring:
             assert app.animation_level == "none"
             assert len(app._notifications) == 0
 
+    @pytest.mark.usefixtures("hold_splash")
     async def test_forced_on_animation_shows_splash_without_a_notification(
         self, fleet_env: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
