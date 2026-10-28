@@ -50,8 +50,37 @@ def _record(log_path: Path, argv: list[str], stdin: bytes) -> None:
         assert path is not None
         record["env_file_content"] = Path(path).read_text(encoding="utf-8")
         record["env_file_mode"] = Path(path).stat().st_mode & 0o777
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record) + "\n")
+    _append_line(log_path, json.dumps(record) + "\n")
+
+
+def _append_line(log_path: Path, line: str) -> None:
+    """Append one line without tearing against concurrent fake invocations.
+
+    Finalize/cancellation tests run several fake ``docker`` processes at once.
+    On Windows, append mode is emulated (seek to EOF, then write), so two
+    writers can land on the same offset, and a record larger than the write
+    buffer -- each carries the whole environment -- is split across several
+    writes. Either tears a JSONL line. An OS lock serializes the appends and is
+    released by the kernel even if its holder is killed mid-test.
+    """
+    payload = line.encode("utf-8")
+    with log_path.with_name(log_path.name + ".lock").open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with log_path.open("ab") as stream:
+                stream.write(payload)
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def main() -> int:
