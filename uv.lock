@@ -458,7 +458,7 @@ requires-dist = [
     { name = "github-copilot-sdk", specifier = ">=1.0.9" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
-    { name = "mcp", specifier = ">=1.30.0,<2" },
+    { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "openai", specifier = ">=2.48.0,<3.0.0" },
     { name = "opentelemetry-api", specifier = ">=1.20" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'telemetry'", specifier = ">=1.20" },
