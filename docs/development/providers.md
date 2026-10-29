@@ -186,9 +186,10 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
   `CAPABILITIES.reasoning_effort` (or `None` for no concept), translates it natively, and re-checks
   the resolved value at run time (it may only be known after Jinja rendering), raising
   `ValidationError` with a clear message.
-- Current declarations: `copilot`, `claude`, `aca` all five; `hermes` omits `max`; `openai` declares
-  `("low", "medium", "high")`; `claude-agent-sdk` declares `None` (not wired), and the validator
-  rejects any effort on it, templated or not.
+- Current declarations: `copilot`, `claude`, `aca`, `claude-agent-sdk` all five; `hermes` omits
+  `max`; `openai` declares `("low", "medium", "high")`.
+- `claude-agent-sdk` forwards the resolved level as `ClaudeAgentOptions.effort`, whose
+  `EffortLevel` is the same five literals, so nothing is mapped; the CLI receives `--effort`.
 - Copilot validates per model against `supported_reasoning_efforts`
   (`CopilotProvider._validate_reasoning_effort_for_model`). Claude maps effort to an extended
   thinking budget via `EFFORT_TO_BUDGET_TOKENS` (low=2048, medium=8192, high=16384, xhigh=32768,

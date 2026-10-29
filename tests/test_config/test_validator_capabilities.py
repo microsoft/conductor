@@ -1282,8 +1282,11 @@ class TestForEachInlineCapabilityCrossCheck:
 
     def test_inline_reasoning_on_no_reasoning_provider_errors(self, patch_caps: Any) -> None:
         """The confirmed #270 example: inline ``reasoning.effort`` on a provider
-        that ignores reasoning (e.g. claude-agent-sdk) must error, exactly like
-        the identical agent at top level."""
+        that declares ``reasoning_effort=None`` must error, exactly like the
+        identical agent at top level. No in-tree provider declares that today
+        (claude-agent-sdk, the original example, now forwards
+        ``ClaudeAgentOptions.effort``), which is why the descriptor is patched
+        rather than named."""
         patch_caps({"copilot": _caps(reasoning_effort=None)})
         config = _for_each_workflow(
             inline=AgentDef(

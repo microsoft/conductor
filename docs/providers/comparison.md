@@ -14,7 +14,7 @@ This guide helps you choose between GitHub Copilot, OpenAI, Anthropic Claude, Cl
 | **Streaming** | Yes | Yes | Yes | Yes | Yes |
 | **Tool Support** | Yes (MCP, all types) | Yes (MCP, stdio only) | Yes (MCP, stdio only) | Yes (MCP + built-in preset) | Yes (hermes toolsets) |
 | **MCP Servers** | Yes | Yes (stdio) | Yes (stdio) | Yes (all types) | No |
-| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (`reasoning_effort` on o1/o3) | Yes (extended `thinking` budget) | Inherits from CLI config | Yes (`reasoning_config`) |
+| **Reasoning / Extended Thinking** | Yes (`reasoning_effort` on session) | Yes (`reasoning_effort` on o1/o3) | Yes (extended `thinking` budget) | Yes (`--effort` on the CLI) | Yes (`reasoning_config`) |
 | **Speed** | Fast | Fast | Fast | Fast | Depends on model |
 | **Output Quality** | Excellent | Excellent | Excellent | Excellent | Depends on model |
 | **Cost Predictability** | High (flat rate) | Variable (usage-based) | Variable (usage-based) | Variable | Variable (usage-based) |

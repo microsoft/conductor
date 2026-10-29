@@ -3357,9 +3357,13 @@ def _validate_provider_capabilities(
             # #262: whether the provider supports reasoning effort AT ALL is a
             # value-INDEPENDENT fact known at validate time, so reject even a
             # templated effort here — no resolved value could ever be valid on
-            # a provider with reasoning_effort=None (e.g. claude-agent-sdk,
-            # which ignores reasoning entirely). Only the membership check
-            # (does the resolved literal fall in the supported subset?) is
+            # a provider that declares reasoning_effort=None. No in-tree
+            # provider does today — claude-agent-sdk was the last one and now
+            # forwards ``ClaudeAgentOptions.effort`` — but this is the
+            # capability contract rather than a per-provider special case, and
+            # a provider with no reasoning concept stays a legal declaration.
+            # Only the membership check (is the resolved literal in the
+            # supported subset?) is
             # value-dependent and must be deferred for templates; providers
             # that support reasoning re-validate the resolved value at runtime
             # (copilot._validate_reasoning_effort_for_model / claude thinking).
