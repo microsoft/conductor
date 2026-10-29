@@ -24,6 +24,9 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   `OPENAI_API_KEY` MUST NOT be a fallback. It raises `ProviderError` when routing is active but
   every resolved field is empty.
 - `api_key`, `bearer_token`, `runtime_token` are `SecretStr`; `ProviderSettings` is frozen.
+- With `resolve_environment=False`, only explicit settings are used: neither custom routing
+  fields nor runtime URL/token fall back to environment variables. The runner uses this mode
+  for host-effective settings, including missing fields.
 - The schema rejects combinations that would silently no-op at the SDK boundary: `type`, `wire_api`,
   `headers`, or `azure` without `base_url`/`api_key`/`bearer_token`; empty `headers`; empty or
   whitespace-only secrets; `azure` without `api_version` or without `type: azure`

@@ -245,6 +245,17 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
 - `ProviderSettings(name="openai")` rejects Copilot-only fields; `type` and `wire_api` get targeted
   "always speaks Chat Completions" messages, the rest the generic Copilot-only message.
 
+### Host-effective runner authentication
+
+- The concrete Copilot, Claude and OpenAI constructors accept keyword-only
+  `resolve_environment=True`. The runner passes `False` whenever `inner_provider_settings`
+  is a supplied dict, including an empty dict: missing fields are authoritative absences,
+  not invitations to read the runner's environment. `None` retains legacy environment fallback.
+- Claude and OpenAI propagate this mode to lazy model construction for execution and dialog.
+  In isolated mode, materialize canonical API URLs only at the SDK boundary, keeping `_base_url`
+  unset for compaction's custom-endpoint detection. Explicit empty Anthropic credentials suppress
+  the SDK's independent fallback for the absent opposite credential. Never mutate `os.environ`.
+
 ### Temperature bounds
 
 - The schema allows `0..2`; each provider's ceiling is `CAPABILITIES.max_temperature` (`1.0` for all
@@ -266,7 +277,7 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
   session identifier, authenticates with `DefaultAzureCredential`, and relays NDJSON frames from the
   in-container runner (`src/conductor/aca_runner/server.py`, which wraps a real `CopilotProvider`)
   verbatim to `event_callback`. The wire contract is `src/conductor/runner/protocol.py`;
-  `src/conductor/providers/aca_protocol.py` is a deprecated re-export shim that warns on import.
+  the former ACA-specific protocol shim has been removed.
 - Inner credential precedence (`_resolve_inner_provider_settings`): `COPILOT_PROVIDER_BASE_URL`
   (BYOK, with optional `COPILOT_PROVIDER_API_KEY`/`COPILOT_PROVIDER_BEARER_TOKEN`), then
   `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`, then `gh auth token` (`_resolve_gh_cli_token`,

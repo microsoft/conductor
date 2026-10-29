@@ -26,7 +26,9 @@ from conductor.config.schema import (
     RestartConfig,
     RouteDef,
     ScriptStepDef,
+    StepDef,
     StepExecutionConfig,
+    ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
     WorkspaceConfig,
@@ -37,6 +39,7 @@ from conductor.engine.workflow import RunContext, WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import CheckpointError, ConfigurationError, ExecutionError, TemplateError
 from conductor.execution import (
+    AgentResult,
     BundleRef,
     CommandResult,
     CommandSpec,
@@ -46,8 +49,18 @@ from conductor.execution import (
     WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution.docker import DockerRunnerBackend
 from conductor.execution.errors import WorkspaceAttachError
 from conductor.providers.copilot import CopilotProvider
+from tests.test_execution.test_workspace_retention import (
+    bundle as retained_bundle,
+)
+from tests.test_execution.test_workspace_retention import (
+    commands as docker_commands,
+)
+from tests.test_execution.test_workspace_retention import (
+    install_docker_processes,
+)
 
 
 def _engine(
@@ -118,6 +131,191 @@ def _checkpoint(engine: WorkflowEngine) -> CheckpointData:
             "executed_backends": [],
         },
     )
+
+
+def _docker_agent_engine(tmp_path: Path) -> WorkflowEngine:
+    """Build an agent-only workflow with a retained Docker workspace."""
+    base = _engine(tmp_path)
+    document = base._execution_session.environment.document.model_copy(deep=True)
+    assert document.profiles["docker"].docker is not None
+    document.profiles["docker"].docker.runner_image = "conductor-runner:test"
+    environment = ResolvedEnvironment(
+        document=document, name="test", source="path", path=None, digest="sha256:agent-env"
+    )
+    agents: list[StepDef] = [
+        AgentDef(
+            name="agent",
+            provider="copilot",
+            prompt="Work in the retained workspace.",
+            tools=[],
+            execution=StepExecutionConfig(profile="docker"),
+            routes=[RouteDef(to="$end")],
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        )
+    ]
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="agent-retention",
+            entry_point="agent",
+            workspace=WorkspaceConfig(persistence="durable"),
+        ),
+        agents=agents,
+    )
+    return WorkflowEngine(
+        config,
+        workflow_path=base.workflow_path,
+        execution_environment=environment,
+        run_context=RunContext(run_id="agent-retention"),
+    )
+
+
+def _agent_bundle(tmp_path: Path) -> BundleRef:
+    """Add the topology required by agent path mapping to the retained bundle."""
+    bundle = retained_bundle(tmp_path)
+    (Path(bundle.store_path) / "bundle.json").write_text(
+        json.dumps({"entries": [], "skills_topology": {}, "plugins_topology": {}}),
+        encoding="utf-8",
+    )
+    return bundle
+
+
+@pytest.mark.parametrize("missing_marker", [False, True])
+async def test_agent_dispatch_failure_preserves_retained_workspace_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_marker: bool
+) -> None:
+    # Requirement: dispatched agents require an intact marker on resume, without restaging.
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    _, binary, store, log = install_docker_processes(tmp_path, monkeypatch)
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: DockerRunnerBackend(binary))
+    bundle = _agent_bundle(tmp_path)
+    volume = store / "volumes" / "conductor-ws-agent-retention"
+    written = volume / "agent-written.txt"
+    calls = 0
+
+    async def stream(*args, **kwargs) -> AgentResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            written.write_text("agent changes", encoding="utf-8")
+            raise ExecutionError("failed after dispatch")
+        assert written.read_text(encoding="utf-8") == "agent changes"
+        return AgentResult(content={"result": "resumed"})
+
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=AsyncMock,
+            return_value=bundle,
+        ),
+        patch.object(
+            DockerRunnerBackend,
+            "_bridge_health",
+            new_callable=AsyncMock,
+            return_value={"ready": True, "protocol_version": 2, "features": ["interrupt"]},
+        ),
+        patch("conductor.execution.docker.stream_agent", side_effect=stream),
+        patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+    ):
+        engine = _docker_agent_engine(tmp_path)
+        with pytest.raises(ExecutionError, match="failed after dispatch"):
+            await engine.run({})
+        assert engine._last_checkpoint_path is not None
+        checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert checkpoint.workspace is not None
+        assert checkpoint.workspace["executed_backends"] == ["docker"]
+        if missing_marker:
+            (volume / ".conductor-staged").unlink()
+        start = len(docker_commands(log))
+        resumed = _docker_agent_engine(tmp_path)
+        if missing_marker:
+            with pytest.raises(WorkspaceAttachError):
+                await resumed.resume("agent", checkpoint=checkpoint)
+            assert calls == 1
+        else:
+            assert await resumed.resume("agent", checkpoint=checkpoint) == {}
+            assert calls == 2
+        later = docker_commands(log)[start:]
+        assert not any(argv[:2] == ["volume", "create"] for argv in later)
+        assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in later)
+        assert written.read_text(encoding="utf-8") == "agent changes"
+
+
+async def test_agent_predispatch_failure_does_not_record_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: a failed runner handshake cannot mark an agent backend as executed.
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    _, binary, _store, _log = install_docker_processes(tmp_path, monkeypatch)
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: DockerRunnerBackend(binary))
+    engine = _docker_agent_engine(tmp_path)
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=AsyncMock,
+            return_value=_agent_bundle(tmp_path),
+        ),
+        patch.object(
+            DockerRunnerBackend,
+            "_bridge_health",
+            new_callable=AsyncMock,
+            side_effect=ConfigurationError("handshake refused"),
+        ),
+        patch("conductor.execution.docker.stream_agent", new_callable=AsyncMock) as dispatch,
+        patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+        pytest.raises(ConfigurationError, match="handshake refused"),
+    ):
+        await engine.run({})
+    dispatch.assert_not_awaited()
+    assert engine._last_checkpoint_path is not None
+    checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+    assert checkpoint.workspace is not None
+    assert checkpoint.workspace["executed_backends"] == []
+
+
+async def test_agent_grader_and_retry_record_each_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: grading bypasses AgentExecutor but records dispatch like primary and retry.
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    _, binary, _store, _log = install_docker_processes(tmp_path, monkeypatch)
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: DockerRunnerBackend(binary))
+    engine = _docker_agent_engine(tmp_path)
+    agent = engine.config.agents[0]
+    assert isinstance(agent, AgentDef)
+    agent.validator = ValidatorConfig(criteria="The result must be complete.", max_retries=1)
+    dispatch_records: list[int] = []
+
+    async def stream(*args, **kwargs) -> AgentResult:
+        dispatch_records.append(record.call_count)
+        spec = args[3]
+        if spec.name.endswith(" (validator)"):
+            return AgentResult(content={"passed": False, "issues": ["incomplete"]})
+        return AgentResult(content={"result": "done"})
+
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=AsyncMock,
+            return_value=_agent_bundle(tmp_path),
+        ),
+        patch.object(
+            DockerRunnerBackend,
+            "_bridge_health",
+            new_callable=AsyncMock,
+            return_value={"ready": True, "protocol_version": 2, "features": ["interrupt"]},
+        ),
+        patch("conductor.execution.docker.stream_agent", side_effect=stream),
+        patch.object(
+            engine._execution_session,
+            "record_backend_execution",
+            wraps=engine._execution_session.record_backend_execution,
+        ) as record,
+    ):
+        await engine.run({})
+    assert dispatch_records == [1, 2, 3]
+    assert all(call.args == ("docker",) for call in record.call_args_list)
 
 
 @pytest.mark.asyncio

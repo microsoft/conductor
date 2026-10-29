@@ -15,7 +15,7 @@ from conductor.providers.factory import create_provider
 from conductor.providers.resolution import provider_type_for_agent
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, ProviderSettings, WorkflowConfig
+    from conductor.config.schema import AgentDef, ProviderSettings, RuntimeConfig, WorkflowConfig
 
 
 ProviderType = ProviderName
@@ -75,6 +75,16 @@ class ProviderRegistry:
     def default_provider_type(self) -> ProviderType:
         """Get the default provider type from workflow config."""
         return self._default_provider_type
+
+    @property
+    def runtime(self) -> RuntimeConfig:
+        """Return the root runtime used to configure providers in child workflows too."""
+        return self._config.workflow.runtime
+
+    @property
+    def mcp_servers(self) -> dict[str, Any] | None:
+        """Return the same resolved servers passed to locally constructed providers."""
+        return self._mcp_servers
 
     def provider_type_for(self, agent: AgentDef) -> ProviderType:
         """Determine which provider type an agent should use.
@@ -167,7 +177,7 @@ class ProviderRegistry:
             self._providers[provider_type] = provider
             return provider
 
-    def provider_settings_for(self, provider_type: ProviderType) -> ProviderSettings | None:
+    def provider_settings_for(self, provider_type: str) -> ProviderSettings | None:
         """Return the structured settings this registry constructs a provider with.
 
         Sub-workflow engines share this registry, so the answer reflects the

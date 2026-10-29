@@ -443,6 +443,8 @@ class CopilotProvider(AgentProvider):
         provider_settings: ProviderSettings | None = None,
         tool_output: ToolOutputConfig | None = None,
         github_token: str | None = None,
+        *,
+        resolve_environment: bool = True,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -500,6 +502,8 @@ class CopilotProvider(AgentProvider):
                 instead. ``None`` preserves the existing default behavior
                 (the SDK's own credential resolution, e.g. a logged-in
                 ``copilot`` CLI session).
+            resolve_environment: Fill missing routing and runtime settings from
+                environment variables. False preserves host-effective settings.
         """
         self._client: Any = None  # Will hold Copilot SDK client
         self._mock_handler = mock_handler
@@ -534,6 +538,7 @@ class CopilotProvider(AgentProvider):
         self._interrupted_session: Any = None
         self._abort_supported: bool | None = None
         self._provider_settings = provider_settings
+        self._resolve_environment = resolve_environment
         self._tool_output_config = tool_output or ToolOutputConfig()
         self._github_token = github_token
         # Warn-once latch for extended idle-recovery suppression while a
@@ -716,21 +721,21 @@ class CopilotProvider(AgentProvider):
         if settings is None or not settings.has_custom_routing():
             return None
 
-        base_url = (
-            settings.base_url
-            or os.environ.get("COPILOT_PROVIDER_BASE_URL")
-            or os.environ.get("OPENAI_BASE_URL")
-        )
-        api_key = (
-            settings.api_key.get_secret_value()
-            if settings.api_key is not None
-            else os.environ.get("COPILOT_PROVIDER_API_KEY")
-        )
+        base_url = settings.base_url
+        api_key = settings.api_key.get_secret_value() if settings.api_key is not None else None
         bearer_token = (
-            settings.bearer_token.get_secret_value()
-            if settings.bearer_token is not None
-            else os.environ.get("COPILOT_PROVIDER_BEARER_TOKEN")
+            settings.bearer_token.get_secret_value() if settings.bearer_token is not None else None
         )
+        if self._resolve_environment:
+            base_url = (
+                base_url
+                or os.environ.get("COPILOT_PROVIDER_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL")
+            )
+            if api_key is None:
+                api_key = os.environ.get("COPILOT_PROVIDER_API_KEY")
+            if bearer_token is None:
+                bearer_token = os.environ.get("COPILOT_PROVIDER_BEARER_TOKEN")
 
         # Operate on the resolved locals so the warning also fires when
         # one credential comes from YAML and the other from an env var.
@@ -838,12 +843,13 @@ class CopilotProvider(AgentProvider):
         settings = self._provider_settings
 
         url = settings.runtime_url if settings is not None else None
-        url = url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL")
+        if self._resolve_environment:
+            url = url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL")
 
         token: str | None = None
         if settings is not None and settings.runtime_token is not None:
             token = settings.runtime_token.get_secret_value()
-        if token is None:
+        if token is None and self._resolve_environment:
             token = os.environ.get("COPILOT_PROVIDER_RUNTIME_TOKEN")
 
         # Values resolved from environment variables are not validated by the

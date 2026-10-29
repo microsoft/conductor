@@ -18,6 +18,7 @@ from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 from conductor.providers.base import AgentOutput
+from conductor.redaction import REDACTED_MARKER
 
 
 class _FakeCopilotProvider:
@@ -62,6 +63,10 @@ class _FakeCopilotProvider:
         tools: list[str] | None = None,
         interrupt_signal: Any | None = None,
         event_callback: Any | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        suppress_mcp_servers: bool = False,
     ) -> AgentOutput:
         self.execute_calls.append(
             {
@@ -69,6 +74,9 @@ class _FakeCopilotProvider:
                 "context": context,
                 "rendered_prompt": rendered_prompt,
                 "tools": tools,
+                "skill_directories": skill_directories,
+                "custom_agents": custom_agents,
+                "suppress_mcp_servers": suppress_mcp_servers,
             }
         )
         if self.execute_error is not None:
@@ -77,24 +85,6 @@ class _FakeCopilotProvider:
             event_callback("agent_turn_start", {"turn": "awaiting_model"})
             event_callback("agent_message", {"content": "hi"})
         return self._result
-
-
-class _DelayedCloseFakeCopilotProvider(_FakeCopilotProvider):
-    """`_FakeCopilotProvider` whose `close()` yields to the event loop.
-
-    Used to widen the race window in `_InnerProviderCache` concurrency
-    tests: without a real `await` suspension inside `close()`, two
-    concurrent `get()` calls racing on the same stale cache entry might not
-    reliably interleave under cooperative scheduling.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-
-        async def _delayed_close() -> None:
-            await asyncio.sleep(0.01)
-
-        self.close = AsyncMock(side_effect=_delayed_close)
 
 
 @pytest.fixture(autouse=True)
@@ -172,11 +162,54 @@ class TestHealth:
         # Requirement: /health must advertise the wire-protocol version so the
         # host can warn on host/runner protocol skew; the key is additive, so
         # old hosts ignore it and old runners simply omit it.
-        assert body["protocol_version"] == 1
+        assert body["protocol_version"] == 2
 
 
 class TestExecuteStreaming:
     """`POST /execute` (E4-T2) — NDJSON event frames + terminal `result`."""
+
+    def test_mcp_credentials_are_redacted_from_provider_events(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: MCP spawn and HTTP authorization secrets echoed by a
+        # provider cannot escape into the runner's NDJSON event stream.
+        async def echo_secrets(
+            provider: _FakeCopilotProvider, *_args: Any, event_callback: Any, **_kwargs: Any
+        ) -> AgentOutput:
+            servers = provider.mcp_servers
+            assert servers is not None
+            event_callback(
+                "agent_message",
+                {
+                    "content": [
+                        servers["stdio"]["env"]["TOKEN"],
+                        servers["remote"]["headers"]["authorization"],
+                    ]
+                },
+            )
+            return provider._result
+
+        monkeypatch.setattr(_FakeCopilotProvider, "execute", echo_secrets)
+        secrets = ("mcp-env-private-value", "Bearer mcp-header-private-value")
+        response = client.post(
+            "/execute",
+            json=_execute_body(
+                mcp_servers={
+                    "stdio": {"command": "echo", "env": {"TOKEN": secrets[0]}},
+                    "remote": {
+                        "type": "http",
+                        "url": "https://example.com/mcp",
+                        "headers": {"authorization": secrets[1]},
+                    },
+                }
+            ),
+        )
+        assert response.status_code == 200
+        assert _parse_ndjson(response.text)[0] == {
+            "type": "agent_message",
+            "data": {"content": [REDACTED_MARKER, REDACTED_MARKER]},
+        }
+        assert all(secret not in response.text for secret in secrets)
 
     def test_execute_streams_events_and_terminal_result(self, client: TestClient) -> None:
         response = client.post("/execute", json=_execute_body())
@@ -231,7 +264,7 @@ class TestExecuteStreaming:
             json=_execute_body(mcp_servers={"git": {"type": "stdio", "command": "echo"}}),
         )
         assert len(_FakeCopilotProvider.instances) == 2
-        assert _FakeCopilotProvider.instances[0].close.await_count == 1
+        assert _FakeCopilotProvider.instances[0].close.await_count == 0
 
 
 class TestExecuteMissingStdioBinary:
@@ -389,6 +422,7 @@ class TestHostRunnerCredentialContract:
             tool_output=None,
         )
 
+        assert isinstance(provider, _FakeCopilotProvider)
         assert provider.github_token == "hosts-default-github-token"
         assert provider.provider_settings is None
 
@@ -481,14 +515,12 @@ class TestExecuteForwardsRetryAndContextTier:
 
 
 class TestInnerProviderCacheConcurrency:
-    """Review fix: concurrent `get()` calls don't corrupt cache state."""
+    """Distinct keys never close one another's active providers."""
 
-    async def test_concurrent_rebuilds_close_the_stale_provider_exactly_once(
+    async def test_concurrent_keys_keep_all_instances_until_shutdown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            "conductor.aca_runner.server.CopilotProvider", _DelayedCloseFakeCopilotProvider
-        )
+        monkeypatch.setattr("conductor.aca_runner.server.CopilotProvider", _FakeCopilotProvider)
         from conductor.aca_runner.server import _InnerProviderCache
 
         cache = _InnerProviderCache()
@@ -512,25 +544,19 @@ class TestInnerProviderCacheConcurrency:
             ),
         )
 
-        # The initial provider must be closed exactly once — a race in the
-        # unlocked check-close-rebuild sequence would double-close it.
-        assert first.close.await_count == 1
-        # No provider is ever silently orphaned: every constructed instance
-        # is either the live cache entry or has been closed.
-        live = cache._provider
-        for instance in _FakeCopilotProvider.instances:
-            if instance is not live:
-                assert instance.close.await_count == 1
-        # Both concurrent callers got a real, live provider back.
+        # All instances remain reusable; shutdown closes them once, not on
+        # another request's key change.
+        assert first.close.await_count == 0
+        assert all(instance.close.await_count == 0 for instance in _FakeCopilotProvider.instances)
         assert all(r is not None for r in results)
-        assert cache._key is not None
+        assert len(cache._entries) == 3
+        await cache.close()
+        assert all(instance.close.await_count == 1 for instance in _FakeCopilotProvider.instances)
 
     async def test_concurrent_get_with_same_key_returns_single_instance(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            "conductor.aca_runner.server.CopilotProvider", _DelayedCloseFakeCopilotProvider
-        )
+        monkeypatch.setattr("conductor.aca_runner.server.CopilotProvider", _FakeCopilotProvider)
         from conductor.aca_runner.server import _InnerProviderCache
 
         cache = _InnerProviderCache()
@@ -619,7 +645,7 @@ class TestInnerProviderCacheKeyHashing:
             tool_output=None,
         )
         assert len(_FakeCopilotProvider.instances) == 2
-        assert _FakeCopilotProvider.instances[0].close.await_count == 1
+        assert _FakeCopilotProvider.instances[0].close.await_count == 0
 
 
 class TestRunnerAuthGate:

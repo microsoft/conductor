@@ -196,6 +196,8 @@ class OpenAIProvider(AgentProvider):
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
         tool_output: ToolOutputConfig | None = None,
+        *,
+        resolve_environment: bool = True,
     ) -> None:
         """Initialize the OpenAI provider.
 
@@ -224,6 +226,8 @@ class OpenAIProvider(AgentProvider):
                 when an agent does not declare its own ``reasoning`` config. Mapped to
                 OpenAI's ``reasoning_effort`` parameter on supported models.
             tool_output: MCP tool result output-size configuration.
+            resolve_environment: Resolve missing credentials and endpoint from
+                the environment. False preserves host-effective settings.
 
         Raises:
             ProviderError: If the OpenAI SDK is not installed.
@@ -237,6 +241,7 @@ class OpenAIProvider(AgentProvider):
 
         self._client: AsyncOpenAI | None = None
         self._api_key = api_key
+        self._resolve_environment = resolve_environment
         self._base_url = base_url
         self._model_user_configured = model is not None
         self._default_model = model or "gpt-5-mini"
@@ -266,7 +271,7 @@ class OpenAIProvider(AgentProvider):
         self._mcp_managers: dict[str, MCPManager] = {}
         self._mcp_manager_locks: dict[str, asyncio.Lock] = {}
 
-        if self._base_url is None:
+        if self._base_url is None and resolve_environment:
             self._base_url = os.environ.get("OPENAI_BASE_URL")
 
         # Set when validate_connection()'s models.list() probe is inconclusive
@@ -311,7 +316,9 @@ class OpenAIProvider(AgentProvider):
             client_kwargs["api_key"] = self._api_key
         else:
             # Only fall back to the ambient key when no custom base_url was requested.
-            effective_api_key = os.environ.get("OPENAI_API_KEY")
+            effective_api_key = (
+                os.environ.get("OPENAI_API_KEY") if self._resolve_environment else None
+            )
             if not effective_api_key:
                 raise ValidationError(
                     "OPENAI_API_KEY environment variable is not set and no api_key was provided",
@@ -321,6 +328,8 @@ class OpenAIProvider(AgentProvider):
 
         if self._base_url is not None:
             client_kwargs["base_url"] = self._base_url
+        elif not self._resolve_environment:
+            client_kwargs["base_url"] = "https://api.openai.com/v1"
 
         self._client = AsyncOpenAI(**client_kwargs)
 
@@ -855,6 +864,7 @@ class OpenAIProvider(AgentProvider):
                 api_key=self._api_key,
                 base_url=self._base_url,
                 timeout=self._timeout,
+                resolve_environment=self._resolve_environment,
             )
 
             pydantic_agent = Agent(
@@ -1022,6 +1032,7 @@ class OpenAIProvider(AgentProvider):
                 api_key=self._api_key,
                 base_url=self._base_url,
                 timeout=self._timeout,
+                resolve_environment=self._resolve_environment,
                 toolsets=toolsets,
                 backend="openai",
                 http_client=None,
