@@ -50,10 +50,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Default model mirrors ClaudeProvider's conservative default to avoid dated
-# model deprecation risk. The "-latest" suffix lets Anthropic aliases keep the
-# identifier current without YAML changes.
-DEFAULT_ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
+# Used when neither the agent nor the workflow sets a model. Anthropic retired
+# ``claude-3-5-sonnet-latest``, the previous default, so requests without an
+# explicit model failed.
+DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-5-5"
 _FINAL_RESULT_TOOL_DESCRIPTION: Final[str] = (
     "Call this tool to return the final structured result and end the conversation. "
     "You must call this tool before finishing; plain text responses are not accepted."
@@ -276,8 +276,8 @@ def _resolve_anthropic_thinking(
             f"reasoning.effort={effort!r} was requested for agent "
             f"{agent.name!r}.",
             suggestion=(
-                "Use a Claude 3.7+ or 4.x model (e.g. claude-3-7-sonnet-latest, "
-                "claude-opus-4-20250514) or remove the reasoning config."
+                "Use a model that supports extended thinking with budget_tokens, "
+                "or remove the reasoning config."
             ),
         )
     return {"type": "enabled", "budget_tokens": effort_to_budget_tokens(effort)}
