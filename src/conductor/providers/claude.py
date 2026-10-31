@@ -216,10 +216,8 @@ class ClaudeProvider(AgentProvider):
             base_url: Custom API endpoint (e.g. Databricks gateway URL).
                 If None, falls back to ANTHROPIC_BASE_URL env var then the
                 default Anthropic API endpoint.
-            model: Default model to use. Defaults to "claude-3-5-sonnet-latest".
-                This default is chosen for stability and to avoid dated model
-                deprecation risk. The "-latest" suffix ensures compatibility
-                with model updates without requiring configuration changes.
+            model: Default model to use. Defaults to "claude-sonnet-5-5"
+                (Anthropic retired the previous default, claude-3-5-sonnet-latest).
             temperature: Default temperature (0.0-1.0). SDK enforces range.
             max_tokens: Maximum output tokens. Defaults to 16384 when not
                 configured, applied uniformly across Claude and OpenAI providers.
@@ -259,7 +257,7 @@ class ClaudeProvider(AgentProvider):
         # ANTHROPIC_BASE_URL rather than an explicit argument.
         self._base_url = base_url if base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
         self._model_user_configured = model is not None
-        self._default_model = model or "claude-3-5-sonnet-latest"
+        self._default_model = model or "claude-sonnet-5-5"
 
         # Validate and store temperature (enforce schema bounds at instantiation)
         if temperature is not None:
@@ -991,8 +989,8 @@ class ClaudeProvider(AgentProvider):
                     f"but default_reasoning_effort={self._default_reasoning_effort!r} "
                     "was configured.",
                     suggestion=(
-                        "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
-                        "claude-sonnet-4-20250514) or remove the reasoning config."
+                        "Use a model that supports extended thinking with budget_tokens, "
+                        "or remove the reasoning config."
                     ),
                 )
             budget = effort_to_budget_tokens(self._default_reasoning_effort)

@@ -105,6 +105,15 @@ class TestModelMapping:
 
         assert _extract_model_name(pydantic_agent) == DEFAULT_ANTHROPIC_MODEL
 
+    def test_default_model_is_not_the_retired_claude_3_5_sonnet(self) -> None:
+        """Both Anthropic code paths must not default to a model Anthropic retired."""
+        from conductor.providers.claude import ClaudeProvider
+
+        provider = ClaudeProvider(api_key="test-key")
+
+        assert DEFAULT_ANTHROPIC_MODEL != "claude-3-5-sonnet-latest"
+        assert provider._default_model == DEFAULT_ANTHROPIC_MODEL
+
 
 class TestOpenAIModelMapping:
     """Tests for resolving the OpenAI model identifier."""
