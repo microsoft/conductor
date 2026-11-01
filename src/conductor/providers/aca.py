@@ -33,20 +33,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
-import re
 import secrets
 import subprocess
 import time
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import ConfigDict, Field, SecretStr
 
 from conductor.exceptions import ProviderError
+from conductor.execution.types import AgentEventSink, AgentResult, AgentSpec, WorkspaceLease
 from conductor.install_hint import install_command
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
@@ -95,14 +95,6 @@ _DYNAMICSESSIONS_SCOPE = "https://dynamicsessions.io/.default"
 
 # Fallback management-API version when the workflow YAML doesn't pin one.
 _DEFAULT_API_VERSION = "2025-07-01"
-
-# ACA session identifiers must fit this bound (Data Flow: "truncated to
-# ≤128 chars with a hash suffix").
-_MAX_IDENTIFIER_LENGTH = 128
-
-# Charset-normalization: anything outside lowercase-alnum-hyphen collapses to
-# a single hyphen (Data Flow: "charset-normalized").
-_IDENTIFIER_INVALID_RE = re.compile(r"[^a-z0-9-]+")
 
 # Refresh the cached AAD token this many seconds before its reported expiry,
 # so a request never starts with a token that expires mid-flight.
@@ -357,12 +349,9 @@ class AcaRuntimeProvider(AgentProvider):
         self._credential: Any = None
         self._cached_token: str | None = None
         self._cached_token_expires_at: float = 0.0
-
-        # `identifier_scope: "none"` needs a fresh workspace on *every* call
-        # (Data Flow: "fresh workspace every execution, including retries");
-        # this monotonic counter is what makes that scope diverge even for
-        # otherwise-identical agent/context pairs.
-        self._none_scope_counter = 0
+        self._runner_protocol_version: int | None = None
+        self._runner_features: tuple[str, ...] = ()
+        self._active_execution_ids: dict[str, str] = {}
 
         # In-flight registry keyed by the *logical* identifier returned from
         # `identifier_for` (review fix, OQ#1). Maps each logical identifier
@@ -372,6 +361,13 @@ class AcaRuntimeProvider(AgentProvider):
         # acquired regardless of completion order — see
         # `_acquire_wire_identifier`.
         self._active_identifiers: dict[str, set[int]] = {}
+        from conductor.engine.aca_execution import AcaIdentifierState
+
+        self._identifier_state = AcaIdentifierState(
+            salt=self._run_salt, active=self._active_identifiers
+        )
+        self._legacy_backend: Any = None
+        self._deprecated_warned = False
 
     # ------------------------------------------------------------------
     # Identifier derivation (E3-T3, DD5, OQ#1)
@@ -418,22 +414,9 @@ class AcaRuntimeProvider(AgentProvider):
         unconditional hash suffix so two distinct raw identifiers never
         collide after normalization/truncation.
         """
-        scope = self._resolve_identifier_scope(agent)
-        scope_key = self._scope_key(scope, agent, context)
-        parts = [f"cond-{self._run_salt}", scope_key]
-
-        # `item` scope already folds the loop key into `scope_key`, so
-        # appending it again as a discriminator would just duplicate it.
-        if scope != "item":
-            discriminator = self._concurrency_discriminator(context)
-            if discriminator:
-                parts.append(discriminator)
-
-        if scope == "none":
-            self._none_scope_counter += 1
-            parts.append(str(self._none_scope_counter))
-
-        return self._normalize_and_truncate("-".join(parts))
+        return self._identifier_state.identifier_for(
+            agent.name, context, self._resolve_identifier_scope(agent)
+        )
 
     def _acquire_wire_identifier(self, logical_id: str) -> tuple[str, int]:
         """Reserve the identifier actually sent to ACA for this call.
@@ -463,57 +446,17 @@ class AcaRuntimeProvider(AgentProvider):
         identifier was used for has completed, passing back the exact
         `slot` this call returned.
         """
-        used_slots = self._active_identifiers.setdefault(logical_id, set())
-        slot = 0
-        while slot in used_slots:
-            slot += 1
-        used_slots.add(slot)
-        if slot == 0:
-            return logical_id, slot
-        return self._normalize_and_truncate(f"{logical_id}-conc{slot}"), slot
+        return self._identifier_state.acquire(logical_id)
 
     def _release_wire_identifier(self, logical_id: str, slot: int) -> None:
         """Release the specific `slot` reserved by `_acquire_wire_identifier`."""
-        used_slots = self._active_identifiers.get(logical_id)
-        if used_slots is None:
-            return
-        used_slots.discard(slot)
-        if not used_slots:
-            self._active_identifiers.pop(logical_id, None)
+        self._identifier_state.release(logical_id, slot)
 
     def _resolve_identifier_scope(self, agent: AgentDef) -> str:
         """Per-agent ``sandbox.identifier_scope`` wins over the workflow default."""
         if agent.sandbox is not None and agent.sandbox.identifier_scope is not None:
             return agent.sandbox.identifier_scope
         return self._provider_settings.identifier_scope or "agent"
-
-    def _scope_key(self, scope: str, agent: AgentDef, context: dict[str, Any]) -> str:
-        if scope == "workflow":
-            # Constant across the whole run — `run_salt` already makes this
-            # unique per *run*; every agent in this workflow shares it.
-            return "workflow"
-        if scope == "item":
-            item_key = context.get("_key", context.get("_index"))
-            if item_key is None:
-                # No active for-each loop context — degrade to per-agent
-                # reuse rather than raising (an `identifier_scope: item`
-                # agent that isn't inside a for_each is a config oddity,
-                # not an execution error).
-                return agent.name
-            return str(item_key)
-        # "agent" (default) and "none" both key off the agent name; "none"'s
-        # per-call uniqueness comes from `_none_scope_counter` instead.
-        return agent.name
-
-    def _concurrency_discriminator(self, context: dict[str, Any]) -> str:
-        """Mandatory concurrency discriminator (DD5) — see OQ#1 in `identifier_for`."""
-        key = context.get("_key")
-        if key is not None:
-            return str(key)
-        index = context.get("_index")
-        if index is not None:
-            return str(index)
-        return ""
 
     def _normalize_and_truncate(self, raw: str) -> str:
         """Charset-normalize ``raw`` and bound it to the ACA identifier limit.
@@ -530,12 +473,7 @@ class AcaRuntimeProvider(AgentProvider):
         pre-normalization input guarantees distinct raw inputs stay distinct
         after normalization, regardless of collapsing.
         """
-        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
-        normalized = _IDENTIFIER_INVALID_RE.sub("-", raw.lower()).strip("-")
-        if not normalized:
-            normalized = "cond"
-        prefix_len = _MAX_IDENTIFIER_LENGTH - len(digest) - 1
-        return f"{normalized[:prefix_len]}-{digest}"
+        return self._identifier_state.normalize(raw)
 
     @property
     def _health_identifier(self) -> str:
@@ -811,15 +749,10 @@ class AcaRuntimeProvider(AgentProvider):
         )
 
     def _wire_body(self, request: RunnerAgentRequest) -> dict[str, Any]:
-        """Serialize `request` into the JSON body actually sent to the runner.
+        """Serialize a direct legacy request for compatibility callers.
 
-        Thin delegate to :func:`conductor.runner.protocol.request_to_wire_body`
-        (the one dedicated wire-serialization step): it unwraps any
-        `SecretStr` values held in `inner_provider_settings` back to
-        plaintext immediately before the bytes are handed to httpx — the
-        request object's own `model_dump`/`repr` stay redacted, and nowhere
-        else in the codebase sees the plaintext. Kept as a method because
-        tests call it directly.
+        Active executions use `AgentSpec` and `agent_spec_to_wire_body`;
+        this method retains the historical request-model serialization seam.
         """
         return request_to_wire_body(request)
 
@@ -898,29 +831,6 @@ class AcaRuntimeProvider(AgentProvider):
             provider_name="aca",
         )
 
-    def _agent_output_from_result(self, data: dict[str, Any], *, interrupted: bool) -> AgentOutput:
-        result = RunnerAgentResult.model_validate(data)
-        input_tokens = result.input_tokens
-        output_tokens = result.output_tokens
-        tokens_used = (
-            (input_tokens or 0) + (output_tokens or 0)
-            if input_tokens is not None or output_tokens is not None
-            else None
-        )
-        return AgentOutput(
-            content=result.content,
-            raw_response=data,
-            tokens_used=tokens_used,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=result.cache_read_tokens,
-            cache_write_tokens=result.cache_write_tokens,
-            last_call_input_tokens=result.last_call_input_tokens,
-            model=result.model,
-            partial=result.partial or interrupted,
-            session_seconds=result.session_seconds,
-        )
-
     # ------------------------------------------------------------------
     # Streaming transport (E3-T5, Branch S)
     # ------------------------------------------------------------------
@@ -955,12 +865,22 @@ class AcaRuntimeProvider(AgentProvider):
         """
         token = await self._get_access_token()
         client = self._ensure_client()
-        response = await client.post(
-            self._build_url("interrupt"),
-            params={"identifier": identifier, "api-version": self._api_version},
-            headers={"Authorization": f"Bearer {token}", **self._runner_auth_headers()},
-            timeout=10.0,
-        )
+        execution_id = self._active_execution_ids.get(identifier)
+        if execution_id is None:
+            response = await client.post(
+                self._build_url("interrupt"),
+                params={"identifier": identifier, "api-version": self._api_version},
+                headers={"Authorization": f"Bearer {token}", **self._runner_auth_headers()},
+                timeout=10.0,
+            )
+        else:
+            response = await client.post(
+                self._build_url("interrupt"),
+                params={"identifier": identifier, "api-version": self._api_version},
+                headers={"Authorization": f"Bearer {token}", **self._runner_auth_headers()},
+                json={"execution_id": execution_id},
+                timeout=10.0,
+            )
         if response.status_code >= 400:
             raise await self._error_from_response(response)
 
@@ -1121,52 +1041,70 @@ class AcaRuntimeProvider(AgentProvider):
         del skill_directories  # Host paths are meaningless in-sandbox (see docstring).
         del custom_agents, extra_mcp_servers  # Same: host-side plugin content.
         del continuation_state  # No continuation surface (see docstring).
-        logical_id = self.identifier_for(agent, context)
-        # Reserve the wire identifier for the full lifetime of this request
-        # (acquired before the request starts, released once it finishes —
-        # success, error, or interrupt) so a genuinely concurrent sibling
-        # sharing `logical_id` diverges while this call is in flight, and
-        # reuses `logical_id` once it is free again (OQ#1; see
-        # `identifier_for` / `_acquire_wire_identifier`). `slot` identifies
-        # exactly which reservation this call holds, so release always frees
-        # the right one even if calls sharing `logical_id` complete out of
-        # order.
-        identifier, slot = self._acquire_wire_identifier(logical_id)
-        try:
-            request = self._build_request(
-                agent, context, rendered_prompt, tools, suppress_mcp_servers
+        if not self._deprecated_warned:
+            warnings.warn(
+                "provider: aca is deprecated; use provider: copilot with an ACA execution profile",
+                DeprecationWarning,
+                stacklevel=2,
             )
-            token = await self._get_access_token()
-            url = self._build_url("execute")
-            params = {"identifier": identifier, "api-version": self._api_version}
-            headers = {"Authorization": f"Bearer {token}", **self._runner_auth_headers()}
-            body = self._wire_body(request)
+            self._deprecated_warned = True
 
-            try:
-                async with self._stream_execute(url, params, headers, body) as response:
-                    if response.status_code >= 400:
-                        raise await self._error_from_response(response)
-                    result_data, interrupted = await self._read_frames(
-                        response, interrupt_signal, identifier, event_callback
-                    )
-            except httpx.HTTPError as exc:
-                raise ProviderError(
-                    f"aca: transport error contacting runner at {url}: {exc}",
-                    provider_name="aca",
-                    is_retryable=True,
-                ) from exc
+        from conductor.engine.aca_execution import AcaRunnerBackend
 
-            if result_data is None:
-                if interrupted:
-                    return AgentOutput(content={}, raw_response=None, partial=True)
-                raise ProviderError(
-                    "aca: runner stream ended without a terminal result frame",
-                    provider_name="aca",
-                    is_retryable=True,
-                )
-            return self._agent_output_from_result(result_data, interrupted=interrupted)
-        finally:
-            self._release_wire_identifier(logical_id, slot)
+        if self._legacy_backend is None:
+            backend = AcaRunnerBackend(transport=self)
+            backend._leases[self._run_salt] = self._identifier_state
+            self._legacy_backend = backend
+        request = self._build_request(agent, context, rendered_prompt, tools, suppress_mcp_servers)
+        payload = request.agent
+        spec = AgentSpec(
+            name=payload.name,
+            execution_id=secrets.token_hex(16),
+            model_provider=request.inner_provider,
+            model=payload.model,
+            rendered_prompt=request.rendered_prompt,
+            system_prompt=payload.system_prompt,
+            output_schema=payload.output,
+            tools=tuple(request.tools) if request.tools is not None else None,
+            mcp_servers=request.mcp_servers,
+            context=request.context,
+            provider_credentials=request.inner_provider_settings,
+            tool_output=request.tool_output,
+            reasoning_effort=payload.reasoning_effort,
+            max_agent_iterations=payload.max_agent_iterations,
+            max_session_seconds=payload.max_session_seconds,
+            working_dir=payload.working_dir,
+            retry=payload.retry,
+            context_tier=payload.context_tier,
+        )
+        result = await self._legacy_backend.run_agent(
+            spec,
+            WorkspaceLease(self._run_salt, "aca", self._run_salt),
+            on_event=(
+                (lambda name, data: event_callback(name, dict(data)))
+                if event_callback is not None
+                else None
+            ),
+            interrupt_signal=interrupt_signal,
+            identifier_scope=self._resolve_identifier_scope(agent),
+        )
+        return AgentOutput(
+            content=dict(result.content),
+            raw_response=result.raw_response,
+            tokens_used=(
+                (result.input_tokens or 0) + (result.output_tokens or 0)
+                if result.input_tokens is not None or result.output_tokens is not None
+                else None
+            ),
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_write_tokens=result.cache_write_tokens,
+            last_call_input_tokens=result.last_call_input_tokens,
+            model=result.model,
+            partial=result.partial,
+            session_seconds=result.session_seconds,
+        )
 
     # ------------------------------------------------------------------
     # Dialog turns (E4-T5, OQ#5)
@@ -1274,6 +1212,8 @@ class AcaRuntimeProvider(AgentProvider):
 
         with contextlib.suppress(Exception):
             health = RunnerHealthResponse.model_validate(response.json())
+            self._runner_protocol_version = health.protocol_version or 1
+            self._runner_features = tuple(health.features or ())
             self._warn_on_version_skew(health)
             self._warn_on_auth_skew(health)
         return True
@@ -1358,6 +1298,19 @@ class AcaRuntimeProvider(AgentProvider):
                 "enabled. Set ACA_RUNNER_AUTH_TOKEN on the runner pool too."
             )
 
+    async def execute_request(
+        self,
+        body: dict[str, Any],
+        identifier: str,
+        *,
+        interrupt_signal: asyncio.Event | None,
+        on_event: AgentEventSink | None,
+    ) -> AgentResult:
+        """Dispatch an already-serialized request over the shared gateway transport."""
+        return await AcaTransport(self).execute_request(
+            body, identifier, interrupt_signal=interrupt_signal, on_event=on_event
+        )
+
     async def close(self) -> None:
         """Release the AAD credential and httpx client."""
         if self._credential is not None:
@@ -1367,3 +1320,66 @@ class AcaRuntimeProvider(AgentProvider):
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
+        self._legacy_backend = None
+
+
+class AcaTransport:
+    """Shared ACA gateway transport for the profile backend and legacy provider."""
+
+    def __init__(self, provider: AcaRuntimeProvider) -> None:
+        self.provider = provider
+
+    async def execute_request(
+        self,
+        body: dict[str, Any],
+        identifier: str,
+        *,
+        interrupt_signal: asyncio.Event | None,
+        on_event: AgentEventSink | None,
+    ) -> AgentResult:
+        provider = self.provider
+        token = await provider._get_access_token()
+        execution_id = body.get("execution_id")
+        if isinstance(execution_id, str):
+            provider._active_execution_ids[identifier] = execution_id
+        url = provider._build_url("execute")
+        params = {"identifier": identifier, "api-version": provider._api_version}
+        headers = {"Authorization": f"Bearer {token}", **provider._runner_auth_headers()}
+        try:
+            try:
+                async with provider._stream_execute(url, params, headers, body) as response:
+                    if response.status_code >= 400:
+                        raise await provider._error_from_response(response)
+                    data, interrupted = await provider._read_frames(
+                        response, interrupt_signal, identifier, on_event
+                    )
+            except httpx.HTTPError as exc:
+                raise ProviderError(
+                    f"aca: transport error contacting runner at {url}: {exc}",
+                    provider_name="aca",
+                    is_retryable=True,
+                ) from exc
+        finally:
+            provider._active_execution_ids.pop(identifier, None)
+
+        if data is None:
+            if interrupted:
+                return AgentResult(content={}, partial=True)
+            raise ProviderError(
+                "aca: runner stream ended without a terminal result frame",
+                provider_name="aca",
+                is_retryable=True,
+            )
+        result = RunnerAgentResult.model_validate(data)
+        return AgentResult(
+            content=result.content,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_write_tokens=result.cache_write_tokens,
+            last_call_input_tokens=result.last_call_input_tokens,
+            session_seconds=result.session_seconds,
+            partial=result.partial or interrupted,
+            raw_response=data,
+        )

@@ -14,6 +14,9 @@ covering E8-T4:
 - A kill on an already-dead PID does not raise.
 - The TUI and CLI resolve to the same shared implementation
   (``conductor.cli.app.stop_records``).
+- A gate choice that declares ``prompt_for`` (e.g. a ``questions`` node's
+  "Write your own") collects and confirms its text before anything is
+  posted, and Escape leaves the gate unanswered (issue #620).
 """
 
 from __future__ import annotations
@@ -761,6 +764,595 @@ class TestResolveGateSyncConcurrency:
         assert "resolved yes" in messages
         assert "resolved no" in messages
         assert gate_module.console is original
+
+
+# ---------------------------------------------------------------------------
+# Gate input collection (issue #620): a choice that declares `prompt_for`
+# collects its text before anything is posted.
+# ---------------------------------------------------------------------------
+
+
+def _detail(
+    value: str,
+    label: str | None = None,
+    *,
+    prompt_for: str | None = None,
+    multiline: bool = False,
+) -> dict[str, Any]:
+    """One ``option_details`` entry, shaped like the engine's
+    ``gate_presented`` payload."""
+    return {
+        "label": label if label is not None else value,
+        "value": value,
+        "route": "",
+        "prompt_for": prompt_for,
+        "multiline": multiline,
+    }
+
+
+def _questions_gate(*, multiline: bool = False, suggested: tuple[str, ...] = ()):
+    """A ``questions``-node gate: optional suggested answers, "Write your
+    own", then the navigation controls -- as ``build_question_prompt`` emits."""
+    from conductor.executor import questions as questions_mod
+
+    details = [_detail(s) for s in suggested]
+    details.append(
+        _detail(
+            questions_mod.FREE_TEXT,
+            "✎ Write your own",
+            prompt_for=questions_mod.FREE_TEXT_FIELD,
+            multiline=multiline,
+        )
+    )
+    details.append(_detail(questions_mod.NAV_SKIP, "⤼ Skip this question"))
+    details.append(_detail(questions_mod.NAV_ABORT, "✕ Abort"))
+    return _gate_info(
+        agent_name="ask",
+        prompt="**Question 1 of 1**\n\nWhat should we call it?",
+        options=[d["value"] for d in details],
+        option_details=details,
+    )
+
+
+def _accepted_post() -> Mock:
+    """An ``httpx.post`` stand-in that accepts every response.
+
+    Patched at the HTTP boundary rather than at ``_gate_respond_impl`` so
+    these tests exercise the real shared CLI implementation and assert on
+    the request body it actually builds.
+    """
+    import httpx
+
+    resp = Mock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.text = '{"status": "accepted"}'
+    resp.json.return_value = {"status": "accepted"}
+    return Mock(return_value=resp)
+
+
+class _GateDriver:
+    """Runs the real :func:`resolve_gate` in a worker and steps through it."""
+
+    def __init__(self, pilot: Any, app: FleetApp) -> None:
+        self.pilot = pilot
+        self.app = app
+        self.result: dict[str, object] = {}
+
+    async def start(self, record: RunRecord, gate: Any) -> None:
+        async def _resolve() -> None:
+            self.result["outcome"] = await tui_actions.resolve_gate(self.app, record, gate)
+
+        self.app.run_worker(_resolve())
+        # Not `settle`: the worker suspends on `push_screen_wait` until the
+        # modal is answered, so waiting for all workers would deadlock.
+        await self.pilot.pause()
+
+    async def choose(self, value: str, gate: Any) -> None:
+        from textual.widgets import OptionList
+
+        assert isinstance(self.app.screen, tui_actions.GateOptionsModal)
+        option_list = self.app.screen.query_one(OptionList)
+        option_list.highlighted = gate.options.index(value)
+        await self.pilot.press("enter")
+        await self.pilot.pause()
+
+    async def type(self, text: str) -> None:
+        keys = ["space" if ch == " " else ch for ch in text]
+        await self.pilot.press(*keys)
+        await self.pilot.pause()
+
+    async def finished(self) -> object:
+        await wait_for(
+            self.pilot,
+            lambda: "outcome" in self.result,
+            message="resolve_gate never returned",
+        )
+        return self.result["outcome"]
+
+
+class TestGateInputCollection:
+    """Selecting a choice with ``prompt_for`` must not respond until the
+    text it asks for has been typed and confirmed. Before #620, choosing
+    "Write your own" posted at once with no ``additional_input``, so the
+    question advanced with nothing collected."""
+
+    @pytest.mark.parametrize("multiline", [False, True], ids=["single-line", "multiline"])
+    @pytest.mark.parametrize("failure", ["connection", "http-403"])
+    @pytest.mark.parametrize("retry", [False, True], ids=["cancel-retry", "confirm-retry"])
+    async def test_failed_submission_preserves_choice_and_draft_for_explicit_retry(
+        self, fleet_env: Path, tmp_path: Path, multiline: bool, failure: str, retry: bool
+    ) -> None:
+        import httpx
+        from textual.widgets import Input, Static, TextArea
+
+        from conductor.executor import questions as questions_mod
+
+        record = _write_record(tmp_path, "run-retry")
+        gate = _questions_gate(multiline=multiline)
+        draft = "my answer\nsecond line" if multiline else "my answer"
+        post = _accepted_post()
+        if failure == "connection":
+            error: Exception | Mock = httpx.ConnectError("connection lost")
+            expected_error = "Cannot connect"
+        else:
+            error = Mock(spec=httpx.Response)
+            error.status_code = 403
+            expected_error = "token"
+        post.side_effect = [error, post.return_value]
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            with patch.object(app, "notify", wraps=app.notify) as notify:
+                async with app.run_test(size=(80, 24)) as pilot:
+                    await settle(pilot)
+                    driver = _GateDriver(pilot, app)
+                    await driver.start(record, gate)
+                    await driver.choose(questions_mod.FREE_TEXT, gate)
+                    await driver.type(draft.replace("\n", ""))
+                    editor = app.screen.query_one("#gate-input-editor")
+                    if isinstance(editor, TextArea):
+                        editor.load_text(draft)
+                    await pilot.press("ctrl+s")
+                    await wait_for(
+                        pilot,
+                        lambda: isinstance(app.screen, tui_actions.GateInputModal)
+                        and app.screen._retry,
+                        message="failed submission did not reopen the draft",
+                    )
+
+                    editor = app.screen.query_one("#gate-input-editor")
+                    assert app.screen.focused is editor
+                    assert (editor.text if isinstance(editor, TextArea) else editor.value) == draft
+                    assert isinstance(editor, TextArea if multiline else Input)
+                    hint = str(app.screen.query_one("#gate-input-hint", Static).render())
+                    assert "retry" in hint
+                    assert expected_error.lower() in notify.call_args.args[0].lower()
+                    assert notify.call_args.kwargs["severity"] == "error"
+                    await pilot.pause()
+                    assert post.call_count == 1, "an ambiguous failure must not auto-retry"
+                    assert "outcome" not in driver.result
+
+                    await pilot.press(("ctrl+s" if multiline else "enter") if retry else "escape")
+                    outcome = await driver.finished()
+
+        assert isinstance(outcome, tui_actions.GateResolveOutcome)
+        assert outcome.success is retry
+        assert post.call_count == (2 if retry else 1)
+        for call in post.call_args_list:
+            assert call.kwargs["json"]["selected_value"] == questions_mod.FREE_TEXT
+            assert call.kwargs["json"]["additional_input"] == draft
+
+    async def test_write_your_own_alone_collects_single_line_text(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        from conductor.executor import questions as questions_mod
+
+        record = _write_record(tmp_path, "run-q1")
+        gate = _questions_gate()
+        post = _accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose(questions_mod.FREE_TEXT, gate)
+
+                assert isinstance(app.screen, tui_actions.GateInputModal), (
+                    "Write your own must open an input editor, not respond"
+                )
+                assert post.call_count == 0, "selecting the choice must not respond"
+
+                await driver.type("my own name")
+                assert post.call_count == 0, "typing must not respond"
+
+                await pilot.press("enter")
+                outcome = await driver.finished()
+
+        assert isinstance(outcome, tui_actions.GateResolveOutcome)
+        assert outcome.success is True
+        post.assert_called_once()
+        body = post.call_args.kwargs["json"]
+        assert body["agent_name"] == "ask"
+        assert body["selected_value"] == questions_mod.FREE_TEXT
+        assert body["additional_input"] == "my own name"
+
+    async def test_multiline_enter_inserts_newline_and_ctrl_s_submits(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        from textual.widgets import TextArea
+
+        from conductor.executor import questions as questions_mod
+
+        record = _write_record(tmp_path, "run-q2")
+        gate = _questions_gate(multiline=True)
+        post = _accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose(questions_mod.FREE_TEXT, gate)
+
+                assert isinstance(app.screen, tui_actions.GateInputModal)
+                editor = app.screen.query_one("#gate-input-editor", TextArea)
+                assert app.screen.focused is editor
+
+                await driver.type("line one")
+                await pilot.press("enter")
+                await pilot.pause()
+                await driver.type("line two")
+
+                assert isinstance(app.screen, tui_actions.GateInputModal), (
+                    "Enter in a multi-line editor must not dismiss it"
+                )
+                assert post.call_count == 0, "Enter in a multi-line editor must not respond"
+                assert editor.text == "line one\nline two"
+
+                await pilot.press("ctrl+s")
+                outcome = await driver.finished()
+
+        assert isinstance(outcome, tui_actions.GateResolveOutcome)
+        assert outcome.success is True
+        post.assert_called_once()
+        assert post.call_args.kwargs["json"]["additional_input"] == "line one\nline two"
+
+    async def test_ordinary_gate_choice_with_prompt_for_collects_text(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Not a questions-only defect: a plain ``human_gate`` option with
+        ``prompt_for: feedback`` lost its text the same way."""
+        record = _write_record(tmp_path, "run-g1")
+        gate = _gate_info(
+            agent_name="review_gate",
+            options=["approve", "revise"],
+            option_details=[
+                _detail("approve", "Approve"),
+                _detail("revise", "Request changes", prompt_for="feedback"),
+            ],
+        )
+        post = _accepted_post()
+        threads: list[threading.Thread] = []
+        post.side_effect = lambda *a, **k: (
+            threads.append(threading.current_thread()),
+            post.return_value,
+        )[1]
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose("revise", gate)
+
+                assert isinstance(app.screen, tui_actions.GateInputModal)
+                assert post.call_count == 0
+
+                await driver.type("tighten section 2")
+                await pilot.press("ctrl+s")
+                outcome = await driver.finished()
+
+        assert isinstance(outcome, tui_actions.GateResolveOutcome)
+        assert outcome.success is True
+        post.assert_called_once()
+        body = post.call_args.kwargs["json"]
+        assert body["selected_value"] == "revise"
+        assert body["additional_input"] == "tighten section 2"
+        # Still dispatched to a worker thread, never the UI thread.
+        assert threads and threads[0] is not threading.main_thread()
+
+    @pytest.mark.parametrize("typed", ["", "half an answ"], ids=["before-typing", "after-typing"])
+    @pytest.mark.parametrize("multiline", [False, True], ids=["single-line", "multiline"])
+    async def test_escape_in_the_editor_cancels_without_responding(
+        self, fleet_env: Path, tmp_path: Path, typed: str, multiline: bool
+    ) -> None:
+        from conductor.executor import questions as questions_mod
+
+        record = _write_record(tmp_path, "run-q3")
+        gate = _questions_gate(multiline=multiline)
+        post = _accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose(questions_mod.FREE_TEXT, gate)
+                assert isinstance(app.screen, tui_actions.GateInputModal)
+
+                if typed:
+                    await driver.type(typed)
+                await pilot.press("escape")
+                outcome = await driver.finished()
+
+                assert isinstance(app.screen, RunsScreen), (
+                    "cancelling must return to the Runs screen, not the options"
+                )
+
+        assert outcome is None
+        post.assert_not_called()
+
+    @pytest.mark.parametrize("submit_key", ["enter", "ctrl+s"])
+    async def test_confirmed_empty_input_is_submitted_not_cancelled(
+        self, fleet_env: Path, tmp_path: Path, submit_key: str
+    ) -> None:
+        """Confirming an empty entry is a submission -- distinct from
+        Escape -- and is left to the engine's own validation (a required
+        question re-presents with its rejection) rather than refused here."""
+        from conductor.executor import questions as questions_mod
+
+        record = _write_record(tmp_path, "run-q4")
+        gate = _questions_gate()
+        post = _accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose(questions_mod.FREE_TEXT, gate)
+                await pilot.press(submit_key)
+                outcome = await driver.finished()
+
+        assert isinstance(outcome, tui_actions.GateResolveOutcome)
+        post.assert_called_once()
+        assert post.call_args.kwargs["json"]["additional_input"] == ""
+
+    @pytest.mark.parametrize(
+        "value",
+        ["Widget", "__skip__", "__abort__"],
+        ids=["suggested-answer", "skip", "abort"],
+    )
+    async def test_choice_without_prompt_for_responds_immediately(
+        self, fleet_env: Path, tmp_path: Path, value: str
+    ) -> None:
+        record = _write_record(tmp_path, "run-q5")
+        gate = _questions_gate(suggested=("Widget", "Gadget"))
+        post = _accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose(value, gate)
+                outcome = await driver.finished()
+                assert not isinstance(app.screen, tui_actions.GateInputModal)
+
+        assert isinstance(outcome, tui_actions.GateResolveOutcome)
+        post.assert_called_once()
+        body = post.call_args.kwargs["json"]
+        assert body["selected_value"] == value
+        assert "additional_input" not in body
+
+    async def test_gate_without_option_details_keeps_select_and_submit(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """An older event carries no metadata; input requirements are never
+        inferred from a label or a reserved value."""
+        from conductor.executor import questions as questions_mod
+
+        record = _write_record(tmp_path, "run-q6")
+        gate = _gate_info(options=[questions_mod.FREE_TEXT, "no"], option_details=[])
+        post = _accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await settle(pilot)
+                driver = _GateDriver(pilot, app)
+                await driver.start(record, gate)
+                await driver.choose(questions_mod.FREE_TEXT, gate)
+                await driver.finished()
+
+        post.assert_called_once()
+        assert "additional_input" not in post.call_args.kwargs["json"]
+
+
+class TestGateInputRequest:
+    def test_prompt_for_metadata_drives_the_request(self) -> None:
+        gate = _gate_info(
+            options=["a", "b", "c", "d"],
+            option_details=[
+                _detail("a", "Alpha", prompt_for="answer", multiline=True),
+                _detail("b", prompt_for="feedback"),
+                _detail("c", prompt_for=""),
+                {"value": "d", "label": "Delta", "prompt_for": "note"},
+            ],
+        )
+        assert tui_actions.gate_input_request(gate, "a") == tui_actions.GateInputRequest(
+            label="Alpha", field="answer", multiline=True
+        )
+        assert tui_actions.gate_input_request(gate, "b") == tui_actions.GateInputRequest(
+            label="b", field="feedback", multiline=False
+        )
+        # An empty `prompt_for` asks for nothing.
+        assert tui_actions.gate_input_request(gate, "c") is None
+        # A missing `multiline` (an older event) means single-line.
+        request = tui_actions.gate_input_request(gate, "d")
+        assert request is not None and request.multiline is False
+        assert tui_actions.gate_input_request(gate, "absent") is None
+
+    def test_duplicate_values_use_the_first_detail(self) -> None:
+        """Matches `_option_label`'s first-match rule for duplicate values."""
+        gate = _gate_info(
+            options=["retry", "retry"],
+            option_details=[_detail("retry", prompt_for="why"), _detail("retry")],
+        )
+        request = tui_actions.gate_input_request(gate, "retry")
+        assert request is not None and request.field == "why"
+
+
+class TestGateInputModal:
+    """The editor itself: focus, layout at 80x24, markup safety."""
+
+    @staticmethod
+    def _long_gate(multiline: bool):
+        return _gate_info(
+            agent_name="ask",
+            prompt="\n".join(f"context line {i}" for i in range(400)),
+            options=["__free_text__"],
+            option_details=[
+                _detail(
+                    "__free_text__",
+                    "✎ Write your own",
+                    prompt_for="answer",
+                    multiline=multiline,
+                )
+            ],
+        )
+
+    @pytest.mark.parametrize("multiline", [False, True], ids=["single-line", "multiline"])
+    async def test_editor_holds_focus_on_mount(self, fleet_env: Path, multiline: bool) -> None:
+        from textual.widgets import Input, TextArea
+
+        gate = self._long_gate(multiline)
+        request = tui_actions.gate_input_request(gate, "__free_text__")
+        assert request is not None
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(tui_actions.GateInputModal(gate, request))
+            await settle(pilot)
+            focused = app.screen.focused
+            assert isinstance(focused, TextArea if multiline else Input)
+            assert focused.id == "gate-input-editor"
+
+    @pytest.mark.parametrize("label", ["✎ Write your own", "Request changes " * 15])
+    @pytest.mark.parametrize("multiline", [False, True], ids=["single-line", "multiline"])
+    async def test_editor_and_hint_stay_on_screen_with_a_long_prompt(
+        self, fleet_env: Path, multiline: bool, label: str
+    ) -> None:
+        from textual.widgets import Static
+
+        gate = self._long_gate(multiline)
+        gate.option_details[0]["label"] = label
+        request = tui_actions.gate_input_request(gate, "__free_text__")
+        assert request is not None
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(tui_actions.GateInputModal(gate, request))
+            await settle(pilot)
+
+            screen = app.screen
+            width, height = screen.size.width, screen.size.height
+            dialog = screen.query_one("#gate-input-modal")
+            assert dialog.region.bottom <= height and dialog.region.right <= width
+
+            for selector in ("#gate-input-heading", "#gate-input-editor", "#gate-input-hint"):
+                region = screen.query_one(selector).region
+                assert region.height > 0, f"{selector} collapsed"
+                assert dialog.content_region.contains_region(region), (
+                    f"{selector} pushed outside the dialog by a long prompt"
+                )
+            editor = screen.query_one("#gate-input-editor").region
+            assert editor.height >= (3 if multiline else 1)
+
+            hint = str(screen.query_one("#gate-input-hint", Static).render())
+            assert "esc cancel" in hint
+            assert "ctrl+↑/↓ scroll" in hint
+            assert ("ctrl+s submit" in hint) is multiline
+
+    @pytest.mark.parametrize("multiline", [False, True], ids=["single-line", "multiline"])
+    async def test_prompt_scroll_bindings_preserve_editor_focus_and_draft(
+        self, fleet_env: Path, multiline: bool
+    ) -> None:
+        from textual.containers import VerticalScroll
+        from textual.widgets import Input, TextArea
+
+        gate = self._long_gate(multiline)
+        request = tui_actions.gate_input_request(gate, "__free_text__")
+        assert request is not None
+        draft = "unfinished answer\nsecond line" if multiline else "unfinished answer"
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(tui_actions.GateInputModal(gate, request, draft=draft))
+            await settle(pilot)
+            editor = app.screen.query_one("#gate-input-editor", TextArea if multiline else Input)
+            scroll = app.screen.query_one("#gate-input-prompt-scroll", VerticalScroll)
+            for down, up in [
+                ("ctrl+down", "ctrl+up"),
+                ("ctrl+shift+down", "ctrl+shift+up"),
+            ]:
+                before = scroll.scroll_y
+                await pilot.press(down)
+                await pilot.pause()
+                after = scroll.scroll_y
+                assert after > before
+                await pilot.press(up)
+                await pilot.pause()
+                assert scroll.scroll_y < after
+                assert app.screen.focused is editor
+                assert (editor.text if isinstance(editor, TextArea) else editor.value) == draft
+
+    async def test_markup_like_label_field_and_prompt_render_literally(
+        self, fleet_env: Path
+    ) -> None:
+        from textual.widgets import Static
+
+        gate = _gate_info(
+            prompt="[/red]evil prompt[/bold]",
+            options=["x"],
+            option_details=[_detail("x", "[/red]evil label[/bold]", prompt_for="[b]field[/b]")],
+        )
+        request = tui_actions.gate_input_request(gate, "x")
+        assert request is not None
+
+        app = FleetApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(tui_actions.GateInputModal(gate, request))
+            await settle(pilot)
+            heading = str(app.screen.query_one("#gate-input-heading", Static).render())
+            prompt = str(app.screen.query_one("#gate-input-prompt", Static).render())
+
+        assert "[/red]evil label[/bold]" in heading
+        assert "[b]field[/b]" in heading
+        assert "[/red]evil prompt[/bold]" in prompt
+
+
+class TestResolveGateSyncInputText:
+    def test_input_text_is_forwarded_to_the_shared_implementation(self) -> None:
+        import conductor.cli.gate as gate_module
+
+        with patch.object(gate_module, "_gate_respond_impl") as impl:
+            tui_actions._resolve_gate_sync(8080, "__free_text__", "ask", "line 1\nline 2")
+        impl.assert_called_once_with(8080, "__free_text__", "ask", "line 1\nline 2", None)
+
+    def test_no_input_text_sends_none(self) -> None:
+        import conductor.cli.gate as gate_module
+
+        with patch.object(gate_module, "_gate_respond_impl") as impl:
+            tui_actions._resolve_gate_sync(8080, "yes", "reviewer")
+        impl.assert_called_once_with(8080, "yes", "reviewer", None, None)
 
 
 class TestDashboardOnWsl:

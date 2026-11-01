@@ -30,7 +30,7 @@ from conductor.config.schema import (
     WorkflowConfig,
     WorkflowDef,
 )
-from conductor.engine.workflow import WorkflowEngine
+from conductor.engine.workflow import AgentRealm, WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ConductorError, MaxIterationsError
 from conductor.providers.base import AgentOutput
@@ -1069,7 +1069,11 @@ class TestParallelGroupEvents:
         )
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
 
-        async def fail_usage_for_bad(agent: AgentDef, model: str | None) -> None:
+        async def fail_usage_for_bad(
+            agent: AgentDef, model: str | None, realm: AgentRealm | None = None
+        ) -> None:
+            # Requirement: the local failure-path test must not move pricing to a remote realm.
+            assert realm is None
             if agent.name == "bad":
                 raise RuntimeError("pricing failed")
 

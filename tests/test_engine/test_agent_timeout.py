@@ -458,8 +458,9 @@ class TestAgentTimeoutParallel:
         # Patch only slow_agent's execution to be slow
         original_get_executor = engine._get_executor_for_agent
 
-        async def patched_get_executor(agent):
-            executor = await original_get_executor(agent)
+        async def patched_get_executor(agent, realm=None):
+            assert realm is None  # Requirement: local timeout tests keep using the local provider.
+            executor = await original_get_executor(agent, realm)
             if agent.name == "slow_agent":
                 original_exec = executor.execute
 
@@ -528,8 +529,9 @@ class TestAgentTimeoutParallel:
 
         original_get_executor = engine._get_executor_for_agent
 
-        async def patched_get_executor(agent):
-            executor = await original_get_executor(agent)
+        async def patched_get_executor(agent, realm=None):
+            assert realm is None  # Requirement: local timeout tests keep using the local provider.
+            executor = await original_get_executor(agent, realm)
             if agent.name == "slow_agent":
                 original_exec = executor.execute
 
@@ -659,8 +661,9 @@ class TestAgentTimeoutForEach:
 
         original_get_executor = engine._get_executor_for_agent
 
-        async def patched_get_executor(agent):
-            executor = await original_get_executor(agent)
+        async def patched_get_executor(agent, realm=None):
+            assert realm is None  # Requirement: local timeout tests keep using the local provider.
+            executor = await original_get_executor(agent, realm)
             # for_each qualifies the per-iteration name ("processor[0]") before
             # resolving the executor, so match the base agent name by prefix.
             if agent.name.startswith("processor"):
@@ -738,8 +741,9 @@ class TestAgentTimeoutForEach:
 
         original_get_executor = engine._get_executor_for_agent
 
-        async def patched_get_executor(agent):
-            executor = await original_get_executor(agent)
+        async def patched_get_executor(agent, realm=None):
+            assert realm is None  # Requirement: local timeout tests keep using the local provider.
+            executor = await original_get_executor(agent, realm)
             # for_each qualifies the per-iteration name ("processor[0]") before
             # resolving the executor, so match the base agent name by prefix.
             if agent.name.startswith("processor"):
