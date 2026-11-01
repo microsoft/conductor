@@ -218,7 +218,7 @@ class ClaudeProvider(AgentProvider):
             base_url: Custom API endpoint (e.g. Databricks gateway URL).
                 If None, falls back to ANTHROPIC_BASE_URL env var then the
                 default Anthropic API endpoint.
-            model: Default model to use. Defaults to "claude-sonnet-5-5"
+            model: Default model to use. Defaults to "claude-sonnet-4-6"
                 (Anthropic retired the previous default, claude-3-5-sonnet-latest).
             temperature: Default temperature (0.0-1.0). SDK enforces range.
             max_tokens: Maximum output tokens. Defaults to 16384 when not
@@ -264,7 +264,7 @@ class ClaudeProvider(AgentProvider):
         if self._base_url is None and resolve_environment:
             self._base_url = os.environ.get("ANTHROPIC_BASE_URL")
         self._model_user_configured = model is not None
-        self._default_model = model or "claude-sonnet-5-5"
+        self._default_model = model or "claude-sonnet-4-6"
 
         # Validate and store temperature (enforce schema bounds at instantiation)
         if temperature is not None:

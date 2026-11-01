@@ -114,6 +114,62 @@ class TestModelMapping:
         assert DEFAULT_ANTHROPIC_MODEL != "claude-3-5-sonnet-latest"
         assert provider._default_model == DEFAULT_ANTHROPIC_MODEL
 
+    def test_default_model_sends_compatible_request_for_structured_output(self) -> None:
+        """The default model must not get a forced tool_choice that newer models reject.
+
+        Structured output goes through a ToolOutput tool; the emitted request must
+        not use extended thinking with a forced ``tool_choice`` and must name the
+        default model, so schema-bearing agents without a model keep working.
+        """
+        import asyncio
+        import json
+
+        from anthropic import AsyncAnthropic
+        from pydantic_ai.providers.anthropic import AnthropicProvider
+
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": DEFAULT_ANTHROPIC_MODEL,
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "final_result",
+                            "input": {"answer": "ok"},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        client = AsyncAnthropic(
+            api_key="test-key",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        model = AnthropicModel(
+            DEFAULT_ANTHROPIC_MODEL, provider=AnthropicProvider(anthropic_client=client)
+        )
+        agent_def = AgentDef(name="mapper", output={"answer": OutputField(type="string")})
+        pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="hi")
+
+        with pydantic_agent.override(model=model):
+            asyncio.run(pydantic_agent.run("hi"))
+
+        body = captured[0]
+        assert body["model"] == DEFAULT_ANTHROPIC_MODEL
+        assert "thinking" not in body
+        assert body["tool_choice"] == {"type": "any"}
+
 
 class TestOpenAIModelMapping:
     """Tests for resolving the OpenAI model identifier."""

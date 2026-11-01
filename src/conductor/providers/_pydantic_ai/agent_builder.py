@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Used when neither the agent nor the workflow sets a model. Anthropic retired
 # ``claude-3-5-sonnet-latest``, the previous default, so requests without an
 # explicit model failed.
-DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-5-5"
+DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
 _FINAL_RESULT_TOOL_DESCRIPTION: Final[str] = (
     "Call this tool to return the final structured result and end the conversation. "
     "You must call this tool before finishing; plain text responses are not accepted."
