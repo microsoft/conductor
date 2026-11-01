@@ -434,25 +434,27 @@ jobs:
     timeout-minutes: 30
     env:
       CONDUCTOR_TEST_RUNNER_IMAGE: conductor-agent-realm:ci
-      RUNNER_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      RUNNER_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
-      RUNNER_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      # Install the commit the host tests run on: for a pull request that is
+      # GitHub's merge commit (refs/pull/N/merge), not the PR head. Pinning the
+      # head made every PR branched before a runner-protocol change fail here,
+      # because the image held the old bridge while the host expected the new
+      # one. The merge commit lives in the base repository (also for forks) and
+      # stays fetchable by SHA even after GitHub recomputes the merge ref.
+      RUNNER_SHA: ${{ github.sha }}
+      RUNNER_REPOSITORY: ${{ github.repository }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Verify runner source is fetchable
-        # The image must install the PR head from its actual repository, not
-        # the checkout merge commit or an unrelated upstream branch.
+      - name: Verify runner source is the tested commit
+        # The image must install exactly the code the host tests check out, via
+        # the same git+https fetch the Dockerfile's pip install performs.
         run: |
           runner_url="https://github.com/$RUNNER_REPOSITORY.git"
-          if ! remote_head=$(git ls-remote "$runner_url" "refs/heads/$RUNNER_BRANCH" | cut -f1); then
-            echo "Runner source unavailable: cannot query $RUNNER_BRANCH on $RUNNER_REPOSITORY" >&2
-            exit 1
-          fi
-          if [ "$remote_head" != "$RUNNER_SHA" ]; then
-            echo "Runner source unavailable: $RUNNER_SHA is not the fetchable head of $RUNNER_BRANCH on $RUNNER_REPOSITORY" >&2
+          checked_out=$(git rev-parse HEAD)
+          if [ "$checked_out" != "$RUNNER_SHA" ]; then
+            echo "Runner source mismatch: checkout is $checked_out but the image would install $RUNNER_SHA" >&2
             exit 1
           fi
           if ! git fetch --no-tags "$runner_url" "$RUNNER_SHA"; then
@@ -477,7 +479,7 @@ jobs:
         # the per-test pull off the lane's runtime and fails fast on a bad pin.
         run: docker pull busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
 
-      - name: Build runner image from pushed PR head
+      - name: Build runner image from the tested commit
         run: |
           docker build \
             --build-arg CONDUCTOR_REPOSITORY="https://github.com/$RUNNER_REPOSITORY.git" \
