@@ -130,6 +130,17 @@ records, and retention are in [CLI and runs](cli-and-runs.md); user-facing behav
 - `RunSummary.gate_resolvable` is computed once in `src/conductor/fleet/summary.py` (true iff the
   record has a dashboard port). A gate on a plain foreground (`fg`) run is displayed but cannot be
   resolved from the TUI; screens read the flag rather than re-deriving it from `mode`.
+- Collect before submit (#620): `src/conductor/fleet/tui/actions.py::resolve_gate` MUST NOT post
+  a choice whose `option_details` entry declares a nonempty `prompt_for` until
+  `GateInputModal` returns confirmed text, which is forwarded verbatim as `_gate_respond_impl`'s
+  `input_text` (the engine maps it onto the declared field). Escape there returns `None` with no
+  worker started, so the Runs screen neither notifies success nor reaches `_await_next_gate`.
+  Cancellation is `is None`; a confirmed empty string is a submission left to engine validation.
+  Input requirements come only from that metadata, NEVER from a label or a reserved value such as
+  `__free_text__`; `GateOptionsModal` still dismisses with the bare choice value
+  (`tests/test_fleet/test_tui_actions.py::TestGateInputCollection`,
+  `tests/test_fleet/test_tui_runs.py::TestChainedGateResolution`,
+  `tests/test_engine/test_workflow.py::TestWorkflowEngineHumanGates::test_human_gate_web_response_nests_additional_input`).
 
 ### Event-log derived state
 
@@ -182,11 +193,14 @@ records, and retention are in [CLI and runs](cli-and-runs.md); user-facing behav
   `pilot.pause()` only turns the loop once and may land before the thread hop. Its leading
   `pause()` is load-bearing. Use `wait_for(pilot, predicate, message=...)` instead of fixed sleeps
   for anything timer-driven.
-- A test that presses a key opening a modal (kill confirm, gate options), or that suspends a
-  worker on a `threading.Event`, and then needs a second keypress, MUST use a plain
+- A test that presses a key opening a modal (kill confirm, gate options, gate input), or that
+  suspends a worker on a `threading.Event`, and then needs a second keypress, MUST use a plain
   `await pilot.pause()` between the two, NEVER `settle`: `settle` awaits
   `app.workers.wait_for_complete()`, which cannot finish until the second keypress. `settle` is
-  bounded at 30 s so the mistake fails instead of hanging the run, but the test still fails.
+  bounded at 30 s so the mistake fails instead of hanging the run, but the test still fails. A
+  gate choice with `prompt_for` chains two modals in one worker (options, then the input editor),
+  so every step from `g` until the editor is confirmed or cancelled needs `pilot.pause()` or
+  `wait_for`, not `settle`.
 
 ## Change checklist
 
