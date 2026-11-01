@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -148,8 +149,17 @@ def main() -> int:
             return 1
         name = _option(argv, "--name")
         assert name is not None
+        mount = next(
+            (
+                argv[index + 1]
+                for index, flag in enumerate(argv[:-1])
+                if flag == "-v" and argv[index + 1].endswith(":/workspace")
+            ),
+            None,
+        )
         state["containers"][name] = {
             "Name": f"/{name}",
+            "Volume": mount.rsplit(":", 1)[0] if mount else None,
             "Config": {"Labels": _labels(argv)},
             "State": {"ExitCode": int(os.environ.get("FAKE_DOCKER_EXIT_CODE", "0"))},
         }
@@ -160,6 +170,25 @@ def main() -> int:
         if scenario == "cpfail":
             print("copy failed", file=sys.stderr)
             return 1
+        # Remember the staging marker per volume so the backend's marker probe
+        # (docker cp <scratch>:/workspace/.conductor-staged) sees what was staged.
+        marker_path = ":/workspace/.conductor-staged"
+        markers = state.setdefault("markers", {})
+        if argv[-1].endswith(marker_path):
+            container = state["containers"].get(argv[-1][: -len(marker_path)], {})
+            if container.get("Volume"):
+                markers[container["Volume"]] = Path(argv[-2]).read_text(encoding="utf-8")
+                _save(state_path, state)
+        elif argv[1].endswith(marker_path):
+            name = argv[1][: -len(marker_path)]
+            marker = markers.get(state["containers"].get(name, {}).get("Volume"))
+            if marker is None:
+                print(
+                    f"Could not find the file /workspace/.conductor-staged in container {name}",
+                    file=sys.stderr,
+                )
+                return 1
+            Path(argv[2]).write_text(marker, encoding="utf-8")
         return 0
     if argv and argv[0] == "start":
         if scenario == "startfail":
@@ -172,6 +201,66 @@ def main() -> int:
         sys.stdout.buffer.write(os.environ.get("FAKE_DOCKER_STDOUT", "command output").encode())
         sys.stderr.buffer.write(os.environ.get("FAKE_DOCKER_STDERR", "").encode())
         return int(os.environ.get("FAKE_DOCKER_START_RC", "0"))
+    if argv and argv[0] == "exec":
+        if "--health" in argv:
+            if scenario == "realm-no-bridge":
+                print("python: No module named conductor.runner.bridge", file=sys.stderr)
+                return 1
+            if scenario == "realm-daemon-error":
+                print("Cannot connect to the Docker daemon", file=sys.stderr)
+                return 1
+            features = os.environ.get("FAKE_DOCKER_FEATURES", "interrupt")
+            print(
+                json.dumps(
+                    {
+                        "ready": True,
+                        "protocol_version": int(
+                            os.environ.get("FAKE_DOCKER_PROTOCOL_VERSION", "2")
+                        ),
+                        "features": features.split(",") if features else [],
+                    }
+                )
+            )
+            return 0
+        if "--interrupt" in argv:
+            release_port = os.environ.get("FAKE_DOCKER_RELEASE_PORT")
+            if release_port:
+                with socket.create_connection(("127.0.0.1", int(release_port))) as release:
+                    release.sendall(b"I")
+            print('{"accepted":true}')
+            return 0
+        request = json.loads(stdin)
+        if scenario == "realm-malformed":
+            sys.stdout.buffer.write(b"{not-json}\n")
+            sys.stdout.buffer.flush()
+            return 0
+        if scenario == "realm-error":
+            sys.stdout.buffer.write(
+                json.dumps({"type": "error", "data": {"message": "secret-overlay"}}).encode()
+                + b"\n"
+            )
+            sys.stdout.buffer.flush()
+            return 0
+        event = {"type": "agent_message", "data": {"text": "streamed"}}
+        sys.stdout.buffer.write(json.dumps(event).encode() + b"\n")
+        sys.stdout.buffer.flush()
+        if scenario == "realm-truncated":
+            return 0
+        release_port = os.environ.get("FAKE_DOCKER_RELEASE_PORT")
+        release_byte = b""
+        if release_port:
+            with socket.create_connection(("127.0.0.1", int(release_port))) as release:
+                release_byte = release.recv(1)
+        result = {
+            "type": "result",
+            "data": {
+                "content": {"answer": request["agent"]["name"]},
+                "partial": release_byte == b"I",
+            },
+        }
+        sys.stdout.buffer.write(json.dumps(result).encode() + b"\n")
+        sys.stdout.buffer.flush()
+        return 0
     if argv and argv[0] == "inspect":
         name = argv[-1]
         data = state["containers"].get(name)

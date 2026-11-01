@@ -29,7 +29,44 @@ from conductor.exceptions import (
 )
 from conductor.executor.agent import AgentExecutor, resolve_agent_tools
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider
+
+
+def test_realm_spec_uses_effective_claude_sampling_settings() -> None:
+    # Requirement: remote agent specs inherit the values used by the host provider.
+    provider = ClaudeProvider(api_key="test-key", temperature=0.41, max_tokens=2048)
+    spec = AgentExecutor(provider).build_realm_spec(
+        AgentDef(
+            name="remote",
+            prompt="task",
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        ),
+        "task",
+        {},
+    )
+    assert spec.temperature == 0.41
+    assert spec.max_tokens == 2048
+
+
+def test_realm_spec_uses_effective_copilot_temperature() -> None:
+    # Requirement: a remote Copilot agent uses the host's configured temperature.
+    provider = CopilotProvider(mock_handler=lambda *_: {}, temperature=0.35)
+    spec = AgentExecutor(provider).build_realm_spec(
+        AgentDef(
+            name="remote",
+            prompt="task",
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        ),
+        "task",
+        {},
+    )
+    assert spec.temperature == 0.35
+    assert spec.max_tokens is None
 
 
 @pytest.fixture

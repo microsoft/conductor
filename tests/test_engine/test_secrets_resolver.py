@@ -71,7 +71,9 @@ _SECRET_SCRIPT = "task4-script-value"
 _SECRET_MCP = "task4-mcp-value-0123456789"
 
 
-def _binding(env_var: str, allow: list[Literal["script", "mcp"]] | None = None) -> SecretBinding:
+def _binding(
+    env_var: str, allow: list[Literal["script", "mcp", "agent"]] | None = None
+) -> SecretBinding:
     """Build a secret binding resolving from one environment variable."""
     return SecretBinding(source=SecretBindingSource(env=env_var), allow=allow)
 
@@ -227,6 +229,17 @@ class TestResolve:
         # Requirement: allow=["mcp"] passes an mcp consumer.
         secret = script_cache.resolve("mcp_token", "mcp", "MCP server 'docs'")
         assert secret.value == _SECRET_MCP
+
+    def test_agent_only_binding_rechecks_other_scopes_on_cache_hit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: agent-only bindings resolve for agents but deny script and MCP, even cached.
+        monkeypatch.setenv(_VAR_SCRIPT, _SECRET_SCRIPT)
+        cache = _authored_cache({"token": _binding(_VAR_SCRIPT, allow=["agent"])})
+        assert cache.resolve("token", "agent", "step 'worker'").value == _SECRET_SCRIPT
+        for scope in ("script", "mcp"):
+            with pytest.raises(ConfigurationError, match="allows only: agent"):
+                cache.resolve("token", scope, f"consumer {scope}")
 
     def test_allow_checked_on_every_resolve_even_cache_hit(
         self, script_cache: SecretValueCache
