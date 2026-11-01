@@ -15,12 +15,15 @@ Local development: push the branch first, then build the base image with::
     docker build --build-arg CONDUCTOR_VERSION=<pushed-sha> \
       -t conductor-agent-realm:ci docker/aca-runner
 
-For a fork, also pass `--build-arg CONDUCTOR_REPOSITORY=https://github.com/<owner>/conductor.git`
-so the image installs the same commit that the CI job verifies.
+For a fork, also pass `--build-arg CONDUCTOR_REPOSITORY=https://github.com/<owner>/conductor.git`.
+The image must hold the same commit the host runs: a runner built from an older
+commit fails the runner protocol check once ``main`` has changed it.
 
 Set
 ``CONDUCTOR_TEST_RUNNER_IMAGE=conductor-agent-realm:ci`` before running this module. The
-CI lane uses the pushed PR head SHA, never GitHub's synthetic merge commit.
+CI lane installs the commit it checked out (``github.sha``), which for a pull request is
+GitHub's merge commit in the base repository, so the image matches the tested code even
+when the PR branch predates a change on ``main``.
 For an unpublished checkout, omit CONDUCTOR_TEST_RUNNER_IMAGE; the fixture
 builds fixtures/runner_image/Dockerfile.local with ``pip install /src`` from
 this checkout. That local variant does not prove the git-ref CI lane.
