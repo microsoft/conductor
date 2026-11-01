@@ -114,10 +114,11 @@ RUN apt-get update \
 RUN npm install -g --no-fund --no-audit @cyanheads/git-mcp-server@2.15.1
 
 ARG CONDUCTOR_VERSION
+ARG CONDUCTOR_REPOSITORY=https://github.com/microsoft/conductor.git
 # The runner ships in-package with conductor-cli (epic E4 decision — no
 # separate runner package to install).
 RUN pip install --no-cache-dir \
-    "conductor-cli @ git+https://github.com/microsoft/conductor.git@${CONDUCTOR_VERSION}"
+    "conductor-cli @ git+${CONDUCTOR_REPOSITORY}@${CONDUCTOR_VERSION}"
 
 ARG TARGET_PORT
 # Issue #396: the runner binds loopback (127.0.0.1) by default now — this

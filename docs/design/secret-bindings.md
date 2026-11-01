@@ -115,7 +115,7 @@ workflow:
 - **Scope Dictionary**:
   - `script`: Valid on script steps. Delivery must be `env`.
   - `mcp`: Valid on MCP servers. Stdio servers require `env` delivery; HTTP/SSE servers support `env` and `header` deliveries, subject to the provider restrictions below.
-  - `agent`: Reserved for future agent execution realms (step 7). Declaring `scope: agent` is rejected at validation and manifest compilation time.
+  - `agent`: Allowed on remote agent steps with a declared stdio MCP server or an enabled MCP plugin that might provide one, and on stdio MCP servers with only remote agent consumers. The static check does not resolve plugin contents; if an enabled plugin ships no stdio server, the runner rejects the undeliverable overlay. `delivery.env` is delivered per call through `env_overlay` to the spawn environment of stdio MCP processes inside the realm, never to the model SDK environment. A remote agent with no possible stdio consumer (including `tools: []`) is rejected statically. Local agents inherit the control environment and do not support scoped agent delivery. The MCP child process environment remains readable to subjects authorized to inspect its `/proc/<pid>/environ`.
 
 ### Transport and Provider Restrictions
 
@@ -170,6 +170,7 @@ The `SecretBindingSource` model uses an explicit source kind pattern. While v1 e
 4. **Step & MCP Delivery**:
    - `ScriptExecutor` merges secret environment variables into the subprocess command environment.
    - `resolve_mcp_server_config` injects resolved secret environment variables and HTTP headers into the MCP client configuration.
+   - Remote agent-scoped uses are indexed per step and passed in `env_overlay` to in-realm stdio MCP subprocesses; MCP-server agent-scoped uses are not merged into the host MCP client configuration.
 5. **Finalization & Cleanup**:
    - When execution finishes, the engine and CLI finalization blocks clear the cache and reset the active redactor context.
 

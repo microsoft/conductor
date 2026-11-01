@@ -88,6 +88,8 @@ def _resolve_openai_model(
     base_url: str | None = None,
     http_client: httpx.AsyncClient | None = None,
     timeout: float | None = None,
+    *,
+    resolve_environment: bool = True,
 ) -> OpenAIChatModel:
     """Build a Pydantic AI ``OpenAIChatModel`` from the agent definition.
 
@@ -106,6 +108,7 @@ def _resolve_openai_model(
         http_client: Optional ``httpx.AsyncClient`` to share across requests.
         timeout: Request timeout in seconds. ``None`` lets the OpenAI SDK apply
             its own default.
+        resolve_environment: Allow ambient credentials and endpoint fallback.
 
     Returns:
         A configured Pydantic AI ``OpenAIChatModel`` instance.
@@ -114,7 +117,9 @@ def _resolve_openai_model(
         ValidationError: If no API key is available, or if a custom base_url is
             provided without an explicit api_key.
     """
-    effective_api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
+    effective_api_key = api_key
+    if effective_api_key is None and resolve_environment:
+        effective_api_key = os.environ.get("OPENAI_API_KEY")
 
     if base_url is not None and api_key is None:
         raise ValidationError(
@@ -132,7 +137,7 @@ def _resolve_openai_model(
 
     openai_client = AsyncOpenAI(
         api_key=effective_api_key,
-        base_url=base_url,
+        base_url=base_url if resolve_environment else base_url or "https://api.openai.com/v1",
         timeout=timeout,
         max_retries=0,
         http_client=http_client,
@@ -148,6 +153,8 @@ def _resolve_anthropic_model(
     base_url: str | None = None,
     auth_token: str | None = None,
     timeout: float | None = None,
+    *,
+    resolve_environment: bool = True,
 ) -> AnthropicModel:
     """Build a Pydantic AI ``AnthropicModel`` from the agent definition.
 
@@ -168,6 +175,7 @@ def _resolve_anthropic_model(
             when no credential is passed explicitly.
         timeout: Request timeout in seconds. ``None`` lets the Anthropic SDK
             apply its own default.
+        resolve_environment: Allow ambient credentials and endpoint fallback.
 
     Returns:
         A configured Pydantic AI ``AnthropicModel`` instance.
@@ -181,7 +189,7 @@ def _resolve_anthropic_model(
     # credential — otherwise e.g. a YAML auth_token plus an ambient
     # ANTHROPIC_API_KEY would send both headers to whatever base_url points
     # at, leaking the user's Anthropic key to a gateway.
-    if api_key is not None or auth_token is not None:
+    if not resolve_environment or api_key is not None or auth_token is not None:
         effective_api_key = api_key
         effective_auth_token = auth_token
     else:
@@ -208,9 +216,9 @@ def _resolve_anthropic_model(
     # Disable transport-level retries; Conductor's execute_with_retry is the
     # only retry layer allowed by the provider plan (Must-NOT-Have double retry).
     anthropic_client = AsyncAnthropic(
-        api_key=effective_api_key,
-        auth_token=effective_auth_token,
-        base_url=base_url,
+        api_key=effective_api_key if resolve_environment else effective_api_key or "",
+        auth_token=effective_auth_token if resolve_environment else effective_auth_token or "",
+        base_url=base_url if resolve_environment else base_url or "https://api.anthropic.com",
         timeout=timeout if timeout is not None else ANTHROPIC_NOT_GIVEN,
         max_retries=0,
     )
@@ -539,6 +547,8 @@ def build_agent(
     backend: Literal["anthropic", "openai"] = "anthropic",
     http_client: httpx.AsyncClient | None = None,
     compaction: CompactionConfig | None = None,
+    *,
+    resolve_environment: bool = True,
 ) -> Agent[Any, Any]:
     """Build a Pydantic AI Agent from a Conductor agent definition.
 
@@ -566,6 +576,7 @@ def build_agent(
             (openai backend only).
         compaction: Optional resolved compaction config. When provided, a
             tiered compaction capability is attached to the agent.
+        resolve_environment: Allow ambient credentials and endpoint fallback.
 
     Returns:
         A configured Pydantic AI ``Agent`` ready to run.
@@ -578,6 +589,7 @@ def build_agent(
             base_url,
             http_client=http_client,
             timeout=timeout,
+            resolve_environment=resolve_environment,
         )
         model_settings = _build_openai_model_settings(
             agent,
@@ -589,7 +601,13 @@ def build_agent(
         )
     else:
         model = _resolve_anthropic_model(
-            agent, default_model, api_key, base_url, auth_token=auth_token, timeout=timeout
+            agent,
+            default_model,
+            api_key,
+            base_url,
+            auth_token=auth_token,
+            timeout=timeout,
+            resolve_environment=resolve_environment,
         )
         model_settings = _build_anthropic_model_settings(
             agent,
