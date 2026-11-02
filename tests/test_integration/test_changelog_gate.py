@@ -161,6 +161,26 @@ class GateRepo:
         self._git("add", "-A")
         self._git("commit", "-qm", message)
 
+    def check_out_pr_merge_then_release(self, version: str) -> None:
+        """Check out a GitHub-style PR merge commit, then move ``main`` past it.
+
+        Mirrors a fork PR whose CI was approved after a release landed: the
+        re-run checks out the original merge commit while ``main`` (and so a
+        freshly fetched ``origin/main``) already carries the version bump.
+        """
+        self._git("checkout", "-q", "--detach", "main")
+        self._git("merge", "-q", "--no-ff", "pr", "-m", "Merge pr into main")
+        merge_commit = self._head()
+        self._git("checkout", "-q", "main")
+        self.write("pyproject.toml", _pyproject_text(version))
+        self.commit_all(f"release {version}")
+        self._git("checkout", "-q", merge_commit)
+
+    def _head(self) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
     def prepare_release(self, version: str, *, lock_version: str | None = None) -> None:
         """Put the branch into a valid release-prep shape for ``version``."""
         self.write("pyproject.toml", _pyproject_text(version))
@@ -180,15 +200,24 @@ def run_gate(
     labels: tuple[str, ...] = (),
     *,
     author_login: str = "",
+    github_ref: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run the gate. ``github_ref`` mimics Actions: the base comes from the
+    checkout instead of the ``CHANGELOG_BASE=main`` override."""
     scratch = repo.root / ".gate-tmp"
     scratch.mkdir(exist_ok=True)
     env = dict(os.environ)
     env["PR_LABELS"] = json.dumps(list(labels))
     env["PR_AUTHOR_LOGIN"] = author_login
-    env["CHANGELOG_BASE"] = "main"
     env["RUNNER_TEMP"] = str(scratch)
-    env.pop("BASE_REF", None)
+    env.pop("GITHUB_REF", None)
+    if github_ref is None:
+        env["CHANGELOG_BASE"] = "main"
+        env.pop("BASE_REF", None)
+    else:
+        env.pop("CHANGELOG_BASE", None)
+        env["BASE_REF"] = "main"
+        env["GITHUB_REF"] = github_ref
     return subprocess.run(
         ["bash", str(GATE_SCRIPT)],
         cwd=repo.root,
@@ -392,6 +421,30 @@ class TestFeatureMode:
         proc = run_gate(repo, labels=(EXEMPTION_LABEL,))
         assert_passed(proc)
         assert "No changes under changelog.d/" in proc.stdout
+
+
+class TestPullRequestMergeCheckout:
+    def test_rerun_after_base_moved_compares_with_the_merge_parent(
+        self, repo: GateRepo, uv_tools: None
+    ) -> None:
+        # Regression: #621's Changelog check re-ran on its original merge
+        # commit after the 0.1.44 release landed; comparing that with the live
+        # main read the release's version bump as the PR's own and demanded a
+        # compiled CHANGELOG.md.
+        repo.write("changelog.d/+feature.fixed.md", "Fix a thing.\n")
+        repo.commit_all()
+        repo.check_out_pr_merge_then_release("0.1.38")
+        assert_passed(run_gate(repo, github_ref="refs/pull/7/merge"))
+        assert_failed(run_gate(repo), "CHANGELOG.md is not changed")
+
+    def test_merge_ref_without_a_merge_commit_fails_clearly(self, repo: GateRepo) -> None:
+        # Requirement: a pull request merge ref must check out a two-parent
+        # merge commit; anything else would silently pick the wrong base.
+        repo.write("changelog.d/+feature.fixed.md", "Fix a thing.\n")
+        repo.commit_all()
+        assert_failed(
+            run_gate(repo, github_ref="refs/pull/7/merge"), "is not a two-parent merge commit"
+        )
 
 
 class TestReleaseMode:
