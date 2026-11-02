@@ -11,6 +11,46 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.44] - 2026-11-01
+
+### Added
+
+- **Agent execution realms and profiles**: run LLM agents in isolated Docker
+  containers or Azure Container Apps dynamic sessions via `execution.profile`.
+  Docker profiles accept `runner_image` to execute the agent loop, stdio MCP
+  tools, and staged workspace dependencies colocated in a long-lived runner
+  container. Remote runners support `/interrupt` for targeted mid-turn pauses,
+  multi-provider execution (Copilot, OpenAI, Claude), and per-call agent-scope
+  secret delivery (`env_overlay`) to stdio MCP processes without leaking into
+  the runner process environment.
+
+  Host-resolved credentials and endpoints stay authoritative inside the
+  runner. Docker interrupt delivery remains monitored through transport
+  shutdown, and a racing completion preserves its result. Retained Docker
+  workspaces record agent dispatch so resume refuses a missing staging
+  marker rather than overwriting agent-written files.
+
+  **ACA execution profiles**: configure the pool and session scope under an
+  environment profile's `aca` block, independently of the agent's model
+  provider. The legacy `provider: aca` form remains available with a
+  deprecation notice. (#598)
+
+### Fixed
+
+- **Fleet TUI gate text entry**: choosing **✎ Write your own** on a
+  `questions` step, or any gate option that declares `prompt_for`, now opens
+  an editor in the Fleet Manager and responds only once the text is
+  confirmed (`enter` for single-line, `ctrl+s` for multi-line). Previously
+  the selection was sent immediately with no text, advancing the question
+  unanswered. Pressing `esc` in the editor sends nothing and leaves the
+  question pending; `g` reopens it. (#620)
+
+### Removed
+
+- The obsolete `conductor.providers.aca_protocol` module has been removed;
+  import runner wire models from `conductor.runner.protocol` instead. (#598)
+
+
 ## [0.1.43] - 2026-10-29
 
 ### Added
