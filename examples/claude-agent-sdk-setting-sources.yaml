@@ -53,7 +53,7 @@ workflow:
       # "trust this repository as much as the workflow" bar the tier above
       # already sets.
       native_tools: claude_code
-    default_model: claude-sonnet-5-5
+    default_model: claude-sonnet-4-6
 
   input:
     repo:

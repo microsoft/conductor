@@ -52,9 +52,9 @@ workflow:
       # Explicit opt-in to the built-in Claude Code tools. Without it an agent
       # that omits `tools:` gets none, and could not read README.md.
       native_tools: claude_code
-    # claude-sonnet-5-5 is a current Sonnet model; adjust to whatever
+    # claude-sonnet-4-6 is a current Sonnet model; adjust to whatever
     # your Claude Code backend (anthropic.com / Vertex AI / Bedrock) expects.
-    default_model: claude-sonnet-5-5
+    default_model: claude-sonnet-4-6
 
   input:
     question:
