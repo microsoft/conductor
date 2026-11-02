@@ -16,9 +16,11 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError, ValidationError
+from conductor.executor.template import TemplateRenderer
 from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
@@ -576,6 +578,17 @@ class CopilotProvider(AgentProvider):
         Raises:
             ProviderError: If execution fails after all retry attempts.
         """
+        if agent.working_dir is not None:
+            rendered_directory = TemplateRenderer().render(agent.working_dir, context)
+            if not rendered_directory.strip():
+                raise ValidationError(f"Agent '{agent.name}' working_dir must not be empty")
+            directory = Path(os.path.abspath(Path(rendered_directory).expanduser()))
+            if not directory.is_dir():
+                raise ValidationError(
+                    f"Agent '{agent.name}' working_dir is not an existing directory: {directory}"
+                )
+            agent = agent.model_copy(update={"working_dir": str(directory)})
+
         # Record the call for testing purposes
         self._call_history.append(
             {
@@ -874,7 +887,7 @@ class CopilotProvider(AgentProvider):
             session_kwargs: dict[str, Any] = {
                 "model": model,
                 "on_permission_request": self._default_permission_handler,
-                "working_directory": os.getcwd(),
+                "working_directory": agent.working_dir or os.getcwd(),
                 "streaming": True,
             }
             if agent.excluded_tools:

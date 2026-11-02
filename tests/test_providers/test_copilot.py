@@ -1,12 +1,12 @@
 """Unit tests for the CopilotProvider implementation."""
 
 import contextlib
+from pathlib import Path
 from typing import Any
 
 import pytest
-
 from conductor.config.schema import AgentDef
-from conductor.exceptions import ProviderError
+from conductor.exceptions import ProviderError, TemplateError, ValidationError
 from conductor.providers.copilot import CopilotProvider, RetryConfig, SDKResponse
 
 
@@ -1674,3 +1674,123 @@ class TestSkillDirectoriesPlumbing:
         agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
         assert "skill_directories" not in captured["create_session_kwargs"]
+
+
+class TestWorkingDirectoryPlumbing:
+    """Tests for resolving agent working directories at the Copilot SDK boundary."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path_kind",
+        ["default", "absolute", "relative", "template-absolute", "template-relative", "home"],
+    )
+    async def test_working_directory_forwarded_to_create_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_kind: str
+    ) -> None:
+        engine_root = tmp_path / "engine"
+        engine_root.mkdir()
+        vp_root = tmp_path / "VP checkout"
+        vp_root.mkdir()
+        monkeypatch.chdir(engine_root)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        invocation_root = Path.cwd()
+        relative_vp_root = str(Path("..") / vp_root.name)
+        working_dirs = {
+            "default": None,
+            "absolute": str(vp_root),
+            "relative": relative_vp_root,
+            "template-absolute": "{{ workflow.input.vp_root }}",
+            "template-relative": "{{ workflow.input.vp_root }}",
+            "home": "~/VP checkout",
+        }
+        context = {
+            "workflow": {
+                "input": {
+                    "vp_root": (
+                        relative_vp_root if path_kind == "template-relative" else str(vp_root)
+                    )
+                }
+            }
+        }
+        agent = AgentDef.model_validate(
+            {
+                "name": "worker",
+                "model": "gpt-4o",
+                "prompt": "Work",
+                "working_dir": working_dirs[path_kind],
+            }
+        )
+        original_agent = agent.model_dump()
+        captured: dict[str, Any] = {}
+        provider = await TestSkillDirectoriesPlumbing._build_provider(captured, monkeypatch)
+
+        await provider.execute(agent=agent, context=context, rendered_prompt="Work")
+
+        expected_directory = invocation_root if path_kind == "default" else vp_root
+        assert captured["create_session_kwargs"]["working_directory"] == str(expected_directory)
+        assert agent.model_dump() == original_agent
+        assert Path.cwd() == invocation_root
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path_kind", ["empty", "whitespace", "rendered-empty", "missing", "file"]
+    )
+    async def test_invalid_working_directory_rejected_before_session_creation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_kind: str
+    ) -> None:
+        ordinary_file = tmp_path / "not-a-directory"
+        ordinary_file.touch()
+        working_dirs = {
+            "empty": "",
+            "whitespace": "   ",
+            "rendered-empty": "{{ workflow.input.vp_root }}",
+            "missing": str(tmp_path / "missing"),
+            "file": str(ordinary_file),
+        }
+        agent = AgentDef.model_validate(
+            {
+                "name": "worker",
+                "model": "gpt-4o",
+                "prompt": "Work",
+                "working_dir": working_dirs[path_kind],
+            }
+        )
+        captured: dict[str, Any] = {}
+        provider = await TestSkillDirectoriesPlumbing._build_provider(captured, monkeypatch)
+        invocation_root = Path.cwd()
+
+        with pytest.raises(ValidationError, match="Agent 'worker' working_dir"):
+            await provider.execute(
+                agent=agent,
+                context={"workflow": {"input": {"vp_root": ""}}},
+                rendered_prompt="Work",
+            )
+
+        assert "create_session_kwargs" not in captured
+        assert provider.get_call_history() == []
+        assert agent.working_dir == working_dirs[path_kind]
+        assert Path.cwd() == invocation_root
+
+    @pytest.mark.asyncio
+    async def test_undefined_working_directory_template_rejected_before_session_creation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = AgentDef.model_validate(
+            {
+                "name": "worker",
+                "model": "gpt-4o",
+                "prompt": "Work",
+                "working_dir": "{{ workflow.input.vp_root }}",
+            }
+        )
+        captured: dict[str, Any] = {}
+        provider = await TestSkillDirectoriesPlumbing._build_provider(captured, monkeypatch)
+
+        with pytest.raises(TemplateError):
+            await provider.execute(
+                agent=agent, context={"workflow": {"input": {}}}, rendered_prompt="Work"
+            )
+
+        assert "create_session_kwargs" not in captured
+        assert provider.get_call_history() == []
