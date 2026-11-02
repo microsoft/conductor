@@ -466,3 +466,26 @@ class TestClaudeAgentSdkExamplesNativeTools:
                 on_provider.add(path.name)
 
         assert on_provider == set(self._INTENDED)
+
+
+class TestClaudeExampleModels:
+    """Examples that run on a Claude provider must not pin a retired model."""
+
+    _EXAMPLES = Path(__file__).parent.parent.parent / "examples"
+    _RETIRED = "claude-sonnet-4-5"
+
+    def test_claude_provider_examples_do_not_pin_retired_model(self) -> None:
+        pinned = []
+        for path in sorted(self._EXAMPLES.glob("*.yaml")):
+            try:
+                config = load_config(path)
+            except Exception:
+                continue
+            if config.workflow.runtime.provider.name not in ("claude", "claude-agent-sdk"):
+                continue
+            models = [config.workflow.runtime.default_model]
+            models += [getattr(a, "model", None) for a in config.agents]
+            if self._RETIRED in models:
+                pinned.append(path.name)
+
+        assert pinned == []

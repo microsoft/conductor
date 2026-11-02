@@ -28,7 +28,7 @@ workflow:
       name: claude
       base_url: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
       api_key: ${ANTHROPIC_API_KEY:-placeholder-key}
-    default_model: claude-sonnet-4-5
+    default_model: claude-sonnet-5-5
 
   input:
     question:
@@ -72,4 +72,4 @@ output:
 #       name: claude
 #       base_url: ${ANTHROPIC_BASE_URL:-https://gateway.example.com}
 #       auth_token: ${ANTHROPIC_AUTH_TOKEN:-placeholder-token}
-#     default_model: claude-sonnet-4-5
+#     default_model: claude-sonnet-5-5

@@ -43,9 +43,9 @@ workflow:
 
   runtime:
     provider: claude-agent-sdk
-    # claude-sonnet-4-5 is the SDK's documented default; adjust to your
+    # claude-sonnet-5-5 is a current Sonnet model; adjust to your
     # Claude Code backend (Vertex AI / Bedrock / anthropic.com).
-    default_model: claude-sonnet-4-5
+    default_model: claude-sonnet-5-5
 
   input:
     topic:

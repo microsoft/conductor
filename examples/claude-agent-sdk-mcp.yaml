@@ -68,7 +68,7 @@ workflow:
   runtime:
     # The bare shorthand resolves to `native_tools: none`.
     provider: claude-agent-sdk
-    default_model: claude-sonnet-4-5
+    default_model: claude-sonnet-5-5
     max_agent_iterations: 20
 
     mcp_servers:
