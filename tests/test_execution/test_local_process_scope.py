@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import errno
 import json
 import os
 import signal
@@ -20,6 +19,7 @@ import pytest
 
 from conductor.execution import local_process_scope as process_core
 from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.local_process_scope import LocalProcessScopeController
 from conductor.execution.local_scope_launcher import connect
 from conductor.execution.types import CommandSpec, ManagedWorkspaceContext, ProcessLaunchSpec
@@ -105,7 +105,7 @@ async def test_script_preserves_bytes_argv_environment_and_cwd(tmp_path: Path) -
 async def test_real_probe_and_main_share_family_not_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Requirement: actual version and main have independent scopes; seal rejects a third.
+    # Requirement: version/main scopes preserve exact binary output; seal rejects a third.
     clock = ControlledClock()
     controller = LocalProcessScopeController(str(tmp_path), "inc", _scheduler=clock)
     owner_return = asyncio.Event()
@@ -144,7 +144,12 @@ async def test_real_probe_and_main_share_family_not_scope(
         assert not scope.resources
         clock.advance(100)
         assert controller.owners.deadline("sdk") is None
-        main = await facade(wrapped, "-c", "import sys; print(sys.stdin.read())")
+        main = await facade(
+            wrapped,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()+b'\\n'); "
+            "sys.stdout.buffer.flush()",
+        )
         out, err = await asyncio.wait_for(main.communicate(b"real-main"), 10)
         assert out == b"real-main\n" and err == b"" and main.returncode == 0
         assert len({proof.scope_id for proof in controller.proofs}) == 2
@@ -161,7 +166,7 @@ async def test_real_probe_and_main_share_family_not_scope(
 
 
 async def test_grace_preserves_eof_only_final_bytes(tmp_path: Path) -> None:
-    # Requirement: begin_teardown does not kill before native stdin EOF and final drain.
+    # Requirement: teardown preserves exact EOF-only bytes without text newline translation.
     controller = LocalProcessScopeController(str(tmp_path), "inc")
     wrapped = await controller.wrap_stdio(
         "sdk",
@@ -170,7 +175,8 @@ async def test_grace_preserves_eof_only_final_bytes(tmp_path: Path) -> None:
                 sys.executable,
                 "-u",
                 "-c",
-                "import sys; print('ready',flush=True); data=sys.stdin.buffer.read(); "
+                "import sys; sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush(); "
+                "data=sys.stdin.buffer.read(); "
                 "sys.stdout.buffer.write(b'final:'+data)",
             ),
             dict(os.environ),
@@ -191,7 +197,7 @@ async def test_grace_preserves_eof_only_final_bytes(tmp_path: Path) -> None:
 
 
 async def test_terminate_facade_does_not_destroy_custodian(tmp_path: Path) -> None:
-    # Requirement: SDK terminate(facade) leaves custody alive to EOF, drain and prove.
+    # Requirement: facade termination keeps custody through EOF, exact final bytes and proof.
     saved = tmp_path / "eof-result"
     controller = LocalProcessScopeController(str(tmp_path), "inc")
     wrapped = await controller.wrap_stdio(
@@ -201,7 +207,8 @@ async def test_terminate_facade_does_not_destroy_custodian(tmp_path: Path) -> No
                 sys.executable,
                 "-u",
                 "-c",
-                "import sys,pathlib; print('ready',flush=True); sys.stdin.buffer.read(); "
+                "import sys,pathlib; sys.stdout.buffer.write(b'ready\\n'); "
+                "sys.stdout.buffer.flush(); sys.stdin.buffer.read(); "
                 f"pathlib.Path({str(saved)!r}).write_bytes(b'final-on-eof')",
             ),
             dict(os.environ),
@@ -257,18 +264,19 @@ async def test_detached_double_fork_is_reaped_before_result(tmp_path: Path) -> N
 
 @pytest.mark.parametrize("failure", ["missing", "cwd"])
 async def test_structured_target_start_failure(tmp_path: Path, failure: str) -> None:
-    # Requirement: genuine target OSError metadata is not helper exit code 127.
+    # Requirement: start failures preserve exact native metadata on this platform, never exit 127.
     controller = LocalProcessScopeController(str(tmp_path), "inc")
     command = str(tmp_path / "missing") if failure == "missing" else sys.executable
     cwd = str(tmp_path / "missing-cwd") if failure == "cwd" else str(tmp_path)
+    spec = CommandSpec(command, working_dir=cwd, stdin=b"")
     try:
-        result = await asyncio.wait_for(
-            controller.spawn_script("script", CommandSpec(command, working_dir=cwd, stdin=b"")), 10
-        )
-        assert result.outcome == "command_not_found"
+        native = await asyncio.wait_for(LocalRunnerBackend().run_command(spec, None), 10)
+        assert native.outcome in ("command_not_found", "start_failed")
+        assert native.exit_code is None and native.start_error is not None
+        result = await asyncio.wait_for(controller.spawn_script("script", spec), 10)
+        assert result.outcome == native.outcome
         assert result.exit_code is None and result.start_error is not None
-        assert result.start_error.errno == errno.ENOENT
-        assert result.start_error.filename == (command if failure == "missing" else cwd)
+        assert result.start_error == native.start_error
         assert "COMMAND_EXITED" not in controller.proofs[0].events
         assert (await controller.await_release()).status == "released"
     finally:

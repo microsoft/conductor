@@ -61,7 +61,7 @@ def main() -> None:
                                         "argv": sys.argv[3:],
                                         "overlay": os.environ.get("MCP_MANAGED_OVERLAY"),
                                         "ambient": os.environ.get("MCP_MANAGED_AMBIENT"),
-                                        "home": os.environ.get("HOME"),
+                                        "home": str(Path.home()),
                                         "text": request["params"].get("arguments", {}).get("text"),
                                     }
                                 ),

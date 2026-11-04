@@ -6,10 +6,13 @@ import asyncio
 import errno
 import json
 import os
+import stat
 import sys
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -433,14 +436,31 @@ def test_windows_case_collision_refuses_without_renaming(
     # Requirement: Windows lexical collision checks reject rather than flatten distinct entries.
     source, destination = tmp_path / "source", tmp_path / "destination"
     source.mkdir()
-    (source / "Case").write_bytes(b"first")
-    (source / "case").write_bytes(b"second")
+    first, second = source / "first", source / "second"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    scandir = os.scandir
+
+    @contextmanager
+    def colliding(path):
+        with scandir(path) as entries:
+            yield (
+                SimpleNamespace(
+                    name="Case" if entry.name == "first" else "case",
+                    path=entry.path,
+                    stat=entry.stat,
+                )
+                for entry in entries
+            )
+
     with monkeypatch.context() as context:
         context.setattr(local_workspace.sys, "platform", "win32")
+        context.setattr(local_workspace.os, "scandir", colliding)
         with pytest.raises(ExecutionSpecError, match="case-colliding"):
             local_workspace._copy_tree(source, destination, source)
-    assert (source / "Case").read_bytes() == b"first"
-    assert (source / "case").read_bytes() == b"second"
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+    assert {path.name for path in source.iterdir()} == {"first", "second"}
 
 
 @pytest.mark.parametrize("field", [1, 2])
@@ -451,14 +471,275 @@ def test_filesystem_without_positive_stable_identity_is_refused(
     original = Path.lstat
 
     def unavailable(path: Path) -> os.stat_result:
-        values = list(original(path))
-        if path == tmp_path:
-            values[field] = 0
-        return os.stat_result(values)
+        info = original(path)
+        if path != tmp_path:
+            return info
+        values = list(info)
+        values[field] = 0
+        tuple_fields = {"st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size"}
+        named = {
+            name: getattr(info, name)
+            for name in dir(info)
+            if name.startswith("st_") and name not in tuple_fields
+        }
+        return os.stat_result(values, named)
 
     monkeypatch.setattr(Path, "lstat", unavailable)
     with pytest.raises(ExecutionSpecError, match="stable positive"):
         local_workspace._directory(tmp_path)
+
+
+def _file_metadata(info: os.stat_result, **changes: int) -> SimpleNamespace:
+    fields = {
+        "st_mode": info.st_mode,
+        "st_dev": info.st_dev,
+        "st_ino": info.st_ino,
+        "st_file_attributes": getattr(info, "st_file_attributes", 0),
+    }
+    return SimpleNamespace(**(fields | changes))
+
+
+def test_copy_accepts_unavailable_enumeration_identity_with_real_file_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: Windows enumeration zeros cannot reject a genuinely identified disk file.
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    original = source / "payload"
+    original.write_bytes(b"immutable CAS\r\n")
+    original.chmod(stat.S_IRUSR)
+    scandir = os.scandir
+
+    @contextmanager
+    def without_ids(path):
+        with scandir(path) as entries:
+            yield (
+                SimpleNamespace(
+                    name=entry.name,
+                    path=entry.path,
+                    stat=lambda *, follow_symlinks=False, entry=entry: _file_metadata(
+                        entry.stat(follow_symlinks=follow_symlinks), st_dev=0, st_ino=0
+                    ),
+                )
+                for entry in entries
+            )
+
+    with monkeypatch.context() as context:
+        context.setattr(local_workspace.os, "scandir", without_ids)
+        local_workspace._copy_tree(source, destination, source)
+    copy = destination / "payload"
+    assert copy.read_bytes() == b"immutable CAS\r\n"
+    assert not copy.samefile(original)
+    assert copy.stat().st_mode & stat.S_IWUSR
+    copy.write_bytes(b"mutable copy")
+    assert original.read_bytes() == b"immutable CAS\r\n"
+
+
+@pytest.mark.parametrize(
+    "boundary", ["before-lstat", "symlink-before-lstat", "before-open", "symlink-before-open"]
+)
+def test_copy_refuses_real_replacement_at_each_identity_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    # Requirement: neither an early positive identity nor a fresh snapshot may be replaced.
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    original, saved, foreign = source / "payload", tmp_path / "saved", tmp_path / "foreign"
+    original.write_bytes(b"original CAS")
+    foreign.write_bytes(b"foreign bytes")
+    enumeration = original.lstat()
+    scandir, open_file = os.scandir, os.open
+
+    def observe(*, follow_symlinks=False):
+        assert not follow_symlinks
+        if boundary in ("before-lstat", "symlink-before-lstat"):
+            original.rename(saved)
+            if boundary == "symlink-before-lstat":
+                original.symlink_to(foreign)
+            else:
+                original.write_bytes(b"replacement")
+        return enumeration
+
+    @contextmanager
+    def anchored(path):
+        with scandir(path) as entries:
+            yield (
+                SimpleNamespace(name=entry.name, path=entry.path, stat=observe) for entry in entries
+            )
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        if Path(path) == original and boundary in ("before-open", "symlink-before-open"):
+            original.rename(saved)
+            if boundary == "symlink-before-open":
+                original.symlink_to(foreign)
+            else:
+                original.write_bytes(b"replacement")
+        return open_file(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(local_workspace.os, "scandir", anchored)
+        context.setattr(local_workspace.os, "open", replace_before_open)
+        with pytest.raises((ExecutionSpecError, OSError)) as caught:
+            local_workspace._copy_tree(source, destination, source)
+    if isinstance(caught.value, OSError):
+        assert boundary == "symlink-before-open" and caught.value.errno == errno.ELOOP
+    elif boundary == "symlink-before-lstat":
+        assert "regular non-link" in str(caught.value)
+    else:
+        assert "identity changed" in str(caught.value)
+    copied = destination / "payload"
+    assert not copied.exists() or copied.read_bytes() == b""
+    assert saved.read_bytes() == b"original CAS"
+    assert foreign.read_bytes() == b"foreign bytes"
+
+
+@pytest.mark.parametrize(
+    ("observation", "changes", "reason"),
+    [
+        ("enumeration", {"st_dev": 0}, "enumeration identity"),
+        ("enumeration", {"st_ino": 0}, "enumeration identity"),
+        ("enumeration", {"st_dev": -1}, "enumeration identity"),
+        ("enumeration", {"st_ino": -1}, "enumeration identity"),
+        ("enumeration", {"st_file_attributes": 0x400}, "reparse point"),
+        ("fresh", {"st_dev": 0}, "stable positive"),
+        ("fresh", {"st_ino": 0}, "stable positive"),
+        ("opened", {"st_dev": 0}, "stable positive"),
+        ("opened", {"st_ino": 0}, "stable positive"),
+        ("fresh", {"st_mode": stat.S_IFLNK | stat.S_IRUSR}, "regular non-link"),
+        ("opened", {"st_mode": stat.S_IFLNK | stat.S_IRUSR}, "regular non-link"),
+        ("fresh", {"st_file_attributes": 0x400}, "regular non-link"),
+        ("opened", {"st_file_attributes": 0x400}, "regular non-link"),
+    ],
+)
+def test_copy_refuses_invalid_file_observations_before_copying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observation, changes, reason
+) -> None:
+    # Requirement: only regular non-reparse files with complete positive IDs authorize copying.
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    original = source / "payload"
+    original.write_bytes(b"unchanged CAS")
+    info = original.lstat()
+    scandir, lstat, fstat = os.scandir, Path.lstat, os.fstat
+
+    @contextmanager
+    def observed(path):
+        with scandir(path) as entries:
+            yield (
+                SimpleNamespace(
+                    name=entry.name,
+                    path=entry.path,
+                    stat=lambda *, follow_symlinks=False: _file_metadata(
+                        info, **(changes if observation == "enumeration" else {})
+                    ),
+                )
+                for entry in entries
+            )
+
+    def fresh(path):
+        result = lstat(path)
+        if path == original and observation == "fresh":
+            return _file_metadata(result, **changes)
+        return result
+
+    def opened(descriptor):
+        result = fstat(descriptor)
+        if observation == "opened":
+            return _file_metadata(result, **changes)
+        return result
+
+    with monkeypatch.context() as context:
+        context.setattr(local_workspace.os, "scandir", observed)
+        context.setattr(Path, "lstat", fresh)
+        context.setattr(local_workspace.os, "fstat", opened)
+        with pytest.raises(ExecutionSpecError, match=reason):
+            local_workspace._copy_tree(source, destination, source)
+    copied = destination / "payload"
+    assert not copied.exists() or copied.read_bytes() == b""
+    assert original.read_bytes() == b"unchanged CAS"
+
+
+@pytest.mark.parametrize("boundary", ["enumeration-fresh", "fresh-opened"])
+def test_copy_compares_all_128_inode_bits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    # Requirement: IDs sharing their low 64 bits cannot authorize a different filesystem object.
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    original = source / "payload"
+    original.write_bytes(b"unchanged CAS")
+    info = original.lstat()
+    first, second = (1 << 100) | 7, (2 << 100) | 7
+    scandir, lstat, fstat = os.scandir, Path.lstat, os.fstat
+
+    @contextmanager
+    def observed(path):
+        with scandir(path) as entries:
+            yield (
+                SimpleNamespace(
+                    name=entry.name,
+                    path=entry.path,
+                    stat=lambda *, follow_symlinks=False: _file_metadata(info, st_ino=first),
+                )
+                for entry in entries
+            )
+
+    def fresh(path):
+        result = lstat(path)
+        if path == original:
+            return _file_metadata(
+                result, st_ino=second if boundary == "enumeration-fresh" else first
+            )
+        return result
+
+    with monkeypatch.context() as context:
+        context.setattr(local_workspace.os, "scandir", observed)
+        context.setattr(Path, "lstat", fresh)
+        context.setattr(
+            local_workspace.os, "fstat", lambda fd: _file_metadata(fstat(fd), st_ino=second)
+        )
+        with pytest.raises(ExecutionSpecError, match="identity changed"):
+            local_workspace._copy_tree(source, destination, source)
+    copied = destination / "payload"
+    assert not copied.exists() or copied.read_bytes() == b""
+    assert original.read_bytes() == b"unchanged CAS"
+
+
+def test_copy_uses_fresh_permissions_instead_of_enumeration_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: the copied file keeps fresh executable bits and gains owner write access.
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    original = source / "payload"
+    original.write_bytes(b"CAS executable")
+    original.chmod(stat.S_IRUSR | stat.S_IXUSR)
+    info = original.lstat()
+    scandir = os.scandir
+
+    @contextmanager
+    def old_permissions(path):
+        with scandir(path) as entries:
+            yield (
+                SimpleNamespace(
+                    name=entry.name,
+                    path=entry.path,
+                    stat=lambda *, follow_symlinks=False: _file_metadata(
+                        info, st_mode=stat.S_IFREG | stat.S_IRUSR
+                    ),
+                )
+                for entry in entries
+            )
+
+    with monkeypatch.context() as context:
+        context.setattr(local_workspace.os, "scandir", old_permissions)
+        local_workspace._copy_tree(source, destination, source)
+    copied = destination / "payload"
+    assert copied.read_bytes() == b"CAS executable"
+    assert copied.stat().st_mode & stat.S_IWUSR
+    if os.name != "nt":
+        assert copied.stat().st_mode & stat.S_IXUSR
+    assert original.read_bytes() == b"CAS executable"
 
 
 async def test_location_is_not_delete_authority_and_root_drift_warns(managed, caplog) -> None:

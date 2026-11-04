@@ -158,13 +158,34 @@ def _copy_tree(source: Path, destination: Path, root: Path) -> None:
             elif stat.S_ISDIR(info.st_mode):
                 _copy_tree(src, dst, root)
             elif stat.S_ISREG(info.st_mode):
+                fresh = src.lstat()
+                if (
+                    not stat.S_ISREG(fresh.st_mode)
+                    or getattr(fresh, "st_file_attributes", 0) & 0x400
+                ):
+                    raise ExecutionSpecError("CAS entry must remain a regular non-link file")
+                if fresh.st_dev <= 0 or fresh.st_ino <= 0:
+                    raise ExecutionSpecError("CAS file has no stable positive file identity")
+                # Windows enumeration omits IDs; keep every available early identity anchor.
+                if (info.st_dev, info.st_ino) != (0, 0):
+                    if info.st_dev <= 0 or info.st_ino <= 0:
+                        raise ExecutionSpecError("CAS entry has incomplete enumeration identity")
+                    if (info.st_dev, info.st_ino) != (fresh.st_dev, fresh.st_ino):
+                        raise ExecutionSpecError("CAS entry identity changed before opening")
                 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
                 with os.fdopen(os.open(src, flags), "rb") as reader, dst.open("xb") as writer:
                     opened = os.fstat(reader.fileno())
-                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or getattr(opened, "st_file_attributes", 0) & 0x400
+                    ):
+                        raise ExecutionSpecError("Opened CAS entry is not a regular non-link file")
+                    if opened.st_dev <= 0 or opened.st_ino <= 0:
+                        raise ExecutionSpecError("Opened CAS file has no stable positive identity")
+                    if (opened.st_dev, opened.st_ino) != (fresh.st_dev, fresh.st_ino):
                         raise ExecutionSpecError("CAS entry identity changed during copying")
                     shutil.copyfileobj(reader, writer)
-                dst.chmod(stat.S_IMODE(info.st_mode) | stat.S_IRUSR | stat.S_IWUSR)
+                dst.chmod(stat.S_IMODE(fresh.st_mode) | stat.S_IRUSR | stat.S_IWUSR)
             else:
                 raise ExecutionSpecError(f"Bundle contains an unsupported filesystem entry: {src}")
 
