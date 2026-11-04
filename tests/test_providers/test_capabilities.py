@@ -43,6 +43,64 @@ def _stable_capabilities(**overrides: object) -> ProviderCapabilities:
 
 
 class TestSchemaValidation:
+    def test_managed_workspace_defaults_false_and_is_explicitly_opted_in(self) -> None:
+        # Requirement: ordinary cwd support cannot implicitly enable managed lifecycle.
+        assert _stable_capabilities(working_dir=True).managed_local_workspace is False
+        assert _stable_capabilities(managed_local_workspace=True).managed_local_workspace is True
+
+    @pytest.mark.parametrize("provider_name", known_provider_names())
+    def test_concrete_providers_do_not_claim_unimplemented_managed_support(
+        self, provider_name: str
+    ) -> None:
+        # Requirement: managed_local_workspace is True precisely for confirmed adapters
+        # (copilot, claude, openai, claude-agent-sdk) and False for unsupported providers.
+        expected = provider_name in {
+            "copilot",
+            "claude",
+            "openai",
+            "claude-agent-sdk",
+        }
+        assert get_capabilities(provider_name).managed_local_workspace is expected
+
+    def test_managed_capability_requires_explicit_execute_context(self) -> None:
+        # Requirement: declaring managed support without accepting context fails at import.
+        from conductor.providers.base import AgentOutput, AgentProvider
+
+        with pytest.raises(TypeError):
+
+            class MissingContext(AgentProvider):
+                CAPABILITIES = _stable_capabilities(managed_local_workspace=True)
+
+                async def execute(self, *args, **kwargs) -> AgentOutput:
+                    raise NotImplementedError
+
+                async def validate_connection(self) -> bool:
+                    return True
+
+                async def close(self) -> None:
+                    return None
+
+    def test_managed_capability_requires_targeted_release(self) -> None:
+        # Requirement: an inherited unsupported hook cannot advertise managed support.
+        from conductor.execution.types import ManagedWorkspaceContext
+        from conductor.providers.base import AgentOutput, AgentProvider
+
+        with pytest.raises(TypeError):
+
+            class MissingRelease(AgentProvider):
+                CAPABILITIES = _stable_capabilities(managed_local_workspace=True)
+
+                async def execute(
+                    self, *args, managed_workspace: ManagedWorkspaceContext | None = None, **kwargs
+                ) -> AgentOutput:
+                    raise NotImplementedError
+
+                async def validate_connection(self) -> bool:
+                    return True
+
+                async def close(self) -> None:
+                    return None
+
     def test_construct_stable_descriptor(self) -> None:
         caps = _stable_capabilities(working_dir=True)
         assert caps.tier == "stable"

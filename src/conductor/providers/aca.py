@@ -64,6 +64,7 @@ from conductor.runner.protocol import (
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
+    from conductor.execution.types import ManagedWorkspaceContext
 
 logger = logging.getLogger(__name__)
 
@@ -1015,6 +1016,7 @@ class AcaRuntimeProvider(AgentProvider):
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Delegate execution to the in-sandbox runner over Branch S streaming.
 
@@ -1038,7 +1040,16 @@ class AcaRuntimeProvider(AgentProvider):
         `suppress_mcp_servers` IS honored -- this provider declares
         `mcp_tools`, and the runner attaches whatever it is sent -- by
         forwarding no servers at all for that call.
+
+        `managed_workspace` is accepted for signature compatibility, but
+        non-None contexts are refused before building the sandbox request.
         """
+        if managed_workspace is not None:
+            raise ProviderError(
+                "aca does not support managed local workspaces",
+                provider_name="aca",
+                is_retryable=False,
+            )
         del skill_directories  # Host paths are meaningless in-sandbox (see docstring).
         del custom_agents, extra_mcp_servers  # Same: host-side plugin content.
         del continuation_state  # No continuation surface (see docstring).
@@ -1118,6 +1129,9 @@ class AcaRuntimeProvider(AgentProvider):
         user_message: str,
         history: list[dict[str, str]] | None = None,
         model: str | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
     ) -> str:
         """Disabled for v1 with a clear error (OQ#5 fallback decision).
 

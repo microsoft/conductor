@@ -43,6 +43,7 @@ from conductor.console import (
     select_console_glyph,
     styled,
 )
+from conductor.engine.execution_resolution import ExecutionResolverSession
 from conductor.engine.secrets import SecretUseIndex, SecretValueCache, index_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import ConfigurationError, WorkflowTerminated
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     from conductor.config.instructions import DiscoveredInstruction
     from conductor.config.schema import ProviderSettings, WorkflowConfig
     from conductor.events import WorkflowEvent, WorkflowEventEmitter
+    from conductor.execution.types import ManagedWorkspaceContext
     from conductor.fleet.records import RunMode
 
 
@@ -1944,10 +1946,24 @@ async def _execute_with_stop_signal(
     engine_task = asyncio.create_task(engine_coro)
     stop_task = asyncio.create_task(dashboard.wait_for_stop())
 
-    done, pending = await asyncio.wait(
-        {engine_task, stop_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    try:
+        done, pending = await asyncio.wait(
+            {engine_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except BaseException:
+        engine_task.cancel()
+        stop_task.cancel()
+        # The engine owns its root deadline. Await orchestration, never its
+        # quarantined resource leaves or a second cancel-ack gather.
+        while not engine_task.done():
+            try:
+                await asyncio.wait({engine_task})
+            except asyncio.CancelledError:
+                continue
+        if not engine_task.cancelled():
+            engine_task.exception()
+        raise
 
     # Cancel any losing task and drain it. Use ``gather(return_exceptions=True)``
     # so a non-CancelledError stored on the losing task (e.g. dashboard.stop
@@ -1956,7 +1972,24 @@ async def _execute_with_stop_signal(
     for task in pending:
         task.cancel()
     if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+        session = getattr(engine, "_execution_session", None)
+        if isinstance(session, ExecutionResolverSession) and session.managed:
+            while not engine_task.done():
+                try:
+                    await asyncio.wait({engine_task})
+                except asyncio.CancelledError:
+                    continue
+            if not stop_task.done():
+                await asyncio.wait(
+                    {stop_task},
+                    timeout=max(
+                        0,
+                        (session.cleanup_deadline or asyncio.get_running_loop().time())
+                        - asyncio.get_running_loop().time(),
+                    ),
+                )
+        else:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     if engine_task in done:
         return engine_task.result()
@@ -2206,36 +2239,79 @@ def _remove_run_record_for_current_process_safe() -> None:
         logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
-def _scrub_exception_fields(exc: BaseException, redactor: RunRedactor) -> None:
+def _scrub_exception_fields(exc: BaseException, redactor: RunRedactor) -> BaseException:
     """Scrub registered secret values from the fields a CLI error render reads.
 
     ``print_error`` renders exception args and structured ``ConductorError``
     fields, while ``OSError.__str__`` reads its structured filename and error
     attributes instead of rebuilt args. This runs at the run/resume boundary
     *before* the redactor is cleared, so the same escaping exception object
-    cannot carry plaintext into the later CLI renderer. Its class, identity,
-    traceback, cause chain, errno, and classification remain untouched.
+    cannot carry plaintext into the later CLI renderer. Ordinary exceptions keep
+    their identity and classification. Group messages are immutable, so only
+    affected group wrappers are rebuilt, retaining their ordinary child objects.
     """
     if not redactor.active:
-        return
+        return exc
 
-    # scrub() returns unsupported types unchanged, so scrubbing every element
-    # also covers bytes args and containers (e.g. Exception({"token": secret}))
-    # whose nested strings the renderer would print.
-    exc.args = tuple(redactor.scrub(arg) for arg in exc.args)
     from conductor.exceptions import ConductorError
 
-    if isinstance(exc, ConductorError):
-        for attribute in ("suggestion", "file_path", "field_path"):
-            value = getattr(exc, attribute, None)
-            if isinstance(value, (str, bytes)):
-                setattr(exc, attribute, redactor.scrub(value))
+    seen: dict[int, BaseException] = {}
 
-    if isinstance(exc, OSError):
-        for attribute in ("strerror", "filename", "filename2"):
-            value = getattr(exc, attribute, None)
-            if isinstance(value, (str, bytes)):
-                setattr(exc, attribute, redactor.scrub(value))
+    def scrub_nested(error: BaseException) -> None:
+        if id(error) in seen:
+            return
+        seen[id(error)] = error
+        if isinstance(error, BaseExceptionGroup):
+            for child in error.exceptions:
+                scrub_nested(child)
+        if error.__cause__ is not None:
+            scrub_nested(error.__cause__)
+        if error.__context__ is not None:
+            scrub_nested(error.__context__)
+        if hasattr(error, "__notes__"):
+            error.__notes__ = [redactor.scrub(note) for note in error.__notes__]
+        error.args = tuple(redactor.scrub(arg) for arg in error.args)
+        if isinstance(error, ConductorError):
+            for attribute in ("suggestion", "file_path", "field_path"):
+                value = getattr(error, attribute, None)
+                if isinstance(value, (str, bytes)):
+                    setattr(error, attribute, redactor.scrub(value))
+        if isinstance(error, OSError):
+            for attribute in ("strerror", "filename", "filename2"):
+                value = getattr(error, attribute, None)
+                if isinstance(value, (str, bytes)):
+                    setattr(error, attribute, redactor.scrub(value))
+
+    scrub_nested(exc)
+    replacements: dict[int, BaseException] = {}
+
+    def rebuild(error: BaseException) -> BaseException:
+        if id(error) in replacements:
+            return replacements[id(error)]
+        safe = error
+        if isinstance(error, BaseExceptionGroup):
+            children = [rebuild(child) for child in error.exceptions]
+            message = redactor.scrub(error.message)
+            if message != error.message or any(
+                child is not original
+                for child, original in zip(children, error.exceptions, strict=True)
+            ):
+                safe = BaseExceptionGroup(message, children).with_traceback(error.__traceback__)
+                safe.__suppress_context__ = error.__suppress_context__
+                if hasattr(error, "__notes__"):
+                    safe.__notes__ = list(error.__notes__)
+        replacements[id(error)] = safe
+        return safe
+
+    for error in seen.values():
+        rebuild(error)
+    for error in seen.values():
+        safe = replacements[id(error)]
+        if error.__cause__ is not None:
+            safe.__cause__ = replacements[id(error.__cause__)]
+        if error.__context__ is not None:
+            safe.__context__ = replacements[id(error.__context__)]
+    return replacements[id(exc)]
 
 
 def _scrub_workflow_terminated(
@@ -2829,16 +2905,22 @@ async def run_workflow_async(
             # already captured where it was raised, above, and re-raising
             # it here must not clobber that with a generic "failed"/no
             # message (MCP server plan E2).
+            escaping = exc
             if secret_redactor is not None and secret_redactor.active:
                 # The escaping exception reaches ``cli.app.print_error``
                 # AFTER the redactor is cleared below, so the fields the
                 # error renderer reads are scrubbed here at the boundary.
-                _scrub_exception_fields(exc, secret_redactor)
+                escaping = _scrub_exception_fields(exc, secret_redactor)
             terminal_status = "failed"
-            terminal_error_type = type(exc).__name__
-            terminal_error_message = str(exc)
+            terminal_error_type = type(escaping).__name__
+            terminal_error_message = str(escaping)
+            if escaping is not exc:
+                raise escaping from None
         raise
     finally:
+        session = getattr(engine, "_execution_session", None)
+        if isinstance(session, ExecutionResolverSession):
+            session.retain_registry_cleanup()
         try:
             # Scrub the terminal-record copies while the redactor still holds
             # the registered values: the CLI-owned pair is cleared only in
@@ -2888,7 +2970,11 @@ async def run_workflow_async(
 
             if dashboard is not None:
                 try:
-                    await dashboard.stop()
+                    session = getattr(engine, "_execution_session", None)
+                    if isinstance(session, ExecutionResolverSession):
+                        await session.close_cli_resource(dashboard.stop())
+                    else:
+                        await dashboard.stop()
                 except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
                     logger.warning(
                         "Failed to stop dashboard during workflow cleanup", exc_info=True
@@ -2929,9 +3015,11 @@ async def run_workflow_async(
             # after the terminal record, telemetry close, and event-log close
             # above have drained, so their scrubbed copies could still
             # resolve values while they were being written.
-            if secret_cache is not None:
+            session = getattr(engine, "_execution_session", None)
+            quarantined = isinstance(session, ExecutionResolverSession) and session.quarantined
+            if secret_cache is not None and not quarantined:
                 secret_cache.clear()
-            if secret_redactor is not None:
+            if secret_redactor is not None and not quarantined:
                 secret_redactor.clear()
             if redaction_token is not None:
                 redaction.reset_current(redaction_token)
@@ -3141,7 +3229,8 @@ def build_dry_run_plan(workflow_path: Path, *, environment: str | None = None) -
             return next((a for a in self.config.agents if a.name == name), None)
 
     # Use a real WorkflowEngine but with a mock provider
-    from conductor.providers.base import AgentOutput, AgentProvider
+    from conductor.exceptions import ProviderError
+    from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 
     class _MockProvider(AgentProvider, abstract=True):
         async def execute(
@@ -3152,13 +3241,19 @@ def build_dry_run_plan(workflow_path: Path, *, environment: str | None = None) -
             *,
             tools: list[str] | None = None,
             interrupt_signal: asyncio.Event | None = None,
-            event_callback: Any = None,
+            event_callback: EventCallback | None = None,
             skill_directories: list[str] | None = None,
             custom_agents: list[dict[str, Any]] | None = None,
             extra_mcp_servers: dict[str, Any] | None = None,
             continuation_state: object | None = None,
             suppress_mcp_servers: bool = False,
+            managed_workspace: ManagedWorkspaceContext | None = None,
         ) -> AgentOutput:
+            if managed_workspace is not None:
+                raise ProviderError(
+                    "Dry-run provider does not support managed local workspaces",
+                    is_retryable=False,
+                )
             del suppress_mcp_servers  # Dry run: nothing executes, no MCP surface.
             return AgentOutput(content={}, raw_response="")
 
@@ -3816,13 +3911,19 @@ async def resume_workflow_async(
             # `WorkflowTerminated` branch above -- a setup error before the
             # engine ever ran (checkpoint resolution, config load, ...) or
             # one that escaped the inner try/except (MCP server plan E2).
+            escaping = exc
             if secret_redactor is not None and secret_redactor.active:
-                _scrub_exception_fields(exc, secret_redactor)
+                escaping = _scrub_exception_fields(exc, secret_redactor)
             terminal_status = "failed"
-            terminal_error_type = type(exc).__name__
-            terminal_error_message = str(exc)
+            terminal_error_type = type(escaping).__name__
+            terminal_error_message = str(escaping)
+            if escaping is not exc:
+                raise escaping from None
         raise
     finally:
+        session = getattr(engine, "_execution_session", None)
+        if isinstance(session, ExecutionResolverSession):
+            session.retain_registry_cleanup()
         try:
             # Scrubbed terminal-record copies — mirrors run_workflow_async:
             # the redactor still holds the registered values here (cleanup
@@ -3869,7 +3970,11 @@ async def resume_workflow_async(
 
             if dashboard is not None:
                 try:
-                    await dashboard.stop()
+                    session = getattr(engine, "_execution_session", None)
+                    if isinstance(session, ExecutionResolverSession):
+                        await session.close_cli_resource(dashboard.stop())
+                    else:
+                        await dashboard.stop()
                 except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
                     logger.warning("Failed to stop dashboard during resume cleanup", exc_info=True)
 
@@ -3906,9 +4011,11 @@ async def resume_workflow_async(
             # CLI-owned secret cleanup — same discipline as
             # ``run_workflow_async``: only after the terminal record,
             # telemetry close, and event-log close above have drained.
-            if secret_cache is not None:
+            session = getattr(engine, "_execution_session", None)
+            quarantined = isinstance(session, ExecutionResolverSession) and session.quarantined
+            if secret_cache is not None and not quarantined:
                 secret_cache.clear()
-            if secret_redactor is not None:
+            if secret_redactor is not None and not quarantined:
                 secret_redactor.clear()
             if redaction_token is not None:
                 redaction.reset_current(redaction_token)

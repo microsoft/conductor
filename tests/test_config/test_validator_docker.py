@@ -278,9 +278,8 @@ def test_docker_free_workflow_has_zero_noise_and_no_discovery(tmp_path: Path) ->
         (WorkspaceConfig(mode="isolated"), None, None, "isolated.*follow-up"),
         (None, RestartConfig(mode="reuse"), None, "reuse.*follow-up"),
         (None, None, RestartConfig(mode="reuse"), "reuse.*follow-up"),
-        (WorkspaceConfig(persistence="durable"), None, None, "local backend.*retained"),
     ],
-    ids=["isolated", "reuse_default", "reuse_step", "retained_local"],
+    ids=["isolated", "reuse_default", "reuse_step"],
 )
 def test_workspace_policy_compiler_and_validator_agree(
     workspace: WorkspaceConfig | None,
@@ -311,6 +310,86 @@ def test_bare_validate_defers_workspace_capability_cross_check() -> None:
     config.workflow.workspace = WorkspaceConfig(persistence="durable")
     warnings = validate_workflow_config(config)
     assert any("capability cross-check requires" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("persistence", ["durable", "on-failure", "ephemeral"])
+@pytest.mark.parametrize("inline", [False, True], ids=["top_level", "for_each"])
+@pytest.mark.parametrize("profile_source", ["step", "defaults", "environment"])
+@pytest.mark.parametrize(
+    "case", ["external", "owned", "override", "explicit_override", "mismatch", "script", "remote"]
+)
+def test_local_copilot_runtime_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    persistence: str,
+    inline: bool,
+    profile_source: str,
+    case: str,
+) -> None:
+    # Requirement: only effective retained local Copilot agents refuse matching external runtimes.
+    class RetainingAgentBackend:
+        def capabilities(self) -> RunnerCapabilities:
+            return RunnerCapabilities(
+                batch=True,
+                sessions=False,
+                shared_workspace=True,
+                snapshots=False,
+                agent=True,
+                retained_workspace=True,
+            )
+
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "local", RetainingAgentBackend())
+    settings = {"name": "openai" if case == "mismatch" else "copilot"}
+    if case in {"external", "override", "explicit_override", "script", "remote"}:
+        settings["runtime_url"] = "localhost:1"
+    step: dict[str, object] = {"name": "probe", "type": "agent"}
+    if case == "override":
+        step["provider"] = "openai"
+    if case in {"explicit_override", "mismatch"}:
+        step["provider"] = "copilot"
+    if case == "script":
+        step = {"name": "probe", "type": "script", "command": "unused"}
+    if profile_source == "step" or case == "remote":
+        step["execution"] = {"profile": "container" if case == "remote" else "host"}
+    workflow: dict[str, object] = {
+        "name": "ownership",
+        "entry_point": "batch" if inline else "probe",
+        "workspace": {"persistence": persistence},
+        "runtime": {"provider": settings},
+    }
+    if profile_source != "environment":
+        workflow["defaults"] = {
+            "execution": {"profile": "container" if profile_source == "step" else "host"}
+        }
+    raw: dict[str, object] = {
+        "workflow": workflow,
+        "agents": [] if inline else [step],
+    }
+    if inline:
+        raw["for_each"] = [
+            {
+                "name": "batch",
+                "type": "for_each",
+                "source": "workflow.input.items",
+                "as": "item",
+                "agent": step,
+            }
+        ]
+    config = WorkflowConfig.model_validate(raw)
+    environment = _environment(
+        {
+            "host": ProfileDefinition(backend="local"),
+            "container": _docker(runner_image="runner:test"),
+        },
+        default="host" if profile_source == "environment" else "container",
+    )
+    # Inline scripts keep their existing semantic rejection, independent of ownership.
+    if (persistence != "ephemeral" and case in {"external", "explicit_override"}) or (
+        inline and case == "script"
+    ):
+        with pytest.raises(ConfigurationError):
+            _ = _validate_explicit(config, environment)
+    else:
+        assert _validate_explicit(config, environment) == []
 
 
 def test_retention_validation_uses_backend_capability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -392,12 +471,14 @@ def test_docker_retention_is_accepted_when_all_executable_steps_use_it() -> None
     assert _validate_explicit(config, environment) == []
 
 
-def test_mixed_profiles_reject_retention_for_local_step() -> None:
-    # Requirement: a single non-retaining step rejects run-global retention.
+def test_mixed_profiles_accept_retaining_local_and_docker_steps() -> None:
+    # Requirement: retaining local and Docker consumers may share one persistence policy.
     config = _config(_script("host", "local"), _script("box", "container"))
     config.workflow.workspace = WorkspaceConfig(persistence="durable")
     environment = _environment(
         {"local": ProfileDefinition(backend="local"), "container": _docker()}
     )
-    with pytest.raises(ConfigurationError, match="host.*local backend.*retained"):
-        _validate_explicit(config, environment)
+    warnings = _validate_explicit(config, environment)
+    assert len(warnings) == 1
+    manifest = compile_run_manifest(config, workflow_path=None, environment=environment)
+    assert {profile.backend for profile in manifest.profiles.values()} == {"local", "docker"}

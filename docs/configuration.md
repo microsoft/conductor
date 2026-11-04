@@ -1000,6 +1000,23 @@ Each profile under `profiles` supports:
 - `docker` (optional, object): Configuration options required when `backend: docker` is selected. Rejected when `backend` is not `docker`.
 - `aca` (optional, object): Configuration options required when `backend: aca` is selected. Rejected when `backend` is not `aca`.
 
+#### Retained local workspaces
+
+An ordinary `backend: local` profile can participate in a retained workspace.
+Opt in on the root workflow with `workflow.workspace.mode: shared` and
+`workflow.workspace.persistence: durable` or `on-failure`; there is no
+separate local profile flag. Only actual local script, agent, and direct MCP
+consumers participate. A profile that no step uses, or a technical local
+lease in a Docker-only run, doesn't create a retained local tree.
+
+The local and Docker realms have separate filesystems. Their context JSON
+outputs still pass between steps, but their file changes aren't synchronized.
+The local profile's environment inheritance setting remains in effect.
+Retained local execution isn't filesystem isolation: subprocesses still have
+the access granted by the host. See the
+[workspace lifecycle](workflow-syntax.md#workspace-lifecycle) and
+[local retained workspace design](design/local-retained-workspace.md).
+
 #### Docker Profile Configuration (`docker`)
 
 When a profile uses `backend: docker`, the `docker` block configures the container execution parameters:

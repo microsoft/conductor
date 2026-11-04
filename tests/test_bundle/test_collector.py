@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -21,13 +22,15 @@ from conductor.bundle.errors import (
     BundleSymlinkEscapeError,
 )
 from conductor.bundle.model import compute_bundle_digest
+from conductor.bundle.store import publish_bundle
 from conductor.config.schema import PluginDef
 from conductor.config.validator import _MAX_SUBWORKFLOW_VALIDATION_DEPTH
 from conductor.exceptions import ConfigurationError
 from conductor.executor.agent import _merge_skills
 from conductor.plugins.registry import resolve_plugins
 from conductor.registry.cache import CACHE_LAYOUT_VERSION, _readiness_marker_payload, _sentinel_path
-from conductor.skills.discovery import resolve_effective_skills
+from conductor.skills.discovery import DiscoverySource, resolve_effective_skills
+from conductor.skills.registry import ResolvedSkill, SkillPluginError, resolve_skill_plugin
 
 
 def _workflow(prompt: str, *, extra_workflow: str = "") -> str:
@@ -631,6 +634,358 @@ def test_assets_hidden_rules_and_additional_root(tmp_path: Path) -> None:
     root_entry = next(entry for entry in bundle.entries if entry.logical_path.endswith("data.txt"))
     assert root_entry.origin_detail == "asset:3;additional_root=00"
     assert str(outside.parent) not in root_entry.origin_detail
+
+
+def test_additional_root_is_permission_not_inclusion(tmp_path: Path) -> None:
+    # Requirement: granting a root never implicitly bundles its files or grants native ownership.
+    project = tmp_path / "project"
+    project.mkdir()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "not-selected.txt").write_bytes(b"not selected")
+    workflow = project / "workflow.yaml"
+    workflow.write_text(
+        _workflow("inline", extra_workflow="\n    additional_roots: [../shared]"),
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+
+    assert set(bundle.files) == {"tree/main/workflow.yaml"}
+    assert (str(shared), "roots/00") in bundle.source_roots
+    assert bundle.agent_paths == ()
+
+
+@pytest.mark.parametrize("provider", ["claude-agent-sdk", "copilot"])
+def test_standalone_native_skill_preserves_only_its_owning_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    # Requirement: native root loading retains the owner, not unselected sibling components.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    project = tmp_path / "project"
+    project.mkdir()
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    sibling = plugin / "skills" / "unselected"
+    sibling.mkdir()
+    (sibling / "SKILL.md").write_text(
+        "---\nname: unselected\ndescription: Test.\n---\n\nUnselected.\n", encoding="utf-8"
+    )
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks" / "unsafe.sh").write_bytes(b"exit 99")
+    skill = plugin / "skills" / "plugin-skill"
+    workflow = project / "workflow.yaml"
+    workflow.write_text(
+        _workflow("inline").replace(
+            "    prompt: inline",
+            f"    prompt: inline\n    provider: {provider}\n"
+            "    skills: [../plugin/skills/plugin-skill]",
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+    store = publish_bundle(bundle.manifest, bundle.files, bundle.links)
+    staged = store / "tree" / dict(bundle.agent_paths)[str(skill)]
+    owner = resolve_skill_plugin(staged)
+
+    assert (staged / "SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
+    if provider == "claude-agent-sdk":
+        assert owner is not None
+        assert owner.plugin_root == store / "tree/skills/plugin-skill/plugin"
+        assert dict(bundle.agent_paths)[str(plugin)] == "skills/plugin-skill/plugin"
+        assert bundle.manifest.plugins_topology == {
+            "review": "tree/skills/plugin-skill/plugin/.github/plugin/plugin.json"
+        }
+        assert set(bundle.files) == {
+            "tree/main/workflow.yaml",
+            "tree/skills/plugin-skill/plugin/.github/plugin/plugin.json",
+            "tree/skills/plugin-skill/plugin/skills/plugin-skill/SKILL.md",
+        }
+        assert resolve_plugins([PluginDef(name=str(owner.plugin_root))])[0].mcp_servers == {}
+    else:
+        assert owner is None
+        assert bundle.manifest.plugins_topology == {}
+        assert bundle.manifest.skills_topology == {
+            "plugin-skill": "tree/skills/plugin-skill/SKILL.md"
+        }
+
+
+@pytest.mark.parametrize("full_first", [False, True])
+@pytest.mark.parametrize(
+    "manifest_symlink",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                os.name == "nt", reason="Symlink semantics require POSIX privileges"
+            ),
+        ),
+    ],
+)
+def test_skill_only_owner_excludes_inline_components_when_another_agent_selects_full_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full_first: bool,
+    manifest_symlink: bool,
+) -> None:
+    # Requirement: a skill-only native owner stays narrow even when its full plugin is staged.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    plugin = tmp_path / "owner"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    manifest = {
+        "name": "owner",
+        "mcpServers": {"unselected": {"command": "NEVER_RUN_UNSELECTED"}},
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "NEVER_RUN_HOOK"}]}]},
+        "agents": ["../unselected-agent.md"],
+        "skills": ["../unselected-skill"],
+        "commands": {"unselected": "NEVER_RUN_COMMAND"},
+    }
+    manifest_path = plugin / ".claude-plugin/plugin.json"
+    source_manifest = json.dumps(manifest).encode()
+    if manifest_symlink:
+        (plugin / "manifest-source.json").write_bytes(source_manifest)
+        manifest_path.symlink_to("../manifest-source.json")
+    else:
+        manifest_path.write_bytes(source_manifest)
+    for name in ("task", "sibling"):
+        directory = plugin / "skills" / name
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Fixture.\n---\n\nSUCCESS is inert fixture data.\n",
+            encoding="utf-8",
+        )
+    (plugin / "agents").mkdir()
+    (plugin / "agents/reviewer.md").write_text(
+        "---\nname: reviewer\ndescription: Fixture.\n---\n\nReview.\n", encoding="utf-8"
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    skill_only = {
+        "name": "skill-only",
+        "prompt": "fixture",
+        "skills": ["../owner/skills/task"],
+        "plugins": [],
+        "routes": [{"to": "$end"}],
+    }
+    full = {
+        "name": "full",
+        "prompt": "fixture",
+        "skills": [],
+        "plugins": ["../owner"],
+        "routes": [{"to": "$end"}],
+    }
+    agents = [full, skill_only] if full_first else [skill_only, full]
+    agents.append(
+        {
+            "name": "sibling-only",
+            "prompt": "fixture",
+            "skills": ["../owner/skills/sibling"],
+            "plugins": [],
+            "routes": [{"to": "$end"}],
+        }
+    )
+    workflow = project / "workflow.yaml"
+    workflow.write_text(
+        json.dumps(
+            {
+                "workflow": {
+                    "name": "scoped-owner",
+                    "entry_point": agents[0]["name"],
+                    "runtime": {"provider": "claude-agent-sdk"},
+                },
+                "agents": agents,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+    store = publish_bundle(bundle.manifest, bundle.files, bundle.links)
+    tree = store / "tree"
+    selections = {dependency.step: dependency for dependency in bundle.agent_dependencies}
+    narrow = selections["skill-only"]
+    assert narrow.plugins == ()
+    assert [selected.name for selected in narrow.skills] == ["task"]
+    owner = resolve_skill_plugin(tree / narrow.skills[0].directory)
+    assert owner is not None
+    narrow_manifest = json.loads(
+        (owner.plugin_root / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+    resolved = resolve_plugins(
+        [PluginDef(name=str(owner.plugin_root))], base_dir=tree / "main", flavor="claude"
+    )[0]
+    assert resolved.mcp_servers == {}
+    assert narrow_manifest == {"name": "owner"}
+    assert not (owner.plugin_root / ".claude-plugin/plugin.json").is_symlink()
+    assert owner.qualified_name == "owner:task"
+    assert narrow.skills[0].owner_root == owner.plugin_root.relative_to(tree).as_posix()
+    assert resolved.agents == ()
+    assert [selected.name for selected in resolved.skills] == ["task"]
+    full_root = tree / selections["full"].plugins[0][1]
+    full_plugin = resolve_plugins(
+        [PluginDef(name=str(full_root))], base_dir=tree / "main", flavor="claude"
+    )[0]
+    assert owner.plugin_root != full_root
+    assert full_plugin.mcp_servers == manifest["mcpServers"]
+    assert len(full_plugin.agents) == 1
+    assert {selected.name for selected in full_plugin.skills} == {"task", "sibling"}
+    assert {selected.directory for selected in selections["full"].skills} == {
+        f"plugins/owner/skills/{name}" for name in ("task", "sibling")
+    }
+    full_manifest = json.loads(
+        (full_root / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+    assert not {"hooks", "commands", "agents", "skills"}.intersection(full_manifest)
+    sibling_owner = resolve_skill_plugin(tree / selections["sibling-only"].skills[0].directory)
+    assert sibling_owner is not None
+    assert sibling_owner.plugin_root not in {owner.plugin_root, full_root}
+    sibling_plugin = resolve_plugins([PluginDef(name=str(sibling_owner.plugin_root))])[0]
+    assert [selected.name for selected in sibling_plugin.skills] == ["sibling"]
+    assert sibling_plugin.mcp_servers == {}
+    assert sibling_plugin.agents == ()
+    assert manifest_path.read_bytes() == source_manifest
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_skill_owner_metadata_does_not_authorize_its_other_files(tmp_path: Path) -> None:
+    # Requirement: retaining an owning manifest does not widen the skill's filesystem grant.
+    project = tmp_path / "project"
+    project.mkdir()
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    (plugin / "private.txt").write_bytes(b"private")
+    (plugin / "skills/plugin-skill/private.txt").symlink_to("../../private.txt")
+    workflow = project / "workflow.yaml"
+    workflow.write_text(
+        _workflow("inline").replace(
+            "    prompt: inline",
+            "    prompt: inline\n    provider: claude-agent-sdk\n"
+            "    skills: [../plugin/skills/plugin-skill]",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleSymlinkEscapeError):
+        _collect(workflow)
+
+
+@pytest.mark.parametrize("discovered", [False, True])
+def test_native_skill_owner_rejects_permission_injection_without_widening_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, discovered: bool
+) -> None:
+    # Requirement: malformed native owner names fail declared skills but only skip discovery.
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    plugin = home / ".copilot"
+    _write_plugin(plugin)
+    (plugin / ".github/plugin/plugin.json").write_text(
+        '{"name":"review),Skill(*)"}', encoding="utf-8"
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    workflow = project / "workflow.yaml"
+    document = _workflow("inline").replace(
+        "    prompt: inline", "    provider: claude-agent-sdk\n    prompt: inline"
+    )
+    if discovered:
+        document = document.replace(
+            "  bundle: {}", "  runtime:\n    skill_discovery:\n      sources: [personal]"
+        )
+    else:
+        document = document.replace(
+            "    prompt: inline",
+            f"    prompt: inline\n    skills: [{json.dumps(str(plugin / 'skills/plugin-skill'))}]",
+        )
+    workflow.write_text(document, encoding="utf-8")
+
+    if discovered:
+        bundle = _collect(workflow)
+        assert bundle.manifest.skills_topology == {}
+        assert bundle.agent_dependencies[0].skills == ()
+    else:
+        with pytest.raises(SkillPluginError):
+            _collect(workflow)
+
+
+def test_personal_discovery_and_staged_bytes_are_frozen_across_agents_and_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: personal discovery runs once; later host additions and edits cannot leak in.
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "conductor-home"))
+    skill = home / ".copilot/skills/frozen"
+    skill.mkdir(parents=True)
+    original = b"---\nname: frozen\ndescription: Test.\n---\n\nOriginal.\n"
+    (skill / "SKILL.md").write_bytes(original)
+    project = tmp_path / "project"
+    child = project / "nested/child.yaml"
+    child.parent.mkdir(parents=True)
+    child.write_text(
+        _workflow("inline").replace(
+            "  bundle: {}", "  runtime:\n    skill_discovery:\n      sources: [personal]"
+        ),
+        encoding="utf-8",
+    )
+    workflow = project / "workflow.yaml"
+    workflow.write_text(
+        child.read_text(encoding="utf-8")
+        + "  - name: again\n    prompt: again\n    routes:\n      - to: child\n"
+        "  - name: child\n    type: workflow\n    workflow: nested/child.yaml\n"
+        "    routes:\n      - to: $end\n",
+        encoding="utf-8",
+    )
+    scans = 0
+    resolve = collector_module.resolve_effective_skills
+
+    def counted_resolve(
+        entries: Sequence[str],
+        *,
+        sources: Sequence[DiscoverySource],
+        exclude: Sequence[str],
+        base_dir: Path,
+        on_warning: Callable[[str], None],
+    ) -> list[ResolvedSkill]:
+        nonlocal scans
+        scans += bool(sources)
+        return resolve(
+            entries, sources=sources, exclude=exclude, base_dir=base_dir, on_warning=on_warning
+        )
+
+    collect_skill = collector_module._Collector._collect_skill
+    mutated = False
+
+    def mutate_after_staging(
+        collector: collector_module._Collector, selected: ResolvedSkill
+    ) -> None:
+        nonlocal mutated
+        collect_skill(collector, selected)
+        if not mutated:
+            mutated = True
+            (skill / "SKILL.md").write_bytes(original + b"host mutation")
+            late = skill.parent / "late"
+            late.mkdir()
+            (late / "SKILL.md").write_bytes(b"---\nname: late\ndescription: Late.\n---\n\nLate.\n")
+
+    monkeypatch.setattr(collector_module, "resolve_effective_skills", counted_resolve)
+    monkeypatch.setattr(collector_module._Collector, "_collect_skill", mutate_after_staging)
+
+    bundle = _collect(workflow)
+    store = publish_bundle(bundle.manifest, bundle.files, bundle.links)
+
+    assert scans == 1
+    assert (store / "tree/skills/frozen/SKILL.md").read_bytes() == original
+    assert set(bundle.manifest.skills_topology) == {"frozen"}
+    assert len(bundle.agent_dependencies) == 3
+    for dependencies in bundle.agent_dependencies:
+        assert [
+            (selected.name, selected.directory, selected.discovered)
+            for selected in dependencies.skills
+        ] == [("frozen", "skills/frozen", True)]
 
 
 def test_additional_root_origin_is_independent_of_host_path(

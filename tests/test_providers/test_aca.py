@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -633,8 +634,30 @@ class TestAcaConcurrencyIsolation:
 class TestAcaExecuteStreaming:
     """`execute()` — Branch S streaming transport (E3-T5)."""
 
+    async def test_managed_workspace_refused_before_payload(self, tmp_path: Path) -> None:
+        # Requirement: unsupported ownership fails nonretryably before any provider startup.
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        controller = LocalProcessScopeController(str(tmp_path), "unsupported-aca")
+        context = ManagedWorkspaceContext(str(tmp_path), "unsupported-aca", controller)
+        provider = object.__new__(AcaRuntimeProvider)
+        try:
+            with pytest.raises(ProviderError) as error:
+                await provider.execute(_agent(), {}, "hello", managed_workspace=context)
+            assert error.value.is_retryable is False
+            assert error.value.provider_name == "aca"
+            assert provider.CAPABILITIES is not None
+            assert not provider.CAPABILITIES.managed_local_workspace
+            assert controller.proofs == ()
+        finally:
+            assert (await controller.close()).status == "released"
+
+    @pytest.mark.parametrize("explicit_none", [False, True])
     @pytest.mark.asyncio
-    async def test_execute_relays_events_and_parses_result(self) -> None:
+    async def test_execute_relays_events_and_parses_result(self, explicit_none: bool) -> None:
+        # Requirement: explicit None preserves the legacy request, events and result.
         frames = [
             {"type": "agent_turn_start", "data": {"turn": "awaiting_model"}},
             {"type": "agent_message", "data": {"content": "hi"}},
@@ -663,14 +686,25 @@ class TestAcaExecuteStreaming:
 
         events: list[tuple[str, dict]] = []
         with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
-            output = await provider.execute(
-                agent=_agent(),
-                context={},
-                rendered_prompt="do the thing",
-                tools=["git"],
-                event_callback=lambda t, d: events.append((t, d)),
-            )
+            if explicit_none:
+                output = await provider.execute(
+                    agent=_agent(),
+                    context={},
+                    rendered_prompt="do the thing",
+                    tools=["git"],
+                    event_callback=lambda t, d: events.append((t, d)),
+                    managed_workspace=None,
+                )
+            else:
+                output = await provider.execute(
+                    agent=_agent(),
+                    context={},
+                    rendered_prompt="do the thing",
+                    tools=["git"],
+                    event_callback=lambda t, d: events.append((t, d)),
+                )
 
+        await provider.close()
         assert events == [
             ("agent_turn_start", {"turn": "awaiting_model"}),
             ("agent_message", {"content": "hi"}),
@@ -1844,6 +1878,35 @@ class TestAcaClose:
 
 class TestAcaDialogTurns:
     """`execute_dialog_turn()` is disabled with a clear error (OQ#5 fallback)."""
+
+    @pytest.mark.parametrize("managed", [False, True])
+    async def test_optional_dialog_context_preserves_refusal(
+        self, tmp_path: Path, managed: bool
+    ) -> None:
+        # Requirement: neither cwd parity nor ownership may bypass the sandbox refusal.
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        controller = LocalProcessScopeController(str(tmp_path), "unsupported-dialog")
+        context = ManagedWorkspaceContext(str(tmp_path), "unsupported-dialog", controller)
+        provider = object.__new__(AcaRuntimeProvider)
+        try:
+            with pytest.raises(ProviderError, match="dialog turn") as error:
+                await provider.execute_dialog_turn(
+                    "system",
+                    "hello",
+                    [],
+                    "model",
+                    managed_workspace=context if managed else None,
+                    working_dir=str(tmp_path) if managed else None,
+                )
+            assert error.value.is_retryable is False
+            assert provider.CAPABILITIES is not None
+            assert not provider.CAPABILITIES.working_dir
+            assert controller.proofs == ()
+        finally:
+            assert (await controller.close()).status == "released"
 
     @pytest.mark.asyncio
     async def test_execute_dialog_turn_raises_clear_provider_error(self) -> None:

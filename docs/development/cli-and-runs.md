@@ -120,6 +120,12 @@ Implementation parity:
   (`src/conductor/engine/event_log.py::EventLogSubscriber`, `existing_path`/`existing_run_id`),
   so a multi-resume session has one continuous log and one `run_id`.
 - Dashboard seeding and replay filtering on resume are specified in [dashboard](dashboard.md).
+- Both synchronous paths use `src/conductor/cli/async_runner.py::run_owned`. When managed cleanup
+  is quarantined, one additional 30-second episode covers remaining tasks, async generators, and
+  default executor shutdown together. Don't turn it into a per-resource timeout or claim that loop
+  close proves native release. Direct engine callers keep ownership of their own loop and foreign
+  tasks. The bounds assume a responsive loop; they don't guarantee interpreter exit.
+  See [local retained workspace design](../design/local-retained-workspace.md#ownership-and-shutdown).
 
 ### Background launch (`--web-bg`)
 

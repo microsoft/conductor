@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from jinja2 import Environment, nodes
+from pydantic import JsonValue, TypeAdapter
 
 from conductor.bundle.errors import (
     BundleCapsError,
@@ -48,9 +49,11 @@ from conductor.config.schema import (
     AgentDef,
     HumanGateStepDef,
     QuestionsStepDef,
+    SkillDiscoveryConfig,
     WorkflowConfig,
     WorkflowStepDef,
 )
+from conductor.digest import canonical_json
 from conductor.file_string import FileString
 from conductor.filesystem import is_dir_strict, is_file_strict, stat_or_none
 from conductor.plugins.errors import PluginFetchError, PluginSourceUnavailableError
@@ -71,7 +74,9 @@ from conductor.registry.cache import (
 )
 from conductor.registry.errors import RegistryError
 from conductor.registry.resolver import ResolvedRef, resolve_ref
-from conductor.skills import ResolvedSkill, resolve_effective_skills
+from conductor.skills import ResolvedSkill, SkillError, resolve_effective_skills
+from conductor.skills.discovery import DiscoverySource
+from conductor.skills.registry import SkillPlugin, resolve_skill_plugin
 
 WarningSink = Callable[[str], None]
 
@@ -94,6 +99,28 @@ _OriginKind = Literal[
 
 
 @dataclass(frozen=True)
+class CollectedSkill:
+    """A frozen skill selection, relative to the bundle's full ``tree/``."""
+
+    name: str
+    directory: str
+    discovered: bool
+    owner_root: str | None = None
+    """Exact staged owning root for this selection, never a host-path grant."""
+
+
+@dataclass(frozen=True)
+class CollectedAgentDependencies:
+    """Run-local dependency selection, never serialized into the content manifest."""
+
+    workflow: str
+    step: str
+    skills: tuple[CollectedSkill, ...]
+    plugins: tuple[tuple[str, str], ...]
+    for_each_group: str | None = None
+
+
+@dataclass(frozen=True)
 class CollectedBundle:
     """A bundle manifest, descriptor, payload, and root directory relative to ``tree/``."""
 
@@ -105,6 +132,7 @@ class CollectedBundle:
     root: str
     source_roots: tuple[tuple[str, str], ...]
     agent_paths: tuple[tuple[str, str], ...]
+    agent_dependencies: tuple[CollectedAgentDependencies, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +173,7 @@ class _Collector:
             str, tuple[Literal["declared", "discovered", "plugin"], ResolvedSkill]
         ] = {}
         self.plugins_topology: dict[str, str] = {}
+        self.plugin_roots: dict[str, Path] = {}
         self.registry_provenance: dict[str, RegistryProvenance] = {}
         self.plugin_provenance: dict[str, PluginProvenance] = {}
         self.incomplete: list[str] = []
@@ -152,6 +181,13 @@ class _Collector:
         self.nodes: list[_WorkflowNode] = []
         self.additional_roots: list[_AdditionalRoot] = []
         self.dependency_roots: set[Path] = set()
+        self.discovered_skills: dict[
+            tuple[Path | None, DiscoverySource], tuple[ResolvedSkill, ...]
+        ] = {}
+        self.agent_skills: dict[int, tuple[ResolvedSkill, ...]] = {}
+        self.skill_owners: dict[Path, SkillPlugin | None] = {}
+        self.agent_dependencies: list[CollectedAgentDependencies] = []
+        self.collected_dependencies: set[tuple[Path, str]] = set()
         self._total_bytes = 0
 
     def warn(self, message: str) -> None:
@@ -171,6 +207,7 @@ class _Collector:
             names=(self.root_workflow.name,),
         )
         self._prepare_additional_roots()
+        self._prepare_skills()
 
         for index, node in enumerate(self.nodes):
             self._collect_loader_graph(node, root=index == 0)
@@ -247,6 +284,7 @@ class _Collector:
                 (str(host), logical.removeprefix("tree/"))
                 for host, logical in sorted(self.agent_paths.items(), key=lambda item: str(item[0]))
             ),
+            agent_dependencies=tuple(self.agent_dependencies),
         )
 
     def _walk_subworkflows(
@@ -522,30 +560,18 @@ class _Collector:
                 self.warn(f"Plugin source {name!r} is not cached: {exc}")
 
         marketplaces = marketplaces_from(source_results)
-        steps = [*node.config.agents, *(group.agent for group in node.config.for_each)]
-        for step in steps:
-            if not isinstance(step, AgentDef):
-                continue
+        steps: list[tuple[str | None, AgentDef]] = [
+            (None, step) for step in node.config.agents if isinstance(step, AgentDef)
+        ]
+        steps.extend(
+            (group.name, group.agent)
+            for group in node.config.for_each
+            if isinstance(group.agent, AgentDef)
+        )
+        for group_name, step in steps:
             flavor = plugin_flavor_for(step.provider or runtime.provider.name)
-            if step.skills is None:
-                skill_entries = list(runtime.skills)
-                discovery = runtime.skill_discovery
-                sources = tuple(discovery.sources)
-                exclude = tuple(discovery.exclude)
-            else:
-                skill_entries = list(step.skills)
-                sources = ()
-                exclude = ()
-            if skill_entries or sources:
-                skills = resolve_effective_skills(
-                    skill_entries,
-                    sources=sources,
-                    exclude=exclude,
-                    base_dir=node.path.parent,
-                    on_warning=self.warn,
-                )
-                for skill in skills:
-                    self._collect_skill(skill)
+            for skill in self.agent_skills[id(step)]:
+                self._collect_skill(skill)
 
             plugin_entries = (
                 list(step.plugins) if step.plugins is not None else list(runtime.plugins)
@@ -556,29 +582,169 @@ class _Collector:
                     for entry in plugin_entries
                     if not self._uses_unavailable_source(entry.name, unavailable)
                 ]
-            if not plugin_entries:
-                continue
-            try:
-                plugins = resolve_plugins(
-                    plugin_entries,
-                    base_dir=node.path.parent,
-                    marketplaces=marketplaces,
-                    declared_sources=unavailable,
-                    flavor=flavor,
-                    on_warning=self.warn,
-                )
-            except PluginSourceUnavailableError:
-                continue
+            plugins: list[ResolvedPlugin] = []
+            if plugin_entries:
+                try:
+                    plugins = resolve_plugins(
+                        plugin_entries,
+                        base_dir=node.path.parent,
+                        marketplaces=marketplaces,
+                        declared_sources=unavailable,
+                        flavor=flavor,
+                        on_warning=self.warn,
+                    )
+                except PluginSourceUnavailableError:
+                    continue
             for plugin in plugins:
                 self._collect_plugin(plugin, flavor, source_results)
+            effective_skills = {
+                skill.name: CollectedSkill(
+                    skill.name,
+                    self.agent_paths[skill.directory].removeprefix("tree/"),
+                    skill.discovered,
+                    self._skill_owner_root(skill),
+                )
+                for skill in self.agent_skills[id(step)]
+            }
+            for plugin in plugins:
+                for skill in plugin.skills:
+                    previous = effective_skills.get(skill.name)
+                    if previous is None or previous.discovered:
+                        relative = skill.directory.relative_to(plugin.root).as_posix()
+                        effective_skills[skill.name] = CollectedSkill(
+                            skill.name,
+                            f"plugins/{plugin.name}/{relative}",
+                            False,
+                            f"plugins/{plugin.name}",
+                        )
+            self.agent_dependencies.append(
+                CollectedAgentDependencies(
+                    workflow=self._local_logical_path(node.path)[0].removeprefix("tree/"),
+                    step=step.name,
+                    skills=tuple(effective_skills.values()),
+                    plugins=tuple(
+                        (plugin.source, self.agent_paths[plugin.root].removeprefix("tree/"))
+                        for plugin in plugins
+                    ),
+                    for_each_group=group_name,
+                )
+            )
 
     @staticmethod
     def _uses_unavailable_source(entry: str, unavailable: set[str]) -> bool:
         return "@" in entry and entry.rsplit("@", 1)[1] in unavailable
 
+    def _prepare_skills(self) -> None:
+        """Resolve the run's skills before assigning any dependency namespaces."""
+        for node in self.nodes:
+            runtime = node.config.workflow.runtime
+            for step in [*node.config.agents, *(group.agent for group in node.config.for_each)]:
+                if not isinstance(step, AgentDef):
+                    continue
+                entries = list(runtime.skills if step.skills is None else step.skills)
+                discovery = (
+                    runtime.skill_discovery if step.skills is None else SkillDiscoveryConfig()
+                )
+                skills = self._resolve_skills(entries, discovery, node.path.parent)
+                if plugin_flavor_for(step.provider or runtime.provider.name) == "claude":
+                    usable: list[ResolvedSkill] = []
+                    for skill in skills:
+                        try:
+                            if skill.directory not in self.skill_owners:
+                                self.skill_owners[skill.directory] = resolve_skill_plugin(
+                                    skill.directory
+                                )
+                        except SkillError as exc:
+                            if not skill.discovered:
+                                raise
+                            self.warn(f"Discovered skill {skill.name!r} was not enabled: {exc}")
+                            continue
+                        usable.append(skill)
+                    skills = usable
+                self.agent_skills[id(step)] = tuple(skills)
+        for skills in self.agent_skills.values():
+            for skill in skills:
+                namespace = f"tree/skills/{skill.name}"
+                owner = self.skill_owners.get(skill.directory)
+                if owner is not None:
+                    relative = Path(os.path.realpath(skill.directory)).relative_to(
+                        owner.plugin_root
+                    )
+                    namespace = f"tree/{self._skill_owner_root(skill)}/{relative.as_posix()}"
+                self.agent_paths[skill.directory] = namespace
+
+    def _resolve_skills(
+        self, entries: list[str], discovery: SkillDiscoveryConfig, base_dir: Path
+    ) -> list[ResolvedSkill]:
+        """Freeze discovery per source, keeping declaration and exclusion precedence."""
+        skills = resolve_effective_skills(
+            entries, sources=(), exclude=(), base_dir=base_dir, on_warning=self.warn
+        )
+        claimed = {skill.name: skill for skill in skills}
+        sources: tuple[DiscoverySource, ...] = ("project", "personal")
+        for source in sources:
+            if source not in discovery.sources:
+                continue
+            key = (base_dir if source == "project" else None, source)
+            if key not in self.discovered_skills:
+                self.discovered_skills[key] = tuple(
+                    resolve_effective_skills(
+                        [],
+                        sources=[source],
+                        exclude=(),
+                        base_dir=base_dir,
+                        on_warning=self.warn,
+                    )
+                )
+            for skill in self.discovered_skills[key]:
+                if skill.name in discovery.exclude:
+                    continue
+                previous = claimed.get(skill.name)
+                if previous is not None:
+                    if previous.directory != skill.directory:
+                        self.warn(
+                            f"Skill {skill.name!r} from {skill.source!r} is shadowed by "
+                            f"{previous.source!r} and was not enabled."
+                        )
+                    continue
+                claimed[skill.name] = skill
+                skills.append(skill)
+        return skills
+
+    def _skill_owner_root(self, skill: ResolvedSkill) -> str | None:
+        """Return the per-skill native projection, separate from full plugin roots."""
+        return f"skills/{skill.name}/plugin" if self.skill_owners.get(skill.directory) else None
+
+    def _claim_plugin_root(self, name: str, root: Path) -> None:
+        """Keep a canonical plugin name tied to one source root across projections."""
+        previous = self.plugin_roots.setdefault(name, root)
+        if previous != root:
+            raise BundleError(f"Two resolved plugins named {name!r} have different source roots.")
+
     def _collect_skill(self, skill: ResolvedSkill) -> None:
-        namespace = f"tree/skills/{skill.name}"
-        self.agent_paths[Path(os.path.abspath(skill.directory))] = namespace
+        namespace = self.agent_paths[skill.directory]
+        owner = self.skill_owners.get(skill.directory)
+        if owner is not None:
+            self._claim_plugin_root(owner.plugin_name, owner.plugin_root)
+            owner_namespace = f"tree/{self._skill_owner_root(skill)}"
+            manifest = find_manifest(owner.plugin_root)
+            if manifest is None:
+                raise BundleError(f"Skill owning plugin has no manifest at {owner.plugin_root}")
+            manifest_logical = (
+                f"{owner_namespace}/{manifest.relative_to(owner.plugin_root).as_posix()}"
+            )
+            # Native qualification needs identity, not executable declarations.
+            # A private root prevents another agent's plugin selection widening it.
+            self.dependency_roots.add(manifest)
+            _ = self.agent_paths.setdefault(owner.plugin_root, owner_namespace)
+            self._stage(
+                manifest,
+                manifest_logical,
+                "skill",
+                f"skill-owner:{owner.plugin_name}",
+                contents=canonical_json({"name": owner.plugin_name}).encode("utf-8"),
+            )
+            _ = self.plugins_topology.setdefault(owner.plugin_name, manifest_logical)
         self.dependency_roots.add(skill.directory)
         detail = f"skill-discovery:{skill.name}" if skill.discovered else f"skill:{skill.name}"
         self._collect_dependency_tree(
@@ -591,6 +757,13 @@ class _Collector:
         )
         topology = f"{namespace}/SKILL.md"
         previous = self.skill_claims.get(skill.name)
+        if previous is not None and previous[1].directory == skill.directory:
+            self.skills_topology[skill.name] = topology
+            self.skill_claims[skill.name] = (
+                "discovered" if skill.discovered else "declared",
+                skill,
+            )
+            return
         if previous is not None and previous[0] == "plugin":
             plugin_skill = previous[1]
             if plugin_skill.directory != skill.directory:
@@ -620,6 +793,7 @@ class _Collector:
             raise BundleError(f"Resolved plugin {plugin.name!r} has no manifest at {plugin.root}")
         actual_flavor = manifest_flavor(manifest, plugin.root)
         namespace = f"tree/plugins/{plugin.name}"
+        self._claim_plugin_root(plugin.name, plugin.root)
         self.agent_paths[Path(os.path.abspath(plugin.root))] = namespace
         self.dependency_roots.add(plugin.root)
         matching_source = next(
@@ -638,11 +812,12 @@ class _Collector:
         else:
             origin, sha = "installed", None
         origin_detail = f"plugin-{origin}:{plugin.name}"
-        selected: set[Path] = set()
+        manifests: set[Path] = set()
         for relative in PLUGIN_MANIFESTS:
             candidate = plugin.root / relative
             if is_file_strict(candidate):
-                selected.add(candidate)
+                manifests.add(candidate)
+        selected = set(manifests)
         if plugin.mcp_servers and plugin.mcp_source is not None:
             selected.add(plugin.mcp_source)
             if not plugin.mcp_source.is_relative_to(plugin.root):
@@ -658,6 +833,22 @@ class _Collector:
             mapping_root, mapping_namespace = self._plugin_dependency_mapping(
                 path, plugin.root, namespace, logical
             )
+            if path in manifests:
+                parsed = TypeAdapter(dict[str, JsonValue]).validate_json(path.read_bytes())
+                removed = {"hooks", "commands", "agents", "skills", "lspServers", "outputStyles"}
+                if not plugin.mcp_servers:
+                    removed.add("mcpServers")
+                if removed.intersection(parsed):
+                    for field in removed:
+                        _ = parsed.pop(field, None)
+                    self._stage(
+                        path,
+                        logical,
+                        "plugin",
+                        origin_detail,
+                        contents=canonical_json(parsed).encode("utf-8"),
+                    )
+                    continue
             self._collect_dependency_tree(
                 path,
                 logical,
@@ -668,7 +859,7 @@ class _Collector:
             )
         for skill in plugin.skills:
             skill_namespace = f"{namespace}/{skill.directory.relative_to(plugin.root).as_posix()}"
-            self.agent_paths[Path(os.path.abspath(skill.directory))] = skill_namespace
+            _ = self.agent_paths.setdefault(Path(os.path.abspath(skill.directory)), skill_namespace)
             self._collect_dependency_tree(
                 skill.directory,
                 skill_namespace,
@@ -678,7 +869,7 @@ class _Collector:
                 detail=origin_detail,
             )
         manifest_logical = f"{namespace}/{manifest.relative_to(plugin.root).as_posix()}"
-        self._set_topology(self.plugins_topology, plugin.name, manifest_logical, "plugin")
+        self.plugins_topology[plugin.name] = manifest_logical
         for skill in plugin.skills:
             self._set_plugin_skill_topology(
                 skill,
@@ -761,6 +952,9 @@ class _Collector:
         active_directories: tuple[Path, ...] = (),
     ) -> None:
         normalized = Path(os.path.abspath(os.path.normpath(path)))
+        collected_key = (normalized, logical_path)
+        if collected_key in self.collected_dependencies:
+            return
         if normalized.is_symlink():
             target = Path(os.path.realpath(normalized))
             if not self._inside_authorized_root(target):
@@ -793,6 +987,7 @@ class _Collector:
                 detail=detail,
                 active_directories=active_directories,
             )
+            self.collected_dependencies.add(collected_key)
             return
 
         if is_dir_strict(normalized):
@@ -817,9 +1012,11 @@ class _Collector:
                     detail=detail,
                     active_directories=active,
                 )
+            self.collected_dependencies.add(collected_key)
             return
 
         self._stage(normalized, logical_path, kind, detail)
+        self.collected_dependencies.add(collected_key)
 
     def _collect_local_path(
         self,
@@ -935,11 +1132,12 @@ class _Collector:
         *,
         mapping_root: Path | None = None,
         mapping_namespace: str | None = None,
+        contents: bytes | None = None,
     ) -> None:
         normalized = Path(os.path.abspath(os.path.normpath(path)))
         self._assert_authorized(normalized)
         logical = PurePosixPath(logical_path).as_posix()
-        if normalized.is_symlink():
+        if normalized.is_symlink() and contents is None:
             resolved_target = Path(os.path.realpath(normalized))
             if not self._inside_authorized_root(resolved_target):
                 raise BundleSymlinkEscapeError(
@@ -968,7 +1166,7 @@ class _Collector:
             info = stat_or_none(normalized)
             if info is None or not stat.S_ISREG(info.st_mode):
                 raise BundleError(f"Bundle dependency is not a regular file: {normalized}")
-            raw = normalized.read_bytes()
+            raw = normalized.read_bytes() if contents is None else contents
             entry = BundleEntry(
                 logical_path=logical,
                 kind="file",

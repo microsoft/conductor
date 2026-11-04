@@ -9,9 +9,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
+import os
+import stat
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, get_args
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypedDict, get_args
 from uuid import uuid4
 
 from conductor.exceptions import ConfigurationError, ExecutionError, ValidationError
@@ -23,6 +27,7 @@ from conductor.execution import (
     RunnerBackend,
     WorkspaceLease,
 )
+from conductor.execution.types import LocalWorkspaceBinding, ManagedWorkspaceContext
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
 from conductor.mcp_auth import resolve_mcp_servers
@@ -33,6 +38,10 @@ from conductor.skills import BYTES_PER_TOKEN_ESTIMATE
 from conductor.templating import is_jinja_template
 
 logger = logging.getLogger(__name__)
+
+
+class _ManagedKwargs(TypedDict, total=False):
+    managed_workspace: ManagedWorkspaceContext
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -51,8 +60,8 @@ def _verbose_log_section(title: str, content: str) -> None:
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
-    from pathlib import Path
 
+    from conductor.bundle.collector import CollectedAgentDependencies
     from conductor.config.schema import (
         AgentDef,
         PluginDef,
@@ -218,6 +227,8 @@ class AgentExecutor:
         remote_provider_type: ProviderName | None = None,
         remote_runtime: RuntimeConfig | None = None,
         remote_mcp_servers: dict[str, Any] | None = None,
+        managed_binding: LocalWorkspaceBinding | None = None,
+        managed_dependencies: CollectedAgentDependencies | None = None,
     ) -> None:
         """Initialize the AgentExecutor.
 
@@ -226,6 +237,8 @@ class AgentExecutor:
             remote_provider_type: Provider identity resolved before dispatch into a remote realm.
             remote_runtime: Effective runtime used to configure the remote provider.
             remote_mcp_servers: MCP servers the registry would give that provider locally.
+            managed_binding: Runtime-only binding from the original prepared local lease.
+            managed_dependencies: Exact frozen workflow/step/group selection for this executor.
             workflow_tools: Tools defined at workflow level. Defaults to empty list.
             instructions_preamble: Optional workspace instructions text to prepend
                 to every agent's rendered prompt.
@@ -260,6 +273,10 @@ class AgentExecutor:
         if provider is None and (remote_provider_type is None or remote_runtime is None):
             raise ValueError("Remote executor requires provider identity and runtime configuration")
         self.provider = provider
+        self._managed_binding = managed_binding
+        self._managed_dependencies = managed_dependencies
+        if (managed_binding is None) != (managed_dependencies is None):
+            raise ConfigurationError("Managed agents require both binding and frozen selection.")
         self._remote_provider_type = remote_provider_type
         self._remote_runtime = remote_runtime
         self._remote_mcp_servers = remote_mcp_servers
@@ -469,6 +486,30 @@ class AgentExecutor:
         # learn from rendering a prompt or calling a model first.
         self._reject_unsupported_session_key(agent)
         self._reject_unsupported_settings_dir(agent)
+        if self._managed_binding is not None:
+            if (
+                not isinstance(execution_backend, LocalRunnerBackend)
+                or workspace_lease is None
+                or execution_backend.local_workspace_binding(workspace_lease)
+                is not self._managed_binding
+            ):
+                raise ConfigurationError(
+                    "Managed agent requires its original prepared local lease."
+                )
+            capabilities = self._capabilities
+            if (
+                capabilities is None
+                or not capabilities.working_dir
+                or not capabilities.managed_local_workspace
+            ):
+                raise ConfigurationError(
+                    "Managed local agents require working_dir and managed_local_workspace support."
+                )
+            self._managed_binding.runtime_context.process_scopes.check_admission()
+            # Resolve before prompt construction, including on continuation calls.
+            # No managed resolution is memoized: topology and live files can change
+            # independently of the host executor's immutable resolution caches.
+            _ = self._resolve_skills_for_agent(agent)
 
         # Render model field if it contains template expressions
         if is_jinja_template(agent.model):
@@ -645,6 +686,10 @@ class AgentExecutor:
                 suggestion="Select an agent-capable execution profile.",
             )
 
+        managed_kwargs: _ManagedKwargs = {}
+        if self._managed_binding is not None:
+            managed_kwargs["managed_workspace"] = self._managed_binding.runtime_context
+
         async def execute_provider() -> AgentOutput:
             if self.provider is None:
                 raise ConfigurationError("Remote executor cannot execute an agent on the host.")
@@ -659,6 +704,7 @@ class AgentExecutor:
                 custom_agents=custom_agents,
                 extra_mcp_servers=extra_mcp_servers,
                 continuation_state=continuation_state,
+                **managed_kwargs,
             )
 
         if execution_backend is None:
@@ -963,11 +1009,60 @@ class AgentExecutor:
         discovery = (
             self._skill_discovery if not overridden and self._skill_discovery.is_enabled else None
         )
-        if not entries and discovery is None:
+        if not entries and discovery is None and self._managed_dependencies is None:
             return []
         self._reject_unsupported_skills(agent, entries, discovery is not None)
         if discovery is not None:
             self._reject_discovery_without_native_skills(agent, discovery)
+        if self._managed_dependencies is not None:
+            from conductor.skills.frontmatter import read_skill_frontmatter
+            from conductor.skills.registry import ResolvedSkill, resolve_skill_plugin
+
+            resolved: list[ResolvedSkill] = []
+            for selected in self._managed_dependencies.skills:
+                directory = self._managed_directory(selected.directory)
+                manifest = read_skill_frontmatter(directory)
+                if manifest.name != selected.name or directory.name != selected.name:
+                    raise ConfigurationError("Managed skill no longer matches its frozen name.")
+                if self._plugin_root:
+                    owner = (
+                        self._managed_directory(selected.owner_root)
+                        if selected.owner_root is not None
+                        else None
+                    )
+                    plugin = resolve_skill_plugin(directory)
+                    if plugin is None or plugin.plugin_root != owner:
+                        raise ConfigurationError("Managed skill has no matching selected owner.")
+                    if selected.owner_root is not None and selected.owner_root.startswith(
+                        "skills/"
+                    ):
+                        # A private projection cannot alias a sibling's full plugin.
+                        assert self._managed_binding is not None
+                        if owner != Path(self._managed_binding.work_root) / selected.owner_root:
+                            raise ConfigurationError("Managed skill owner projection was replaced.")
+                        from conductor.plugins.manifest import find_manifest
+
+                        assert owner is not None
+                        manifest_path = find_manifest(owner)
+                        assert manifest_path is not None
+                        if json.loads(manifest_path.read_text(encoding="utf-8")) != {
+                            "name": plugin.plugin_name
+                        }:
+                            raise ConfigurationError("Managed skill owner is not identity-only.")
+                        for path in owner.rglob("*"):
+                            if (
+                                path != manifest_path
+                                and not path.is_relative_to(directory)
+                                and path not in directory.parents
+                                and path not in manifest_path.parents
+                            ):
+                                raise ConfigurationError(
+                                    "Managed skill owner exposes extra components."
+                                )
+                resolved.append(
+                    ResolvedSkill(selected.name, directory, selected.directory, selected.discovered)
+                )
+            return resolved
         return self._resolve_skills(entries, discovery)
 
     def _merge_skills_and_plugin_skills(
@@ -979,6 +1074,9 @@ class AgentExecutor:
         so the two sets are combined here — see :func:`_merge_skills` for
         how a name claimed by both is resolved.
         """
+        if self._managed_dependencies is not None:
+            # The collector already froze declared > plugin > discovered precedence.
+            return self._resolve_skills_for_agent(agent)
         return _merge_skills(
             self._resolve_skills_for_agent(agent),
             plugin_skills,
@@ -1014,11 +1112,99 @@ class AgentExecutor:
             return []
         self._reject_unsupported_plugins(agent, entries)
         self._reject_unfilterable_agents(agent, entries)
+        if self._managed_dependencies is not None:
+            from conductor.plugins.registry import resolve_plugins
+
+            assert self._managed_binding is not None
+            selected = dict(self._managed_dependencies.plugins)
+            if set(selected) != {entry.name for entry in entries}:
+                raise ConfigurationError("Managed plugins do not match their frozen selection.")
+            capabilities = self._capabilities
+            flavor = capabilities.plugin_flavor if capabilities is not None else None
+            work = Path(self._managed_binding.work_root).resolve(strict=True)
+
+            def map_mcp_source(root: Path, source: Path) -> Path:
+                # Only the manifest's typed config-file path is translated.
+                # Command, argv, env and tool strings remain opaque authored data.
+                assert self._managed_binding is not None
+                if not source.is_relative_to(work):
+                    namespace = root.relative_to(work).as_posix()
+                    origins = [
+                        host
+                        for host, staged in self._managed_binding.bundle.agent_paths
+                        if staged == namespace
+                    ]
+                    if len(origins) != 1:
+                        raise ConfigurationError("Managed plugin has no unique source translation.")
+                    try:
+                        source = root / os.path.relpath(source, origins[0])
+                    except ValueError as exc:
+                        raise ConfigurationError(
+                            "Managed plugin MCP source cannot be translated."
+                        ) from exc
+                candidate = Path(os.path.abspath(source))
+                if not candidate.is_relative_to(work):
+                    raise ConfigurationError("Managed plugin MCP source escapes its work tree.")
+                try:
+                    resolved_source = candidate.resolve(strict=True)
+                    if not resolved_source.is_relative_to(work) or not stat.S_ISREG(
+                        resolved_source.stat().st_mode
+                    ):
+                        raise ConfigurationError("Managed plugin MCP source is not a staged file.")
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise ConfigurationError("Managed plugin MCP source is unavailable.") from exc
+                return resolved_source
+
+            staged = [
+                entry.model_copy(
+                    update={"name": str(self._managed_directory(selected[entry.name]))}
+                )
+                for entry in entries
+            ]
+            resolved = resolve_plugins(
+                staged,
+                home=Path(self._managed_binding.work_root),
+                flavor=flavor,
+                mcp_source_mapper=map_mcp_source,
+                on_warning=lambda message: _verbose_log(f"  Plugins: {message}", style="yellow"),
+            )
+            self._report_dropped(resolved)
+            return resolved
         resolved = self._resolve_plugins(entries)
         # Reported here rather than inside the memoized resolve, so a second
         # agent naming the same plugin is told about its dropped components too.
         self._report_dropped(resolved)
         return resolved
+
+    def _managed_directory(self, namespace: str) -> Path:
+        """Check selected directories and every live descendant before readers run."""
+        from conductor.engine.local_workspace import LocalWorkspacePathMapper
+
+        assert self._managed_binding is not None
+        directory = Path(
+            LocalWorkspacePathMapper(self._managed_binding).map_selected_directory(namespace)
+        )
+        work = Path(self._managed_binding.work_root).resolve(strict=True)
+        try:
+            pending = [directory]
+            checked: set[Path] = set()
+            while pending:
+                path = pending.pop().resolve(strict=True)
+                if not path.is_relative_to(work):
+                    raise ConfigurationError("Managed dependency escapes its work tree.")
+                if path in checked:
+                    continue
+                checked.add(path)
+                mode = path.stat().st_mode
+                if stat.S_ISDIR(mode):
+                    pending.extend(path.iterdir())
+                elif not stat.S_ISREG(mode):
+                    raise ConfigurationError(
+                        "Managed dependency is not a regular file or directory."
+                    )
+        except (OSError, RuntimeError) as exc:
+            raise ConfigurationError("Managed dependency is missing or unreadable.") from exc
+        return directory
 
     def _reject_unfilterable_agents(self, agent: AgentDef, entries: list[PluginDef]) -> None:
         """Refuse ``agents: false`` where the provider cannot honour it.
@@ -1365,7 +1551,10 @@ class AgentExecutor:
             if resolved:
                 from conductor.skills import load_skill_content
 
-                content = load_skill_content([(item.name, item.directory) for item in resolved])
+                content = load_skill_content(
+                    [(item.name, item.directory) for item in resolved],
+                    cache=self._managed_binding is None,
+                )
                 if content:
                     self._enforce_injection_budget(agent, resolved, content, event_callback)
                     parts.append(content)

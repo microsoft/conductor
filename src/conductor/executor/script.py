@@ -99,6 +99,7 @@ class ScriptExecutor:
         inherit_control_environment: bool = True,
         attempt_id: str | None = None,
         on_dispatch: Callable[[], None] | None = None,
+        working_directory_mapper: Callable[[str | None], str] | None = None,
     ) -> ScriptOutput:
         """Execute a script step.
 
@@ -139,6 +140,8 @@ class ScriptExecutor:
             attempt_id: Optional attempt identity carried into CommandSpec.
             on_dispatch: Optional callback forwarded to the backend, which invokes
                 it only when command process creation is about to begin.
+            working_directory_mapper: Optional mapping and validation of the
+                already-rendered working directory before command dispatch.
 
         Returns:
             :class:`ScriptOutput` with stdout, stderr, exit_code, and stdin_bytes.
@@ -155,6 +158,8 @@ class ScriptExecutor:
         rendered_working_dir = (
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
         )
+        if working_directory_mapper is not None:
+            rendered_working_dir = working_directory_mapper(rendered_working_dir)
         # Declared ``env`` values pass through verbatim — they are NOT
         # Jinja-rendered, matching the long-standing contract. Secret
         # deliveries merge on top verbatim as well (a secret value containing

@@ -285,6 +285,44 @@ async def test_inputs_panel_scrubs_before_serialization(
 class TestEscapingExceptionSink:
     """Any exception escaping run/resume has its CLI-rendered fields scrubbed."""
 
+    @pytest.mark.parametrize("resume", [False, True])
+    async def test_exception_group_messages_and_children_are_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume: bool
+    ) -> None:
+        # Requirement: immutable group messages and nested diagnostics stay scrubbed after cleanup.
+        import traceback
+
+        from conductor.cli.run import resume_workflow_async, run_workflow_async
+
+        secret = "nested-exception-group-secret"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        leaf = ConfigurationError(secret, suggestion=secret, file_path=secret)
+        nested = ExceptionGroup(secret, [RuntimeError(secret)])
+        failure = ExceptionGroup(secret, [leaf, nested])
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as engine_cls,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(side_effect=failure)
+            engine.resume = AsyncMock(side_effect=failure)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(registry_cls, engine_cls, engine)
+            with pytest.raises(ExceptionGroup) as raised:
+                if resume:
+                    await resume_workflow_async(
+                        workflow_path=path,
+                        checkpoint_path=_write_checkpoint(tmp_path, path),
+                        environment="demo",
+                    )
+                else:
+                    await run_workflow_async(path, {}, environment="demo")
+        assert raised.value.exceptions[0] is leaf
+        assert secret not in "".join(traceback.format_exception(raised.value))
+        assert REDACTED_MARKER in str(raised.value)
+
     @pytest.mark.asyncio
     async def test_run_configuration_error_structured_fields_are_scrubbed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
