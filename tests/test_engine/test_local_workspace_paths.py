@@ -65,7 +65,8 @@ def test_absolute_live_child(binding: LocalWorkspaceBinding) -> None:
     )
 
 
-@pytest.mark.parametrize("value", ["new", "{{ 6 * 7 }}"])
+# Requirement: Jinja expression uses Windows-valid chars (no wildcard '*') evaluating to 42.
+@pytest.mark.parametrize("value", ["new", "{{ 6 + 36 }}"])
 def test_render_once_boundary(binding: LocalWorkspaceBinding, value: str) -> None:
     # Requirement: executors render once; a resulting template expression remains path data.
     main = Path(binding.work_root) / "main"

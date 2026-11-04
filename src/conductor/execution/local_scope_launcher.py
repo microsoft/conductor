@@ -624,7 +624,7 @@ if sys.platform == "win32":
                 startup.hStdInput, startup.hStdOutput, startup.hStdError = handles
                 startup.lpAttributeList = {"handle_list": handles}
                 process, thread, _pid, _tid = _winapi.CreateProcess(
-                    argv[0],
+                    None,
                     subprocess.list2cmdline(argv),
                     None,
                     None,
