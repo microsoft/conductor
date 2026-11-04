@@ -56,6 +56,7 @@ class _RemoteBackend(LocalRunnerBackend):
     """In-memory agent backend for testing dispatch without a daemon."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.specs: list[AgentSpec] = []
 
     def capabilities(self) -> RunnerCapabilities:

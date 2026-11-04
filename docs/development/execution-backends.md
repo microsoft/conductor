@@ -25,33 +25,34 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 - The package is stdlib-only (it may import only the stdlib and `conductor.execution.*`). Bundle
   materialization lives in `src/conductor/engine/bundle_prep.py` precisely so the seam stays
   transport-neutral.
-- Outcomes are data-shaped (`src/conductor/execution/types.py::CommandResult`): a non-zero exit is
-  `outcome="completed"` with `exit_code` (data for routing), a timeout is `"timed_out"`.
-  Cancellation is NEVER an outcome: it propagates as `asyncio.CancelledError`, only after the
-  backend has killed and reaped its child.
-- `run_command` drains the child with a shielded `communicate()` task
-  (`asyncio.wait_for(asyncio.shield(task), timeout)`). Both teardown paths (timeout and outer
-  cancellation) MUST go through `_kill_and_reap`, which kills the child, then awaits the
-  still-running drain and a shielded `process.wait()`. Never cancel `communicate()` and then
-  `wait()`: cancelling pauses the pipe transports and a dead child with full pipe buffers can
-  wedge the reap.
-- `_kill_and_reap` returns whether it absorbed a racing cancellation; the caller MUST re-raise it
-  (or convert a `timed_out` result back into `CancelledError`). Never swallow cancellation into a
-  data-shaped outcome. Both `src/conductor/execution/local.py` and
-  `src/conductor/execution/docker.py` implement this.
-- Docker only, Windows only: `src/conductor/execution/docker.py::_kill_and_reap` first runs a
-  best-effort `taskkill /PID <pid> /T /F` bounded by `_WINDOWS_TREE_KILL_TIMEOUT_SECONDS`, because
-  a wrapper shim (`docker.cmd` via `cmd.exe`) leaves the workload in a grandchild that holds the
-  pipes open. The local backend has no tree kill.
+- Command outcomes (`src/conductor/execution/types.py::CommandResult`) are data-shaped:
+  `outcome="completed"` includes an `exit_code`, which may be non-zero, and `"timed_out"`
+  denotes a timeout. Cancellation is never an outcome: `asyncio.CancelledError` propagates
+  after backend teardown.
+- For legacy local commands and Docker CLI subprocesses, output is drained by a shielded
+  `communicate()` task (`asyncio.wait_for(asyncio.shield(task), timeout)`). On timeout or
+  outer cancellation, both paths MUST use `_kill_and_reap`. It kills the child, awaits the
+  ongoing drain and a shielded `process.wait()`. Never cancel `communicate()` before `wait()`:
+  this pauses pipe transports, so full buffers can block reaping even after the child dies.
+- In these two subprocess paths, `_kill_and_reap` reports whether it absorbed a racing
+  cancellation. The caller MUST re-raise it, including instead of returning `timed_out`.
+  Never turn cancellation into a data-shaped outcome.
+- For Docker CLI subprocesses on Windows only, `src/conductor/execution/docker.py::_kill_and_reap`
+  first runs a best-effort `taskkill /PID <pid> /T /F`, bounded by
+  `_WINDOWS_TREE_KILL_TIMEOUT_SECONDS`. A wrapper shim (`docker.cmd` via `cmd.exe`) can leave
+  the workload in a grandchild holding the pipes open. The legacy local path has no tree kill.
+  Managed retained local uses its [own controller and custody](#retained-local-backend);
+  an unconfirmed release leaves the workspace in place.
 - `ScriptExecutor` (`src/conductor/executor/script.py`) requires the backend's `batch` capability
   at construction and per call. It keeps `import os` / `import shutil` as patch anchors for
   legacy tests; do not remove them as unused.
 - The `run_agent` seam on `RunnerBackend` (`src/conductor/execution/backend.py`) executes agent steps
   across backends using `AgentSpec` and `AgentResult` contract types (`src/conductor/execution/types.py`).
   Backends declare capability flags via `RunnerCapabilities.agent` and `RunnerCapabilities.interrupt`.
-- `AgentExecutor` (`src/conductor/executor/agent.py`) dispatches agent calls through `RunnerBackend.run_agent`
-  across main loop, parallel, for-each, and guidance paths. Remote profiles reject dialog
-  until evaluation and conversation turns have a backend contract.
+- `AgentExecutor` (`src/conductor/executor/agent.py`) calls the provider directly for ordinary
+  local execution without a managed binding. Managed local uses `RunnerBackend.run_agent` with
+  an in-process closure, while remote calls use the corresponding backend without one. Remote
+  profiles reject dialog until evaluation and conversation turns have a backend contract.
 - Wire serialization stays stdlib-only in `src/conductor/execution/agent_wire.py` (`agent_spec_to_wire_body`),
   unwrapping credentials only at transport.
 - For Docker agent realms, `src/conductor/execution/docker_agent.py` streams execution over
@@ -59,6 +60,24 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   `src/conductor/execution/docker_paths.py` maps declared skill and plugin directories to staged
   `/workspace` locations.
 - Verbose output goes through a neutral diagnostics callback; the seam never imports the CLI.
+
+### Retained local backend
+
+- `src/conductor/execution/local.py::LocalRunnerBackend` declares
+  `retained_workspace=True`. A retained local binding is created only for an actual local
+  script, agent, or direct MCP file consumer, not an unused profile or a technical lease.
+- `src/conductor/execution/local_workspace.py` copies the complete bundle `tree/` into a writable
+  `work/`, with the identity marker outside it. Never hardlink to the CAS or restage an attached
+  tree. `src/conductor/engine/local_workspace.py::LocalWorkspacePathMapper` checks mapped
+  directories against the live tree; don't rewrite ordinary argv, environment values, or prompts.
+- `src/conductor/execution/local_process_scope.py::LocalProcessScopeController` seals admission
+  and combines native process proof with owner joins. `unconfirmed` is terminal for the attempt:
+  keep the workspace and fence attachment even if a quarantined owner finishes later. Preserve the
+  original absolute cleanup deadline across force, joins, and cancellation.
+- `LocalRunnerBackend.confirm_workspace_released(lease)` accepts the root's existing proof;
+  `finalize_run` must receive the original backend-issued lease and may delete only a verified
+  idle tree. See [local retained workspace design](../design/local-retained-workspace.md) for
+  runtime ownership, platform restrictions, and the CLI/caller-loop distinction.
 
 ### Docker backend (`src/conductor/execution/docker.py::DockerRunnerBackend`)
 
@@ -111,9 +130,9 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   the root run spec, under one lock spanning construction, defensive bundle materialization and
   `prepare_run`, so concurrent for-each children cannot duplicate side effects.
 - `finalize_leases` detaches leases from session state BEFORE cleanup (a repeated `run()` must
-  prepare fresh leases, never reuse finalized ones), finalizes each backend once, shields each
-  `finalize_run` from cancellation, logs (never raises) backend failures so the run outcome is not
-  masked, and re-raises cancellation only after every backend finalized.
+  prepare fresh leases, never reuse finalized ones). Legacy cleanup shields and attempts each
+  backend once, logging failures without masking the run outcome. Managed local cleanup uses the
+  shared bounded root barrier; unconfirmed cleanup is surfaced and retains the tree.
 - Retained workspace policy is passed only to backends declaring `retained_workspace`; technical
   local leases in Docker-backed runs must receive `workspace_persistence=None` in both
   `prepare_leases` and `ensure_backends`. On resume, retained identities go through
@@ -142,13 +161,13 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   (rejects `sandbox.identifier_scope` on steps, rejects skills/plugins/discovery since ACA sandboxes
   cannot read host paths).
 - `script_step_backends` restricts mixed-backend script warnings to actual script steps.
-- `prepare_run_bundle` checks every manifest profile for Docker, including agent-only
-  workflows, before scanning unresolved sub-workflows and collecting the bundle.
+- `prepare_run_bundle` checks the manifest and statically knowable child closure for Docker or
+  retained local file consumers before collecting the bundle.
 - `src/conductor/engine/bundle_prep.py` scans the statically knowable sub-workflow closure
   offline (`scan_subworkflow_docker_usage`) so a Docker-only child has its bundle before execution
   starts (`prepare_run_bundle`); the session repeats materialization defensively for late-found
-  backends. Docker script steps need a workflow file on disk. Every resume prepares a fresh lease
-  and reuses or republishes the content-addressed bundle.
+  backends. Bundle-backed steps need a workflow file on disk. Retained resume verifies and attaches
+  the recorded incarnation; it doesn't seed a fresh tree over retained files.
 
 ### Bundles (`src/conductor/bundle/`)
 
@@ -289,9 +308,9 @@ open, which showed up as 30-second `timed_out` results. Tests:
 **Data-shaped outcomes.** Routing on exit codes requires a non-zero exit to be ordinary data,
 while a cancelled run must never look like a completed step.
 
-**Agent realm seam.** Routing agent steps through `run_agent` provides unified lifecycle,
-workspace leasing, and secret delivery across local, Docker, and ACA backends. Manifest
-compilation validates backend capabilities before run start. Tests:
+**Agent realm seam.** Managed local and remote invocations use `run_agent`; ordinary local
+calls the provider directly. Manifest compilation validates backend capabilities before run
+start. Tests:
 `tests/test_execution/test_agent_realm_parity.py`, `tests/test_execution/test_docker_agent_realm.py`.
 
 **In-container runner bridge.** Running `conductor.runner.bridge` over `docker exec -i`

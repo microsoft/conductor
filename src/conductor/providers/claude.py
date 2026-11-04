@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
+from conductor.execution.types import ManagedWorkspaceContext
 from conductor.mcp.manager import MCPManager
 from conductor.providers._pydantic_ai.compaction_window import DEFAULT_MAX_TOKENS
 from conductor.providers.base import (
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from pydantic_ai.messages import ModelMessage
+
+    from conductor.providers._pydantic_ai.interrupt import _ManagedRun, _ManagedWorkspace
 
 # Try to import the Anthropic SDK
 try:
@@ -169,6 +172,7 @@ class ClaudeProvider(AgentProvider):
         # forwarded to ``StdioServerParameters(cwd=...)`` for each stdio MCP
         # server the agent connects.
         working_dir=True,
+        managed_local_workspace=True,
         # Skill content is eagerly injected into the rendered prompt by
         # AgentExecutor (Claude's Messages API has no server-side skill
         # surface without adopting the container/code-execution beta).
@@ -302,6 +306,7 @@ class ClaudeProvider(AgentProvider):
         self._mcp_servers_config = mcp_servers
         self._mcp_managers: dict[str, MCPManager] = {}
         self._mcp_manager_locks: dict[str, asyncio.Lock] = {}
+        self._managed_workspaces: dict[str, _ManagedWorkspace] = {}
 
         # Cache of model_id -> max_input_tokens populated lazily on first
         # get_max_prompt_tokens() call, and model_id -> max_tokens populated
@@ -922,6 +927,8 @@ class ClaudeProvider(AgentProvider):
         Shuts down every pooled MCPManager (one per distinct working
         directory). Idempotent: a second call is a no-op.
         """
+        for workspace in tuple(self._managed_workspaces.values()):
+            await workspace.release()
         # Close MCP connections first (all pool entries).
         if self._mcp_managers:
             for cwd, manager in self._mcp_managers.items():
@@ -955,6 +962,42 @@ class ClaudeProvider(AgentProvider):
         user_message: str,
         history: list[dict[str, str]] | None = None,
         model: str | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
+    ) -> str:
+        """Run an HTTP-only dialog with an explicit cwd for managed ownership."""
+        from conductor.providers._pydantic_ai.interrupt import _ManagedWorkspace
+
+        async def run(managed_run: _ManagedRun | None = None) -> str:
+            return await self._execute_dialog_turn(
+                system_prompt,
+                user_message,
+                history,
+                model,
+                **({"managed_run": managed_run} if managed_run is not None else {}),
+            )
+
+        if managed_workspace is not None:
+            workspace = _ManagedWorkspace.for_context(self._managed_workspaces, managed_workspace)
+            return await workspace.call(working_dir, run)
+        return await run()
+
+    async def release_workspace(self, workspace_root: str) -> None:
+        """Release attempted managed resources without closing HTTP or other roots."""
+        workspace = self._managed_workspaces.get(workspace_root)
+        if workspace is None:
+            raise ProviderError("Unknown managed Pydantic AI workspace", is_retryable=False)
+        await workspace.release()
+
+    async def _execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+        *,
+        managed_run: _ManagedRun | None = None,
     ) -> str:
         """Execute a single dialog turn using a Pydantic AI agent.
 
@@ -1048,10 +1091,14 @@ class ClaudeProvider(AgentProvider):
                 model_settings=model_settings,
                 retries=0,
             )
+            if managed_run is not None:
+                managed_run.check_dispatch()
             result = await pydantic_agent.run(
                 user_prompt=user_message,
                 message_history=pydantic_history,
             )
+            if managed_run is not None:
+                managed_run.check_dispatch()
             return str(result.output)
         except ValidationError:
             raise
@@ -1075,6 +1122,53 @@ class ClaudeProvider(AgentProvider):
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+    ) -> AgentOutput:
+        """Execute with explicit managed ownership, or the unchanged legacy pipeline."""
+        from conductor.providers._pydantic_ai.interrupt import _ManagedWorkspace
+
+        async def run(managed_run: _ManagedRun | None = None) -> AgentOutput:
+            return await self._execute(
+                agent,
+                context,
+                rendered_prompt,
+                tools=tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_directories,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+                continuation_state=continuation_state,
+                suppress_mcp_servers=suppress_mcp_servers,
+                **({"managed_run": managed_run} if managed_run is not None else {}),
+            )
+
+        if managed_workspace is not None:
+            if agent.settings_dir or agent.session_key or custom_agents or extra_mcp_servers:
+                raise ProviderError(
+                    "Managed ClaudeProvider cannot honor settings, "
+                    "native sessions or plugin components",
+                    is_retryable=False,
+                )
+            workspace = _ManagedWorkspace.for_context(self._managed_workspaces, managed_workspace)
+            return await workspace.call(agent.working_dir, run)
+        return await run()
+
+    async def _execute(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        rendered_prompt: str,
+        *,
+        tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
+        suppress_mcp_servers: bool = False,
+        managed_run: _ManagedRun | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Pydantic AI pipeline.
 
@@ -1125,12 +1219,22 @@ class ClaudeProvider(AgentProvider):
         from conductor.providers._pydantic_ai.retry import RetryConfig as PydanticRetryConfig
         from conductor.providers._pydantic_ai.runner import run_agent_pipeline
 
-        resolved_cwd = agent.working_dir or os.getcwd()
+        if managed_run is not None:
+            managed_run.check_dispatch()
+            event_callback = managed_run.callback(event_callback)
+        resolved_cwd = (
+            managed_run.cwd if managed_run is not None else agent.working_dir or os.getcwd()
+        )
         # A synthetic, tool-free execution (OutputValidator's grader) runs
         # with no MCP toolset at all rather than the workflow's servers.
-        manager = (
-            None if suppress_mcp_servers else await self._get_mcp_manager_for_cwd(resolved_cwd)
-        )
+        if suppress_mcp_servers:
+            manager = None
+        elif managed_run is not None:
+            manager = await managed_run.workspace.manager_for(
+                managed_run, self._mcp_servers_config, self._tool_output_config
+            )
+        else:
+            manager = await self._get_mcp_manager_for_cwd(resolved_cwd)
 
         effective_model = agent.model or self._default_model
         effective_max_tokens = resolve_anthropic_effective_max_tokens(
@@ -1144,6 +1248,8 @@ class ClaudeProvider(AgentProvider):
             model=effective_model,
             has_custom_base_url=self._base_url is not None,
         )
+        if managed_run is not None:
+            managed_run.check_dispatch()
         output_limit = await resolve_output_limit(
             provider=self,
             model=effective_model,
@@ -1152,6 +1258,8 @@ class ClaudeProvider(AgentProvider):
                 getattr(agent, "max_tokens", None) is not None or self._max_tokens_user_configured
             ),
         )
+        if managed_run is not None:
+            managed_run.check_dispatch()
         tool_buffer = tool_buffer_tokens(self._tool_output_config)
         plan = resolve_compaction_plan(
             window=window.tokens,
@@ -1193,6 +1301,8 @@ class ClaudeProvider(AgentProvider):
         def build_agent_fn(
             toolsets: list[Any], *, max_parse_recovery_attempts: int, compaction: Any | None = None
         ) -> Any:
+            if managed_run is not None:
+                managed_run.check_dispatch()
             return build_agent(
                 agent=agent,
                 system_prompt=agent.system_prompt or "",
@@ -1259,4 +1369,5 @@ class ClaudeProvider(AgentProvider):
             build_agent_fn=build_agent_fn,
             message_history=message_history,
             compaction=compaction_cfg,
+            **({"managed_run": managed_run} if managed_run is not None else {}),
         )

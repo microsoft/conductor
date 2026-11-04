@@ -48,12 +48,13 @@ class RunnerBackend(Protocol):
         ...
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
-        """Acquire the workspace handle for a run.
+        """Prepare a workspace and return an opaque lease for a run.
 
-        This must be cheap handle acquisition only — heavy allocation is
-        deferred to the first command that needs it. The returned lease is
-        opaque to callers and is threaded through ``run_command`` and back
-        into ``finalize_run``.
+        Resource allocation and content readiness depend on the backend.
+        Managed local publishes a ready tree before issuing the lease.
+        Docker ensures a retained volume exists before returning its lease,
+        but stages bundle contents later. Legacy local creates only a handle.
+        Pass the lease to ``run_command`` and ``finalize_run``.
 
         Args:
             run: The run to prepare a workspace for.

@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 from conductor.config.environment import AcaProfileOptions, ResolvedEnvironment
-from conductor.config.schema import WorkflowConfig
+from conductor.config.schema import AgentDef, MCPStepDef, ScriptStepDef, WorkflowConfig
 from conductor.engine.bundle_prep import materialize_run_bundle
 from conductor.engine.run_manifest import (
     BACKEND_CAPABILITY_PROVIDERS,
@@ -32,8 +33,9 @@ from conductor.engine.secrets import (
     SecretValueCache,
     index_config,
 )
-from conductor.exceptions import ConfigurationError
+from conductor.exceptions import ConfigurationError, ExecutionError
 from conductor.execution import (
+    BundleRef,
     LocalRunnerBackend,
     ResolvedExecutionSpec,
     RunnerBackend,
@@ -43,12 +45,37 @@ from conductor.execution import (
     WorkspaceLease,
 )
 from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.local_process_scope import LocalProcessScopeController
+from conductor.execution.types import LocalWorkspaceBinding
 from conductor.redaction import RunRedactor
 
 if TYPE_CHECKING:
+    from conductor.bundle.collector import CollectedAgentDependencies
     from conductor.engine.aca_execution import AcaGateway
+    from conductor.providers.base import AgentProvider
+    from conductor.providers.registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
+
+_QUARANTINED_SECRETS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, set[tuple[SecretValueCache, RunRedactor]]
+] = WeakKeyDictionary()
+
+
+def quarantined_secrets(
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[tuple[SecretValueCache, RunRedactor], ...]:
+    """Retain only secret pairs, not sessions that would keep a weak loop key alive."""
+    return tuple(_QUARANTINED_SECRETS.get(loop, ()))
+
+
+def release_loop_secrets(loop: asyncio.AbstractEventLoop) -> None:
+    """Release retained scrubbers only after the CLI-owned loop has closed."""
+    if not loop.is_closed():
+        raise RuntimeError("Close the owned loop before releasing quarantined secrets")
+    for cache, redactor in _QUARANTINED_SECRETS.pop(loop, ()):
+        cache.clear()
+        redactor.clear()
 
 
 def _aca_transport(options: AcaProfileOptions) -> AcaGateway:
@@ -131,6 +158,9 @@ class ExecutionResolverSession:
             "local": default_backend or BACKEND_FACTORIES["local"](),
         }
         self.leases: dict[str, WorkspaceLease] = {}
+        # Run-local collector output, supplied with the prepared original lease.
+        # Never serialize this view into BundleRef or a checkpoint.
+        self.agent_dependencies: tuple[CollectedAgentDependencies, ...] | None = None
         self._aca_profiles: dict[str, RunnerBackend] = {}
         self._root_run_spec: RunSpec | None = None
         self._root_workflow_path: Path | None = None
@@ -138,6 +168,24 @@ class ExecutionResolverSession:
         self._expect_staged: Mapping[str, bool] | None = None
         self._claim_active = False
         self._executed_backends: set[str] = set()
+        self._file_consumers: dict[str, set[str]] = {}
+        self._mixed_files_warned = False
+        self.retained_participants: set[str] = set()
+        self._local_consumer = False
+        self.sealed = False
+        self.cleanup_uncertain = False
+        self.cli_cleanup_pending = False
+        self.cleanup_deadline: float | None = None
+        self._managed_binding: LocalWorkspaceBinding | None = None
+        self._terminal_identities: dict[str, WorkspaceIdentity] = {}
+        self._providers: list[AgentProvider] = []
+        self._registry: ProviderRegistry | None = None
+        self._resource_releases: dict[int, Callable[[], Awaitable[None]]] = {}
+        self._resource_tasks: set[asyncio.Future[Any]] = set()
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._cleanup_expired = asyncio.Event()
+        self._cleanup_timer: asyncio.TimerHandle | None = None
+        self.root_task: asyncio.Task[Any] | None = None
         self._ensure_lock = asyncio.Lock()
         self._owns_secrets = secret_cache is None
         if secret_cache is not None:
@@ -181,10 +229,333 @@ class ExecutionResolverSession:
 
     def reset_secrets(self) -> None:
         """Clear self-owned secret state before a new run generation."""
-        if not self._owns_secrets:
+        if not self._owns_secrets or self.quarantined:
             return
         self.secret_cache.clear()
         self.redactor.clear()
+
+    def begin_generation(self) -> None:
+        """Refuse poisoned reuse and discard only the previous generation's views."""
+        self.retain_registry_cleanup()
+        if self.quarantined:
+            raise ExecutionError(
+                "Managed root cleanup is unconfirmed; this session cannot be reused."
+            )
+        self.sealed = False
+        self.cleanup_deadline = None
+        self._cleanup_expired = asyncio.Event()
+        self._cleanup_task = None
+        self._managed_binding = None
+        self._terminal_identities = {}
+        self.agent_dependencies = None
+        self.retained_participants.clear()
+        self._file_consumers.clear()
+        self._mixed_files_warned = False
+        self._local_consumer = False
+        self._providers.clear()
+        self._resource_releases.clear()
+        self._root_run_spec = None
+        self._registry = None
+        self.root_task = None
+
+    @property
+    def quarantined(self) -> bool:
+        """Whether either root resources or later CLI-owned leaves need a retained scrubber."""
+        return self.cleanup_uncertain or self.cli_cleanup_pending
+
+    def retain_registry_cleanup(self) -> None:
+        """Keep pending owned registry leaves out of pools and alive through loop close."""
+        if self._registry is None or not self.managed:
+            return
+        pending = self._registry.pending_close_tasks
+        if pending:
+            self.cli_cleanup_pending = True
+            _QUARANTINED_SECRETS.setdefault(asyncio.get_running_loop(), set()).add(
+                (self.secret_cache, self.redactor)
+            )
+            for task in pending:
+                if task not in self._resource_tasks:
+                    self._track(task)
+
+    @property
+    def managed(self) -> bool:
+        """Whether this generation owns an actual retained-local binding."""
+        return self._managed_binding is not None
+
+    @property
+    def run_bundle(self) -> BundleRef | None:
+        """Return the original bundle, including defensive late preparation."""
+        return self._root_run_spec.bundle if self._root_run_spec is not None else None
+
+    def register_provider(self, provider: AgentProvider, registry: ProviderRegistry | None) -> None:
+        """Register every attempted provider before its first resource dispatch."""
+        if not self.managed:
+            return
+        if self.sealed:
+            raise ExecutionError("Managed root admission is sealed.")
+        if not any(item is provider for item in self._providers):
+            self._providers.append(provider)
+        self._registry = registry
+        if registry is not None:
+            assert self._managed_binding is not None
+            registry.register_workspace_provider(self._managed_binding.runtime_context, provider)
+
+    def register_resource(self, resource: object, release: Callable[[], Awaitable[None]]) -> None:
+        """Account attempted native resources independently of successful caches."""
+        if self.sealed:
+            raise ExecutionError("Managed root admission is sealed.")
+        self._resource_releases.setdefault(id(resource), release)
+
+    def _track[T](self, task: asyncio.Future[T]) -> asyncio.Future[T]:
+        self._resource_tasks.add(task)
+
+        def finished(owner: asyncio.Future[T]) -> None:
+            self._resource_tasks.discard(owner)
+            if not owner.cancelled() and (error := owner.exception()) is not None:
+                logger.warning(
+                    "Managed resource finished with an error: %s", self.redactor.scrub(str(error))
+                )
+
+        task.add_done_callback(finished)
+        return task
+
+    async def invoke[T](
+        self,
+        coroutine: Coroutine[Any, Any, T],
+        *,
+        nested_timeout: asyncio.Timeout | None = None,
+    ) -> T:
+        """Own a resource leaf, never a detached engine orchestration continuation."""
+        if not self.managed:
+            return await coroutine
+        if self.sealed:
+            coroutine.close()
+            raise ExecutionError("Managed root admission is sealed.")
+        owner = self._track(asyncio.create_task(coroutine))
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            # A root cancellation seals immediately. A nested invocation timeout
+            # keeps its adapter's invocation-scoped teardown and fail-open policy.
+            root_requests = self.root_task.cancelling() if self.root_task is not None else 1
+            nested_cancel = nested_timeout is not None and nested_timeout.expired()
+            if root_requests and (not nested_cancel or root_requests > 1):
+                self.begin_teardown("cancelled", retain=True)
+            owner.cancel()
+            raise
+
+    async def close_cli_resource(self, coroutine: Coroutine[Any, Any, None]) -> None:
+        """Attempt unrelated CLI cleanup without renewing a quarantined root's budget."""
+        if not self.quarantined:
+            await coroutine
+            return
+        assert self.cleanup_deadline is not None
+        task = self._track(asyncio.create_task(coroutine))
+        await asyncio.wait({task}, timeout=0)
+        if not task.done():
+            logger.warning("CLI cleanup owner remains pending under the original root deadline")
+        elif not task.cancelled():
+            task.result()
+
+    def begin_teardown(self, outcome: RunOutcome, *, retain: bool) -> None:
+        """Detach reusable leases and start all cleanup attempts without awaiting joins."""
+        if self._cleanup_task is not None:
+            return
+        binding = self._managed_binding
+        if binding is None:
+            return
+        self._terminal_identities = self.workspace_identities()
+        self.sealed = True
+        leases, self.leases = self.leases, {}
+        invocations = tuple(self._resource_tasks)
+        controller = binding.runtime_context.process_scopes
+        loop = asyncio.get_running_loop()
+        earlier = controller.owners.deadline()
+        self.cleanup_deadline = loop.time() + 30
+        if earlier is not None:
+            self.cleanup_deadline = min(self.cleanup_deadline, earlier)
+        controller.begin_teardown(deadline=self.cleanup_deadline)
+        native_deadline = controller.owners.deadline()
+        if native_deadline is not None:
+            self.cleanup_deadline = min(self.cleanup_deadline, native_deadline)
+        self._cleanup_timer = loop.call_at(self.cleanup_deadline, self._cleanup_expired.set)
+        attempts: set[asyncio.Future[Any]] = set()
+        finalized: set[int] = set()
+        local = self.backends["local"]
+        local_lease = leases["local"]
+        if self._registry is not None:
+            self._registry.account_workspace_cleanup(
+                binding.workspace_root,
+                deadline=self.cleanup_deadline,
+                managed_workspace=binding.runtime_context,
+                redactor=self.redactor,
+            )
+        for name, lease in leases.items():
+            backend = self.backends[name]
+            if id(backend) in finalized:
+                continue
+            finalized.add(id(backend))
+            if backend is local:
+                continue
+            attempts.add(
+                self._track(
+                    asyncio.create_task(backend.finalize_run(lease, outcome, retain=retain))
+                )
+            )
+        if self._registry is not None:
+            attempts.add(
+                self._track(
+                    asyncio.create_task(self._registry.release_workspace(binding.workspace_root))
+                )
+            )
+        else:
+            for provider in self._providers:
+                attempts.add(
+                    self._track(
+                        asyncio.create_task(provider.release_workspace(binding.workspace_root))
+                    )
+                )
+        for release in self._resource_releases.values():
+            attempts.add(self._track(asyncio.ensure_future(release())))
+        for invocation in invocations:
+            if not invocation.done():
+                invocation.cancel()
+        self._cleanup_task = asyncio.create_task(
+            self._finish_managed(local, local_lease, outcome, retain, attempts)
+        )
+
+    async def _finish_managed(
+        self,
+        local: RunnerBackend,
+        lease: WorkspaceLease,
+        outcome: RunOutcome,
+        retain: bool,
+        attempts: set[asyncio.Future[Any]],
+    ) -> None:
+        binding = self._managed_binding
+        assert binding is not None and isinstance(local, LocalRunnerBackend)
+        assert self.cleanup_deadline is not None
+        controller = binding.runtime_context.process_scopes
+        proof_task = asyncio.create_task(controller.owners.wait_terminal())
+        waiting = self._resource_tasks | attempts | {proof_task}
+        expired = asyncio.create_task(self._cleanup_expired.wait())
+        pending = set(waiting)
+        while pending and not self._cleanup_expired.is_set():
+            done, _ = await asyncio.wait(pending | {expired}, return_when=asyncio.FIRST_COMPLETED)
+            pending.difference_update(done)
+            if proof_task in done and proof_task.result().status != "released":
+                break
+        expired.cancel()
+        if not proof_task.done():
+            proof_task.cancel()
+        await asyncio.wait({expired, proof_task}, timeout=0)
+        proven = (
+            proof_task.done()
+            and not proof_task.cancelled()
+            and proof_task.result().status == "released"
+        )
+        self.cleanup_uncertain = bool(pending) or not proven
+        if not self.cleanup_uncertain:
+            confirmation = self._track(asyncio.create_task(local.confirm_workspace_released(lease)))
+            expiry = asyncio.create_task(self._cleanup_expired.wait())
+            await asyncio.wait({confirmation, expiry}, return_when=asyncio.FIRST_COMPLETED)
+            expiry.cancel()
+            await asyncio.wait({expiry}, timeout=0)
+            if (
+                not confirmation.done()
+                or confirmation.cancelled()
+                or confirmation.exception() is not None
+                or self._cleanup_expired.is_set()
+            ):
+                self.cleanup_uncertain = True
+        if self.cleanup_uncertain:
+            local.mark_workspace_uncertain(lease)
+            _QUARANTINED_SECRETS.setdefault(asyncio.get_running_loop(), set()).add(
+                (self.secret_cache, self.redactor)
+            )
+            logger.warning(
+                "Managed root cleanup is unconfirmed; retaining workspace and refusing reuse: %s",
+                self.redactor.scrub(binding.workspace_root),
+            )
+            if isinstance(controller, LocalProcessScopeController):
+                self._track(asyncio.create_task(controller.close()))
+        if self._registry is not None and self._providers:
+            self._registry.account_workspace_cleanup(
+                binding.workspace_root, uncertain=self.cleanup_uncertain
+            )
+        # Disposal has exactly one owner and one already-decided retain value.
+        disposal = self._track(
+            asyncio.create_task(
+                local.finalize_run(lease, outcome, retain=retain or self.cleanup_uncertain)
+            )
+        )
+        await asyncio.wait(
+            {disposal},
+            timeout=(
+                0
+                if self.cleanup_uncertain
+                else max(0, self.cleanup_deadline - asyncio.get_running_loop().time())
+            ),
+        )
+        if self._cleanup_timer is not None:
+            self._cleanup_timer.cancel()
+        if not disposal.done():
+            self.cleanup_uncertain = True
+            local.mark_workspace_uncertain(lease)
+            _QUARANTINED_SECRETS.setdefault(asyncio.get_running_loop(), set()).add(
+                (self.secret_cache, self.redactor)
+            )
+
+    def set_agent_dependencies(self, dependencies: tuple[CollectedAgentDependencies, ...]) -> None:
+        """Replace the generation's view with the same published bundle's topology."""
+        self.agent_dependencies = dependencies
+
+    def note_participants(self, config: WorkflowConfig, manifest: ResolvedRunManifest) -> None:
+        """Distinguish actual file consumers from technical workflow placement."""
+        steps = [(step.name, step) for step in config.agents]
+        steps.extend(
+            (executable_step_identity(group.agent.name, for_each_group=group.name), group.agent)
+            for group in config.for_each
+        )
+        for key, step in steps:
+            if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef)):
+                continue
+            backend = manifest.profiles[key].backend
+            if backend == "local":
+                self._local_consumer = True
+            if BACKEND_CAPABILITY_PROVIDERS[backend].capabilities().retained_workspace:
+                self.retained_participants.add(backend)
+
+    def note_known_children(self, root_config: WorkflowConfig, workflow_path: Path | None) -> None:
+        """Preflight offline known children using the bundle collector's resolution."""
+        if workflow_path is None:
+            return
+        from conductor.bundle.collector import MAX_SUBWORKFLOW_DEPTH, _Collector
+        from conductor.bundle.errors import BundleError
+        from conductor.config.loader import load_config
+        from conductor.engine.bundle_prep import _workflow_steps
+
+        resolver = _Collector(workflow_path, self.environment, False, logger.warning)
+        visited: set[Path] = set()
+
+        def scan(path: Path, depth: int) -> None:
+            if path in visited or depth > MAX_SUBWORKFLOW_DEPTH:
+                return
+            visited.add(path)
+            config = root_config if path == workflow_path else load_config(path)
+            manifest = compile_run_manifest(
+                config, workflow_path=path, environment=self.environment
+            )
+            self.note_participants(config, manifest)
+            for step in _workflow_steps(config):
+                try:
+                    child, _ = resolver._resolve_subworkflow(step.workflow, path.parent)
+                except BundleError:
+                    # Bundle preparation owns the actionable incomplete-closure error.
+                    continue
+                scan(child, depth + 1)
+
+        scan(workflow_path, 0)
 
     async def ensure_backends(self, names: Iterable[str]) -> None:
         """Instantiate and, after root preparation, lease requested backends.
@@ -196,8 +567,17 @@ class ExecutionResolverSession:
         ``prepare_run`` so concurrent for-each children cannot duplicate any
         of those run-scoped side effects.
         """
-        missing = set(names).difference(self.backends)
-        if not missing:
+        if self.sealed:
+            raise ExecutionError("Managed root admission is sealed.")
+        names = set(names)
+        missing = names.difference(self.backends)
+        upgrade_local = (
+            self._local_consumer
+            and self._root_run_spec is not None
+            and self._root_run_spec.workspace_persistence is not None
+            and ("local" not in self.leases or self.leases["local"].location is None)
+        )
+        if not missing and not upgrade_local:
             return
 
         async with self._ensure_lock:
@@ -234,6 +614,7 @@ class ExecutionResolverSession:
                         bundle = await materialize_run_bundle(
                             self._root_workflow_path,
                             self.environment,
+                            on_topology=self.set_agent_dependencies,
                         )
                         run_spec = replace(run_spec, bundle=bundle)
                         self._root_run_spec = run_spec
@@ -253,6 +634,10 @@ class ExecutionResolverSession:
                             expect_staged=(self._expect_staged or {}).get(name, False),
                         )
                     else:
+                        if self._resume_identities is not None and name in self._executed_backends:
+                            raise ConfigurationError(
+                                f"Checkpoint is missing the required identity for {name!r}."
+                            )
                         if self._resume_identities is not None and not self._claim_active:
                             raise ConfigurationError(
                                 f"Cannot prepare late backend {name!r} without a workspace claim."
@@ -260,6 +645,65 @@ class ExecutionResolverSession:
                         lease = await backend.prepare_run(backend_spec)
                     self.leases[name] = lease
                 self.backends[name] = backend
+            if upgrade_local and (
+                "local" not in self.leases or self.leases["local"].location is None
+            ):
+                if not self._claim_active:
+                    raise ConfigurationError("Cannot prepare managed local without a root claim.")
+                run_spec = self._root_run_spec
+                assert run_spec is not None
+                if "local" in self._executed_backends and (
+                    self._resume_identities is not None and "local" not in self._resume_identities
+                ):
+                    raise ConfigurationError("Checkpoint is missing the required local identity.")
+                if run_spec.bundle is None:
+                    bundle = await materialize_run_bundle(
+                        self._root_workflow_path,
+                        self.environment,
+                        on_topology=self.set_agent_dependencies,
+                    )
+                    run_spec = replace(run_spec, bundle=bundle)
+                    self._root_run_spec = run_spec
+                backend = self.backends["local"]
+                old = self.leases.pop("local", None)
+                if old is not None:
+                    await backend.finalize_run(old, "succeeded")
+                spec = self._backend_run_spec("local", run_spec)
+                identity = (self._resume_identities or {}).get("local")
+                self.leases["local"] = (
+                    await backend.attach_run(
+                        spec,
+                        identity,
+                        expect_staged=(self._expect_staged or {}).get("local", False),
+                    )
+                    if identity is not None
+                    else await backend.prepare_run(spec)
+                )
+                self.retained_participants.add("local")
+                if isinstance(backend, LocalRunnerBackend):
+                    self._managed_binding = backend.local_workspace_binding(self.leases["local"])
+                    if self._managed_binding is not None:
+                        controller = self._managed_binding.runtime_context.process_scopes
+                        if isinstance(controller, LocalProcessScopeController):
+                            controller.scrub = self.redactor.scrub
+                        backend.mark_workspace_in_use(self.leases["local"])
+
+    def _backend_run_spec(self, name: str, run: RunSpec) -> RunSpec:
+        managed_local = name == "local" and self._local_consumer
+        retained = self.backends[name].capabilities().retained_workspace and (
+            name != "local" or managed_local
+        )
+        root = None
+        if managed_local and run.workspace_persistence is not None:
+            import os
+
+            home = Path(os.environ.get("CONDUCTOR_HOME", Path.home() / ".conductor"))
+            root = str((home / "workspaces" / run.run_id / "local").absolute())
+        return replace(
+            run,
+            workspace_persistence=run.workspace_persistence if retained else None,
+            local_workspace_root=root,
+        )
 
     async def prepare_leases(
         self,
@@ -281,20 +725,17 @@ class ExecutionResolverSession:
         self._claim_active = claim_active
         self._root_run_spec = run_spec
         self._root_workflow_path = workflow_path
+        if run_spec.local_workspace_root is not None:
+            self._local_consumer = True
         leases_by_backend: dict[int, WorkspaceLease] = {
             id(self.backends[name]): lease for name, lease in self.leases.items()
         }
         for name, backend in self.backends.items():
+            backend_spec = self._backend_run_spec(name, run_spec)
+            if backend_spec.local_workspace_root is not None and not claim_active:
+                raise ConfigurationError("Cannot prepare managed local without a root claim.")
             lease = leases_by_backend.get(id(backend))
             if lease is None:
-                backend_spec = replace(
-                    run_spec,
-                    workspace_persistence=(
-                        run_spec.workspace_persistence
-                        if backend.capabilities().retained_workspace
-                        else None
-                    ),
-                )
                 identity = (resume_identities or {}).get(name)
                 if identity is not None:
                     lease = await backend.attach_run(
@@ -306,14 +747,61 @@ class ExecutionResolverSession:
                     lease = await backend.prepare_run(backend_spec)
                 leases_by_backend[id(backend)] = lease
             self.leases[name] = lease
+            if backend_spec.workspace_persistence is not None:
+                self.retained_participants.add(name)
+            if (
+                name == "local"
+                and isinstance(backend, LocalRunnerBackend)
+                and backend_spec.local_workspace_root is not None
+            ):
+                binding = backend.local_workspace_binding(lease)
+                if (
+                    binding is None
+                    or binding.run_id != run_spec.run_id
+                    or binding.workspace_root != backend_spec.local_workspace_root
+                    or binding.bundle != run_spec.bundle
+                ):
+                    raise ConfigurationError(
+                        "Prepared local lease does not belong to this root run."
+                    )
+                self._managed_binding = binding
+                if self._managed_binding is not None:
+                    controller = self._managed_binding.runtime_context.process_scopes
+                    if isinstance(controller, LocalProcessScopeController):
+                        controller.scrub = self.redactor.scrub
+                    # The whole root is active even before a reachable local step.
+                    # A later uncertain-marker write failure must leave active, not idle.
+                    backend.mark_workspace_in_use(lease)
 
     def lease_for_backend(self, name: str) -> WorkspaceLease | None:
         """Return the prepared lease for ``name``, if one exists."""
         return self.leases.get(name)
 
-    def record_backend_execution(self, name: str) -> None:
+    def record_backend_execution(self, name: str, *, step: str | None = None) -> None:
         """Remember a backend that executed a step in this run."""
         self._executed_backends.add(name)
+        if step is None:
+            return
+        self._file_consumers.setdefault(name, set()).add(step)
+        if (
+            self._root_run_spec is not None
+            and self._root_run_spec.workspace_persistence is not None
+            and not self._mixed_files_warned
+            and {"local", "docker"} <= self._file_consumers.keys()
+        ):
+            self._mixed_files_warned = True
+            assignments = "; ".join(
+                f"{realm}: {', '.join(sorted(self._file_consumers[realm]))}"
+                for realm in ("local", "docker")
+            )
+            logger.warning(
+                "%s",
+                self.redactor.scrub(
+                    f"Workflow uses independent local/Docker file workspaces ({assignments}). "
+                    "There is no filesystem synchronization between realms; "
+                    "context JSON outputs are shared unchanged."
+                ),
+            )
 
     def executed_backends(self) -> frozenset[str]:
         """Return the accumulated executed backend names."""
@@ -325,6 +813,8 @@ class ExecutionResolverSession:
 
     def workspace_identities(self) -> dict[str, WorkspaceIdentity]:
         """Describe leases belonging to backends that support retention."""
+        if self.sealed:
+            return dict(self._terminal_identities)
         return {
             name: WorkspaceIdentity(
                 backend=lease.backend,
@@ -333,7 +823,8 @@ class ExecutionResolverSession:
                 location=lease.location,
             )
             for name, lease in self.leases.items()
-            if self.backends[name].capabilities().retained_workspace
+            if name in self.retained_participants
+            and (name != "local" or self._managed_binding is not None)
         }
 
     async def finalize_leases(self, outcome: RunOutcome, *, retain: bool = False) -> None:
@@ -344,6 +835,19 @@ class ExecutionResolverSession:
         racing cancellation; cancellation is re-raised only after every
         backend has had its chance to finalize.
         """
+        if self.managed:
+            self.begin_teardown(outcome, retain=retain)
+            assert self._cleanup_task is not None
+            managed_cancel: asyncio.CancelledError | None = None
+            while not self._cleanup_task.done():
+                try:
+                    await asyncio.shield(self._cleanup_task)
+                except asyncio.CancelledError as error:
+                    managed_cancel = managed_cancel or error
+            self._cleanup_task.result()
+            if managed_cancel is not None:
+                raise managed_cancel
+            return
         leases = self.leases
         self.leases = {}
         cancelled = False

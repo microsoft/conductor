@@ -20,6 +20,7 @@ from conductor.config.schema import (
     AgentDef,
     ExecutableStepBase,
     HumanGateStepDef,
+    MCPStepDef,
     QuestionsStepDef,
     RoutableStepBase,
     ScriptStepDef,
@@ -347,7 +348,7 @@ def validate_workflow_config(
         )
     else:
         workspace_errors, workspace_warnings = _validate_workspace_policy(
-            config, _environment_context
+            config, _environment_context, workflow_path
         )
         errors.extend(workspace_errors)
         warnings.extend(workspace_warnings)
@@ -2113,6 +2114,7 @@ def _executable_steps(config: WorkflowConfig) -> list[tuple[str, ExecutableStepB
 def _validate_workspace_policy(
     config: WorkflowConfig,
     context: _EnvironmentValidationContext,
+    workflow_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     """Check reserved modes and resolved backend retention without contacting a daemon."""
     errors: list[str] = []
@@ -2143,7 +2145,11 @@ def _validate_workspace_policy(
         return errors, warnings
 
     # Import after config initialization; the engine package imports the config loader.
-    from conductor.engine.run_manifest import BACKEND_CAPABILITY_PROVIDERS
+    from conductor.engine.run_manifest import (
+        BACKEND_CAPABILITY_PROVIDERS,
+        _require_local_agent_runtime_ownership,
+        _require_managed_local_consumer,
+    )
 
     for _environment_name, environment in sorted((context["environments"] or {}).items()):
         if environment is None:
@@ -2156,14 +2162,22 @@ def _validate_workspace_policy(
             definition = environment.document.profiles.get(profile_name) if profile_name else None
             if definition is None:
                 continue  # Profile resolution already reports the missing profile.
+            if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef, WorkflowStepDef)):
+                continue
+            if definition.backend == "local":
+                try:
+                    _require_local_agent_runtime_ownership(key, step, config)
+                    _require_managed_local_consumer(key, step, config, workflow_path, environment)
+                except ConfigurationError as exc:
+                    errors.append(str(exc))
+                    continue
+            if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef)):
+                continue
             provider = BACKEND_CAPABILITY_PROVIDERS.get(definition.backend)
             if provider is not None and not provider.capabilities().retained_workspace:
                 errors.append(
                     f"Step '{key}': {definition.backend} backend does not support retained "
-                    "workspaces; use docker profiles for every executable step or drop "
-                    "persistence; local retained workspace arrives in a later delivery. "
-                    "Until the agent realm follow-up, retained policy is available only "
-                    "for docker script workflows."
+                    "workspaces; choose a retaining backend or drop persistence."
                 )
     return errors, warnings
 
@@ -2222,19 +2236,32 @@ def _validate_docker_profiles(
                     f"'{environment_name}', but this step requires the local backend."
                 )
 
+        retained = config.workflow.workspace is not None and (
+            config.workflow.workspace.persistence != "ephemeral"
+        )
+        consumer_types = (AgentDef, ScriptStepDef, MCPStepDef) if retained else (ScriptStepDef,)
         script_backends = {
-            backend for _, step, _, backend in resolved if isinstance(step, ScriptStepDef)
+            backend for _, step, _, backend in resolved if isinstance(step, consumer_types)
         }
         if "local" in script_backends and "docker" in script_backends:
             assignments = ", ".join(
                 f"{key} ({backend})"
                 for key, step, _, backend in resolved
-                if isinstance(step, ScriptStepDef) and backend in {"local", "docker"}
+                if isinstance(step, consumer_types) and backend in {"local", "docker"}
             )
             warnings.append(
-                f"environment '{environment_name}' mixes local and docker script backends: "
-                f"{assignments}. Docker steps see the bundle snapshot collected before the run, "
-                "not host filesystem mutations made by local steps."
+                (
+                    f"environment '{environment_name}' declares independent local/Docker "
+                    f"file consumers: {assignments}. There is no filesystem synchronization "
+                    "between realms; context JSON outputs are shared unchanged."
+                )
+                if retained
+                else (
+                    f"environment '{environment_name}' mixes local and docker script backends: "
+                    f"{assignments}. Docker steps see the bundle snapshot collected "
+                    "before the run, "
+                    "not host filesystem mutations made by local steps."
+                )
             )
 
         used_docker_profiles = {

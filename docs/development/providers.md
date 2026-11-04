@@ -48,6 +48,12 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
 - Capability lookups that must not instantiate a provider go through `get_capabilities`,
   `uses_native_skills`, `uses_native_plugins`, `plugin_flavor_for`, which return `None` when the
   answer cannot be determined so callers skip rather than guess.
+- Retained local agents require both `working_dir` and `managed_local_workspace`. A provider
+  declaring the latter must account for attempted resources and implement targeted
+  `release_workspace(workspace_root)` without closing unrelated roots or the provider itself.
+  The root combines that release with native process proof and owner joins; API success alone
+  doesn't authorize an idle marker or deletion. See
+  [local retained workspace design](../design/local-retained-workspace.md#ownership-and-shutdown).
 
 ### Registering a provider
 

@@ -742,7 +742,6 @@ def run(
         conductor run workflow.yaml --workspace-instructions
         conductor run workflow.yaml --instructions AGENTS.md
     """
-    import asyncio
     import json
 
     from conductor.registry.cache import resolve_and_fetch
@@ -862,7 +861,9 @@ def run(
 
     try:
         # Run the workflow
-        result = asyncio.run(
+        from conductor.cli.async_runner import run_owned
+
+        result = run_owned(
             run_workflow_async(
                 workflow_path,
                 inputs,
@@ -1248,7 +1249,6 @@ def resume(
         conductor resume workflow.yaml --web-bg
         conductor resume workflow.yaml --guidance "Skip the benchmark step"
     """
-    import asyncio
     import json
 
     from conductor.cli.run import (
@@ -1400,7 +1400,9 @@ def resume(
         return
 
     try:
-        result = asyncio.run(
+        from conductor.cli.async_runner import run_owned
+
+        result = run_owned(
             resume_workflow_async(
                 workflow_path=resolved_workflow,
                 checkpoint_path=resolved_checkpoint,

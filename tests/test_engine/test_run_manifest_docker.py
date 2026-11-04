@@ -103,6 +103,115 @@ def _config(*steps: Any, entry_point: str | None = None) -> WorkflowConfig:
     )
 
 
+@pytest.mark.parametrize("persistence", ["durable", "on-failure", "ephemeral"])
+@pytest.mark.parametrize("inline", [False, True], ids=["top_level", "for_each"])
+@pytest.mark.parametrize("profile_source", ["step", "defaults", "environment"])
+@pytest.mark.parametrize(
+    "case", ["external", "owned", "override", "explicit_override", "mismatch", "script", "remote"]
+)
+def test_local_copilot_runtime_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    persistence: str,
+    inline: bool,
+    profile_source: str,
+    case: str,
+) -> None:
+    # Requirement: ownership refusal survives a retaining backend and applies to inline agents.
+    class RetainingAgentBackend:
+        def capabilities(self) -> RunnerCapabilities:
+            return RunnerCapabilities(
+                batch=True,
+                sessions=False,
+                shared_workspace=True,
+                snapshots=False,
+                agent=True,
+                retained_workspace=True,
+            )
+
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "local", RetainingAgentBackend())
+    settings = {"name": "openai" if case == "mismatch" else "copilot"}
+    if case in {"external", "override", "explicit_override", "script", "remote"}:
+        settings["runtime_url"] = "localhost:1"
+    step: dict[str, object] = {"name": "probe", "type": "agent"}
+    if case == "override":
+        step["provider"] = "openai"
+    if case in {"explicit_override", "mismatch"}:
+        step["provider"] = "copilot"
+    if case == "script":
+        step = {"name": "probe", "type": "script", "command": "unused"}
+    if profile_source == "step" or case == "remote":
+        step["execution"] = {"profile": "container" if case == "remote" else "local"}
+    workflow: dict[str, object] = {
+        "name": "ownership",
+        "entry_point": "batch" if inline else "probe",
+        "workspace": {"persistence": persistence},
+        "runtime": {"provider": settings},
+    }
+    if profile_source != "environment":
+        workflow["defaults"] = {
+            "execution": {"profile": "container" if profile_source == "step" else "local"}
+        }
+    raw: dict[str, object] = {
+        "workflow": workflow,
+        "agents": [] if inline else [step],
+    }
+    if inline:
+        raw["for_each"] = [
+            {
+                "name": "batch",
+                "type": "for_each",
+                "source": "workflow.input.items",
+                "as": "item",
+                "agent": step,
+            }
+        ]
+    config = WorkflowConfig.model_validate(raw)
+    environment = _environment(
+        docker=DockerProfileOptions(image="base:test", runner_image="runner:test")
+    )
+    environment.document.default = "local" if profile_source == "environment" else "container"
+    if persistence != "ephemeral" and case in {"external", "explicit_override"}:
+        with pytest.raises(ConfigurationError) as error:
+            _ = compile_run_manifest(config, workflow_path=None, environment=environment)
+        assert error.value.field_path == "workflow.runtime.provider.runtime_url"
+    else:
+        manifest = compile_run_manifest(config, workflow_path=None, environment=environment)
+        key = "for_each.batch.agent" if inline else "probe"
+        assert manifest.profiles[key].backend == ("docker" if case == "remote" else "local")
+
+
+def test_copilot_runtime_ownership_precedes_unsupported_local_retention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: generic capability refusal cannot hide dedicated ownership diagnostics.
+    class UnsupportedBackend:
+        def capabilities(self) -> RunnerCapabilities:
+            return RunnerCapabilities(
+                batch=True,
+                sessions=False,
+                shared_workspace=True,
+                snapshots=False,
+                agent=True,
+                retained_workspace=False,
+            )
+
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "local", UnsupportedBackend())
+    config = WorkflowConfig.model_validate(
+        {
+            "workflow": {
+                "name": "ownership",
+                "entry_point": "probe",
+                "workspace": {"persistence": "durable"},
+                "runtime": {"provider": {"name": "copilot", "runtime_url": "localhost:1"}},
+            },
+            "agents": [{"name": "probe"}],
+        }
+    )
+    with pytest.raises(ConfigurationError) as error:
+        _ = compile_run_manifest(config, workflow_path=None, environment=_environment())
+    assert error.value.field_path == "workflow.runtime.provider.runtime_url"
+
+
 def test_docker_script_records_normalized_execution_with_explicit_nulls(
     docker_backend: None,
 ) -> None:
@@ -494,9 +603,8 @@ class TestWorkspaceManifest:
             (WorkspaceConfig(mode="isolated"), None, None, "isolated.*follow-up"),
             (None, RestartConfig(mode="reuse"), None, "reuse.*follow-up"),
             (None, None, RestartConfig(mode="reuse"), "reuse.*follow-up"),
-            (WorkspaceConfig(persistence="durable"), None, None, "local backend.*retained"),
         ],
-        ids=["isolated", "reuse_default", "reuse_step", "retained_local"],
+        ids=["isolated", "reuse_default", "reuse_step"],
     )
     def test_reserved_and_unsupported_policies_fail_compilation(
         self,

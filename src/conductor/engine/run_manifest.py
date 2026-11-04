@@ -51,9 +51,11 @@ entirely so dumps stay byte-identical to pre-recording producers.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import sys
 from collections.abc import Iterable, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
@@ -71,6 +73,7 @@ from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
     AgentDef,
     ExecutableStepBase,
+    MCPStepDef,
     RuntimeConfig,
     ScriptStepDef,
     StepSecretRef,
@@ -546,6 +549,133 @@ def remote_dialog_error(key: str, backend_name: str) -> str:
     )
 
 
+def _require_local_agent_runtime_ownership(
+    key: str, step: ExecutableStepBase, config: WorkflowConfig
+) -> None:
+    """Refuse explicit external Copilot runtimes for retained local agents."""
+    workspace = config.workflow.workspace
+    if not isinstance(step, AgentDef) or workspace is None or workspace.persistence == "ephemeral":
+        return
+    settings = config.workflow.runtime.provider
+    effective_provider = provider_type_for_agent(step, settings.name)
+    if (
+        effective_provider == "copilot"
+        and settings.name == effective_provider
+        and settings.has_external_runtime()
+    ):
+        raise ConfigurationError(
+            f"Agent step '{key}' uses runtime_url with a retained local workspace; "
+            "managed Copilot requires an owned stdio runtime, not an external runtime.",
+            field_path="workflow.runtime.provider.runtime_url",
+        )
+
+
+def _require_managed_local_consumer(
+    key: str,
+    step: ExecutableStepBase,
+    config: WorkflowConfig,
+    workflow_path: Path | None,
+    environment: ResolvedEnvironment,
+) -> None:
+    """Check effective managed consumers without granting host filesystem access."""
+    from conductor.engine.local_workspace import _logical_directory
+    from conductor.providers.capabilities import get_capabilities
+    from conductor.templating import is_jinja_template
+
+    consumer = isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef))
+    if not consumer and not isinstance(step, WorkflowStepDef):
+        return
+    runtime = config.workflow.runtime
+    if isinstance(step, AgentDef):
+        provider = provider_type_for_agent(step, runtime.provider.name)
+        capabilities = get_capabilities(provider)
+        if not capabilities.working_dir or not capabilities.managed_local_workspace:
+            raise ConfigurationError(
+                f"Agent step '{key}' requires provider working_dir and "
+                "managed_local_workspace capabilities for retained local execution.",
+                field_path=f"agents.{key}.provider",
+            )
+    directories = (
+        [
+            getattr(step, "working_dir", None)
+            if getattr(step, "working_dir", None) is not None
+            else runtime.working_dir,
+            step.settings_dir if isinstance(step, AgentDef) else None,
+        ]
+        if consumer
+        else []
+    )
+    literal = [value for value in directories if value is not None and not is_jinja_template(value)]
+    # Relative traversal is decidable even for programmatic configurations. A
+    # real source closure supplies the absolute translation provenance below.
+    for value in literal:
+        if not Path(value).is_absolute():
+            _logical_directory(value, (), "main", windows=os.name == "nt")
+    if workflow_path is None:
+        return
+    from conductor.bundle.collector import _Collector
+    from conductor.bundle.errors import BundleError
+
+    try:
+        collector = _Collector(
+            workflow_path,
+            environment,
+            False,
+            lambda _message: logging.getLogger(__name__).warning(
+                "Managed local source collection reported a warning; "
+                "run conductor validate for details."
+            ),
+        )
+        collected = collector.collect()
+    except BundleError as exc:
+        raise ConfigurationError(
+            "Managed local source closure is unavailable.",
+            suggestion="Declare the complete offline bundle closure before running.",
+        ) from exc
+    if collected.descriptor.incomplete:
+        raise ConfigurationError("Managed local source closure is incomplete.")
+    for index, node in enumerate(collector.nodes):
+        active = config if index == 0 else node.config
+        if index:
+            if active.workflow.workspace is not None:
+                raise ConfigurationError("Sub-workflow cannot override root workspace policy.")
+            active = active.model_copy(
+                update={
+                    "workflow": active.workflow.model_copy(
+                        update={"workspace": config.workflow.workspace}
+                    )
+                }
+            )
+        # Reuse the compiler's capability/ownership checks, without recollecting
+        # files. The collector already resolved the closure and rejected cycles.
+        manifest = compile_run_manifest(active, workflow_path=None, environment=environment)
+        namespace = (
+            PurePosixPath(collector._local_logical_path(node.path)[0])
+            .parent.relative_to("tree")
+            .as_posix()
+        )
+        for node_key, node_step in _iter_executable_steps(active):
+            if manifest.profiles[node_key].backend != "local" or not isinstance(
+                node_step, (AgentDef, ScriptStepDef, MCPStepDef)
+            ):
+                continue
+            cwd = getattr(node_step, "working_dir", None)
+            fields = (
+                cwd if cwd is not None else active.workflow.runtime.working_dir,
+                node_step.settings_dir if isinstance(node_step, AgentDef) else None,
+            )
+            for value in fields:
+                if value is not None and not is_jinja_template(value):
+                    # Existence belongs to live dispatch: a prior step can create
+                    # this directory in work/, without changing source or CAS.
+                    _logical_directory(
+                        value,
+                        collected.source_roots + collected.agent_paths,
+                        namespace,
+                        windows=os.name == "nt",
+                    )
+
+
 def _require_agent_backend_capability(
     key: str,
     backend_name: str,
@@ -967,16 +1097,21 @@ def compile_run_manifest(
                 "point the step at one of the defined profiles.",
             )
         backend_name = definition.backend
+        if backend_name == "local":
+            _require_local_agent_runtime_ownership(key, step, config)
         if workspace is not None and workspace.persistence != "ephemeral":
             provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
-            if provider is not None and not provider.capabilities().retained_workspace:
+            if (
+                isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef))
+                and provider is not None
+                and not provider.capabilities().retained_workspace
+            ):
                 raise ConfigurationError(
                     f"Step '{key}': {backend_name} backend does not support retained workspaces; "
-                    "use docker profiles for every executable step or drop persistence; "
-                    "local retained workspace arrives in a later delivery. Until the agent "
-                    "realm follow-up, retained policy is available only for docker script "
-                    "workflows."
+                    "choose a retaining backend or drop persistence."
                 )
+            if backend_name == "local":
+                _require_managed_local_consumer(key, step, config, workflow_path, environment)
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)

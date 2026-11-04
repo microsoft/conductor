@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from pydantic_ai import Agent
 
     from conductor.config.schema import ToolOutputConfig
+    from conductor.providers._pydantic_ai.interrupt import _ManagedRun
 
 
 # A permissive validator that accepts any JSON-shaped dict. This matches how
@@ -53,6 +54,7 @@ class MCPManagerToolset(AbstractToolset[Any]):
         output_config: ToolOutputConfig | None,
         *,
         event_callback: EventCallback | None = None,
+        managed_run: _ManagedRun | None = None,
     ) -> None:
         """Create a toolset adapter.
 
@@ -69,6 +71,7 @@ class MCPManagerToolset(AbstractToolset[Any]):
         self._tool_names = tool_names
         self._output_config = output_config
         self._event_callback = event_callback
+        self._managed_run = managed_run
 
     @property
     def id(self) -> str | None:
@@ -77,11 +80,17 @@ class MCPManagerToolset(AbstractToolset[Any]):
 
     async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
         """Return tools from the MCP manager in ``{server}__{tool}`` form."""
+        if self._managed_run is not None:
+            self._managed_run.check_dispatch()
         tools: dict[str, ToolsetTool[Any]] = {}
         for tool in self._manager.get_all_tools():
             name = tool["name"]
             if self._tool_names is not None and name not in self._tool_names:
                 continue
+            if self._managed_run is not None:
+                grants = self._managed_run.workspace.tool_grants[self._manager][tool["server"]]
+                if grants is not None and tool["original_name"] not in grants:
+                    continue
             tools[name] = ToolsetTool(
                 toolset=self,
                 tool_def=ToolDefinition(
@@ -121,15 +130,25 @@ class MCPManagerToolset(AbstractToolset[Any]):
                 records an ``outcome='failed'`` tool return that Anthropic maps to
                 ``is_error=True``.
         """
-        try:
-            result = await self._manager.call_tool(name, tool_args)
-        except Exception as e:
-            # The model will see this failure in its transcript, but operator
-            # logs need it too: without this warning a genuine adapter bug is
-            # indistinguishable from a legitimate tool-level failure unless
-            # someone digs through model transcripts.
-            logger.warning("MCP tool call %r failed: %s: %s", name, type(e).__name__, e)
-            raise ToolFailed(f"Error executing tool {name!r}: {e}") from e
+        if self._managed_run is not None:
+            self._managed_run.check_dispatch()
+
+        async def invoke() -> str:
+            try:
+                return await self._manager.call_tool(name, tool_args)
+            except Exception as e:
+                # SDK tool errors belong in the transcript; ownership failures
+                # from the outer observer must abort rather than become tools.
+                logger.warning("MCP tool call %r failed: %s: %s", name, type(e).__name__, e)
+                raise ToolFailed(f"Error executing tool {name!r}: {e}") from e
+
+        result = (
+            await invoke()
+            if self._managed_run is None
+            else await self._managed_run.wait(self._managed_run.spawn(invoke))
+        )
+        if self._managed_run is not None:
+            self._managed_run.check_dispatch()
         if self._event_callback is not None and ctx.agent is not None:
             maybe_emit_tool_truncation(ctx.agent, name, result, self._event_callback)
         return result

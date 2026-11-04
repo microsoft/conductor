@@ -5,6 +5,39 @@ import pytest
 from conductor.providers.base import AgentOutput, ModelCapabilityInfo, match_model_id
 
 
+async def test_workspace_release_is_explicitly_unsupported_by_default() -> None:
+    # Requirement: an unimplemented release hook never certifies an empty workspace.
+    from conductor.exceptions import ProviderError
+    from conductor.providers.base import AgentProvider
+
+    class LegacyProvider(AgentProvider, abstract=True):
+        async def execute(self, *args, **kwargs) -> AgentOutput:
+            return AgentOutput(content={}, raw_response=None)
+
+        async def validate_connection(self) -> bool:
+            return True
+
+        async def close(self) -> None:
+            raise AssertionError("targeted release must not call close")
+
+    with pytest.raises(ProviderError) as caught:
+        await LegacyProvider().release_workspace("/workspace")
+    assert caught.value.is_retryable is False
+
+
+@pytest.mark.parametrize("method", ["execute", "execute_dialog_turn"])
+def test_base_managed_context_is_optional_and_keyword_only(method: str) -> None:
+    # Requirement: execution and dialog expose an additive explicit ownership context.
+    import inspect
+
+    from conductor.providers.base import AgentProvider
+
+    parameter = inspect.signature(getattr(AgentProvider, method)).parameters["managed_workspace"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
+    assert parameter.annotation == "ManagedWorkspaceContext | None"
+
+
 class TestAgentOutput:
     """Tests for the AgentOutput dataclass."""
 

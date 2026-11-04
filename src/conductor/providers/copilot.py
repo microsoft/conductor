@@ -15,13 +15,18 @@ import math
 import os
 import random
 import subprocess
+import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
+from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeGuard
+from uuid import uuid4
 
 from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
+from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
 from conductor.executor.output import validate_output
 from conductor.providers._event_format import (
     emit_parse_recovery_event,
@@ -51,6 +56,41 @@ if TYPE_CHECKING:
     from conductor.engine.pricing import ModelPricing
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ManagedCopilotInvocation:
+    """Keep attempted startup and its actual owner until release is proven."""
+
+    provider: CopilotProvider
+    workspace: ManagedWorkspaceContext
+    invocation_id: str
+    cwd: str
+    client: Any = None
+    owner: asyncio.Task[Any] | None = None
+    process: subprocess.Popen[bytes] | subprocess.Popen[str] | None = None
+    readers: tuple[threading.Thread, ...] = ()
+    stopping: bool = False
+
+    def begin_teardown(self) -> None:
+        self.stopping = True
+        self.workspace.process_scopes.begin_teardown(self.invocation_id)
+
+
+@dataclass(frozen=True)
+class _ManagedCopilotSession:
+    """Disk-session continuation identity, never a cached SDK client."""
+
+    root: str
+    incarnation: str
+    session_id: str
+    cwd: str
+    resume_kwargs: dict[str, Any]
+
+
+_MANAGED_COPILOT: ContextVar[_ManagedCopilotInvocation | None] = ContextVar(
+    "managed_copilot_invocation", default=None
+)
 
 # GitHub Copilot bills token usage in "AI Credits". The SDK's per-model
 # ``billing.token_prices`` are quoted in credits per batch of ``batch_size``
@@ -384,6 +424,8 @@ class CopilotProvider(AgentProvider):
         # ``working_directory`` and stamped onto each stdio MCP server
         # config per execution (no shared-dict mutation).
         working_dir=True,
+        # Each managed call owns its stdio client and proves invocation release.
+        managed_local_workspace=True,
         # Skill directories are registered on the SDK session via
         # ``session_kwargs["skill_directories"]`` and the agent discovers
         # skill content natively (progressive disclosure).
@@ -506,6 +548,9 @@ class CopilotProvider(AgentProvider):
                 environment variables. False preserves host-effective settings.
         """
         self._client: Any = None  # Will hold Copilot SDK client
+        self._owned_legacy_client: Any = None
+        self._managed_invocations: dict[str, list[_ManagedCopilotInvocation]] = {}
+        self._managed_sealed_roots: set[str] = set()
         self._mock_handler = mock_handler
         self._call_history: list[dict[str, Any]] = []
         self._retry_config = retry_config or RetryConfig()
@@ -898,6 +943,7 @@ class CopilotProvider(AgentProvider):
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -929,6 +975,8 @@ class CopilotProvider(AgentProvider):
                 ``False``), so it never populates
                 ``AgentOutput.continuation_state`` and is never handed one
                 back.
+            managed_workspace: Explicit owned local context. Each call uses a
+                fresh stdio client and proves invocation release before returning.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -936,6 +984,23 @@ class CopilotProvider(AgentProvider):
         Raises:
             ProviderError: If execution fails after all retry attempts.
         """
+        if managed_workspace is not None:
+            return await self._managed_call(
+                managed_workspace,
+                agent.working_dir,
+                lambda: self.execute(
+                    agent,
+                    context,
+                    rendered_prompt,
+                    tools=tools,
+                    interrupt_signal=interrupt_signal,
+                    event_callback=event_callback,
+                    skill_directories=skill_directories,
+                    custom_agents=custom_agents,
+                    extra_mcp_servers=extra_mcp_servers,
+                    suppress_mcp_servers=suppress_mcp_servers,
+                ),
+            )
         del continuation_state  # No continuation surface (see docstring).
         # Record the call for testing purposes
         self._call_history.append(
@@ -1058,6 +1123,7 @@ class CopilotProvider(AgentProvider):
                     extra_mcp_servers=extra_mcp_servers,
                     suppress_mcp_servers=suppress_mcp_servers,
                 )
+                self._check_managed_mutations()
                 # A successful SDK call resets the consecutive-restart budget
                 # (issue #483, Q2): the counter only bounds a death loop where
                 # the runtime dies again before ever succeeding, not restarts
@@ -1279,7 +1345,10 @@ class CopilotProvider(AgentProvider):
             # ``agent.working_dir`` (Jinja render, absolutize, is_dir check)
             # before dispatching to the provider; ``None`` keeps the legacy
             # process-cwd behavior.
-            resolved_cwd = agent.working_dir or os.getcwd()
+            invocation = self._managed_invocation()
+            resolved_cwd = (
+                invocation.cwd if invocation is not None else agent.working_dir or os.getcwd()
+            )
 
             # Build session kwargs for the SDK.
             #
@@ -1439,10 +1508,8 @@ class CopilotProvider(AgentProvider):
                                 "mode": "replace",
                                 "content": agent.system_prompt,
                             }
-                        if self._mcp_servers or extra_mcp_servers:
-                            resume_kwargs["mcp_servers"] = self._merge_mcp_servers(
-                                resolved_cwd, extra_mcp_servers
-                            )
+                        if merged_servers:
+                            resume_kwargs["mcp_servers"] = merged_servers
                         resume_kwargs["large_output"] = self._large_output_config()
                         # Skills and plugin subagents are session-scoped, so a
                         # resumed session that omits them silently runs with
@@ -1454,7 +1521,9 @@ class CopilotProvider(AgentProvider):
                             resume_kwargs["custom_agents"] = [dict(spec) for spec in custom_agents]
                         self._apply_provider_config(resume_kwargs)
                         self._apply_github_token(resume_kwargs)
-                        session = await self._client.resume_session(resume_sid, **resume_kwargs)
+                        session = await self._session_client().resume_session(
+                            resume_sid, **resume_kwargs
+                        )
                         logger.info(
                             f"Resumed Copilot session {resume_sid} for agent '{agent.name}'"
                         )
@@ -1467,11 +1536,12 @@ class CopilotProvider(AgentProvider):
 
             # Fall back to creating a new session
             if session is None:
-                session = await self._client.create_session(**session_kwargs)
+                session = await self._session_client().create_session(**session_kwargs)
 
             # Track session ID and resolved cwd for checkpoint persistence
             sid = getattr(session, "session_id", None)
             if sid is not None:
+                self._check_managed_mutations()
                 self._session_ids[agent.name] = sid
                 self._session_cwds[agent.name] = resolved_cwd
 
@@ -1512,8 +1582,22 @@ class CopilotProvider(AgentProvider):
                 # Handle mid-agent interrupt: return partial content
                 # and keep session alive for follow-up
                 if sdk_response.partial:
-                    self._interrupted_session = session
-                    session_destroyed = True  # Prevent finally from destroying it
+                    invocation = self._managed_invocation()
+                    self._check_managed_mutations()
+                    if invocation is None:
+                        self._interrupted_session = session
+                        session_destroyed = True  # Keep the legacy live session.
+                    else:
+                        resume_options = dict(session_kwargs)
+                        resume_options.pop("model", None)
+                        resume_options.pop("streaming", None)
+                        self._interrupted_session = _ManagedCopilotSession(
+                            invocation.workspace.root,
+                            invocation.workspace.incarnation,
+                            session.session_id,
+                            invocation.cwd,
+                            resume_options,
+                        )
                     partial_content: dict[str, Any]
                     try:
                         extracted = self._extract_json(response_content)
@@ -1673,6 +1757,8 @@ class CopilotProvider(AgentProvider):
             finally:
                 # Disconnect session unless it was kept alive for follow-up
                 if not session_destroyed:
+                    if (invocation := self._managed_invocation()) is not None:
+                        invocation.begin_teardown()
                     try:
                         await session.disconnect()
                     except asyncio.CancelledError:
@@ -1784,9 +1870,17 @@ class CopilotProvider(AgentProvider):
         # (#488) — see IdleRecoveryConfig.idle_timeout_seconds docstring for
         # why a stale clock isn't reliable here.
         active_tools: dict[str, str] = {}
+        invocation = self._managed_invocation()
 
         def on_event(event: Any) -> None:
             nonlocal response_content, error_message
+            if (
+                invocation is not None
+                and not invocation.workspace.process_scopes.owners.mutations_allowed(
+                    invocation.invocation_id
+                )
+            ):
+                return
             event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
 
             # Log every SDK event for debugging stalls (visible via --log-file)
@@ -2014,6 +2108,8 @@ class CopilotProvider(AgentProvider):
         guidance: str,
         agent_name: str | None = None,
         agent_model: str | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Send follow-up guidance to an interrupted session.
 
@@ -2032,10 +2128,32 @@ class CopilotProvider(AgentProvider):
                 tag, when supplied, is the unqualified agent name.
             agent_model: Optional configured model for the interrupted agent,
                 used when the follow-up response does not report a resolved model.
+            managed_workspace: Required for a managed interrupted session; resumes
+                its disk SID in a fresh owned runtime with the original cwd.
 
         Returns:
             AgentOutput with the follow-up response content.
         """
+        if managed_workspace is not None:
+            if not isinstance(session, _ManagedCopilotSession) or (
+                session.root != managed_workspace.root
+                or session.incarnation != managed_workspace.incarnation
+            ):
+                raise ProviderError(
+                    "Managed Copilot continuation identity mismatch", is_retryable=False
+                )
+
+            async def resume() -> AgentOutput:
+                resumed = await self._session_client().resume_session(
+                    session.session_id, **session.resume_kwargs
+                )
+                return await self.send_followup(resumed, guidance, agent_name, agent_model)
+
+            return await self._managed_call(managed_workspace, session.cwd, resume)
+        if isinstance(session, _ManagedCopilotSession):
+            raise ProviderError(
+                "Managed Copilot continuation requires its workspace", is_retryable=False
+            )
         from conductor.cli.app import is_full, is_verbose
 
         verbose_enabled = is_verbose()
@@ -2074,6 +2192,8 @@ class CopilotProvider(AgentProvider):
                 or self._default_model,
             )
         finally:
+            if (invocation := self._managed_invocation()) is not None:
+                invocation.begin_teardown()
             await session.disconnect()
 
     def _extract_json(self, content: str) -> dict[str, Any]:
@@ -2750,9 +2870,15 @@ class CopilotProvider(AgentProvider):
         waiter to observe a dead runtime rebuilds it, and any waiter that
         arrives after that rebuild sees a live child and does nothing.
         """
+        if (invocation := self._managed_invocation()) is not None:
+            self._check_managed_mutations()
+            if invocation.stopping:
+                raise ProviderError("Managed Copilot invocation is sealed", is_retryable=False)
+            return
         async with self._start_lock:
             if self._client is None:
                 self._client = self._build_client()
+                self._owned_legacy_client = self._client
             if not self._started:
                 await self._client.start()
                 self._started = True
@@ -2817,6 +2943,8 @@ class CopilotProvider(AgentProvider):
         FFI mode, and a client that has not started yet, so no non-spawned
         mode can ever trigger a restart.
         """
+        if self._managed_invocation() is not None:
+            return False  # Managed transport failure is reported by SDK/custody, not private PIDs.
         process = self._spawned_runtime_process()
         return process is not None and process.poll() is not None
 
@@ -2844,7 +2972,9 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             )
 
-        process = self._spawned_runtime_process()
+        process = (
+            None if self._managed_invocation() is not None else self._spawned_runtime_process()
+        )
         exit_code = process.poll() if process is not None else None
         if exit_code is not None:
             return ProviderError(
@@ -2929,6 +3059,7 @@ class CopilotProvider(AgentProvider):
         new_client = self._build_client()
         await new_client.start()
         self._client = new_client
+        self._owned_legacy_client = new_client
         self._started = True
         self._fix_pipe_blocking_mode()
 
@@ -2990,6 +3121,252 @@ class CopilotProvider(AgentProvider):
             url,
         )
         return CopilotClient(connection=RuntimeConnection.for_uri(url, connection_token=token))
+
+    def _managed_invocation(self) -> _ManagedCopilotInvocation | None:
+        invocation = _MANAGED_COPILOT.get()
+        return invocation if invocation is not None and invocation.provider is self else None
+
+    def _session_client(self) -> Any:
+        invocation = self._managed_invocation()
+        return invocation.client if invocation is not None else self._client
+
+    def _check_managed_mutations(self) -> None:
+        invocation = self._managed_invocation()
+        if (
+            invocation is not None
+            and not invocation.workspace.process_scopes.owners.mutations_allowed(
+                invocation.invocation_id
+            )
+        ):
+            raise ProviderError(
+                "Managed Copilot owner no longer permits mutations", is_retryable=False
+            )
+
+    async def _managed_call[T](
+        self,
+        workspace: ManagedWorkspaceContext,
+        cwd: str | None,
+        operation: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Own one fresh native client; the outer root alone owns its root barrier."""
+        if self._resolve_runtime_connection() is not None or (
+            self._client is not None and self._client is not self._owned_legacy_client
+        ):
+            raise ProviderError(
+                "Managed Copilot requires an owned stdio client, not an external runtime/client",
+                is_retryable=False,
+            )
+        if not COPILOT_SDK_AVAILABLE or RuntimeConnection is None:
+            raise ProviderError(
+                "Managed Copilot requires the stdio RuntimeConnection API", is_retryable=False
+            )
+        if self._mock_handler is not None:
+            raise ProviderError(
+                "Managed Copilot requires the native SDK runtime", is_retryable=False
+            )
+        previous = self._managed_invocations.get(workspace.root, [])
+        if workspace.root in self._managed_sealed_roots or any(
+            entry.workspace.incarnation != workspace.incarnation
+            or entry.workspace.process_scopes is not workspace.process_scopes
+            for entry in previous
+        ):
+            raise ProviderError("Managed Copilot workspace is sealed or stale", is_retryable=False)
+        directory = Path(cwd) if cwd is not None else Path(workspace.root) / "work"
+        work_root = (Path(workspace.root) / "work").resolve()
+        if (
+            not directory.is_absolute()
+            or not directory.resolve().is_relative_to(work_root)
+            or not directory.is_dir()
+        ):
+            raise ProviderError(
+                "Managed Copilot cwd must exist inside the workspace work tree", is_retryable=False
+            )
+        invocation = _ManagedCopilotInvocation(self, workspace, uuid4().hex, str(directory))
+        self._managed_invocations.setdefault(workspace.root, []).append(invocation)
+        scopes = workspace.process_scopes
+        pipes_closed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        scopes.owners.register(invocation.invocation_id, pipes_closed)
+
+        async def run() -> T:
+            token = _MANAGED_COPILOT.set(invocation)
+            try:
+                assert RuntimeConnection is not None and CopilotClient is not None
+                connection = RuntimeConnection.for_stdio()
+                telemetry = _build_client_telemetry()
+                options: dict[str, Any] = {
+                    "connection": connection,
+                    "working_directory": invocation.cwd,
+                }
+                if telemetry is not None:
+                    options["telemetry"] = telemetry
+                elif guards.is_telemetry_active() and guards.warn_copilot_grpc_once():
+                    logger.warning(
+                        "Copilot native OpenTelemetry spans require HTTP OTLP; set OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf."
+                    )
+                # The unstarted public constructor resolves connection.path. It
+                # must see the original target, never the installed facade.
+                invocation.client = CopilotClient(**options)
+                target = connection.path
+                if not target:
+                    raise ProviderError(
+                        "Copilot SDK did not resolve a stdio target", is_retryable=False
+                    )
+                argv = ("node", target) if target.endswith(".js") else (target,)
+                launch = await scopes.wrap_stdio(
+                    invocation.invocation_id,
+                    ProcessLaunchSpec(argv, dict(os.environ), invocation.cwd),
+                )
+                connection.path = launch.argv[0]
+                start_stdio = invocation.client._start_cli_server
+
+                async def start_owned_stdio() -> None:
+                    try:
+                        await start_stdio()
+                    finally:
+                        process = invocation.client._cli_process
+                        if (
+                            isinstance(process, subprocess.Popen)
+                            and isinstance(process.args, list)
+                            and process.args[0] == launch.argv[0]
+                        ):
+                            invocation.process = process
+
+                invocation.client._start_cli_server = start_owned_stdio
+                await invocation.client.start()
+                return await operation()
+            finally:
+                # stop() discards the exact JSON-RPC reader references, even
+                # when start() failed before creating any successful session.
+                if invocation.client is not None:
+                    transport = invocation.client._client
+                    if transport is not None:
+                        invocation.readers = tuple(
+                            thread
+                            for thread in (transport._read_thread, transport._stderr_thread)
+                            if thread is not None
+                        )
+                invocation.begin_teardown()
+                try:
+                    if invocation.client is not None:
+                        try:
+                            await invocation.client.stop()
+                        except Exception:
+                            logger.warning(
+                                "Managed Copilot native stop failed; release still requires process and owner proofs",
+                                exc_info=True,
+                            )
+                finally:
+                    try:
+                        process = invocation.process
+                        if process is not None:
+                            # SDK stop reaps the facade but does not close its
+                            # FileIO pipes. Join its exact readers before close,
+                            # using only the original invocation budget.
+                            deadline = scopes.owners.deadline(invocation.invocation_id)
+                            assert deadline is not None
+                            for thread in invocation.readers:
+                                await asyncio.to_thread(
+                                    thread.join, max(0.0, deadline - time.monotonic())
+                                )
+                            if process.poll() is None or any(
+                                thread.is_alive() for thread in invocation.readers
+                            ):
+                                raise ProviderError(
+                                    "Managed Copilot stdio owners did not join",
+                                    is_retryable=False,
+                                )
+                            for stream in (process.stdin, process.stdout, process.stderr):
+                                if stream is not None:
+                                    stream.close()
+                        pipes_closed.set_result(None)
+                    except (OSError, ProviderError):
+                        # The registered unfinished owner keeps the original
+                        # barrier fail-closed without replacing startup failure.
+                        logger.warning("Managed Copilot stdio close is unconfirmed", exc_info=True)
+                    finally:
+                        _MANAGED_COPILOT.reset(token)
+
+        owner = asyncio.create_task(run())
+        invocation.owner = owner
+        try:
+            scopes.owners.register(invocation.invocation_id, owner)
+        except BaseException:
+            owner.cancel()
+            raise
+        try:
+            await self._join_managed(invocation)
+        except ProviderError:
+            if owner.done():
+                owner.result()
+            raise
+        return owner.result()
+
+    async def _join_managed(self, invocation: _ManagedCopilotInvocation) -> None:
+        """Observe completion and native proof under the first absolute deadline."""
+        scopes = invocation.workspace.process_scopes
+        assert invocation.owner is not None
+        observed = asyncio.create_task(
+            scopes.owners.observe(invocation.invocation_id, invocation.owner)
+        )
+        cancelled: asyncio.CancelledError | None = None
+        cancel_requested = False
+        try:
+            while not observed.done():
+                try:
+                    await asyncio.wait({observed})
+                except asyncio.CancelledError as error:
+                    cancelled = cancelled or error
+                    was_stopping = invocation.stopping
+                    invocation.begin_teardown()
+                    if not cancel_requested and not was_stopping:
+                        invocation.owner.cancel()
+                        cancel_requested = True
+            joined = observed.result()
+            invocation.begin_teardown()
+            while True:
+                try:
+                    proof = await scopes.await_release(invocation.invocation_id)
+                    break
+                except asyncio.CancelledError as error:
+                    cancelled = cancelled or error
+            if not joined or proof.status != "released":
+                logger.warning(
+                    "Managed Copilot cleanup is unconfirmed for invocation %s: %s; proofs=%s",
+                    invocation.invocation_id,
+                    proof.reasons,
+                    tuple(
+                        item
+                        for item in scopes.proofs
+                        if item.invocation_id == invocation.invocation_id
+                    ),
+                )
+                if cancelled is not None:
+                    raise cancelled
+                raise ProviderError("Managed Copilot cleanup is unconfirmed", is_retryable=False)
+            if cancelled is not None:
+                raise cancelled
+        finally:
+            observed.cancel()
+
+    async def release_workspace(self, workspace_root: str) -> None:
+        """Release attempted invocations only, never the root controller/provider."""
+        invocations = self._managed_invocations.get(workspace_root)
+        if invocations is None:
+            raise ProviderError("Unknown managed Copilot workspace", is_retryable=False)
+        self._managed_sealed_roots.add(workspace_root)
+        for invocation in invocations:
+            was_stopping = invocation.stopping
+            invocation.begin_teardown()
+            if invocation.owner is not None and not invocation.owner.done() and not was_stopping:
+                invocation.owner.cancel()
+        errors: list[Exception] = []
+        for invocation in invocations:
+            try:
+                await self._join_managed(invocation)
+            except ProviderError as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("Managed Copilot workspace release failed", errors)
 
     def _fix_pipe_blocking_mode(self) -> None:
         """Clear O_NONBLOCK on the Copilot CLI subprocess pipes.
@@ -3166,6 +3543,9 @@ class CopilotProvider(AgentProvider):
         user_message: str,
         history: list[dict[str, str]] | None = None,
         model: str | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
     ) -> str:
         """Execute a single dialog turn using a lightweight Copilot session.
 
@@ -3178,6 +3558,10 @@ class CopilotProvider(AgentProvider):
             user_message: The latest user message.
             history: Optional prior conversation history.
             model: Optional model override. Falls back to provider default.
+            managed_workspace: Optional owned context; uses its staged work tree
+                and a fresh client rather than the provider's legacy runtime.
+            working_dir: Explicit resolved staged cwd, required with
+                managed_workspace. Omitted on legacy calls.
 
         Returns:
             The agent's response text.
@@ -3185,6 +3569,17 @@ class CopilotProvider(AgentProvider):
         Raises:
             ProviderError: If the dialog turn fails.
         """
+        if managed_workspace is not None:
+            if working_dir is None:
+                raise ProviderError(
+                    "Managed Copilot dialog requires an explicit staged working_dir",
+                    is_retryable=False,
+                )
+            return await self._managed_call(
+                managed_workspace,
+                working_dir,
+                lambda: self.execute_dialog_turn(system_prompt, user_message, history, model),
+            )
         await self._ensure_client_started()
 
         # Build the full prompt from history + current message
@@ -3204,6 +3599,8 @@ class CopilotProvider(AgentProvider):
                 "on_permission_request": self._default_permission_handler,
                 "system_message": {"mode": "replace", "content": system_prompt},
             }
+            if (invocation := self._managed_invocation()) is not None:
+                dialog_kwargs["working_directory"] = invocation.cwd
 
             # Honor the same custom provider routing as agent sessions so
             # dialog turns hit the same endpoint as agent execution.
@@ -3238,14 +3635,22 @@ class CopilotProvider(AgentProvider):
                     dialog_kwargs["model"],
                 )
 
-            session = await self._client.create_session(**dialog_kwargs)
+            session = await self._session_client().create_session(**dialog_kwargs)
 
             response_content = ""
             done = asyncio.Event()
             error_message: str | None = None
+            invocation = self._managed_invocation()
 
             def on_event(event: Any) -> None:
                 nonlocal response_content, error_message
+                if (
+                    invocation is not None
+                    and not invocation.workspace.process_scopes.owners.mutations_allowed(
+                        invocation.invocation_id
+                    )
+                ):
+                    return
                 event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
                 if event_type == "assistant.message":
                     response_content = event.data.content
@@ -3284,6 +3689,8 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             ) from exc
         finally:
+            if (invocation := self._managed_invocation()) is not None:
+                invocation.begin_teardown()
             if session is not None:
                 with contextlib.suppress(Exception):
                     await session.destroy()
@@ -3327,7 +3734,7 @@ class CopilotProvider(AgentProvider):
             return None
         try:
             await self._ensure_client_started()
-            models = await self._client.list_models()
+            models = await self._session_client().list_models()
         except Exception as e:
             logger.debug("Failed to list Copilot models for %r: %s", model, e)
             return None
@@ -3391,7 +3798,7 @@ class CopilotProvider(AgentProvider):
             return None
         try:
             await self._ensure_client_started()
-            models = await self._client.list_models()
+            models = await self._session_client().list_models()
             by_id = {info.id: info for info in models}
         except Exception as e:
             logger.debug("Failed to list Copilot models for pricing of %r: %s", model, e)
@@ -3463,7 +3870,7 @@ class CopilotProvider(AgentProvider):
             return None
         try:
             await self._ensure_client_started()
-            models = await self._client.list_models()
+            models = await self._session_client().list_models()
         except Exception as e:
             logger.debug("Failed to list Copilot models: %s", e)
             return None
@@ -3502,7 +3909,7 @@ class CopilotProvider(AgentProvider):
             return
         try:
             await self._ensure_client_started()
-            models = await self._client.list_models()
+            models = await self._session_client().list_models()
         except Exception as e:
             logger.debug(
                 "Failed to list Copilot models for reasoning_effort validation of %r: %s",
@@ -3554,7 +3961,7 @@ class CopilotProvider(AgentProvider):
             return None
         try:
             await self._ensure_client_started()
-            models = await self._client.list_models()
+            models = await self._session_client().list_models()
         except Exception as e:
             logger.debug("Failed to list Copilot models for capabilities of %r: %s", model, e)
             return None

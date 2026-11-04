@@ -9,10 +9,13 @@ from __future__ import annotations
 import asyncio
 import gc
 import time
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Any, Never
 from unittest.mock import patch
 
+import httpx
 import pytest
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
@@ -33,6 +36,70 @@ def _build_structured_agent(model_cls: type[BaseModel], data: dict[str, Any]) ->
 def _ensure_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide a dummy API key so ClaudeProvider construction succeeds."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_model_metadata(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """Serve deterministic metadata through the real SDK and close its clients."""
+    clients: list[AsyncAnthropic] = []
+    served: set[httpx.AsyncClient] = set()
+    responses: list[httpx.Response] = []
+    original_init = AsyncAnthropic.__init__
+
+    def track_client(self: AsyncAnthropic, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        clients.append(self)
+
+    async def metadata_send(
+        self: httpx.AsyncClient, request: httpx.Request, *args: Any, **kwargs: Any
+    ) -> httpx.Response:
+        # TestModel must not leave metadata HTTP live; exercise real SDK parsing and cache fill.
+        if (
+            request.method != "GET"
+            or request.url != httpx.URL("https://api.anthropic.com/v1/models?limit=100")
+            or self in served
+        ):
+            pytest.fail("Unexpected HTTP request in Claude performance test")
+        served.add(self)
+        response = httpx.Response(
+            200,
+            request=request,
+            json={
+                "data": [
+                    {
+                        "id": "claude-3-5-sonnet-latest",
+                        "type": "model",
+                        "display_name": "Diagnostic Claude",
+                        "created_at": "2025-01-01T00:00:00Z",
+                        "max_input_tokens": 200000,
+                        "max_tokens": 8192,
+                    }
+                ],
+                "has_more": False,
+                "first_id": "claude-3-5-sonnet-latest",
+                "last_id": "claude-3-5-sonnet-latest",
+            },
+        )
+        responses.append(response)
+        return response
+
+    def reject_sync_send(
+        self: httpx.Client, request: httpx.Request, *args: Any, **kwargs: Any
+    ) -> Never:
+        pytest.fail("Unexpected synchronous HTTP request in Claude performance test")
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(AsyncAnthropic, "__init__", track_client)
+    monkeypatch.setattr(httpx.AsyncClient, "send", metadata_send)
+    monkeypatch.setattr(httpx.Client, "send", reject_sync_send)
+    try:
+        yield
+    finally:
+        for response in responses:
+            await response.aclose()
+        for client in clients:
+            await client.close()
 
 
 class TestClaudeProviderPerformance:
