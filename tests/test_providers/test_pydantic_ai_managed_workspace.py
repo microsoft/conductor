@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,6 +29,9 @@ from conductor.providers._pydantic_ai import runner as runner_module
 from conductor.providers.base import AgentOutput
 from conductor.providers.claude import ClaudeProvider
 from conductor.providers.openai import OpenAIProvider
+from conductor.providers.registry import ProviderRegistry
+from conductor.redaction import REDACTED_MARKER, RunRedactor
+from tests.test_providers.test_registry import create_test_config
 
 FIXTURE = Path(__file__).with_name("managed_pydantic_mcp_fixture.py")
 Provider = ClaudeProvider | OpenAIProvider
@@ -166,6 +170,455 @@ def agent(name: str, cwd: str | None = None) -> AgentDef:
 async def completed(task: asyncio.Task[Any]) -> None:
     done, pending = await asyncio.wait({task}, timeout=10)
     assert done == {task} and not pending
+
+
+@pytest.mark.parametrize("cancel_release", [False, True])
+async def test_close_starts_independent_resources_before_waiting(
+    provider: Provider,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_release: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement: cleanup starts before wait; resource cancellation is an ordinary failure.
+    first_entered, later_entered = asyncio.Event(), asyncio.Event()
+    mcp_closed, http_closed, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    failure = OSError("first workspace cleanup failed")
+    cancellation = asyncio.CancelledError("private resource cancellation arguments")
+    original_release = interrupt_module._ManagedWorkspace.release
+    client = provider._client
+    assert client is not None
+    match provider:
+        case ClaudeProvider():
+            provider._max_input_cache = {"model": 123}
+            provider._max_output_cache = {"model": 456}
+            provider._model_listing_unavailable = True
+            provider._model_listing_unavailable_warned = True
+        case OpenAIProvider():
+            pass
+        case unreachable:
+            assert_never(unreachable)
+    original_http_close = client.close
+    legacy = manager_module.MCPManager()
+    original_mcp_close = legacy.close
+    async with (
+        workspace(provider, tmp_path, "first") as (_, first_context, _),
+        workspace(provider, tmp_path, "later") as (_, later_context, _),
+    ):
+        first = interrupt_module._ManagedWorkspace.for_context(
+            provider._managed_workspaces, first_context
+        )
+        interrupt_module._ManagedWorkspace.for_context(provider._managed_workspaces, later_context)
+        provider._mcp_managers["legacy"] = legacy
+
+        async def release(state: interrupt_module._ManagedWorkspace) -> None:
+            if state is first:
+                first_entered.set()
+                await finish.wait()
+                await original_release(state)
+                if cancel_release:
+                    raise cancellation from RuntimeError("private resource cancellation cause")
+                raise failure
+            later_entered.set()
+            await original_release(state)
+
+        async def close_http() -> None:
+            assert provider._client is None
+            await original_http_close()
+            http_closed.set()
+
+        async def close_mcp() -> None:
+            await original_mcp_close()
+            mcp_closed.set()
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(interrupt_module._ManagedWorkspace, "release", release)
+            patcher.setattr(client, "close", close_http)
+            patcher.setattr(legacy, "close", close_mcp)
+            closing = asyncio.create_task(provider.close())
+            try:
+                async with asyncio.timeout(10):
+                    await first_entered.wait()
+                    await later_entered.wait()
+                    await mcp_closed.wait()
+                    await http_closed.wait()
+                assert not closing.done()
+                finish.set()
+                await completed(closing)
+                expected = ProviderError if cancel_release else OSError
+                with pytest.raises(expected) as error:
+                    closing.result()
+                assert not closing.cancelled()
+                if cancel_release:
+                    assert isinstance(error.value, ProviderError) and not error.value.is_retryable
+                    assert error.value.__cause__ is None and error.value.__context__ is None
+                    formatted = "\n".join(
+                        logging.Formatter().format(record) for record in caplog.records
+                    )
+                    assert "resource cleanup operation was cancelled" in formatted
+                    assert "private resource cancellation" not in formatted
+                else:
+                    assert error.value is failure
+                assert client.is_closed()
+                match provider:
+                    case ClaudeProvider():
+                        assert provider._max_input_cache is provider._max_output_cache is None
+                        assert not provider._model_listing_unavailable
+                        assert not provider._model_listing_unavailable_warned
+                    case OpenAIProvider():
+                        pass
+                    case unreachable:
+                        assert_never(unreachable)
+            finally:
+                finish.set()
+                await completed(closing)
+                with suppress(Exception, asyncio.CancelledError):
+                    closing.result()
+
+
+async def test_close_collects_original_errors_and_scrubs_diagnostics(
+    provider: Provider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    # Requirement: independent ordinary failures are all reported, scrubbed, and sticky on repeat.
+    secret = "registered-independent-cleanup-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
+    first_error = PermissionError(13, "workspace denied", f"/private/{secret}")
+    mcp_error, http_error = RuntimeError("legacy cleanup failed"), OSError("HTTP cleanup failed")
+    legacy = manager_module.MCPManager()
+    original_mcp_close = legacy.close
+    client = provider._client
+    assert client is not None
+    original_http_close = client.close
+    original_release = interrupt_module._ManagedWorkspace.release
+    async with workspace(provider, tmp_path) as (controller, context, _):
+        controller.scrub = redactor.scrub
+        interrupt_module._ManagedWorkspace.for_context(provider._managed_workspaces, context)
+        provider._mcp_managers["legacy"] = legacy
+
+        async def release(state: interrupt_module._ManagedWorkspace) -> None:
+            await original_release(state)
+            raise first_error
+
+        async def close_mcp() -> None:
+            await original_mcp_close()
+            raise mcp_error
+
+        async def close_http() -> None:
+            await original_http_close()
+            raise http_error
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(interrupt_module._ManagedWorkspace, "release", release)
+            patcher.setattr(legacy, "close", close_mcp)
+            patcher.setattr(client, "close", close_http)
+            for _ in range(2):
+                with pytest.raises(ExceptionGroup) as error:
+                    await provider.close()
+                assert error.value.exceptions == (first_error, mcp_error, http_error)
+        formatted = "\n".join(logging.Formatter().format(record) for record in caplog.records)
+        assert secret not in formatted and REDACTED_MARKER in formatted
+        assert "workspace denied" in formatted and "HTTP cleanup failed" in formatted
+        assert all(record.exc_info is None for record in caplog.records)
+        assert client.is_closed()
+
+
+async def test_close_preserves_first_caller_cancellation_and_companion_failure(
+    provider: Provider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    # Requirement: the first real caller cancellation outranks resource cancellation and failures.
+    entered, finish = asyncio.Event(), asyncio.Event()
+    secret = "registered-cancel-cleanup-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
+    original_release = interrupt_module._ManagedWorkspace.release
+    client = provider._client
+    assert client is not None
+    legacy = manager_module.MCPManager()
+    original_mcp_close = legacy.close
+    provider._mcp_managers["cancelled-resource"] = legacy
+
+    async def cancel_resource() -> None:
+        await original_mcp_close()
+        raise asyncio.CancelledError(f"different resource cancellation: {secret}")
+
+    async with workspace(provider, tmp_path) as (controller, context, _):
+        controller.scrub = redactor.scrub
+        interrupt_module._ManagedWorkspace.for_context(provider._managed_workspaces, context)
+
+        async def release(state: interrupt_module._ManagedWorkspace) -> None:
+            entered.set()
+            await finish.wait()
+            await original_release(state)
+            raise PermissionError(13, "companion cleanup denied", secret)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(interrupt_module._ManagedWorkspace, "release", release)
+            patcher.setattr(legacy, "close", cancel_resource)
+            closing = asyncio.create_task(provider.close())
+            try:
+                await asyncio.wait_for(entered.wait(), 10)
+                closing.cancel("first caller cancellation")
+                checkpoint = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_soon(checkpoint.set_result, None)
+                await checkpoint
+                closing.cancel("second caller cancellation")
+                finish.set()
+                await completed(closing)
+                with pytest.raises(asyncio.CancelledError) as error:
+                    closing.result()
+                assert error.value.args == ("first caller cancellation",)
+                assert client.is_closed()
+                formatted = "\n".join(
+                    logging.Formatter().format(record) for record in caplog.records
+                )
+                assert "companion cleanup denied" in formatted and REDACTED_MARKER in formatted
+                assert "resource cleanup operation was cancelled" in formatted
+                assert "different resource cancellation" not in formatted
+                assert secret not in formatted
+            finally:
+                finish.set()
+                await completed(closing)
+                with suppress(Exception, asyncio.CancelledError):
+                    closing.result()
+
+
+async def test_close_keeps_live_http_owner_and_sticky_failure_after_late_join(
+    provider: Provider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: shared HTTP survives a quarantined model owner; later join cannot erase failure.
+    entered, cancelled, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class HeldModel(TestModel):
+        async def request(self, *args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            while not finish.is_set():
+                try:
+                    await finish.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+            return await super().request(*args, **kwargs)
+
+    network_model(monkeypatch, HeldModel(custom_output_text="late"))
+    client = provider._client
+    assert client is not None
+    match provider:
+        case ClaudeProvider():
+            provider._max_input_cache = {"model": 123}
+            provider._max_output_cache = {"model": 456}
+            provider._model_listing_unavailable = True
+            provider._model_listing_unavailable_warned = True
+        case OpenAIProvider():
+            pass
+        case unreachable:
+            assert_never(unreachable)
+    clock = ControlledClock()
+    async with workspace(provider, tmp_path, clock=clock, unconfirmed=True) as (
+        controller,
+        context,
+        work,
+    ):
+        call = asyncio.create_task(
+            provider.execute_dialog_turn(
+                "system", "hold", managed_workspace=context, working_dir=str(work)
+            )
+        )
+        closing: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            closing = asyncio.create_task(provider.close())
+            await asyncio.wait_for(cancelled.wait(), 10)
+            deadline = controller.owners.deadline()
+            assert deadline is not None
+            clock.advance(deadline)
+            await completed(closing)
+            with pytest.raises(ProviderError):
+                closing.result()
+            assert provider._client is client and not client.is_closed()
+            match provider:
+                case ClaudeProvider():
+                    assert provider._max_input_cache == {"model": 123}
+                    assert provider._max_output_cache == {"model": 456}
+                    assert provider._model_listing_unavailable
+                    assert provider._model_listing_unavailable_warned
+                case OpenAIProvider():
+                    pass
+                case unreachable:
+                    assert_never(unreachable)
+            state = provider._managed_workspaces[context.root]
+            assert state.failed and controller.owners.quarantined
+            finish.set()
+            owners = {task for run in state.runs for task in run.tasks}
+            done, pending = await asyncio.wait(owners, timeout=10)
+            assert done == owners and not pending
+            with pytest.raises(ProviderError):
+                await provider.close()
+            assert client.is_closed() and provider._client is None
+            match provider:
+                case ClaudeProvider():
+                    assert provider._max_input_cache is provider._max_output_cache is None
+                    assert not provider._model_listing_unavailable
+                    assert not provider._model_listing_unavailable_warned
+                case OpenAIProvider():
+                    pass
+                case unreachable:
+                    assert_never(unreachable)
+            assert controller.owners.deadline() == deadline
+            assert (await controller.await_release()).status == "unconfirmed"
+        finally:
+            finish.set()
+            await completed(call)
+            with suppress(Exception, asyncio.CancelledError):
+                call.result()
+            if closing is not None:
+                await completed(closing)
+                with suppress(Exception, asyncio.CancelledError):
+                    closing.result()
+
+
+async def test_close_does_not_close_a_borrowed_http_client(provider: Provider) -> None:
+    # Requirement: global close must not close another provider's privately borrowed HTTP handle.
+    owned = provider._client
+    match provider:
+        case ClaudeProvider():
+            other = ClaudeProvider(api_key="fixture-key", resolve_environment=False)
+            provider._client = other._client
+        case OpenAIProvider():
+            other = OpenAIProvider(api_key="fixture-key", resolve_environment=False)
+            provider._client = other._client
+        case unreachable:
+            assert_never(unreachable)
+    borrowed = other._client
+    assert owned is not None and borrowed is not None
+    try:
+        await provider.close()
+        assert owned.is_closed() and not borrowed.is_closed()
+    finally:
+        await owned.close()
+        await other.close()
+        provider._client = None
+
+
+@pytest.mark.parametrize("boundary", ["repeat", "registry"])
+async def test_cancelled_resource_stays_ordinary_in_new_close_callers(
+    provider: Provider,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    # Requirement: sticky resource cancellation preserves callers and independent registry cleanup.
+    calls = 0
+    original_release = interrupt_module._ManagedWorkspace.release
+    registry = ProviderRegistry(create_test_config())
+    match provider:
+        case ClaudeProvider():
+            other = OpenAIProvider(api_key="fixture-key", resolve_environment=False)
+            registry._providers["claude"] = provider
+            registry._providers["openai"] = other
+        case OpenAIProvider():
+            other = ClaudeProvider(api_key="fixture-key", resolve_environment=False)
+            registry._providers["openai"] = provider
+            registry._providers["claude"] = other
+        case unreachable:
+            assert_never(unreachable)
+    other_client = other._client
+    assert other_client is not None
+    async with workspace(provider, tmp_path) as (_, context, _):
+        state = interrupt_module._ManagedWorkspace.for_context(
+            provider._managed_workspaces, context
+        )
+
+        async def release(resource: interrupt_module._ManagedWorkspace) -> None:
+            nonlocal calls
+            calls += 1
+            await original_release(resource)
+            raise asyncio.CancelledError("unregistered private resource cancellation")
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(interrupt_module._ManagedWorkspace, "release", release)
+            first = asyncio.create_task(provider.close())
+            await completed(first)
+            with suppress(ProviderError, asyncio.CancelledError):
+                first.result()
+            retained = provider._close_tasks[id(state)]
+            legacy_closed = asyncio.Event()
+            legacy = manager_module.MCPManager()
+            legacy_close = legacy.close
+
+            async def close_legacy() -> None:
+                await legacy_close()
+                legacy_closed.set()
+
+            patcher.setattr(legacy, "close", close_legacy)
+            provider._mcp_managers["new-independent"] = legacy
+            if boundary == "registry":
+                assert not registry._workspace_releases
+                closing = asyncio.create_task(registry.close())
+            else:
+                closing = asyncio.create_task(provider.close())
+            try:
+                await completed(closing)
+                with pytest.raises(ProviderError) as error:
+                    closing.result()
+                assert not error.value.is_retryable
+                assert not closing.cancelled()
+                assert legacy_closed.is_set()
+                assert provider._close_tasks[id(state)] is retained and retained.cancelled()
+                assert calls == 1
+                if boundary == "registry":
+                    assert other_client.is_closed()
+                    assert registry.get_active_providers() == {}
+            finally:
+                await other.close()
+                with suppress(Exception, asyncio.CancelledError):
+                    closing.result()
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed", "cancelled", "absent"])
+async def test_claude_metadata_reset_requires_confirmed_owned_http_close(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    # Requirement: Claude metadata resets only for confirmed owned HTTP close, never missing proof.
+    provider = ClaudeProvider(api_key="fixture-key", resolve_environment=False)
+    client = provider._client
+    assert client is not None
+    original_close = client.close
+    inputs: dict[str, int | None] = {"model": 123}
+    outputs: dict[str, int | None] = {"model": 456}
+    provider._max_input_cache, provider._max_output_cache = inputs, outputs
+    provider._model_listing_unavailable = True
+    provider._model_listing_unavailable_warned = True
+
+    async def failed_close() -> None:
+        if outcome == "cancelled":
+            raise asyncio.CancelledError("private HTTP cleanup cancellation")
+        raise OSError("owned HTTP cleanup failed")
+
+    try:
+        if outcome == "absent":
+            await original_close()
+            provider._client = provider._owned_client = None
+        elif outcome != "success":
+            monkeypatch.setattr(client, "close", failed_close)
+        closing = asyncio.create_task(provider.close())
+        await completed(closing)
+        if outcome in ("failed", "cancelled"):
+            expected = OSError if outcome == "failed" else ProviderError
+            with pytest.raises(expected):
+                closing.result()
+            assert not closing.cancelled()
+        else:
+            closing.result()
+        if outcome == "success":
+            assert provider._max_input_cache is provider._max_output_cache is None
+            assert not provider._model_listing_unavailable
+            assert not provider._model_listing_unavailable_warned
+        else:
+            assert provider._max_input_cache is inputs and provider._max_output_cache is outputs
+            assert provider._model_listing_unavailable
+            assert provider._model_listing_unavailable_warned
+    finally:
+        await original_close()
 
 
 async def test_legacy_pipeline_and_node_calls_omit_managed_keywords(

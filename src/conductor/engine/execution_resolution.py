@@ -24,6 +24,7 @@ from conductor.engine.run_manifest import (
     BACKEND_CAPABILITY_PROVIDERS,
     ManifestExecutionSpec,
     ResolvedRunManifest,
+    RunPreflight,
     compile_run_manifest,
     executable_step_identity,
 )
@@ -161,6 +162,7 @@ class ExecutionResolverSession:
         # Run-local collector output, supplied with the prepared original lease.
         # Never serialize this view into BundleRef or a checkpoint.
         self.agent_dependencies: tuple[CollectedAgentDependencies, ...] | None = None
+        self._preflights: list[RunPreflight] = []
         self._aca_profiles: dict[str, RunnerBackend] = {}
         self._root_run_spec: RunSpec | None = None
         self._root_workflow_path: Path | None = None
@@ -248,6 +250,7 @@ class ExecutionResolverSession:
         self._managed_binding = None
         self._terminal_identities = {}
         self.agent_dependencies = None
+        self._preflights.clear()
         self.retained_participants.clear()
         self._file_consumers.clear()
         self._mixed_files_warned = False
@@ -510,6 +513,21 @@ class ExecutionResolverSession:
         """Replace the generation's view with the same published bundle's topology."""
         self.agent_dependencies = dependencies
 
+    def preflight_for(
+        self, config: WorkflowConfig, workflow_path: Path | None
+    ) -> RunPreflight | None:
+        """Own snapshots only for this generation and the exact known source/config closure."""
+        if workflow_path is None:
+            return None
+        for preflight in self._preflights:
+            if preflight.matches(config, workflow_path):
+                return preflight
+        preflight = RunPreflight(config, workflow_path, self.environment)
+        if preflight.workspace is None and self._preflights:
+            preflight.workspace = self._preflights[0].workspace
+        self._preflights.append(preflight)
+        return preflight
+
     def note_participants(self, config: WorkflowConfig, manifest: ResolvedRunManifest) -> None:
         """Distinguish actual file consumers from technical workflow placement."""
         steps = [(step.name, step) for step in config.agents]
@@ -530,32 +548,15 @@ class ExecutionResolverSession:
         """Preflight offline known children using the bundle collector's resolution."""
         if workflow_path is None:
             return
-        from conductor.bundle.collector import MAX_SUBWORKFLOW_DEPTH, _Collector
-        from conductor.bundle.errors import BundleError
-        from conductor.config.loader import load_config
-        from conductor.engine.bundle_prep import _workflow_steps
-
-        resolver = _Collector(workflow_path, self.environment, False, logger.warning)
-        visited: set[Path] = set()
-
-        def scan(path: Path, depth: int) -> None:
-            if path in visited or depth > MAX_SUBWORKFLOW_DEPTH:
-                return
-            visited.add(path)
-            config = root_config if path == workflow_path else load_config(path)
+        preflight = self.preflight_for(root_config, workflow_path)
+        assert preflight is not None
+        nodes = preflight.nodes
+        for index, node in enumerate(nodes):
+            config = root_config if index == 0 else node.config
             manifest = compile_run_manifest(
-                config, workflow_path=path, environment=self.environment
+                config, workflow_path=node.path, environment=self.environment, _preflight=preflight
             )
             self.note_participants(config, manifest)
-            for step in _workflow_steps(config):
-                try:
-                    child, _ = resolver._resolve_subworkflow(step.workflow, path.parent)
-                except BundleError:
-                    # Bundle preparation owns the actionable incomplete-closure error.
-                    continue
-                scan(child, depth + 1)
-
-        scan(workflow_path, 0)
 
     async def ensure_backends(self, names: Iterable[str]) -> None:
         """Instantiate and, after root preparation, lease requested backends.
@@ -615,6 +616,7 @@ class ExecutionResolverSession:
                             self._root_workflow_path,
                             self.environment,
                             on_topology=self.set_agent_dependencies,
+                            _preflight=self._preflights[0] if self._preflights else None,
                         )
                         run_spec = replace(run_spec, bundle=bundle)
                         self._root_run_spec = run_spec
@@ -661,6 +663,7 @@ class ExecutionResolverSession:
                         self._root_workflow_path,
                         self.environment,
                         on_topology=self.set_agent_dependencies,
+                        _preflight=self._preflights[0] if self._preflights else None,
                     )
                     run_spec = replace(run_spec, bundle=bundle)
                     self._root_run_spec = run_spec
@@ -899,11 +902,13 @@ class ExecutionResolver:
         """Compile this engine's step map immediately from its own config."""
         self._session = session
         self._config = config
+        self._workflow_path = workflow_path
         self.publish_manifest = publish_manifest
         self._manifest = compile_run_manifest(
             config,
             workflow_path=workflow_path,
             environment=session.environment,
+            _preflight=session.preflight_for(config, workflow_path),
         )
         self._secret_uses = index_config(config, session.secret_cache)
 
@@ -929,6 +934,15 @@ class ExecutionResolver:
     def refresh_secret_uses(self) -> None:
         """Re-resolve this view's secret uses for a new run generation."""
         self._secret_uses = index_config(self._config, self._session.secret_cache)
+
+    def refresh_manifest(self) -> None:
+        """Recollect and compile fresh sources after the session begins a new generation."""
+        self._manifest = compile_run_manifest(
+            self._config,
+            workflow_path=self._workflow_path,
+            environment=self._session.environment,
+            _preflight=self._session.preflight_for(self._config, self._workflow_path),
+        )
 
     def inherit_env_for_step(
         self,

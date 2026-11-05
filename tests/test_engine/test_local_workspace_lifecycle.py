@@ -12,8 +12,12 @@ import pytest
 
 from conductor.config.loader import load_config
 from conductor.engine.checkpoint import CheckpointManager
+from conductor.engine.context import WorkflowContext
+from conductor.engine.limits import LimitEnforcer
 from conductor.engine.workflow import RunContext, WorkflowEngine
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import CheckpointError, ExecutionError
+from conductor.exceptions import TimeoutError as ConductorTimeoutError
 from conductor.execution.errors import WorkspaceAttachError
 from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import ManagedWorkspaceContext, RunSpec, WorkspaceLease
@@ -504,3 +508,169 @@ async def test_grading_timeout_does_not_seal_the_root_or_break_fail_open(
         if not expiration.done():
             expiration.cancel()
         await asyncio.wait({expiration}, timeout=5)
+
+
+@pytest.mark.usefixtures("retained_capability")
+@pytest.mark.parametrize("resume", [False, True], ids=["run", "resume"])
+@pytest.mark.parametrize("unconfirmed", [False, True], ids=["released", "unconfirmed"])
+async def test_workflow_timeout_publishes_primary_failure_after_barrier(
+    tmp_path: Path, resume: bool, unconfirmed: bool
+) -> None:
+    # Requirement: real run/resume deadlines publish one primary failure only after root cleanup.
+    path = flow(tmp_path)
+    path.write_text(
+        path.read_text().replace("  runtime:", "  limits: {timeout_seconds: 1}\n  runtime:")
+    )
+    checkpoint = None
+    if resume:
+        initial = engine(path, Provider(fail=True))
+        with pytest.raises(ExecutionError, match="primary execution failure"):
+            await initial.run({})
+        assert initial._last_checkpoint_path is not None
+        checkpoint = CheckpointManager.load_checkpoint(initial._last_checkpoint_path)
+
+    entered, interrupted = asyncio.Event(), asyncio.Event()
+    release_entered, backend_entered = asyncio.Event(), asyncio.Event()
+    finish, release_finish, backend_finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class HeldProvider(Provider, abstract=True):
+        async def execute(self, agent, context, rendered_prompt, **kwargs) -> AgentOutput:
+            self.calls.append(kwargs["managed_workspace"])
+            entered.set()
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                if not unconfirmed:
+                    raise
+                await finish.wait()
+            kwargs["event_callback"]("agent_completed", {"late": True})
+            return AgentOutput(content={"result": "late"}, raw_response="")
+
+        async def release_workspace(self, workspace_root: str) -> None:
+            self.released.append(workspace_root)
+            release_entered.set()
+            await release_finish.wait()
+
+    class HeldBackend(LocalRunnerBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalized: list[tuple[str, bool]] = []
+
+        async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
+            return WorkspaceLease(run.run_id, "docker", "timeout-other")
+
+        async def finalize_run(self, lease, outcome, *, retain=False) -> None:
+            self.finalized.append((outcome, retain))
+            backend_entered.set()
+            await backend_finish.wait()
+
+    provider = HeldProvider()
+    emitter = WorkflowEventEmitter()
+    events: list[WorkflowEvent] = []
+    publication_states: list[str] = []
+
+    def collect(event: WorkflowEvent) -> None:
+        events.append(event)
+        if event.type in ("checkpoint_saved", "workflow_failed"):
+            marker = Path(provider.calls[0].root) / "identity.json"
+            publication_states.append(json.loads(marker.read_text())["runtime_state"])
+
+    emitter.subscribe(collect)
+    run = WorkflowEngine(
+        load_config(path),
+        provider,
+        workflow_path=path,
+        skip_gates=True,
+        event_emitter=emitter,
+        run_context=RunContext(run_id=checkpoint.run_id if checkpoint else "root-timeout"),
+    )
+    if checkpoint is not None:
+        run.set_context(WorkflowContext.from_dict(checkpoint.context))
+        run.set_limits(
+            LimitEnforcer.from_dict(
+                checkpoint.limits, timeout_seconds=1, budget_usd=None, budget_mode="enforce"
+            )
+        )
+    other = HeldBackend()
+    session = run._execution_session
+    session.backends["docker"] = other
+    task = asyncio.create_task(
+        run.resume(checkpoint.current_agent, checkpoint=checkpoint)
+        if checkpoint is not None
+        else run.run({})
+    )
+    try:
+        async with asyncio.timeout(10):
+            await entered.wait()
+            await interrupted.wait()
+            await release_entered.wait()
+            await backend_entered.wait()
+            deadline = session.cleanup_deadline
+            assert deadline is not None and session.sealed
+            assert publication_states == []
+            assert run._last_checkpoint_path is None
+            if unconfirmed:
+                session._cleanup_expired.set()
+            else:
+                release_finish.set()
+                backend_finish.set()
+            with pytest.raises(ConductorTimeoutError) as caught:
+                await task
+            error = caught.value
+            assert session.cleanup_uncertain is unconfirmed
+            assert session.cleanup_deadline == deadline
+            assert other.finalized == [("cancelled", True)]
+            assert publication_states == ["uncertain" if unconfirmed else "idle"] * 2
+            failures = [event.data for event in events if event.type == "workflow_failed"]
+            assert failures == [
+                {
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "agent_name": "worker",
+                    "elapsed_seconds": error.elapsed_seconds,
+                    "timeout_seconds": 1.0,
+                    "current_agent": "worker",
+                }
+            ]
+            saved = [event for event in events if event.type == "checkpoint_saved"]
+            assert len(saved) == 1 and saved[0].data["trigger"] == "failure"
+            assert run._last_checkpoint_path is not None
+            result = CheckpointManager.load_checkpoint(run._last_checkpoint_path)
+            assert result.failure["error_type"] == type(error).__name__
+            assert result.failure["message"] == "Workflow exceeded timeout (1s)"
+            assert result.current_agent == "worker"
+            assert result.interrupted_step is not None
+            assert result.interrupted_step["status"] == "unknown"
+            if checkpoint is not None:
+                assert result.run_id == checkpoint.run_id
+                assert result.workspace is not None and checkpoint.workspace is not None
+                assert (
+                    result.workspace["identities"]["local"]
+                    == checkpoint.workspace["identities"]["local"]
+                )
+
+            # Requirement: late resource callbacks cannot rewrite terminal artifacts or emit again.
+            files = {p: p.read_bytes() for p in tmp_path.rglob("*.json")}
+            published = list(events)
+            finish.set()
+            release_finish.set()
+            backend_finish.set()
+            owners = set(session._resource_tasks)
+            if owners:
+                _, pending = await asyncio.wait(owners, timeout=5)
+                assert not pending
+            run._emit("workflow_failed", {"message": "late resource failure"})
+            assert run._save_checkpoint_on_failure(ExecutionError("late")) is None
+            assert events == published
+            assert {p: p.read_bytes() for p in tmp_path.rglob("*.json")} == files
+            assert session.cleanup_deadline == deadline
+            assert other.finalized == [("cancelled", True)]
+    finally:
+        finish.set()
+        release_finish.set()
+        backend_finish.set()
+        if not task.done():
+            task.cancel()
+        _, pending = await asyncio.wait({task} | session._resource_tasks, timeout=5)
+        assert not pending

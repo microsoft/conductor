@@ -43,6 +43,7 @@ from conductor.config.schema import (
 )
 from conductor.engine.run_manifest import (
     ResolvedRunManifest,
+    RunPreflight,
     effective_profile_name,
     executable_step_identity,
 )
@@ -163,6 +164,7 @@ async def materialize_run_bundle(
     environment: ResolvedEnvironment,
     *,
     on_topology: Callable[[tuple[CollectedAgentDependencies, ...]], None] | None = None,
+    _preflight: RunPreflight | None = None,
 ) -> BundleRef:
     """Collect and publish one offline bundle, exposing run-local selections separately."""
     if workflow_path is None:
@@ -172,13 +174,16 @@ async def materialize_run_bundle(
         logger.warning("Bundle collection: %s", message)
 
     try:
-        collected = await asyncio.to_thread(
-            collect_bundle,
-            workflow_path,
-            environment=environment,
-            allow_network=False,
-            on_warning=warning_sink,
-        )
+        if _preflight is not None:
+            collected = await asyncio.to_thread(_preflight.collect)
+        else:
+            collected = await asyncio.to_thread(
+                collect_bundle,
+                workflow_path,
+                environment=environment,
+                allow_network=False,
+                on_warning=warning_sink,
+            )
     except BundleError as exc:
         exc.suggestion = _CACHE_REMEDY
         raise
@@ -233,10 +238,23 @@ async def prepare_run_bundle(
         return None
 
     needs_bundle = any(profile.backend == "docker" for profile in manifest.profiles.values())
+    preflight = manifest._preflight
     if not needs_bundle:
         if workflow_path is None:
             raise ConfigurationError(_PROGRAMMATIC_BUNDLE_ERROR)
-        if retained_local:
+        if preflight is not None and preflight.collected is not None:
+            for index, node in enumerate(preflight.nodes):
+                active = preflight.config if index == 0 else node.config
+                for key, step in _executable_steps(active):
+                    name = effective_profile_name(step, key, active.workflow.defaults, environment)
+                    backend = environment.document.profiles[name].backend
+                    if backend == "docker" or (
+                        retained_local
+                        and backend == "local"
+                        and isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef))
+                    ):
+                        needs_bundle = True
+        elif retained_local:
             needs_bundle = (
                 scan_subworkflow_bundle_usage(workflow_path, environment, retained_local=True)
                 is not False
@@ -245,4 +263,6 @@ async def prepare_run_bundle(
             needs_bundle = scan_subworkflow_docker_usage(workflow_path, environment) is not False
     if not needs_bundle:
         return None
-    return await materialize_run_bundle(workflow_path, environment, on_topology=on_topology)
+    return await materialize_run_bundle(
+        workflow_path, environment, on_topology=on_topology, _preflight=preflight
+    )

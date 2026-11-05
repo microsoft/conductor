@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 import types
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -1549,9 +1550,11 @@ class _ManagedClaudeResource:
                 except (Exception, asyncio.CancelledError) as exc:
                     self.cleanup_error = exc
                     logger.warning(
-                        "claude-agent-sdk: managed native disconnect failed (invocation=%s)",
+                        "claude-agent-sdk: managed native disconnect failed (invocation=%s): %s",
                         self.invocation,
-                        exc_info=exc,
+                        self.workspace.process_scopes.scrub(
+                            "".join(traceback.format_exception(exc))
+                        ),
                     )
 
         self.owner = self.register(own_client())
@@ -2355,12 +2358,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     primary = sys.exc_info()[1]
                     try:
                         await call.close()
-                    except ProviderError:
+                    except ProviderError as error:
                         if primary is None:
                             raise
                         logger.warning(
-                            "claude-agent-sdk: managed execution cleanup unconfirmed",
-                            exc_info=True,
+                            "claude-agent-sdk: managed execution cleanup unconfirmed: %s",
+                            call.workspace.process_scopes.scrub(
+                                "".join(traceback.format_exception(error))
+                            ),
                         )
                 finally:
                     if slot is not None:
@@ -3163,12 +3168,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         primary = sys.exc_info()[1]
                         try:
                             await managed_session.close()
-                        except ProviderError:
+                        except ProviderError as error:
                             if primary is None:
                                 raise
                             logger.warning(
-                                "claude-agent-sdk: managed session cleanup unconfirmed",
-                                exc_info=True,
+                                "claude-agent-sdk: managed session cleanup unconfirmed: %s",
+                                managed_session.workspace.process_scopes.scrub(
+                                    "".join(traceback.format_exception(error))
+                                ),
                             )
                         shutdown_cancelled = None
                     else:

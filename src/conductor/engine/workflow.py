@@ -3924,6 +3924,8 @@ class WorkflowEngine:
         redaction_token = None
         claim = None
         try:
+            if self._subworkflow_depth == 0:
+                self._execution_resolver.refresh_manifest()
             persistence = self._workspace_persistence()
             if self._subworkflow_depth == 0 and persistence is not None:
                 if not self._run_id:
@@ -4069,6 +4071,8 @@ class WorkflowEngine:
         redaction_token = None
         claim = None
         try:
+            if self._subworkflow_depth == 0:
+                self._execution_resolver.refresh_manifest()
             persistence = self._workspace_persistence()
             root_spec = self._execution_session._root_run_spec
             if persistence is not None or (
@@ -4294,6 +4298,7 @@ class WorkflowEngine:
             checkpoint_error = self._pending_checkpoint_error or (
                 cleanup_error if primary is None else None
             )
+            self._pending_checkpoint_error = None
             if checkpoint_error is not None and not self._explicit_terminal_failure:
                 self._save_checkpoint_on_failure(checkpoint_error)
             pending = self._pending_terminal_event
@@ -7513,8 +7518,14 @@ class WorkflowEngine:
                 # renders a calm "Workflow Stopped" banner, matching the
                 # hard-Kill path handled by ``handle_dashboard_stop``. #245.
                 fail_data["stopped_by_user"] = True
-            self._emit("workflow_failed", fail_data)
-            self._save_checkpoint_on_failure(e)
+            if self._subworkflow_depth == 0 and self._execution_session.managed:
+                # Root orchestration owns this intent even if its timeout sealed admission.
+                # Resource callbacks still pass through the sealed event/checkpoint guards.
+                self._pending_terminal_event = ("workflow_failed", fail_data)
+                self._pending_checkpoint_error = e
+            else:
+                self._emit("workflow_failed", fail_data)
+                self._save_checkpoint_on_failure(e)
             raise
         except Exception as e:
             self._emit(

@@ -996,7 +996,7 @@ secrets:
 Each profile under `profiles` supports:
 
 - `backend` (required): The runner backend implementing this profile (`local`, `docker`, or `aca`).
-- `inherit_control_environment` (optional, boolean): Controls whether subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while the `docker` backend defaults to effective `false`. Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to daemon administrators.
+- `inherit_control_environment` (optional, boolean): Controls whether script subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while the `docker` backend defaults to effective `false`. Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to daemon administrators. For local profiles, this flag applies only to script steps; local agent runtimes and direct MCP consumers use provider/SDK-specific environment inheritance and explicit overrides instead.
 - `docker` (optional, object): Configuration options required when `backend: docker` is selected. Rejected when `backend` is not `docker`.
 - `aca` (optional, object): Configuration options required when `backend: aca` is selected. Rejected when `backend` is not `aca`.
 
@@ -1011,7 +1011,10 @@ lease in a Docker-only run, doesn't create a retained local tree.
 
 The local and Docker realms have separate filesystems. Their context JSON
 outputs still pass between steps, but their file changes aren't synchronized.
-The local profile's environment inheritance setting remains in effect.
+Local script steps continue to honor the profile's
+`inherit_control_environment` setting. Local agent runtimes and direct MCP
+consumers do not consume this flag; their environment follows the provider's
+or SDK's own inheritance and explicit overrides.
 Retained local execution isn't filesystem isolation: subprocesses still have
 the access granted by the host. See the
 [workspace lifecycle](workflow-syntax.md#workspace-lifecycle) and

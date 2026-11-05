@@ -32,6 +32,7 @@ from typing import Any
 from conductor import redaction
 from conductor.config.schema import ToolOutputConfig
 from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.local_windows_launch import merge_windows_environment
 from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
 
 logger = logging.getLogger(__name__)
@@ -317,7 +318,10 @@ class MCPManager:
                         if managed is not None:
                             # Match the native SDK's filtered inheritance and overlay;
                             # never substitute the controller's ambient environment.
-                            from mcp.client.stdio import get_default_environment
+                            from mcp.client.stdio import (
+                                DEFAULT_INHERITED_ENV_VARS,
+                                get_default_environment,
+                            )
 
                             if (
                                 cwd is None
@@ -329,13 +333,18 @@ class MCPManager:
                                 raise ExecutionSpecError(
                                     "Managed MCP requires an absolute mapped workspace cwd"
                                 )
-                            effective_env = {**get_default_environment(), **(env or {})}
+                            inherited_env = get_default_environment()
+                            effective_env = (
+                                merge_windows_environment(
+                                    inherited_env,
+                                    env or {},
+                                    canonical_names=DEFAULT_INHERITED_ENV_VARS,
+                                )
+                                if sys.platform == "win32"
+                                else {**inherited_env, **(env or {})}
+                            )
                             executable = command
-                            if sys.platform == "win32":
-                                from mcp.os.win32.utilities import get_windows_executable_command
-
-                                executable = get_windows_executable_command(command)
-                            elif not os.path.dirname(command):
+                            if sys.platform != "win32" and not os.path.dirname(command):
                                 executable = (
                                     shutil.which(
                                         command, path=effective_env.get("PATH", os.defpath)

@@ -57,12 +57,13 @@ import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SerializerFunctionWrapHandler,
     field_serializer,
     field_validator,
@@ -80,6 +81,7 @@ from conductor.config.schema import (
     WorkflowConfig,
     WorkflowDefaults,
     WorkflowStepDef,
+    WorkspaceConfig,
 )
 from conductor.digest import canonical_json_digest
 from conductor.exceptions import ConfigurationError
@@ -92,6 +94,9 @@ from conductor.providers.resolution import (
     format_remote_mcp_stdio_only_error,
     provider_type_for_agent,
 )
+
+if TYPE_CHECKING:
+    from conductor.bundle.collector import CollectedBundle, _Collector, _WorkflowNode
 
 REMOTE_AGENT_PROVIDERS = frozenset({"copilot", "openai", "claude"})
 RESERVED_AGENT_ENV_NAMES = frozenset(
@@ -275,6 +280,7 @@ class ResolvedRunManifest(BaseModel):
     """The compiled, run-invariant execution manifest for one workflow run."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+    _preflight: RunPreflight | None = PrivateAttr(default=None)
 
     version: Literal[1]
     workflow: WorkflowIdentity
@@ -570,6 +576,120 @@ def _require_local_agent_runtime_ownership(
         )
 
 
+class RunPreflight:
+    """Accumulate one generation's source snapshot without publishing any workspace."""
+
+    def __init__(
+        self, config: WorkflowConfig, workflow_path: Path, environment: ResolvedEnvironment
+    ) -> None:
+        self.config = config.model_copy(deep=True)
+        self.path = Path(os.path.abspath(os.path.normpath(workflow_path.expanduser())))
+        self.environment = environment
+        self.workspace: WorkspaceConfig | None = self.config.workflow.workspace
+        self._collector: _Collector | None = None
+        self.collected: CollectedBundle | None = None
+        self._local_checked = False
+
+    def matches(self, config: WorkflowConfig, workflow_path: Path) -> bool:
+        """Reuse only this exact config or a known member of this generation's closure."""
+        path = Path(os.path.abspath(os.path.normpath(workflow_path.expanduser())))
+        if path == self.path:
+            return config == self.config
+        return self._collector is not None and any(
+            node.path == path and node.config == config for node in self._collector.nodes
+        )
+
+    def collect(self) -> CollectedBundle:
+        """Resolve and freeze the full closure once, leaving publication to materialization."""
+        if self.collected is None:
+            from conductor.bundle.collector import _Collector
+
+            collector = _Collector(
+                self.path,
+                self.environment,
+                False,
+                lambda _message: logging.getLogger(__name__).warning(
+                    "Source preflight reported a warning; run conductor validate for details."
+                ),
+            )
+            collected = collector.collect()
+            self._collector = collector
+            self.collected = collected
+        return self.collected
+
+    @property
+    def nodes(self) -> tuple[_WorkflowNode, ...]:
+        """Return the actual frozen collector closure for participant inventory."""
+        self.collect()
+        assert self._collector is not None
+        return tuple(self._collector.nodes)
+
+    def workflow_digest(self, workflow_path: Path) -> str | None:
+        """Use the same source bytes as the collected content when a snapshot exists."""
+        path = Path(os.path.abspath(os.path.normpath(workflow_path.expanduser())))
+        if self._collector is not None:
+            for node in self._collector.nodes:
+                if node.path == path:
+                    return node.graph[0].digest
+        return None
+
+    def validate_local(self) -> None:
+        """Validate inherited capability and logical-path contracts once for this closure."""
+        if self._local_checked:
+            return
+        from conductor.bundle.errors import BundleError
+        from conductor.engine.local_workspace import _logical_directory
+        from conductor.templating import is_jinja_template
+
+        try:
+            collected = self.collect()
+        except BundleError as exc:
+            raise ConfigurationError(
+                "Managed local source closure is unavailable.",
+                suggestion="Declare the complete offline bundle closure before running.",
+            ) from exc
+        if collected.descriptor.incomplete:
+            raise ConfigurationError("Managed local source closure is incomplete.")
+        assert self._collector is not None
+        for index, node in enumerate(self.nodes):
+            active = self.config if index == 0 else node.config
+            if index and active.workflow.workspace is not None:
+                raise ConfigurationError("Sub-workflow cannot override root workspace policy.")
+            active = active.model_copy(
+                update={
+                    "workflow": active.workflow.model_copy(update={"workspace": self.workspace})
+                }
+            )
+            manifest = compile_run_manifest(
+                active, workflow_path=None, environment=self.environment
+            )
+            namespace = (
+                PurePosixPath(self._collector._local_logical_path(node.path)[0])
+                .parent.relative_to("tree")
+                .as_posix()
+            )
+            for key, step in _iter_executable_steps(active):
+                if manifest.profiles[key].backend != "local" or not isinstance(
+                    step, (AgentDef, ScriptStepDef, MCPStepDef)
+                ):
+                    continue
+                cwd = getattr(step, "working_dir", None)
+                fields = (
+                    cwd if cwd is not None else active.workflow.runtime.working_dir,
+                    step.settings_dir if isinstance(step, AgentDef) else None,
+                )
+                for value in fields:
+                    if value is not None and not is_jinja_template(value):
+                        # Existence remains a live dispatch check: earlier steps may create cwd.
+                        _logical_directory(
+                            value,
+                            collected.source_roots + collected.agent_paths,
+                            namespace,
+                            windows=os.name == "nt",
+                        )
+        self._local_checked = True
+
+
 def _require_managed_local_consumer(
     key: str,
     step: ExecutableStepBase,
@@ -611,69 +731,10 @@ def _require_managed_local_consumer(
     for value in literal:
         if not Path(value).is_absolute():
             _logical_directory(value, (), "main", windows=os.name == "nt")
-    if workflow_path is None:
-        return
-    from conductor.bundle.collector import _Collector
-    from conductor.bundle.errors import BundleError
-
-    try:
-        collector = _Collector(
-            workflow_path,
-            environment,
-            False,
-            lambda _message: logging.getLogger(__name__).warning(
-                "Managed local source collection reported a warning; "
-                "run conductor validate for details."
-            ),
-        )
-        collected = collector.collect()
-    except BundleError as exc:
-        raise ConfigurationError(
-            "Managed local source closure is unavailable.",
-            suggestion="Declare the complete offline bundle closure before running.",
-        ) from exc
-    if collected.descriptor.incomplete:
-        raise ConfigurationError("Managed local source closure is incomplete.")
-    for index, node in enumerate(collector.nodes):
-        active = config if index == 0 else node.config
-        if index:
-            if active.workflow.workspace is not None:
-                raise ConfigurationError("Sub-workflow cannot override root workspace policy.")
-            active = active.model_copy(
-                update={
-                    "workflow": active.workflow.model_copy(
-                        update={"workspace": config.workflow.workspace}
-                    )
-                }
-            )
-        # Reuse the compiler's capability/ownership checks, without recollecting
-        # files. The collector already resolved the closure and rejected cycles.
-        manifest = compile_run_manifest(active, workflow_path=None, environment=environment)
-        namespace = (
-            PurePosixPath(collector._local_logical_path(node.path)[0])
-            .parent.relative_to("tree")
-            .as_posix()
-        )
-        for node_key, node_step in _iter_executable_steps(active):
-            if manifest.profiles[node_key].backend != "local" or not isinstance(
-                node_step, (AgentDef, ScriptStepDef, MCPStepDef)
-            ):
-                continue
-            cwd = getattr(node_step, "working_dir", None)
-            fields = (
-                cwd if cwd is not None else active.workflow.runtime.working_dir,
-                node_step.settings_dir if isinstance(node_step, AgentDef) else None,
-            )
-            for value in fields:
-                if value is not None and not is_jinja_template(value):
-                    # Existence belongs to live dispatch: a prior step can create
-                    # this directory in work/, without changing source or CAS.
-                    _logical_directory(
-                        value,
-                        collected.source_roots + collected.agent_paths,
-                        namespace,
-                        windows=os.name == "nt",
-                    )
+    if workflow_path is not None:
+        # Static validator callers retain the complete check; compilation shares
+        # its generation snapshot separately after the cheap per-step checks.
+        RunPreflight(config, workflow_path, environment).validate_local()
 
 
 def _require_agent_backend_capability(
@@ -1015,6 +1076,7 @@ def compile_run_manifest(
     *,
     workflow_path: Path | None,
     environment: ResolvedEnvironment,
+    _preflight: RunPreflight | None = None,
 ) -> ResolvedRunManifest:
     """Compile the run-invariant execution manifest for a workflow configuration.
 
@@ -1111,7 +1173,7 @@ def compile_run_manifest(
                     "choose a retaining backend or drop persistence."
                 )
             if backend_name == "local":
-                _require_managed_local_consumer(key, step, config, workflow_path, environment)
+                _require_managed_local_consumer(key, step, config, None, environment)
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)
@@ -1158,11 +1220,22 @@ def compile_run_manifest(
 
     secrets.extend(_compile_mcp_secret_uses(config, environment, profiles))
 
+    preflight = _preflight
+    if workflow_path is not None:
+        preflight = preflight or RunPreflight(config, workflow_path, environment)
+        if (
+            preflight.workspace is not None
+            and preflight.workspace.persistence != "ephemeral"
+            and any(profile.backend == "local" for profile in profiles.values())
+        ):
+            preflight.validate_local()
     digest: str | None = None
     if workflow_path is not None:
-        digest = f"sha256:{hashlib.sha256(workflow_path.read_bytes()).hexdigest()}"
+        digest = preflight.workflow_digest(workflow_path) if preflight is not None else None
+        if digest is None:
+            digest = f"sha256:{hashlib.sha256(workflow_path.read_bytes()).hexdigest()}"
 
-    return ResolvedRunManifest(
+    manifest = ResolvedRunManifest(
         version=1,
         workflow=WorkflowIdentity(name=config.workflow.name, digest=digest),
         environment=EnvironmentIdentity(
@@ -1182,3 +1255,5 @@ def compile_run_manifest(
         script_steps=tuple(script_keys),
         script_steps_known=True,
     )
+    manifest._preflight = preflight
+    return manifest

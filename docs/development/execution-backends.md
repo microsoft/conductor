@@ -78,6 +78,27 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   `finalize_run` must receive the original backend-issued lease and may delete only a verified
   idle tree. See [local retained workspace design](../design/local-retained-workspace.md) for
   runtime ownership, platform restrictions, and the CLI/caller-loop distinction.
+- `local_windows_launch.py` owns the shared managed Windows environment merge,
+  declared-context resolution and limited batch encoder. Prepare the final
+  script or facade HELLO launch off-loop before `on_dispatch` and `GO`, copying
+  the existing `ProcessLaunchSpec` and preserving its other fields. Never
+  resolve a managed Windows MCP target through the SDK's ambient resolver.
+  Canonicalize only the actual SDK inherited-name subset and selector names;
+  do not expand inheritance or grants.
+- Known preparation refusals use `StartError`, not the cancellation-only
+  `scope.rejected` flag. A real custodian must still prove empty/drained/DONE
+  through `REJECTED`; undispatched input pumps must not start. Unexpected
+  preparation exceptions must reach the owned infrastructure task, even though
+  `_thread_call` only forwards a narrow set of I/O exceptions. Read resolved
+  target metadata before consumption permits retirement.
+- The Windows child revalidates encoding without another search. Native
+  `CreateProcess` keeps `applicationName=None` and CRT arguments; automatic
+  batch uses the declared interpreter and the fixed `/d /e:on /v:off /s /c`
+  form. Keep suspended creation, non-breakaway Job assignment before resume,
+  the three-handle stdio allowlist, raw EOF and the original deadline.
+  `tests/test_execution/test_local_windows_launch.py` owns portable policy and
+  mandatory Windows-native cases, including actual SDK peers and kernel
+  observations. Windows-only skips on another OS are not native verification.
 
 ### Docker backend (`src/conductor/execution/docker.py::DockerRunnerBackend`)
 

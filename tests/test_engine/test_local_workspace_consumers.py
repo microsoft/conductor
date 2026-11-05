@@ -119,6 +119,9 @@ async def prepared(
         result = await controller.await_release()
         if result.status == "released":
             await backend.confirm_workspace_released(lease)
+            marker = json.loads((Path(binding.workspace_root) / "identity.json").read_text())
+            assert marker["runtime_state"] == "idle"
+            assert controller._closed
             await backend.finalize_run(lease, "succeeded")
         await controller.close()
         # Test resource accounting is deliberately stronger than API close.
@@ -210,9 +213,15 @@ async def test_effective_cwd_is_rendered_once_without_config_mutation(
 
 @pytest.mark.parametrize("consumer", ["script", "mcp"])
 async def test_mapping_refusal_prevents_dispatch(tmp_path, monkeypatch, consumer):
-    # Requirement: refused cwd cannot create a scope/manager or execution history.
+    # Requirement: refused cwd preserves active custody until real release, without dispatch.
     monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
     async with prepared(tmp_path) as (engine, _backend, _lease, binding, _run):
+        controller = binding.runtime_context.process_scopes
+        assert isinstance(controller, LocalProcessScopeController)
+        marker_path = Path(binding.workspace_root) / "identity.json"
+        prepared_identity = marker_path.read_bytes()
+        assert json.loads(prepared_identity)["runtime_state"] == "active"
+        assert not controller._closed and controller._accepting.is_alive()
         if consumer == "script":
             step = ScriptStepDef(name="write", command=sys.executable, working_dir="../escape")
             with pytest.raises(LocalWorkspacePathError):
@@ -222,10 +231,13 @@ async def test_mapping_refusal_prevents_dispatch(tmp_path, monkeypatch, consumer
             with pytest.raises(ExecutionError):
                 await engine._run_mcp_step(engine.config.agents[1], {})
         assert not binding.runtime_context.process_scopes.proofs
+        assert not controller._scopes
         assert not engine._managed_mcp_step_managers
         assert not engine._execution_session.executed_backends()
-        marker = json.loads((Path(binding.workspace_root) / "identity.json").read_text())
-        assert marker["runtime_state"] == "idle"
+        assert marker_path.read_bytes() == prepared_identity
+        assert not controller._closed and controller._accepting.is_alive()
+    assert controller._closed and not controller._accepting.is_alive()
+    assert not marker_path.parent.exists()
 
 
 async def test_parallel_and_for_each_use_mapped_pools(tmp_path, monkeypatch):

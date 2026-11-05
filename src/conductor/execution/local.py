@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import shutil
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -16,7 +17,11 @@ from uuid import uuid4
 from conductor.exceptions import ConfigurationError
 from conductor.execution import local_workspace
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
-from conductor.execution.local_process_scope import LocalProcessScopeController
+from conductor.execution.local_process_scope import (
+    LocalProcessScopeController,
+    _ControllerInstallation,
+    _installation_warning,
+)
 from conductor.execution.types import (
     AgentEventSink,
     AgentResult,
@@ -104,6 +109,7 @@ class LocalRunnerBackend:
         self._leases: dict[str, WorkspaceLease] = {}
         self._bindings: dict[str, LocalWorkspaceBinding] = {}
         self._managed: dict[str, _ManagedLease] = {}
+        self._failed_installations: dict[str, _ControllerInstallation] = {}
 
     def capabilities(self) -> RunnerCapabilities:
         """Declare local batch execution with a shared workspace."""
@@ -117,7 +123,9 @@ class LocalRunnerBackend:
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
-        """Create an opaque local workspace handle for a run."""
+        """Issue a managed active workspace; idle is restored only after confirmed release."""
+        if run.run_id in self._failed_installations:
+            raise ExecutionSpecError("Local workspace installation is terminally unconfirmed")
         if run.local_workspace_root is not None:
             if run.workspace_persistence is None or run.bundle is None:
                 raise ExecutionSpecError("Managed local workspace requires retention and a bundle")
@@ -126,12 +134,15 @@ class LocalRunnerBackend:
                 state = self._managed.get(run.run_id)
                 if state is None or state.run != run or state.uncertain or state.released:
                     raise ExecutionSpecError("Local workspace lease is already issued or closed")
-                _ = local_workspace.verify(run, lease, run.bundle, previous=state.identity)
+                _ = local_workspace.verify(
+                    run, lease, run.bundle, idle=False, previous=state.identity
+                )
                 return lease
+            LocalProcessScopeController.preflight()
             root = local_workspace.expected_root(run)
             lease = WorkspaceLease(run.run_id, "local", str(uuid4()), str(root))
             identity = local_workspace.stage(run, lease, run.bundle)
-            return self._install_managed(run, lease, identity)
+            return self._install_managed(run, lease, identity, fresh=True)
         if run.workspace_persistence is not None:
             raise ExecutionSpecError("local backend does not support retained workspaces")
         if run.run_id in self._managed:
@@ -146,26 +157,111 @@ class LocalRunnerBackend:
         return lease
 
     def _install_managed(
-        self, run: RunSpec, lease: WorkspaceLease, identity: local_workspace.LocalIdentity
+        self,
+        run: RunSpec,
+        lease: WorkspaceLease,
+        identity: local_workspace.LocalIdentity,
+        *,
+        fresh: bool = False,
     ) -> WorkspaceLease:
-        """Bind an issued lease to its concrete process controller and CAS metadata."""
+        """Fence active before allocations and commit gated admission after local assembly."""
         assert run.bundle is not None and run.local_workspace_root is not None
-        controller = LocalProcessScopeController(run.local_workspace_root, lease.incarnation)
-        context = ManagedWorkspaceContext(run.local_workspace_root, lease.incarnation, controller)
-        self._leases[lease.lease_id] = lease
-        self._managed[lease.lease_id] = _ManagedLease(run, identity, controller)
-        self._bindings[lease.lease_id] = LocalWorkspaceBinding(
-            run.run_id,
-            lease.incarnation,
-            run.local_workspace_root,
-            os.path.join(run.local_workspace_root, "work"),
-            run.bundle,
-            context,
-        )
+        installation = _ControllerInstallation()
+        previous_registries = self._leases, self._managed, self._bindings
+        active: local_workspace.LocalIdentity | None = None
+        try:
+            installation.stage = "active-fence"
+            active = local_workspace.set_state(run, lease, run.bundle, identity, "active")
+            installation.stage = "preflight"
+            controller = LocalProcessScopeController(
+                run.local_workspace_root, lease.incarnation, _installation=installation
+            )
+            installation.stage = "backend-assembly"
+            context = ManagedWorkspaceContext(
+                run.local_workspace_root, lease.incarnation, controller
+            )
+            state = _ManagedLease(run, active, controller)
+            binding = LocalWorkspaceBinding(
+                run.run_id,
+                lease.incarnation,
+                run.local_workspace_root,
+                os.path.join(run.local_workspace_root, "work"),
+                run.bundle,
+                context,
+            )
+            leases = self._leases.copy()
+            managed = self._managed.copy()
+            bindings = self._bindings.copy()
+            leases[lease.lease_id] = lease
+            managed[lease.lease_id] = state
+            bindings[lease.lease_id] = binding
+            installation.stage = "registry-commit"
+            self._leases, self._managed, self._bindings = leases, managed, bindings
+            installation.commit()
+        except BaseException as primary:
+            registries_restored = True
+            try:
+                self._leases, self._managed, self._bindings = previous_registries
+            except BaseException:
+                registries_restored = False
+                _installation_warning(
+                    primary, "Managed local installation registry rollback unconfirmed."
+                )
+            outcome = installation.abort(primary)
+            if outcome == "unconfirmed" or not registries_restored:
+                installation.outcome = "unconfirmed"
+                self._failed_installations[lease.lease_id] = installation
+                if active is not None:
+                    try:
+                        local_workspace.set_state(run, lease, run.bundle, active, "uncertain")
+                    except BaseException:
+                        _installation_warning(
+                            primary,
+                            "Managed local installation uncertain-marker write failed; workspace "
+                            "retained. Identity or attachment fence may have drifted; inspect "
+                            "before manual recovery. Do not bypass identity.json.",
+                        )
+                _installation_warning(
+                    primary,
+                    f"Managed local installation failed at {installation.stage}; cleanup "
+                    "unconfirmed; workspace retained. Inspect owned resources "
+                    "before manual recovery.",
+                )
+            else:
+                try:
+                    if active is not None:
+                        local_workspace.set_state(run, lease, run.bundle, active, "idle")
+                    # Only THIS prepare's original stage-issued idle object authorizes deletion.
+                    local_workspace.verify(run, lease, run.bundle, previous=identity)
+                except BaseException:
+                    _installation_warning(
+                        primary,
+                        "Managed local installation identity recovery unconfirmed; workspace "
+                        "retained. Detected replacement or drift is not overwritten or deleted.",
+                    )
+                else:
+                    if fresh:
+                        try:
+                            local_workspace.delete(run, lease, run.bundle, identity)
+                        except BaseException:
+                            _installation_warning(
+                                primary,
+                                "Managed local installation rollback incomplete; workspace "
+                                "retained where present. No recursive deletion retry "
+                                "will be attempted.",
+                            )
+                    _installation_warning(
+                        primary,
+                        f"Managed local installation failed at {installation.stage}; "
+                        "cleanup confirmed.",
+                    )
+            raise
         return lease
 
     def local_workspace_binding(self, lease: WorkspaceLease) -> LocalWorkspaceBinding | None:
         """Return only this backend's binding after verifying the complete lease."""
+        if lease.lease_id in self._failed_installations:
+            raise ExecutionSpecError("Local workspace installation is terminally unconfirmed")
         issued = self._leases.get(lease.lease_id)
         if issued != lease or (lease.lease_id in self._managed and issued is not lease):
             raise ExecutionSpecError("local workspace lease is foreign or stale")
@@ -235,7 +331,7 @@ class LocalRunnerBackend:
     async def attach_run(
         self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
     ) -> WorkspaceLease:
-        """Verify an existing ready/idle incarnation without staging or trusting location."""
+        """Verify a ready/idle incarnation, then install it active without restaging."""
         del expect_staged
         if run.local_workspace_root is None or run.bundle is None:
             raise WorkspaceAttachError("local backend does not support retained workspaces")
@@ -247,6 +343,8 @@ class LocalRunnerBackend:
                 raise ExecutionSpecError("Retained local identity does not name the expected root")
             if run.run_id in self._leases:
                 raise ExecutionSpecError("Local workspace lease has already been issued")
+            if run.run_id in self._failed_installations:
+                raise ExecutionSpecError("Local workspace installation is terminally unconfirmed")
             lease = WorkspaceLease(
                 identity.lease_id, identity.backend, identity.incarnation, str(root)
             )
@@ -255,6 +353,7 @@ class LocalRunnerBackend:
             marker = local_workspace.verify(run, lease, run.bundle)
         except (OSError, ValueError, TypeError) as exc:
             raise WorkspaceAttachError(f"Cannot attach retained local workspace: {exc}") from exc
+        LocalProcessScopeController.preflight()
         return self._install_managed(run, lease, marker)
 
     async def finalize_run(
@@ -270,6 +369,9 @@ class LocalRunnerBackend:
         lease records remain in place.
         """
         del outcome
+        if lease.lease_id in self._failed_installations:
+            _log.warning("Leaving local workspace intact: installation cleanup is unconfirmed")
+            return
         issued = self._leases.get(lease.lease_id)
         if issued == lease and (lease.lease_id not in self._managed or issued is lease):
             state = self._managed.get(lease.lease_id)
@@ -286,7 +388,10 @@ class LocalRunnerBackend:
                     try:
                         local_workspace.delete(state.run, lease, state.run.bundle, state.identity)
                     except (OSError, ValueError, TypeError) as exc:
-                        _log.warning("Leaving unverifiable local workspace intact: %s", exc)
+                        _log.warning(
+                            "Leaving unverifiable local workspace intact: %s",
+                            state.controller.scrub(str(exc)),
+                        )
                         return
                 _ = self._managed.pop(lease.lease_id)
             _ = self._leases.pop(lease.lease_id)
@@ -350,7 +455,11 @@ class LocalRunnerBackend:
         has_separator = os.sep in resolved_command or (
             os.altsep is not None and os.altsep in resolved_command
         )
-        if os.path.isabs(resolved_command) or not has_separator:
+        if (os.path.isabs(resolved_command) or not has_separator) and not (
+            sys.platform == "win32"
+            and lease is not None
+            and (lease.location is not None or lease.lease_id in self._managed)
+        ):
             resolved_command = (
                 shutil.which(resolved_command, path=env.get("PATH")) or resolved_command
             )

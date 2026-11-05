@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import logging
 import os
 import stat
 import sys
+import threading
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -16,7 +18,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from conductor.execution import local as local_backend
 from conductor.execution import local_process_scope as process_core
+from conductor.execution import local_scope_launcher as scope_launcher
 from conductor.execution import local_workspace
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.local import LocalRunnerBackend
@@ -25,10 +29,12 @@ from conductor.execution.types import (
     AgentSpec,
     BundleRef,
     CommandSpec,
+    LocalWorkspaceBinding,
     RunSpec,
     WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 
 def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RunSpec:
@@ -111,12 +117,19 @@ async def test_complete_tree_is_mutable_separate_and_published_identity_last(
     (source / "main/link").symlink_to("../additional/assets", target_is_directory=True)
     original = local_workspace.write_identity
     observed: list[Path] = []
+    active_transitions: list[local_workspace.LocalIdentity] = []
 
     def last(temporary: Path, identity: local_workspace.LocalIdentity) -> None:
-        assert not root.exists()
-        assert (temporary / "work/registry/child/source").read_bytes() == b"registry/child"
-        assert not (temporary / "identity.json").exists()
-        observed.append(temporary)
+        if temporary == root:
+            assert identity.runtime_state == "active"
+            assert json.loads((root / "identity.json").read_text())["runtime_state"] == "idle"
+            active_transitions.append(identity)
+        else:
+            assert not root.exists()
+            assert (temporary / "work/registry/child/source").read_bytes() == b"registry/child"
+            assert not (temporary / "identity.json").exists()
+            assert identity.runtime_state == "idle"
+            observed.append(temporary)
         original(temporary, identity)
 
     monkeypatch.setattr(local_workspace, "write_identity", last)
@@ -125,6 +138,7 @@ async def test_complete_tree_is_mutable_separate_and_published_identity_last(
     controller = backend._managed[lease.lease_id].controller
     try:
         assert len(observed) == 1 and not observed[0].exists()
+        assert len(active_transitions) == 1
         work = root / "work"
         for path in source.rglob("source"):
             copy = work / path.relative_to(source)
@@ -135,7 +149,7 @@ async def test_complete_tree_is_mutable_separate_and_published_identity_last(
         (work / "main/source").write_bytes(b"mutable")
         assert (source / "main/source").read_bytes() == b"main"
         marker = json.loads((root / "identity.json").read_text())
-        assert marker["version"] == 1 and marker["runtime_state"] == "idle"
+        assert marker["version"] == 1 and marker["runtime_state"] == "active"
         assert (marker["st_dev"], marker["st_ino"]) == (root.stat().st_dev, root.stat().st_ino)
         monkeypatch.setattr(local_workspace, "write_identity", original)
         await _release(backend, lease)
@@ -756,6 +770,29 @@ async def test_location_is_not_delete_authority_and_root_drift_warns(managed, ca
     assert "Leaving unverifiable" in caplog.text
 
 
+async def test_delete_warning_scrubs_registered_path_secret(
+    managed, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Requirement: failed verified deletion retains storage and scrubs the exception's path.
+    backend, _run_spec, lease = managed
+    secret = "registered-workspace-path-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
+    backend._managed[lease.lease_id].controller.scrub = redactor.scrub
+    await _release(backend, lease)
+
+    def denied(path: Path) -> None:
+        raise PermissionError(13, "workspace cleanup denied", str(path / secret))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(local_workspace.shutil, "rmtree", denied)
+        await backend.finalize_run(lease, "succeeded")
+    assert Path(lease.location).is_dir()
+    formatted = "\n".join(logging.Formatter().format(record) for record in caplog.records)
+    assert secret not in formatted
+    assert REDACTED_MARKER in formatted and "workspace cleanup denied" in formatted
+
+
 async def test_active_cannot_confirm_without_common_root_proof_or_delete(managed, caplog) -> None:
     # Requirement: active is written before dispatch and only the common root proof permits idle.
     backend, _run_spec, lease = managed
@@ -1002,3 +1039,683 @@ async def test_managed_start_errors_preserve_native_cause_fields(
     assert type(cause) is type(original) and str(cause) == str(original)
     assert (cause.errno, cause.filename) == (original.errno, original.filename)
     await _release(backend, lease)
+
+
+def _installation_socket_fd(address: str) -> int:
+    """Find the actual owned socket by its kernel inode, independent of CPython internals."""
+    socket_inode = next(
+        int(fields[6])
+        for line in Path("/proc/net/unix").read_text().splitlines()[1:]
+        if (fields := line.split())[-1] == address
+    )
+    descriptors = []
+    for path in list(Path("/proc/self/fd").iterdir()):
+        fd = int(path.name)
+        try:
+            info = os.fstat(fd)
+        except OSError as error:
+            assert error.errno == errno.EBADF
+            continue
+        if stat.S_ISSOCK(info.st_mode) and info.st_ino == socket_inode:
+            descriptors.append(fd)
+    assert len(descriptors) == 1
+    return descriptors[0]
+
+
+def _installation_fd_live(fd, identity):
+    try:
+        info = os.fstat(fd)
+    except OSError as error:
+        assert error.errno == errno.EBADF
+        return False
+    return (info.st_dev, info.st_ino) == identity
+
+
+@pytest.fixture
+def installation_resources(monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("Requires Linux procfs native descriptor observation")
+    listeners = []
+    threads = []
+    real_listener = scope_launcher.Listener
+    real_thread = threading.Thread
+
+    def listener(*args, **kwargs):
+        result = real_listener(*args, **kwargs)
+        address = result.address
+        assert isinstance(address, str)
+        fd = _installation_socket_fd(address)
+        info = os.fstat(fd)
+        directory_fd = int(address.split("/fd/")[1].split("/")[0])
+        directory_info = os.fstat(directory_fd)
+        listeners.append(
+            (
+                result,
+                result.close,
+                fd,
+                (info.st_dev, info.st_ino),
+                directory_fd,
+                (directory_info.st_dev, directory_info.st_ino),
+                address,
+            )
+        )
+        return result
+
+    def thread(*args, **kwargs):
+        result = real_thread(*args, **kwargs)
+        threads.append((result, kwargs.get("target"), kwargs.get("args", ())))
+        return result
+
+    monkeypatch.setattr(scope_launcher, "Listener", listener)
+    monkeypatch.setattr(threading, "Thread", thread)
+    try:
+        yield listeners, threads
+    finally:
+        # Test-owned recovery is deliberately separate from product cleanup evidence.
+        for native, target, _args in threads:
+            owner = getattr(target, "__self__", None)
+            if isinstance(owner, process_core.LocalProcessScopeController):
+                owner._closed = True
+            if isinstance(owner, process_core._ControllerInstallation):
+                owner.aborted = True
+                owner.gate.set()
+            if native.is_alive():
+                for _listener, _close, _fd, _identity, _dfd, _did, address in listeners:
+                    try:
+                        with scope_launcher.connect({"endpoint": address}, authenticate=False):
+                            pass
+                    except OSError:
+                        pass
+                native.join(2)
+            assert not native.is_alive()
+        for _listener, close, _fd, _identity, dfd, did, _address in listeners:
+            close()
+            if _installation_fd_live(dfd, did):
+                os.close(dfd)
+
+
+@pytest.mark.parametrize("fault", ["helper", "platform"])
+async def test_installation_preflight_precedes_publication(tmp_path, monkeypatch, fault):
+    # Requirement: a deterministic unavailable runtime never publishes a workspace.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    if fault == "helper":
+        monkeypatch.setattr(
+            process_core.sysconfig, "get_path", lambda _name: str(tmp_path / "missing")
+        )
+    else:
+        monkeypatch.setattr(process_core.sys, "platform", "freebsd")
+    with pytest.raises(ExecutionSpecError):
+        await LocalRunnerBackend().prepare_run(run)
+    assert not Path(run.local_workspace_root).exists()
+
+
+@pytest.mark.parametrize(
+    "fault", ["chmod", "thread-construction", "real-start", "unknown-start", "context", "binding"]
+)
+async def test_installation_resources_abort(tmp_path, monkeypatch, installation_resources, fault):
+    # Requirement: acquired startup resources close before a fresh root can be rolled back.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    listeners, threads = installation_resources
+    primary = PermissionError(
+        errno.EACCES, "installation-private-primary", "installation-private-filename"
+    )
+    original_args = primary.args
+    original_cause = RuntimeError("installation-private-cause")
+    primary.__cause__ = original_cause
+    original_chmod = os.chmod
+    original_thread = threading.Thread
+
+    def denied(path, *args, **kwargs):
+        if str(path).startswith("/proc/") and str(path).endswith("/control"):
+            raise primary
+        return original_chmod(path, *args, **kwargs)
+
+    def broken_thread(*args, **kwargs):
+        if fault == "thread-construction":
+            raise primary
+        result = original_thread(*args, **kwargs)
+        original_start = result.start
+
+        def start():
+            if fault == "real-start":
+                original_start()
+            raise primary
+
+        result.start = start
+        return result
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    if fault == "chmod":
+        monkeypatch.setattr(os, "chmod", denied)
+    elif fault in ("thread-construction", "real-start", "unknown-start"):
+        monkeypatch.setattr(threading, "Thread", broken_thread)
+    elif fault == "context":
+        monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    else:
+        monkeypatch.setattr(local_backend, "LocalWorkspaceBinding", fail)
+    backend = LocalRunnerBackend()
+    with pytest.raises(PermissionError) as caught:
+        await backend.prepare_run(run)
+    assert caught.value is primary and primary.args == original_args
+    assert primary.__cause__ is original_cause and primary.__context__ is None
+    assert not backend._bindings and not backend._leases and not backend._managed
+    assert listeners
+    for _listener, _close, fd, identity, dfd, did, _address in listeners:
+        assert not _installation_fd_live(fd, identity)
+        assert not _installation_fd_live(dfd, did)
+    assert all(not thread.is_alive() for thread, _target, _args in threads)
+    root = Path(run.local_workspace_root)
+    if fault == "unknown-start":
+        assert json.loads((root / "identity.json").read_text())["runtime_state"] in (
+            "active",
+            "uncertain",
+        )
+    else:
+        assert not root.exists()
+
+
+@pytest.mark.parametrize("after_replace", [False, True])
+async def test_installation_active_write_failure_never_starts_controller(
+    tmp_path, monkeypatch, installation_resources, after_replace
+):
+    # Requirement: exception after marker replacement cannot be mistaken for unchanged idle.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    original = local_workspace.set_state
+    primary = OSError(errno.EIO, "installation-marker-secret")
+
+    def fence(*args, **kwargs):
+        if args[-1] == "active":
+            if after_replace:
+                original(*args, **kwargs)
+            raise primary
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(local_workspace, "set_state", fence)
+    backend = LocalRunnerBackend()
+    try:
+        with pytest.raises(OSError) as caught:
+            await backend.prepare_run(run)
+        assert caught.value is primary
+        assert not installation_resources[0] and not installation_resources[1]
+        root = Path(run.local_workspace_root)
+        if after_replace:
+            assert json.loads((root / "identity.json").read_text())["runtime_state"] == "active"
+        else:
+            assert not root.exists()
+    finally:
+        if backend._managed:
+            controller = next(iter(backend._managed.values())).controller
+            await controller.close()
+
+
+async def test_installation_double_fault_retains_real_listener_and_fence(
+    tmp_path, monkeypatch, installation_resources, caplog
+):
+    # Requirement: failed disposal and failed uncertain write still block independent attachment.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    original_listener = scope_launcher.Listener
+    original_state = local_workspace.set_state
+    primary = asyncio.CancelledError("installation-cancellation-secret")
+    secondary = OSError(errno.EIO, "installation-cleanup-secret")
+
+    def listener(*args, **kwargs):
+        result = original_listener(*args, **kwargs)
+
+        def close():
+            raise secondary
+
+        result.close = close
+        return result
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    def uncertain(*args, **kwargs):
+        if args[-1] == "uncertain":
+            raise secondary
+        return original_state(*args, **kwargs)
+
+    monkeypatch.setattr(scope_launcher, "Listener", listener)
+    monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    monkeypatch.setattr(local_workspace, "set_state", uncertain)
+    backend = LocalRunnerBackend()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await backend.prepare_run(run)
+    assert caught.value is primary and primary.args == ("installation-cancellation-secret",)
+    root = Path(run.local_workspace_root)
+    marker = json.loads((root / "identity.json").read_text())
+    assert marker["runtime_state"] == "active"
+    identity = WorkspaceIdentity("local", marker["lease_id"], marker["incarnation"], str(root))
+    with pytest.raises(WorkspaceAttachError):
+        await LocalRunnerBackend().attach_run(run, identity)
+    assert backend._failed_installations
+    assert any(
+        _installation_fd_live(fd, identity)
+        for _, _, fd, identity, _, _, _ in installation_resources[0]
+    )
+    assert caplog.records and all(record.exc_info is None for record in caplog.records)
+    assert "installation-" not in caplog.text
+
+
+async def test_installation_attached_abort_restores_idle_and_preserves_modified_work(
+    tmp_path, monkeypatch, installation_resources
+):
+    # Requirement: confirmed attachment abort closes its resources but never deletes user work.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    backend = LocalRunnerBackend()
+    lease = await backend.prepare_run(run)
+    await _release(backend, lease)
+    assert lease.location is not None
+    root = Path(lease.location)
+    previous_ipc = set(root.glob(".scope-ipc-*"))
+    modified = root / "work/main/source"
+    modified.write_bytes(b"user modified")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("installation interrupted")
+
+    monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    with pytest.raises(RuntimeError):
+        await LocalRunnerBackend().attach_run(run, _checkpoint(lease))
+    assert modified.read_bytes() == b"user modified"
+    assert json.loads((root / "identity.json").read_text())["runtime_state"] == "idle"
+    assert set(root.glob(".scope-ipc-*")) == previous_ipc
+
+
+async def test_installation_fd_allocation_after_side_effect_cannot_be_fake_confirmed(
+    tmp_path, monkeypatch
+):
+    # Requirement: an unreturned native directory fd remains unknown, fenced and retained.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    primary = OSError(errno.EMFILE, "directory-fd allocation failed after side effect")
+    real_open = os.open
+    acquired = []
+
+    def opened(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if ".scope-ipc-" in str(path):
+            info = os.fstat(fd)
+            acquired.append((fd, (info.st_dev, info.st_ino)))
+            raise primary
+        return fd
+
+    monkeypatch.setattr(os, "open", opened)
+    backend = LocalRunnerBackend()
+    try:
+        with pytest.raises(OSError) as caught:
+            await backend.prepare_run(run)
+        assert caught.value is primary
+        assert acquired and all(_installation_fd_live(fd, identity) for fd, identity in acquired)
+        marker = json.loads((Path(run.local_workspace_root) / "identity.json").read_text())
+        assert marker["runtime_state"] in ("active", "uncertain")
+        assert not backend._leases and not backend._bindings
+    finally:
+        for fd, identity in acquired:
+            if _installation_fd_live(fd, identity):
+                os.close(fd)
+
+
+async def test_installation_rollback_uses_original_stage_authority_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources
+) -> None:
+    # Requirement: confirmed fresh abort deletes only with the original stage-issued objects.
+    run = _run(tmp_path, monkeypatch)
+    assert run.bundle is not None and run.local_workspace_root is not None
+    source = Path(run.bundle.store_path) / "tree"
+    before = {
+        path: (path.read_bytes(), path.stat().st_dev, path.stat().st_ino)
+        for path in source.rglob("source")
+    }
+    backend = LocalRunnerBackend()
+    issued = []
+    deleted = []
+    real_stage = local_workspace.stage
+    real_delete = local_workspace.delete
+    primary = OSError(errno.EIO, "assembly failed")
+
+    def stage(run, lease, bundle):
+        identity = real_stage(run, lease, bundle)
+        issued.append((lease, identity))
+        return identity
+
+    def delete(run, lease, bundle, identity):
+        assert lease is issued[0][0] and identity is issued[0][1]
+        assert local_workspace.verify(run, lease, bundle, previous=identity) == identity
+        deleted.append(identity)
+        real_delete(run, lease, bundle, identity)
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    with monkeypatch.context() as fault:
+        fault.setattr(local_workspace, "stage", stage)
+        fault.setattr(local_workspace, "delete", delete)
+        fault.setattr(local_backend, "ManagedWorkspaceContext", fail)
+        with pytest.raises(OSError) as caught:
+            await backend.prepare_run(run)
+        assert caught.value is primary
+    assert len(deleted) == 1 and deleted[0] is issued[0][1]
+    assert not Path(run.local_workspace_root).exists()
+    assert {
+        path: (path.read_bytes(), path.stat().st_dev, path.stat().st_ino)
+        for path in source.rglob("source")
+    } == before
+    lease = await backend.prepare_run(run)
+    try:
+        assert lease.location is not None
+        assert lease.incarnation != issued[0][0].incarnation
+        assert await backend.prepare_run(run) is lease
+        assert (
+            json.loads((Path(lease.location) / "identity.json").read_text())["runtime_state"]
+            == "active"
+        )
+        await _release(backend, lease)
+        await backend.finalize_run(lease, "succeeded")
+    finally:
+        if backend._managed:
+            await backend._managed[lease.lease_id].controller.close()
+
+
+@pytest.mark.parametrize("boundary", ["context", "state", "binding", "mappings"])
+async def test_installation_assembly_failure_preserves_real_foreign_workload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources, boundary: str
+) -> None:
+    # Requirement: assembly abort never publishes its binding or damages a live foreign lease.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    root = Path(run.local_workspace_root)
+    other = replace(
+        run, run_id="other", local_workspace_root=str(root.parent.parent / "other/local")
+    )
+    backend = LocalRunnerBackend()
+    foreign = await backend.prepare_run(other)
+    controller = backend._managed[foreign.lease_id].controller
+    primary = MemoryError("candidate assembly failed")
+    listeners, _threads = installation_resources
+    previous_count = len(listeners)
+
+    class FailingCopy(dict[str, LocalWorkspaceBinding]):
+        def copy(self) -> dict[str, LocalWorkspaceBinding]:
+            raise primary
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    if boundary == "mappings":
+        backend._bindings = FailingCopy(backend._bindings)
+    registries = backend._leases, backend._managed, backend._bindings
+    try:
+        with monkeypatch.context() as fault:
+            if boundary != "mappings":
+                name = {
+                    "context": "ManagedWorkspaceContext",
+                    "state": "_ManagedLease",
+                    "binding": "LocalWorkspaceBinding",
+                }[boundary]
+                fault.setattr(local_backend, name, fail)
+            with pytest.raises(MemoryError) as caught:
+                await backend.prepare_run(run)
+            assert caught.value is primary
+        assert all(
+            current is previous
+            for current, previous in zip(
+                (backend._leases, backend._managed, backend._bindings), registries, strict=True
+            )
+        )
+        assert backend._leases == {"other": foreign}
+        assert not root.exists()
+        for _listener, _close, fd, identity, dfd, did, _address in listeners[previous_count:]:
+            assert not _installation_fd_live(fd, identity)
+            assert not _installation_fd_live(dfd, did)
+        result = await backend.run_command(
+            CommandSpec(sys.executable, ("-c", "print('foreign-live')"), stdin=b""), foreign
+        )
+        assert result.stdout == "foreign-live\n" and result.exit_code == 0
+    finally:
+        await _release(backend, foreign)
+        await backend.finalize_run(foreign, "succeeded")
+        await controller.close()
+
+
+@pytest.mark.parametrize("fault", ["before-transfer", "after-transfer"])
+async def test_installation_unknown_listener_transfer_is_never_fake_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources, fault: str
+) -> None:
+    # Requirement: an interrupted native listener transfer retains its dependent fd and fence.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    backend = LocalRunnerBackend()
+    primary = OSError(errno.EIO, "listener transfer interrupted")
+    original_listener = scope_launcher.Listener
+    original_transfer = process_core._ControllerInstallation.receive_listener
+
+    def allocate(*args, **kwargs):
+        original_listener(*args, **kwargs)
+        raise primary
+
+    def transfer(owner, listener):
+        original_transfer(owner, listener)
+        raise primary
+
+    if fault == "before-transfer":
+        monkeypatch.setattr(scope_launcher, "Listener", allocate)
+    else:
+        monkeypatch.setattr(process_core._ControllerInstallation, "receive_listener", transfer)
+    with pytest.raises(OSError) as caught:
+        await backend.prepare_run(run)
+    assert caught.value is primary
+    record = backend._failed_installations[run.run_id]
+    assert record.outcome == "unconfirmed"
+    assert record.fd is not None
+    assert record.directory_identity is not None
+    assert os.fstat(record.fd).st_ino == record.directory_identity[1]
+    marker = json.loads((Path(run.local_workspace_root) / "identity.json").read_text())
+    assert marker["runtime_state"] == "uncertain"
+    with pytest.raises(ExecutionSpecError):
+        await backend.prepare_run(run)
+
+
+async def test_installation_late_thread_exit_never_upgrades_unknown_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources
+) -> None:
+    # Requirement: late native exit cannot upgrade unknown startup or authorize deletion.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    root = Path(run.local_workspace_root)
+    original_thread = threading.Thread
+    primary = OSError(errno.EAGAIN, "native startup unknown")
+    native_starts = []
+
+    def thread(*args, **kwargs):
+        result = original_thread(*args, **kwargs)
+        native_starts.append(result.start)
+
+        def start():
+            raise primary
+
+        result.start = start
+        return result
+
+    monkeypatch.setattr(threading, "Thread", thread)
+    backend = LocalRunnerBackend()
+    with pytest.raises(OSError) as caught:
+        await backend.prepare_run(run)
+    assert caught.value is primary
+    record = backend._failed_installations[run.run_id]
+    before = (root / "identity.json").read_bytes()
+    native_starts[0]()
+    assert record.thread is not None
+    record.thread.join(1)
+    assert record.entered.is_set() and not record.thread.is_alive()
+    assert not Path(f"/proc/self/task/{record.thread.native_id}").exists()
+    assert record.abort(primary) == "unconfirmed"
+    assert (root / "identity.json").read_bytes() == before
+    assert record.outcome == "unconfirmed" and root.exists()
+
+
+@pytest.mark.parametrize("swap", ["root", "parent", "work", "marker"])
+async def test_installation_abort_detected_drift_never_deletes_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources, caplog, swap: str
+) -> None:
+    # Requirement: observed recovery drift leaves replacement storage and moved data intact.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    root = Path(run.local_workspace_root)
+    target = {
+        "root": root,
+        "parent": root.parent,
+        "work": root / "work",
+        "marker": root / "identity.json",
+    }[swap]
+    saved = target.with_name(target.name + "-saved")
+    primary = OSError(errno.EIO, "assembly failure")
+
+    def fail(*args, **kwargs):
+        target.rename(saved)
+        if swap in ("root", "parent"):
+            target.mkdir()
+            (target / "foreign").write_bytes(b"foreign bytes")
+        else:
+            target.symlink_to(saved, target_is_directory=swap == "work")
+        raise primary
+
+    monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    backend = LocalRunnerBackend()
+    with pytest.raises(OSError) as caught:
+        await backend.prepare_run(run)
+    assert caught.value is primary
+    assert saved.exists()
+    if swap in ("root", "parent"):
+        assert (target / "foreign").read_bytes() == b"foreign bytes"
+        original_root = saved if swap == "root" else saved / "local"
+        assert (original_root / "work/main/source").read_bytes() == b"main"
+    else:
+        assert target.is_symlink()
+    assert not backend._leases and not backend._bindings
+    assert "retained" in caplog.text
+
+
+@pytest.mark.parametrize("after_replace", [False, True])
+async def test_installation_idle_restore_failure_never_retries_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources, after_replace: bool
+) -> None:
+    # Requirement: an unreturned idle restore never authorizes destructive recovery by inference.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    primary = OSError(errno.EIO, "primary startup failure")
+    original_state = local_workspace.set_state
+
+    def restore(*args, **kwargs):
+        if args[-1] == "idle":
+            if after_replace:
+                original_state(*args, **kwargs)
+            raise PermissionError(errno.EACCES, "secondary restore failure")
+        return original_state(*args, **kwargs)
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    monkeypatch.setattr(local_workspace, "set_state", restore)
+    monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    with pytest.raises(OSError) as caught:
+        await LocalRunnerBackend().prepare_run(run)
+    assert caught.value is primary
+    root = Path(run.local_workspace_root)
+    assert (root / "work/main/source").read_bytes() == b"main"
+    marker = json.loads((root / "identity.json").read_text())
+    assert marker["runtime_state"] == ("idle" if after_replace else "active")
+    for _listener, _close, fd, identity, dfd, did, _address in installation_resources[0]:
+        assert not _installation_fd_live(fd, identity)
+        assert not _installation_fd_live(dfd, did)
+
+
+@pytest.mark.parametrize("kind", ["oserror", "cancel", "custom"])
+async def test_installation_primary_survives_partial_delete_with_safe_formatted_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources, caplog, kind: str
+) -> None:
+    # Requirement: partial rmtree failure preserves the exact primary and never logs its data.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None and run.bundle is not None
+    root = Path(run.local_workspace_root)
+    secret = "registered-installation-private-value"
+
+    class StartupFailure(RuntimeError):
+        pass
+
+    primary = {
+        "oserror": OSError(errno.EIO, secret, secret),
+        "cancel": asyncio.CancelledError(secret),
+        "custom": StartupFailure(secret),
+    }[kind]
+    cause = RuntimeError(secret)
+    context = ValueError(secret)
+    primary.__cause__ = cause
+    primary.__context__ = context
+    original_args = primary.args
+    original_errno = getattr(primary, "errno", None)
+    original_filename = getattr(primary, "filename", None)
+    destructive_attempts = []
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    def incomplete(*args, **kwargs):
+        destructive_attempts.append(args[-1])
+        (root / "work/main/source").unlink()
+        raise PermissionError(errno.EACCES, secret, secret)
+
+    monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    monkeypatch.setattr(local_workspace, "delete", incomplete)
+    with pytest.raises(type(primary)) as caught:
+        await LocalRunnerBackend().prepare_run(run)
+    assert caught.value is primary and primary.args == original_args
+    assert getattr(primary, "errno", None) == original_errno
+    assert getattr(primary, "filename", None) == original_filename
+    assert primary.__cause__ is cause and primary.__context__ is context
+    assert root.exists() and not (root / "work/main/source").exists()
+    assert (Path(run.bundle.store_path) / "tree/main/source").read_bytes() == b"main"
+    assert len(destructive_attempts) == 1
+    assert any("rollback incomplete" in record.getMessage() for record in caplog.records)
+    for record in caplog.records:
+        assert secret not in logging.Formatter("%(levelname)s %(message)s").format(record)
+        assert record.exc_info is None and record.stack_info is None
+
+
+async def test_installation_logging_failure_cannot_replace_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_resources
+) -> None:
+    # Requirement: a failing warning handler cannot replace startup error or expose secondary text.
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    primary = OSError(errno.EIO, "private primary", "private filename")
+
+    class BrokenSink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            raise asyncio.CancelledError("private secondary sink failure")
+
+    def fail(*args, **kwargs):
+        raise primary
+
+    handler = BrokenSink()
+    process_core._log.addHandler(handler)
+    monkeypatch.setattr(local_backend, "ManagedWorkspaceContext", fail)
+    try:
+        with pytest.raises(OSError) as caught:
+            await LocalRunnerBackend().prepare_run(run)
+        assert caught.value is primary
+        assert primary.args == (errno.EIO, "private primary")
+        assert primary.filename == "private filename" and primary.__context__ is None
+        assert primary.__notes__ == [
+            "Managed local installation diagnostic could not be delivered."
+        ]
+        assert not Path(run.local_workspace_root).exists()
+    finally:
+        process_core._log.removeHandler(handler)

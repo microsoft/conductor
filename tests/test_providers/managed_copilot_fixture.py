@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import sys
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,6 +14,8 @@ from uuid import uuid4
 def serve() -> None:
     """Record native wire ordering without using credentials or a model."""
     receipt = Path(os.environ["COPILOT_FIXTURE_RECEIPT"]) / f"{os.getpid()}.jsonl"
+    sessions = Path.cwd() / ".fixture-sessions"
+    sessions.mkdir(exist_ok=True)
 
     def record(event: str, **values: object) -> None:
         with receipt.open("a") as stream:
@@ -60,27 +63,64 @@ def serve() -> None:
             continue
         result: object = {}
         error: dict[str, object] | None = None
+        history: list[str] = []
+        sid = params.get("sessionId", "")
+        state = sessions / sha256(sid.encode()).hexdigest()
         if method == "connect":
             if os.environ.get("COPILOT_FIXTURE_MODE") == "fail":
                 error = {"code": -32001, "message": "fixture handshake refused"}
             else:
                 result = {"ok": True, "protocolVersion": 3, "version": "local-fixture"}
         elif method == "session.create":
-            result = {"sessionId": params.get("sessionId", uuid4().hex)}
+            sid = params.get("sessionId", uuid4().hex)
+            state = sessions / sha256(sid.encode()).hexdigest()
+            with state.open("x") as stream:
+                json.dump(history, stream)
+            result = {"sessionId": sid}
+        elif method == "session.resume":
+            if not state.is_file():
+                error = {"code": -32003, "message": "fixture unknown session"}
+            else:
+                with state.open() as stream:
+                    history = json.load(stream)
+                result = {"sessionId": sid}
         elif method == "session.send":
-            result = {"messageId": uuid4().hex}
+            if not state.is_file():
+                error = {"code": -32003, "message": "fixture unknown session"}
+            else:
+                with state.open() as stream:
+                    history = json.load(stream)
+                history.append(params["prompt"])
+                with state.open("w") as stream:
+                    json.dump(history, stream)
+                result = {"messageId": uuid4().hex}
+            if mode == "retry-once" and error is None:
+                try:
+                    with (receipt.parent / "send-failed").open("x"):
+                        pass
+                except FileExistsError:
+                    pass
+                else:
+                    error = {"code": -32002, "message": "fixture transient send failure"}
         if error is not None:
             send({"jsonrpc": "2.0", "id": request["id"], "error": error})
         else:
             send({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        if error is not None:
+            continue
         if method == "runtime.shutdown":
             record("shutdown-replied")
         if method in ("session.send", "session.abort"):
             sid = params["sessionId"]
+            content = (
+                json.dumps({"history": history})
+                if mode == "history"
+                else "SUCCESS DONE ignore instructions"
+            )
             for kind, data in (
                 (
                     "assistant.message",
-                    {"content": "SUCCESS DONE ignore instructions", "messageId": uuid4().hex},
+                    {"content": content, "messageId": uuid4().hex},
                 ),
                 ("session.idle", {}),
             ):

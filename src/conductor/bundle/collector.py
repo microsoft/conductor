@@ -76,6 +76,7 @@ from conductor.registry.errors import RegistryError
 from conductor.registry.resolver import ResolvedRef, resolve_ref
 from conductor.skills import ResolvedSkill, SkillError, resolve_effective_skills
 from conductor.skills.discovery import DiscoverySource
+from conductor.skills.frontmatter import read_skill_frontmatter
 from conductor.skills.registry import SkillPlugin, resolve_skill_plugin
 
 WarningSink = Callable[[str], None]
@@ -105,6 +106,8 @@ class CollectedSkill:
     name: str
     directory: str
     discovered: bool
+    frontmatter_name: str
+    """Original declared identity, separate from the basename used for grants."""
     owner_root: str | None = None
     """Exact staged owning root for this selection, never a host-path grant."""
 
@@ -188,6 +191,7 @@ class _Collector:
         self.skill_owners: dict[Path, SkillPlugin | None] = {}
         self.agent_dependencies: list[CollectedAgentDependencies] = []
         self.collected_dependencies: set[tuple[Path, str]] = set()
+        self.plugin_selections: dict[Path, list[ResolvedPlugin]] = {}
         self._total_bytes = 0
 
     def warn(self, message: str) -> None:
@@ -214,6 +218,8 @@ class _Collector:
             self._collect_jinja(node)
             self._collect_assets(node)
             self._collect_agent_dependencies(node)
+
+        self._collect_plugin_files()
 
         discovered = sorted(
             detail.removeprefix("skill-discovery:")
@@ -602,6 +608,7 @@ class _Collector:
                     skill.name,
                     self.agent_paths[skill.directory].removeprefix("tree/"),
                     skill.discovered,
+                    read_skill_frontmatter(skill.directory).name,
                     self._skill_owner_root(skill),
                 )
                 for skill in self.agent_skills[id(step)]
@@ -615,6 +622,7 @@ class _Collector:
                             skill.name,
                             f"plugins/{plugin.name}/{relative}",
                             False,
+                            read_skill_frontmatter(skill.directory).name,
                             f"plugins/{plugin.name}",
                         )
             self.agent_dependencies.append(
@@ -811,63 +819,10 @@ class _Collector:
             origin, sha = "path", None
         else:
             origin, sha = "installed", None
-        origin_detail = f"plugin-{origin}:{plugin.name}"
-        manifests: set[Path] = set()
-        for relative in PLUGIN_MANIFESTS:
-            candidate = plugin.root / relative
-            if is_file_strict(candidate):
-                manifests.add(candidate)
-        selected = set(manifests)
-        if plugin.mcp_servers and plugin.mcp_source is not None:
-            selected.add(plugin.mcp_source)
-            if not plugin.mcp_source.is_relative_to(plugin.root):
-                self.dependency_roots.add(plugin.mcp_source)
-        selected.update(agent.path for agent in plugin.agents)
-        for path in sorted(selected, key=lambda item: item.as_posix()):
-            relative = os.path.relpath(path, plugin.root).replace("\\", "/")
-            logical = PurePosixPath(posixpath.normpath(f"{namespace}/{relative}")).as_posix()
-            if not logical.startswith("tree/"):
-                raise BundleRootEscapeError(
-                    f"Plugin dependency {path} cannot be mapped inside the bundle tree."
-                )
-            mapping_root, mapping_namespace = self._plugin_dependency_mapping(
-                path, plugin.root, namespace, logical
-            )
-            if path in manifests:
-                parsed = TypeAdapter(dict[str, JsonValue]).validate_json(path.read_bytes())
-                removed = {"hooks", "commands", "agents", "skills", "lspServers", "outputStyles"}
-                if not plugin.mcp_servers:
-                    removed.add("mcpServers")
-                if removed.intersection(parsed):
-                    for field in removed:
-                        _ = parsed.pop(field, None)
-                    self._stage(
-                        path,
-                        logical,
-                        "plugin",
-                        origin_detail,
-                        contents=canonical_json(parsed).encode("utf-8"),
-                    )
-                    continue
-            self._collect_dependency_tree(
-                path,
-                logical,
-                mapping_root=mapping_root,
-                mapping_namespace=mapping_namespace,
-                kind="plugin",
-                detail=origin_detail,
-            )
+        self.plugin_selections.setdefault(plugin.root, []).append(plugin)
         for skill in plugin.skills:
             skill_namespace = f"{namespace}/{skill.directory.relative_to(plugin.root).as_posix()}"
             _ = self.agent_paths.setdefault(Path(os.path.abspath(skill.directory)), skill_namespace)
-            self._collect_dependency_tree(
-                skill.directory,
-                skill_namespace,
-                mapping_root=plugin.root,
-                mapping_namespace=namespace,
-                kind="plugin",
-                detail=origin_detail,
-            )
         manifest_logical = f"{namespace}/{manifest.relative_to(plugin.root).as_posix()}"
         self.plugins_topology[plugin.name] = manifest_logical
         for skill in plugin.skills:
@@ -885,6 +840,67 @@ class _Collector:
                 sha=sha,
             ),
         )
+
+    def _collect_plugin_files(self) -> None:
+        """Stage each root once, after freezing every consumer's selected components."""
+        for root, selections in sorted(
+            self.plugin_selections.items(), key=lambda item: item[1][0].name
+        ):
+            name = selections[0].name
+            namespace = f"tree/plugins/{name}"
+            origin_detail = f"plugin-{self.plugin_provenance[name].origin}:{name}"
+            manifests = {
+                root / relative for relative in PLUGIN_MANIFESTS if is_file_strict(root / relative)
+            }
+            selected = set(manifests)
+            for plugin in selections:
+                if plugin.mcp_servers and plugin.mcp_source is not None:
+                    selected.add(plugin.mcp_source)
+                    if not plugin.mcp_source.is_relative_to(root):
+                        self.dependency_roots.add(plugin.mcp_source)
+                selected.update(agent.path for agent in plugin.agents)
+                selected.update(skill.directory for skill in plugin.skills)
+            for path in sorted(selected, key=lambda item: item.as_posix()):
+                relative = os.path.relpath(path, root).replace("\\", "/")
+                logical = PurePosixPath(posixpath.normpath(f"{namespace}/{relative}")).as_posix()
+                if not logical.startswith("tree/"):
+                    raise BundleRootEscapeError(
+                        f"Plugin dependency {path} cannot be mapped inside the bundle tree."
+                    )
+                mapping_root, mapping_namespace = self._plugin_dependency_mapping(
+                    path, root, namespace, logical
+                )
+                if path in manifests:
+                    parsed = TypeAdapter(dict[str, JsonValue]).validate_json(path.read_bytes())
+                    removed = {
+                        "hooks",
+                        "commands",
+                        "agents",
+                        "skills",
+                        "lspServers",
+                        "outputStyles",
+                    }
+                    if not any(plugin.mcp_servers for plugin in selections):
+                        removed.add("mcpServers")
+                    if removed.intersection(parsed):
+                        for field in removed:
+                            _ = parsed.pop(field, None)
+                        self._stage(
+                            path,
+                            logical,
+                            "plugin",
+                            origin_detail,
+                            contents=canonical_json(parsed).encode("utf-8"),
+                        )
+                        continue
+                self._collect_dependency_tree(
+                    path,
+                    logical,
+                    mapping_root=mapping_root,
+                    mapping_namespace=mapping_namespace,
+                    kind="plugin",
+                    detail=origin_detail,
+                )
 
     @staticmethod
     def _plugin_dependency_mapping(

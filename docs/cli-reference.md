@@ -453,9 +453,45 @@ conductor resume workflow.yaml --guidance "Use Python 3.12 syntax"
 
 The `WorkflowEngine` constructor accepts `config`, an optional `provider` or
 `registry`, and a file-backed `workflow_path` for bundle collection. Call
-`await engine.run(inputs)` or restore the context and limits and call
-`await engine.resume(current_agent_name, checkpoint=checkpoint)` for retained
-resume. The root engine coordinates targeted release before finalizing its
+`await engine.run(inputs)` for a fresh run.
+
+For retained resume, construct the engine with
+`run_context=RunContext(run_id=checkpoint.run_id)`, the file-backed
+`workflow_path`, and an `execution_environment` whose name and digest match
+the checkpoint's resume contract. `resume()` does not adopt the checkpoint's
+run ID. Set these constructor arguments before restoring the context and
+limits. With the config, checkpoint, workflow path, matching resolved
+environment, and provider registry already loaded, use this sequence inside
+the caller's async code:
+
+```python
+from conductor.engine.context import WorkflowContext
+from conductor.engine.limits import LimitEnforcer
+from conductor.engine.workflow import RunContext, WorkflowEngine
+
+engine = WorkflowEngine(
+    config,
+    registry=registry,
+    workflow_path=workflow_path,
+    execution_environment=execution_environment,
+    run_context=RunContext(run_id=checkpoint.run_id),
+)
+engine.set_context(WorkflowContext.from_dict(checkpoint.context))
+engine.set_limits(
+    LimitEnforcer.from_dict(
+        checkpoint.limits,
+        timeout_seconds=config.workflow.limits.timeout_seconds,
+        budget_usd=config.workflow.limits.budget_usd,
+        budget_mode=config.workflow.limits.budget_mode,
+    )
+)
+await engine.resume(checkpoint.current_agent, checkpoint=checkpoint)
+```
+
+The timeout and budget arguments to `LimitEnforcer.from_dict()` are required
+and come from the current workflow configuration.
+
+The root engine coordinates targeted release before finalizing its
 lease. An injected provider is not globally closed by that release; its caller
 owns the provider's eventual `close()`.
 

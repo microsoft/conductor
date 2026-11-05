@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import textwrap
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -15,7 +16,7 @@ import pytest
 
 import conductor.engine.bundle_prep as bundle_prep
 import conductor.engine.execution_resolution as resolution_module
-from conductor.bundle.collector import CollectedAgentDependencies
+from conductor.bundle.collector import CollectedAgentDependencies, CollectedBundle, _Collector
 from conductor.bundle.errors import BundleRootEscapeError, BundleUnfetchedError
 from conductor.bundle.model import BundleManifest
 from conductor.config.environment import (
@@ -23,17 +24,19 @@ from conductor.config.environment import (
     EnvironmentDocument,
     ProfileDefinition,
     ResolvedEnvironment,
+    builtin_local_environment,
 )
 from conductor.config.loader import load_config
-from conductor.engine.execution_resolution import ExecutionResolverSession
+from conductor.engine.checkpoint import CheckpointManager
+from conductor.engine.execution_resolution import ExecutionResolver, ExecutionResolverSession
 from conductor.engine.run_manifest import (
     BACKEND_CAPABILITY_PROVIDERS,
     WorkspacePolicy,
     compile_run_manifest,
 )
-from conductor.engine.workflow import WorkflowEngine
+from conductor.engine.workflow import RunContext, WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ConfigurationError
+from conductor.exceptions import CheckpointError, ConfigurationError, ExecutionError
 from conductor.execution import (
     BundleRef,
     CommandResult,
@@ -146,6 +149,229 @@ def _write_script_workflow(
 
 def _manifest(path: Path, environment: ResolvedEnvironment):
     return compile_run_manifest(load_config(path), workflow_path=path, environment=environment)
+
+
+def _observe_full_collections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Path, CollectedBundle]]:
+    """Observe the real operation and return its untouched result to every caller."""
+    observations: list[tuple[Path, CollectedBundle]] = []
+    original = _Collector.collect
+
+    def observed(collector: _Collector) -> CollectedBundle:
+        result = original(collector)
+        observations.append((collector.root_workflow, result))
+        return result
+
+    monkeypatch.setattr(_Collector, "collect", observed)
+    return observations
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+async def test_preflight_collects_once_through_compile_and_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, steps: int
+) -> None:
+    # Requirement: eligible step count must not multiply full closure collection or change topology.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    skill = tmp_path / "skills/guide"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: declared-guide\ndescription: Fixture.\n---\nBODY")
+    workflow = tmp_path / "flow.yaml"
+    workflow.write_text(
+        json.dumps(
+            {
+                "workflow": {
+                    "name": "once",
+                    "entry_point": "step0",
+                    "workspace": {"persistence": "durable"},
+                    "runtime": {"provider": "openai", "skills": ["./skills/guide"]},
+                },
+                "agents": [
+                    {"name": f"step{i}", "prompt": "fixture", "routes": [{"to": "$end"}]}
+                    for i in range(steps)
+                ],
+            }
+        )
+    )
+    observations = _observe_full_collections(monkeypatch)
+    environment = builtin_local_environment()
+    manifest = _manifest(workflow, environment)
+    topologies: list[tuple[CollectedAgentDependencies, ...]] = []
+
+    bundle = await bundle_prep.prepare_run_bundle(
+        manifest, workflow, environment, on_topology=topologies.append
+    )
+
+    assert bundle is not None
+    assert set(manifest.profiles) == {f"step{i}" for i in range(steps)}
+    assert len(observations) == 1
+    collected = observations[0][1]
+    assert topologies[0] is collected.agent_dependencies
+    assert json.loads((Path(bundle.store_path) / "bundle.json").read_text()) == (
+        collected.manifest.model_dump(mode="json")
+    )
+    assert collected.manifest.skills_topology == {"guide": "tree/skills/guide/SKILL.md"}
+    assert all(
+        selection.skills[0].frontmatter_name == "declared-guide" for selection in topologies[0]
+    )
+    print(f"standalone steps={steps} collections={len(observations)}")
+
+
+async def test_public_generations_recollect_once_and_refuse_changed_resume_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: generations are fresh, live-created cwd works, and changed source blocks resume.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    (tmp_path / "payload.txt").write_text("ORIGINAL")
+    workflow = tmp_path / "flow.yaml"
+    workflow.write_text(
+        json.dumps(
+            {
+                "workflow": {
+                    "name": "generations",
+                    "entry_point": "first",
+                    "workspace": {"persistence": "durable"},
+                    "bundle": {"assets": ["payload.txt"]},
+                },
+                "agents": [
+                    {
+                        "name": "first",
+                        "type": "script",
+                        "command": sys.executable,
+                        "args": [
+                            "-c",
+                            "from pathlib import Path; Path('created').mkdir(); "
+                            "Path('created/payload.txt').write_text(Path('payload.txt').read_text())",
+                        ],
+                        "routes": [{"to": "second"}],
+                    },
+                    {
+                        "name": "second",
+                        "type": "script",
+                        "command": sys.executable,
+                        "working_dir": "created",
+                        "args": [
+                            "-c",
+                            "from pathlib import Path; p=Path('attempt'); "
+                            "n=int(p.read_text()) if p.exists() else 0; "
+                            "p.write_text(str(n+1)); print(Path('payload.txt').read_text())",
+                        ],
+                        "routes": [{"to": "$end"}],
+                    },
+                ],
+                "output": {"result": "{{ second.output.stdout }}"},
+            }
+        )
+    )
+    observations = _observe_full_collections(monkeypatch)
+    engine = WorkflowEngine(
+        load_config(workflow),
+        workflow_path=workflow,
+        skip_gates=True,
+        run_context=RunContext(run_id="generation-fixture"),
+    )
+    constructor_count = len(observations)
+    observations.clear()
+    original_store = engine.context.store
+    fail_once = True
+
+    def store(name, value):
+        nonlocal fail_once
+        if name == "second" and fail_once:
+            fail_once = False
+            raise ExecutionError("fixture failure after real staged dispatch")
+        original_store(name, value)
+
+    monkeypatch.setattr(engine.context, "store", store)
+    with pytest.raises(ExecutionError):
+        await engine.run({})
+    first = len(observations)
+    assert engine._last_checkpoint_path is not None
+    checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+    observations.clear()
+
+    result = await engine.resume(checkpoint.current_agent, checkpoint=checkpoint)
+    second = len(observations)
+    assert "ORIGINAL" in result["result"]
+    observations.clear()
+    (tmp_path / "payload.txt").write_text("CHANGED_SOURCE")
+    with pytest.raises(CheckpointError, match="bundle_digest mismatch"):
+        await engine.resume(checkpoint.current_agent, checkpoint=checkpoint)
+    third = len(observations)
+
+    assert (constructor_count, first, second, third) == (1, 1, 1, 1)
+    print(f"constructor={constructor_count} generation_collections={[first, second, third]}")
+
+
+def test_late_child_gets_its_own_inherited_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: an unknown child cannot borrow the root's validated closure or retention grants.
+    root = _write_script_workflow(tmp_path / "root.yaml")
+    root.write_text(
+        root.read_text().replace(
+            "  entry_point: script", "  entry_point: script\n  workspace: {persistence: durable}"
+        )
+    )
+    session = ExecutionResolverSession(builtin_local_environment())
+    observations = _observe_full_collections(monkeypatch)
+    ExecutionResolver(load_config(root), session, workflow_path=root, publish_manifest=True)
+    observations.clear()
+    child = _write_script_workflow(tmp_path / "late.yaml")
+
+    manifest = ExecutionResolver(
+        load_config(child), session, workflow_path=child, publish_manifest=False
+    ).manifest
+
+    assert manifest.profiles["script"].backend == "local"
+    assert [path for path, _ in observations] == [child]
+    child.write_text(
+        "workflow: {name: late, entry_point: agent, runtime: {provider: hermes}}\n"
+        "agents:\n  - name: agent\n    prompt: fixture\n    routes: [{to: $end}]\n"
+    )
+    with pytest.raises(ConfigurationError, match="managed_local_workspace"):
+        ExecutionResolver(load_config(child), session, workflow_path=child, publish_manifest=False)
+
+
+async def test_failed_generation_preflight_does_not_recollect_for_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker_environment: ResolvedEnvironment
+) -> None:
+    # Requirement: unavailable closure fails once before publication, without retrying collection.
+    backend = StubBackend()
+    capabilities = backend.capabilities()
+    monkeypatch.setattr(
+        backend, "capabilities", lambda: replace(capabilities, retained_workspace=True)
+    )
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "docker", backend)
+    monkeypatch.setitem(resolution_module.BACKEND_FACTORIES, "docker", lambda: backend)
+    project = tmp_path / "project"
+    project.mkdir()
+    (tmp_path / "outside.txt").write_text("not authorized")
+    path = _write_script_workflow(project / "flow.yaml", profile="docker")
+    path.write_text(
+        path.read_text().replace(
+            "  entry_point: script",
+            "  entry_point: script\n  workspace: {persistence: durable}\n"
+            "  bundle: {assets: [../outside.txt]}",
+        )
+    )
+    attempts = []
+    original = _Collector.collect
+
+    def observed(collector):
+        attempts.append(collector.root_workflow)
+        return original(collector)
+
+    monkeypatch.setattr(_Collector, "collect", observed)
+    engine = WorkflowEngine(
+        load_config(path), workflow_path=path, execution_environment=docker_environment
+    )
+
+    with pytest.raises(BundleRootEscapeError):
+        await engine.run({})
+
+    assert attempts == [path]
+    assert backend.prepare_calls == []
 
 
 @pytest.mark.asyncio
@@ -591,6 +817,7 @@ async def test_concurrent_late_discovery_serializes_bundle_and_prepare(
         environment: ResolvedEnvironment,
         *,
         on_topology: Callable[[tuple[CollectedAgentDependencies, ...]], None] | None = None,
+        _preflight: resolution_module.RunPreflight | None = None,
     ) -> BundleRef:
         nonlocal calls
         del path, environment

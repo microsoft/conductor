@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from conductor import redaction
 from conductor.exceptions import ProviderError
 from conductor.execution.types import ManagedWorkspaceContext
 from conductor.providers import claude_agent_sdk as adapter
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 from tests.test_providers.managed_claude_sdk_fixture import native_harness
 
 pytestmark = [
@@ -111,36 +114,52 @@ async def test_native_cancelled_connect_uses_original_deadline_and_joins(
 async def test_native_disconnect_error_with_full_proof_is_visible_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Requirement: an API close error cannot erase complete OS and owner release proof.
+    # Requirement: close warnings scrub exception chains without erasing output or release proof.
     from claude_agent_sdk import ClaudeSDKClient
 
     original = ClaudeSDKClient.disconnect
-    failure = RuntimeError("native close returned an error after cleanup")
+    secret = "registered-native-close-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
 
     async def disconnect(client: ClaudeSDKClient) -> None:
         await original(client)
-        raise failure
+        _private_local = "unregistered-close-local-canary"
+        try:
+            raise PermissionError(13, "native cleanup denied", f"/private/{secret}")
+        except PermissionError as cause:
+            raise RuntimeError(f"native close failed: {secret}") from cause
 
     monkeypatch.setattr(ClaudeSDKClient, "disconnect", disconnect)
     async with native_harness(tmp_path / "warning", monkeypatch) as h:
+        h.controller.scrub = redactor.scrub
         provider = adapter.ClaudeAgentSdkProvider(auth_mode="subscription")
         output = await provider.execute(h.agent(), {}, "hello", managed_workspace=h.context)
         await provider.release_workspace(h.context.root)
         assert output.content == {"response": "fixture response"}
-        assert any(record.exc_info and record.exc_info[1] is failure for record in caplog.records)
+        records = [record for record in caplog.records if record.name == adapter.__name__]
+        formatted = "\n".join(logging.Formatter().format(record) for record in records)
+        assert secret not in formatted
+        assert REDACTED_MARKER in formatted and "PermissionError" in formatted
+        assert "RuntimeError" in formatted and "native cleanup denied" in formatted
+        assert "unregistered-close-local-canary" not in formatted
+        assert "Traceback" in formatted and all(record.exc_info is None for record in records)
         assert (await h.controller.await_release()).status == "released"
 
 
 @pytest.mark.parametrize("mode", ["success", "fail_connect"])
 async def test_native_unjoined_owner_is_bounded_and_late_success_cannot_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Requirement: native cleanup followed by a resistant owner is sticky uncertainty.
+    # Requirement: late cleanup keeps sticky uncertainty and redacts after ambient context reset.
     from claude_agent_sdk import ClaudeSDKClient
 
     original = ClaudeSDKClient.disconnect
     entered, release = asyncio.Event(), asyncio.Event()
     cancellations = [asyncio.Event(), asyncio.Event()]
+    secret = "registered-late-sdk-owner-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
 
     async def disconnect(client: ClaudeSDKClient) -> None:
         await original(client)
@@ -152,11 +171,14 @@ async def test_native_unjoined_owner_is_bounded_and_late_success_cannot_release(
             except asyncio.CancelledError:
                 cancellations[count].set()
                 count += 1
-        raise RuntimeError("late native owner error")
+        raise RuntimeError(f"late native owner error: {secret}")
 
     monkeypatch.setattr(ClaudeSDKClient, "disconnect", disconnect)
     async with native_harness(tmp_path / "owner", monkeypatch, mode) as h:
+        h.controller.scrub = redactor.scrub
+        token = redaction.set_current(redactor)
         provider = adapter.ClaudeAgentSdkProvider(auth_mode="subscription")
+        redaction.reset_current(token)
         task = asyncio.create_task(
             provider.execute(h.agent(), {}, "hello", managed_workspace=h.context)
         )
@@ -182,6 +204,11 @@ async def test_native_unjoined_owner_is_bounded_and_late_success_cannot_release(
                 await provider.release_workspace(h.context.root)
             release.set()
             await owner
+            records = [record for record in caplog.records if record.name == adapter.__name__]
+            formatted = "\n".join(logging.Formatter().format(record) for record in records)
+            assert secret not in formatted
+            assert REDACTED_MARKER in formatted and "late native owner error" in formatted
+            assert all(record.exc_info is None for record in records)
             with pytest.raises(ProviderError):
                 await provider.release_workspace(h.context.root)
             assert (await h.controller.await_release()).status == "unconfirmed"
