@@ -13,6 +13,8 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -453,6 +455,55 @@ class TestMCPManagerConnectServer:
             assert "web-search" in manager.tools
             assert manager.tool_to_server["web-search__search"] == "web-search"
             await manager.close()
+
+    async def test_managed_windows_preserves_declared_selector_and_overlay(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: managed Windows forwards declared context without ambient SDK resolution.
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
+        from conductor.mcp import manager as manager_module
+
+        controller = LocalProcessScopeController(str(tmp_path), "windows-routing")
+        manager = manager_module.MCPManager(
+            managed_workspace=ManagedWorkspaceContext(str(tmp_path), "windows-routing", controller)
+        )
+        transport = _TaskAffineMCP()
+        launches: list[ProcessLaunchSpec] = []
+
+        async def capture(_invocation: str, launch: ProcessLaunchSpec) -> ProcessLaunchSpec:
+            launches.append(launch)
+            return launch
+
+        monkeypatch.setattr(controller, "wrap_stdio", capture)
+        monkeypatch.setattr(manager_module, "sys", SimpleNamespace(platform="win32"))
+        with (
+            patch("mcp.client.stdio.get_default_environment", return_value={"PATH": r"C:\parent"}),
+            patch(
+                "mcp.os.win32.utilities.get_windows_executable_command",
+                return_value=r"C:\parent\npx.cmd",
+            ) as ambient_resolver,
+            patch.object(manager_module, "stdio_client", side_effect=transport.stdio),
+            patch.object(manager_module, "ClientSession", side_effect=transport.session),
+        ):
+            try:
+                await manager.connect_server(
+                    "fixture",
+                    "npx",
+                    ["-y", "@scope/pkg", ""],
+                    env={"Path": r"C:\declared", "MARKER": "overlay"},
+                    cwd=str(tmp_path),
+                )
+                (launch,) = launches
+                assert launch.argv == ("npx", "-y", "@scope/pkg", "")
+                assert dict(launch.env) == {"PATH": r"C:\declared", "MARKER": "overlay"}
+                assert launch.working_dir == str(tmp_path)
+                ambient_resolver.assert_not_called()
+            finally:
+                await manager.close(strict=True)
+                assert (await controller.close()).status == "released"
+                controller._accepting.join(timeout=3)
+                assert not controller._accepting.is_alive()
 
     async def test_connect_server_forwards_cwd(self, manager: Any) -> None:
         """Requirement: agent working_dir must reach the MCP server subprocess.

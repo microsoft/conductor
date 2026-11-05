@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -232,6 +233,127 @@ async def test_main_reads_staged_eager_bytes_after_source_removal(tmp_path, monk
         assert engine._execution_session.executed_backends() == {"local"}
 
 
+@pytest.mark.parametrize("provider_name", ["claude", "openai"])
+@pytest.mark.parametrize("plugin_path", [False, True])
+async def test_managed_eager_skill_preserves_distinct_frontmatter_identity(
+    tmp_path, monkeypatch, provider_name, plugin_path
+):
+    # Requirement: eager dispatch grants the selected basename while retaining its declared name.
+    from unittest.mock import AsyncMock
+
+    from pydantic_ai.messages import ModelMessagesTypeAdapter, UserPromptPart
+    from pydantic_ai.models.test import TestModel
+
+    from conductor.providers._pydantic_ai import agent_builder
+    from conductor.providers.claude import ClaudeProvider
+
+    entry = "./plugin/skills/local-guide" if plugin_path else "./skills/local-guide"
+
+    def source_files(source: Path) -> None:
+        directory = source / entry
+        write_skill(directory, "STAGED_BODY {{ literal_skill }}")
+        manifest = directory / "SKILL.md"
+        manifest.write_text(manifest.read_text().replace("name: local-guide", "name: acme-guide"))
+        if plugin_path:
+            (source / "plugin/.claude-plugin").mkdir()
+            (source / "plugin/.claude-plugin/plugin.json").write_text(
+                '{"name":"owner","mcpServers":{"unselected":{"command":"NEVER_RUN"}}}'
+            )
+            write_skill(source / "plugin/skills/sibling", "UNSELECTED_SIBLING")
+
+    flow = json.dumps(
+        {
+            "workflow": {
+                "name": "eager-identity",
+                "entry_point": "worker",
+                "runtime": {"provider": provider_name},
+            },
+            "agents": [
+                {
+                    "name": "worker",
+                    "prompt": "{{ '{{ literal_task }}' }}",
+                    "skills": [entry],
+                    "tools": [],
+                    "routes": [{"to": "$end"}],
+                }
+            ],
+        }
+    )
+    model = TestModel(custom_output_text="done")
+    monkeypatch.setattr(agent_builder, "_resolve_anthropic_model", lambda *a, **kw: model)
+    monkeypatch.setattr(agent_builder, "_resolve_openai_model", lambda *a, **kw: model)
+    async with prepared_agents(tmp_path, monkeypatch, flow=flow, setup_source=source_files) as (
+        engine,
+        _,
+    ):
+        provider_type = ClaudeProvider if provider_name == "claude" else OpenAIProvider
+        provider = provider_type(api_key="fixture-key", resolve_environment=False)
+        monkeypatch.setattr(provider, "get_max_prompt_tokens", AsyncMock(return_value=128_000))
+        monkeypatch.setattr(provider, "get_max_output_tokens", AsyncMock(return_value=4096))
+        engine._single_provider = provider
+        (tmp_path / "source").rename(tmp_path / "host-unavailable")
+        try:
+            output, _, realm, _ = await invocation(engine)
+            messages = ModelMessagesTypeAdapter.validate_python(output.continuation_state)
+            prompts = [
+                part.content
+                for message in messages
+                for part in message.parts
+                if isinstance(part, UserPromptPart)
+            ]
+            assert len(prompts) == 1 and isinstance(prompts[0], str)
+            prompt = prompts[0]
+            assert prompt.count('<skill name="local-guide">') == 1
+            assert "name: acme-guide" in prompt
+            assert "STAGED_BODY {{ literal_skill }}" in prompt
+            assert "STAGED_BODY {{ literal_skill }}_REFERENCE" in prompt
+            assert prompt.endswith("{{ literal_task }}")
+            assert "UNSELECTED_SIBLING" not in prompt
+            assert '<skill name="acme-guide">' not in prompt
+            assert realm.dependencies is not None and realm.binding is not None
+            (selected,) = realm.dependencies.skills
+            assert selected.name == "local-guide"
+            assert selected.frontmatter_name == "acme-guide"
+            assert selected.directory == "skills/local-guide"
+            assert selected.owner_root is None and realm.dependencies.plugins == ()
+            assert model.last_model_request_parameters is not None
+            assert model.last_model_request_parameters.function_tools == []
+        finally:
+            binding = engine._local_workspace_binding()
+            assert binding is not None
+            await provider.release_workspace(binding.runtime_context.root)
+            await provider.close()
+
+
+@pytest.mark.parametrize("provider_name", ["claude", "openai"])
+@pytest.mark.parametrize("replacement", ["one", "renamed"])
+async def test_managed_skill_rejects_frontmatter_drift_even_to_its_basename(
+    tmp_path, monkeypatch, provider_name, replacement
+):
+    # Requirement: collection freezes the declared name; changing it to the basename is still drift.
+    def source_files(source: Path) -> None:
+        manifest = source / "skills/one/SKILL.md"
+        manifest.write_text(manifest.read_text().replace("name: one", "name: original-declared"))
+
+    async with prepared_agents(
+        tmp_path,
+        monkeypatch,
+        flow=FLOW.replace("provider: openai", f"provider: {provider_name}"),
+        setup_source=source_files,
+    ) as (engine, provider):
+        binding = engine._local_workspace_binding()
+        assert binding is not None
+        manifest = Path(binding.work_root) / "skills/one/SKILL.md"
+        manifest.write_text(
+            manifest.read_text().replace("name: original-declared", f"name: {replacement}")
+        )
+        (tmp_path / "source").rename(tmp_path / "host-unavailable")
+
+        with pytest.raises(ConfigurationError, match="frozen name"):
+            await invocation(engine)
+        assert provider.calls == []
+
+
 async def test_same_incarnation_mutable_payload_is_fresh_without_host_cache_clear(
     tmp_path, monkeypatch
 ):
@@ -455,6 +577,157 @@ agents:
     plugins: [{name: ./plugin, skills: false, agents: false, mcp: false}]
     routes: [{to: $end}]
 """
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Native peers use Linux scope custody")
+@pytest.mark.parametrize("provider_name", ["claude-agent-sdk", "copilot"])
+@pytest.mark.parametrize("inline", [True, False])
+@pytest.mark.parametrize("off_first", [True, False])
+async def test_shared_plugin_mcp_switches_reach_native_provider_wire(
+    tmp_path, monkeypatch, provider_name, inline, off_first
+):
+    # Requirement: actual SDK sessions share one staged skill root without sharing MCP grants.
+    from conductor.providers import claude_agent_sdk as claude
+    from conductor.providers.copilot import CopilotProvider
+    from tests.test_providers.managed_claude_sdk_fixture import native_harness
+
+    def source_files(source: Path) -> None:
+        plugin = source / "plugin"
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        servers = {"fixture": {"command": "OPAQUE_EXEC", "args": ["/authored/raw"]}}
+        (plugin / ".claude-plugin/plugin.json").write_text(
+            json.dumps({"name": "toolkit", "mcpServers": servers if inline else "servers.json"})
+        )
+        (plugin / "servers.json").write_text(json.dumps({"mcpServers": servers}))
+        write_skill(plugin / "skills/task", "STAGED_PLUGIN")
+
+    agent_order = ("off", "on") if off_first else ("on", "off")
+    definitions = [
+        {
+            "name": name,
+            "prompt": "fixture",
+            "skills": [],
+            "plugins": [{"name": "./plugin", "mcp": name == "on"}],
+            **(
+                {"tools": ["fixture__lookup"] if name == "on" else ["view"]}
+                if provider_name == "copilot"
+                else {}
+            ),
+            "routes": [{"to": "$end"}],
+        }
+        for name in agent_order
+    ]
+    flow = json.dumps(
+        {
+            "workflow": {
+                "name": "shared-native-plugin",
+                "entry_point": definitions[0]["name"],
+                "runtime": {"provider": provider_name},
+            },
+            "agents": definitions,
+            **({"tools": ["fixture__lookup", "view"]} if provider_name == "copilot" else {}),
+        }
+    )
+    run = tmp_path / "run"
+    run.mkdir()
+    options = []
+    payloads = []
+    original_options = claude.ClaudeAgentOptions
+    original_write = claude._write_mcp_config
+
+    def capture_options(**kwargs):
+        option = original_options(**kwargs)
+        options.append(option)
+        return option
+
+    def capture_payload(servers):
+        path = original_write(servers)
+        payloads.append(json.loads(Path(path).read_text()))
+        return path
+
+    monkeypatch.setattr(claude, "ClaudeAgentOptions", capture_options)
+    monkeypatch.setattr(claude, "_write_mcp_config", capture_payload)
+    async with native_harness(tmp_path / "peer", monkeypatch) as peer:
+        receipt = tmp_path / "receipts"
+        receipt.mkdir()
+        fixture = tmp_path / "copilot-peer"
+        fixture.write_text(
+            f"#!{sys.executable}\n"
+            + Path(__file__)
+            .parents[1]
+            .joinpath("test_providers/managed_copilot_fixture.py")
+            .read_text()
+        )
+        fixture.chmod(0o700)
+        monkeypatch.setenv("COPILOT_CLI_PATH", str(fixture))
+        monkeypatch.setenv("COPILOT_FIXTURE_RECEIPT", str(receipt))
+        async with prepared_agents(
+            run, monkeypatch, native=True, flow=flow, setup_source=source_files
+        ) as (engine, _):
+            workflow_servers = {"workflow-only": {"type": "stdio", "command": "WF_OPAQUE"}}
+            provider = (
+                claude.ClaudeAgentSdkProvider(mcp_servers=workflow_servers)
+                if provider_name == "claude-agent-sdk"
+                else CopilotProvider(mcp_servers=workflow_servers, github_token="fixture-token")
+            )
+            engine._single_provider = provider
+            binding = engine._local_workspace_binding()
+            assert binding is not None
+            root = Path(binding.work_root) / "plugins/toolkit"
+            expected_skills = [str(root / "skills/task")]
+            (run / "source/plugin").rename(run / "retired-plugin")
+            original_agents = [agent.model_dump() for agent in engine.config.agents]
+            try:
+                for name in agent_order:
+                    await invocation(engine, name)
+                assert [agent.model_dump() for agent in engine.config.agents] == original_agents
+                if provider_name == "claude-agent-sdk":
+                    assert [o.plugins for o in options] == [
+                        [{"type": "local", "path": str(root)}],
+                        [{"type": "local", "path": str(root)}],
+                    ]
+                    assert all(o.strict_mcp_config and o.setting_sources == [] for o in options)
+                    assert all(o.skills == ["toolkit:task"] for o in options)
+                    for name, option, payload in zip(agent_order, options, payloads, strict=True):
+                        enabled = name == "on"
+                        assert set(payload["mcpServers"]) == (
+                            {"workflow-only", "fixture"} if enabled else {"workflow-only"}
+                        )
+                        assert set(option.allowed_tools) == (
+                            {"mcp__workflow-only__*", "mcp__fixture__*"}
+                            if enabled
+                            else {"mcp__workflow-only__*"}
+                        )
+                    main = [event for event in peer.events if event["event"] == "main"]
+                    assert len(main) == 2
+                    assert all("--strict-mcp-config" in event["argv"] for event in main)
+                    assert all(str(root) in event["argv"] for event in main)
+                else:
+                    wires = [
+                        json.loads(line)
+                        for path in receipt.glob("*.jsonl")
+                        for line in path.read_text().splitlines()
+                    ]
+                    creates = [
+                        wire["params"] for wire in wires if wire.get("method") == "session.create"
+                    ]
+                    assert len(creates) == 2
+                    by_name = {config["sessionId"]: config for config in creates}
+                    assert len(by_name) == 2
+                    for name in agent_order:
+                        config = by_name[provider.get_session_ids()[name]]
+                        assert config["skillDirectories"] == expected_skills
+                        assert "pluginDirectories" not in config
+                        assert not config.get("enableConfigDiscovery")
+                        assert set(config["mcpServers"]) == (
+                            {"workflow-only", "fixture"} if name == "on" else {"workflow-only"}
+                        )
+                        assert config["availableTools"] == (
+                            ["mcp:fixture-lookup"] if name == "on" else ["view"]
+                        )
+            finally:
+                await provider.release_workspace(binding.runtime_context.root)
+                await provider.close()
 
 
 async def test_full_plugin_and_private_skill_owner_do_not_share_authority(tmp_path, monkeypatch):

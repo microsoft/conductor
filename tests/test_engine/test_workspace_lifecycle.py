@@ -68,9 +68,9 @@ def _engine(
     *,
     persistence: Literal["durable", "on-failure"] = "durable",
     restart: Literal["rerun", "fail"] = "rerun",
+    command: str = "true",
 ) -> WorkflowEngine:
     path = tmp_path / "workflow.yaml"
-    path.write_text("workflow: test\n", encoding="utf-8")
     document = EnvironmentDocument(
         default="docker",
         profiles={
@@ -89,7 +89,7 @@ def _engine(
         agents=[
             ScriptStepDef(
                 name="script",
-                command="true",
+                command=command,
                 timeout=None,
                 execution=StepExecutionConfig(profile="docker"),
                 restart=RestartConfig(mode=restart),
@@ -97,6 +97,7 @@ def _engine(
             )
         ],
     )
+    path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     return WorkflowEngine(
         config,
         workflow_path=path,
@@ -163,6 +164,8 @@ def _docker_agent_engine(tmp_path: Path) -> WorkflowEngine:
         ),
         agents=agents,
     )
+    assert base.workflow_path is not None
+    base.workflow_path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     return WorkflowEngine(
         config,
         workflow_path=base.workflow_path,
@@ -285,6 +288,8 @@ async def test_agent_grader_and_retry_record_each_dispatch(
     agent = engine.config.agents[0]
     assert isinstance(agent, AgentDef)
     agent.validator = ValidatorConfig(criteria="The result must be complete.", max_retries=1)
+    assert engine.workflow_path is not None
+    engine.workflow_path.write_text(engine.config.model_dump_json(by_alias=True), encoding="utf-8")
     dispatch_records: list[int] = []
 
     async def stream(*args, **kwargs) -> AgentResult:
@@ -425,6 +430,8 @@ async def test_group_member_restart_fail_blocks_failure_resume(
                 }
             )
         ]
+    assert base.workflow_path is not None
+    base.workflow_path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     engine = WorkflowEngine(
         config,
         workflow_path=base.workflow_path,
@@ -461,6 +468,8 @@ async def test_periodic_group_checkpoint_skips_member_restart_policy(tmp_path: P
             }
         )
     ]
+    assert base.workflow_path is not None
+    base.workflow_path.write_text(base.config.model_dump_json(by_alias=True), encoding="utf-8")
     engine = WorkflowEngine(
         base.config,
         workflow_path=base.workflow_path,
@@ -591,6 +600,10 @@ def test_agent_attempt_event_field_requires_restart_and_retained_backend(tmp_pat
     original.config.workflow.entry_point = agent.name
     original.config.workflow.workspace = None
     original.config.agents = [agent]
+    assert original.workflow_path is not None
+    original.workflow_path.write_text(
+        original.config.model_dump_json(by_alias=True), encoding="utf-8"
+    )
     engine = WorkflowEngine(
         original.config,
         workflow_path=original.workflow_path,
@@ -633,9 +646,11 @@ async def test_subworkflow_view_inherits_root_retained_identity(tmp_path: Path) 
             )
         ],
     )
+    child_path = tmp_path / "child.yaml"
+    child_path.write_text(child_config.model_dump_json(by_alias=True), encoding="utf-8")
     child = WorkflowEngine(
         child_config,
-        workflow_path=root.workflow_path,
+        workflow_path=child_path,
         _subworkflow_depth=1,
         _execution_session=root._execution_session,
     )
@@ -653,7 +668,6 @@ async def test_subworkflow_view_inherits_root_retained_identity(tmp_path: Path) 
 async def test_legacy_agent_started_event_omits_attempt_id(tmp_path: Path) -> None:
     # Requirement: agent event payload stays byte-compatible without a retained restart contract.
     path = tmp_path / "legacy.yaml"
-    path.write_text("workflow: legacy\n", encoding="utf-8")
     agent = AgentDef(
         name="worker",
         model="gpt-4",
@@ -664,8 +678,12 @@ async def test_legacy_agent_started_event_omits_attempt_id(tmp_path: Path) -> No
     emitter = WorkflowEventEmitter()
     events: list[WorkflowEvent] = []
     emitter.subscribe(events.append)
+    config = WorkflowConfig(
+        workflow=WorkflowDef(name="legacy", entry_point="worker"), agents=[agent]
+    )
+    path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     engine = WorkflowEngine(
-        WorkflowConfig(workflow=WorkflowDef(name="legacy", entry_point="worker"), agents=[agent]),
+        config,
         CopilotProvider(mock_handler=lambda _agent, _prompt, _context: {"value": "ok"}),
         workflow_path=path,
         event_emitter=emitter,
@@ -921,6 +939,8 @@ async def test_plain_docker_run_has_no_attempt_id_or_mint(
     monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: backend)
     base = _engine(tmp_path)
     base.config.workflow.workspace = None
+    assert base.workflow_path is not None
+    base.workflow_path.write_text(base.config.model_dump_json(by_alias=True), encoding="utf-8")
     engine = WorkflowEngine(
         base.config,
         workflow_path=base.workflow_path,
@@ -950,8 +970,8 @@ async def test_template_failure_does_not_mark_docker_executed_before_first_comma
     backend.fail_command = False
     monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: backend)
     bundle = BundleRef("sha256:bundle", str(tmp_path))
-    engine = _engine(tmp_path, persistence="on-failure")
-    engine.config.agents[0].command = "{{ missing }}"
+    command = "{{ workflow.input.command }}"
+    engine = _engine(tmp_path, persistence="on-failure", command=command)
     with (
         patch(
             "conductor.engine.workflow.prepare_run_bundle",
@@ -970,7 +990,9 @@ async def test_template_failure_does_not_mark_docker_executed_before_first_comma
     assert checkpoint.workspace["executed_backends"] == []
     assert backend.volume is True and backend.marker is False
 
-    resumed = _engine(tmp_path, persistence="on-failure")
+    # Resume supplies the missing input without changing the recorded workflow source.
+    resumed = _engine(tmp_path, persistence="on-failure", command=command)
+    resumed.context.set_workflow_inputs({"command": "true"})
     with patch(
         "conductor.engine.workflow.prepare_run_bundle", new_callable=AsyncMock, return_value=bundle
     ):
@@ -983,7 +1005,6 @@ async def test_template_failure_does_not_mark_docker_executed_before_first_comma
 async def test_plain_workflow_failure_checkpoint_keeps_legacy_envelope(tmp_path: Path) -> None:
     # Requirement: without a workspace block, lifecycle fields are absent from file and event.
     path = tmp_path / "legacy.yaml"
-    path.write_text("workflow: legacy\n", encoding="utf-8")
     emitter = WorkflowEventEmitter()
     events: list[WorkflowEvent] = []
     emitter.subscribe(events.append)
@@ -991,6 +1012,7 @@ async def test_plain_workflow_failure_checkpoint_keeps_legacy_envelope(tmp_path:
         workflow=WorkflowDef(name="legacy", entry_point="script"),
         agents=[ScriptStepDef(name="script", command="{{ missing }}", timeout=None)],
     )
+    path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     engine = WorkflowEngine(config, workflow_path=path, event_emitter=emitter)
     with (
         patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),

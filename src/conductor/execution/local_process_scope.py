@@ -15,19 +15,25 @@ import math
 import os
 import select
 import shutil
+import stat
 import sys
 import sysconfig
 import threading
 import time
+import traceback
 import weakref
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from multiprocessing.reduction import recv_handle
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.local_windows_launch import (
+    merge_windows_environment,
+    prepare_windows_launch,
+)
 from conductor.execution.types import (
     CommandResult,
     CommandSpec,
@@ -39,6 +45,7 @@ from conductor.execution.types import (
 
 from .local_scope_launcher import (
     CHUNK,
+    Acceptor,
     Channel,
     Json,
     authenticate,
@@ -54,6 +61,145 @@ from .local_scope_launcher import (
 )
 
 _log = logging.getLogger(__name__)
+
+type _InstallationStage = Literal[
+    "preflight",
+    "active-fence",
+    "ipc-directory",
+    "directory-fd",
+    "listener-allocation",
+    "listener-permissions",
+    "thread-construction",
+    "thread-start",
+    "backend-assembly",
+    "registry-commit",
+    "admission-commit",
+]
+
+
+def _installation_warning(primary: BaseException, message: str) -> None:
+    """Report only caller-supplied fixed diagnostics, preserving the primary on sink failure."""
+    try:
+        _log.warning(message)
+    except BaseException:
+        # This installation boundary must also preserve cancellation from a failed sink.
+        BaseException.add_note(
+            primary, "Managed local installation diagnostic could not be delivered."
+        )
+
+
+@dataclass(slots=True)
+class _ControllerInstallation:
+    """Own startup acquisitions until backend commit, independently of its primary exception."""
+
+    stage: _InstallationStage = "preflight"
+    directory: Path | None = None
+    directory_identity: tuple[int, int] | None = None
+    directory_pending: bool = False
+    fd: int | None = None
+    fd_pending: bool = False
+    listener: Acceptor | None = None
+    listener_pending: bool = False
+    thread: threading.Thread | None = None
+    start_attempted: bool = False
+    entered: threading.Event = field(default_factory=threading.Event)
+    gate: threading.Event = field(default_factory=threading.Event)
+    aborted: bool = False
+    commit_started: bool = False
+    committed: bool = False
+    deadline: float | None = None
+    outcome: Literal["confirmed", "unconfirmed"] | None = None
+
+    def receive_listener(self, listener: Acceptor) -> None:
+        """Take the concrete resource before the factory can fail at chmod."""
+        self.listener = listener
+        self.listener_pending = False
+        self.stage = "listener-permissions"
+
+    def reject_listener_transfer(self) -> None:
+        """Keep an interrupted transfer unknown even when factory disposal was attempted."""
+        self.listener_pending = True
+
+    def bootstrap(self, accept: Callable[[], None]) -> None:
+        """Keep native acceptance and HELLO readers behind the registry commit."""
+        self.entered.set()
+        self.gate.wait()
+        if self.committed and not self.aborted:
+            accept()
+
+    def commit(self) -> None:
+        """Irreversibly transfer admission only after all backend mappings are published."""
+        self.stage = "admission-commit"
+        self.commit_started = True
+        self.committed = True
+        self.gate.set()
+
+    def abort(self, primary: BaseException) -> Literal["confirmed", "unconfirmed"]:
+        """Attempt concrete disposal once, within one absolute IPC-derived join budget."""
+        if self.outcome is not None:
+            return self.outcome
+        self.aborted = True
+        if self.commit_started:
+            self.outcome = "unconfirmed"
+            return self.outcome
+        limit = time.monotonic() + 1
+        self.deadline = min(self.deadline, limit) if self.deadline is not None else limit
+        confirmed = not (self.directory_pending or self.fd_pending or self.listener_pending)
+        try:
+            self.gate.set()
+        except BaseException:
+            confirmed = False
+            _installation_warning(primary, "Managed local installation abort gate failed.")
+        if self.start_attempted:
+            assert self.thread is not None
+            try:
+                self.thread.join(max(0, self.deadline - time.monotonic()))
+                if self.thread.is_alive() or not self.entered.is_set():
+                    confirmed = False
+            except BaseException:
+                # A failed start may still have started a native thread; absence is not proof.
+                confirmed = False
+                _installation_warning(
+                    primary, "Managed local installation thread join unconfirmed."
+                )
+        listener_closed = not self.listener_pending
+        if self.listener is not None and not self.listener_pending:
+            try:
+                self.listener.close()
+            except BaseException:
+                listener_closed = False
+                confirmed = False
+                _installation_warning(
+                    primary, "Managed local installation listener close unconfirmed."
+                )
+        fd_closed = not self.fd_pending and listener_closed
+        if self.fd is not None and fd_closed:
+            try:
+                os.close(self.fd)
+            except BaseException:
+                fd_closed = False
+                confirmed = False
+                _installation_warning(
+                    primary, "Managed local installation directory fd close unconfirmed."
+                )
+        if self.directory is not None and fd_closed and not self.directory_pending:
+            try:
+                info = self.directory.lstat()
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or (info.st_dev, info.st_ino) != self.directory_identity
+                ):
+                    raise ExecutionSpecError("Installation IPC directory identity changed")
+                self.directory.rmdir()
+            except BaseException:
+                confirmed = False
+                _installation_warning(primary, "Managed local installation IPC directory retained.")
+        self.outcome = "confirmed" if confirmed else "unconfirmed"
+        return self.outcome
+
+
+# Direct constructor failures have no backend lifetime to retain unknown native acquisitions.
+_failed_controller_installations: list[_ControllerInstallation] = []
 
 
 class Timer(Protocol):
@@ -94,7 +240,7 @@ class _Scope:
     scope_id: str
     invocation: str
     incarnation: str
-    launch: ProcessLaunchSpec = field(repr=False)
+    launch: ProcessLaunchSpec | None = field(repr=False)
     episode: _Episode = field(default_factory=_Episode)
     process: asyncio.subprocess.Process | None = None
     control: Channel | None = field(default=None, repr=False)
@@ -124,6 +270,33 @@ class _Scope:
     eof_received: asyncio.Event = field(default_factory=asyncio.Event)
     force_sent: asyncio.Event = field(default_factory=asyncio.Event)
     force_write: asyncio.Task[Json] | None = field(default=None, repr=False)
+    consumed: bool = False
+    retiring: bool = False
+
+    @property
+    def proof(self) -> ProcessProof:
+        return ProcessProof(
+            self.scope_id,
+            self.invocation,
+            self.incarnation,
+            self.kernel_empty,
+            self.drained,
+            self.facade_exited,
+            self.reaped,
+            self.done,
+            tuple(self.events),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RetiredScope:
+    """Immutable audit and terminal accounting without native or launch resources."""
+
+    proof: ProcessProof
+    result: ShutdownResult
+    deadline: float | None
+    code: int | None
+    error: StartError | None
 
 
 @dataclass(frozen=True)
@@ -231,6 +404,14 @@ class OwnerRegistry:
             if episode.deadline is not None
             and (episode.result is None or episode.result.status == "unconfirmed")
         ]
+        deadlines.extend(
+            record.deadline
+            for record in self.controller._history.values()
+            if record is not None
+            and record.deadline is not None
+            and record.result.status == "unconfirmed"
+            and (invocation_id is None or invocation_id == record.proof.invocation_id)
+        )
         return min(deadlines) if deadlines else None
 
     async def wait_terminal(self, invocation_id: str | None = None) -> ShutdownResult:
@@ -296,16 +477,21 @@ class LocalProcessScopeController:
         *,
         scrub: Callable[[str], str] = str,
         _scheduler: Scheduler | None = None,
+        _installation: _ControllerInstallation | None = None,
     ) -> None:
         self.root = Path(root)
         self.incarnation = incarnation
         self.scrub = scrub
-        self._loop = asyncio.get_running_loop()
+        self._loop, self._helper = self.preflight()
         self._clock = _scheduler or _LoopScheduler()
         self._root = _Episode()
         self._invocations: dict[str, _Episode] = {}
         self._launchers: dict[str, tuple[str, ProcessLaunchSpec]] = {}
         self._scopes: dict[str, _Scope] = {}
+        self._history: dict[str, _RetiredScope | None] = {}
+        self._processes: weakref.WeakKeyDictionary[asyncio.subprocess.Process, str] = (
+            weakref.WeakKeyDictionary()
+        )
         self._tasks: set[asyncio.Task[Json]] = set()
         self._writes: dict[asyncio.Task[Json], str] = {}
         self._send_tails: dict[Channel, threading.Event] = {}
@@ -314,28 +500,71 @@ class LocalProcessScopeController:
         self._connections_lock = threading.Lock()
         self._accept_finished = threading.Event()
         self._owners = OwnerRegistry(self)
-        self._helper = Path(sysconfig.get_path("scripts")) / (
+        self._nonce = os.urandom(32).hex()
+        installation = _installation if _installation is not None else _ControllerInstallation()
+        try:
+            # Avoid Unix sockaddr path limits even for deeply nested workspace roots.
+            if sys.platform == "win32":
+                self._endpoint = "\\\\.\\pipe\\conductor-scope-" + uuid4().hex
+            else:
+                ipc = self.root / (".scope-ipc-" + uuid4().hex)
+                installation.stage = "ipc-directory"
+                installation.directory_pending = True
+                ipc.mkdir(mode=0o700)
+                installation.directory = ipc
+                info = ipc.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_dev <= 0 or info.st_ino <= 0:
+                    raise ExecutionSpecError("Installation IPC directory identity is unavailable")
+                installation.directory_identity = (info.st_dev, info.st_ino)
+                installation.directory_pending = False
+                installation.stage = "directory-fd"
+                installation.fd_pending = True
+                self._ipc_fd = os.open(ipc, os.O_RDONLY | os.O_DIRECTORY)
+                installation.fd = self._ipc_fd
+                installation.fd_pending = False
+                self._endpoint = f"/proc/{os.getpid()}/fd/{self._ipc_fd}/control"
+            installation.stage = "listener-allocation"
+            installation.listener_pending = True
+            self._listener = private_listener(
+                self._endpoint,
+                register=installation.receive_listener,
+                transfer_failed=installation.reject_listener_transfer,
+            )
+            installation.stage = "thread-construction"
+            self._accepting = threading.Thread(
+                target=installation.bootstrap, args=(self._accept,), daemon=True
+            )
+            installation.thread = self._accepting
+            installation.stage = "thread-start"
+            installation.start_attempted = True
+            self._accepting.start()
+            if _installation is None:
+                installation.commit()
+        except BaseException as primary:
+            if _installation is None and installation.abort(primary) == "unconfirmed":
+                _failed_controller_installations.append(installation)
+                _installation_warning(
+                    primary,
+                    "Managed local controller installation cleanup unconfirmed; "
+                    "resources retained.",
+                )
+            raise
+
+    @staticmethod
+    def preflight() -> tuple[asyncio.AbstractEventLoop, Path]:
+        """Require the actual loop, installed executable and supported platform before staging."""
+        loop = asyncio.get_running_loop()
+        helper = Path(sysconfig.get_path("scripts")) / (
             "conductor-local-scope.exe" if sys.platform == "win32" else "conductor-local-scope"
         )
-        if not self._helper.is_file() or not os.access(self._helper, os.X_OK):
+        if not helper.is_file() or not os.access(helper, os.X_OK):
             raise ExecutionSpecError(
                 "Installed conductor-local-scope is required in this Python environment; "
                 "install conductor-cli into the active environment before managed local execution"
             )
         if sys.platform not in ("linux", "win32"):
             raise ExecutionSpecError("Managed local custody requires Linux or Windows")
-        self._nonce = os.urandom(32).hex()
-        # Avoid Unix sockaddr path limits even for deeply nested workspace roots.
-        if sys.platform == "win32":
-            self._endpoint = "\\\\.\\pipe\\conductor-scope-" + uuid4().hex
-        else:
-            ipc = self.root / (".scope-ipc-" + uuid4().hex)
-            ipc.mkdir(mode=0o700)
-            self._ipc_fd = os.open(ipc, os.O_RDONLY | os.O_DIRECTORY)
-            self._endpoint = f"/proc/{os.getpid()}/fd/{self._ipc_fd}/control"
-        self._listener = private_listener(self._endpoint)
-        self._accepting = threading.Thread(target=self._accept, daemon=True)
-        self._accepting.start()
+        return loop, helper
 
     def _task(
         self,
@@ -355,7 +584,17 @@ class LocalProcessScopeController:
         def finished(completed: asyncio.Task[Json]) -> None:
             self._tasks.discard(completed)
             _quarantine.get(self._loop, {}).pop(id(completed), None)
-            if not completed.cancelled() and completed.exception() is not None and fatal:
+            error = None if completed.cancelled() else completed.exception()
+            if error is not None and fatal:
+                context = (
+                    f"scope={scope.scope_id}, invocation={scope.invocation}"
+                    if scope is not None
+                    else "root scope"
+                )
+                _log.warning(
+                    "Managed process infrastructure failure: %s",
+                    self.scrub(f"{context}\n{''.join(traceback.format_exception(error))}"),
+                )
                 self._poison("Managed process infrastructure failure")
             if scope is not None:
                 if completed.cancelled():
@@ -461,10 +700,13 @@ class LocalProcessScopeController:
         protect(metadata, 0o400)
         return path
 
-    def register_launcher(self, invocation_id: str, launch: ProcessLaunchSpec) -> str:
+    def _admit_launch(self, invocation_id: str, launch: ProcessLaunchSpec) -> None:
         self._open(invocation_id)
         if not launch.argv or any(key.startswith("CONDUCTOR_LOCAL_SCOPE_") for key in launch.env):
             raise ExecutionSpecError("Empty argv or reserved local scope environment name")
+
+    def register_launcher(self, invocation_id: str, launch: ProcessLaunchSpec) -> str:
+        self._admit_launch(invocation_id, launch)
         launcher = uuid4().hex
         self._launchers[launcher] = (invocation_id, launch)
         return launcher
@@ -472,9 +714,16 @@ class LocalProcessScopeController:
     def register_process(self, invocation_id: str, process: asyncio.subprocess.Process) -> str:
         """Accept only controller-created custodians; arbitrary PIDs are not proof."""
         self._open(invocation_id)
-        for scope in self._scopes.values():
-            if scope.invocation == invocation_id and scope.process is process:
-                return scope.scope_id
+        scope_id = self._processes.get(process)
+        if scope_id is not None:
+            record = self._history[scope_id]
+            owner = (
+                record.proof.invocation_id
+                if record is not None
+                else self._scopes[scope_id].invocation
+            )
+            if owner == invocation_id:
+                return scope_id
         raise ExecutionSpecError("A managed process must be created by its custodian")
 
     async def wrap_stdio(self, invocation_id: str, launch: ProcessLaunchSpec) -> ProcessLaunchSpec:
@@ -492,18 +741,8 @@ class LocalProcessScopeController:
     @property
     def proofs(self) -> tuple[ProcessProof, ...]:
         return tuple(
-            ProcessProof(
-                scope.scope_id,
-                scope.invocation,
-                scope.incarnation,
-                scope.kernel_empty,
-                scope.drained,
-                scope.facade_exited,
-                scope.reaped,
-                scope.done,
-                tuple(scope.events),
-            )
-            for scope in self._scopes.values()
+            record.proof if record is not None else self._scopes[scope_id].proof
+            for scope_id, record in self._history.items()
         )
 
     def _accept(self) -> None:
@@ -540,11 +779,11 @@ class LocalProcessScopeController:
                 else:
                     handle = recv_handle(connection)
             if self._loop.is_closed():
-                connection.close()
+                self._disconnect(connection)
                 return
             self._loop.call_soon_threadsafe(self._received, connection, frame, handle)
         except (OSError, EOFError, ValueError, KeyError):
-            connection.close()
+            self._disconnect(connection)
             if handle is not None:
                 self._close_handle(handle)
             if attempted_launch and not self._loop.is_closed():
@@ -586,11 +825,11 @@ class LocalProcessScopeController:
                     scope.control = connection
                     scope.ready.set()
                 case "CLOSE":
-                    connection.close()
+                    self._disconnect(connection)
                 case _:
                     raise ValueError("Invalid registration")
         except (KeyError, ValueError, OSError, ExecutionSpecError):
-            connection.close()
+            self._disconnect(connection)
             if handle is not None:
                 self._close_handle(handle)
 
@@ -598,6 +837,7 @@ class LocalProcessScopeController:
         self._open(invocation)
         scope = _Scope(uuid4().hex, invocation, incarnation, launch)
         self._scopes[scope.scope_id] = scope
+        self._history[scope.scope_id] = None
         return scope
 
     @staticmethod
@@ -645,7 +885,10 @@ class LocalProcessScopeController:
             else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Terminal SIGINT must not end custody before controlled teardown and reaping.
+            start_new_session=sys.platform == "linux",
         )
+        self._processes[scope.process] = scope.scope_id
         reaped = self._task(self._reap(scope), scope=scope)
         ready = self._task(scope.ready.wait())
         done, _ = await asyncio.wait({ready, reaped}, return_when=asyncio.FIRST_COMPLETED)
@@ -654,13 +897,32 @@ class LocalProcessScopeController:
             self._poison("Custodian exited before registration")
             return
         control = scope.control
-        argv: list[Json] = list(scope.launch.argv)
-        env: dict[str, Json] = dict(scope.launch.env)
+        launch = scope.launch
+        assert launch is not None
+        if sys.platform == "win32" and scope.error is None:
+
+            def prepare(
+                target: ProcessLaunchSpec = launch,
+            ) -> tuple[ProcessLaunchSpec, StartError | None] | Exception:
+                try:
+                    return prepare_windows_launch(target)
+                except Exception as error:
+                    # Transport unexpected exceptions past _thread_call's narrow I/O catches.
+                    # Re-raise on the owned task; they are infrastructure failures, not refusals.
+                    return error
+
+            preparation = await _thread_call(prepare)
+            if isinstance(preparation, Exception):
+                raise preparation
+            launch, scope.error = preparation
+            scope.launch = launch
+        argv: list[Json] = list(launch.argv)
+        env: dict[str, Json] = dict(launch.env)
         configuration: dict[str, Json] = {
             "event": "CONFIGURE",
             "argv": argv,
             "env": env,
-            "cwd": scope.launch.working_dir,
+            "cwd": launch.working_dir,
         }
         await asyncio.shield(self._send(scope, control, configuration))
         acknowledgement = await _thread_call(lambda: receive_frame(control))
@@ -681,16 +943,22 @@ class LocalProcessScopeController:
                 scope.facade_handle, wait=False
             ):
                 raise ExecutionSpecError("Facade exited before GO")
-            if scope.on_dispatch is not None:
-                scope.on_dispatch()
-            self._open(scope.invocation)
-            await asyncio.shield(self._send(scope, control, {"event": "GO"}))
+            if scope.error is None:
+                if scope.on_dispatch is not None:
+                    scope.on_dispatch()
+                self._open(scope.invocation)
+                await asyncio.shield(self._send(scope, control, {"event": "GO"}))
         except (ExecutionSpecError, OSError):
             scope.rejected = True
+        else:
+            if scope.error is None:
+                scope.dispatched.set()
+        if not scope.dispatched.is_set():
+            if scope.error is not None:
+                _log.warning("Managed Windows launch refused: %s", self.scrub(scope.error.message))
+                self._start_episode(scope.episode, lambda: self._expire("Process cleanup deadline"))
             with contextlib.suppress(OSError):
                 await asyncio.shield(self._send(scope, control, {"event": "REJECTED"}))
-        else:
-            scope.dispatched.set()
         assert scope.process.stdout is not None and scope.process.stderr is not None
         outputs = [
             self._task(
@@ -700,9 +968,9 @@ class LocalProcessScopeController:
                 self._output(scope, scope.process.stderr, "stderr", scope.stderr), scope=scope
             ),
         ]
-        if scope.facade is not None and not scope.rejected:
+        if scope.facade is not None and scope.dispatched.is_set():
             self._task(self._input(scope), scope=scope)
-        elif scope.stdin is not None and not scope.rejected:
+        elif scope.stdin is not None and scope.dispatched.is_set():
             self._task(self._script_input(scope), scope=scope)
         try:
             while True:
@@ -790,6 +1058,8 @@ class LocalProcessScopeController:
                     )
                 )
             await _thread_call(lambda: self._disconnect(facade))
+            # Facade exit additionally proves its DATA output pumps consumed every frame.
+            scope.consumed = True
         scope.completed.set()
         self._check()
 
@@ -896,6 +1166,8 @@ class LocalProcessScopeController:
     async def force_stop(self, scope_ids: tuple[str, ...]) -> None:
         """Queue force requests without waiting for an unresponsive peer to read."""
         for scope_id in scope_ids:
+            if self._history[scope_id] is not None:
+                continue
             scope = self._scopes[scope_id]
             if (
                 scope.control is not None
@@ -943,16 +1215,36 @@ class LocalProcessScopeController:
                 and scope.facade_exited
                 and scope.completed.is_set()
                 and not scope.resources
+                and scope.consumed
+                and not scope.retiring
+                and not any(
+                    not entry.task.done() and entry.invocation == scope.invocation
+                    for entry in self.owners.tasks.values()
+                )
+                and scope.invocation not in self._writes.values()
             ):
-                self._terminal(scope.episode, ShutdownResult("released"))
+                # Root aggregators can await child release; the root barrier joins them separately.
+                scope.retiring = True
+                self._task(self._retire(scope))
         for invocation, episode in self._invocations.items():
             if (
                 episode.sealed
                 and episode.result is None
                 and all(
-                    scope.episode.result is not None and scope.episode.result.status == "released"
-                    for scope in self._scopes.values()
-                    if scope.invocation == invocation
+                    (
+                        result := record.result
+                        if record is not None
+                        else self._scopes[scope_id].episode.result
+                    )
+                    is not None
+                    and result.status == "released"
+                    for scope_id, record in self._history.items()
+                    if (
+                        record.proof.invocation_id
+                        if record is not None
+                        else self._scopes[scope_id].invocation
+                    )
+                    == invocation
                 )
                 and all(
                     entry.task.done()
@@ -962,6 +1254,18 @@ class LocalProcessScopeController:
                 and all(task.done() for task, owner in self._writes.items() if owner == invocation)
             ):
                 self._terminal(episode, ShutdownResult("released"))
+            if (
+                episode.sealed
+                and episode.result is not None
+                and not any(scope.invocation == invocation for scope in self._scopes.values())
+                and not any(
+                    not entry.task.done() and entry.invocation == invocation
+                    for entry in self.owners.tasks.values()
+                )
+            ):
+                for launcher, (owner, _launch) in tuple(self._launchers.items()):
+                    if owner == invocation:
+                        del self._launchers[launcher]
         if (
             self._root.sealed
             and self._root.result is None
@@ -973,6 +1277,33 @@ class LocalProcessScopeController:
             and all(task.done() for task in self._writes)
         ):
             self._terminal(self._root, ShutdownResult("released"))
+
+    async def _retire(self, scope: _Scope) -> None:
+        """Close only joined scope endpoints, then retain its immutable audit result."""
+        channels = tuple(
+            {
+                channel
+                for channel in (scope.control, scope.facade, *scope.channels.values())
+                if channel is not None
+            }
+        )
+
+        def close_channels() -> None:
+            for channel in channels:
+                self._disconnect(channel)
+
+        await _thread_call(close_channels)
+        self._terminal(scope.episode, ShutdownResult("released"))
+        assert scope.episode.result is not None
+        self._history[scope.scope_id] = _RetiredScope(
+            scope.proof, scope.episode.result, scope.episode.deadline, scope.code, scope.error
+        )
+        del self._scopes[scope.scope_id]
+        scope.process = scope.control = scope.facade = scope.launch = None
+        scope.channels.clear()
+        scope.stdout.clear()
+        scope.stderr.clear()
+        scope.stdin = scope.on_dispatch = scope.force_write = None
 
     async def await_release(self, invocation_id: str | None = None) -> ShutdownResult:
         """Observe the first teardown deadline, absorbing repeated cancellation."""
@@ -1006,14 +1337,29 @@ class LocalProcessScopeController:
             "PYTHONUTF8": "1",
             **spec.env,
         }
+        preparation_error: StartError | None = None
+        if sys.platform == "win32":
+            try:
+                inherited = merge_windows_environment(
+                    os.environ if spec.inherit_control_environment else {},
+                    {"PYTHONUTF8": "1"},
+                    canonical_names=("PYTHONUTF8",),
+                )
+                env = merge_windows_environment(
+                    inherited, spec.env, canonical_names=("PYTHONUTF8",)
+                )
+            except ExecutionSpecError as exc:
+                preparation_error = StartError("os_error", str(exc))
         command = spec.command
-        if os.path.isabs(command) or not any(
-            separator and separator in command for separator in (os.sep, os.altsep)
+        if sys.platform != "win32" and (
+            os.path.isabs(command)
+            or not any(separator and separator in command for separator in (os.sep, os.altsep))
         ):
             command = shutil.which(command, path=env.get("PATH")) or command
         launch = ProcessLaunchSpec((command, *spec.args), env, spec.working_dir or os.getcwd())
-        self.register_launcher(invocation_id, launch)
+        self._admit_launch(invocation_id, launch)
         scope = self._new_scope(invocation_id, launch, uuid4().hex)
+        scope.error = preparation_error
         scope.on_dispatch, scope.stdin = on_dispatch, spec.stdin
         self._task(self._run(scope), scope=scope)
         completed = asyncio.create_task(scope.completed.wait())
@@ -1044,6 +1390,8 @@ class LocalProcessScopeController:
                 raise asyncio.CancelledError
             if scope.rejected:
                 raise asyncio.CancelledError
+            assert scope.launch is not None
+            command = scope.launch.argv[0]
             duration = time.monotonic() - started
             if timed_out:
                 return CommandResult(
@@ -1072,6 +1420,8 @@ class LocalProcessScopeController:
                 duration_seconds=duration,
             )
         finally:
+            scope.consumed = True
+            self._check()
             completed.cancel()
             terminal.cancel()
 
@@ -1108,3 +1458,4 @@ class LocalProcessScopeController:
         with self._connections_lock:
             if not connection.closed:
                 disconnect(connection)
+            self._connections.discard(connection)

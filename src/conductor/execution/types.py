@@ -138,6 +138,9 @@ class ProcessScopeController(Protocol):
     permit a released result.
     """
 
+    scrub: Callable[[str], str]
+    """Retained run scrubber, available through the final owner diagnostic."""
+
     @property
     def owners(self) -> ProcessOwnerRegistry: ...
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
+import logging
 import os
 import signal
 import socket
@@ -23,6 +25,7 @@ from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.local_process_scope import LocalProcessScopeController
 from conductor.execution.local_scope_launcher import connect
 from conductor.execution.types import CommandSpec, ManagedWorkspaceContext, ProcessLaunchSpec
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 
 class ControlledTimer:
@@ -64,6 +67,81 @@ async def facade(wrapped: ProcessLaunchSpec, *args: str) -> asyncio.subprocess.P
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+
+async def _join_scope_task_callbacks(controller: LocalProcessScopeController) -> None:
+    """Join actual completion callbacks, including retirement admitted by previous owners."""
+    while controller._tasks or controller.owners.tasks:
+        owners = {
+            *tuple(controller._tasks),
+            *(entry.task for entry in tuple(controller.owners.tasks.values())),
+        }
+        callbacks: list[asyncio.Future[None]] = []
+        for owner in owners:
+            assert isinstance(owner, asyncio.Future)
+            finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            owner.add_done_callback(lambda _done, finished=finished: finished.set_result(None))
+            callbacks.append(finished)
+        await asyncio.gather(*callbacks)
+
+
+async def test_scope_callback_join_observes_done_and_transitive_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: queued product callbacks and their newly admitted owners must actually join.
+    controller = LocalProcessScopeController(str(tmp_path), "callback-order")
+    terminal = asyncio.Event()
+    external: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    controller.owners.register(None, external)
+    callbacks_seen: list[str] = []
+    children = []
+
+    async def first_owner() -> None:
+        terminal.set()
+        external.set_result(None)
+
+    async def second_owner() -> None:
+        return None
+
+    def admit_child(_done) -> None:
+        callbacks_seen.append("first")
+        child = controller._task(second_owner())
+        children.append(child)
+        child.add_done_callback(lambda _child: callbacks_seen.append("second"))
+
+    first = controller._task(first_owner())
+    first.add_done_callback(admit_child)
+    original_gather = asyncio.gather
+    eager_iterations = 0
+
+    def finite_gather(*owners, **kwargs):
+        nonlocal eager_iterations
+        if owners and all(owner.done() for owner in owners) and first in controller._tasks:
+            eager_iterations += 1
+            assert eager_iterations <= 3, "Join starved the queued product completion callback"
+        return original_gather(*owners, **kwargs)
+
+    monkeypatch.setattr(asyncio, "gather", finite_gather)
+    try:
+        await terminal.wait()
+        assert first.done() and first in controller._tasks
+        assert external.done() and controller.owners.tasks
+        await _join_scope_task_callbacks(controller)
+        assert callbacks_seen == ["first", "second"]
+        assert children and all(child.done() for child in children)
+        assert not controller._tasks and not controller.owners.tasks
+    finally:
+        # Preserve physical cleanup even if the finite starvation guard detects a regression.
+        joined: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        first.add_done_callback(lambda _done: joined.set_result(None))
+        await joined
+        for child in children:
+            completed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            child.add_done_callback(lambda _done, completed=completed: completed.set_result(None))
+            await completed
+        assert (await controller.close()).status == "released"
+        controller._accepting.join(timeout=3)
+        assert not controller._accepting.is_alive()
 
 
 async def test_script_preserves_bytes_argv_environment_and_cwd(tmp_path: Path) -> None:
@@ -334,6 +412,96 @@ async def test_reserved_environment_rejected_before_launch(tmp_path: Path) -> No
         assert controller.proofs == ()
     finally:
         await controller.close()
+
+
+@pytest.mark.parametrize("operation", ["descriptor", "spawn"])
+async def test_fatal_infrastructure_logs_scrubbed_cause_before_fencing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    # Requirement: infrastructure failures expose scrubbed causes, never payload exits or reuse.
+    secret = "registered-infrastructure-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
+    controller = LocalProcessScopeController(str(tmp_path), "inc", scrub=redactor.scrub)
+    descriptor = controller._descriptor
+    payload = tmp_path / "payload-started"
+
+    def fail() -> None:
+        try:
+            raise OSError(errno.ENOSPC, "descriptor storage exhausted", f"/private/{secret}")
+        except OSError as cause:
+            raise PermissionError(errno.EACCES, "custodian launch denied", secret) from cause
+
+    def failed_descriptor(directory: Path, role: str, **values: str) -> Path:
+        if role == "custodian":
+            fail()
+        return descriptor(directory, role, **values)
+
+    async def failed_spawn(*args: str, **kwargs: int | None) -> asyncio.subprocess.Process:
+        fail()
+        raise AssertionError("unreachable")
+
+    try:
+        if operation == "descriptor":
+            monkeypatch.setattr(controller, "_descriptor", failed_descriptor)
+        else:
+            monkeypatch.setattr(process_core.asyncio, "create_subprocess_exec", failed_spawn)
+        result = await asyncio.wait_for(
+            controller.spawn_script(
+                "diagnostic",
+                CommandSpec(
+                    sys.executable,
+                    ("-c", f"from pathlib import Path; Path({str(payload)!r}).touch()"),
+                ),
+            ),
+            10,
+        )
+        assert result.outcome == "start_failed" and result.exit_code is None
+        assert not payload.exists()
+        assert (await controller.await_release()).status == "unconfirmed"
+        with pytest.raises(ExecutionSpecError, match="sealed"):
+            controller.check_admission()
+        records = [record for record in caplog.records if record.name == process_core.__name__]
+        formatted = "\n".join(logging.Formatter().format(record) for record in records)
+        assert "PermissionError" in formatted and "OSError" in formatted
+        assert (
+            "descriptor storage exhausted" in formatted and "custodian launch denied" in formatted
+        )
+        assert secret not in formatted and REDACTED_MARKER in formatted
+        assert "diagnostic" in formatted and controller.proofs[0].scope_id in formatted
+        assert "Traceback" in formatted and all(record.exc_info is None for record in records)
+        assert not controller.owners.mutations_allowed("diagnostic")
+    finally:
+        await controller.close()
+        controller._accepting.join(timeout=5)
+        assert not controller._accepting.is_alive()
+
+
+async def test_nonfatal_infrastructure_failure_does_not_poison_or_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Requirement: expected nonfatal infrastructure errors do not become fatal diagnostics.
+    controller = LocalProcessScopeController(str(tmp_path), "inc")
+
+    async def peer_closed() -> None:
+        raise BrokenPipeError("expected peer close")
+
+    task = controller._task(peer_closed(), fatal=False)
+    observed = asyncio.Event()
+    task.add_done_callback(lambda _task: observed.set())
+    try:
+        await asyncio.wait_for(observed.wait(), 10)
+        assert isinstance(task.exception(), BrokenPipeError)
+        controller.check_admission()
+        assert not [record for record in caplog.records if record.name == process_core.__name__]
+        assert (await controller.await_release()).status == "released"
+    finally:
+        await controller.close()
+        controller._accepting.join(timeout=5)
+        assert not controller._accepting.is_alive()
 
 
 async def test_original_root_deadline_bounds_registry_owner(tmp_path: Path) -> None:
@@ -815,6 +983,8 @@ async def test_release_joins_output_producer_and_late_native_result_writer(
         await asyncio.wait_for(drain, 10)
         await asyncio.wait_for(producer_waiting.wait(), 10)
         scope = next(iter(controller._scopes.values()))
+        control = scope.control
+        assert control is not None
         await asyncio.wait_for(scope.facade_dead.wait(), 10)
         assert all(
             p.done
@@ -865,14 +1035,21 @@ async def test_release_joins_output_producer_and_late_native_result_writer(
         )
         for observed in joined:
             await asyncio.wait_for(observed.wait(), 10)
+        # Join retirement work admitted by those actual resource completion callbacks.
+        async with asyncio.timeout(10):
+            await _join_scope_task_callbacks(controller)
         assert all(task.done() and isinstance(task.exception(), OSError) for task in writers)
         assert (await release_task).status == ("unconfirmed" if expire else "released")
         assert not controller._writes and not controller._send_tails
-        assert controller.owners.quarantined == 0
+        assert controller.owners.quarantined == 0, [
+            repr(entry.owner)
+            for entry in process_core._quarantine.get(loop, {}).values()
+            if entry.controller is controller
+        ]
         assert not scope.resources
-        assert scope.control is not None
+        assert control.closed
         with pytest.raises(ExecutionSpecError):
-            controller._send(scope, scope.control, {"event": "RESULT", "code": 0})
+            controller._send(scope, control, {"event": "RESULT", "code": 0})
         if expire:
             assert not controller.owners.mutations_allowed("window")
     finally:
@@ -1247,8 +1424,501 @@ async def test_admission_uses_root_gate_without_changing_owner_mutation_rights(
         assert not controller._accepting.is_alive()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Exact native descriptor baseline")
+@pytest.mark.parametrize("wrapped", [False, True], ids=["script", "facade"])
+async def test_consumed_scopes_retire_resources_in_a_live_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapped: bool
+) -> None:
+    # Requirement: sequential consumed scopes release native resources without closing their root.
+    controller = LocalProcessScopeController(str(tmp_path), "retirement")
+    scopes = []
+    original = controller._new_scope
+
+    def created(*args):
+        scope = original(*args)
+        scopes.append(scope)
+        return scope
+
+    def descriptors() -> dict[int, str]:
+        result = {}
+        for path in Path("/proc/self/fd").iterdir():
+            with contextlib.suppress(FileNotFoundError):
+                result[int(path.name)] = os.readlink(path)
+        return result
+
+    monkeypatch.setattr(controller, "_new_scope", created)
+    baseline = descriptors()
+    threads = set(threading.enumerate())
+    launches = (
+        [
+            await controller.wrap_stdio(
+                family, ProcessLaunchSpec((sys.executable,), dict(os.environ), str(tmp_path))
+            )
+            for family in ("one", "two")
+        ]
+        if wrapped
+        else []
+    )
+    saved_proofs = ()
+    try:
+        for index in range(16):
+            output = f"{index}\x00" + "x" * 65536
+            code = (
+                f"import sys; sys.stdout.buffer.write({output.encode()!r}); "
+                "sys.stderr.buffer.write(b'exact\\x00stderr')"
+            )
+            if wrapped:
+                process = await facade(launches[index % 2], "-c", code)
+                stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
+                assert stdout == output.encode() and stderr == b"exact\x00stderr"
+                assert process.returncode == 0
+            else:
+                result = await controller.spawn_script(
+                    f"script-{index % 2}", CommandSpec(sys.executable, ("-c", code), stdin=b"")
+                )
+                assert result.stdout == output and result.stderr == "exact\x00stderr"
+                assert result.exit_code == 0
+            scope = scopes[-1]
+            await asyncio.wait_for(scope.episode.terminal.wait(), 10)
+            if controller._tasks:
+                await asyncio.wait_for(
+                    asyncio.gather(*tuple(controller._tasks), return_exceptions=True), 10
+                )
+            for thread in set(threading.enumerate()) - threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+            if index == 15:
+                print(
+                    "RETIREMENT",
+                    wrapped,
+                    len(baseline),
+                    len(descriptors()),
+                    len(controller._connections),
+                    sum(len(item.stdout) + len(item.stderr) for item in scopes),
+                )
+                assert descriptors() == baseline
+                assert not controller._connections
+                assert all(not item.stdout and not item.stderr for item in scopes)
+                assert all(item.stdin is None and item.process is None for item in scopes)
+                assert all(item.control is None and not item.channels for item in scopes)
+                assert not controller._scopes
+            assert controller.proofs[:-1] == saved_proofs
+            saved_proofs = controller.proofs
+            assert len(saved_proofs) == index + 1
+            assert all(p.kernel_empty and p.custodian_reaped for p in saved_proofs)
+            assert not controller._root.sealed
+        assert len(controller._launchers) == (2 if wrapped else 0)
+        await controller.force_stop(tuple(p.scope_id for p in controller.proofs))
+        assert (await controller.await_release()).status == "released"
+        assert controller.proofs == saved_proofs
+    finally:
+        await controller.close()
+        controller._accepting.join(timeout=5)
+        assert not controller._accepting.is_alive()
+
+
+async def test_retirement_waits_for_script_consumption_and_owner_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: native proof alone cannot discard unconsumed bytes or an unjoined owner.
+    controller = LocalProcessScopeController(str(tmp_path), "consumption")
+    paused, consume = asyncio.Event(), asyncio.Event()
+    original = asyncio.wait
+    owner: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    controller.owners.register("script", owner)
+    command = None
+
+    async def wait(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if asyncio.current_task() is command:
+            paused.set()
+            await consume.wait()
+        return result
+
+    monkeypatch.setattr(asyncio, "wait", wait)
+    command = asyncio.create_task(
+        controller.spawn_script(
+            "script", CommandSpec(sys.executable, ("-c", "print('unconsumed')"), stdin=b"")
+        )
+    )
+    try:
+        await asyncio.wait_for(paused.wait(), 10)
+        scope = next(iter(controller._scopes.values()))
+        assert scope.done and scope.reaped
+        assert scope.stdout == b"unconsumed\n" and scope.control is not None
+        assert not scope.control.closed
+        consume.set()
+        assert (await asyncio.wait_for(command, 10)).stdout == "unconsumed\n"
+        assert scope.scope_id in controller._scopes and not scope.control.closed
+        owner.set_result(None)
+        await asyncio.wait_for(scope.episode.terminal.wait(), 10)
+        if controller._tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*tuple(controller._tasks), return_exceptions=True), 10
+            )
+        assert scope.scope_id not in controller._scopes
+        assert not scope.stdout and scope.control is None
+    finally:
+        consume.set()
+        if not owner.done():
+            owner.set_result(None)
+        await command
+        await controller.close()
+
+
+async def test_retirement_preserves_unconsumed_facade_bytes_and_reader_owner(
+    tmp_path: Path,
+) -> None:
+    # Requirement: facade exit cannot retire channels before its registered reader consumes EOF.
+    controller = LocalProcessScopeController(str(tmp_path), "reader")
+    reader: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    controller.owners.register("sdk", reader)
+    launch = await controller.wrap_stdio(
+        "sdk",
+        ProcessLaunchSpec(
+            (
+                sys.executable,
+                "-c",
+                "import sys; sys.stdin.buffer.read(); "
+                "sys.stdout.buffer.write(b'not-yet-consumed\\x00'); "
+                "sys.stderr.buffer.write(b'last-stderr')",
+            ),
+            dict(os.environ),
+            str(tmp_path),
+        ),
+    )
+    process = await facade(launch)
+    assert process.stdin is not None
+    process.stdin.close()
+    try:
+        await asyncio.wait_for(process.wait(), 10)
+        scope = next(iter(controller._scopes.values()))
+        await asyncio.wait_for(scope.completed.wait(), 10)
+        assert scope.done and scope.reaped and scope.scope_id in controller._scopes
+        assert scope.control is not None and not scope.control.closed
+        assert process.stdout is not None and process.stderr is not None
+        assert await process.stdout.read() == b"not-yet-consumed\x00"
+        assert await process.stderr.read() == b"last-stderr"
+        assert process.stdout.at_eof() and process.stderr.at_eof()
+        assert scope.scope_id in controller._scopes
+        reader.set_result(None)
+        await asyncio.wait_for(scope.episode.terminal.wait(), 10)
+        assert scope.scope_id not in controller._scopes
+        assert process.stdout.at_eof() and process.stderr.at_eof()
+        assert (await controller.await_release()).status == "released"
+    finally:
+        if not reader.done():
+            reader.set_result(None)
+        await controller.close()
+        await process.communicate()
+
+
+async def _terminal_sigint_worker(root: Path) -> None:
+    """Own a controlling terminal and reap only this worker's test descendants."""
+    import ctypes
+    import select
+
+    # The supervisor must also recover descendants when the unfixed custodian dies.
+    assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+
+    def descriptors() -> dict[int, str]:
+        snapshot = {}
+        for path in Path("/proc/self/fd").iterdir():
+            with contextlib.suppress(FileNotFoundError):
+                snapshot[int(path.name)] = os.readlink(path)
+        return snapshot
+
+    baseline_fds, baseline_threads = descriptors(), set(threading.enumerate())
+    fifo = root / "ready"
+    os.mkfifo(fifo)
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    loop = asyncio.get_running_loop()
+    ready: asyncio.Future[bytes] = loop.create_future()
+
+    def readable() -> None:
+        data = os.read(reader, 4096)
+        if data:
+            loop.remove_reader(reader)
+            ready.set_result(data)
+
+    loop.add_reader(reader, readable)
+    payload = (
+        "import json,os,signal,sys\n"
+        "parent=os.getpid()\n"
+        "if os.fork()==0:\n"
+        " os.setsid()\n"
+        " null=os.open(os.devnull,os.O_RDWR)\n"
+        " for fd in (0,1,2): os.dup2(null,fd)\n"
+        f" with open({str(root / 'descendant-write')!r},'wb') as output:\n"
+        "  output.write(b'owned descendant'); output.flush()\n"
+        f"  with open({str(fifo)!r},'w') as channel:\n"
+        "   json.dump({'payload':parent,'descendant':os.getpid(),"
+        "'sigint_default':signal.getsignal(signal.SIGINT)==signal.default_int_handler},channel)\n"
+        "  signal.pause()\n"
+        "signal.pause()\n"
+    )
+    controller = LocalProcessScopeController(str(root), "terminal")
+    command = asyncio.create_task(
+        controller.spawn_script("terminal", CommandSpec(sys.executable, ("-c", payload), stdin=b""))
+    )
+    controller.owners.register("terminal", command)
+    handles: list[int] = []
+    receipt = {}
+    try:
+        family = json.loads(await asyncio.wait_for(ready, 10))
+        scope = next(iter(controller._scopes.values()))
+        assert scope.process is not None
+        for pid in (scope.process.pid, family["payload"], family["descendant"]):
+            handles.append(os.pidfd_open(pid))
+        receipt = {
+            "parent": os.getpid(),
+            "foreground": os.tcgetpgrp(0),
+            "parent_group": os.getpgrp(),
+            "custodian_group": os.getpgid(scope.process.pid),
+            "custodian": scope.process.pid,
+            "payload_group": os.getpgid(family["payload"]),
+            "descendant_group": os.getpgid(family["descendant"]),
+            **family,
+        }
+        print("READY " + json.dumps(receipt), flush=True)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            receipt["parent_cancelled"] = True
+            controller.begin_teardown()
+            deadline = controller._root.deadline
+            command.cancel()
+            try:
+                await asyncio.shield(command)
+            except asyncio.CancelledError:
+                receipt["command_cancelled"] = True
+            proof = await controller.await_release()
+            controller.begin_teardown(deadline=loop.time() + 100)
+            receipt.update(
+                status=proof.status,
+                original_deadline=deadline,
+                final_deadline=controller._root.deadline,
+                started=controller._root.started,
+                proof_complete=all(
+                    p.kernel_empty and p.streams_drained and p.custodian_reaped and p.done
+                    for p in controller.proofs
+                ),
+                descendant_dead_before_cleanup=bool(select.select([handles[-1]], [], [], 0)[0]),
+            )
+    finally:
+        # Stable handles never select unrelated processes, even on a failing RED run.
+        kills = 0
+        for handle in handles:
+            if not select.select([handle], [], [], 0)[0]:
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(handle, signal.SIGKILL)
+                    kills += 1
+        await controller.close()
+        if controller._tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*tuple(controller._tasks), return_exceptions=True), 5
+            )
+        if not command.done():
+            command.cancel()
+        await asyncio.wait({command}, timeout=5)
+        for handle in handles:
+            exited: asyncio.Future[None] = loop.create_future()
+            loop.add_reader(handle, lambda event=exited: event.done() or event.set_result(None))
+            try:
+                await asyncio.wait_for(exited, 5)
+            finally:
+                loop.remove_reader(handle)
+                os.close(handle)
+        while True:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            assert pid > 0, "An owned child is still running after its pidfd reported exit"
+        loop.remove_reader(reader)
+        os.close(reader)
+        for thread in set(threading.enumerate()) - baseline_threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert descriptors() == baseline_fds
+        assert set(threading.enumerate()) == baseline_threads
+        assert not controller._tasks and not controller._writes and not controller._connections
+        assert not controller.owners.tasks and not controller.owners.quarantined
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+        receipt.update(fallback_kills=kills, owned_fds=0, owned_threads=0, owned_tasks=0)
+        print("RESULT " + json.dumps(receipt), flush=True)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Native Linux controlling PTY and pidfd custody"
+)
+async def test_terminal_sigint_cancels_parent_without_destroying_custody(tmp_path: Path) -> None:
+    # Requirement: terminal Ctrl+C cancels the parent; custody reaps detached setsid children.
+    import pty
+
+    master, slave = pty.openpty()
+    worker = await asyncio.create_subprocess_exec(
+        sys.executable,
+        __file__,
+        str(tmp_path),
+        "terminal-sigint",
+        stdin=slave,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    os.close(slave)
+    try:
+        assert worker.stdout is not None
+        ready = await asyncio.wait_for(worker.stdout.readline(), 10)
+        assert ready.startswith(b"READY "), ready
+        family = json.loads(ready.removeprefix(b"READY "))
+        assert family["parent"] == worker.pid
+        assert family["foreground"] == family["parent_group"] == worker.pid
+        assert family["parent_group"] != os.getpgrp()
+        os.write(master, b"\x03")
+        output, error = await asyncio.wait_for(worker.communicate(), 15)
+        assert worker.returncode == 0, (output, error)
+        print(ready.decode().strip(), output.decode().strip())
+        result = json.loads(output.removeprefix(b"RESULT "))
+        assert result["parent_cancelled"] and result["command_cancelled"]
+        assert result["status"] == "released", (result, error.decode())
+        assert result["proof_complete"] and result["descendant_dead_before_cleanup"]
+        assert result["custodian_group"] == result["payload_group"] == result["custodian"]
+        assert result["custodian_group"] != result["parent_group"]
+        assert result["descendant_group"] == result["descendant"]
+        assert result["sigint_default"]
+        assert result["original_deadline"] == result["final_deadline"]
+        assert result["original_deadline"] - result["started"] == 30
+        assert result["fallback_kills"] == 0
+        assert result["owned_fds"] == result["owned_threads"] == result["owned_tasks"] == 0
+    finally:
+        if worker.returncode is None:
+            os.write(master, b"\x03")
+            await asyncio.wait_for(worker.communicate(), 15)
+        os.close(master)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Native Linux default payload SIGINT")
+async def test_managed_payload_keeps_default_sigint_behavior(tmp_path: Path) -> None:
+    # Requirement: isolating custody must not make payloads inherit SIG_IGN.
+    controller = LocalProcessScopeController(str(tmp_path), "payload-signal")
+    try:
+        result = await controller.spawn_script(
+            "payload",
+            CommandSpec(
+                sys.executable,
+                (
+                    "-c",
+                    "import os,signal; "
+                    "assert signal.getsignal(signal.SIGINT)==signal.default_int_handler; "
+                    "os.kill(os.getpid(),signal.SIGINT)",
+                ),
+                stdin=b"",
+            ),
+        )
+        assert result.exit_code == -signal.SIGINT
+        assert (await controller.await_release()).status == "released"
+        assert controller.proofs[0].kernel_empty and controller.proofs[0].custodian_reaped
+    finally:
+        await controller.close()
+
+
 if __name__ == "__main__":
     if sys.argv[2] in ("signal-overlap", "signal-control"):
         _signal_wakeup_worker(sys.argv[2] == "signal-overlap")
+    elif sys.argv[2] == "terminal-sigint":
+        import fcntl
+        import termios
+
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        os.tcsetpgrp(0, os.getpgrp())
+        asyncio.run(_terminal_sigint_worker(Path(sys.argv[1])))
     else:
         asyncio.run(_saturated_control_worker(Path(sys.argv[1]), sys.argv[2]))
+
+
+def _installation_descriptor_identities() -> dict[int, tuple[int, int]]:
+    result = {}
+    for path in list(Path("/proc/self/fd").iterdir()):
+        fd = int(path.name)
+        try:
+            info = os.fstat(fd)
+        except OSError as error:
+            assert error.errno == errno.EBADF
+            continue
+        result[fd] = (info.st_dev, info.st_ino)
+    return result
+
+
+def test_controller_preflight_requires_actual_running_loop_before_allocation(
+    tmp_path: Path,
+) -> None:
+    # Requirement: direct callers outside a running loop allocate no controller resources.
+    root = tmp_path / "not-created"
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        LocalProcessScopeController(str(root), "no-loop")
+    assert not root.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux procfs FD/thread identity")
+async def test_direct_constructor_chmod_failure_closes_actual_listener_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: default construction owns permissions-failure cleanup without a backend.
+    before = _installation_descriptor_identities()
+    sentinel = tmp_path / "user-data"
+    sentinel.write_bytes(b"keep")
+    original_factory = process_core.private_listener
+    original_chmod = os.chmod
+    captured = []
+    primary = PermissionError(errno.EACCES, "permissions primary", "private filename")
+
+    def factory(address, *, register, transfer_failed):
+        owner = getattr(register, "__self__", None)
+        assert isinstance(owner, process_core._ControllerInstallation)
+        captured.append(owner)
+        return original_factory(address, register=register, transfer_failed=transfer_failed)
+
+    def denied(path, *args, **kwargs):
+        if str(path).startswith("/proc/") and str(path).endswith("/control"):
+            raise primary
+        return original_chmod(path, *args, **kwargs)
+
+    monkeypatch.setattr(process_core, "private_listener", factory)
+    monkeypatch.setattr(os, "chmod", denied)
+    with pytest.raises(PermissionError) as caught:
+        LocalProcessScopeController(str(tmp_path), "direct-failure")
+    assert caught.value is primary and primary.__traceback__ is not None
+    assert captured[0].outcome == "confirmed"
+    assert captured[0].directory is not None and not captured[0].directory.exists()
+    assert _installation_descriptor_identities() == before
+    assert sentinel.read_bytes() == b"keep"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux procfs FD/thread identity")
+async def test_uncommitted_bootstrap_thread_never_enters_native_accept(tmp_path: Path) -> None:
+    # Requirement: real startup threads wait for commit and abort without accepting or HELLO.
+    before = _installation_descriptor_identities()
+    owner = process_core._ControllerInstallation()
+    controller = LocalProcessScopeController(str(tmp_path), "bootstrap", _installation=owner)
+    primary = RuntimeError("abort uncommitted controller")
+    try:
+        assert owner.entered.wait(1) and not owner.gate.is_set()
+        assert owner.thread is not None and owner.thread.ident is not None
+        assert owner.thread.native_id is not None
+        frame = sys._current_frames()[owner.thread.ident]
+        frames = []
+        while frame is not None:
+            frames.append(frame.f_code.co_name)
+            frame = frame.f_back
+        assert "bootstrap" in frames and "_accept" not in frames
+        assert not controller._connections and not controller._tasks and not controller.proofs
+    finally:
+        controller._closed = True
+        with connect({"endpoint": controller._endpoint}, authenticate=False):
+            pass
+        assert owner.abort(primary) == "confirmed"
+    assert owner.thread is not None and not owner.thread.is_alive()
+    assert not Path(f"/proc/self/task/{owner.thread.native_id}").exists()
+    assert _installation_descriptor_identities() == before

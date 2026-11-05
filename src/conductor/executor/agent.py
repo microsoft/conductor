@@ -1021,7 +1021,7 @@ class AgentExecutor:
             for selected in self._managed_dependencies.skills:
                 directory = self._managed_directory(selected.directory)
                 manifest = read_skill_frontmatter(directory)
-                if manifest.name != selected.name or directory.name != selected.name:
+                if manifest.name != selected.frontmatter_name or directory.name != selected.name:
                     raise ConfigurationError("Managed skill no longer matches its frozen name.")
                 if self._plugin_root:
                     owner = (

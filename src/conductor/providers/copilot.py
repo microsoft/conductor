@@ -17,6 +17,7 @@ import random
 import subprocess
 import threading
 import time
+import traceback
 from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from uuid import uuid4
 
 from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
+from conductor.execution.errors import ExecutionSpecError
 from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
 from conductor.executor.output import validate_output
 from conductor.providers._event_format import (
@@ -984,23 +986,6 @@ class CopilotProvider(AgentProvider):
         Raises:
             ProviderError: If execution fails after all retry attempts.
         """
-        if managed_workspace is not None:
-            return await self._managed_call(
-                managed_workspace,
-                agent.working_dir,
-                lambda: self.execute(
-                    agent,
-                    context,
-                    rendered_prompt,
-                    tools=tools,
-                    interrupt_signal=interrupt_signal,
-                    event_callback=event_callback,
-                    skill_directories=skill_directories,
-                    custom_agents=custom_agents,
-                    extra_mcp_servers=extra_mcp_servers,
-                    suppress_mcp_servers=suppress_mcp_servers,
-                ),
-            )
         del continuation_state  # No continuation surface (see docstring).
         # Record the call for testing purposes
         self._call_history.append(
@@ -1029,6 +1014,7 @@ class CopilotProvider(AgentProvider):
             custom_agents=custom_agents,
             extra_mcp_servers=extra_mcp_servers,
             suppress_mcp_servers=suppress_mcp_servers,
+            managed_workspace=managed_workspace,
         )
 
     def _resolve_retry_config(self, agent: AgentDef) -> RetryConfig:
@@ -1079,6 +1065,7 @@ class CopilotProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -1108,61 +1095,75 @@ class CopilotProvider(AgentProvider):
         last_error: Exception | None = None
         config = self._resolve_retry_config(agent)
 
+        attempt_started = False
+
+        async def execute_attempt() -> AgentOutput:
+            nonlocal attempt_started
+            attempt_started = True
+            content, sdk_response = await self._execute_sdk_call(
+                agent,
+                rendered_prompt,
+                context,
+                tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                retry_config=config,
+                skill_directories=skill_directories,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+                suppress_mcp_servers=suppress_mcp_servers,
+            )
+            self._check_managed_mutations()
+            # A successful SDK call resets the consecutive-restart budget
+            # (issue #483, Q2): the counter only bounds a death loop where
+            # the runtime dies again before ever succeeding, not restarts
+            # spread across a long, otherwise-healthy run.
+            self._consecutive_runtime_restarts = 0
+            # Extract usage data from SDK response if available
+            input_tokens = sdk_response.input_tokens if sdk_response else None
+            output_tokens = sdk_response.output_tokens if sdk_response else None
+            cache_read = sdk_response.cache_read_tokens if sdk_response else None
+            cache_write = sdk_response.cache_write_tokens if sdk_response else None
+            last_call_input_tokens = sdk_response.last_call_input_tokens if sdk_response else None
+            tokens_used = None
+            if input_tokens is not None and output_tokens is not None:
+                tokens_used = input_tokens + output_tokens
+
+            # Detect partial result from mid-agent interrupt
+            is_partial = sdk_response.partial if sdk_response else False
+
+            return AgentOutput(
+                content=content,
+                raw_response=json.dumps(content),
+                tokens_used=tokens_used,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                last_call_input_tokens=last_call_input_tokens,
+                model=(
+                    sdk_response.resolved_model
+                    if sdk_response and agent.model in (None, "auto")
+                    else None
+                )
+                or agent.model
+                or self._default_model,
+                partial=is_partial,
+            )
+
         for attempt in range(1, config.max_attempts + 1):
+            attempt_started = False
             try:
-                content, sdk_response = await self._execute_sdk_call(
-                    agent,
-                    rendered_prompt,
-                    context,
-                    tools,
-                    interrupt_signal=interrupt_signal,
-                    event_callback=event_callback,
-                    retry_config=config,
-                    skill_directories=skill_directories,
-                    custom_agents=custom_agents,
-                    extra_mcp_servers=extra_mcp_servers,
-                    suppress_mcp_servers=suppress_mcp_servers,
-                )
-                self._check_managed_mutations()
-                # A successful SDK call resets the consecutive-restart budget
-                # (issue #483, Q2): the counter only bounds a death loop where
-                # the runtime dies again before ever succeeding, not restarts
-                # spread across a long, otherwise-healthy run.
-                self._consecutive_runtime_restarts = 0
-                # Extract usage data from SDK response if available
-                input_tokens = sdk_response.input_tokens if sdk_response else None
-                output_tokens = sdk_response.output_tokens if sdk_response else None
-                cache_read = sdk_response.cache_read_tokens if sdk_response else None
-                cache_write = sdk_response.cache_write_tokens if sdk_response else None
-                last_call_input_tokens = (
-                    sdk_response.last_call_input_tokens if sdk_response else None
-                )
-                tokens_used = None
-                if input_tokens is not None and output_tokens is not None:
-                    tokens_used = input_tokens + output_tokens
-
-                # Detect partial result from mid-agent interrupt
-                is_partial = sdk_response.partial if sdk_response else False
-
-                return AgentOutput(
-                    content=content,
-                    raw_response=json.dumps(content),
-                    tokens_used=tokens_used,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read,
-                    cache_write_tokens=cache_write,
-                    last_call_input_tokens=last_call_input_tokens,
-                    model=(
-                        sdk_response.resolved_model
-                        if sdk_response and agent.model in (None, "auto")
-                        else None
+                if managed_workspace is not None:
+                    return await self._managed_call(
+                        managed_workspace, agent.working_dir, execute_attempt
                     )
-                    or agent.model
-                    or self._default_model,
-                    partial=is_partial,
-                )
+                return await execute_attempt()
             except ProviderError as e:
+                if managed_workspace is not None and (
+                    not attempt_started or managed_workspace.root in self._managed_sealed_roots
+                ):
+                    raise
                 last_error = e
                 self._retry_history.append(
                     {
@@ -1224,6 +1225,10 @@ class CopilotProvider(AgentProvider):
                 # the workflow engine can present the original message.
                 raise
             except Exception as e:
+                if managed_workspace is not None and (
+                    not attempt_started or managed_workspace.root in self._managed_sealed_roots
+                ):
+                    raise
                 # Wrap unexpected errors as retryable
                 last_error = e
                 logger.error(f"Unexpected error in agent '{agent.name}': {type(e).__name__}: {e}")
@@ -1763,13 +1768,21 @@ class CopilotProvider(AgentProvider):
                         await session.disconnect()
                     except asyncio.CancelledError:
                         raise
-                    except Exception:
-                        logger.warning(
-                            "Failed to disconnect Copilot session for agent '%s' during "
-                            "cleanup; continuing.",
-                            agent.name,
-                            exc_info=True,
-                        )
+                    except Exception as error:
+                        if invocation is not None:
+                            logger.warning(
+                                "Failed to disconnect managed Copilot session during cleanup: %s",
+                                invocation.workspace.process_scopes.scrub(
+                                    "".join(traceback.format_exception(error))
+                                ),
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to disconnect Copilot session for agent '%s' during "
+                                "cleanup; continuing.",
+                                agent.name,
+                                exc_info=True,
+                            )
 
         except ProviderError as e:
             if e.is_retryable and self._runtime_is_dead():
@@ -3165,6 +3178,7 @@ class CopilotProvider(AgentProvider):
                 "Managed Copilot requires the native SDK runtime", is_retryable=False
             )
         previous = self._managed_invocations.get(workspace.root, [])
+        workspace.process_scopes.check_admission()
         if workspace.root in self._managed_sealed_roots or any(
             entry.workspace.incarnation != workspace.incarnation
             or entry.workspace.process_scopes is not workspace.process_scopes
@@ -3250,10 +3264,11 @@ class CopilotProvider(AgentProvider):
                     if invocation.client is not None:
                         try:
                             await invocation.client.stop()
-                        except Exception:
+                        except Exception as error:
                             logger.warning(
-                                "Managed Copilot native stop failed; release still requires process and owner proofs",
-                                exc_info=True,
+                                "Managed Copilot native stop failed; release still requires "
+                                "process and owner proofs: %s",
+                                scopes.scrub("".join(traceback.format_exception(error))),
                             )
                 finally:
                     try:
@@ -3279,10 +3294,13 @@ class CopilotProvider(AgentProvider):
                                 if stream is not None:
                                     stream.close()
                         pipes_closed.set_result(None)
-                    except (OSError, ProviderError):
+                    except (OSError, ProviderError) as error:
                         # The registered unfinished owner keeps the original
                         # barrier fail-closed without replacing startup failure.
-                        logger.warning("Managed Copilot stdio close is unconfirmed", exc_info=True)
+                        logger.warning(
+                            "Managed Copilot stdio close is unconfirmed: %s",
+                            scopes.scrub("".join(traceback.format_exception(error))),
+                        )
                     finally:
                         _MANAGED_COPILOT.reset(token)
 
@@ -3296,8 +3314,16 @@ class CopilotProvider(AgentProvider):
         try:
             await self._join_managed(invocation)
         except ProviderError:
+            # Preserve the primary error, but never retry over an unconfirmed join.
+            self._managed_sealed_roots.add(workspace.root)
             if owner.done():
                 owner.result()
+            raise
+        try:
+            scopes.check_admission()
+        except ExecutionSpecError:
+            self._managed_sealed_roots.add(workspace.root)
+            owner.result()
             raise
         return owner.result()
 

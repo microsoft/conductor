@@ -157,3 +157,52 @@ junctions and other non-symlink reparse points, and unsafe symlinks. Symlink
 creation depends on the host's permissions. These are implementation restrictions,
 not a claim that every native Windows or remote Docker configuration has been
 tested.
+
+Managed Windows commands resolve from the final process environment and working
+directory, including arguments, environment and cwd supplied by an SDK to its
+stdio facade. Environment names use Windows ordinal case-insensitive identity.
+Explicit overlays replace inherited aliases; conflicting aliases within one
+mapping are refused. MCP retains its SDK's filtered inheritance, with canonical
+key spelling so the SDK's second merge cannot restore an overridden value.
+
+Bare commands search only the declared `PATH`, in directory order. Missing or
+empty `PATH` searches nothing. Empty segments are ignored; `.` explicitly
+selects the supplied cwd, and ordinary relative entries are anchored there.
+Ambiguous drive-relative or rooted-without-drive paths and malformed PATH
+quotes are refused. Supported targets are `.exe`, `.com`, `.cmd` and `.bat`.
+For a command without an extension, missing `PATHEXT` means
+`.COM;.EXE;.BAT;.CMD`; present-empty means no extension completion. A supplied
+list keeps the order of its supported extensions, with each directory checked
+before the next. An explicit extension is never supplemented. Explicit native
+paths retain the actual Windows loader's errors and native argument encoding.
+There is no implicit parent, system-directory, current-directory or file
+association fallback. A JavaScript CLI needs an explicitly selected native
+interpreter, such as `node.exe`; `.js` and `.ps1` are not automatic targets.
+
+Automatic `.cmd` and `.bat` invocation supports a limited literal argument
+subset. Empty arguments, ordinary spaces, Unicode, internal backslashes, and
+plain trailing-backslash tokens such as `C:\plain\` are supported. Quotes,
+percent signs, exclamation marks, carets, shell operators, parentheses,
+wildcards, control characters, unpaired surrogates and Unicode line/paragraph
+separators are refused before payload dispatch. A trailing backslash that needs
+quoting, such as `C:\with space\`, is also refused rather than rewritten.
+The target path has the same character restrictions. These restrictions do
+not apply to native `.exe` or `.com` arguments.
+
+Batch target, cwd and interpreter paths must be drive-absolute; automatic UNC
+and device-path adaptation is unsupported. An explicitly declared `ComSpec`
+must be an unquoted absolute path to a compatible Microsoft command processor.
+Only an absent `ComSpec` permits `<SystemRoot>\System32\cmd.exe`, using a
+declared absolute `SystemRoot`. An empty, invalid or unavailable `ComSpec`
+does not fall back. Invocation uses `/d /e:on /v:off /s /c`; it adds no `CALL`,
+escapes, associations or extra grants. The complete command line including its
+terminator, and each `name=value` environment entry including its terminator,
+must fit 8191 UTF-16 code units. Oversized entries are refused, never dropped.
+
+SDK-added arguments follow the same rules. For example, JSON schema arguments
+or quoted prompts may require a native CLI instead of a batch wrapper.
+Diagnostics retain the requested or resolved wrapper target, not `cmd.exe`.
+A policy refusal, lookup miss, native startup error, and an already-started
+batch command's nonzero exit remain different outcomes. A wrapper's own
+expansion, parsing, subprocess lookup and failures remain its authored
+behavior; this adapter does not intercept all descendant subprocesses.

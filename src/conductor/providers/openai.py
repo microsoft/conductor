@@ -21,10 +21,13 @@ import asyncio
 import inspect
 import logging
 import os
+import traceback
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel
 
+from conductor import redaction
 from conductor.config.schema import AgentDef, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.execution.types import ManagedWorkspaceContext
@@ -243,6 +246,8 @@ class OpenAIProvider(AgentProvider):
             )
 
         self._client: AsyncOpenAI | None = None
+        self._owned_client: AsyncOpenAI | None = None
+        self._close_tasks: dict[int, asyncio.Task[None]] = {}
         self._api_key = api_key
         self._resolve_environment = resolve_environment
         self._base_url = base_url
@@ -336,6 +341,7 @@ class OpenAIProvider(AgentProvider):
             client_kwargs["base_url"] = "https://api.openai.com/v1"
 
         self._client = AsyncOpenAI(**client_kwargs)
+        self._owned_client = self._client
 
         if openai is not None:
             self._sdk_version = getattr(openai, "__version__", "unknown")
@@ -761,29 +767,94 @@ class OpenAIProvider(AgentProvider):
             return manager
 
     async def close(self) -> None:
-        """Release provider resources and close connections."""
-        for workspace in tuple(self._managed_workspaces.values()):
-            await workspace.release()
-        if self._mcp_managers:
-            for cwd, manager in self._mcp_managers.items():
-                try:
-                    await manager.close()
-                except Exception as e:
-                    logger.warning(f"Error closing MCP manager for cwd={cwd}: {e}")
-            self._mcp_managers.clear()
-            self._mcp_manager_locks.clear()
-            logger.debug("All pooled MCP managers closed")
+        """Attempt independent cleanup without losing failures or caller cancellation."""
+        workspaces = tuple(self._managed_workspaces.values())
+        scrubbers = tuple(workspace.context.process_scopes.scrub for workspace in workspaces)
+        ambient_redactor = redaction.current()
+        client = self._owned_client
 
-        if self._client is not None:
-            client = self._client
-            self._client = None
-            await client.close()
-            logger.debug("OpenAI provider closed")
+        def start(key: int, operation: Callable[[], Coroutine[None, None, None]]) -> None:
+            if key not in self._close_tasks:
+                self._close_tasks[key] = asyncio.create_task(operation())
 
-        # Drop cached metadata so a re-initialized provider re-fetches.
+        for workspace in workspaces:
+            start(id(workspace), workspace.release)
+        for manager in self._mcp_managers.values():
+            start(id(manager), manager.close)
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            http_in_use = any(
+                not task.done()
+                for workspace in workspaces
+                for run in workspace.runs
+                for task in run.tasks
+            )
+            if client is not None and not http_in_use:
+                # Invalidate only our own handle, before close can yield.
+                if self._client is client:
+                    self._client = None
+                start(id(client), client.close)
+            pending = {task for task in self._close_tasks.values() if not task.done()}
+            if not pending:
+                break
+            try:
+                # The enclosing registry owns its deadline; managed releases
+                # retain their original native budget. Never cancel siblings.
+                await asyncio.wait(pending)
+            except asyncio.CancelledError as error:
+                cancelled = cancelled or error
+        errors: list[Exception] = []
+        for task in self._close_tasks.values():
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                errors.append(
+                    ProviderError(
+                        "Provider cleanup is unconfirmed: "
+                        "a resource cleanup operation was cancelled",
+                        is_retryable=False,
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+        if client is not None and http_in_use:
+            logger.warning(
+                "Provider HTTP cleanup deferred: managed resource owners are still alive"
+            )
+            if not errors:
+                errors.append(
+                    ProviderError("Provider HTTP cleanup is unconfirmed", is_retryable=False)
+                )
+        for cwd, manager in tuple(self._mcp_managers.items()):
+            task = self._close_tasks[id(manager)]
+            if not task.cancelled() and task.exception() is None:
+                del self._mcp_managers[cwd]
+                self._mcp_manager_locks.pop(cwd, None)
+        if client is not None and not http_in_use:
+            task = self._close_tasks[id(client)]
+            if not task.cancelled() and task.exception() is None:
+                self._owned_client = None
+        self._close_tasks = {
+            key: task
+            for key, task in self._close_tasks.items()
+            if task.cancelled() or task.exception() is not None
+        }
         self._model_limits_cache = None
         self._model_listing_unavailable = False
         self._model_listing_unavailable_warned = False
+        for error in errors:
+            message = "".join(traceback.format_exception(error))
+            for scrub in scrubbers:
+                message = scrub(message)
+            if ambient_redactor is not None:
+                message = ambient_redactor.scrub(message)
+            logger.warning("Provider cleanup failed: %s", message)
+        if cancelled is not None:
+            raise cancelled
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Provider cleanup failed", errors)
 
     async def execute_dialog_turn(
         self,

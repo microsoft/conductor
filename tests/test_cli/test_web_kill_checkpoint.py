@@ -85,14 +85,15 @@ def _wait_workflow() -> WorkflowConfig:
 @pytest.mark.asyncio
 async def test_kill_mid_step_writes_checkpoint(tmp_path: Path) -> None:
     wf_path = tmp_path / "workflow.yaml"
-    wf_path.write_text("name: kill-checkpoint\n")
+    config = _wait_workflow()
+    wf_path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
 
     emitter = WorkflowEventEmitter()
     events: list[WorkflowEvent] = []
     emitter.subscribe(events.append)
 
     engine = WorkflowEngine(
-        _wait_workflow(),
+        config,
         CopilotProvider(mock_handler=lambda a, p, c: {}),
         workflow_path=wf_path,
         event_emitter=emitter,
@@ -127,9 +128,10 @@ async def test_retained_cancel_finalizes_before_failed_checkpoint_warning(
 ) -> None:
     # Requirement: a failed stop checkpoint warns after retaining, regardless of a stale path.
     wf_path = tmp_path / "workflow.yaml"
-    wf_path.write_text("name: kill-checkpoint\n", encoding="utf-8")
+    config = _wait_workflow()
+    wf_path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     engine = WorkflowEngine(
-        _wait_workflow(),
+        config,
         CopilotProvider(mock_handler=lambda a, p, c: {}),
         workflow_path=wf_path,
     )

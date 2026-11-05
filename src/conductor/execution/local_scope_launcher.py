@@ -28,6 +28,10 @@ from types import TracebackType
 from typing import Protocol
 from uuid import uuid4
 
+from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.local_windows_launch import windows_create_process_arguments
+from conductor.execution.types import ProcessLaunchSpec
+
 type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
 
 MAX_CONTROL = 8 * 1024 * 1024
@@ -144,15 +148,39 @@ def authenticate(channel: Channel, key: bytes) -> None:
     channel.send_bytes(hmac.digest(key, b"server" + response[32:], hashlib.sha256))
 
 
-def private_listener(address: str) -> Acceptor:
-    """Bind a user-private Unix socket or an owner-only Windows named pipe."""
+def private_listener(
+    address: str,
+    *,
+    register: Callable[[Acceptor], None],
+    transfer_failed: Callable[[], None],
+) -> Acceptor:
+    """Transfer the actual private listener to its installation owner before permissions."""
     if sys.platform != "win32":
-        listener = Listener(address, family="AF_UNIX")
+        listener: Acceptor = Listener(address, family="AF_UNIX")
+    else:
+        # multiprocessing's default Windows DACL grants Everyone read access. The
+        # native pipe factory below installs an explicit owner/system DACL instead.
+        listener = _WindowsListener(address)
+    try:
+        register(listener)
+    except BaseException as primary:
+        # A failed transfer remains unknown to the caller, even if this disposal succeeds.
+        try:
+            transfer_failed()
+        except BaseException:
+            BaseException.add_note(
+                primary, "Managed local listener ownership transfer unconfirmed."
+            )
+        try:
+            listener.close()
+        except BaseException:
+            BaseException.add_note(
+                primary, "Managed local listener ownership transfer cleanup unconfirmed."
+            )
+        raise
+    if sys.platform != "win32":
         os.chmod(address, 0o600)
-        return listener
-    # multiprocessing's default Windows DACL grants Everyone read access. The
-    # native pipe factory below installs an explicit owner/system DACL instead.
-    return _WindowsListener(address)
+    return listener
 
 
 def protect(path: Path, mode: int) -> None:
@@ -610,6 +638,9 @@ if sys.platform == "win32":
                     raise ctypes.WinError(ctypes.get_last_error())
 
         def start(self, argv: list[str], env: dict[str, str], cwd: str) -> None:
+            application, command_line = windows_create_process_arguments(
+                ProcessLaunchSpec(tuple(argv), env, cwd)
+            )
             with contextlib.ExitStack() as stack:
                 child_in, parent_in = os.pipe()
                 parent_out, child_out = os.pipe()
@@ -624,8 +655,8 @@ if sys.platform == "win32":
                 startup.hStdInput, startup.hStdOutput, startup.hStdError = handles
                 startup.lpAttributeList = {"handle_list": handles}
                 process, thread, _pid, _tid = _winapi.CreateProcess(
-                    None,
-                    subprocess.list2cmdline(argv),
+                    application,
+                    command_line,
                     None,
                     None,
                     True,
@@ -763,14 +794,16 @@ def _custodian(descriptor: dict[str, Json]) -> int:
             tree.close()
             emit("HELPER_FAILED", phase="assignment", message="Native custody setup failed")
             return 125
-        except OSError as exc:
+        except (OSError, ExecutionSpecError) as exc:
             emit(
                 "PAYLOAD_START_FAILED",
                 resolved_command=argv[0],
                 kind="file_not_found" if isinstance(exc, FileNotFoundError) else "os_error",
-                message=exc.strerror if exc.errno is not None else str(exc),
-                errno=exc.errno,
-                filename=exc.filename,
+                message=exc.strerror
+                if isinstance(exc, OSError) and exc.strerror is not None
+                else str(exc),
+                errno=exc.errno if isinstance(exc, OSError) else None,
+                filename=exc.filename if isinstance(exc, OSError) else None,
             )
             tree.reap()
             if not tree.empty:

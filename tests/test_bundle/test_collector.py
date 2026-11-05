@@ -30,6 +30,7 @@ from conductor.executor.agent import _merge_skills
 from conductor.plugins.registry import resolve_plugins
 from conductor.registry.cache import CACHE_LAYOUT_VERSION, _readiness_marker_payload, _sentinel_path
 from conductor.skills.discovery import DiscoverySource, resolve_effective_skills
+from conductor.skills.frontmatter import SkillManifestError
 from conductor.skills.registry import ResolvedSkill, SkillPluginError, resolve_skill_plugin
 
 
@@ -377,6 +378,65 @@ def test_plugin_manifest_selected_mcp_file_is_collected_only_when_enabled(tmp_pa
     assert source not in disabled_paths
 
 
+@pytest.mark.parametrize("inline", [True, False])
+@pytest.mark.parametrize("switches", [(True, False), (False, True), (False, False)])
+def test_shared_plugin_projection_preserves_selected_union(
+    tmp_path: Path, *, inline: bool, switches: tuple[bool, bool]
+) -> None:
+    # Requirement: independent MCP switches share canonical bytes and exclude unselected components.
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    manifest = plugin / ".github/plugin/plugin.json"
+    servers = {"review-tools": {"command": "review"}}
+    declaration = servers if inline else ".mcp.json"
+    manifest.write_text(json.dumps({"name": "review", "mcpServers": declaration}))
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks/hook.json").write_text('{"unselected":true}')
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        json.dumps(
+            {
+                "workflow": {"name": "shared-plugin", "entry_point": "first"},
+                "agents": [
+                    {
+                        "name": name,
+                        "prompt": "fixture",
+                        "skills": [],
+                        "plugins": [
+                            {"name": "./plugin", "agents": False, "skills": False, "mcp": enabled}
+                        ],
+                        "routes": [{"to": "$end"}],
+                    }
+                    for name, enabled in zip(("first", "second"), switches, strict=True)
+                ],
+            }
+        )
+    )
+
+    bundle = _collect(workflow)
+
+    canonical = "tree/plugins/review/.github/plugin/plugin.json"
+    expected_manifest = {"name": "review", **({"mcpServers": declaration} if any(switches) else {})}
+    assert json.loads(bundle.files[canonical]) == expected_manifest
+    expected_paths = {canonical}
+    if any(switches) and not inline:
+        expected_paths.add("tree/plugins/review/.mcp.json")
+    assert {p for p in bundle.files if p.startswith("tree/plugins/")} == expected_paths
+    assert [selection.plugins for selection in bundle.agent_dependencies] == [
+        (("./plugin", "plugins/review"),),
+        (("./plugin", "plugins/review"),),
+    ]
+
+    # Reversing agents changes authored YAML, but must preserve the plugin payload byte for byte.
+    data = json.loads(workflow.read_text())
+    data["agents"].reverse()
+    workflow.write_text(json.dumps(data))
+    reversed_bundle = _collect(workflow)
+    assert {p: b for p, b in reversed_bundle.files.items() if p.startswith("tree/plugins/")} == {
+        p: b for p, b in bundle.files.items() if p.startswith("tree/plugins/")
+    }
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
 def test_plugin_manifest_symlinked_mcp_file_collects_target(tmp_path: Path) -> None:
     # Requirement: a manifest-selected MCP symlink includes its target bytes in the bundle.
@@ -656,6 +716,54 @@ def test_additional_root_is_permission_not_inclusion(tmp_path: Path) -> None:
     assert bundle.agent_paths == ()
 
 
+@pytest.mark.parametrize("provider", ["claude", "openai"])
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        "description: Fixture.",
+        "name: local-guide",
+        "name: [local-guide]\ndescription: Fixture.",
+        "name: local-guide\ndescription: invalid: scalar",
+    ],
+)
+def test_eager_collection_rejects_invalid_original_frontmatter(
+    tmp_path: Path, provider: str, frontmatter: str
+) -> None:
+    # Requirement: freezing identity must still parse and validate the original skill manifest.
+    skill = tmp_path / "skills/local-guide"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(f"---\n{frontmatter}\n---\nBody.\n")
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _workflow("fixture").replace(
+            "    prompt: fixture",
+            f"    prompt: fixture\n    provider: {provider}\n    skills: [./skills/local-guide]",
+        )
+    )
+
+    with pytest.raises(SkillManifestError):
+        _collect(workflow)
+
+
+def test_native_collection_rejects_distinct_frontmatter_identity(tmp_path: Path) -> None:
+    # Requirement: native SDK skill qualification still requires name equal to directory basename.
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin, skill="local-guide")
+    manifest = plugin / "skills/local-guide/SKILL.md"
+    manifest.write_text(manifest.read_text().replace("name: local-guide", "name: acme-guide"))
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _workflow("fixture").replace(
+            "    prompt: fixture",
+            "    prompt: fixture\n    provider: claude-agent-sdk\n"
+            "    skills: [./plugin/skills/local-guide]",
+        )
+    )
+
+    with pytest.raises(SkillPluginError, match="matches nothing"):
+        _collect(workflow)
+
+
 @pytest.mark.parametrize("provider", ["claude-agent-sdk", "copilot"])
 def test_standalone_native_skill_preserves_only_its_owning_topology(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
@@ -690,6 +798,7 @@ def test_standalone_native_skill_preserves_only_its_owning_topology(
     owner = resolve_skill_plugin(staged)
 
     assert (staged / "SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
+    assert bundle.agent_dependencies[0].skills[0].frontmatter_name == "plugin-skill"
     if provider == "claude-agent-sdk":
         assert owner is not None
         assert owner.plugin_root == store / "tree/skills/plugin-skill/plugin"
@@ -823,6 +932,7 @@ def test_skill_only_owner_excludes_inline_components_when_another_agent_selects_
     assert narrow.skills[0].owner_root == owner.plugin_root.relative_to(tree).as_posix()
     assert resolved.agents == ()
     assert [selected.name for selected in resolved.skills] == ["task"]
+    assert narrow.skills[0].frontmatter_name == "task"
     full_root = tree / selections["full"].plugins[0][1]
     full_plugin = resolve_plugins(
         [PluginDef(name=str(full_root))], base_dir=tree / "main", flavor="claude"
@@ -833,6 +943,10 @@ def test_skill_only_owner_excludes_inline_components_when_another_agent_selects_
     assert {selected.name for selected in full_plugin.skills} == {"task", "sibling"}
     assert {selected.directory for selected in selections["full"].skills} == {
         f"plugins/owner/skills/{name}" for name in ("task", "sibling")
+    }
+    assert {selected.frontmatter_name for selected in selections["full"].skills} == {
+        "task",
+        "sibling",
     }
     full_manifest = json.loads(
         (full_root / ".claude-plugin/plugin.json").read_text(encoding="utf-8")

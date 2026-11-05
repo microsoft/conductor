@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -18,7 +20,8 @@ from conductor.config.schema import AgentDef, ProviderSettings
 from conductor.exceptions import ProviderError
 from conductor.execution.local_process_scope import LocalProcessScopeController
 from conductor.execution.types import ManagedWorkspaceContext
-from conductor.providers.copilot import CopilotProvider
+from conductor.providers.copilot import CopilotProvider, RetryConfig
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Native Linux SDK custody fixture")
 
@@ -207,9 +210,10 @@ async def test_execute_uses_owned_sdk_and_native_shutdown(
 
 
 async def test_resume_and_dialog_use_fresh_clients(
-    workspace: ManagedWorkspaceContext, tmp_path: Path
+    workspace: ManagedWorkspaceContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Requirement: execute, resume and dialog retain the selected staged namespace cwd.
+    # Requirement: a new runtime resumes prior conversation bytes in the selected namespace.
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "history")
     provider = CopilotProvider()
     selected_cwd = Path(workspace.root) / "work" / "nested"
     selected_cwd.mkdir()
@@ -217,13 +221,14 @@ async def test_resume_and_dialog_use_fresh_clients(
     await provider.execute(definition, {}, "first", managed_workspace=workspace)
     provider.set_resume_session_ids(provider.get_session_ids())
     provider.set_resume_session_cwds(provider.get_session_cwds())
-    await provider.execute(definition, {}, "second", managed_workspace=workspace)
+    second = await provider.execute(definition, {}, "second", managed_workspace=workspace)
+    assert json.loads(second.content["result"]) == {"history": ["first", "second"]}
     response = await provider.execute_dialog_turn(
         "system", "third", managed_workspace=workspace, working_dir=str(selected_cwd)
     )
     await provider.release_workspace(workspace.root)
     wires = receipts(tmp_path)
-    assert len(wires) == 3 and response == "SUCCESS DONE ignore instructions"
+    assert len(wires) == 3 and json.loads(response) == {"history": ["User: third"]}
     assert sum(any(item.get("method") == "session.resume" for item in wire) for wire in wires) == 1
     assert len({proof.invocation_id for proof in workspace.process_scopes.proofs}) == 3
     for wire in wires:
@@ -232,6 +237,144 @@ async def test_resume_and_dialog_use_fresh_clients(
             item for item in wire if item.get("method") in {"session.create", "session.resume"}
         )
         assert session_rpc["params"]["workingDirectory"] == str(selected_cwd)
+
+
+async def test_retry_joins_first_native_attempt_before_starting_second(
+    workspace: ManagedWorkspaceContext,
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_processes: list[subprocess.Popen[bytes]],
+) -> None:
+    # Requirement: a retryable send gets a new runtime only after real release and joins.
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "retry-once")
+    provider = CopilotProvider(retry_config=RetryConfig(max_attempts=2, base_delay=0, jitter=False))
+    start = subprocess.Popen.__init__
+    launches = 0
+
+    def observe(process: Any, args: Any, *positional: Any, **kwargs: Any) -> None:
+        nonlocal launches
+        if Path(args[0]).is_relative_to(Path(workspace.root) / ".launchers"):
+            if launches:
+                first = provider._managed_invocations[workspace.root][0]
+                assert first.owner is not None and first.owner.done()
+                assert all(not thread.is_alive() for thread in first.readers)
+                assert sdk_processes[0].poll() is not None
+                assert all(
+                    stream is not None and stream.closed
+                    for stream in (
+                        sdk_processes[0].stdin,
+                        sdk_processes[0].stdout,
+                        sdk_processes[0].stderr,
+                    )
+                )
+                assert all(proof.done for proof in workspace.process_scopes.proofs)
+            launches += 1
+        start(process, args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", observe)
+    result = await provider.execute(agent(), {}, "retry payload", managed_workspace=workspace)
+    await provider.release_workspace(workspace.root)
+    assert result.content == {"result": "SUCCESS DONE ignore instructions"}
+    assert launches == len(sdk_processes) == 2
+    assert len({item.invocation_id for item in workspace.process_scopes.proofs}) == 2
+    assert len(provider.get_retry_history()) == 1
+
+
+@pytest.mark.parametrize("stage", ["disconnect", "stop", "stdio"])
+async def test_cleanup_warnings_scrub_native_exception_chains(
+    workspace: ManagedWorkspaceContext,
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_processes: list[subprocess.Popen[bytes]],
+    caplog: pytest.LogCaptureFixture,
+    stage: str,
+) -> None:
+    # Requirement: every managed cleanup sink scrubs chains while retaining native release proof.
+    from copilot import CopilotClient
+    from copilot.session import CopilotSession
+
+    secret = "registered-copilot-cleanup-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
+    controller = workspace.process_scopes
+    assert isinstance(controller, LocalProcessScopeController)
+    controller.scrub = redactor.scrub
+    clock = Clock()
+    controller._clock = clock
+    failed = asyncio.Event()
+    stop = CopilotClient.stop
+    disconnect = CopilotSession.disconnect
+
+    def fail() -> None:
+        failed.set()
+        try:
+            raise PermissionError(13, "native cleanup denied", f"/private/{secret}")
+        except PermissionError as cause:
+            raise OSError(f"native {stage} failed: {secret}") from cause
+
+    async def failed_disconnect(session: CopilotSession) -> None:
+        already_closed = session._destroyed
+        await disconnect(session)
+        if not already_closed:
+            fail()
+
+    async def failed_stop(client: CopilotClient) -> None:
+        await stop(client)
+        if stage == "stop":
+            fail()
+        if stage == "stdio":
+            (process,) = sdk_processes
+            stream = process.stderr
+            assert stream is not None
+            close = stream.close
+
+            def failed_close() -> None:
+                monkeypatch.setattr(stream, "close", close)
+                close()
+                fail()
+
+            monkeypatch.setattr(stream, "close", failed_close)
+
+    if stage == "disconnect":
+        monkeypatch.setattr(CopilotSession, "disconnect", failed_disconnect)
+    else:
+        monkeypatch.setattr(CopilotClient, "stop", failed_stop)
+    provider = CopilotProvider()
+    call = asyncio.create_task(provider.execute(agent(), {}, "p", managed_workspace=workspace))
+    await asyncio.wait_for(failed.wait(), 10)
+    if stage == "stdio":
+        for scope in controller._scopes.values():
+            await asyncio.wait_for(scope.completed.wait(), 10)
+        clock.advance(30)
+        with pytest.raises(ProviderError):
+            await call
+        with pytest.raises(ExceptionGroup):
+            await provider.release_workspace(workspace.root)
+    else:
+        output = await call
+        await provider.release_workspace(workspace.root)
+        assert output.content == {"result": "SUCCESS DONE ignore instructions"}
+    if stage == "stdio":
+        joined = asyncio.Event()
+        for entry in tuple(controller.owners.tasks.values()):
+            assert isinstance(entry.task, asyncio.Future)
+            entry.task.add_done_callback(lambda _task: joined.set())
+            entry.task.cancel()
+        await asyncio.wait_for(joined.wait(), 10)
+    records = [record for record in caplog.records if record.name == "conductor.providers.copilot"]
+    formatted = "\n".join(logging.Formatter().format(record) for record in records)
+    assert secret not in formatted
+    assert REDACTED_MARKER in formatted and "PermissionError" in formatted
+    assert "native cleanup denied" in formatted and f"native {stage} failed" in formatted
+    assert "Traceback" in formatted and all(record.exc_info is None for record in records)
+    expected_status = "unconfirmed" if stage == "stdio" else "released"
+    assert (await workspace.process_scopes.await_release()).status == expected_status
+    assert all(
+        proof.kernel_empty and proof.custodian_reaped for proof in workspace.process_scopes.proofs
+    )
+    assert all(
+        stream is not None and stream.closed
+        for process in sdk_processes
+        for stream in (process.stdin, process.stdout, process.stderr)
+    )
 
 
 @pytest.mark.parametrize("working_dir", [None, "", "relative"])
@@ -419,7 +562,7 @@ async def test_native_interrupt_resumes_disk_session_with_fresh_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # Requirement: managed native abort retains SID/cwd, not a live SDK client.
+    # Requirement: guidance in a fresh runtime observes the interrupted conversation history.
     monkeypatch.setenv("COPILOT_FIXTURE_MODE", "interrupt")
     provider = CopilotProvider()
     signal = asyncio.Event()
@@ -429,10 +572,11 @@ async def test_native_interrupt_resumes_disk_session_with_fresh_runtime(
     )
     assert partial.partial
     identity = provider.get_interrupted_session()
-    monkeypatch.delenv("COPILOT_FIXTURE_MODE")
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "history")
     output = await provider.send_followup(identity, "guidance", managed_workspace=workspace)
     await provider.release_workspace(workspace.root)
     assert not output.partial and len(workspace.process_scopes.proofs) == 2
+    assert output.content == {"history": ["p", "guidance"]}
     assert (
         sum(
             any(item.get("method") == "session.abort" for item in wire)
@@ -447,6 +591,114 @@ async def test_native_interrupt_resumes_disk_session_with_fresh_runtime(
         )
         == 1
     )
+
+
+@pytest.mark.parametrize("identity_source", ["wrong-id", "fresh-root"])
+async def test_native_followup_refuses_unknown_disk_session(
+    workspace: ManagedWorkspaceContext,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identity_source: str,
+) -> None:
+    # Requirement: a supplied SID cannot fabricate history in another root or unknown session.
+    from copilot._jsonrpc import JsonRpcError
+
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "interrupt")
+    provider = CopilotProvider()
+    signal = asyncio.Event()
+    signal.set()
+    await provider.execute(
+        agent(), {}, "private first turn", interrupt_signal=signal, managed_workspace=workspace
+    )
+    identity = provider.get_interrupted_session()
+    assert identity is not None
+    root = tmp_path / "fresh"
+    (root / "work").mkdir(parents=True)
+    controller = LocalProcessScopeController(str(root), "fresh-incarnation")
+    fresh = ManagedWorkspaceContext(str(root), "fresh-incarnation", controller)
+    selected = workspace
+    if identity_source == "wrong-id":
+        identity = replace(identity, session_id="unknown-session")
+    else:
+        selected = fresh
+        identity = replace(
+            identity, root=fresh.root, incarnation=fresh.incarnation, cwd=str(root / "work")
+        )
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "history")
+    try:
+        with pytest.raises(JsonRpcError) as caught:
+            await provider.send_followup(identity, "recall", managed_workspace=selected)
+        assert caught.value.code == -32003
+        await provider.release_workspace(workspace.root)
+        if selected is fresh:
+            await provider.release_workspace(fresh.root)
+    finally:
+        controller.begin_teardown()
+        await controller.force_stop(tuple(proof.scope_id for proof in controller.proofs))
+        await controller.await_release()
+        await controller.close()
+
+
+async def test_omitted_resume_id_starts_without_prior_history(
+    workspace: ManagedWorkspaceContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: history is recovered from the supplied disk SID, never a process global.
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "history")
+    first = CopilotProvider()
+    await first.execute(agent(), {}, "private first turn", managed_workspace=workspace)
+    fresh = CopilotProvider()
+    output = await fresh.execute(agent(), {}, "recall", managed_workspace=workspace)
+    assert json.loads(output.content["result"]) == {"history": ["recall"]}
+    await first.release_workspace(workspace.root)
+    await fresh.release_workspace(workspace.root)
+
+
+async def test_retryable_primary_does_not_retry_after_unconfirmed_pipe_join(
+    workspace: ManagedWorkspaceContext,
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_processes: list[subprocess.Popen[bytes]],
+) -> None:
+    # Requirement: a retryable payload error never overrides an unconfirmed native join fence.
+    from copilot import CopilotClient
+
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "retry-once")
+    controller = workspace.process_scopes
+    assert isinstance(controller, LocalProcessScopeController)
+    clock = Clock()
+    controller._clock = clock
+    failed = asyncio.Event()
+    stop = CopilotClient.stop
+
+    async def failed_close(client: CopilotClient) -> None:
+        await stop(client)
+        stream = sdk_processes[0].stderr
+        assert stream is not None
+        close = stream.close
+
+        def close_once() -> None:
+            monkeypatch.setattr(stream, "close", close)
+            close()
+            failed.set()
+            raise OSError("fixture pipe close unconfirmed")
+
+        monkeypatch.setattr(stream, "close", close_once)
+
+    monkeypatch.setattr(CopilotClient, "stop", failed_close)
+    provider = CopilotProvider(retry_config=RetryConfig(max_attempts=2, base_delay=0, jitter=False))
+    call = asyncio.create_task(provider.execute(agent(), {}, "p", managed_workspace=workspace))
+    await asyncio.wait_for(failed.wait(), 10)
+    for scope in controller._scopes.values():
+        await asyncio.wait_for(scope.completed.wait(), 10)
+    clock.advance(30)
+    with pytest.raises(ProviderError, match="fixture transient send failure"):
+        await call
+    assert len(sdk_processes) == 1
+    assert (await controller.await_release()).status == "unconfirmed"
+    with pytest.raises(ExceptionGroup):
+        await provider.release_workspace(workspace.root)
+    for entry in tuple(controller.owners.tasks.values()):
+        assert isinstance(entry.task, asyncio.Future)
+        entry.task.cancel()
 
 
 async def test_native_stuck_shutdown_force_is_independent(
