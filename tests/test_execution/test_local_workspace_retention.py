@@ -1537,7 +1537,12 @@ async def test_installation_assembly_failure_preserves_real_foreign_workload(
             assert not _installation_fd_live(fd, identity)
             assert not _installation_fd_live(dfd, did)
         result = await backend.run_command(
-            CommandSpec(sys.executable, ("-c", "print('foreign-live')"), stdin=b""), foreign
+            CommandSpec(
+                sys.executable,
+                ("-c", "import sys; sys.stdout.buffer.write(b'foreign-live\\n')"),
+                stdin=b"",
+            ),
+            foreign,
         )
         assert result.stdout == "foreign-live\n" and result.exit_code == 0
     finally:
