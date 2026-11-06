@@ -119,7 +119,12 @@ def _link_target(link: Path, root: Path) -> Path:
                 raise ExecutionSpecError(f"Bundle contains a cyclic symlink: {link}")
             seen.add(key)
             target = os.readlink(candidate)
-            if os.path.isabs(target) or ntpath.isabs(target) or ntpath.splitdrive(target)[0]:
+            if (
+                target.startswith(("/", "\\"))
+                or os.path.isabs(target)
+                or ntpath.isabs(target)
+                or ntpath.splitdrive(target)[0]
+            ):
                 raise ExecutionSpecError(f"Bundle symlink must be self-contained: {link}")
             pending = list(Path(target).parts) + pending
         else:
