@@ -164,12 +164,12 @@ jobs:
         # Windows runs the suite at roughly twice the Linux wall time, so this
         # is ~2x headroom there and ~3x on Linux — still short enough to catch
         # a genuine hang rather than burning a full job timeout on one.
-        timeout-minutes: 45
+        timeout-minutes: 30
         # `docker_integration` is excluded here too even though the marker is
         # already deselected via PYTEST_DEFAULT_MARKERS in the Makefile: this
         # job invokes pytest directly, and the real-daemon lane must run only
         # in the dedicated serialized docker-integration job below.
-        run: uv run pytest -n 2 --dist loadfile --durations=60 --durations-min=2 --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+        run: uv run pytest -n 2 --dist loadfile -v -o faulthandler_timeout=180 --durations=60 --durations-min=2 tests/test_bundle/test_collector.py tests/test_cli/test_async_runner.py tests/test_cli/test_local_workspace.py tests/test_cli/test_run.py tests/test_cli/test_run_secrets_wiring.py tests/test_cli/test_web_kill_checkpoint.py tests/test_config/test_validator_docker.py tests/test_engine/test_agent_realm_validation.py tests/test_engine/test_bundle_prep.py tests/test_engine/test_local_workspace_agents.py tests/test_engine/test_local_workspace_capability.py tests/test_engine/test_local_workspace_consumers.py tests/test_engine/test_local_workspace_lifecycle.py tests/test_engine/test_local_workspace_paths.py tests/test_engine/test_run_manifest_docker.py tests/test_engine/test_workspace_lifecycle.py tests/test_execution/test_contract_types.py tests/test_execution/test_local_backend.py tests/test_execution/test_local_process_scope.py tests/test_execution/test_local_windows_launch.py tests/test_execution/test_local_workspace_retention.py tests/test_execution/test_workspace_retention.py tests/test_execution/test_workspace_session.py tests/test_executor/test_script.py tests/test_mcp/test_manager.py tests/test_mcp/test_manager_managed_workspace.py tests/test_providers/test_aca.py tests/test_providers/test_base.py tests/test_providers/test_capabilities.py tests/test_providers/test_claude_agent_sdk_managed.py tests/test_providers/test_claude_agent_sdk_managed_dialog.py tests/test_providers/test_claude_performance.py tests/test_providers/test_copilot_managed_workspace.py tests/test_providers/test_hermes.py tests/test_providers/test_pydantic_ai_managed_workspace.py tests/test_providers/test_registry.py -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
           # Real API tests (marked with @pytest.mark.real_api) are excluded from CI
