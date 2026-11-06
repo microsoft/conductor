@@ -198,7 +198,11 @@ async def test_managed_authority_refuses_equal_reconstructed_lease(managed, oper
     dispatched: list[str] = []
     command = CommandSpec(
         sys.executable,
-        ("-c", "from pathlib import Path; Path('executed').write_text('owned'); print('done')"),
+        (
+            "-c",
+            "import sys; from pathlib import Path; Path('executed').write_text('owned'); "
+            "sys.stdout.buffer.write(b'done\\n')",
+        ),
         working_dir=binding.work_root,
         stdin=b"",
     )
@@ -420,7 +424,9 @@ async def test_failed_publication_cleans_only_its_own_temporary(
         assert not root.exists()
 
 
-@pytest.mark.parametrize("target", ["../../outside", "/outside", "C:\\outside", "../link"])
+@pytest.mark.parametrize(
+    "target", ["../../outside", "/outside", "\\outside", "C:\\outside", "../link"]
+)
 async def test_staging_rejects_escaping_absolute_and_cyclic_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
@@ -893,7 +899,14 @@ async def test_backend_waits_for_output_owner_join(
 
     monkeypatch.setattr(controller, "_output", held)
     command = asyncio.create_task(
-        backend.run_command(CommandSpec(sys.executable, ("-c", "print('bytes')"), stdin=b""), lease)
+        backend.run_command(
+            CommandSpec(
+                sys.executable,
+                ("-c", "import sys; sys.stdout.buffer.write(b'bytes\\n')"),
+                stdin=b"",
+            ),
+            lease,
+        )
     )
     try:
         await asyncio.wait_for(drained.wait(), 10)
@@ -1329,6 +1342,9 @@ async def test_installation_attached_abort_restores_idle_and_preserves_modified_
     assert set(root.glob(".scope-ipc-*")) == previous_ipc
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows named-pipe installation allocates no directory fd"
+)
 async def test_installation_fd_allocation_after_side_effect_cannot_be_fake_confirmed(
     tmp_path, monkeypatch
 ):
@@ -1361,6 +1377,51 @@ async def test_installation_fd_allocation_after_side_effect_cannot_be_fake_confi
         for fd, identity in acquired:
             if _installation_fd_live(fd, identity):
                 os.close(fd)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows named-pipe allocation")
+async def test_windows_listener_allocation_after_side_effect_keeps_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: an unreturned real pipe handle keeps the primary, unknown owner and fence.
+    import _winapi
+
+    run = _run(tmp_path, monkeypatch)
+    assert run.local_workspace_root is not None
+    primary = OSError(errno.EMFILE, "listener allocation failed after side effect")
+    original_args = primary.args
+    original_listener = scope_launcher._WindowsListener
+    acquired = []
+
+    def allocate(address):
+        listener = original_listener(address)
+        acquired.append(listener)
+        raise primary
+
+    monkeypatch.setattr(scope_launcher, "_WindowsListener", allocate)
+    backend = LocalRunnerBackend()
+    try:
+        with pytest.raises(OSError) as caught:
+            await backend.prepare_run(run)
+        assert caught.value is primary and primary.args == original_args
+        assert acquired and acquired[0].pending is not None
+        handle = acquired[0].pending
+        assert _winapi.GetFileType(handle) == 3  # FILE_TYPE_PIPE: the handle is still live.
+        record = backend._failed_installations[run.run_id]
+        assert record.outcome == "unconfirmed" and record.listener_pending
+        assert record.listener is None and record.thread is None and record.fd is None
+        assert not backend._leases and not backend._bindings and not backend._managed
+        root = Path(run.local_workspace_root)
+        marker = json.loads((root / "identity.json").read_text())
+        assert marker["runtime_state"] in ("active", "uncertain")
+        identity = WorkspaceIdentity("local", marker["lease_id"], marker["incarnation"], str(root))
+        with pytest.raises(WorkspaceAttachError):
+            await LocalRunnerBackend().attach_run(run, identity)
+    finally:
+        # The product cannot close a handle whose allocation never returned; the test owns it.
+        for listener in acquired:
+            listener.close()
+            assert listener.closed and listener.pending is None
 
 
 async def test_installation_rollback_uses_original_stage_authority_and_allows_retry(

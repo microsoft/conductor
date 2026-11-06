@@ -244,6 +244,45 @@ def test_missing_or_empty_path_performs_zero_search(
     stat.assert_not_called()
 
 
+@pytest.mark.parametrize("message", ["Missing.", "Missing... \r\n\t", "Missing.\x00\x1f ."])
+def test_synthetic_lookup_miss_matches_native_message_format(
+    monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    # Requirement: only the synthetic lookup miss uses CPython's Win32 trailing-character rule.
+    synthetic = FileNotFoundError(errno.ENOENT, message)
+    winerror = Mock(return_value=synthetic)
+    monkeypatch.setattr(windows, "ctypes", SimpleNamespace(WinError=winerror))
+    monkeypatch.setattr(windows, "sys", SimpleNamespace(platform="win32"))
+    with pytest.raises(FileNotFoundError) as caught:
+        windows._resolve(ProcessLaunchSpec(("missing",), {"PATH": ""}, r"C:\work"))
+    assert caught.value is synthetic
+    assert synthetic.strerror == "Missing"
+    assert synthetic.errno == errno.ENOENT and synthetic.filename is None
+    assert str(synthetic) == "[Errno 2] Missing"
+    winerror.assert_called_once_with(2)
+
+
+def test_lookup_preserves_original_os_error_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Requirement: a real lookup error is neither reformatted nor replaced by a synthetic miss.
+    original = PermissionError(errno.EACCES, "Original message. \r\n", r"C:\declared\tool.EXE")
+    winerror = Mock(side_effect=AssertionError("Native error must not become a lookup miss"))
+    monkeypatch.setattr(windows, "ctypes", SimpleNamespace(WinError=winerror))
+    monkeypatch.setattr(windows, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(windows, "os", SimpleNamespace(stat=Mock(side_effect=original)))
+    launch = ProcessLaunchSpec(("tool",), {"PATH": r"C:\declared", "PATHEXT": ".EXE"}, r"C:\work")
+    with pytest.raises(PermissionError) as caught:
+        windows._resolve(launch)
+    assert caught.value is original
+    _prepared, error = windows.prepare_windows_launch(launch)
+    assert error is not None
+    assert (error.message, error.errno, error.filename) == (
+        "Original message. \r\n",
+        errno.EACCES,
+        r"C:\declared\tool.EXE",
+    )
+    winerror.assert_not_called()
+
+
 @pytest.mark.parametrize("extra", [0, 1])
 @pytest.mark.parametrize("non_bmp", [False, True])
 def test_batch_command_limit_counts_utf16_terminator(extra: int, non_bmp: bool) -> None:

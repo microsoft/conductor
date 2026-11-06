@@ -592,7 +592,8 @@ async def test_native_workflow_failure_keeps_on_failure_tree(tmp_path, monkeypat
     cfg = config()
     script = cfg.agents[0]
     assert isinstance(script, ScriptStepDef)
-    script.command = str(tmp_path / "missing-target")
+    # Explicit native images fail after dispatch, rather than during Windows PATH preparation.
+    script.command = str(tmp_path / "missing-target.exe")
     async with prepared(tmp_path, workflow_config=cfg, persistence="on-failure") as (
         engine,
         backend,

@@ -529,49 +529,103 @@ async def test_original_root_deadline_bounds_registry_owner(tmp_path: Path) -> N
         await controller.close()
 
 
-async def test_force_driver_runs_while_native_owner_is_blocked(tmp_path: Path) -> None:
+@pytest.mark.parametrize("early_failure", [False, True], ids=["force", "early-readiness-failure"])
+async def test_force_driver_runs_while_native_owner_is_blocked(
+    tmp_path: Path, early_failure: bool
+) -> None:
     # Requirement: EOF grace expiry forces the native tree independently of SDK finally.
+    # Requirement: an early readiness assertion survives cleanup with all native owners joined.
     clock = ControlledClock()
     controller = LocalProcessScopeController(str(tmp_path), "inc", _scheduler=clock)
     release = asyncio.Event()
     owner = asyncio.create_task(release.wait())
     controller.owners.register("sdk", owner)
-    wrapped = await controller.wrap_stdio(
-        "sdk",
-        ProcessLaunchSpec(
-            (
-                sys.executable,
-                "-u",
-                "-c",
-                "import sys,threading; print('ready',flush=True); sys.stdin.read(); "
-                "threading.Event().wait()",
-            ),
-            dict(os.environ),
-            str(tmp_path),
-        ),
+    process = None
+    scopes = ()
+    readiness = b"ready\r\n" if early_failure else b"ready\n"
+    expected = (
+        pytest.raises(AssertionError, match="readiness bytes differ")
+        if early_failure
+        else contextlib.nullcontext()
     )
-    try:
-        process = await facade(wrapped)
-        assert process.stdout is not None and process.stdin is not None
-        assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n"
-        scope = controller._scopes[controller.proofs[0].scope_id]
-        controller.begin_teardown("sdk")
-        process.stdin.close()
-        await asyncio.wait_for(scope.eof_received.wait(), 10)
-        assert "FORCE_STOP" not in scope.events
-        clock.advance(5)
-        await asyncio.wait_for(scope.force_sent.wait(), 10)
-        await asyncio.wait_for(process.communicate(), 10)
-        await asyncio.wait_for(scope.completed.wait(), 10)
-        assert scope.kernel_empty and scope.drained and scope.reaped
-        assert not owner.done()
-        release.set()
-        await owner
-        assert (await controller.await_release()).status == "released"
-    finally:
-        release.set()
-        await owner
-        await controller.close()
+    with expected:
+        try:
+            wrapped = await controller.wrap_stdio(
+                "sdk",
+                ProcessLaunchSpec(
+                    (
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        f"import sys,threading; sys.stdout.buffer.write({readiness!r}); "
+                        "sys.stdout.buffer.flush(); sys.stdin.read(); threading.Event().wait()",
+                    ),
+                    dict(os.environ),
+                    str(tmp_path),
+                ),
+            )
+            process = await facade(wrapped)
+            assert process.stdout is not None and process.stdin is not None
+            assert await asyncio.wait_for(process.stdout.readline(), 10) == b"ready\n", (
+                "readiness bytes differ"
+            )
+            scope = controller._scopes[controller.proofs[0].scope_id]
+            controller.begin_teardown("sdk")
+            process.stdin.close()
+            await asyncio.wait_for(scope.eof_received.wait(), 10)
+            assert "FORCE_STOP" not in scope.events
+            clock.advance(5)
+            await asyncio.wait_for(scope.force_sent.wait(), 10)
+            await asyncio.wait_for(process.communicate(), 10)
+            await asyncio.wait_for(scope.completed.wait(), 10)
+            assert scope.kernel_empty and scope.drained and scope.reaped
+            assert not owner.done()
+            release.set()
+            await owner
+            assert (await controller.await_release()).status == "released"
+        finally:
+            primary = sys.exception()
+            release.set()
+            await owner
+            controller.begin_teardown()
+            scopes = tuple(controller._scopes.values())
+            if process is not None and process.stdin is not None:
+                process.stdin.close()
+            try:
+                try:
+                    for scope in scopes:
+                        if not scope.completed.is_set():
+                            await asyncio.wait_for(scope.eof_received.wait(), 10)
+                    # Both the normal and early-failure paths start at zero: advance is absolute.
+                    clock.advance(5)
+                    if process is not None:
+                        await asyncio.wait_for(process.communicate(), 10)
+                    for scope in scopes:
+                        await asyncio.wait_for(scope.completed.wait(), 10)
+                finally:
+                    # Terminal must be driven before close: await_release absorbs cancellation.
+                    deadline = controller.owners.deadline()
+                    if deadline is not None:
+                        clock.advance(deadline)
+                    await controller.close()
+                    await asyncio.wait_for(_join_scope_task_callbacks(controller), 10)
+                    controller._accepting.join(timeout=3)
+            except BaseException as cleanup_error:
+                if primary is None:
+                    raise
+                primary.add_note(f"Test resource cleanup failed: {cleanup_error!r}")
+    assert process is not None and process.returncode is not None
+    assert process.stdin is not None and process.stdin.is_closing()
+    assert process.stdout is not None and process.stdout.at_eof()
+    assert process.stderr is not None and process.stderr.at_eof()
+    assert all(scope.kernel_empty and scope.drained and scope.reaped for scope in scopes)
+    assert all(
+        proof.kernel_empty and proof.streams_drained and proof.custodian_reaped
+        for proof in controller.proofs
+    )
+    assert owner.done() and not controller.owners.tasks and not controller.owners.quarantined
+    assert not controller._tasks and not controller._connections
+    assert controller._closed and not controller._accepting.is_alive()
 
 
 async def test_repeated_cancellation_seals_without_resetting_budget(

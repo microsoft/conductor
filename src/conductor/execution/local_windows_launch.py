@@ -203,7 +203,13 @@ def _resolve(launch: ProcessLaunchSpec) -> str:
             if stat.S_ISREG(info.st_mode):
                 return candidate
     if sys.platform == "win32":
-        raise ctypes.WinError(2)
+        error = ctypes.WinError(2)
+        # Match CPython's native CreateProcess formatting only for this synthetic miss.
+        message = error.strerror
+        while message and (message[-1] <= " " or message[-1] == "."):
+            message = message[:-1]
+        error.strerror = message
+        raise error
     # Portable policy tests use the host's missing-file data, never a simulated Win32 result.
     raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT))
 
