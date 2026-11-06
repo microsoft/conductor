@@ -1248,6 +1248,42 @@ class TestDryRunDisplayFunctions:
 class TestBuildDryRunPlan:
     """Tests for build_dry_run_plan function."""
 
+    async def test_actual_dry_run_provider_managed_contract(
+        self, tmp_path: Path, sample_workflow_yaml: str
+    ) -> None:
+        # Requirement: the actual dry-run provider accepts None but refuses managed ownership.
+        from conductor.cli.run import build_dry_run_plan
+        from conductor.config.schema import AgentDef
+        from conductor.engine.workflow import WorkflowEngine
+        from conductor.exceptions import ProviderError
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext
+        from conductor.providers.base import AgentProvider
+        from conductor.providers.capabilities import ProviderCapabilities
+
+        workflow_file = tmp_path / "dry-run.yaml"
+        workflow_file.write_text(sample_workflow_yaml)
+        with patch("conductor.cli.run.WorkflowEngine", wraps=WorkflowEngine) as engine:
+            plan = build_dry_run_plan(workflow_file)
+        assert plan.steps
+        provider = engine.call_args.kwargs["provider"]
+        assert isinstance(provider, AgentProvider)
+        agent = AgentDef.model_validate({"name": "dry", "prompt": "hello"})
+        assert (await provider.execute(agent, {}, "hello")).content == {}
+        assert (await provider.execute(agent, {}, "hello", managed_workspace=None)).content == {}
+        assert ProviderCapabilities.model_fields["managed_local_workspace"].default is False
+        assert provider.CAPABILITIES is None
+        controller = LocalProcessScopeController(str(tmp_path), "unsupported-mock")
+        context = ManagedWorkspaceContext(str(tmp_path), "unsupported-mock", controller)
+        try:
+            with pytest.raises(ProviderError) as error:
+                await provider.execute(agent, {}, "hello", managed_workspace=context)
+            assert error.value.is_retryable is False
+            assert controller.proofs == ()
+        finally:
+            await provider.close()
+            assert (await controller.close()).status == "released"
+
     def test_build_plan_simple_workflow(self, tmp_path: Path) -> None:
         """Test building execution plan for simple workflow."""
         from conductor.cli.run import build_dry_run_plan

@@ -49,6 +49,11 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   once. `has_structured_config()` counts either, so neither collapses to bare-string serialization.
 - Schema rejects `runtime_token` without `runtime_url`, empty/whitespace values, and both fields on
   any provider other than `copilot`.
+- Retained local calls require an owned native stdio runtime. `_managed_call` refuses an
+  external `runtime_url`, including the ambient `COPILOT_PROVIDER_RUNTIME_URL`, and an injected
+  external client. Keep this guard scoped to managed calls; the unmanaged external runtime path
+  remains supported. Each managed call registers its process scope and uses targeted workspace
+  release as described in the [local retained workspace design](../../design/local-retained-workspace.md).
 
 ### Dead spawned runtime recovery (#483)
 

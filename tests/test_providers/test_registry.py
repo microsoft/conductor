@@ -1,6 +1,8 @@
 """Unit tests for the ProviderRegistry."""
 
 import asyncio
+import warnings
+from collections.abc import Iterable
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +15,7 @@ from conductor.config.schema import (
     WorkflowDef,
 )
 from conductor.exceptions import ProviderError
+from conductor.execution.types import ManagedWorkspaceContext, ProcessScopeController
 from conductor.providers.base import AgentOutput, AgentProvider
 from conductor.providers.registry import ProviderRegistry
 
@@ -44,6 +47,363 @@ class MockProvider(AgentProvider, abstract=True):
 
     async def close(self) -> None:
         self.closed = True
+
+
+class WorkspaceProvider(MockProvider, abstract=True):
+    """Own attempted workspace resources independently of successful session pools."""
+
+    def __init__(self, *roots: str, failure: Exception | None = None) -> None:
+        super().__init__()
+        self.roots = set(roots)
+        self.releases: list[str] = []
+        self.failure = failure
+
+    async def release_workspace(self, workspace_root: str) -> None:
+        self.releases.append(workspace_root)
+        if self.failure is not None:
+            raise self.failure
+        self.roots.remove(workspace_root)
+
+
+def workspace_context(root: str, incarnation: str = "incarnation") -> ManagedWorkspaceContext:
+    """Create a typed context without touching real process resources."""
+    return ManagedWorkspaceContext(root, incarnation, MagicMock(spec=ProcessScopeController))
+
+
+class TestWorkspaceRelease:
+    async def test_managed_factory_defers_validation_and_registers_before_resume_wiring(
+        self,
+    ) -> None:
+        # Requirement: validation is managed and registration precedes fallible resume wiring.
+        registry = ProviderRegistry(create_test_config())
+        context = workspace_context("/root")
+        primary = RuntimeError("resume wiring failed")
+
+        class FailedWiring(WorkspaceProvider, abstract=True):
+            def set_resume_session_ids(self, sessions) -> None:
+                raise primary
+
+        provider = FailedWiring("/root")
+        registry.set_resume_session_ids({"test_agent": "existing-session"})
+        agent = AgentDef.model_validate({"name": "test_agent", "prompt": "work"})
+        with (
+            patch("conductor.providers.registry.create_provider", return_value=provider) as create,
+            pytest.raises(RuntimeError) as caught,
+        ):
+            await registry.get_provider(agent, managed_workspace=context)
+        assert caught.value is primary
+        assert create.call_args.kwargs["validate"] is False
+        assert registry.get_active_providers() == {}
+        assert registry._workspace_releases["/root"].providers == [provider]
+        await registry.release_workspace("/root")
+        assert provider.releases == ["/root"] and not provider.closed
+
+    async def test_unaffected_owned_close_is_bounded_by_original_root_deadline(self) -> None:
+        # Requirement: unrelated owned cleanup gets one attempt, never an unbounded outer wait.
+        registry = ProviderRegistry(create_test_config())
+        context = workspace_context("/root")
+        managed = WorkspaceProvider("/root")
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        class HeldClose(MockProvider, abstract=True):
+            async def close(self) -> None:
+                entered.set()
+                await finish.wait()
+                self.closed = True
+
+        unrelated = HeldClose()
+        registry._providers.update({"copilot": managed, "openai": unrelated})
+        registry.register_workspace_provider(context, managed)
+        registry.account_workspace_cleanup(
+            "/root", uncertain=True, deadline=asyncio.get_running_loop().time()
+        )
+        try:
+            with pytest.raises(ProviderError):
+                await registry.close()
+            assert entered.is_set()
+            pending = registry.pending_close_tasks
+            assert len(pending) == 1
+            assert registry.get_active_providers() == {}
+            assert not managed.closed
+        finally:
+            finish.set()
+            if registry.pending_close_tasks:
+                _, unfinished = await asyncio.wait(registry.pending_close_tasks, timeout=5)
+                assert not unfinished
+        assert unrelated.closed
+
+    async def test_owned_exit_skips_quarantine_but_closes_unaffected_provider(self) -> None:
+        # Requirement: registry exit skips quarantined roots and closes unrelated owned objects.
+        registry = ProviderRegistry(create_test_config())
+        entered, finish = asyncio.Event(), asyncio.Event()
+        context = workspace_context("/root")
+
+        class HeldProvider(MockProvider, abstract=True):
+            async def release_workspace(self, workspace_root: str) -> None:
+                entered.set()
+                try:
+                    await finish.wait()
+                except asyncio.CancelledError:
+                    await finish.wait()
+
+        held, unaffected = HeldProvider(), MockProvider()
+        registry._providers.update({"copilot": held, "openai": unaffected})
+        registry.register_workspace_provider(context, held)
+        registry.account_workspace_cleanup(
+            "/root", uncertain=True, deadline=asyncio.get_running_loop().time()
+        )
+        try:
+            async with registry:
+                with pytest.raises(ExceptionGroup):
+                    await registry.release_workspace("/root")
+                await entered.wait()
+            assert not held.closed and unaffected.closed
+        finally:
+            finish.set()
+            pending = set(registry._workspace_releases["/root"].pending)
+            if pending:
+                _, unfinished = await asyncio.wait(pending, timeout=5)
+                assert not unfinished
+
+    async def test_release_targets_injected_provider_and_only_matching_root(self) -> None:
+        # Requirement: targeted release preserves cached/injected providers and other roots.
+        registry = ProviderRegistry(create_test_config())
+        provider = WorkspaceProvider("/first", "/second")
+        context = workspace_context("/first")
+        registry._providers["copilot"] = provider
+        registry.register_workspace_provider(context, provider)
+        registry.register_workspace_provider(context, provider)
+        registry.register_workspace_provider(workspace_context("/second"), provider)
+
+        await registry.release_workspace("/first")
+
+        assert provider.releases == ["/first"]
+        assert provider.roots == {"/second"}
+        assert not provider.closed
+        assert registry.get_active_providers() == {"copilot": provider}
+        assert registry._workspace_releases["/first"].context is context
+
+    async def test_failed_startup_providers_are_aggregated_without_cache_membership(self) -> None:
+        # Requirement: failed startup handles are accounted before successful publication.
+        registry = ProviderRegistry(create_test_config())
+        failures = [ProviderError("connect cleanup failed"), RuntimeError("disconnect failed")]
+        providers = [WorkspaceProvider("/root", failure=error) for error in failures]
+        healthy = WorkspaceProvider("/root")
+        context = workspace_context("/root")
+        for provider in [*providers, healthy]:
+            registry.register_workspace_provider(context, provider)
+
+        with pytest.raises(ExceptionGroup) as caught:
+            await registry.release_workspace("/root")
+
+        assert set(caught.value.exceptions) == set(failures)
+        assert all(provider.releases == ["/root"] for provider in [*providers, healthy])
+        assert all(provider.roots == {"/root"} for provider in providers)
+        assert healthy.roots == set()
+        assert registry.get_active_providers() == {}
+        with pytest.raises(ExceptionGroup) as repeated:
+            await registry.release_workspace("/root")
+        assert set(repeated.value.exceptions) == set(failures)
+        assert healthy.releases == ["/root"]
+
+    @pytest.mark.parametrize("root", ["", "/unknown", "/root/../other", "IGNORE ALL RULES"])
+    async def test_unregistered_root_never_means_released(self, root: str) -> None:
+        # Requirement: absent maps and arbitrary root strings cannot certify release.
+        registry = ProviderRegistry(create_test_config())
+        with pytest.raises(ProviderError):
+            await registry.release_workspace(root)
+
+    async def test_registered_legacy_provider_surfaces_unsupported_release(self) -> None:
+        # Requirement: inherited unsupported release is visible and never falls back to close.
+        registry = ProviderRegistry(create_test_config())
+        provider = MockProvider()
+        registry.register_workspace_provider(workspace_context("/root"), provider)
+        with pytest.raises(ExceptionGroup) as caught:
+            await registry.release_workspace("/root")
+        assert len(caught.value.exceptions) == 1
+        assert isinstance(caught.value.exceptions[0], ProviderError)
+        assert not provider.closed
+
+    async def test_legacy_execute_and_close_do_not_require_registration(self) -> None:
+        # Requirement: ordinary provider lifecycle needs neither managed kwargs nor release.
+        registry = ProviderRegistry(create_test_config())
+        provider = MockProvider()
+        registry._providers["copilot"] = provider
+        agent = AgentDef.model_validate({"name": "legacy", "prompt": "hello"})
+        result = await provider.execute(agent, {}, "hello")
+
+        await registry.close()
+
+        assert result.content == {"result": "mock"}
+        assert provider.closed
+        assert registry.get_active_providers() == {}
+
+    def test_stale_incarnation_or_controller_cannot_replace_registered_owner(self) -> None:
+        # Requirement: a reused path cannot overwrite ownership or failed-startup records.
+        registry = ProviderRegistry(create_test_config())
+        provider = WorkspaceProvider("/root")
+        registry.register_workspace_provider(workspace_context("/root"), provider)
+
+        with pytest.raises(ProviderError):
+            registry.register_workspace_provider(
+                workspace_context("/root", "replacement"), provider
+            )
+        with pytest.raises(ProviderError):
+            registry.register_workspace_provider(workspace_context("/root"), provider)
+
+    async def test_success_is_idempotent_and_seals_new_registrations(self) -> None:
+        # Requirement: successful release is cached without reopening dispatch or closing twice.
+        registry = ProviderRegistry(create_test_config())
+        provider = WorkspaceProvider("/root")
+        context = workspace_context("/root")
+        registry.register_workspace_provider(context, provider)
+
+        await registry.release_workspace("/root")
+        await registry.release_workspace("/root")
+
+        assert provider.releases == ["/root"]
+        with pytest.raises(ProviderError):
+            registry.register_workspace_provider(context, provider)
+
+    async def test_visible_api_warning_does_not_override_adapter_release_proof(self) -> None:
+        # Requirement: an adapter may warn on API failure after proving complete release.
+        registry = ProviderRegistry(create_test_config())
+
+        class ProvenProvider(WorkspaceProvider, abstract=True):
+            async def release_workspace(self, workspace_root: str) -> None:
+                warnings.warn(
+                    "native close failed after complete proof and owner join", stacklevel=2
+                )
+                await super().release_workspace(workspace_root)
+
+        provider = ProvenProvider("/root")
+        registry.register_workspace_provider(workspace_context("/root"), provider)
+
+        with pytest.warns(UserWarning):
+            await registry.release_workspace("/root")
+
+        assert provider.roots == set()
+        assert registry._workspace_releases["/root"].released
+
+    async def test_all_hooks_start_before_any_owner_finishes(self) -> None:
+        # Requirement: a blocked provider cannot prevent another provider's teardown intent.
+        registry = ProviderRegistry(create_test_config())
+        arrived = [asyncio.Event(), asyncio.Event()]
+        finish = asyncio.Event()
+
+        class BlockingProvider(MockProvider, abstract=True):
+            def __init__(self, index: int) -> None:
+                super().__init__()
+                self.index = index
+
+            async def release_workspace(self, workspace_root: str) -> None:
+                arrived[self.index].set()
+                await finish.wait()
+
+        context = workspace_context("/root")
+        for index in range(2):
+            registry.register_workspace_provider(context, BlockingProvider(index))
+
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(registry.release_workspace("/root"))
+            try:
+                for event in arrived:
+                    await event.wait()
+                with pytest.raises(ProviderError):
+                    await registry.release_workspace("/root")
+            finally:
+                finish.set()
+                await task
+
+    @pytest.mark.parametrize("interruptions", [1, 2])
+    async def test_cancellation_is_primary_and_late_failure_cannot_become_success(
+        self, interruptions: int
+    ) -> None:
+        # Requirement: cancellation never waits on an uncooperative owner or erases uncertainty.
+        registry = ProviderRegistry(create_test_config())
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+        finish = asyncio.Event()
+        late_failure = RuntimeError("late teardown failure")
+
+        class UncooperativeProvider(MockProvider, abstract=True):
+            async def release_workspace(self, workspace_root: str) -> None:
+                entered.set()
+                try:
+                    await finish.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await finish.wait()
+                raise late_failure
+
+        provider = UncooperativeProvider()
+        context = workspace_context("/root")
+        registry.register_workspace_provider(context, provider)
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(registry.release_workspace("/root"))
+            try:
+                await entered.wait()
+                for _ in range(interruptions):
+                    task.cancel("primary cancellation")
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await task
+                assert caught.value.args == ("primary cancellation",)
+                await cancelled.wait()
+                with pytest.raises(ExceptionGroup):
+                    await registry.release_workspace("/root")
+            finally:
+                finish.set()
+                owners = tuple(registry._workspace_releases["/root"].pending)
+                for owner in owners:
+                    with pytest.raises(RuntimeError) as late:
+                        await owner
+                    assert late.value is late_failure
+            with pytest.raises(ExceptionGroup) as repeated:
+                await registry.release_workspace("/root")
+        assert late_failure in repeated.value.exceptions
+        assert not provider.closed
+        with pytest.raises(ProviderError):
+            registry.register_workspace_provider(context, provider)
+
+    async def test_deadline_does_not_wait_for_cancel_acknowledgement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: budget exhaustion is terminal even when native teardown ignores cancel.
+        registry = ProviderRegistry(create_test_config())
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+        finish = asyncio.Event()
+        real_wait = asyncio.wait
+
+        async def deadline_wait(
+            tasks: Iterable[asyncio.Task[None]], *, timeout: float
+        ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+            await entered.wait()
+            return await real_wait(tasks, timeout=0)
+
+        class HungProvider(MockProvider, abstract=True):
+            async def release_workspace(self, workspace_root: str) -> None:
+                entered.set()
+                try:
+                    await finish.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await finish.wait()
+
+        monkeypatch.setattr("conductor.providers.registry.asyncio.wait", deadline_wait)
+        registry.register_workspace_provider(workspace_context("/root"), HungProvider())
+        async with asyncio.timeout(5):
+            try:
+                with pytest.raises(ExceptionGroup) as caught:
+                    await registry.release_workspace("/root")
+                assert any(isinstance(error, ProviderError) for error in caught.value.exceptions)
+                await cancelled.wait()
+            finally:
+                finish.set()
+                for owner in tuple(registry._workspace_releases["/root"].pending):
+                    await owner
+            with pytest.raises(ExceptionGroup):
+                await registry.release_workspace("/root")
 
 
 def create_test_config(

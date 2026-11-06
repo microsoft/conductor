@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
@@ -27,6 +27,9 @@ from conductor.providers._pydantic_ai.retry import (
     RetryConfig as PydanticRetryConfig,
 )
 from conductor.providers.base import AgentOutput, EventCallback
+
+if TYPE_CHECKING:
+    from conductor.providers._pydantic_ai.interrupt import _ManagedRun
 
 
 def _model_name_from_pydantic_agent(
@@ -83,6 +86,7 @@ async def run_agent_pipeline(
     build_agent_fn: Callable[..., Agent[Any, Any]],
     message_history: Sequence[ModelMessage] | None = None,
     compaction: CompactionConfig | None = None,
+    managed_run: _ManagedRun | None = None,
 ) -> AgentOutput:
     """Run the shared Pydantic AI execution pipeline.
 
@@ -139,7 +143,15 @@ async def run_agent_pipeline(
     from conductor.providers._pydantic_ai.structured_output import extract_content
     from conductor.providers._pydantic_ai.usage import build_agent_output
 
+    if managed_run is not None:
+        managed_run.check_dispatch()
+
     def intercepting_callback(event_type: str, data: dict[str, Any]) -> None:
+        if managed_run is not None:
+            try:
+                managed_run.check_dispatch()
+            except ProviderError:
+                return
         if event_type == "agent_retry":
             retry_history.append(data)
         if event_callback is not None:
@@ -154,6 +166,7 @@ async def run_agent_pipeline(
                 tool_names,
                 tool_output_config,
                 event_callback=event_callback,
+                **({"managed_run": managed_run} if managed_run is not None else {}),
             )
         )
 
@@ -176,6 +189,7 @@ async def run_agent_pipeline(
             max_session_seconds=max_session_seconds,
             max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
             message_history=message_history,
+            **({"managed_run": managed_run} if managed_run is not None else {}),
         ),
         retry_config=retry_cfg,
         event_callback=intercepting_callback,
@@ -184,6 +198,8 @@ async def run_agent_pipeline(
 
     if outcome.is_cancelled:
         raise asyncio.CancelledError()
+    if managed_run is not None:
+        managed_run.check_dispatch()
 
     model_name = _model_name_from_pydantic_agent(pydantic_agent, default_model)
 

@@ -407,8 +407,6 @@ def lifecycle_engine(
     last: str = "$end",
 ) -> WorkflowEngine:
     path = tmp_path / "workflow.yaml"
-    if not path.exists():
-        path.write_text("workflow: test", encoding="utf-8")
     config = WorkflowConfig(
         workflow=WorkflowDef(
             name="retention",
@@ -435,6 +433,8 @@ def lifecycle_engine(
             WaitStepDef(name="pause", duration="30s", routes=[RouteDef(to="$end")]),
         ],
     )
+    if not path.exists():
+        path.write_text(config.model_dump_json(by_alias=True), encoding="utf-8")
     environment = ResolvedEnvironment(
         document=EnvironmentDocument(
             default="local",

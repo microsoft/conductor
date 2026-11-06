@@ -13,6 +13,7 @@ import logging
 import re
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,7 @@ from rich.prompt import Prompt
 from rich.text import Text
 
 from conductor.console import MarkupFreeConsole, make_console, styled
+from conductor.execution.types import ManagedWorkspaceContext
 from conductor.executor.linkify import linkify_markdown
 from conductor.gates.human import (
     DIALOG_SUBMIT_SENTINEL,
@@ -355,6 +357,10 @@ class DialogHandler:
         opening_question: str,
         provider: AgentProvider,
         base_dir: Path | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> DialogResult:
         """Run an interactive dialog session with the user.
 
@@ -388,6 +394,9 @@ class DialogHandler:
                 provider=provider,
                 dialog_id=dialog_id,
                 result=result,
+                managed_workspace=managed_workspace,
+                working_dir=working_dir,
+                on_dispatch=on_dispatch,
             )
 
         self._emit_event(
@@ -479,12 +488,24 @@ class DialogHandler:
             # Send to agent and get response
             history.append({"role": "user", "content": user_input})
             try:
-                agent_response = await provider.execute_dialog_turn(
-                    system_prompt=system_prompt,
-                    user_message=user_input,
-                    history=history[:-1],  # History excludes current message
-                    model=agent.model,
-                )
+                if managed_workspace is not None:
+                    if on_dispatch is not None:
+                        on_dispatch()
+                    agent_response = await provider.execute_dialog_turn(
+                        system_prompt,
+                        user_input,
+                        history[:-1],
+                        agent.model,
+                        managed_workspace=managed_workspace,
+                        working_dir=working_dir,
+                    )
+                else:
+                    agent_response = await provider.execute_dialog_turn(
+                        system_prompt=system_prompt,
+                        user_message=user_input,
+                        history=history[:-1],
+                        model=agent.model,
+                    )
             except Exception:
                 # Roll back the user turn so the next attempt doesn't leave two
                 # consecutive user messages in the provider context.
@@ -584,6 +605,10 @@ class DialogHandler:
         provider: AgentProvider,
         dialog_id: str,
         result: DialogResult,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> DialogResult:
         """Run a dialog session with input from the web dashboard.
 
@@ -656,12 +681,24 @@ class DialogHandler:
             # Send to agent and get response
             history.append({"role": "user", "content": user_input})
             try:
-                agent_response = await provider.execute_dialog_turn(
-                    system_prompt=system_prompt,
-                    user_message=user_input,
-                    history=history[:-1],
-                    model=agent.model,
-                )
+                if managed_workspace is not None:
+                    if on_dispatch is not None:
+                        on_dispatch()
+                    agent_response = await provider.execute_dialog_turn(
+                        system_prompt,
+                        user_input,
+                        history[:-1],
+                        agent.model,
+                        managed_workspace=managed_workspace,
+                        working_dir=working_dir,
+                    )
+                else:
+                    agent_response = await provider.execute_dialog_turn(
+                        system_prompt=system_prompt,
+                        user_message=user_input,
+                        history=history[:-1],
+                        model=agent.model,
+                    )
             except Exception:
                 # Roll back the user turn so the next attempt doesn't leave two
                 # consecutive user messages in the provider context.

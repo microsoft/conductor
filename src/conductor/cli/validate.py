@@ -149,6 +149,12 @@ def _report_execution_resolution(
     if manifest.workspace is not None:
         details.add_row("Workspace mode", manifest.workspace.mode)
         details.add_row("Workspace persistence", manifest.workspace.persistence)
+        if manifest.workspace.persistence != "ephemeral":
+            details.add_row(
+                "File realms",
+                "Retained local/Docker workspaces are independent; no filesystem "
+                "synchronization. Context JSON outputs are shared unchanged.",
+            )
     console.print(details)
     console.print(
         styled("  [dim]Path:[/dim] {}", environment.path if environment.path is not None else "—"),

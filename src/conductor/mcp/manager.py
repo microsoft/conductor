@@ -19,15 +19,21 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import stat
+import sys
 import tempfile
 import uuid
 from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from conductor import redaction
 from conductor.config.schema import ToolOutputConfig
+from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.local_windows_launch import merge_windows_environment
+from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,29 @@ MCP_SDK_AVAILABLE = ClientSession is not None
 
 
 _MISSING: Any = object()
+_CLEANUP_TIMEOUT_SECONDS = 30.0
+# The event loop only weakly references tasks blocked in transport teardown.
+_PENDING_LIFECYCLES: set[asyncio.Task[None]] = set()
+
+
+@dataclass
+class _ConnectionOwner:
+    """Retain an attempted connection and its cleanup outcome, independently of pools."""
+
+    name: str
+    stop: asyncio.Event
+    redact_errors: bool
+    stack: AsyncExitStack = field(default_factory=AsyncExitStack)
+    resources: list[Any] = field(default_factory=list)
+    deadline: float | None = None
+    cleanup_complete: bool = False
+    cleanup_error: BaseException | None = None
+    primary_error: BaseException | None = None
+    observed: bool = False
+    unconfirmed: bool = False
+    finished_at: float | None = None
+    invocation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    connected: bool = False
 
 
 def _scrub_log_value(obj: Any) -> Any:
@@ -127,12 +156,21 @@ class MCPManager:
         >>> await manager.close()
     """
 
-    def __init__(self, tool_output: ToolOutputConfig | None = None) -> None:
+    def __init__(
+        self,
+        tool_output: ToolOutputConfig | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+    ) -> None:
         """Initialize the MCP manager.
 
         Args:
             tool_output: MCP tool result output-size configuration. When None,
                 the default configuration is used.
+            managed_workspace: Owned local runtime context. Construction registers
+                this manager before any connect or successful pool insertion.
+                The caller must retain attempted managers and close them, even
+                when no connection succeeds. Only stdio is supported here.
 
         Raises:
             ImportError: If MCP SDK is not installed.
@@ -145,7 +183,50 @@ class MCPManager:
         self.tool_to_server: dict[str, str] = {}  # prefixed_name -> server
         self._connection_tasks: dict[str, asyncio.Task[None]] = {}
         self._connection_stops: dict[str, asyncio.Event] = {}
+        self._owners: dict[asyncio.Task[None], _ConnectionOwner] = {}
+        self._cleanup_uncertain: bool = False
+        self._strict_closed: bool = False
         self._tool_output = tool_output or ToolOutputConfig()
+        self._managed_workspace = managed_workspace
+        self._managed_stop = asyncio.Event()
+        self._managed_owner: asyncio.Task[None] | None = None
+        if managed_workspace is not None:
+            task = asyncio.create_task(self._own_managed_manager(), name="mcp-managed-manager")
+            _PENDING_LIFECYCLES.add(task)
+            task.add_done_callback(self._observe_managed_manager)
+            try:
+                managed_workspace.process_scopes.owners.register(None, task)
+            except ExecutionSpecError:
+                task.cancel()
+                raise
+            self._managed_owner = task
+
+    @property
+    def managed_workspace(self) -> ManagedWorkspaceContext | None:
+        """Return the exact context whose controller owns this manager."""
+        return self._managed_workspace
+
+    def _observe_managed_manager(self, task: asyncio.Task[None]) -> None:
+        _PENDING_LIFECYCLES.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _own_managed_manager(self) -> None:
+        """Own attempted connections independently of a caller's successful pool.
+
+        This root owner only waits for its own invocation barriers, never the
+        root barrier containing itself. Root disposal belongs to the caller.
+        """
+        await self._managed_stop.wait()
+        tasks = list(self._owners)
+        for task in tasks:
+            owner = self._owners[task]
+            self._begin_cleanup(owner)
+            if not owner.connected and owner.primary_error is None and not task.done():
+                task.cancel()
+        await self._join_owners(tasks)
+        if self._cleanup_uncertain:
+            raise RuntimeError("MCP managed cleanup is unconfirmed")
 
     async def connect_server(
         self,
@@ -201,13 +282,18 @@ class MCPManager:
         session_type = ClientSession
         if name in self._connection_tasks:
             raise RuntimeError(f"MCP server '{name}' is already connected or connecting")
+        if self._strict_closed:
+            raise RuntimeError("MCP manager has been strictly closed")
 
-        logger.info(
-            "Connecting to MCP server '%s': %s %s",
-            name,
-            _scrub_log_value(command),
-            _scrub_log_value(args or []),
-        )
+        if self._managed_workspace is None:
+            logger.info(
+                "Connecting to MCP server '%s': %s %s",
+                name,
+                _scrub_log_value(command),
+                _scrub_log_value(args or []),
+            )
+        else:
+            logger.info("Connecting to managed MCP server '%s'", name)
 
         # Build server parameters
         server_params = server_parameters_type(
@@ -219,88 +305,189 @@ class MCPManager:
 
         ready: asyncio.Future[list[dict[str, Any]]] = asyncio.get_running_loop().create_future()
         stop = asyncio.Event()
+        owner = _ConnectionOwner(name=name, stop=stop, redact_errors=redact_errors)
+        registered = asyncio.Event()
 
         async def own_connection_lifecycle() -> None:
+            await registered.wait()
             try:
-                async with AsyncExitStack() as stack:
-                    transport = await stack.enter_async_context(open_stdio(server_params))
-                    read_stream, write_stream = transport
-                    session = await stack.enter_async_context(
-                        session_type(read_stream, write_stream)
-                    )
-                    await session.initialize()
+                async with owner.stack as stack:
+                    try:
+                        params = server_params
+                        managed = self._managed_workspace
+                        if managed is not None:
+                            # Match the native SDK's filtered inheritance and overlay;
+                            # never substitute the controller's ambient environment.
+                            from mcp.client.stdio import (
+                                DEFAULT_INHERITED_ENV_VARS,
+                                get_default_environment,
+                            )
 
-                    response = await session.list_tools()
-                    tools: list[dict[str, Any]] = []
-                    for tool in response.tools:
-                        prefixed_name = f"{name}__{tool.name}"
-                        tools.append(
-                            {
-                                "name": prefixed_name,
-                                "description": tool.description or "",
-                                # model_dump(by_alias=True) works for Tool, but the
-                                # helper keeps both rename sites in one idiom.
-                                "input_schema": _mcp_field(tool, "input_schema", "inputSchema"),
-                                "server": name,
-                                "original_name": tool.name,
-                            }
-                        )
-                        self.tool_to_server[prefixed_name] = name
+                            if (
+                                cwd is None
+                                or not Path(cwd).is_absolute()
+                                or not Path(cwd)
+                                .resolve()
+                                .is_relative_to(Path(managed.root).resolve())
+                            ):
+                                raise ExecutionSpecError(
+                                    "Managed MCP requires an absolute mapped workspace cwd"
+                                )
+                            inherited_env = get_default_environment()
+                            effective_env = (
+                                merge_windows_environment(
+                                    inherited_env,
+                                    env or {},
+                                    canonical_names=DEFAULT_INHERITED_ENV_VARS,
+                                )
+                                if sys.platform == "win32"
+                                else {**inherited_env, **(env or {})}
+                            )
+                            executable = command
+                            if sys.platform != "win32" and not os.path.dirname(command):
+                                executable = (
+                                    shutil.which(
+                                        command, path=effective_env.get("PATH", os.defpath)
+                                    )
+                                    or command
+                                )
+                            launch = await managed.process_scopes.wrap_stdio(
+                                owner.invocation_id,
+                                ProcessLaunchSpec((executable, *(args or [])), effective_env, cwd),
+                            )
+                            params = server_parameters_type(
+                                command=launch.argv[0],
+                                args=list(launch.argv[1:]),
+                                env=dict(launch.env),
+                                cwd=launch.working_dir,
+                            )
+                        transport_context = open_stdio(params)
+                        owner.resources.append(transport_context)
+                        transport = await stack.enter_async_context(transport_context)
+                        owner.resources.append(transport)
+                        read_stream, write_stream = transport
+                        session_context = session_type(read_stream, write_stream)
+                        owner.resources.append(session_context)
+                        session = await stack.enter_async_context(session_context)
+                        owner.resources.append(session)
+                        await session.initialize()
 
-                    self.sessions[name] = session
-                    self.tools[name] = tools
-                    ready.set_result(tools)
-                    await stop.wait()
-            except asyncio.CancelledError:
-                if not ready.done():
-                    ready.cancel()
+                        response = await session.list_tools()
+                        tools: list[dict[str, Any]] = []
+                        for tool in response.tools:
+                            prefixed_name = f"{name}__{tool.name}"
+                            tools.append(
+                                {
+                                    "name": prefixed_name,
+                                    "description": tool.description or "",
+                                    "input_schema": _mcp_field(tool, "input_schema", "inputSchema"),
+                                    "server": name,
+                                    "original_name": tool.name,
+                                }
+                            )
+
+                        if stop.is_set() or (
+                            managed is not None
+                            and not managed.process_scopes.owners.mutations_allowed(
+                                owner.invocation_id
+                            )
+                        ):
+                            raise asyncio.CancelledError
+                        self.sessions[name] = session
+                        self.tools[name] = tools
+                        for tool in tools:
+                            self.tool_to_server[tool["name"]] = name
+                        owner.connected = True
+                        ready.set_result(tools)
+                        await stop.wait()
+                    except BaseException as exc:
+                        # Publish the primary outcome BEFORE potentially failing teardown.
+                        owner.primary_error = exc
+                        self._begin_cleanup(owner)
+                        if not ready.done():
+                            if isinstance(exc, asyncio.CancelledError):
+                                ready.cancel()
+                            else:
+                                ready.set_exception(exc)
+                        # Teardown must not receive and re-wrap the primary startup error.
+                    finally:
+                        if self._managed_workspace is not None:
+                            self._begin_cleanup(owner)
+            except BaseException as exc:
+                owner.cleanup_error = exc
+                if (
+                    self._managed_workspace is not None
+                    and redact_errors
+                    and not isinstance(exc, asyncio.CancelledError)
+                ):
+                    # The shared owner registry also logs task exceptions.
+                    # Preserve the real error chain without exposing its text
+                    # through that independent diagnostic sink.
+                    raise RuntimeError("MCP cleanup failed (details redacted)") from exc
                 raise
-            except Exception as exc:
-                if not ready.done():
-                    ready.set_exception(exc)
-                raise
+            else:
+                owner.cleanup_complete = True
+                if owner.primary_error is not None:
+                    if (
+                        self._managed_workspace is not None
+                        and redact_errors
+                        and not isinstance(owner.primary_error, asyncio.CancelledError)
+                    ):
+                        raise RuntimeError(
+                            "MCP startup failed (details redacted)"
+                        ) from owner.primary_error
+                    raise owner.primary_error
+            finally:
+                owner.finished_at = asyncio.get_running_loop().time()
 
         task = asyncio.create_task(
             own_connection_lifecycle(),
             name=f"mcp-lifecycle-{name}",
         )
+        if self._managed_workspace is not None:
+            try:
+                self._managed_workspace.process_scopes.owners.register(owner.invocation_id, task)
+            except ExecutionSpecError:
+                # The entry gate has never opened, so rejection cannot have
+                # spawned a payload or acquired native contexts.
+                _PENDING_LIFECYCLES.add(task)
+                task.add_done_callback(self._observe_managed_manager)
+                task.cancel()
+                raise
         self._connection_tasks[name] = task
         self._connection_stops[name] = stop
+        self._owners[task] = owner
+        _PENDING_LIFECYCLES.add(task)
+        task.add_done_callback(self._observe_owner)
+        registered.set()
 
         try:
-            tools = await asyncio.shield(ready)
+            if self._managed_workspace is None:
+                tools = await asyncio.shield(ready)
+            else:
+                terminal = asyncio.create_task(
+                    self._managed_workspace.process_scopes.owners.wait_terminal(owner.invocation_id)
+                )
+                try:
+                    await asyncio.wait({ready, terminal}, return_when=asyncio.FIRST_COMPLETED)
+                    if not ready.done():
+                        raise RuntimeError("MCP managed startup is unconfirmed")
+                    tools = ready.result()
+                finally:
+                    terminal.cancel()
         except asyncio.CancelledError:
             if not ready.done():
                 ready.cancel()
-            task.cancel()
-            cleanup = asyncio.gather(task, return_exceptions=True)
-            # Await the owner task's teardown under a re-shielding loop: a
-            # repeated cancellation of connect_server() lands on the shield
-            # instead of the gather, so cleanup still completes and the
-            # bookkeeping below always runs.
-            results: list[BaseException | None] | None = None
-            while results is None:
-                try:
-                    results = list(await asyncio.shield(cleanup))
-                except asyncio.CancelledError:
-                    if cleanup.done():
-                        results = list(cleanup.result())
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(
-                        "Error cancelling MCP connection '%s': %s",
-                        name,
-                        _scrub_log_value(str(result)),
-                    )
-            self._connection_tasks.pop(name, None)
-            self._connection_stops.pop(name, None)
-            self._discard_server_state(name)
+            elif not ready.cancelled():
+                ready.exception()
+            if not stop.is_set():
+                self._begin_cleanup(owner)
+                task.cancel()
+            await self._join_owners([task])
             raise
         except Exception as exc:
-            await asyncio.gather(task, return_exceptions=True)
-            self._connection_tasks.pop(name, None)
-            self._connection_stops.pop(name, None)
-            self._discard_server_state(name)
+            self._begin_cleanup(owner)
+            await self._join_owners([task])
             if redact_errors:
                 logger.error(
                     "Failed to connect to MCP server '%s' "
@@ -785,41 +972,190 @@ class MCPManager:
         for tool_name in stale_tools:
             self.tool_to_server.pop(tool_name, None)
 
-    async def close(self) -> None:
+    def _begin_cleanup(self, owner: _ConnectionOwner) -> None:
+        if self._managed_workspace is not None:
+            controller = self._managed_workspace.process_scopes
+            controller.begin_teardown(owner.invocation_id, deadline=owner.deadline)
+            deadline = controller.owners.deadline(owner.invocation_id)
+            if deadline is not None:
+                owner.deadline = (
+                    min(owner.deadline, deadline) if owner.deadline is not None else deadline
+                )
+        elif owner.deadline is None:
+            owner.deadline = asyncio.get_running_loop().time() + _CLEANUP_TIMEOUT_SECONDS
+        owner.stop.set()
+
+    def _observe_owner(self, task: asyncio.Task[None]) -> None:
+        """Consume late failures without erasing uncertainty or failed resource handles."""
+        owner = self._owners[task]
+        if owner.observed:
+            return
+        owner.observed = True
+        _PENDING_LIFECYCLES.discard(task)
+        if not task.cancelled():
+            task.exception()
+        if (
+            self._managed_workspace is None
+            and owner.deadline is not None
+            and owner.finished_at is not None
+            and owner.finished_at > owner.deadline
+        ):
+            if not owner.unconfirmed:
+                logger.warning("MCP cleanup deadline expired for '%s'", owner.name)
+            owner.unconfirmed = True
+            self._cleanup_uncertain = True
+        if not owner.cleanup_complete or owner.cleanup_error is not None:
+            # Legacy strict cleanup has no independent resource proof. Managed
+            # API exit errors remain warnings only if the controller later
+            # confirms every process and joined owner; an owner that never
+            # entered cleanup cannot establish that contract.
+            if self._managed_workspace is None or owner.cleanup_error is None:
+                self._cleanup_uncertain = True
+            if owner.redact_errors:
+                logger.warning("MCP cleanup failed for '%s' (details redacted)", owner.name)
+            else:
+                action = (
+                    "cancelling"
+                    if isinstance(owner.primary_error, asyncio.CancelledError)
+                    else "closing"
+                )
+                logger.warning(
+                    "Error %s MCP connection '%s': %s",
+                    action,
+                    owner.name,
+                    _scrub_log_value(str(owner.cleanup_error or "owner did not complete cleanup")),
+                )
+        elif self._managed_workspace is None:
+            owner.resources.clear()
+        if self._connection_tasks.get(owner.name) is task:
+            self._connection_tasks.pop(owner.name, None)
+            self._connection_stops.pop(owner.name, None)
+            self._discard_server_state(owner.name)
+
+    async def _join_owners(self, tasks: list[asyncio.Task[None]]) -> bool:
+        """Observe teardown within its original budget, without cancelling the wait target."""
+        if self._managed_workspace is not None:
+            return await self._join_managed_owners(tasks)
+        cancelled = False
+        pending = {task for task in tasks if not task.done() and not self._owners[task].unconfirmed}
+        while pending:
+            for task in tuple(pending):
+                owner = self._owners[task]
+                if task.done():
+                    pending.remove(task)
+                elif (
+                    owner.deadline is not None
+                    and owner.deadline <= asyncio.get_running_loop().time()
+                ):
+                    owner.unconfirmed = True
+                    self._cleanup_uncertain = True
+                    self._discard_server_state(owner.name)
+                    logger.warning("MCP cleanup deadline expired for '%s'", owner.name)
+                    pending.remove(task)
+            if not pending:
+                break
+            deadlines = [self._owners[task].deadline for task in pending]
+            deadline = min(value for value in deadlines if value is not None)
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            try:
+                _, pending = await asyncio.wait(pending, timeout=remaining)
+            except asyncio.CancelledError:
+                cancelled = True
+        for task in tasks:
+            if task.done():
+                self._observe_owner(task)
+        return cancelled
+
+    async def _join_managed_owners(self, tasks: list[asyncio.Task[None]]) -> bool:
+        """Join native owners and process proofs under the controller's original deadline."""
+        assert self._managed_workspace is not None
+        controller = self._managed_workspace.process_scopes
+        cancelled = False
+        for task in tasks:
+            owner = self._owners[task]
+            while True:
+                try:
+                    observed = await controller.owners.observe(owner.invocation_id, task)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if task.done():
+                self._observe_owner(task)
+            if not observed:
+                owner.unconfirmed = True
+                self._cleanup_uncertain = True
+            while True:
+                try:
+                    result = await controller.await_release(owner.invocation_id)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if result.status != "released":
+                owner.unconfirmed = True
+                self._cleanup_uncertain = True
+                logger.warning(
+                    "Managed MCP cleanup is unconfirmed for '%s': %s",
+                    owner.name,
+                    _scrub_log_value(result.reasons),
+                )
+            elif observed and not owner.unconfirmed:
+                owner.resources.clear()
+            if self._connection_tasks.get(owner.name) is task and owner.unconfirmed:
+                self._discard_server_state(owner.name)
+        return cancelled
+
+    async def close(self, *, strict: bool = False) -> None:
         """Close all server connections and clean up resources.
 
-        This method should be called when the manager is no longer needed.
-        It properly closes all stdio connections and cleans up internal state.
-        Cancellation is deliberately absorbed until owner-task teardown
-        completes, so task-affine MCP contexts are never orphaned.
+        Legacy callers receive warnings on cleanup failure. With ``strict=True``,
+        seal new connections and raise RuntimeError unless every attempted owner
+        finished cleanup successfully, even if its startup failed or was cancelled.
+        Failed teardown or an expired budget remains uncertain for this manager's
+        lifetime, even after late completion.
+        Each teardown has a private 30-second observation budget; repeated calls
+        and cancellations never extend it. Pending owners remain strongly held.
+
+        With a managed context every close requires both native owner teardown
+        and invocation process proofs, even when strict is omitted. It never
+        closes the controller or waits for its root barrier. The outer root
+        owner still owns the final workspace barrier and disposal decision.
+        A native API exit error stays visible as a warning and in the owner
+        record; only complete process proof and actual owner join can make
+        that error non-blocking. Missing proof stays permanently uncertain.
         """
-        if not self._connection_tasks:
+        if self._managed_owner is not None:
+            assert self._managed_workspace is not None
+            self._strict_closed = True
+            for owner in self._owners.values():
+                self._begin_cleanup(owner)
+            self._managed_stop.set()
+            # A cancellation seals invocations, not the shared root containing
+            # this manager and potentially unrelated provider connections.
+            cancelled = False
+            controller = self._managed_workspace.process_scopes
+            observing = asyncio.create_task(controller.owners.observe(None, self._managed_owner))
+            while not observing.done():
+                try:
+                    await asyncio.wait({observing})
+                except asyncio.CancelledError:
+                    cancelled = True
+            observed = observing.result()
+            if cancelled:
+                raise asyncio.CancelledError
+            if not observed:
+                self._cleanup_uncertain = True
+                raise RuntimeError("MCP managed cleanup is unconfirmed")
+            self._managed_owner.result()
             return
-
-        logger.debug(f"Closing {len(self._connection_tasks)} MCP server connection(s)")
-
-        for stop in self._connection_stops.values():
-            stop.set()
-
-        cleanup = asyncio.gather(*self._connection_tasks.values(), return_exceptions=True)
-        # Await teardown under a re-shielding loop: a repeated cancellation of
-        # close() lands on the shield instead of the gather, so cleanup still
-        # completes before bookkeeping is cleared.
-        results: list[BaseException | None] | None = None
-        while results is None:
-            try:
-                results = list(await asyncio.shield(cleanup))
-            except asyncio.CancelledError:
-                if cleanup.done():
-                    results = list(cleanup.result())
-
-        self.sessions.clear()
-        self.tools.clear()
-        self.tool_to_server.clear()
-        self._connection_tasks.clear()
-        self._connection_stops.clear()
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning("Error closing MCP connections: %s", _scrub_log_value(str(result)))
-
-        logger.debug("MCP manager closed")
+        if strict:
+            self._strict_closed = True
+        tasks = list(self._owners)
+        for task in tasks:
+            self._begin_cleanup(self._owners[task])
+        cancelled = await self._join_owners(tasks)
+        if strict and cancelled:
+            raise asyncio.CancelledError
+        if strict and self._cleanup_uncertain:
+            raise RuntimeError(
+                "MCP cleanup is unconfirmed; attempted lifecycle owners failed to close"
+            )

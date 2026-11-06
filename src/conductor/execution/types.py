@@ -13,9 +13,11 @@ the original exception for ``raise ... from ...`` chaining.
 
 from __future__ import annotations
 
+from asyncio import Future
+from asyncio.subprocess import Process
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 CommandOutcome = Literal["completed", "command_not_found", "start_failed", "timed_out"]
 """Outcome of a single command execution.
@@ -59,6 +61,152 @@ class BundleRef:
     """Host directory and staged namespace pairs for runtime path translation."""
     agent_paths: tuple[tuple[str, str], ...] = ()
     """Host skill/plugin directory and its collected staged namespace."""
+
+
+@dataclass(frozen=True, slots=True)
+class ShutdownResult:
+    """Internal release proof, never a command outcome or checkpoint field.
+
+    Unconfirmed is terminal for this teardown attempt and does not authorize
+    workspace deletion, even if resources finish later.
+    """
+
+    status: Literal["released", "unconfirmed"]
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessProof:
+    """Internal audit snapshot; DONE alone does not prove facade/owner release."""
+
+    scope_id: str
+    invocation_id: str
+    process_incarnation: str
+    kernel_empty: bool
+    streams_drained: bool
+    facade_exited: bool
+    custodian_reaped: bool
+    done: bool
+    events: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessLaunchSpec:
+    """Private launch configuration; never persist or log launch credentials."""
+
+    argv: tuple[str, ...] = field(repr=False)
+    env: Mapping[str, str] = field(repr=False)
+    working_dir: str
+    control_token: str | None = field(default=None, repr=False)
+
+
+class ProcessOwnerRegistry(Protocol):
+    """Internal resource-owner seam, separate from process and command results."""
+
+    def register[T](self, invocation_id: str | None, owner: Future[T]) -> None:
+        """Register the owner before yielding to its first spawn."""
+        ...
+
+    async def observe[T](self, invocation_id: str | None, owner: Future[T]) -> bool:
+        """True permits result(); False means terminal uncertainty, not a join."""
+        ...
+
+    def mutations_allowed(self, invocation_id: str | None) -> bool:
+        """Check before an owner writes checkpoint or terminal state."""
+        ...
+
+    def deadline(self, invocation_id: str | None = None) -> float | None:
+        """Earliest original monotonic deadline, never a new relative budget."""
+        ...
+
+    async def wait_terminal(self, invocation_id: str | None = None) -> ShutdownResult:
+        """Observe terminal proof/failure without starting a teardown episode."""
+        ...
+
+    @property
+    def quarantined(self) -> int:
+        """Count unfinished quarantined owners for this root."""
+        ...
+
+
+class ProcessScopeController(Protocol):
+    """Per-run process custody contract for managed local consumers.
+
+    Implementations transition ACTIVE -> STOPPING -> RELEASED or UNCONFIRMED.
+    Teardown seals registrations before native owner shutdown; API close alone
+    is not release proof. Only kernel-empty, drained streams and joined owners
+    permit a released result.
+    """
+
+    scrub: Callable[[str], str]
+    """Retained run scrubber, available through the final owner diagnostic."""
+
+    @property
+    def owners(self) -> ProcessOwnerRegistry: ...
+
+    @property
+    def proofs(self) -> tuple[ProcessProof, ...]: ...
+
+    def check_admission(self) -> None:
+        """Refuse new work after root seal, without registering or mutating resources."""
+        ...
+
+    def register_launcher(self, invocation_id: str, launch: ProcessLaunchSpec) -> str:
+        """Register a launcher family before any payload may start."""
+        ...
+
+    def register_process(self, invocation_id: str, process: Process) -> str:
+        """Register an owned process before granting permission to execute."""
+        ...
+
+    async def wrap_stdio(self, invocation_id: str, launch: ProcessLaunchSpec) -> ProcessLaunchSpec:
+        """Wrap a stdio launch while preserving its target argv, env and cwd."""
+        ...
+
+    async def spawn_script(
+        self,
+        invocation_id: str,
+        spec: CommandSpec,
+        *,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> CommandResult:
+        """Execute a script under custody, preserving command outcome semantics."""
+        ...
+
+    def begin_teardown(
+        self, invocation_id: str | None = None, *, deadline: float | None = None
+    ) -> None:
+        """Seal an invocation, or the root when omitted, without killing payloads."""
+        ...
+
+    async def force_stop(self, scope_ids: tuple[str, ...]) -> None:
+        """Request forced cleanup of the selected process scopes."""
+        ...
+
+    async def await_release(self, invocation_id: str | None = None) -> ShutdownResult:
+        """Await bounded proof of release; uncertainty remains terminal."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedWorkspaceContext:
+    """Explicit per-run runtime handle, never part of serialized run state."""
+
+    root: str
+    incarnation: str
+    process_scopes: ProcessScopeController = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class LocalWorkspaceBinding:
+    """Backend-owned, nonpersistent binding to a managed local workspace."""
+
+    run_id: str
+    incarnation: str
+    workspace_root: str
+    work_root: str
+    bundle: BundleRef
+    runtime_context: ManagedWorkspaceContext = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -275,12 +423,15 @@ class RunSpec:
             for containerized execution realms, or ``None``.
         workspace_persistence: Retention policy for the workspace, or ``None``
             for legacy ephemeral behavior.
+        local_workspace_root: Absolute managed local root supplied by the engine
+            for actual local consumers only; ``None`` preserves legacy behavior.
     """
 
     run_id: str
     workflow_name: str | None = None
     bundle: BundleRef | None = None
     workspace_persistence: Literal["durable", "on-failure"] | None = None
+    local_workspace_root: str | None = None
 
 
 @dataclass(frozen=True)

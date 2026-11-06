@@ -8,6 +8,7 @@ import errno
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,7 +30,7 @@ from conductor.execution import (
     WorkspaceIdentity,
     WorkspaceLease,
 )
-from conductor.execution.errors import WorkspaceAttachError
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.executor.script import ScriptExecutor
 
 
@@ -60,6 +61,66 @@ class TestLocalRunnerBackend:
         assert lease.backend == "local"
         assert len(lease.incarnation) == 12
         assert lease.location is None
+
+    async def test_legacy_binding_is_none_without_filesystem_mutations(
+        self, tmp_path: Path
+    ) -> None:
+        # Requirement: legacy local preparation remains filesystem-free despite retention support.
+        backend = LocalRunnerBackend()
+        lease = await backend.prepare_run(RunSpec("run-1"))
+        before = tuple(tmp_path.iterdir())
+
+        binding = backend.local_workspace_binding(lease)
+
+        assert binding is None
+        assert backend.capabilities().retained_workspace is True
+        assert tuple(tmp_path.iterdir()) == before
+
+    @pytest.mark.parametrize("invalid", ["backend", "incarnation", "location", "foreign"])
+    async def test_binding_refuses_foreign_or_modified_lease(
+        self, tmp_path: Path, invalid: str
+    ) -> None:
+        # Requirement: lookup validates backend ownership and all lease fields without I/O.
+        backend = LocalRunnerBackend()
+        lease = await backend.prepare_run(RunSpec("run-1"))
+        foreign = await LocalRunnerBackend().prepare_run(RunSpec("run-1"))
+        candidates = {
+            "backend": replace(lease, backend="docker"),
+            "incarnation": replace(lease, incarnation="stale"),
+            "location": replace(lease, location=str(tmp_path / "unowned")),
+            "foreign": foreign,
+        }
+        before = tuple(tmp_path.iterdir())
+
+        with pytest.raises(ExecutionSpecError):
+            backend.local_workspace_binding(candidates[invalid])
+
+        assert tuple(tmp_path.iterdir()) == before
+        assert backend.local_workspace_binding(lease) is None
+
+    @pytest.mark.parametrize("stale", ["superseded", "finalized"])
+    async def test_binding_refuses_stale_lease(self, stale: str) -> None:
+        # Requirement: a replaced or finalized handle cannot retrieve a runtime binding.
+        backend = LocalRunnerBackend()
+        lease = await backend.prepare_run(RunSpec("run-1"))
+        if stale == "superseded":
+            _ = await backend.prepare_run(RunSpec("run-1"))
+        else:
+            await backend.finalize_run(lease, "succeeded")
+
+        with pytest.raises(ExecutionSpecError):
+            backend.local_workspace_binding(lease)
+
+    async def test_foreign_finalization_does_not_revoke_owned_binding(self) -> None:
+        # Requirement: finalization cannot remove state belonging to a different incarnation.
+        backend = LocalRunnerBackend()
+        lease = await backend.prepare_run(RunSpec("run-1"))
+        foreign = await LocalRunnerBackend().prepare_run(RunSpec("run-1"))
+
+        await backend.finalize_run(foreign, "failed")
+
+        assert backend.local_workspace_binding(lease) is None
+        await backend.finalize_run(lease, "succeeded")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("expect_staged", [False, True])

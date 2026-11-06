@@ -3173,13 +3173,21 @@ For script steps running on a Docker profile, `working_dir` resolves against the
 
 #### Mixed-Backend Workflow Warnings
 
-Workflows may combine `local` and `docker` script steps. When an environment document resolves script steps to both backends, `conductor validate` and the runtime engine emit a warning disclosing the snapshot boundary:
+Workflows may combine `local` and `docker` script steps. For ordinary local
+execution, validation and the runtime engine warn about the snapshot boundary.
+For example, validation can report:
 
 ```
 environment 'demo' mixes local and docker script backends: host_step (local), container_step (docker). Docker steps see the bundle snapshot collected before the run, not host filesystem mutations made by local steps.
 ```
 
-Docker steps execute against the pre-staged content-addressed run bundle in the named volume. Changes made to the host filesystem by earlier local script steps are not automatically mirrored into the container volume.
+For ordinary local execution, Docker steps see the pre-staged bundle, not host
+filesystem changes made by local scripts. With retained local execution,
+actual local and Docker file consumers instead use independent mutable
+workspaces. Conductor emits one runtime warning when both realms dispatch file
+consumers. Their files aren't synchronized, although context JSON outputs are
+passed between steps unchanged. An unused profile isn't a consumer. See
+[local retained workspaces](design/local-retained-workspace.md).
 
 ### Execution Profiles on Agent Steps
 
@@ -3687,7 +3695,10 @@ Only UTF-8 text files are supported. Non-UTF-8 files produce a `ConfigurationErr
 
 The `workflow.bundle` block declares static asset files and extra authorized filesystem roots for run bundle packaging.
 
-A run bundle collects the complete statically knowable file closure needed to run a workflow on remote or containerized backends. This closure includes included files (`!file` and `!yamlfile`), Jinja2 template partials, sub-workflows, skills, plugins, and declared assets.
+A run bundle collects the statically knowable file closure needed by Docker or
+retained local execution. It includes referenced files (`!file` and
+`!yamlfile`), Jinja2 template partials, sub-workflows, selected skills and
+plugins, and declared assets.
 
 ```yaml
 workflow:
@@ -3719,6 +3730,10 @@ workflow:
 By default, file collection is strictly confined to the workflow file's directory and pre-authorized cache locations (registry cache, plugin checkouts, and installed skills).
 
 If your workflow references external files or sub-workflows residing in parent or sibling directories (for example, `!file ../shared/prompt.md`), declare those directories in `additional_roots`. Entries in `additional_roots` may be relative paths or absolute paths.
+
+An additional root authorizes collection from that location. It doesn't
+include every file under the root; files must still be selected as
+dependencies or assets.
 
 ### Bundle Errors and Remedies
 
@@ -3754,7 +3769,10 @@ workflow:
 
 ### Runtime Execution Note
 
-The `workflow.bundle` section is consumed by `conductor bundle build` and `conductor validate --environment`. Standard local execution via `conductor run` and `conductor resume` ignores this block.
+`conductor bundle build` and `conductor validate --environment` use this
+block. `run` and `resume` also collect a bundle for Docker and for actual
+retained local file consumers. Ordinary local execution without retained
+persistence keeps its existing host-local behavior.
 
 ## Complete Example
 
@@ -3841,7 +3859,9 @@ output:
 
 ## Workspace Lifecycle
 
-Workflows can control how workspace files and directories persist across steps, runs, and resumptions. This is especially useful for containerized workloads using the Docker execution backend, where rebuilding dependencies on every retry is slow.
+Workflows can retain workspace files across steps and resumptions with the
+local or Docker backend. Retained local execution uses a mutable copy of the
+selected run bundle, not the source files or the bundle cache.
 
 ### Configuration (`workflow.workspace`)
 
@@ -3857,11 +3877,22 @@ workflow:
 
 #### Fields and Defaults
 
-* **`mode`** (default `shared`): Defines how workspace storage is shared across steps in the run. Currently, only `shared` is implemented. The value `isolated` is reserved for future per-step sandbox isolation.
-* **`persistence`** (default `ephemeral`): Defines volume retention when the workflow concludes:
-  * `ephemeral`: The workspace is cleaned up when the run finishes, regardless of success or failure.
+* **`mode`** (default `shared`): Steps share one workspace per backend realm.
+  Local and Docker don't share a filesystem. `isolated` is reserved.
+* **`persistence`** (default `ephemeral`): Defines retention when the workflow concludes:
+  * `ephemeral`: Retained local execution is disabled. Local steps keep their
+    existing host-local behavior; Docker's ephemeral workspace is cleaned up.
   * `durable`: The workspace is retained after the run finishes, whether it succeeds, fails, or is cancelled.
   * `on-failure`: The workspace is retained if the workflow fails or is cancelled. If the workflow completes cleanly (including intentional exits via `type: terminate` with `status: success` or `status: failed`), the workspace is removed.
+
+Local retention requires an actual local script, agent, or direct MCP file
+consumer. The copied tree is shared by participating local steps, but it isn't
+a sandbox and changes aren't copied back to the source. Removal or reuse also
+requires confirmed runtime release; uncertain cleanup leaves the tree in
+place. See [local retained workspaces](design/local-retained-workspace.md)
+for paths, provider requirements, cleanup, and resume restrictions. The
+[example](../examples/local-retained-workspace.yaml) demonstrates two script
+steps using the same copied tree.
 
 #### Sub-workflow Inheritance
 
@@ -3869,7 +3900,11 @@ Workspace persistence is a run-global policy. Root workflows set the policy, and
 
 ### Restart Policy (`restart:`)
 
-When resuming a workflow that failed mid-step, Conductor uses the `restart:` policy to decide how to handle the in-flight step recorded in `checkpoint_saved.interrupted_step`.
+When resuming a workflow that failed mid-step, Conductor uses the `restart:`
+policy to decide how to handle the recorded interrupted step. Its status is
+unknown, so rerunning it can repeat side effects. A checkpoint without
+`interrupted_step` uses `current_agent` as a heuristic, not proof that the
+step was running.
 
 #### Configuration Positions
 
@@ -3910,7 +3945,9 @@ Conductor enforces fail-closed validation for features reserved for future relea
 
 1. **Reserved `mode: isolated`**: Setting `workflow.workspace.mode: isolated` raises a validation error stating that isolated workspaces are reserved for future sandbox isolation.
 2. **Reserved `restart.mode: reuse`**: Setting `restart.mode: reuse` raises a validation error stating that reuse restart mode is reserved for future step output reuse.
-3. **Local Backend Retained Error**: Setting `persistence: durable` or `persistence: on-failure` when steps target the `local` runner backend raises a configuration error stating that the local backend supports ephemeral workspaces only, and that retained workspaces require the `docker` runner backend.
+3. **Unsupported retained consumer**: A retained local agent requires a
+   provider that supports managed local execution and a working directory.
+   External Copilot runtimes aren't supported for this mode.
 
 ## See Also
 

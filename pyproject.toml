@@ -110,6 +110,7 @@ Changelog = "https://github.com/microsoft/conductor/releases"
 
 [project.scripts]
 conductor = "conductor.cli.app:app"
+conductor-local-scope = "conductor.execution.local_scope_launcher:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -152,6 +152,12 @@ Esc/Ctrl+G interrupt listener).
   validates workflow, environment, manifest and bundle digests before attaching a workspace or
   dispatching a step; `src/conductor/cli/run.py::resume_workflow_async` must pass the checkpoint
   through, including the background-run path.
+- A recorded non-null bundle digest is compared with the newly collected bundle; a recorded null
+  digest isn't treated as a non-null digest. Retained local attach verifies the original idle
+  incarnation and never repairs a missing identity or restages retained edits. An interrupted
+  attempt remains unknown, so restart policy determines whether to rerun or refuse it.
+  Runtime handles and bindings aren't checkpoint fields. See
+  [local retained workspace design](../design/local-retained-workspace.md).
 
 ### LimitEnforcer resume state
 

@@ -19,17 +19,25 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Coroutine, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.run import AgentRunResult
 from pydantic_graph.basenode import End
 
+from conductor.config.schema import MCPServerDef, ToolOutputConfig
 from conductor.exceptions import ProviderError
+from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.types import ManagedWorkspaceContext
+from conductor.filesystem import is_dir_strict
+from conductor.mcp.manager import MCPManager
 from conductor.providers._pydantic_ai.events import (
     emit_agent_turn_start,
     emit_output_recovery_event,
@@ -41,6 +49,343 @@ from conductor.telemetry import guards
 logger = logging.getLogger(__name__)
 
 EventCallback = Callable[[str, dict[str, Any]], None]
+
+
+@dataclass(slots=True)
+class _ManagedRun:
+    """Mutable accounting for resource leaves, never an engine orchestration task."""
+
+    workspace: _ManagedWorkspace
+    cwd: str
+    invocation_id: str = field(default_factory=lambda: uuid4().hex)
+    owner: asyncio.Task[Any] | None = None
+    tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    cancelled: set[asyncio.Task[Any]] = field(default_factory=set)
+    stopping: bool = False
+    deadline: float | None = None
+
+    def check_dispatch(self) -> None:
+        if self.workspace.sealed or self.stopping:
+            raise ProviderError("Managed Pydantic AI execution is sealed", is_retryable=False)
+        self.check_publish()
+
+    def check_publish(self) -> None:
+        scopes = self.workspace.context.process_scopes
+        if self.workspace.sealed or not scopes.owners.mutations_allowed(None):
+            raise ProviderError("Managed Pydantic AI workspace is sealed", is_retryable=False)
+        if self.owner is not None and not self.stopping:
+            try:
+                # Re-registration checks both seals before further dispatch.
+                # Publication after joined teardown uses the workspace guard.
+                scopes.owners.register(self.invocation_id, self.owner)
+            except ExecutionSpecError as error:
+                raise ProviderError(
+                    "Managed Pydantic AI workspace is sealed", is_retryable=False
+                ) from error
+
+    def callback(self, callback: EventCallback | None) -> EventCallback | None:
+        if callback is None:
+            return None
+
+        def emit(event_type: str, data: dict[str, Any]) -> None:
+            try:
+                self.check_dispatch()
+            except ProviderError:
+                return
+            callback(event_type, data)
+
+        return emit
+
+    def spawn[T](
+        self, operation: Callable[[], Coroutine[Any, Any, T]], *, primary: bool = False
+    ) -> asyncio.Task[T]:
+        """Register an actual leaf before its coroutine can acquire resources."""
+        self.check_dispatch()
+        registered = asyncio.Event()
+
+        async def run() -> T:
+            await registered.wait()
+            self.check_dispatch()
+            return await operation()
+
+        task = asyncio.create_task(run())
+        self.tasks.add(task)
+        if primary:
+            self.owner = task
+        task.add_done_callback(self._observe)
+        try:
+            self.workspace.context.process_scopes.owners.register(self.invocation_id, task)
+        except ExecutionSpecError as error:
+            task.cancel()
+            raise ProviderError(
+                "Managed Pydantic AI resource registration is sealed", is_retryable=False
+            ) from error
+        registered.set()
+        return task
+
+    @staticmethod
+    def _observe(task: asyncio.Task[Any]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    def begin_teardown(self) -> None:
+        self.stopping = True
+        scopes = self.workspace.context.process_scopes
+        scopes.begin_teardown(self.invocation_id, deadline=self.deadline)
+        deadline = scopes.owners.deadline(self.invocation_id)
+        if deadline is not None:
+            self.deadline = min(self.deadline, deadline) if self.deadline is not None else deadline
+
+    def cancel(self, task: asyncio.Task[Any]) -> None:
+        if not task.done() and task not in self.cancelled:
+            self.cancelled.add(task)
+            task.cancel()
+
+    async def join(self, task: asyncio.Task[Any]) -> bool:
+        """Observe the real task, never wait for a resistant cancel acknowledgement."""
+        scopes = self.workspace.context.process_scopes
+        observer = asyncio.create_task(scopes.owners.observe(self.invocation_id, task))
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            while not observer.done():
+                try:
+                    await asyncio.wait({observer})
+                except asyncio.CancelledError as error:
+                    cancelled = cancelled or error
+                    self.begin_teardown()
+                    self.cancel(task)
+            joined = observer.result()
+            if not joined:
+                self.workspace.failed = True
+            if cancelled is not None:
+                raise cancelled
+            return joined
+        finally:
+            observer.cancel()
+
+    async def wait[T](self, task: asyncio.Task[T]) -> T:
+        if not await self.join(task):
+            raise ProviderError("Managed Pydantic AI owner is unconfirmed", is_retryable=False)
+        return task.result()
+
+    async def finish(self) -> None:
+        self.begin_teardown()
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                proof = await self.workspace.context.process_scopes.await_release(
+                    self.invocation_id
+                )
+                break
+            except asyncio.CancelledError as error:
+                cancelled = cancelled or error
+        if proof.status != "released":
+            self.workspace.failed = True
+            logger.warning(
+                "Managed Pydantic AI invocation release is unconfirmed: %s", proof.reasons
+            )
+            if cancelled is None:
+                raise ProviderError(
+                    "Managed Pydantic AI invocation release is unconfirmed", is_retryable=False
+                )
+        if cancelled is not None:
+            raise cancelled
+
+
+@dataclass(slots=True)
+class _ManagedWorkspace:
+    """Retain attempted managers and leaves for one immutable context identity."""
+
+    context: ManagedWorkspaceContext
+    runs: list[_ManagedRun] = field(default_factory=list)
+    managers: list[MCPManager] = field(default_factory=list)
+    tool_grants: dict[MCPManager, dict[str, frozenset[str] | None]] = field(default_factory=dict)
+    pool: dict[str, MCPManager] = field(default_factory=dict)
+    locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    closers: list[asyncio.Task[None]] = field(default_factory=list)
+    sealed: bool = False
+    failed: bool = False
+
+    @classmethod
+    def for_context(
+        cls, workspaces: dict[str, _ManagedWorkspace], context: ManagedWorkspaceContext
+    ) -> _ManagedWorkspace:
+        workspace = workspaces.get(context.root)
+        if workspace is None:
+            workspace = cls(context)
+            workspaces[context.root] = workspace
+        if (
+            workspace.sealed
+            or workspace.context.incarnation != context.incarnation
+            or workspace.context.process_scopes is not context.process_scopes
+        ):
+            raise ProviderError(
+                "Managed Pydantic AI workspace is sealed or stale", is_retryable=False
+            )
+        return workspace
+
+    async def call[T](
+        self, cwd: str | None, operation: Callable[[_ManagedRun], Coroutine[Any, Any, T]]
+    ) -> T:
+        work_root = (Path(self.context.root) / "work").resolve()
+        directory = Path(cwd) if cwd is not None else None
+        if (
+            directory is None
+            or not directory.is_absolute()
+            or not directory.resolve().is_relative_to(work_root)
+            or not is_dir_strict(directory)
+        ):
+            raise ProviderError(
+                "Managed Pydantic AI requires an explicit mapped cwd "
+                "inside the workspace work tree",
+                is_retryable=False,
+            )
+        invocation = _ManagedRun(self, str(directory))
+        self.runs.append(invocation)
+
+        async def run() -> T:
+            try:
+                return await operation(invocation)
+            finally:
+                invocation.begin_teardown()
+
+        owner = invocation.spawn(run, primary=True)
+        try:
+            result = await invocation.wait(owner)
+        except BaseException:
+            try:
+                await invocation.finish()
+            except (ProviderError, asyncio.CancelledError) as cleanup_error:
+                # The primary SDK error/cancellation stays primary. Failed
+                # proofs are already sticky and separately reach root release.
+                logger.warning(
+                    "Managed Pydantic AI teardown raised %s; preserving the primary failure",
+                    type(cleanup_error).__name__,
+                )
+            raise
+        await invocation.finish()
+        invocation.check_publish()
+        return result
+
+    async def manager_for(
+        self,
+        invocation: _ManagedRun,
+        servers: dict[str, Any] | None,
+        tool_output: ToolOutputConfig,
+    ) -> MCPManager | None:
+        invocation.check_dispatch()
+        if not servers:
+            return None
+        from conductor.mcp.manager import MCP_SDK_AVAILABLE
+
+        if not MCP_SDK_AVAILABLE:
+            raise ProviderError(
+                "Managed Pydantic AI MCP requires the installed SDK and stdio servers",
+                is_retryable=False,
+            )
+        grants: dict[str, frozenset[str] | None] = {}
+        for name, config in servers.items():
+            try:
+                server = MCPServerDef.model_validate(config)
+            except PydanticValidationError as error:
+                raise ProviderError(
+                    "Invalid managed Pydantic AI MCP configuration", is_retryable=False
+                ) from error
+            if server.type != "stdio" or server.url is not None or server.headers:
+                raise ProviderError(
+                    "Managed Pydantic AI MCP supports stdio command/args/env, "
+                    "not HTTP/SSE settings",
+                    is_retryable=False,
+                )
+            grants[name] = None if "*" in server.tools else frozenset(server.tools)
+        lock = self.locks.setdefault(invocation.cwd, asyncio.Lock())
+        async with lock:
+            invocation.check_dispatch()
+            if invocation.cwd in self.pool:
+                return self.pool[invocation.cwd]
+            manager = MCPManager(tool_output=tool_output, managed_workspace=self.context)
+            self.managers.append(manager)
+            self.tool_grants[manager] = grants
+            for name, config in servers.items():
+                invocation.check_dispatch()
+                try:
+                    await manager.connect_server(
+                        name=name,
+                        command=config["command"],
+                        args=config.get("args", []),
+                        env=config.get("env"),
+                        timeout=config.get("timeout"),
+                        cwd=invocation.cwd,
+                    )
+                except Exception:
+                    logger.warning("Managed MCP server '%s' failed to connect", name)
+            invocation.check_dispatch()
+            if manager.has_servers():
+                self.pool[invocation.cwd] = manager
+            return manager
+
+    async def release(self) -> None:
+        """Join only this provider's resources; the caller owns the root barrier."""
+        scopes = self.context.process_scopes
+        if not self.sealed:
+            self.sealed = True
+            # This intent preserves an earlier root/invocation deadline. Never
+            # await the root barrier containing the provider release hook.
+            scopes.begin_teardown()
+            self.pool.clear()
+            for invocation in self.runs:
+                invocation.begin_teardown()
+                for task in invocation.tasks:
+                    invocation.cancel(task)
+            for manager in self.managers:
+                task = asyncio.create_task(manager.close(strict=True))
+                self.closers.append(task)
+                task.add_done_callback(self._observe_close)
+        pending = {
+            task
+            for task in [*self.closers, *(task for run in self.runs for task in run.tasks)]
+            if not task.done()
+        }
+        terminal = asyncio.create_task(scopes.owners.wait_terminal())
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            while pending:
+                if terminal.done() and terminal.result().status == "unconfirmed":
+                    self.failed = True
+                    break
+                try:
+                    done, _ = await asyncio.wait(
+                        pending | ({terminal} if not terminal.done() else set()),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError as error:
+                    cancelled = cancelled or error
+                    continue
+                pending.difference_update(done)
+                if terminal in done and terminal.result().status == "unconfirmed":
+                    self.failed = True
+                    break
+            for task in self.closers:
+                if task.done():
+                    self._observe_close(task)
+            if pending:
+                self.failed = True
+            if not scopes.owners.mutations_allowed(None):
+                proof = await scopes.owners.wait_terminal()
+                if proof.status != "released":
+                    self.failed = True
+            if cancelled is not None:
+                raise cancelled
+            if self.failed:
+                raise ProviderError(
+                    "Managed Pydantic AI workspace release is unconfirmed", is_retryable=False
+                )
+        finally:
+            terminal.cancel()
+
+    def _observe_close(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled() or task.exception() is not None:
+            self.failed = True
 
 
 _INTERRUPTION_USER_PROMPT = (
@@ -180,6 +525,7 @@ async def run_with_interrupt(
     max_session_seconds: float | None = None,
     max_parse_recovery_attempts: int = 0,
     message_history: Sequence[ModelMessage] | None = None,
+    managed_run: _ManagedRun | None = None,
 ) -> RunOutcome:
     """Run a Pydantic AI agent with Conductor interrupt support.
 
@@ -219,13 +565,19 @@ async def run_with_interrupt(
         A ``RunOutcome`` describing normal completion, partial output, or
         cancellation.
     """
+    if managed_run is not None:
+        managed_run.check_dispatch()
     interrupt_signal = interrupt_signal or asyncio.Event()
 
     if interrupt_signal.is_set():
         logger.info("Pydantic AI agent interrupted before first iteration")
         interrupt_signal.clear()
         return await _request_partial_output(
-            agent, list(message_history or []), event_callback, has_output_schema
+            agent,
+            list(message_history or []),
+            event_callback,
+            has_output_schema,
+            **({"managed_run": managed_run} if managed_run is not None else {}),
         )
 
     recovery_attempt = [0]
@@ -241,6 +593,8 @@ async def run_with_interrupt(
         ) as run:
             next_node = run.next_node
             while not isinstance(next_node, End):
+                if managed_run is not None:
+                    managed_run.check_dispatch()
                 iteration += 1
 
                 if max_session_seconds is not None:
@@ -256,22 +610,32 @@ async def run_with_interrupt(
                     logger.info("Pydantic AI agent interrupted between iterations")
                     interrupt_signal.clear()
                     return await _request_partial_output(
-                        agent, list(run.all_messages()), event_callback, has_output_schema
+                        agent,
+                        list(run.all_messages()),
+                        event_callback,
+                        has_output_schema,
+                        **({"managed_run": managed_run} if managed_run is not None else {}),
                     )
 
                 emit_agent_turn_start(event_callback, iteration)
 
                 if type(next_node).__name__ == "ModelRequestNode":
                     emit_agent_turn_start(event_callback, "awaiting_model")
-                    node_task = asyncio.create_task(
-                        _execute_node(
+
+                    def execute_node(node: Any = next_node) -> Coroutine[Any, Any, Any]:
+                        return _execute_node(
                             agent,
                             run,
-                            next_node,
+                            node,
                             event_callback,
                             recovery_attempt,
                             max_parse_recovery_attempts,
                         )
+
+                    node_task = (
+                        asyncio.create_task(execute_node())
+                        if managed_run is None
+                        else managed_run.spawn(execute_node)
                     )
                     signal_task = asyncio.create_task(interrupt_signal.wait())
                     finished: set[asyncio.Task[Any]]
@@ -281,18 +645,32 @@ async def run_with_interrupt(
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     except BaseException:
-                        node_task.cancel()
+                        if managed_run is not None:
+                            managed_run.begin_teardown()
+                            managed_run.cancel(node_task)
+                        else:
+                            node_task.cancel()
                         signal_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
-                            await node_task
+                            if managed_run is None:
+                                await node_task
+                            else:
+                                await managed_run.join(node_task)
                         with contextlib.suppress(asyncio.CancelledError):
                             await signal_task
                         raise
 
                     if signal_task in finished:
-                        node_task.cancel()
+                        if managed_run is not None:
+                            managed_run.begin_teardown()
+                            managed_run.cancel(node_task)
+                        else:
+                            node_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
-                            await node_task
+                            if managed_run is None:
+                                await node_task
+                            else:
+                                await managed_run.join(node_task)
                         interrupt_signal.clear()
                         logger.info("Pydantic AI agent interrupted during model API call")
                         return RunOutcome(is_cancelled=True)
@@ -306,14 +684,28 @@ async def run_with_interrupt(
                     except asyncio.CancelledError:
                         raise
                 else:
-                    next_node = await _execute_node(
-                        agent,
-                        run,
-                        next_node,
-                        event_callback,
-                        recovery_attempt,
-                        max_parse_recovery_attempts,
-                    )
+                    if managed_run is None:
+                        next_node = await _execute_node(
+                            agent,
+                            run,
+                            next_node,
+                            event_callback,
+                            recovery_attempt,
+                            max_parse_recovery_attempts,
+                        )
+                    else:
+                        next_node = await managed_run.wait(
+                            managed_run.spawn(
+                                lambda node=next_node: _execute_node(
+                                    agent,
+                                    run,
+                                    node,
+                                    event_callback,
+                                    recovery_attempt,
+                                    max_parse_recovery_attempts,
+                                )
+                            )
+                        )
 
     except UsageLimitExceeded as exc:
         request_limit = usage_limits.request_limit if usage_limits is not None else None
@@ -340,6 +732,8 @@ async def _request_partial_output(
     history: list[ModelMessage],
     event_callback: EventCallback | None,
     has_output_schema: bool,
+    *,
+    managed_run: _ManagedRun | None = None,
 ) -> RunOutcome:
     """Run one final model call asking for the best partial result.
 
@@ -357,12 +751,25 @@ async def _request_partial_output(
     # output_type=str bypasses the ToolOutput schema so the model answers
     # directly instead of retrying output-tool validation.
     with agent.override(toolsets=[], tools=[]):
-        result = await agent.run(
-            user_prompt=None,
-            message_history=partial_history,
-            output_type=str,
-            conversation_id=guards.current_run_id(),
-        )
+        if managed_run is None:
+            result = await agent.run(
+                user_prompt=None,
+                message_history=partial_history,
+                output_type=str,
+                conversation_id=guards.current_run_id(),
+            )
+        else:
+            result = await managed_run.wait(
+                managed_run.spawn(
+                    lambda: agent.run(
+                        user_prompt=None,
+                        message_history=partial_history,
+                        output_type=str,
+                        conversation_id=guards.current_run_id(),
+                    )
+                )
+            )
+            managed_run.check_dispatch()
     return RunOutcome(
         partial_output=result.output,
         is_partial=True,
