@@ -108,7 +108,12 @@ outside. Read [providers](../providers.md) first for the shared contract.
 
 ### Runtime config and working directory (#348)
 
-- `temperature` and `max_tokens` are rejected at the factory; `reasoning_effort=None` (not wired).
+- `temperature` and `max_tokens` are rejected at the factory.
+- `reasoning_effort=("low", "medium", "high", "xhigh", "max")`: `resolve_reasoning_effort`
+  (per-agent `reasoning.effort` over `runtime.default_reasoning_effort`) is forwarded verbatim as
+  `ClaudeAgentOptions.effort`, and `__init__` takes `default_reasoning_effort` like every other
+  provider. Unset stays out of argv, so the CLI keeps its own default. No per-model pre-flight:
+  this provider has no model-listing surface.
 - The engine-resolved `working_dir` is forwarded verbatim as `ClaudeAgentOptions.cwd`; do not
   re-resolve (it would collapse symlink aliases the engine preserves). Build options inside
   `execute`'s `try` so an `os.getcwd()` failure becomes a `ProviderError`. There is no provider-side

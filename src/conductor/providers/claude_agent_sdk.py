@@ -33,6 +33,7 @@ from conductor.providers.base import (
     refuse_mcp_server_clashes,
 )
 from conductor.providers.capabilities import ProviderCapabilities
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
     from claude_agent_sdk import SdkPluginConfig  # ty: ignore[unresolved-import]
@@ -1366,10 +1367,15 @@ class ClaudeAgentSdkProvider(AgentProvider):
         streaming_events=True,
         # ``ThinkingBlock`` content is forwarded as ``agent_reasoning``.
         agent_reasoning_events=True,
-        # The SDK does expose an ``effort`` field on ClaudeAgentOptions,
-        # but the provider does not currently wire ``agent.reasoning.effort``
-        # through to it. Declare ``None`` until that plumbing exists.
-        reasoning_effort=None,
+        # ``ClaudeAgentOptions.effort`` takes the same five discrete levels
+        # as Conductor's own ``ReasoningEffort``, so ``execute`` forwards the
+        # resolved value verbatim — no mapping table as Claude's token-budget
+        # translation needs, and no per-model pre-flight as Copilot's does:
+        # the level travels as an ``--effort`` argv flag and the CLI, not
+        # Conductor, decides what a given model makes of it. The field is
+        # present at the ``upstream_pin`` floor declared below, so every
+        # supported build has it and it needs no feature detection.
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
         # The SDK's ``output_format={"type": "json_schema", ...}`` plus
         # follow-on JSON parsing approximates native schema enforcement,
         # but the model still occasionally returns prose. Mark as
@@ -1443,6 +1449,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         *,
         auth_mode: ClaudeAuthMode = "auto",
         native_tools: ClaudeNativeTools = "none",
+        default_reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
@@ -1489,6 +1496,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
         self._default_model = model or _DEFAULT_MODEL
         self._default_max_turns = max_turns if max_turns is not None else 50
+        # Workflow-wide floor for ``ClaudeAgentOptions.effort``; a per-agent
+        # ``reasoning.effort`` overrides it in ``_execute_session``.
+        self._default_reasoning_effort = default_reasoning_effort
         self._max_session_seconds = max_session_seconds
         self._auth_mode = auth_mode
         self._last_validation_error: str | None = None
@@ -2086,6 +2096,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
             else self._max_session_seconds
         )
 
+        # Per-agent ``reasoning.effort`` wins over the workflow-wide
+        # ``runtime.default_reasoning_effort``; the shared resolver also
+        # refuses a ``{{ ... }}`` template that reached the provider
+        # unrendered rather than casting it straight into the SDK.
+        effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+
         # The tiers the readiness probe ran with (see
         # ``_effective_setting_sources`` for the ``skills: []`` opt-out), read
         # from the context rather than re-derived so the two cannot diverge.
@@ -2173,6 +2189,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         options = ClaudeAgentOptions(
             model=model,
+            # Conductor's ``ReasoningEffort`` and the SDK's ``EffortLevel`` are
+            # the same five literals, so the resolved level goes through
+            # unmapped. ``None`` is the SDK default and genuinely inert: the
+            # transport appends ``--effort`` only when this is set, so a
+            # workflow that configures nothing keeps the CLI's own default
+            # rather than being pinned to one by Conductor.
+            effort=effort,
             system_prompt=agent.system_prompt,
             resume=resume_session_id,
             # Explicit though it matches the SDK default: forking would mint a

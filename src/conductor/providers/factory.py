@@ -281,6 +281,7 @@ async def create_provider(
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
                 mcp_servers=mcp_servers,
+                default_reasoning_effort=default_reasoning_effort,
                 setting_sources=(
                     provider_settings.setting_sources
                     if provider_settings is not None

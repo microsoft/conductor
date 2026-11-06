@@ -2859,6 +2859,7 @@ class TestSkillsWiring:
         tools: list[str] | None = None,
         setting_sources: list[str] | None = None,
         native_tools: str = "none",
+        default_reasoning_effort: str | None = None,
     ):
         captured: dict = {}
 
@@ -2868,7 +2869,9 @@ class TestSkillsWiring:
 
         with patch_sdk(fake_query):
             provider = ClaudeAgentSdkProvider(
-                setting_sources=setting_sources, native_tools=native_tools
+                setting_sources=setting_sources,
+                native_tools=native_tools,
+                default_reasoning_effort=default_reasoning_effort,  # type: ignore[arg-type]
             )
             await provider.execute(
                 agent=agent,
@@ -5171,3 +5174,160 @@ class TestTeardownOrderingAndIsolation:
             assert len(paths) == 2
             assert paths[0] != paths[1]
             assert not any(Path(p).exists() for p in paths)
+
+
+class TestReasoningEffortWiring:
+    """``reasoning.effort`` reaches ``ClaudeAgentOptions.effort`` (and the CLI).
+
+    The provider previously declared ``reasoning_effort=None``, which made the
+    field a hard ``conductor validate`` error on this provider rather than a
+    silently dropped one — so these cover a capability that changed from "not
+    supported" to "supported", not a refinement of an existing one. Assertions
+    go through to the argv the SDK builds, like the skills and settings-source
+    suites above: ``effort`` travels as a plain ``--effort`` flag, so the
+    options object alone would not prove the CLI ever sees it.
+    """
+
+    _capture_options = staticmethod(TestSkillsWiring._capture_options)
+    _argv = staticmethod(TestSkillsWiring._argv)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+    async def test_per_agent_effort_reaches_the_cli(self, level: str) -> None:
+        """All five declared levels, unmapped: Conductor's ``ReasoningEffort``
+        and the SDK's ``EffortLevel`` are the same literals, so anything the
+        capability advertises must survive the trip verbatim."""
+        from conductor.config.schema import ReasoningConfig
+
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", reasoning=ReasoningConfig(effort=level))
+        )
+
+        assert options.effort == level
+
+        argv = self._argv(options)
+        assert argv[argv.index("--effort") + 1] == level
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_runtime_default_applies_when_the_agent_declares_none(self) -> None:
+        """Parity with every other provider's ``runtime.default_reasoning_effort``.
+
+        This provider's ``__init__`` was the only one that did not even accept
+        the argument, so an unconfigured agent could not inherit the workflow
+        default no matter what the factory passed.
+        """
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), default_reasoning_effort="high"
+        )
+
+        argv = self._argv(options)
+        assert options.effort == "high"
+        assert argv[argv.index("--effort") + 1] == "high"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_per_agent_effort_beats_the_runtime_default(self) -> None:
+        from conductor.config.schema import ReasoningConfig
+
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", reasoning=ReasoningConfig(effort="max")),
+            default_reasoning_effort="low",
+        )
+
+        assert options.effort == "max"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unconfigured_leaves_the_cli_default_alone(self) -> None:
+        """``None`` must stay out of argv entirely.
+
+        Unlike ``skills``, there is no opt-out meaning to encode here: sending
+        a level Conductor invented would silently override whatever default
+        the ``claude`` CLI applies for the model.
+        """
+        options = await self._capture_options(AgentDef(name="t", prompt="hi"))
+
+        assert options.effort is None
+        assert "--effort" not in self._argv(options)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unrendered_template_is_refused_rather_than_forwarded(self) -> None:
+        """The provider goes through the shared resolver, not
+        ``agent.reasoning.effort`` directly — so #262's backstop covers this
+        provider too and a raw ``{{ ... }}`` never reaches ``--effort``."""
+        from conductor.config.schema import ReasoningConfig
+
+        with pytest.raises(ValueError, match="reasoning.effort reached the provider unresolved"):
+            await self._capture_options(
+                AgentDef(
+                    name="t",
+                    prompt="hi",
+                    reasoning=ReasoningConfig(effort="{{ workflow.input.eff }}"),
+                )
+            )
+
+    async def test_factory_forwards_the_runtime_default(self) -> None:
+        """``providers/factory.py`` is where the plumbing was missing: the
+        argument existed on ``create_provider`` and was dropped on the way to
+        this provider's constructor."""
+        from conductor.config.schema import RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(provider="claude-agent-sdk", default_reasoning_effort="xhigh")
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+
+        assert provider._default_reasoning_effort == "xhigh"
+
+    def test_capability_declares_the_full_level_set(self) -> None:
+        """The descriptor is a contract, and this one is read at validate time
+        by ``config/validator.py`` before any session exists."""
+        assert ClaudeAgentSdkProvider.CAPABILITIES.reasoning_effort == (
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        )
+        assert "reasoning_effort ignored" not in (
+            ClaudeAgentSdkProvider.CAPABILITIES.declared_limitations()
+        )
+
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+    def test_validate_accepts_reasoning_effort_on_this_provider(self, level: str) -> None:
+        """The user-visible half of the change: ``conductor validate`` used to
+        fail a workflow that set ``reasoning.effort`` on this provider, so the
+        field was unreachable rather than merely ignored."""
+        from conductor.config.schema import (
+            ReasoningConfig,
+            RuntimeConfig,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+        from conductor.config.validator import validate_workflow_config
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+            ),
+            agents=[
+                AgentDef(name="a", prompt="hi", reasoning=ReasoningConfig(effort=level)),
+            ],
+        )
+
+        validate_workflow_config(config)  # no raise
+
+    def test_validate_accepts_the_runtime_default_on_this_provider(self) -> None:
+        from conductor.config.schema import RuntimeConfig, WorkflowConfig, WorkflowDef
+        from conductor.config.validator import validate_workflow_config
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="a",
+                runtime=RuntimeConfig(provider="claude-agent-sdk", default_reasoning_effort="max"),
+            ),
+            agents=[AgentDef(name="a", prompt="hi")],
+        )
+
+        validate_workflow_config(config)  # no raise
