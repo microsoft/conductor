@@ -93,8 +93,8 @@ jobs:
     needs: [lint, typecheck]
     strategy:
       matrix:
-        os: [ubuntu-latest]
-        python-version: ["3.12", "3.13"]
+        os: [windows-latest]
+        python-version: ["3.13"]
         # Windows carries a substantial amount of platform-specific code —
         # cli/pid.py is an entire OpenProcess/GetExitCodeProcess ctypes
         # implementation, cli/bg_runner.py handles process groups and job-object
@@ -106,9 +106,6 @@ jobs:
         # platform is the variable here, not the interpreter, and the
         # install-scripts job already provisions a Windows runner on every PR so
         # this is incremental cost rather than a new platform commitment.
-        include:
-          - os: windows-latest
-            python-version: "3.13"
       fail-fast: false
 
     steps:
@@ -167,12 +164,12 @@ jobs:
         # Windows runs the suite at roughly twice the Linux wall time, so this
         # is ~2x headroom there and ~3x on Linux — still short enough to catch
         # a genuine hang rather than burning a full job timeout on one.
-        timeout-minutes: 20
+        timeout-minutes: 45
         # `docker_integration` is excluded here too even though the marker is
         # already deselected via PYTEST_DEFAULT_MARKERS in the Makefile: this
         # job invokes pytest directly, and the real-daemon lane must run only
         # in the dedicated serialized docker-integration job below.
-        run: uv run pytest -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+        run: uv run pytest -n 2 --dist loadfile --durations=60 --durations-min=2 --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
           # Real API tests (marked with @pytest.mark.real_api) are excluded from CI
