@@ -743,7 +743,12 @@ async def test_malformed_private_input_does_not_disable_next_launch(tmp_path: Pa
         await asyncio.wait_for(asyncio.to_thread(malformed), 10)
         result = await asyncio.wait_for(
             controller.spawn_script(
-                "script", CommandSpec(sys.executable, ("-c", "print('actual')"), stdin=b"")
+                "script",
+                CommandSpec(
+                    sys.executable,
+                    ("-c", "import sys; sys.stdout.buffer.write(b'actual\\n')"),
+                    stdin=b"",
+                ),
             ),
             10,
         )
@@ -959,7 +964,12 @@ async def test_managed_context_exposes_typed_consumer_surface(tmp_path: Path) ->
     context = ManagedWorkspaceContext(str(tmp_path), "inc", controller)
     scopes = context.process_scopes
     command = asyncio.create_task(
-        scopes.spawn_script("script", CommandSpec(sys.executable, ("-c", "print(7)"), stdin=b""))
+        scopes.spawn_script(
+            "script",
+            CommandSpec(
+                sys.executable, ("-c", "import sys; sys.stdout.buffer.write(b'7\\n')"), stdin=b""
+            ),
+        )
     )
     scopes.owners.register("script", command)
     try:
@@ -1592,7 +1602,12 @@ async def test_retirement_waits_for_script_consumption_and_owner_join(
     monkeypatch.setattr(asyncio, "wait", wait)
     command = asyncio.create_task(
         controller.spawn_script(
-            "script", CommandSpec(sys.executable, ("-c", "print('unconsumed')"), stdin=b"")
+            "script",
+            CommandSpec(
+                sys.executable,
+                ("-c", "import sys; sys.stdout.buffer.write(b'unconsumed\\n')"),
+                stdin=b"",
+            ),
         )
     )
     try:
