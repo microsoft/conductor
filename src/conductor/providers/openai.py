@@ -209,7 +209,7 @@ class OpenAIProvider(AgentProvider):
             base_url: Optional custom API endpoint. Resolves from ``OPENAI_BASE_URL``
                 when not passed explicitly. When set, ``api_key`` must also be provided
                 explicitly.
-            model: Default model to use. Defaults to ``gpt-5-mini``.
+            model: Default model to use. Defaults to ``gpt-5.6-terra``.
             temperature: Default temperature (0.0-2.0).
             max_tokens: Maximum output tokens. Omitted from the request when
                 unset, so the server applies the model's own default; the
@@ -244,7 +244,7 @@ class OpenAIProvider(AgentProvider):
         self._resolve_environment = resolve_environment
         self._base_url = base_url
         self._model_user_configured = model is not None
-        self._default_model = model or "gpt-5-mini"
+        self._default_model = model or "gpt-5.6-terra"
 
         if temperature is not None:
             self._validate_temperature(temperature)
@@ -843,7 +843,7 @@ class OpenAIProvider(AgentProvider):
                     f"Model {resolved_model!r} does not support reasoning.effort, but "
                     f"default_reasoning_effort={self._default_reasoning_effort!r} was requested.",
                     suggestion=(
-                        "Use a reasoning-capable model (e.g. o-series, gpt-5-mini) or "
+                        "Use a reasoning-capable model (e.g. o-series, gpt-5.6-terra) or "
                         "remove the reasoning config."
                     ),
                 )

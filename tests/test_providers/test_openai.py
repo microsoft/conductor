@@ -74,10 +74,10 @@ def _build_text_agent(text: str) -> Agent[Any, str]:
 class TestProviderConstruction:
     """Tests for OpenAIProvider construction and validation."""
 
-    def test_default_model_is_gpt_5_mini(self) -> None:
+    def test_default_model_is_gpt_5_6_terra(self) -> None:
         """Requirement: omitted model uses the default; an unset cap stays off the wire."""
         p = OpenAIProvider(api_key="test-key")
-        assert p._default_model == "gpt-5-mini"
+        assert p._default_model == "gpt-5.6-terra"
         assert p._default_max_tokens is None
         assert p._max_tokens_user_configured is False
 

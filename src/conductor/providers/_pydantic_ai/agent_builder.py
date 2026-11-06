@@ -60,7 +60,7 @@ _FINAL_RESULT_TOOL_DESCRIPTION: Final[str] = (
 )
 
 # Default OpenAI model used when the agent and runtime fail to declare one.
-DEFAULT_OPENAI_MODEL: str = "gpt-5-mini"
+DEFAULT_OPENAI_MODEL: str = "gpt-5.6-terra"
 
 # Default cap for total output tokens when Anthropic extended thinking is
 # enabled. This matches CLAUDE_EXTENDED_THINKING_OUTPUT_CAP in reasoning.py
@@ -399,7 +399,7 @@ def _build_openai_model_settings(
                 f"Model {model_name!r} does not support reasoning.effort, but "
                 f"reasoning.effort={effort!r} was requested for agent {agent.name!r}.",
                 suggestion=(
-                    "Use a reasoning-capable model (e.g. o-series, gpt-5-mini) or "
+                    "Use a reasoning-capable model (e.g. o-series, gpt-5.6-terra) or "
                     "remove the reasoning config."
                 ),
             )
