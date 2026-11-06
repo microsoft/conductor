@@ -30,11 +30,11 @@ workflow:
   name: my-openai-workflow
   runtime:
     provider: openai
-    default_model: gpt-5-mini
+    default_model: gpt-5.6-terra
 
 agents:
   - name: assistant
-    model: gpt-5-mini
+    model: gpt-5.6-terra
     prompt: |
       Answer the following question: {{ workflow.input.question }}
     output:
@@ -193,7 +193,7 @@ Unlike the Claude and Copilot providers which cap temperature at `1.0`, the Open
 workflow:
   runtime:
     provider: openai
-    default_model: gpt-5-mini
+    default_model: gpt-5.6-terra
     temperature: 1.5  # Valid for OpenAI (0.0 to 2.0 range)
 ```
 
@@ -231,7 +231,7 @@ The OpenAI provider supports stdio MCP servers via Conductor's `MCPManager`.
 workflow:
   runtime:
     provider: openai
-    default_model: gpt-5-mini
+    default_model: gpt-5.6-terra
     mcp_servers:
       fetch:
         command: uvx

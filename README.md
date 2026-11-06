@@ -401,7 +401,7 @@ Copilot is the default provider — `runtime.provider` can be omitted entirely. 
 workflow:
   runtime:
     provider: openai
-    default_model: gpt-5-mini
+    default_model: gpt-5.6-terra
 ```
 
 Set your API key: `export OPENAI_API_KEY=sk-...`
@@ -450,7 +450,7 @@ workflow:
       name: aca
       pool_endpoint: "https://my-agent-pool.example.westus2.azurecontainerapps.io"
       inner_provider: copilot
-    default_model: gpt-5-mini
+    default_model: gpt-5.6-terra
 ```
 
 The `aca` provider delegates an agent's entire agentic loop, tools, and MCP calls to a remote **Azure Container Apps dynamic-sessions sandbox** instead of running it on the host — useful for untrusted or isolation-sensitive agents (e.g. running arbitrary generated code). Unlike the other providers, `aca` requires the structured `provider:` form with a `pool_endpoint` pointing at an operator-provisioned ACA session pool (`scripts/aca/provision-pool.sh`) and `azure-identity` for authentication. Resolves its inner Copilot credential automatically via `COPILOT_PROVIDER_BASE_URL` → `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth token`, so a `gh`-authenticated operator needs no ACA-specific setup. See [`examples/aca-coding-agent.yaml`](examples/aca-coding-agent.yaml) for a full end-to-end example.

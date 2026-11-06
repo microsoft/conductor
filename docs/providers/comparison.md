@@ -88,7 +88,7 @@ workflow:
   name: openai-workflow
   runtime:
     provider: openai
-    default_model: gpt-5-mini
+    default_model: gpt-5.6-terra
     temperature: 0.7
 
 agents:
