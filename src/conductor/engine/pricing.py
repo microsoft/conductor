@@ -144,11 +144,52 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
     ),
+    # Claude 5.5 models have their own rates; without exact keys the
+    # versioned-suffix fallback prices them at the older Claude 5 rate.
+    "claude-opus-5-5": ModelPricing(
+        input_per_mtok=4.00,
+        output_per_mtok=20.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=5.00,
+    ),
+    "claude-sonnet-5-5": ModelPricing(
+        input_per_mtok=2.00,
+        output_per_mtok=10.00,
+        cache_read_per_mtok=0.10,
+        cache_write_per_mtok=2.50,
+    ),
+    "claude-fable-5-1": ModelPricing(
+        input_per_mtok=10.00,
+        output_per_mtok=50.00,
+        cache_read_per_mtok=0.25,
+        cache_write_per_mtok=12.50,
+    ),
+    # The SDK also reports dotted names (claude-*-X.Y) and the ``-`` fallback
+    # does not cover them, so each 5.5 model needs both spellings.
+    "claude-opus-5.5": ModelPricing(
+        input_per_mtok=4.00,
+        output_per_mtok=20.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=5.00,
+    ),
+    "claude-sonnet-5.5": ModelPricing(
+        input_per_mtok=2.00,
+        output_per_mtok=10.00,
+        cache_read_per_mtok=0.10,
+        cache_write_per_mtok=2.50,
+    ),
+    "claude-fable-5.1": ModelPricing(
+        input_per_mtok=10.00,
+        output_per_mtok=50.00,
+        cache_read_per_mtok=0.25,
+        cache_write_per_mtok=12.50,
+    ),
+    # Sonnet 5's $2/$10 introductory price became the standard price.
     "claude-sonnet-5": ModelPricing(
-        input_per_mtok=3.00,
-        output_per_mtok=15.00,
-        cache_read_per_mtok=0.30,
-        cache_write_per_mtok=3.75,
+        input_per_mtok=2.00,
+        output_per_mtok=10.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=2.50,
     ),
     # Claude 4.5 Series
     "claude-opus-4-5": ModelPricing(
