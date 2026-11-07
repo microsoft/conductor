@@ -602,5 +602,5 @@ def test_claude_5_5_models_do_not_inherit_claude_5_rates() -> None:
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
     )
-    assert get_pricing("claude-sonnet-5-5").cache_read_per_mtok == 0.10
+    assert get_pricing("claude-sonnet-5-5").cache_read_per_mtok == 0.20
     assert calculate_cost("claude-opus-5-5", 1_000_000, 1_000_000) == 24.0

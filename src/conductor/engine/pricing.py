@@ -155,7 +155,7 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "claude-sonnet-5-5": ModelPricing(
         input_per_mtok=2.00,
         output_per_mtok=10.00,
-        cache_read_per_mtok=0.10,
+        cache_read_per_mtok=0.20,
         cache_write_per_mtok=2.50,
     ),
     "claude-fable-5-1": ModelPricing(
@@ -175,7 +175,7 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "claude-sonnet-5.5": ModelPricing(
         input_per_mtok=2.00,
         output_per_mtok=10.00,
-        cache_read_per_mtok=0.10,
+        cache_read_per_mtok=0.20,
         cache_write_per_mtok=2.50,
     ),
     "claude-fable-5.1": ModelPricing(
