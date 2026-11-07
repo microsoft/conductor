@@ -859,6 +859,7 @@ class AgentExecutor:
                 else None
             ),
             tools=tuple(tools) if tools is not None else None,
+            declared_tools=tuple(agent.tools) if agent.tools is not None else None,
             mcp_servers=(
                 {
                     name: cfg.model_dump(mode="json") if hasattr(cfg, "model_dump") else cfg

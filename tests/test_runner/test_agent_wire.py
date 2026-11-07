@@ -83,6 +83,7 @@ def test_v1_body_is_accepted_by_the_pinned_v1_request_shape() -> None:
     assert body["inner_provider_settings"] == {"api_key": "model-secret"}
     assert "temperature" not in body["agent"]
     assert "max_tokens" not in body["agent"]
+    assert "tools" not in body["agent"]
 
 
 def test_sampling_values_survive_spec_to_wire_parse() -> None:
@@ -93,7 +94,23 @@ def test_sampling_values_survive_spec_to_wire_parse() -> None:
     assert parsed.agent.max_tokens == 4096
 
 
+def test_declared_empty_tools_survive_spec_to_wire_parse() -> None:
+    # Requirement: resolved and declared empty lists both survive the remote boundary.
+    body = agent_spec_to_wire_body(replace(_spec(), tools=(), declared_tools=()))
+
+    parsed = RunnerAgentRequest.model_validate(body)
+
+    assert parsed.tools == []
+    assert parsed.agent.tools == []
+
+
 def test_v1_sampling_configuration_is_rejected() -> None:
     # Requirement: a v1 runner must not silently ignore configured sampling settings.
     with pytest.raises(ValueError, match="v1 cannot honor"):
         agent_spec_to_wire_body(replace(_spec(), temperature=0.27), protocol_version=1)
+
+
+def test_v1_declared_empty_tools_are_rejected() -> None:
+    # Requirement: an older runner must not widen explicit tools: [] to its default catalog.
+    with pytest.raises(ValueError, match="v1 cannot honor tools"):
+        agent_spec_to_wire_body(replace(_spec(), declared_tools=()), protocol_version=1)

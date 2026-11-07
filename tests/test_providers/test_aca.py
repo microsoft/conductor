@@ -1276,6 +1276,62 @@ class TestAcaCredentialPrecedence:
         assert "super-secret-value" not in str(secret)
         assert secret.get_secret_value() == "super-secret-value"
 
+    @pytest.mark.asyncio
+    async def test_execute_preserves_declared_empty_tools(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: the legacy ACA send path preserves explicit tools: [] on the wire.
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-token")
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/health":
+                return httpx.Response(
+                    200,
+                    json={"ready": True, "protocol_version": 2, "features": ["interrupt"]},
+                )
+            return httpx.Response(
+                200,
+                content=_ndjson_body([{"type": "result", "data": {"content": {}}}]),
+            )
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            assert await provider.validate_connection() is True
+            await provider.execute(
+                _agent(tools=[]), {}, "x", tools=[], interrupt_signal=asyncio.Event()
+            )
+
+        execute_requests = [request for request in captured if request.url.path == "/execute"]
+        assert len(execute_requests) == 1
+        body = json.loads(execute_requests[0].content)
+        assert body["tools"] == []
+        assert body["agent"]["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_declared_empty_tools_on_v1(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: legacy ACA v1 rejects tools: [] instead of widening tool access.
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-token")
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(500)
+
+        provider = _make_provider()
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            pytest.raises(ValueError, match="v1 cannot honor tools"),
+        ):
+            await provider.execute(_agent(tools=[]), {}, "x", tools=[])
+
+        assert captured == []
+
     def test_github_token_redacted_in_request_dump_and_repr(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

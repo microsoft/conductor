@@ -187,6 +187,10 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   `RunnerHealthResponse`) are `extra="ignore"`. Evolution is additive only; bump
   `RUNNER_PROTOCOL_VERSION` only for an incompatible change.
 - Wire v2 adds `execution_id`, `env_overlay`, `skill_directories`, and `custom_agents` to request payloads.
+  `RunnerAgentPayload.tools` preserves the declared agent list separately from the resolved
+  `RunnerAgentRequest.tools` allowlist: explicit `tools: []` must never become `None` and widen
+  to the inner provider's default catalog. Protocol v1 cannot represent that distinction, so
+  `agent_spec_to_wire_body` rejects an explicitly empty declared list instead of sending it.
   The `/interrupt` endpoint targets specific invocations by `execution_id` without restarting the runner.
 - The Docker interrupt bridge exits 0 for an accepted signal and 3 for HTTP 409;
   other failures remain errors. The host uses these machine outcomes, not stderr

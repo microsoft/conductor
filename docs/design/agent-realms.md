@@ -29,6 +29,13 @@ The seam contract relies on two frozen dataclasses defined in `conductor.executi
 1. `AgentSpec`: A transport-neutral description of a single agent call. It carries the model provider identity, rendered prompt, system prompt, output schema, tool configuration, MCP servers, context dictionary, staged skill paths, custom agent definitions, per-call environment overlay, provider credentials, and execution settings. Credential fields set `repr=False` to avoid leaking secrets in debugging output.
 2. `AgentResult`: The outcome of the invocation, capturing output content, token usage, session duration, and partial completion flags. Local in-process runs can also carry opaque references to continuation state and raw provider responses, but those fields never cross remote transports.
 
+Tool configuration preserves two distinct states: `AgentSpec.tools` carries the
+allowlist resolved against workflow tools, while `AgentSpec.declared_tools`
+carries the authored agent list before resolution. `None` and an empty tuple
+are different declared states, so an explicit `tools: []` cannot turn into the
+inner provider's default tool catalog inside the runner. Protocol v1 cannot
+represent that distinction and rejects an explicitly empty declared list.
+
 ### Transport Neutrality Rule
 
 The `AgentSpec` contract stays strictly neutral across execution backends. It contains no Docker flags, no HTTP URLs, and no cloud provider identifiers. Evolution follows three rules:

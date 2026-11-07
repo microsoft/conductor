@@ -83,6 +83,15 @@ class RunnerAgentPayload(BaseModel):
     output: dict[str, Any] | None = None
     """Agent's ``output:`` schema (``OutputField`` dumped to plain dicts)."""
 
+    tools: list[str] | None = None
+    """Declared agent ``tools:``: ``None`` when omitted, ``[]`` when explicitly empty.
+
+    This is distinct from ``RunnerAgentRequest.tools``, which carries the list
+    resolved against workflow-level tools. Both are required because inner
+    providers use the declared value to distinguish an explicit empty allowlist
+    from an omitted declaration with no workflow tools.
+    """
+
     max_agent_iterations: int | None = None
     """Maximum tool-use iterations for this execution."""
 
@@ -355,9 +364,9 @@ def request_to_wire_body(request: RunnerAgentRequest) -> dict[str, Any]:
     codebase sees the plaintext.
     """
     body = request.model_dump(mode="json")
-    # Legacy ACA requests do not carry sampling overrides; keep their v1
-    # payload shape intact when the host sends null defaults.
-    for key in ("temperature", "max_tokens"):
+    # Legacy ACA requests do not carry newer optional agent fields; keep
+    # their v1 payload shape intact when the host sends null defaults.
+    for key in ("temperature", "max_tokens", "tools"):
         if body["agent"][key] is None:
             del body["agent"][key]
     # Legacy ACA callers construct no v2 fields; omitting their null defaults

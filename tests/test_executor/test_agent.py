@@ -69,6 +69,25 @@ def test_realm_spec_uses_effective_copilot_temperature() -> None:
     assert spec.max_tokens is None
 
 
+def test_realm_spec_preserves_declared_empty_tools() -> None:
+    # Requirement: realm transport keeps explicit tools: [] distinct from omitted tools.
+    spec = AgentExecutor(CopilotProvider(mock_handler=lambda *_: {})).build_realm_spec(
+        AgentDef(
+            name="remote",
+            prompt="task",
+            tools=[],
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        ),
+        "task",
+        {},
+        tools=[],
+    )
+
+    assert spec.declared_tools == ()
+
+
 @pytest.fixture
 def simple_agent() -> AgentDef:
     """Create a simple agent definition."""

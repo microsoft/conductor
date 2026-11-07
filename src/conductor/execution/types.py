@@ -348,6 +348,8 @@ class AgentSpec:
     retry: Mapping[str, Any] | None = None
     context_tier: str | None = None
     execution: ResolvedExecutionSpec | None = None
+    declared_tools: tuple[str, ...] | None = None
+    """Declared agent tools before workflow resolution: None if omitted, () if empty."""
 
 
 @dataclass(frozen=True)
