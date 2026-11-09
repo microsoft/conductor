@@ -169,7 +169,7 @@ jobs:
         # already deselected via PYTEST_DEFAULT_MARKERS in the Makefile: this
         # job invokes pytest directly, and the real-daemon lane must run only
         # in the dedicated serialized docker-integration job below.
-        run: uv run pytest -n 2 --dist loadfile --durations=0 --durations-min=0.5 --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+        run: uv run pytest -n 2 --dist loadfile --durations=0 --durations-min=0 --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           # Fake API key for mock tests to prevent accidental real API calls.
           # Real API tests (marked with @pytest.mark.real_api) are excluded from CI
