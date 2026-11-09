@@ -96,7 +96,7 @@ workflow:
       # everything it defines: enable it only for repositories trusted to the
       # same degree as this workflow.
       setting_sources: [project]
-    default_model: claude-sonnet-4-5
+    default_model: claude-sonnet-4-6
 
     # cwd for every agent: the wide directory. The filesystem MCP server's
     # argv roots below are discarded by the server itself (see the header), so
