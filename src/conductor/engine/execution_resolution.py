@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from conductor.config.environment import ResolvedEnvironment
+from conductor.config.environment import AcaProfileOptions, ResolvedEnvironment
 from conductor.config.schema import WorkflowConfig
 from conductor.engine.bundle_prep import materialize_run_bundle
 from conductor.engine.run_manifest import (
+    BACKEND_CAPABILITY_PROVIDERS,
     ManifestExecutionSpec,
     ResolvedRunManifest,
     compile_run_manifest,
@@ -37,12 +39,34 @@ from conductor.execution import (
     RunnerBackend,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.redaction import RunRedactor
 
+if TYPE_CHECKING:
+    from conductor.engine.aca_execution import AcaGateway
+
 logger = logging.getLogger(__name__)
+
+
+def _aca_transport(options: AcaProfileOptions) -> AcaGateway:
+    from conductor.config.schema import ProviderSettings
+    from conductor.providers.aca import AcaRuntimeProvider
+
+    return AcaRuntimeProvider(
+        provider_settings=ProviderSettings(
+            name="aca", **options.model_dump(mode="python", exclude_none=True)
+        )
+    )
+
+
+def _aca_backend() -> RunnerBackend:
+    # The optional ACA SDK is consulted only when this backend is first used.
+    from conductor.engine.aca_execution import AcaRunnerBackend
+
+    return AcaRunnerBackend(transport_factory=_aca_transport)
 
 
 BACKEND_FACTORIES: dict[str, Callable[[], RunnerBackend]] = {
@@ -51,7 +75,11 @@ BACKEND_FACTORIES: dict[str, Callable[[], RunnerBackend]] = {
     # name and an environment snapshot), so registering the factory here is
     # safe: no daemon contact happens until a docker-backed command runs.
     "docker": DockerRunnerBackend,
+    "aca": _aca_backend,
 }
+
+# A capability lookup must not import the optional HTTP or Azure SDK.
+BACKEND_CAPABILITY_PROVIDERS.setdefault("aca", _aca_backend())
 
 
 def _spec_to_contract(spec: ManifestExecutionSpec) -> ResolvedExecutionSpec:
@@ -103,8 +131,13 @@ class ExecutionResolverSession:
             "local": default_backend or BACKEND_FACTORIES["local"](),
         }
         self.leases: dict[str, WorkspaceLease] = {}
+        self._aca_profiles: dict[str, RunnerBackend] = {}
         self._root_run_spec: RunSpec | None = None
         self._root_workflow_path: Path | None = None
+        self._resume_identities: Mapping[str, WorkspaceIdentity] | None = None
+        self._expect_staged: Mapping[str, bool] | None = None
+        self._claim_active = False
+        self._executed_backends: set[str] = set()
         self._ensure_lock = asyncio.Lock()
         self._owns_secrets = secret_cache is None
         if secret_cache is not None:
@@ -181,16 +214,50 @@ class ExecutionResolverSession:
                     )
 
                 backend = factory()
+                if name == "aca":
+                    from conductor.engine.aca_execution import AcaRunnerBackend
+
+                    profiles = {
+                        profile_name: profile.aca
+                        for profile_name, profile in sorted(
+                            self.environment.document.profiles.items()
+                        )
+                        if profile.backend == "aca" and profile.aca is not None
+                    }
+                    if isinstance(backend, AcaRunnerBackend):
+                        self._aca_profiles.update(backend.bind_profiles(profiles))
+                    else:
+                        self._aca_profiles.update(dict.fromkeys(profiles, backend))
                 run_spec = self._root_run_spec
                 if run_spec is not None and name != "local":
-                    if run_spec.bundle is None:
+                    if run_spec.bundle is None and backend.capabilities().shared_workspace:
                         bundle = await materialize_run_bundle(
                             self._root_workflow_path,
                             self.environment,
                         )
                         run_spec = replace(run_spec, bundle=bundle)
                         self._root_run_spec = run_spec
-                    lease = await backend.prepare_run(run_spec)
+                    backend_spec = replace(
+                        run_spec,
+                        workspace_persistence=(
+                            run_spec.workspace_persistence
+                            if backend.capabilities().retained_workspace
+                            else None
+                        ),
+                    )
+                    identity = (self._resume_identities or {}).get(name)
+                    if identity is not None:
+                        lease = await backend.attach_run(
+                            backend_spec,
+                            identity,
+                            expect_staged=(self._expect_staged or {}).get(name, False),
+                        )
+                    else:
+                        if self._resume_identities is not None and not self._claim_active:
+                            raise ConfigurationError(
+                                f"Cannot prepare late backend {name!r} without a workspace claim."
+                            )
+                        lease = await backend.prepare_run(backend_spec)
                     self.leases[name] = lease
                 self.backends[name] = backend
 
@@ -199,8 +266,19 @@ class ExecutionResolverSession:
         run_spec: RunSpec,
         *,
         workflow_path: Path | None = None,
+        resume_identities: Mapping[str, WorkspaceIdentity] | None = None,
+        expect_staged: Mapping[str, bool] | None = None,
+        claim_active: bool = False,
     ) -> None:
-        """Prepare one lease per distinct backend, idempotently."""
+        """Prepare or attach one lease per distinct backend, idempotently."""
+        unknown = set(resume_identities or {}).difference(self.backends | BACKEND_FACTORIES)
+        if unknown:
+            raise ConfigurationError(
+                f"Workspace identities refer to unknown backends: {', '.join(sorted(unknown))}."
+            )
+        self._resume_identities = resume_identities
+        self._expect_staged = expect_staged
+        self._claim_active = claim_active
         self._root_run_spec = run_spec
         self._root_workflow_path = workflow_path
         leases_by_backend: dict[int, WorkspaceLease] = {
@@ -209,7 +287,23 @@ class ExecutionResolverSession:
         for name, backend in self.backends.items():
             lease = leases_by_backend.get(id(backend))
             if lease is None:
-                lease = await backend.prepare_run(run_spec)
+                backend_spec = replace(
+                    run_spec,
+                    workspace_persistence=(
+                        run_spec.workspace_persistence
+                        if backend.capabilities().retained_workspace
+                        else None
+                    ),
+                )
+                identity = (resume_identities or {}).get(name)
+                if identity is not None:
+                    lease = await backend.attach_run(
+                        backend_spec,
+                        identity,
+                        expect_staged=(expect_staged or {}).get(name, False),
+                    )
+                else:
+                    lease = await backend.prepare_run(backend_spec)
                 leases_by_backend[id(backend)] = lease
             self.leases[name] = lease
 
@@ -217,7 +311,32 @@ class ExecutionResolverSession:
         """Return the prepared lease for ``name``, if one exists."""
         return self.leases.get(name)
 
-    async def finalize_leases(self, outcome: RunOutcome) -> None:
+    def record_backend_execution(self, name: str) -> None:
+        """Remember a backend that executed a step in this run."""
+        self._executed_backends.add(name)
+
+    def executed_backends(self) -> frozenset[str]:
+        """Return the accumulated executed backend names."""
+        return frozenset(self._executed_backends)
+
+    def restore_executed_backends(self, names: Iterable[str]) -> None:
+        """Merge checkpoint history without erasing work in this process."""
+        self._executed_backends.update(names)
+
+    def workspace_identities(self) -> dict[str, WorkspaceIdentity]:
+        """Describe leases belonging to backends that support retention."""
+        return {
+            name: WorkspaceIdentity(
+                backend=lease.backend,
+                lease_id=lease.lease_id,
+                incarnation=lease.incarnation,
+                location=lease.location,
+            )
+            for name, lease in self.leases.items()
+            if self.backends[name].capabilities().retained_workspace
+        }
+
+    async def finalize_leases(self, outcome: RunOutcome, *, retain: bool = False) -> None:
         """Best-effort finalize every prepared lease without masking outcomes.
 
         Leases are detached before cleanup starts, preventing a repeated run
@@ -235,7 +354,9 @@ class ExecutionResolverSession:
             if id(backend) in finalized_backends:
                 continue
             finalized_backends.add(id(backend))
-            finalize_task = asyncio.ensure_future(backend.finalize_run(lease, outcome))
+            finalize_task = asyncio.ensure_future(
+                backend.finalize_run(lease, outcome, retain=retain)
+            )
             while True:
                 try:
                     await asyncio.shield(finalize_task)
@@ -296,6 +417,9 @@ class ExecutionResolver:
         """Return the backend resolved for a top-level or inline step."""
         key = executable_step_identity(name, for_each_group=for_each_group)
         backend_name = self._manifest.profiles[key].backend
+        if backend_name == "aca":
+            profile = self._manifest.profiles[key].profile
+            return self._session._aca_profiles[profile]
         return self._session.backends[backend_name]
 
     def refresh_secret_uses(self) -> None:

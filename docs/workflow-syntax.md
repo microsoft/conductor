@@ -18,6 +18,7 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Context Compaction](#context-compaction)
 - [External File References](#external-file-references)
 - [Run Bundles](#run-bundles)
+- [Workspace Lifecycle](#workspace-lifecycle)
 
 ## Workflow Configuration
 
@@ -39,6 +40,14 @@ workflow:
                                     # (path relative to this workflow file).
     - !file ./docs/conventions.md
     - "Always respond in English."
+
+  workspace:                        # Optional: workspace retention lifecycle
+    mode: shared                    # shared (default) | isolated (reserved)
+    persistence: ephemeral          # ephemeral (default) | durable | on-failure
+
+  defaults:                         # Optional: workflow-wide step defaults
+    restart:
+      mode: rerun                   # rerun (default) | fail | reuse (reserved)
 
   limits:
     max_iterations: 10              # Default: 10, max: 500
@@ -401,7 +410,7 @@ Because paths are normalized lexically instead of resolving to their real paths:
 #### Key Restrictions and Exclusions
 
 - **Rejected Step Types:** The `working_dir` field is strictly rejected on `wait`, `set`, `terminate`, `human_gate`, `questions`, and `workflow` (sub-workflow) step types. Defining `working_dir` on these steps raises a `ValidationError` at load time.
-- **Script Steps:** `script` steps honor only their own `working_dir` field, rendered as a Jinja2 template. `workflow.runtime.working_dir` is not applied; relative paths are passed to the subprocess as-is and therefore resolve against the Conductor process cwd, not the workflow file directory; missing directories surface as subprocess startup `ExecutionError`s rather than the LLM-agent pre-provider working-dir check.
+- **Script Steps:** `script` steps honor only their own `working_dir` field, rendered as a Jinja2 template. `workflow.runtime.working_dir` is not applied; relative paths are passed to the subprocess as-is and therefore resolve against the Conductor process cwd, not the workflow file directory; missing directories surface as subprocess startup `ExecutionError`s rather than the LLM-agent preflight working-dir check.
 - **Dialog Turns:** The working directory isn't applied to dialog turns in the current version. Multi-turn interactions run in the process default directory.
 - **Sub-Workflows:** A sub-workflow doesn't inherit the parent's working directory configuration. Instead, any relative paths in the child workflow resolve against the child workflow's own file directory.
 
@@ -2205,6 +2214,22 @@ How it works:
   interrupted; the failure is surfaced via a `checkpoint_save_failed` event and
   a console warning so you know recovery may be unavailable.
 
+#### Checkpoint Events
+
+Conductor emits structured lifecycle events whenever a checkpoint is written or fails to write:
+
+- **`checkpoint_saved`**: Emitted when a failure or periodic checkpoint is written to disk.
+  - `path`: String filesystem path to the saved checkpoint JSON file.
+  - `agent_name`: Name of the step that was executing (failure checkpoint) or about to execute (periodic checkpoint).
+  - `error_type`: String exception class name for failure checkpoints, or `null` for periodic checkpoints.
+  - `trigger`: String trigger type, either `"failure"` or `"periodic"`.
+  - `interrupted_step`: Optional dictionary included on failure checkpoints when a step was actively in flight. Contains:
+    - `name`: Name of the interrupted step.
+    - `status`: Always `"unknown"`, indicating that container side effects cannot be verified without inspection.
+    - `attempt_id`: The execution attempt identifier if one was active, or `null`.
+
+- **`checkpoint_save_failed`**: Emitted when a periodic checkpoint write fails. Execution continues without halting the workflow.
+
 Recover a stalled run by killing the process (e.g. `conductor stop` for a
 `--web-bg` run) and then:
 
@@ -3156,13 +3181,41 @@ environment 'demo' mixes local and docker script backends: host_step (local), co
 
 Docker steps execute against the pre-staged content-addressed run bundle in the named volume. Changes made to the host filesystem by earlier local script steps are not automatically mirrored into the container volume.
 
-#### Non-Script Steps Reserved Errors
+### Execution Profiles on Agent Steps
 
-In this release, `backend: docker` is available for `type: script` steps only. Assigning a Docker execution profile to LLM agents (`type: agent`), direct MCP tool steps (`type: mcp`), or sub-workflows (`type: workflow`) fails validation and manifest compilation:
+Agent steps (`type: agent` or default untagged steps) can run inside remote execution realms when assigned to a profile with `backend: docker` (with `runner_image` configured) or `backend: aca`.
+
+#### Backend and Step Type Capability Matrix
+
+The following table summarizes step type support across execution backends:
+
+| Step Type | `local` | `docker` | `aca` |
+|---|---|---|---|
+| `agent` | Supported | Supported (requires `runner_image`) | Supported |
+| `script` | Supported | Supported (uses `image`) | Rejected |
+| `mcp` | Supported | Rejected | Rejected |
+| `workflow` | Supported | Rejected | Rejected |
+
+Direct MCP tool steps (`type: mcp`) and sub-workflows (`type: workflow`) require the local backend. Assigning either step type to a remote backend (`docker` or `aca`) fails validation and manifest compilation:
 
 ```
-Step '<name>' resolves to backend 'docker' in environment '<env>', but backend 'docker' is available for script steps only; agent execution realms arrive in step 7.
+Step '<name>' resolves to backend '<backend>', but this step requires the local backend.
 ```
+
+Assigning an agent step to a Docker profile that omits `runner_image` fails validation with:
+
+```
+Agent step '<name>' resolves to Docker without docker.runner_image.
+```
+
+Remote agent profiles reject `dialog:` during validation and manifest compilation: dialog
+evaluation and conversation do not yet have a runner protocol, so they cannot safely run
+in the selected realm. Dialog remains available to local agents.
+
+Remote Copilot also rejects `runtime.max_tokens` because its runner SDK cannot enforce
+that limit. Remote OpenAI and Claude forward the configured `temperature` and
+`max_tokens` to their in-realm providers. The host does not start a model-provider
+session merely to resolve a remote agent's settings.
 
 #### Environment Inheritance (`inherit_control_environment`)
 
@@ -3190,6 +3243,9 @@ Execution profiles are resolved against environment documents defined in project
 Secret bindings provide a secure, declarative way for workflow steps and MCP servers to request credentials without hardcoding secrets or relying on ambient environment variables.
 
 Workflows declare logical secret references at the step or server level. An execution environment document (see [Execution Environments](configuration.md#execution-environments)) binds those logical names to credential sources and enforces consumer access rules.
+The binding's optional `allow` list accepts `script`, `mcp`, and `agent`. For example,
+`allow: [agent]` permits agent-scoped delivery while denying script and MCP consumers;
+omitting `allow` permits all three, and `allow: []` denies all three.
 
 ### Use-Sites
 
@@ -3241,12 +3297,12 @@ Each secret reference in `secrets:` contains:
 | Field | Type | Description |
 |-------|------|-------------|
 | `ref` | string (required) | Logical secret name matching `[A-Za-z0-9_.-]+`. Must match a binding in the resolved environment document. |
-| `scope` | string (required) | Target consumer scope: `script` or `mcp`. `agent` is reserved for future releases. |
+| `scope` | string (required) | Target consumer scope: `script`, `mcp`, or remote-only `agent`. |
 | `delivery` | object (required) | Delivery mechanism. Exactly one of `env` or `header` must be set. |
 
 ### Delivery Targets (`delivery`)
 
-- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Agent-scoped `delivery.env` reaches only the spawn environment of stdio MCP processes inside the remote realm per call (via `env_overlay`), never the model SDK environment. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
 - **`header`**: Injects the secret value as an HTTP request header. Header delivery applies only to HTTP/SSE MCP servers; it is rejected on script steps and stdio MCP servers. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Prefer `delivery.header` for remote authentication.
 
 MCP transport and delivery support is based on the effective providers of the agents that can consume the workflow's declared servers. Per-agent `provider:` overrides take precedence over the workflow default.
@@ -3266,11 +3322,21 @@ Remote servers used by an effective Claude or OpenAI consumer are rejected by bo
 
 1. **Scope Requirements**:
    - `scope: script` is required for script steps.
-   - `scope: mcp` is required for MCP servers.
-   - `scope: agent` is reserved for future agent execution realms (architecture step 7). Using `agent` scope raises a validation error.
+   - `scope: mcp` is used for MCP-server delivery outside agent realms.
+   - `scope: agent` is allowed on agent steps using remote Docker or ACA profiles and on stdio MCP servers when all consuming agents use remote realms. It requires `delivery.env` and either a declared stdio MCP server or an enabled MCP plugin that may provide one (`tools: []` cannot consume either). Static validation does not fetch or inspect plugin contents; a plugin that supplies no stdio server leaves the runner to reject the undeliverable overlay. Without any possible consumer, explicit validation and manifest compilation fail before runner contact. The variable reaches the spawn environment of in-realm stdio MCP processes per call, not the model SDK environment. A local agent inherits the control environment and does not support scoped agent delivery. Requesting agent-scope delivery on a local profile fails with:
+     ```
+     Agent step '<name>': local agent runtime inherits the control environment; scoped delivery for local agents is not built, use a remote execution profile or mcp/script scope.
+     ```
+     Bare validation warns to rerun with `--environment` when placement cannot be checked.
+   - **Reserved-Name Rule**: Agent-scoped delivery names cannot collide with model provider credentials. Using any of the reserved names (`base_url`, `api_key`, `bearer_token`, `github_token`, `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`, checked case-insensitively) fails validation with:
+     ```
+     Agent-scope delivery.env '<name>' is reserved for provider credentials; choose a different MCP process environment variable.
+     ```
+     Remote realms support `copilot`, `openai`, and `claude` as inner providers; other providers require a separate implementation.
 2. **Delivery Collisions**:
    - Literal `env` and secret `env` delivery names within the same consumer must be unique.
    - Literal `headers` and secret `header` delivery names within the same consumer must be unique (case-insensitive).
+   - Agent `env_overlay` must not overwrite literal or secret-bound environment variables on any receiving stdio MCP server. The same MCP credential variable name on separate servers is allowed when it does not collide with the overlay.
 3. **Redaction**:
    - Registered secret values are automatically sanitized across event streams, checkpoints, terminal records, and CLI output displays.
 
@@ -3772,6 +3838,79 @@ output:
   summary: "{{ summarizer.output.summary }}"
   all_issues: "{{ analyzer.output.issues }}"
 ```
+
+## Workspace Lifecycle
+
+Workflows can control how workspace files and directories persist across steps, runs, and resumptions. This is especially useful for containerized workloads using the Docker execution backend, where rebuilding dependencies on every retry is slow.
+
+### Configuration (`workflow.workspace`)
+
+Declare the `workspace:` block under the top-level `workflow:` section:
+
+```yaml
+workflow:
+  name: containerized-ci
+  workspace:
+    mode: shared           # shared (default) | isolated (reserved)
+    persistence: on-failure # ephemeral (default) | durable | on-failure
+```
+
+#### Fields and Defaults
+
+* **`mode`** (default `shared`): Defines how workspace storage is shared across steps in the run. Currently, only `shared` is implemented. The value `isolated` is reserved for future per-step sandbox isolation.
+* **`persistence`** (default `ephemeral`): Defines volume retention when the workflow concludes:
+  * `ephemeral`: The workspace is cleaned up when the run finishes, regardless of success or failure.
+  * `durable`: The workspace is retained after the run finishes, whether it succeeds, fails, or is cancelled.
+  * `on-failure`: The workspace is retained if the workflow fails or is cancelled. If the workflow completes cleanly (including intentional exits via `type: terminate` with `status: success` or `status: failed`), the workspace is removed.
+
+#### Sub-workflow Inheritance
+
+Workspace persistence is a run-global policy. Root workflows set the policy, and all sub-workflows automatically inherit it. If a sub-workflow declares its own `workspace:` block, Conductor rejects the workflow at validation time with a schema error. Sub-workflows cannot override the root retention policy.
+
+### Restart Policy (`restart:`)
+
+When resuming a workflow that failed mid-step, Conductor uses the `restart:` policy to decide how to handle the in-flight step recorded in `checkpoint_saved.interrupted_step`.
+
+#### Configuration Positions
+
+Configure restart policy globally under `workflow.defaults.restart`, or override it on individual step definitions:
+
+```yaml
+# Global default
+workflow:
+  name: deploy-pipeline
+  defaults:
+    restart:
+      mode: rerun
+
+# Per-step override
+agents:
+  - name: publish_release
+    type: script
+    restart:
+      mode: fail
+    command: ./scripts/publish.sh
+```
+
+#### Semantics
+
+* **`rerun`** (default): If the step was interrupted mid-execution, re-run it from the beginning upon resume.
+* **`fail`**: If the step was interrupted mid-execution, fail immediately upon resume. Use this for non-idempotent steps, such as deploying artifacts or firing external webhooks.
+* **`reuse`**: Reserved for future step-level caching and output reuse.
+
+#### Step Groups
+
+For parallel groups and for-each groups, `restart:` applies to the whole group. If execution stopped while any member was running, resuming the workflow re-runs all items in the group from the beginning. Partial group re-execution is deferred.
+
+Periodic checkpoints behave differently from failure checkpoints. Because periodic checkpoints trigger at clean step boundaries where prior outputs are committed, resumption starts at the next pending step. The `restart:` policy governs steps that were interrupted midway during a failure.
+
+### Reserved Modes and Validation Errors
+
+Conductor enforces fail-closed validation for features reserved for future releases:
+
+1. **Reserved `mode: isolated`**: Setting `workflow.workspace.mode: isolated` raises a validation error stating that isolated workspaces are reserved for future sandbox isolation.
+2. **Reserved `restart.mode: reuse`**: Setting `restart.mode: reuse` raises a validation error stating that reuse restart mode is reserved for future step output reuse.
+3. **Local Backend Retained Error**: Setting `persistence: durable` or `persistence: on-failure` when steps target the `local` runner backend raises a configuration error stating that the local backend supports ephemeral workspaces only, and that retained workspaces require the `docker` runner backend.
 
 ## See Also
 

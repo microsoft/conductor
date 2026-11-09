@@ -1962,6 +1962,175 @@ class TestChainedGateResolution:
 
         assert calls == ["Q1?"]
 
+    @staticmethod
+    def _write_free_text_question(tmp_path: Path, run_id: str) -> None:
+        """A run sitting at a questions-node gate whose only answer is
+        "Write your own" -- the shape that used to advance unanswered."""
+        details = [
+            {
+                "label": "✎ Write your own",
+                "value": "__free_text__",
+                "route": "",
+                "prompt_for": "answer",
+                "multiline": False,
+            },
+            {
+                "label": "⤼ Skip this question",
+                "value": "__skip__",
+                "route": "",
+                "prompt_for": None,
+                "multiline": False,
+            },
+        ]
+        log = tmp_path / f"{run_id}.events.jsonl"
+        _write_events(
+            log,
+            [
+                _event("workflow_started", {"workflow_name": "wf"}),
+                _event("agent_started", {"agent_name": "ask"}),
+                _event(
+                    "gate_presented",
+                    {
+                        "agent_name": "ask",
+                        "prompt": "Q1?",
+                        "options": [d["value"] for d in details],
+                        "option_details": details,
+                        "step_type": "questions",
+                    },
+                ),
+            ],
+        )
+        _write_record(tmp_path, run_id, workflow_name="wf", event_log_path=str(log))
+
+    @staticmethod
+    def _accepted_post() -> Any:
+        from unittest.mock import Mock
+
+        import httpx
+
+        resp = Mock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.text = '{"status": "accepted"}'
+        resp.json.return_value = {"status": "accepted"}
+        return Mock(return_value=resp)
+
+    async def _open_editor(self, pilot: Any, app: FleetApp) -> None:
+        """`g`, then pick "Write your own" -- through the real resolver.
+
+        `pilot.pause()`/`wait_for`, never `settle`: the gate worker is
+        suspended on a modal for the whole interaction."""
+        from textual.widgets import OptionList
+
+        from conductor.fleet.tui.actions import GateInputModal
+
+        await pilot.press("g")
+        await wait_for(
+            pilot,
+            lambda: isinstance(app.screen, GateOptionsModal),
+            message="`g` never opened the options modal",
+        )
+        app.screen.query_one(OptionList).highlighted = 0
+        await pilot.press("enter")
+        await wait_for(
+            pilot,
+            lambda: isinstance(app.screen, GateInputModal),
+            message="Write your own never opened the input editor",
+        )
+
+    async def test_editing_and_cancelling_never_reach_the_next_gate(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """While the answer is being typed nothing has been sent, so there
+        is no next question to wait for; Escape leaves the question open,
+        releases the resolve guard, and `g` reopens the same gate (#620)."""
+        self._write_free_text_question(tmp_path, "aaaa0022")
+
+        waited: list[str] = []
+
+        async def _record_next(self, record, *, after, timeout=8.0):
+            waited.append(after.prompt)
+            return None
+
+        monkeypatch.setattr(RunsScreen, "_await_next_gate", _record_next)
+        post = self._accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                screen = app.screen
+                assert isinstance(screen, RunsScreen)
+
+                await self._open_editor(pilot, app)
+                await pilot.press("a", "b", "c")
+                await pilot.pause()
+                assert waited == [], "editing must not wait for the next gate"
+                assert post.call_count == 0
+                assert screen._resolving_gate is True
+
+                await pilot.press("escape")
+                await wait_for(
+                    pilot,
+                    lambda: app.screen is screen and not screen._resolving_gate,
+                    message="cancelling the editor never released the resolve guard",
+                )
+                assert waited == [], "a cancelled answer must not wait for the next gate"
+                post.assert_not_called()
+
+                summary = screen._selected_summary()
+                assert summary is not None and summary.gate is not None
+                assert summary.gate.prompt == "Q1?", "the question must still be pending"
+
+                # And it can be reopened.
+                await pilot.press("g")
+                await wait_for(
+                    pilot,
+                    lambda: isinstance(app.screen, GateOptionsModal),
+                    message="`g` could not reopen the pending gate after a cancel",
+                )
+                await pilot.press("escape")
+                await wait_for(
+                    pilot,
+                    lambda: app.screen is screen and not screen._resolving_gate,
+                    message="the reopened gate never closed",
+                )
+
+    async def test_confirmed_answer_reaches_the_next_gate(
+        self, fleet_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._write_free_text_question(tmp_path, "aaaa0023")
+
+        waited: list[str] = []
+
+        async def _record_next(self, record, *, after, timeout=8.0):
+            waited.append(after.prompt)
+            return None
+
+        monkeypatch.setattr(RunsScreen, "_await_next_gate", _record_next)
+        post = self._accepted_post()
+
+        with patch("httpx.post", post):
+            app = FleetApp()
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                screen = app.screen
+                assert isinstance(screen, RunsScreen)
+
+                await self._open_editor(pilot, app)
+                await pilot.press("o", "k")
+                await pilot.press("enter")
+                await wait_for(
+                    pilot,
+                    lambda: bool(waited) and not screen._resolving_gate,
+                    message="a confirmed answer never chained to the next gate",
+                )
+
+        assert waited == ["Q1?"]
+        post.assert_called_once()
+        body = post.call_args.kwargs["json"]
+        assert body["selected_value"] == "__free_text__"
+        assert body["additional_input"] == "ok"
+
 
 class TestRunsScreenPausesWhileNotOnTop:
     """The Runs screen must stop animating while another screen covers it.

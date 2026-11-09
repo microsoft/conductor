@@ -48,6 +48,18 @@ def _no_tui_animation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SESSIONNAME", raising=False)
 
 
+@pytest.fixture
+def hold_splash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the launch splash up for tests that assert it is on screen.
+
+    The splash pops itself after ``SPLASH_SECONDS`` (1.4 s). A loaded CI
+    runner can take longer than that to start the app, so the splash is gone
+    before the first assertion. Tests of the self-dismiss timer must not use
+    this.
+    """
+    monkeypatch.setattr("conductor.fleet.tui.screens.splash.SPLASH_SECONDS", 3600)
+
+
 async def settle(pilot: Any) -> None:
     """Pause until every background load worker has finished and rendered.
 

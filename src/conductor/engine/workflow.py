@@ -17,9 +17,9 @@ import tempfile
 import time as _time
 import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from conductor import redaction
 from conductor.billing import BillingMode, aggregate_label
@@ -38,20 +38,28 @@ from conductor.config.schema import (
 )
 from conductor.duration import parse_duration
 from conductor.engine.bundle_prep import prepare_run_bundle
-from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
+from conductor.engine.checkpoint import CheckpointData, CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
 from conductor.engine.execution_resolution import ExecutionResolver, ExecutionResolverSession
 from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
+from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.engine.router import Router, RouteResult
-from conductor.engine.run_manifest import executable_step_identity, script_step_backends
+from conductor.engine.run_manifest import (
+    executable_step_identity,
+    manifest_semantic_digest,
+    remote_dialog_error,
+    script_step_backends,
+)
 from conductor.engine.secrets import SecretValueCache
 from conductor.engine.usage import UsageTracker, WorkflowUsage
+from conductor.engine.workspace_claim import WorkspaceClaim, acquire_workspace_claim
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
     BudgetExceededError,
+    CheckpointError,
     ConductorError,
     ConfigurationError,
     ExecutionError,
@@ -64,7 +72,16 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
-from conductor.execution import BundleRef, RunnerBackend, RunOutcome, RunSpec, WorkspaceLease
+from conductor.execution import (
+    AgentSpec,
+    BundleRef,
+    ResolvedExecutionSpec,
+    RunnerBackend,
+    RunOutcome,
+    RunSpec,
+    WorkspaceIdentity,
+    WorkspaceLease,
+)
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -102,13 +119,31 @@ from conductor.telemetry import guards
 
 logger = logging.getLogger(__name__)
 
+
+def _release_workspace_claim(claim: WorkspaceClaim) -> None:
+    """Keep an in-flight outcome when claim cleanup fails."""
+    active_error = sys.exc_info()[1]
+    try:
+        claim.release()
+    except Exception:
+        if active_error is None:
+            raise
+        logger.warning(
+            "Failed to release workspace claim for run %s at %s; "
+            "inspect the claim before removing it manually.",
+            claim.run_id,
+            claim.path,
+            exc_info=True,
+        )
+
+
 # Maximum nesting depth for sub-workflow composition.
 # Prevents runaway recursion when workflows reference each other.
 MAX_SUBWORKFLOW_DEPTH = 10
 
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Mapping
+    from collections.abc import Callable, Coroutine, Mapping
 
     from conductor.config.schema import (
         ForEachDef,
@@ -137,6 +172,43 @@ class RunContext:
     log_file: str = ""
     dashboard_port: int | None = None
     bg_mode: bool = False
+
+
+@dataclass(frozen=True)
+class AgentRealm:
+    """Placement fixed for an agent, its grader, and all re-executions."""
+
+    backend: RunnerBackend
+    lease: WorkspaceLease | None
+    execution: ResolvedExecutionSpec | None
+    env_overlay: Mapping[str, str]
+    credential_resolver: Callable[[str], Mapping[str, Any] | None]
+    image: str | None
+    name: str
+    on_dispatch: Callable[[], None] | None = None
+
+
+class _RealmKwargs(TypedDict, total=False):
+    execution_backend: RunnerBackend
+    workspace_lease: WorkspaceLease | None
+    resolved_execution: ResolvedExecutionSpec | None
+    agent_env_overlay: Mapping[str, str]
+    realm_credential_resolver: Callable[[str], Mapping[str, Any] | None]
+    on_dispatch: Callable[[], None] | None
+
+
+def _realm_kwargs(realm: AgentRealm | None) -> _RealmKwargs:
+    """Leave the historical call shape untouched for local agents."""
+    if realm is None:
+        return {}
+    return {
+        "execution_backend": realm.backend,
+        "workspace_lease": realm.lease,
+        "resolved_execution": realm.execution,
+        "agent_env_overlay": realm.env_overlay,
+        "realm_credential_resolver": realm.credential_resolver,
+        "on_dispatch": realm.on_dispatch,
+    }
 
 
 @dataclass(frozen=True)
@@ -606,6 +678,10 @@ class WorkflowEngine:
             backward compatibility.
         """
         self.config = config
+        if _subworkflow_depth and config.workflow.workspace is not None:
+            raise ConfigurationError(
+                "Sub-workflows cannot declare workflow.workspace; the root policy applies."
+            )
         self.skip_gates = skip_gates
         self.workflow_path = workflow_path
         self._run_context = run_context or RunContext()
@@ -797,11 +873,16 @@ class WorkflowEngine:
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
+        self._in_flight_attempts: dict[str, str] = {}
+        self._explicit_terminal_failure = False
         # Idempotency flag for handle_dashboard_stop (issue #245). Tracked
         # separately from _last_checkpoint_path because periodic checkpoints
         # (issue #244) also set _last_checkpoint_path, so it can no longer
         # double as "the dashboard-stop handler already ran".
         self._dashboard_stop_handled: bool = False
+        self._dashboard_stop_workspace: (
+            tuple[dict[str, WorkspaceIdentity], frozenset[str]] | None
+        ) = None
 
         # True only for the first questions node reached via resume(), so a
         # loop-back re-asks rather than replaying the prior pass's answers.
@@ -1811,15 +1892,18 @@ class WorkflowEngine:
 
         return _callback
 
-    async def _get_executor_for_agent(self, agent: AgentDef) -> AgentExecutor:
+    async def _get_executor_for_agent(
+        self, agent: AgentDef, realm: AgentRealm | None = None
+    ) -> AgentExecutor:
         """Get the appropriate executor for an agent.
 
-        When using a ProviderRegistry (multi-provider mode), this creates
-        an executor with the provider appropriate for the agent. When using
-        a single provider (backward compat mode), returns the shared executor.
+        Remote realms use static registry configuration without constructing
+        a host provider. Local registry agents still obtain their provider;
+        local single-provider mode returns the shared executor.
 
         Args:
             agent: The agent definition.
+            realm: Resolved remote placement, if any.
 
         Returns:
             AgentExecutor configured for the agent's provider.
@@ -1827,29 +1911,91 @@ class WorkflowEngine:
         Raises:
             ExecutionError: If no provider or registry is configured.
         """
-        if self._registry is not None:
-            # Multi-provider mode: get provider from registry
-            provider = await self._registry.get_provider(agent)
-            return AgentExecutor(
-                provider,
-                workflow_tools=self.config.tools,
-                instructions_preamble=self._instructions_preamble,
-                workflow_skills=self._workflow_skills,
-                workflow_dir=self._workflow_dir,
-                skill_injection=self.config.workflow.runtime.skill_injection,
-                skill_discovery=self.config.workflow.runtime.skill_discovery,
-                workflow_plugins=self._workflow_plugins,
-                plugin_marketplaces=self._plugin_marketplaces,
-                declared_plugin_sources=self._declared_plugin_sources,
-            )
-        elif self.executor is not None:
+        if realm is None and self._registry is None and self.executor is not None:
             # Single provider mode (backward compatibility)
             return self.executor
-        else:
+        if realm is None and self._registry is None:
             raise ExecutionError(
                 "No provider configured for workflow execution",
                 suggestion="Provide either a provider or registry to WorkflowEngine",
             )
+
+        remote_kwargs: dict[str, Any] = {}
+        if realm is not None:
+            runtime = (
+                self._registry.runtime
+                if self._registry is not None
+                else self.config.workflow.runtime
+            )
+            remote_kwargs = {
+                "remote_provider_type": self._provider_name_for(agent),
+                "remote_runtime": runtime,
+                "remote_mcp_servers": (
+                    self._registry.mcp_servers
+                    if self._registry is not None
+                    else self.config.workflow.runtime.mcp_servers
+                ),
+            }
+            provider = None
+        else:
+            assert self._registry is not None
+            provider = await self._registry.get_provider(agent)
+        return AgentExecutor(
+            provider,
+            workflow_tools=self.config.tools,
+            instructions_preamble=self._instructions_preamble,
+            workflow_skills=self._workflow_skills,
+            workflow_dir=self._workflow_dir,
+            skill_injection=self.config.workflow.runtime.skill_injection,
+            skill_discovery=self.config.workflow.runtime.skill_discovery,
+            workflow_plugins=self._workflow_plugins,
+            plugin_marketplaces=self._plugin_marketplaces,
+            declared_plugin_sources=self._declared_plugin_sources,
+            **remote_kwargs,
+        )
+
+    def _realm_credentials_for(self, provider_type: str) -> Mapping[str, Any] | None:
+        """Resolve credentials using the registry settings that configure this provider."""
+        settings = (
+            self._registry.provider_settings_for(provider_type)
+            if self._registry is not None
+            else self.config.workflow.runtime.provider
+        )
+        return resolve_realm_credentials(provider_type, settings)
+
+    def _agent_realm(self, name: str, *, for_each_group: str | None = None) -> AgentRealm | None:
+        """Resolve placement once, retaining the identity for every follow-up."""
+        key = executable_step_identity(name, for_each_group=for_each_group)
+        profile = self._execution_resolver.manifest.profiles[key]
+        if profile.backend == "local":
+            return None
+        backend = self._execution_resolver.backend_for_step(name, for_each_group=for_each_group)
+        if not backend.capabilities().agent:
+            raise ConfigurationError(
+                f"Execution backend '{profile.backend}' does not support agent steps.",
+                suggestion="Use an agent-capable execution profile.",
+            )
+        execution = self._execution_resolver.execution_spec_for_step(
+            name, for_each_group=for_each_group
+        )
+        image = execution.image if execution is not None else None
+        if image is None and profile.backend == "docker":
+            docker = self._execution_session.environment.document.profiles[profile.profile].docker
+            image = docker.runner_image if docker is not None else None
+        return AgentRealm(
+            backend=backend,
+            lease=self._execution_session.lease_for_backend(profile.backend),
+            execution=execution,
+            env_overlay=self._execution_resolver.secret_env_for_step(
+                name, for_each_group=for_each_group
+            ),
+            credential_resolver=self._realm_credentials_for,
+            image=image,
+            name=profile.backend,
+            on_dispatch=(lambda: self._execution_session.record_backend_execution(profile.backend))
+            if backend.capabilities().retained_workspace
+            else None,
+        )
 
     async def _execute_script(
         self,
@@ -1892,10 +2038,24 @@ class WorkflowEngine:
                 suggestion="Remove the duplicate from the step's 'env' mapping or choose a "
                 "different secret delivery name.",
             )
+        backend_name = self._execution_resolver.manifest.profiles[
+            executable_step_identity(agent.name, for_each_group=for_each_group)
+        ].backend
+        attempt_id = self._in_flight_attempts.get(agent.name)
+        if attempt_id is None and self._workspace_persistence() is not None:
+            attempt_id = self._mint_attempt(agent.name)
         return await self.limits.wait_for_with_timeout(
             self.script_executor.execute(
                 agent,
                 context,
+                attempt_id=(
+                    attempt_id
+                    if self._workspace_persistence() is not None and backend_name != "local"
+                    else None
+                ),
+                on_dispatch=(lambda: self._execution_session.record_backend_execution(backend_name))
+                if backend.capabilities().retained_workspace
+                else None,
                 lease=lease,
                 backend=backend,
                 secret_env=secret_env,
@@ -3264,7 +3424,9 @@ class WorkflowEngine:
             },
         )
 
-    async def _ensure_pricing_resolved(self, agent: AgentDef, model: str | None) -> None:
+    async def _ensure_pricing_resolved(
+        self, agent: AgentDef, model: str | None, realm: AgentRealm | None = None
+    ) -> None:
         """Resolve provider-supplied pricing for ``model`` and cache it.
 
         Best-effort bridge between the async :meth:`AgentProvider.get_model_pricing`
@@ -3295,7 +3457,7 @@ class WorkflowEngine:
         ``(provider, model)`` or returning the price inline to ``record`` — when a
         second provider implements the hook. Acceptable for a best-effort estimate.
         """
-        if not model or not isinstance(model, str):
+        if realm is not None or not model or not isinstance(model, str):
             return
         # Fast path: this model was already attempted this run (price cached, or
         # deliberately left unpriced).
@@ -3356,7 +3518,7 @@ class WorkflowEngine:
             self._pricing_resolved_models.add(model)
 
     async def _get_context_window_for_agent(
-        self, agent: AgentDef, output: AgentOutput | None = None
+        self, agent: AgentDef, output: AgentOutput | None = None, realm: AgentRealm | None = None
     ) -> int | None:
         """Return the SDK-reported max prompt tokens for an agent.
 
@@ -3371,6 +3533,8 @@ class WorkflowEngine:
         reached, or the provider's metadata call fails — context-window
         metadata is best-effort and must never break workflow execution.
         """
+        if realm is not None:
+            return None
         provider = await self._get_provider_for_agent(agent)
         if provider is None:
             return None
@@ -3398,7 +3562,7 @@ class WorkflowEngine:
         return None
 
     async def _context_window_fields(
-        self, agent: AgentDef, output: AgentOutput
+        self, agent: AgentDef, output: AgentOutput, realm: AgentRealm | None = None
     ) -> dict[str, int | None]:
         """Return the ``context_window_used`` / ``context_window_max`` event pair.
 
@@ -3429,7 +3593,7 @@ class WorkflowEngine:
             ready to splice into an event payload.
         """
         used = output.last_call_input_tokens
-        maximum = await self._get_context_window_for_agent(agent, output)
+        maximum = await self._get_context_window_for_agent(agent, output, realm)
         if used is not None and maximum is not None and used > maximum:
             logger.debug(
                 "Dropping impossible context-window pair for agent %s: "
@@ -3457,6 +3621,54 @@ class WorkflowEngine:
             return {"context_window_used": None, "context_window_max": None}
         return {"context_window_used": used, "context_window_max": maximum}
 
+    def _workspace_persistence(self) -> Literal["durable", "on-failure"] | None:
+        policy = self.config.workflow.workspace
+        if policy is not None and policy.persistence in ("durable", "on-failure"):
+            return policy.persistence
+        return None
+
+    def _mint_attempt(self, step_key: str) -> str:
+        attempt_id = uuid.uuid4().hex
+        self._in_flight_attempts[step_key] = attempt_id
+        return attempt_id
+
+    def _agent_attempt_field(
+        self,
+        agent: AgentDef,
+        step_key: str,
+        *,
+        for_each_group: str | None = None,
+    ) -> dict[str, str]:
+        if self._workspace_persistence() is None or (
+            agent.restart is None and self.config.workflow.defaults.restart is None
+        ):
+            return {}
+        backend = self._execution_resolver.backend_for_step(
+            agent.name, for_each_group=for_each_group
+        )
+        if not backend.capabilities().retained_workspace:
+            return {}
+        return {"attempt_id": self._in_flight_attempts[step_key]}
+
+    def _compute_workspace_retain(self, outcome: RunOutcome) -> bool:
+        persistence = self._workspace_persistence()
+        return persistence == "durable" or (
+            persistence == "on-failure"
+            and outcome != "succeeded"
+            and not self._explicit_terminal_failure
+        )
+
+    def _resume_contract(self, bundle: BundleRef | None = None) -> dict[str, Any]:
+        manifest = self._execution_resolver.manifest
+        environment = self._execution_session.environment
+        return {
+            "workflow_digest": manifest.workflow.digest,
+            "environment_name": environment.name,
+            "environment_digest": environment.digest,
+            "manifest_digest": manifest_semantic_digest(manifest),
+            "bundle_digest": bundle.digest if bundle is not None else None,
+        }
+
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
 
@@ -3480,6 +3692,9 @@ class WorkflowEngine:
             TemplateError: If template rendering fails.
         """
         await self._ensure_plugin_marketplaces()
+        self._explicit_terminal_failure = False
+        self._dashboard_stop_handled = False
+        self._dashboard_stop_workspace = None
 
         # Apply defaults from input schema for optional inputs not provided
         merged_inputs = self._apply_input_defaults(inputs)
@@ -3493,7 +3708,13 @@ class WorkflowEngine:
         # finally without setting it died on an unexpected path.
         outcome: RunOutcome = "failed"
         redaction_token = None
+        claim = None
         try:
+            persistence = self._workspace_persistence()
+            if self._subworkflow_depth == 0 and persistence is not None:
+                if not self._run_id:
+                    self._run_id = uuid.uuid4().hex
+                claim = acquire_workspace_claim(self._run_id)
             backend_names = {
                 profile.backend for profile in self._execution_resolver.manifest.profiles.values()
             }
@@ -3522,8 +3743,10 @@ class WorkflowEngine:
                         run_id=self._run_id,
                         workflow_name=self.config.workflow.name,
                         bundle=bundle,
+                        workspace_persistence=persistence,
                     ),
                     workflow_path=self.workflow_path,
+                    claim_active=claim is not None,
                 )
                 self._workspace_lease = self._execution_session.lease_for_backend("local")
                 set_redactor = getattr(self._event_emitter, "set_redactor", None)
@@ -3556,16 +3779,27 @@ class WorkflowEngine:
             finally:
                 if self._subworkflow_depth == 0:
                     try:
-                        await self._execution_session.finalize_leases(outcome)
+                        if outcome == "cancelled":
+                            self._dashboard_stop_workspace = (
+                                self._execution_session.workspace_identities(),
+                                self._execution_session.executed_backends(),
+                            )
+                        await self._execution_session.finalize_leases(
+                            outcome, retain=self._compute_workspace_retain(outcome)
+                        )
                     finally:
                         self._workspace_lease = None
                         if redaction_token is not None:
                             redaction.reset_current(redaction_token)
+                        if claim is not None:
+                            _release_workspace_claim(claim)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
 
-    async def resume(self, current_agent_name: str) -> dict[str, Any]:
+    async def resume(
+        self, current_agent_name: str, *, checkpoint: CheckpointData | None = None
+    ) -> dict[str, Any]:
         """Resume workflow execution from a specific agent.
 
         Assumes ``self.context`` and ``self.limits`` have been pre-loaded
@@ -3585,6 +3819,9 @@ class WorkflowEngine:
             TimeoutError: If timeout limit is exceeded.
         """
         await self._ensure_plugin_marketplaces()
+        self._explicit_terminal_failure = False
+        self._dashboard_stop_handled = False
+        self._dashboard_stop_workspace = None
 
         # A questions node restores its partial answers only here. On an
         # ordinary loop-back the node must ask its new questions, not replay
@@ -3599,11 +3836,114 @@ class WorkflowEngine:
         # prepare/finalize (run/resume parity).
         outcome: RunOutcome = "failed"
         redaction_token = None
+        claim = None
         try:
+            persistence = self._workspace_persistence()
+            if checkpoint is None and persistence is not None:
+                raise CheckpointError(
+                    "Retained workspace resume requires checkpoint data; start a fresh run."
+                )
+            resume_identities: dict[str, WorkspaceIdentity] | None = None
+            expect_staged: dict[str, bool] | None = None
+            if checkpoint is not None:
+                contract = checkpoint.resume_contract
+                if contract is None and persistence is not None:
+                    raise CheckpointError(
+                        "Checkpoint predates the workspace lifecycle; start a fresh run."
+                    )
+                if contract is not None:
+                    current = self._resume_contract()
+                    for field_name in (
+                        "workflow_digest",
+                        "environment_name",
+                        "environment_digest",
+                        "manifest_digest",
+                    ):
+                        if contract.get(field_name) != current[field_name]:
+                            raise CheckpointError(
+                                f"Checkpoint {field_name} mismatch: recorded "
+                                f"{contract.get(field_name)!r}, current {current[field_name]!r}; "
+                                "select the recorded environment with --environment "
+                                "or start a fresh run with the current workflow and environment."
+                            )
+                workspace = checkpoint.workspace
+                if persistence is not None:
+                    if workspace is None or workspace.get("policy") != persistence:
+                        raise CheckpointError(
+                            "Checkpoint workspace policy mismatch; start a fresh run."
+                        )
+                    identities = workspace.get("identities", {})
+                    resume_identities = {}
+                    for name, raw in identities.items():
+                        try:
+                            identity = WorkspaceIdentity(**raw)
+                        except (TypeError, ValueError) as exc:
+                            raise CheckpointError(
+                                f"Checkpoint workspace identity for {name!r} is invalid."
+                            ) from exc
+                        if (
+                            identity.backend != name
+                            or identity.lease_id != self._run_id
+                            or not identity.incarnation
+                        ):
+                            raise CheckpointError(
+                                f"Checkpoint workspace identity mismatch for {name!r}; "
+                                "start a fresh run."
+                            )
+                        resume_identities[name] = identity
+                    retained_names = {
+                        profile.backend
+                        for profile in self._execution_resolver.manifest.profiles.values()
+                        if profile.backend != "local"
+                    }
+                    if not retained_names.issubset(resume_identities):
+                        raise CheckpointError(
+                            "Checkpoint is missing an identity for a retained backend; "
+                            "start a fresh run."
+                        )
+                    executed = workspace.get("executed_backends")
+                    if executed is None:
+                        staged = bool(checkpoint.context.get("execution_history")) or (
+                            checkpoint.interrupted_step is not None
+                        )
+                        expect_staged = dict.fromkeys(resume_identities, staged)
+                    else:
+                        expect_staged = {name: name in executed for name in resume_identities}
+                    self._execution_session.restore_executed_backends(executed or [])
+                if checkpoint.trigger == "failure":
+                    interrupted = checkpoint.interrupted_step
+                    step_name = (interrupted or {}).get("name") or checkpoint.current_agent
+                    step = self._find_agent(step_name)
+                    parallel_group = self._find_parallel_group(step_name)
+                    for_each_group = self._find_for_each_group(step_name)
+                    if parallel_group is not None:
+                        members = [self._find_agent(name) for name in parallel_group.agents]
+                    elif for_each_group is not None:
+                        members = [for_each_group.agent]
+                    else:
+                        members = [step]
+                    default_restart = self.config.workflow.defaults.restart
+                    for member in members:
+                        restart = getattr(member, "restart", None) or default_restart
+                        if restart is not None and restart.mode == "fail":
+                            member_name = getattr(member, "name", step_name)
+                            raise CheckpointError(
+                                f"Interrupted step {step_name!r} includes {member_name!r} "
+                                "with restart.mode: fail; start a fresh run."
+                            )
+                    note = (
+                        f"Resuming interrupted step {step_name!r} at least once "
+                        "(legacy current_agent is a heuristic, not a proven in-flight identity)"
+                    )
+                    logger.info(note)
+                    from conductor.cli.run import verbose_log
+
+                    verbose_log(note, style="yellow")
+            if self._subworkflow_depth == 0 and persistence is not None:
+                claim = acquire_workspace_claim(self._run_id)
             backend_names = {
                 profile.backend for profile in self._execution_resolver.manifest.profiles.values()
             }
-            await self._execution_session.ensure_backends(backend_names)
             if self._subworkflow_depth == 0:
                 if self._execution_session.owns_secrets:
                     self._execution_session.reset_secrets()
@@ -3614,6 +3954,15 @@ class WorkflowEngine:
                     self._execution_session.environment,
                 )
                 self._run_bundle = bundle
+                if checkpoint is not None and checkpoint.resume_contract is not None:
+                    recorded_bundle = checkpoint.resume_contract.get("bundle_digest")
+                    current_bundle = bundle.digest if bundle is not None else None
+                    if recorded_bundle is not None and recorded_bundle != current_bundle:
+                        raise CheckpointError(
+                            f"Checkpoint bundle_digest mismatch: recorded {recorded_bundle!r}, "
+                            f"current {current_bundle!r}; start a fresh run."
+                        )
+                await self._execution_session.ensure_backends(backend_names)
                 backends = script_step_backends(self._execution_resolver.manifest)
                 if len(backends) > 1:
                     message = "Workflow uses mixed script execution backends: " + ", ".join(
@@ -3628,8 +3977,12 @@ class WorkflowEngine:
                         run_id=self._run_id,
                         workflow_name=self.config.workflow.name,
                         bundle=bundle,
+                        workspace_persistence=persistence,
                     ),
                     workflow_path=self.workflow_path,
+                    resume_identities=resume_identities,
+                    expect_staged=expect_staged,
+                    claim_active=claim is not None,
                 )
                 self._workspace_lease = self._execution_session.lease_for_backend("local")
                 set_redactor = getattr(self._event_emitter, "set_redactor", None)
@@ -3637,6 +3990,8 @@ class WorkflowEngine:
                     set_redactor(self._execution_session.redactor)
                 if redaction.current() is not self._execution_session.redactor:
                     redaction_token = redaction.set_current(self._execution_session.redactor)
+            else:
+                await self._execution_session.ensure_backends(backend_names)
             result = await self._execute_loop(current_agent_name)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -3657,11 +4012,20 @@ class WorkflowEngine:
             finally:
                 if self._subworkflow_depth == 0:
                     try:
-                        await self._execution_session.finalize_leases(outcome)
+                        if outcome == "cancelled":
+                            self._dashboard_stop_workspace = (
+                                self._execution_session.workspace_identities(),
+                                self._execution_session.executed_backends(),
+                            )
+                        await self._execution_session.finalize_leases(
+                            outcome, retain=self._compute_workspace_retain(outcome)
+                        )
                     finally:
                         self._workspace_lease = None
                         if redaction_token is not None:
                             redaction.reset_current(redaction_token)
+                        if claim is not None:
+                            _release_workspace_claim(claim)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3777,6 +4141,23 @@ class WorkflowEngine:
             copilot_session_ids = None
             copilot_session_cwds = None
 
+        persistence = self._workspace_persistence()
+        if self._dashboard_stop_handled and self._dashboard_stop_workspace is not None:
+            identities, executed_backends = self._dashboard_stop_workspace
+        else:
+            identities = self._execution_session.workspace_identities()
+            executed_backends = self._execution_session.executed_backends()
+        interrupted = None
+        if (
+            persistence is not None
+            and trigger == "failure"
+            and self._current_agent_name is not None
+        ):
+            interrupted = {
+                "name": self._current_agent_name,
+                "status": "unknown",
+                "attempt_id": self._in_flight_attempts.get(self._current_agent_name),
+            }
         return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
             context=self.context,
@@ -3788,13 +4169,26 @@ class WorkflowEngine:
             copilot_session_cwds=copilot_session_cwds,
             system_metadata=self._system_metadata,
             instructions_preamble=self._instructions_preamble,
-            run_id=self._run_context.run_id,
+            run_id=self._run_id,
             event_log_path=self._run_context.log_file,
             trigger=trigger,
             redactor=self._execution_session.redactor,
+            workspace=(
+                {
+                    "policy": persistence,
+                    "identities": {name: asdict(identity) for name, identity in identities.items()},
+                    "executed_backends": sorted(executed_backends),
+                }
+                if persistence is not None
+                else None
+            ),
+            resume_contract=(
+                self._resume_contract(self._run_bundle) if persistence is not None else None
+            ),
+            interrupted_step=interrupted,
         )
 
-    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
+    def _save_checkpoint_on_failure(self, error: BaseException) -> Path | None:
         """Attempt to save a checkpoint after a failure.
 
         This method never raises — on failure it logs a warning so the
@@ -3816,8 +4210,23 @@ class WorkflowEngine:
                     "agent_name": self._current_agent_name,
                     "error_type": type(error).__name__,
                     "trigger": "failure",
+                    **(
+                        {
+                            "interrupted_step": {
+                                "name": self._current_agent_name,
+                                "status": "unknown",
+                                "attempt_id": self._in_flight_attempts.get(
+                                    self._current_agent_name
+                                ),
+                            }
+                        }
+                        if self._workspace_persistence() is not None
+                        and self._current_agent_name is not None
+                        else {}
+                    ),
                 },
             )
+        return checkpoint_path
 
     @property
     def _periodic_checkpoints_active(self) -> bool:
@@ -4002,7 +4411,17 @@ class WorkflowEngine:
         # outcome (path, or the reason none was written) atomically. This emits
         # ``checkpoint_saved`` on success; harmless here since the dashboard
         # reads the path inline from ``workflow_failed``.
-        self._save_checkpoint_on_failure(error)
+        try:
+            checkpoint_path = self._save_checkpoint_on_failure(error)
+        finally:
+            self._dashboard_stop_workspace = None
+        if checkpoint_path is None and self._compute_workspace_retain("cancelled"):
+            logger.warning(
+                "Retained workspace for run %s has no current checkpoint; "
+                "manual cleanup: docker volume rm conductor-ws-%s",
+                self._run_id,
+                self._run_id,
+            )
 
         fail_data: dict[str, Any] = {
             "error_type": type(error).__name__,
@@ -4010,8 +4429,8 @@ class WorkflowEngine:
             "agent_name": self._current_agent_name,
             "stopped_by_user": True,
         }
-        if self._last_checkpoint_path is not None:
-            fail_data["checkpoint_path"] = str(self._last_checkpoint_path)
+        if checkpoint_path is not None:
+            fail_data["checkpoint_path"] = str(checkpoint_path)
         else:
             fail_data["checkpoint_unavailable_reason"] = (
                 "no workflow file is associated with this run"
@@ -4020,7 +4439,7 @@ class WorkflowEngine:
             )
         self._emit("workflow_failed", fail_data)
 
-        return self._last_checkpoint_path
+        return checkpoint_path
 
     def _get_top_level_agent_names(self) -> list[str]:
         """Return names of top-level agents (excluding parallel/for-each nested agents).
@@ -5006,6 +5425,7 @@ class WorkflowEngine:
         guidance_section: str | None,
         executor: AgentExecutor,
         agent_start_time: float,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput:
         """Handle partial output from a mid-agent interrupt.
 
@@ -5056,13 +5476,22 @@ class WorkflowEngine:
         self.add_user_guidance(interrupt_result.guidance, source="interrupt")
 
         # Try Copilot follow-up if provider supports it
-        followup = await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
+        followup = (
+            await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
+            if realm is None
+            else None
+        )
         if followup is not None:
             return followup
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
-        return await executor.execute(agent, agent_context, guidance_section=new_guidance_section)
+        return await executor.execute(
+            agent,
+            agent_context,
+            guidance_section=new_guidance_section,
+            **_realm_kwargs(realm),
+        )
 
     async def _handle_dialog(
         self,
@@ -5070,6 +5499,7 @@ class WorkflowEngine:
         output: AgentOutput,
         agent_context: dict[str, Any],
         executor: AgentExecutor,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput:
         """Handle dialog mode evaluation and conversation for an agent.
 
@@ -5089,7 +5519,11 @@ class WorkflowEngine:
             The original output if dialog was not triggered or declined,
             or an updated output after re-execution with dialog context.
         """
+        if realm is not None:
+            raise ConfigurationError(remote_dialog_error(agent.name, realm.name))
+
         provider = executor.provider
+        assert provider is not None
 
         # Suspend keyboard listener for interactive dialog
         if self._keyboard_listener is not None:
@@ -5137,7 +5571,10 @@ class WorkflowEngine:
             guidance_section += dialog_guidance
 
             new_output = await executor.execute(
-                agent, agent_context, guidance_section=guidance_section
+                agent,
+                agent_context,
+                guidance_section=guidance_section,
+                **_realm_kwargs(realm),
             )
             return new_output
 
@@ -5163,6 +5600,7 @@ class WorkflowEngine:
         guidance_section: str | None,
         event_callback: EventCallback | None,
         usage_label: str | None = None,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput:
         """Run an agent's ``validator:`` and, on failure, re-run the primary once.
 
@@ -5251,13 +5689,46 @@ class WorkflowEngine:
         # workflow — failing open on timeout rather than hanging. A direct
         # ``wait_for`` is used (not ``_execute_with_agent_timeout``) to avoid
         # emitting a misleading ``agent_timeout`` event for the primary agent.
-        validate_coro = self._output_validator.validate(
-            agent,
-            primary_prompt,
-            output.content,
-            provider,
-            interrupt_signal=self._interrupt_event,
-        )
+        if realm is None:
+            validate_coro = self._output_validator.validate(
+                agent,
+                primary_prompt,
+                output.content,
+                provider,
+                interrupt_signal=self._interrupt_event,
+            )
+        else:
+
+            def grader_spec(grader: AgentDef, prompt: str) -> AgentSpec:
+                grader_agent = (
+                    grader.model_copy(update={"sandbox": agent.sandbox})
+                    if realm.name == "aca"
+                    else grader
+                )
+                return replace(
+                    executor.build_realm_spec(
+                        grader_agent,
+                        prompt,
+                        {},
+                        tools=[],
+                        execution=realm.execution,
+                        credential_resolver=realm.credential_resolver,
+                        backend_name=realm.lease.backend if realm.lease is not None else None,
+                    ),
+                    mcp_servers=None,
+                )
+
+            validate_coro = self._output_validator.validate(
+                agent,
+                primary_prompt,
+                output.content,
+                provider,
+                interrupt_signal=self._interrupt_event,
+                execution_backend=realm.backend,
+                workspace_lease=realm.lease,
+                spec_factory=grader_spec,
+                on_dispatch=realm.on_dispatch,
+            )
         try:
             if agent.timeout_seconds is not None:
                 outcome = await asyncio.wait_for(validate_coro, timeout=agent.timeout_seconds)
@@ -5279,7 +5750,7 @@ class WorkflowEngine:
         v_cost: float | None = None
         v_billing_mode: BillingMode | None = None
         if outcome.output is not None:
-            await self._ensure_pricing_resolved(agent, outcome.output.model)
+            await self._ensure_pricing_resolved(agent, outcome.output.model, realm)
             v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
             v_cost = v_usage.cost_usd
             v_billing_mode = v_usage.billing_mode
@@ -5336,6 +5807,7 @@ class WorkflowEngine:
                     continuation_state=continuation_state,
                     interrupt_signal=self._interrupt_event,
                     event_callback=event_callback,
+                    **_realm_kwargs(realm),
                 ),
             )
         except asyncio.CancelledError:
@@ -5384,7 +5856,7 @@ class WorkflowEngine:
         # The re-run succeeded and is now the effective output (recorded under
         # the primary name by the caller). Attribute the now-discarded first
         # attempt to the validator row so its cost isn't lost.
-        await self._ensure_pricing_resolved(agent, output.model)
+        await self._ensure_pricing_resolved(agent, output.model, realm)
         self.usage_tracker.record(validator_row, output, primary_elapsed)
         return new_output
 
@@ -5475,6 +5947,8 @@ class WorkflowEngine:
 
                         # Execute for-each group with timeout enforcement
                         _group_start = _time.time()
+                        if self._workspace_persistence() is not None:
+                            self._mint_attempt(for_each_group.name)
                         for_each_output = await self.limits.wait_for_with_timeout(
                             self._execute_for_each_group(for_each_group),
                             operation_name=f"for-each group '{for_each_group.name}'",
@@ -5504,6 +5978,11 @@ class WorkflowEngine:
                         self.limits.record_execution(
                             for_each_group.name, count=for_each_output.count
                         )
+                        self._in_flight_attempts.pop(for_each_group.name, None)
+                        member_prefix = f"{for_each_group.agent.name}["
+                        for member_key in tuple(self._in_flight_attempts):
+                            if member_key.startswith(member_prefix):
+                                self._in_flight_attempts.pop(member_key)
 
                         # Check timeout and budget after for-each group
                         self.limits.check_timeout()
@@ -5548,6 +6027,8 @@ class WorkflowEngine:
 
                         # Execute parallel group with timeout enforcement
                         _group_start = _time.time()
+                        if self._workspace_persistence() is not None:
+                            self._mint_attempt(parallel_group.name)
                         parallel_output = await self.limits.wait_for_with_timeout(
                             self._execute_parallel_group(parallel_group),
                             operation_name=f"parallel group '{parallel_group.name}'",
@@ -5576,6 +6057,11 @@ class WorkflowEngine:
                         # (both successful and failed agents count toward iteration limit)
                         agent_count = len(parallel_group.agents)
                         self.limits.record_execution(parallel_group.name, count=agent_count)
+                        self._in_flight_attempts.pop(parallel_group.name, None)
+                        for member_name in parallel_group.agents:
+                            self._in_flight_attempts.pop(
+                                f"{parallel_group.name}.{member_name}", None
+                            )
 
                         # Check timeout and budget after parallel group
                         self.limits.check_timeout()
@@ -5636,6 +6122,8 @@ class WorkflowEngine:
                             mode=self.config.workflow.context.mode,
                             agent_type=agent.type,
                         )
+                        if self._workspace_persistence() is not None:
+                            self._mint_attempt(agent.name)
 
                         # Resolve working_dir / settings_dir for provider-backed LLM agents
                         # (type "agent"). wait/set/terminate/human_gate/
@@ -5644,6 +6132,7 @@ class WorkflowEngine:
                         resolved_agent: AgentDef | None = None
                         if isinstance(agent, AgentDef):
                             resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
+                        agent_realm = self._agent_realm(agent.name) if resolved_agent else None
                         event_provider = (
                             self._provider_name_for(resolved_agent)
                             if resolved_agent is not None
@@ -5666,12 +6155,18 @@ class WorkflowEngine:
                             "provider": event_provider,
                             "context_window_max": (
                                 await self._get_context_window_for_agent(resolved_agent)
-                                if resolved_agent is not None
+                                if resolved_agent is not None and agent_realm is None
                                 else None
                             ),
                         }
                         if resolved_agent is not None:
                             started_payload["working_dir"] = resolved_agent.working_dir
+                            if agent_realm is not None:
+                                started_payload["execution_backend"] = agent_realm.name
+                                started_payload["realm_image"] = agent_realm.image
+                            started_payload.update(
+                                self._agent_attempt_field(resolved_agent, agent.name)
+                            )
                             # Emitted alongside working_dir because it is a
                             # trust decision: settings_dir loads another
                             # repository's conventions and, when the session
@@ -5719,6 +6214,7 @@ class WorkflowEngine:
                             # MaxIterationsError from record_execution.
                             self.limits.check_timeout()
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
 
                             # Build the final output: prefer output_template
                             # when set (replaces workflow-level output:);
@@ -5794,6 +6290,7 @@ class WorkflowEngine:
                             # checkpoints (the raise below bypasses the
                             # run()/resume() success cleanup).
                             self._cleanup_run_periodic_checkpoints()
+                            self._explicit_terminal_failure = True
                             raise WorkflowTerminated(
                                 rendered_reason,
                                 output=output,
@@ -5863,6 +6360,7 @@ class WorkflowEngine:
 
                             # Record human gate as executed
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
 
                             if gate_result.route == "$end":
                                 result = self._build_final_output()
@@ -5884,6 +6382,7 @@ class WorkflowEngine:
                             questions_output = await self._run_questions_step(agent)
                             self.context.store(agent.name, questions_output)
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
                             self.limits.check_timeout()
 
                             if questions_output["outcome"] == questions_mod.OUTCOME_ABORTED:
@@ -6024,6 +6523,7 @@ class WorkflowEngine:
 
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
                             self.limits.check_timeout()
                             self._check_budget()
 
@@ -6162,6 +6662,7 @@ class WorkflowEngine:
 
                             self.context.store(agent.name, output_content)
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
                             self.limits.check_timeout()
 
                             route_result = self._evaluate_routes(agent, output_content)
@@ -6204,6 +6705,7 @@ class WorkflowEngine:
                             set_output = await self._run_set_step(agent, agent_context)
                             self.context.store(agent.name, set_output.value)
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
                             self.limits.check_timeout()
 
                             # Routes attached to a set step evaluate against
@@ -6297,6 +6799,7 @@ class WorkflowEngine:
                                 continue
                             self.context.store(agent.name, mcp_envelope)
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
                             self.limits.check_timeout()
 
                             route_result = self._evaluate_routes(agent, mcp_envelope)
@@ -6383,6 +6886,7 @@ class WorkflowEngine:
                             # Store sub-workflow output in context
                             self.context.store(agent.name, sub_output)
                             self.limits.record_execution(agent.name)
+                            self._in_flight_attempts.pop(agent.name, None)
                             self.limits.check_timeout()
                             self._check_budget()
 
@@ -6431,7 +6935,7 @@ class WorkflowEngine:
                                 "executed as a provider-backed agent"
                             )
                         _agent_start = _time.time()
-                        executor = await self._get_executor_for_agent(resolved_agent)
+                        executor = await self._get_executor_for_agent(resolved_agent, agent_realm)
                         guidance_section = self.context.get_guidance_prompt_section()
                         event_callback = self._make_event_callback(agent.name)
                         output = await self._execute_with_agent_timeout(
@@ -6442,6 +6946,7 @@ class WorkflowEngine:
                                 guidance_section=guidance_section,
                                 interrupt_signal=self._interrupt_event,
                                 event_callback=event_callback,
+                                **_realm_kwargs(agent_realm),
                             ),
                         )
                         _agent_elapsed = _time.time() - _agent_start
@@ -6502,6 +7007,7 @@ class WorkflowEngine:
                                     guidance_section,
                                     executor,
                                     _agent_start,
+                                    agent_realm,
                                 )
                                 _agent_elapsed = _time.time() - _agent_start
 
@@ -6512,6 +7018,7 @@ class WorkflowEngine:
                                 output,
                                 agent_context,
                                 executor,
+                                agent_realm,
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
@@ -6525,11 +7032,14 @@ class WorkflowEngine:
                                 executor,
                                 guidance_section,
                                 event_callback,
+                                realm=agent_realm,
                             )
                             _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost
-                        await self._ensure_pricing_resolved(resolved_agent, output.model)
+                        await self._ensure_pricing_resolved(
+                            resolved_agent, output.model, agent_realm
+                        )
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
                         if output.session_seconds is not None:
                             self.usage_tracker.record_sandbox(
@@ -6552,8 +7062,18 @@ class WorkflowEngine:
                                 "cost_usd": usage.cost_usd,
                                 "output": output.content,
                                 "output_keys": output_keys,
+                                **(
+                                    {
+                                        "execution_backend": agent_realm.name,
+                                        "realm_image": agent_realm.image,
+                                    }
+                                    if agent_realm
+                                    else {}
+                                ),
                                 **_billing_mode_field(usage.billing_mode),
-                                **await self._context_window_fields(resolved_agent, output),
+                                **await self._context_window_fields(
+                                    resolved_agent, output, agent_realm
+                                ),
                             },
                         )
 
@@ -6562,6 +7082,7 @@ class WorkflowEngine:
 
                         # Record successful execution
                         self.limits.record_execution(agent.name)
+                        self._in_flight_attempts.pop(agent.name, None)
 
                         # Check timeout and budget after each agent
                         self.limits.check_timeout()
@@ -7457,6 +7978,8 @@ class WorkflowEngine:
                 Exception: Any exception from agent execution (wrapped).
             """
             _agent_start = _time.time()
+            if self._workspace_persistence() is not None:
+                self._mint_attempt(f"{parallel_group.name}.{agent.name}")
             output_for_error: AgentOutput | None = None
             try:
                 # Build context for this agent using the snapshot
@@ -7534,6 +8057,7 @@ class WorkflowEngine:
                         "in a parallel group"
                     )
                 resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
+                realm = self._agent_realm(agent.name)
 
                 # LLM-only per-member start event: emitted only here (after the
                 # per-agent resolution) so ``working_dir`` is the resolved value;
@@ -7545,16 +8069,24 @@ class WorkflowEngine:
                         "group_name": parallel_group.name,
                         "agent_name": agent.name,
                         "working_dir": resolved_agent.working_dir,
+                        **self._agent_attempt_field(
+                            resolved_agent, f"{parallel_group.name}.{agent.name}"
+                        ),
                         "settings_dir": resolved_agent.settings_dir,
                         "provider": event_provider,
                         "native_otel_spans_active": self._native_otel_spans_active_for(
                             event_provider
                         ),
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                     },
                 )
 
                 # Execute agent (get executor for multi-provider support)
-                executor = await self._get_executor_for_agent(resolved_agent)
+                executor = await self._get_executor_for_agent(resolved_agent, realm)
                 event_callback = self._make_event_callback(agent.name)
                 guidance_section = self.context.get_guidance_prompt_section()
                 output = await self._execute_with_agent_timeout(
@@ -7564,6 +8096,7 @@ class WorkflowEngine:
                         agent_context,
                         guidance_section=guidance_section,
                         event_callback=event_callback,
+                        **_realm_kwargs(realm),
                     ),
                 )
                 output_for_error = output
@@ -7579,12 +8112,13 @@ class WorkflowEngine:
                         executor,
                         guidance_section,
                         event_callback,
+                        realm=realm,
                     )
                     output_for_error = output
                     _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(resolved_agent, output.model)
+                await self._ensure_pricing_resolved(resolved_agent, output.model, realm)
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
                 if output.session_seconds is not None:
                     self.usage_tracker.record_sandbox(
@@ -7602,8 +8136,13 @@ class WorkflowEngine:
                         "input_tokens": output.input_tokens,
                         "output_tokens": output.output_tokens,
                         "cost_usd": usage.cost_usd,
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                         **_billing_mode_field(usage.billing_mode),
-                        **await self._context_window_fields(resolved_agent, output),
+                        **await self._context_window_fields(resolved_agent, output, realm),
                     },
                 )
 
@@ -8120,6 +8659,9 @@ class WorkflowEngine:
                 # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
                 # the path resolves to this iteration's value.
                 qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
+                realm = self._agent_realm(inline_agent.name, for_each_group=for_each_group.name)
+                if self._workspace_persistence() is not None:
+                    self._mint_attempt(qualified_agent.name)
 
                 # LLM-only per-item start event: emitted only here (after the
                 # per-item resolution) so ``working_dir`` is the resolved value;
@@ -8132,6 +8674,11 @@ class WorkflowEngine:
                         "group_name": for_each_group.name,
                         "agent_name": qualified_agent.name,
                         "item_key": key,
+                        **self._agent_attempt_field(
+                            inline_agent,
+                            qualified_agent.name,
+                            for_each_group=for_each_group.name,
+                        ),
                         "index": index,
                         "working_dir": qualified_agent.working_dir,
                         "settings_dir": qualified_agent.settings_dir,
@@ -8139,10 +8686,15 @@ class WorkflowEngine:
                         "native_otel_spans_active": self._native_otel_spans_active_for(
                             event_provider
                         ),
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                     },
                 )
 
-                executor = await self._get_executor_for_agent(qualified_agent)
+                executor = await self._get_executor_for_agent(qualified_agent, realm)
 
                 # Item-scoped event callback that tags all streaming events
                 # with the for-each group name + item_key. Wrapper keys are
@@ -8169,6 +8721,7 @@ class WorkflowEngine:
                         agent_context,
                         guidance_section=guidance_section,
                         event_callback=event_callback,
+                        **_realm_kwargs(realm),
                     ),
                 )
                 _item_elapsed = _time.time() - _item_start
@@ -8184,11 +8737,12 @@ class WorkflowEngine:
                         guidance_section,
                         event_callback,
                         usage_label=f"{for_each_group.name}[{key}]",
+                        realm=realm,
                     )
                     _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(qualified_agent, output.model)
+                await self._ensure_pricing_resolved(qualified_agent, output.model, realm)
                 usage = self.usage_tracker.record(
                     f"{for_each_group.name}[{key}]", output, _item_elapsed
                 )
@@ -8207,6 +8761,11 @@ class WorkflowEngine:
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
                         "output": output.content,
+                        **(
+                            {"execution_backend": realm.name, "realm_image": realm.image}
+                            if realm
+                            else {}
+                        ),
                         **_billing_mode_field(usage.billing_mode),
                     },
                 )

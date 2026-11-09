@@ -97,6 +97,8 @@ class ScriptExecutor:
         secret_env: dict[str, str] | None = None,
         execution: ResolvedExecutionSpec | None = None,
         inherit_control_environment: bool = True,
+        attempt_id: str | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> ScriptOutput:
         """Execute a script step.
 
@@ -134,6 +136,9 @@ class ScriptExecutor:
                 on a minimal environment plus ``env`` instead of merging over
                 the control process's environment. Defaults to True (the local
                 backend's long-standing behavior).
+            attempt_id: Optional attempt identity carried into CommandSpec.
+            on_dispatch: Optional callback forwarded to the backend, which invokes
+                it only when command process creation is about to begin.
 
         Returns:
             :class:`ScriptOutput` with stdout, stderr, exit_code, and stdin_bytes.
@@ -208,12 +213,14 @@ class ScriptExecutor:
             # must produce the byte-identical legacy spec (name=None), while a
             # container run gets the step name for realm-side labels/names.
             name=agent.name if execution is not None else None,
+            attempt_id=attempt_id,
         )
         try:
             result = await execution_backend.run_command(
                 spec,
                 lease,
                 diagnostics=self._make_diagnostics(),
+                on_dispatch=on_dispatch,
             )
         except ExecutionSpecError as exc:
             # The execution leaf speaks its own specification-error type; the

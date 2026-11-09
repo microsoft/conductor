@@ -21,14 +21,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePath
 from typing import cast
 from uuid import uuid4
 
-from conductor.execution.errors import ExecutionSpecError
+from conductor.exceptions import ConfigurationError
+from conductor.execution.docker_agent import InterruptOutcome, stream_agent
+from conductor.execution.docker_paths import map_agent_paths
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     BundleRef,
     CommandResult,
     CommandSpec,
@@ -37,6 +43,7 @@ from conductor.execution.types import (
     RunOutcome,
     RunSpec,
     StartError,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -74,9 +81,18 @@ docs/design/docker-backend.md).
 """
 
 
-@dataclass(frozen=True)
+@dataclass
 class _LeaseState:
     run: RunSpec
+    attached: bool = False
+    staged: bool = False
+    expect_staged: bool = False
+
+
+@dataclass(frozen=True)
+class _RunnerState:
+    name: str
+    features: frozenset[str]
 
 
 class _DockerFailure(RuntimeError):
@@ -87,6 +103,13 @@ def _bounded(value: str) -> str:
     if len(value) <= _BOUNDED_OUTPUT_CHARS:
         return value
     return value[-_BOUNDED_OUTPUT_CHARS:]
+
+
+def _runner_rebuild_error(image: str, detail: str) -> ConfigurationError:
+    return ConfigurationError(
+        f"Docker runner image {image!r} {detail}. Protocol 2 is required. "
+        "Rebuild the runner image from this Conductor version."
+    )
 
 
 def _decode(value: bytes) -> str:
@@ -257,6 +280,34 @@ def _map_working_dir(value: str | None, root: str = "main") -> str:
     return mapped
 
 
+def _container_options(execution: ResolvedExecutionSpec) -> list[str]:
+    """Build the shared creation flags for script and agent containers."""
+    argv: list[str] = []
+    if execution.init:
+        argv.append("--init")
+    if execution.read_only:
+        argv.append("--read-only")
+    if execution.cap_drop_all:
+        argv.append("--cap-drop=ALL")
+    if execution.no_new_privileges:
+        argv.append("--security-opt=no-new-privileges")
+    if execution.tmpfs is True:
+        argv.extend(("--tmpfs", "/tmp"))
+    elif isinstance(execution.tmpfs, str):
+        argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
+    for flag, value in (
+        ("--network", execution.network),
+        ("--platform", execution.platform),
+        ("--user", execution.user),
+        ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
+        ("--memory", execution.memory),
+        ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
+    ):
+        if value is not None:
+            argv.extend((flag, value))
+    return argv
+
+
 class DockerRunnerBackend:
     """Run commands in short-lived containers over a run-scoped named volume."""
 
@@ -268,24 +319,290 @@ class DockerRunnerBackend:
         self._staged: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._closed_leases: set[tuple[str, str]] = set()
         self._attempts: dict[tuple[str, str], int] = {}
+        self._runners: dict[tuple[tuple[str, str], str, str], list[asyncio.Task[_RunnerState]]] = {}
+        self._busy_runners: set[asyncio.Task[_RunnerState]] = set()
+        self._runner_cleanup: dict[tuple[str, str], set[asyncio.Task[None]]] = {}
+        self._warned_missing_interrupt: set[str] = set()
 
     def capabilities(self) -> RunnerCapabilities:
-        """Declare Docker batch execution with a shared named-volume workspace."""
+        """Advertise interrupt only after every active runner confirmed the feature."""
+        interrupt = bool(self._runners) and all(
+            task.done()
+            and not task.cancelled()
+            and task.exception() is None
+            and "interrupt" in task.result().features
+            for tasks in self._runners.values()
+            for task in tasks
+        )
         return RunnerCapabilities(
             batch=True,
             sessions=False,
             shared_workspace=True,
             snapshots=False,
+            agent=True,
+            interrupt=interrupt,
+            retained_workspace=True,
+        )
+
+    async def run_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease | None,
+        *,
+        on_event: AgentEventSink | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> AgentResult:
+        """Reserve one runner per active call, reusing it only after the call ends."""
+        if execute_local is not None:
+            raise ConfigurationError("Docker agent execution does not accept a local closure")
+        if lease is None or lease.backend != "docker" or spec.execution is None:
+            raise ConfigurationError(
+                "Docker agent execution requires a Docker lease and runner image"
+            )
+        lease_state = self._lease_states.get(self._lease_key(lease))
+        if lease_state is None or lease_state.run.bundle is None:
+            raise ConfigurationError("Docker agent realm requires a published run bundle")
+        key = self._runner_key(lease, spec.execution)
+        task = self._reserve_runner(lease, spec.execution)
+        try:
+            runner = await asyncio.shield(task)
+            result = await self._execute_agent(
+                spec, lease, runner, on_event, interrupt_signal, on_dispatch
+            )
+        except BaseException:
+            cleanup = self._retire_runner(lease, key, task)
+            if await _await_task_cleanup(cast(asyncio.Task[object], cleanup)):
+                raise asyncio.CancelledError from None
+            raise
+        else:
+            if (
+                interrupt_signal is not None
+                and interrupt_signal.is_set()
+                and ("interrupt" not in runner.features)
+            ):
+                cleanup = self._retire_runner(lease, key, task)
+                if await _await_task_cleanup(cast(asyncio.Task[object], cleanup)):
+                    raise asyncio.CancelledError from None
+            return result
+        finally:
+            self._busy_runners.discard(task)
+
+    @staticmethod
+    def _runner_key(
+        lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> tuple[tuple[str, str], str, str]:
+        options = json.dumps(asdict(execution), sort_keys=True, separators=(",", ":"))
+        return (
+            DockerRunnerBackend._lease_key(lease),
+            execution.image,
+            hashlib.sha256(options.encode()).hexdigest(),
+        )
+
+    def _reserve_runner(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> asyncio.Task[_RunnerState]:
+        key = self._runner_key(lease, execution)
+        if key[0] in self._closed_leases:
+            raise ConfigurationError("Docker lease is finalizing")
+        tasks = self._runners.setdefault(key, [])
+        task = next((item for item in tasks if item not in self._busy_runners), None)
+        if task is None:
+            task = asyncio.create_task(self._start_runner(lease, execution))
+            tasks.append(task)
+        self._busy_runners.add(task)
+        return task
+
+    async def _start_runner(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> _RunnerState:
+        await self._ensure_staged(lease, execution, None)
+        await self._ensure_image(execution, None)
+        name = f"conductor-{lease.lease_id[:8]}-runner-{uuid4().hex[:8]}"
+        argv = [
+            "create",
+            "--name",
+            name,
+            *self._label_args(self._labels(lease, "runner")),
+            *_container_options(execution),
+        ]
+        argv.extend(
+            (
+                "-v",
+                f"{self._volume_name(lease)}:/workspace",
+                "-w",
+                "/workspace",
+                "-e",
+                "ACA_RUNNER_HOST=127.0.0.1",
+                "-e",
+                "ACA_RUNNER_PORT=8080",
+                "--entrypoint",
+                "python",
+                execution.image,
+                "-m",
+                "conductor.aca_runner",
+            )
+        )
+        created = False
+        try:
+            rc, _stdout, stderr = await self._run_docker(argv)
+            if rc != 0:
+                raise ConfigurationError(f"Docker runner create failed: {_bounded(stderr)}")
+            created = True
+            rc, _stdout, stderr = await self._run_docker(("start", name))
+            if rc != 0:
+                raise ConfigurationError(f"Docker runner start failed: {_bounded(stderr)}")
+            health = await self._bridge_health(name, execution.image)
+            version = health.get("protocol_version")
+            if version != 2:
+                raise _runner_rebuild_error(execution.image, f"reports protocol {version!r}")
+            if health.get("ready") is not True:
+                raise ConfigurationError(
+                    f"Docker runner image {execution.image!r} failed its readiness check. "
+                    "Check runner logs and rebuild or pull the runner image."
+                )
+            features = health.get("features")
+            return _RunnerState(
+                name=name,
+                features=frozenset(feature for feature in features if isinstance(feature, str))
+                if isinstance(features, list)
+                else frozenset(),
+            )
+        except BaseException:
+            if created:
+                cleanup = asyncio.create_task(self._cleanup_container(lease, name, kill=True))
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+            raise
+
+    def _retire_runner(
+        self,
+        lease: WorkspaceLease,
+        key: tuple[tuple[str, str], str, str],
+        task: asyncio.Task[_RunnerState],
+    ) -> asyncio.Task[None]:
+        tasks = self._runners.get(key)
+        if tasks is not None and task in tasks:
+            tasks.remove(task)
+            if not tasks:
+                self._runners.pop(key)
+        cleanup = asyncio.create_task(self._cleanup_runner(lease, task))
+        cleanups = self._runner_cleanup.setdefault(key[0], set())
+        cleanups.add(cleanup)
+        cleanup.add_done_callback(cleanups.discard)
+        return cleanup
+
+    async def _cleanup_runner(
+        self, lease: WorkspaceLease, task: asyncio.Task[_RunnerState]
+    ) -> None:
+        try:
+            runner = await asyncio.shield(task)
+        except Exception:
+            return  # Startup already cleaned a partially created container.
+        if not await self._cleanup_container(lease, runner.name, kill=True):
+            raise _DockerFailure("Previous Docker runner could not be removed")
+
+    async def _bridge_health(self, name: str, image: str) -> dict[str, object]:
+        rc, stdout, stderr = await self._run_docker(
+            ("exec", "-i", name, "python", "-m", "conductor.runner.bridge", "--health"),
+            stdin_bytes=b"",
+        )
+        if rc != 0:
+            if rc == _CLI_TIMEOUT_RC or any(
+                marker in stderr.lower()
+                for marker in (
+                    "cannot connect to the docker daemon",
+                    "error during connect",
+                    "is the docker daemon running",
+                )
+            ):
+                raise ConfigurationError(
+                    f"Docker runner health check failed for image {image!r}: {_bounded(stderr)}. "
+                    "Check Docker connectivity, then rebuild or pull the runner image."
+                )
+            raise _runner_rebuild_error(image, "has no usable protocol 2 bridge")
+        try:
+            health = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise _runner_rebuild_error(image, "returned invalid health JSON") from exc
+        if not isinstance(health, dict):
+            raise _runner_rebuild_error(image, "returned invalid health JSON")
+        return health
+
+    async def _execute_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease,
+        runner: _RunnerState,
+        on_event: AgentEventSink | None,
+        interrupt_signal: asyncio.Event | None,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> AgentResult:
+        binary = self._resolved_binary()
+        if binary is None:
+            raise ConfigurationError("Docker CLI was not found")
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is None:
+            raise ConfigurationError("Docker lease was not prepared by this backend")
+        mapped = map_agent_paths(spec, state.run.bundle)
+
+        async def send_interrupt(execution_id: str) -> InterruptOutcome:
+            rc, _stdout, stderr = await self._run_docker(
+                (
+                    "exec",
+                    "-i",
+                    runner.name,
+                    "python",
+                    "-m",
+                    "conductor.runner.bridge",
+                    "--interrupt",
+                    execution_id,
+                ),
+                stdin_bytes=b"",
+                timeout=15,
+            )
+            match rc:
+                case 0:
+                    return "accepted"
+                case 3:
+                    return "conflict"
+                case _:
+                    raise ConfigurationError(f"Docker runner interrupt failed: {_bounded(stderr)}")
+
+        if (
+            interrupt_signal is not None
+            and "interrupt" not in runner.features
+            and runner.name not in self._warned_missing_interrupt
+        ):
+            logger.warning("Docker runner does not advertise interrupt; stopping the stream only")
+            self._warned_missing_interrupt.add(runner.name)
+        if on_dispatch is not None:
+            on_dispatch()
+        return await stream_agent(
+            binary,
+            self._cli_env,
+            runner.name,
+            mapped,
+            on_event,
+            interrupt_signal,
+            "interrupt" in runner.features,
+            send_interrupt,
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
-        """Create a cheap lease and retain its bundle reference for lazy staging."""
+        """Acquire a lease, materializing retained volumes without staging their bundle."""
         lease = WorkspaceLease(
             lease_id=run.run_id,
             backend="docker",
             incarnation=uuid4().hex[:12],
         )
         self._lease_states[self._lease_key(lease)] = _LeaseState(run=run)
+        if run.workspace_persistence is not None:
+            try:
+                await self._ensure_volume(lease, self._lease_states[self._lease_key(lease)])
+            except BaseException:
+                self._lease_states.pop(self._lease_key(lease), None)
+                raise
         return lease
 
     @staticmethod
@@ -312,6 +629,42 @@ class DockerRunnerBackend:
         for key, value in labels.items():
             result.extend(("--label", f"{key}={value}"))
         return result
+
+    def _volume_labels(self, lease: WorkspaceLease, state: _LeaseState) -> dict[str, str]:
+        labels = self._labels(lease, "workspace")
+        if state.attached:
+            del labels["io.conductor.workspace"]
+            return labels
+        if state.run.workspace_persistence is not None:
+            labels["io.conductor.retention"] = state.run.workspace_persistence
+        return labels
+
+    async def _ensure_volume(self, lease: WorkspaceLease, state: _LeaseState) -> bool:
+        """Return whether our volume already existed; attached leases never mutate it."""
+        volume = self._volume_name(lease)
+        try:
+            existing = await self._inspect_labels("volume", volume)
+        except (OSError, _DockerFailure) as exc:
+            if state.attached:
+                raise WorkspaceAttachError(
+                    f"could not verify Docker workspace {volume}: {exc}"
+                ) from exc
+            raise
+        expected = self._volume_labels(lease, state)
+        if existing is not None and all(existing.get(k) == v for k, v in expected.items()):
+            return True
+        if state.attached or (existing is not None and state.run.workspace_persistence is not None):
+            reason = "missing" if existing is None else "label mismatch"
+            raise WorkspaceAttachError(f"Docker workspace {volume} {reason}")
+        if existing is not None:
+            rc, _stdout, stderr = await self._run_docker(("volume", "rm", "-f", volume))
+            if rc != 0:
+                raise _DockerFailure(f"could not replace stale Docker volume: {_bounded(stderr)}")
+        create = ["volume", "create", *self._label_args(expected), volume]
+        rc, _stdout, stderr = await self._run_docker(create)
+        if rc != 0:
+            raise _DockerFailure(f"docker volume create failed: {_bounded(stderr)}")
+        return False
 
     def _resolved_binary(self) -> str | None:
         return shutil.which(self._docker_binary, path=self._cli_env.get("PATH"))
@@ -395,11 +748,47 @@ class DockerRunnerBackend:
         key = self._lease_key(lease)
         if key in self._closed_leases:
             raise ExecutionSpecError("backend is finalizing")
+        state = self._lease_states[key]
+        if state.staged and not state.attached:
+            await self._verify_created_volume(lease)
+            if state.run.bundle is not None:
+                await self._ensure_image(execution, diagnostics)
+                marker = await self._probe_marker(lease, execution)
+                if marker != state.run.bundle.digest:
+                    reason = "missing" if marker is None else "digest mismatch"
+                    raise WorkspaceAttachError(f"Docker workspace staging marker {reason}")
+            return
+        bundle = state.run.bundle
+        if state.attached and bundle is not None:
+            await self._ensure_image(execution, diagnostics)
+            marker = await self._probe_marker(lease, execution)
+            if marker is not None and marker != bundle.digest:
+                raise WorkspaceAttachError("Docker workspace marker digest mismatch")
+            if marker == bundle.digest:
+                state.staged = True
+                return
+            if state.expect_staged or state.staged:
+                raise WorkspaceAttachError("Docker workspace staging marker is missing")
         task = self._staged.get(key)
+        if task is not None and task.done():
+            self._staged.pop(key, None)
+            if not task.cancelled():
+                _ = task.exception()
+            if state.staged:
+                return
+            task = None
         if task is None:
             task = asyncio.create_task(self._stage_workspace(lease, execution, diagnostics))
             self._staged[key] = task
-        await asyncio.shield(task)
+        try:
+            await asyncio.shield(task)
+        finally:
+            if (
+                task.done()
+                and (task.cancelled() or task.exception() is not None)
+                and self._staged.get(key) is task
+            ):
+                self._staged.pop(key, None)
 
     async def _ensure_image(
         self,
@@ -428,6 +817,83 @@ class DockerRunnerBackend:
             return f"{_bounded(stderr)} Docker Engine 20.10 or newer (API 1.41) is required."
         return ""
 
+    def _scratch_argv(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec, name: str
+    ) -> list[str]:
+        argv = ["create", "--name", name, *self._label_args(self._labels(lease, "scratch"))]
+        if execution.platform is not None:
+            argv.extend(("--platform", execution.platform))
+        if execution.user is not None:
+            argv.extend(("--user", execution.user))
+        argv.extend(
+            (
+                "-v",
+                f"{self._volume_name(lease)}:/workspace",
+                "--entrypoint",
+                "/conductor-staging-placeholder",
+                execution.image,
+            )
+        )
+        return argv
+
+    async def _probe_marker(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> str | None:
+        """Read the committed marker via a stopped scratch container, not labels."""
+        scratch = f"conductor-stage-{lease.lease_id[:8]}-{uuid4().hex[:6]}"
+        destination = Path(tempfile.mkdtemp(prefix="conductor-probe-"))
+        created = False
+        try:
+            rc, _stdout, stderr = await self._run_docker(
+                self._scratch_argv(lease, execution, scratch)
+            )
+            if rc != 0:
+                raise WorkspaceAttachError(f"Docker marker probe create failed: {_bounded(stderr)}")
+            created = True
+            await self._verify_created_volume(lease)
+            rc, _stdout, stderr = await self._run_docker(
+                ("cp", f"{scratch}:/workspace/.conductor-staged", str(destination / "marker"))
+            )
+            if rc != 0:
+                error = stderr.strip().lower()
+                missing_marker = "/workspace/.conductor-staged" in error and (
+                    "no such file" in error or "could not find" in error
+                )
+                if rc != _CLI_TIMEOUT_RC and missing_marker:
+                    return None
+                raise WorkspaceAttachError(f"Docker marker probe failed: {_bounded(stderr)}")
+            marker = destination / "marker"
+            if not marker.is_file():
+                raise WorkspaceAttachError("Docker marker probe returned no marker file")
+            return marker.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WorkspaceAttachError(f"Docker marker probe failed: {exc}") from exc
+        finally:
+            if created:
+                await self._run_docker(("rm", "-f", scratch))
+            _remove_tree_with_retry(destination)
+
+    async def _verify_attached_volume(self, lease: WorkspaceLease) -> None:
+        state = self._lease_states[self._lease_key(lease)]
+        if state.attached:
+            await self._ensure_volume(lease, state)
+
+    async def _verify_created_volume(self, lease: WorkspaceLease) -> None:
+        # Docker can silently auto-create an unlabeled volume between inspection
+        # and container creation. This detects that race; it cannot prevent it.
+        volume = self._volume_name(lease)
+        state = self._lease_states[self._lease_key(lease)]
+        try:
+            labels = await self._inspect_labels("volume", volume)
+        except (OSError, _DockerFailure) as exc:
+            raise WorkspaceAttachError(
+                f"could not verify Docker workspace {volume}: {exc}"
+            ) from exc
+        if labels is None or not all(
+            labels.get(key) == value for key, value in self._volume_labels(lease, state).items()
+        ):
+            raise WorkspaceAttachError(f"Docker workspace {volume} missing or label mismatch")
+
     async def _stage_workspace(
         self,
         lease: WorkspaceLease,
@@ -440,43 +906,22 @@ class DockerRunnerBackend:
         state = self._lease_states.get(key)
         if state is None:
             raise ExecutionSpecError("Docker lease was not prepared by this backend")
-        volume = self._volume_name(lease)
-        existing = await self._inspect_labels("volume", volume)
-        expected = self._labels(lease, "workspace")
-        if existing is not None and all(existing.get(k) == v for k, v in expected.items()):
-            return
-        if existing is not None:
-            rc, _stdout, stderr = await self._run_docker(("volume", "rm", "-f", volume))
-            if rc != 0:
-                raise _DockerFailure(f"could not replace stale Docker volume: {_bounded(stderr)}")
-        create = ["volume", "create", *self._label_args(expected), volume]
-        rc, _stdout, stderr = await self._run_docker(create)
-        if rc != 0:
-            raise _DockerFailure(f"docker volume create failed: {_bounded(stderr)}")
+        existing = await self._ensure_volume(lease, state)
         bundle = state.run.bundle
         if bundle is None:
+            state.staged = True
             return
-        await self._ensure_image(execution, diagnostics)
+        if not state.attached:
+            await self._ensure_image(execution, diagnostics)
+        if existing and not state.attached:
+            marker = await self._probe_marker(lease, execution)
+            if marker is not None and marker != bundle.digest:
+                raise WorkspaceAttachError("Docker workspace marker digest mismatch")
+            if marker == bundle.digest:
+                state.staged = True
+                return
         scratch = f"conductor-stage-{lease.lease_id[:8]}-{uuid4().hex[:6]}"
-        create_scratch = [
-            "create",
-            "--name",
-            scratch,
-            *self._label_args(self._labels(lease, "scratch")),
-        ]
-        if execution.platform is not None:
-            create_scratch.extend(("--platform", execution.platform))
-        if execution.user is not None:
-            create_scratch.extend(("--user", execution.user))
-        create_scratch.extend(
-            (
-                "-v",
-                f"{volume}:/workspace",
-                "--entrypoint",
-                "/conductor-staging-placeholder",
-                execution.image,
-            )
-        )
+        create_scratch = self._scratch_argv(lease, execution, scratch)
         staging = Path(tempfile.mkdtemp(prefix=f"conductor-stage-{lease.lease_id[:8]}-"))
         try:
             self._build_staging_tree(bundle, staging)
@@ -486,12 +931,21 @@ class DockerRunnerBackend:
                     self._version_hint(stderr)
                     or f"docker staging create failed: {_bounded(stderr)}"
                 )
+            await self._verify_created_volume(lease)
             source = PurePath(staging).as_posix().rstrip("/") + "/."
             rc, _stdout, stderr = await self._run_docker(
                 ("cp", "-a", source, f"{scratch}:/workspace")
             )
             if rc != 0:
                 raise _DockerFailure(f"docker cp staging failed: {_bounded(stderr)}")
+            marker = staging / ".conductor-staged"
+            marker.write_text(bundle.digest, encoding="utf-8")
+            rc, _stdout, stderr = await self._run_docker(
+                ("cp", "-a", str(marker), f"{scratch}:/workspace/.conductor-staged")
+            )
+            if rc != 0:
+                raise _DockerFailure(f"docker cp marker failed: {_bounded(stderr)}")
+            state.staged = True
         finally:
 
             async def cleanup_staging() -> None:
@@ -521,6 +975,8 @@ class DockerRunnerBackend:
         tree = Path(bundle.store_path) / "tree"
         if not tree.is_dir():
             raise ExecutionSpecError(f"bundle tree does not exist: {tree}")
+        if (tree / ".conductor-staged").exists() or (tree / ".conductor-staged").is_symlink():
+            raise ExecutionSpecError("bundle tree contains reserved staging marker")
         _copy_tree_preserving_symlinks(tree, staging, allowed_root=tree)
 
     def _next_attempt(self, lease: WorkspaceLease) -> int:
@@ -579,29 +1035,9 @@ class DockerRunnerBackend:
             "io.conductor.step": spec.name or spec.command,
             "io.conductor.attempt": str(attempt),
         }
-        argv = ["create", "--name", name, *self._label_args(labels)]
-        if execution.init:
-            argv.append("--init")
-        if execution.read_only:
-            argv.append("--read-only")
-        if execution.cap_drop_all:
-            argv.append("--cap-drop=ALL")
-        if execution.no_new_privileges:
-            argv.append("--security-opt=no-new-privileges")
-        if execution.tmpfs is True:
-            argv.extend(("--tmpfs", "/tmp"))
-        elif isinstance(execution.tmpfs, str):
-            argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
-        for flag, value in (
-            ("--network", execution.network),
-            ("--platform", execution.platform),
-            ("--user", execution.user),
-            ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
-            ("--memory", execution.memory),
-            ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
-        ):
-            if value is not None:
-                argv.extend((flag, value))
+        if spec.attempt_id is not None:
+            labels["io.conductor.attempt_id"] = spec.attempt_id
+        argv = ["create", "--name", name, *self._label_args(labels), *_container_options(execution)]
         argv.extend(("-v", f"{self._volume_name(lease)}:/workspace"))
         state = self._lease_states.get(self._lease_key(lease))
         if state is None:
@@ -620,6 +1056,7 @@ class DockerRunnerBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         """Run one command in Docker and return its data-shaped outcome."""
         started_at = time.monotonic()
@@ -649,21 +1086,25 @@ class DockerRunnerBackend:
         step_hash = hashlib.sha1((spec.name or spec.command).encode()).hexdigest()[:8]
         name = f"conductor-{lease.lease_id[:8]}-{step_hash}-{attempt}"
         created = False
-        started = False
         try:
             try:
+                await self._verify_attached_volume(lease)
                 await self._ensure_staged(lease, execution, diagnostics)
                 await self._ensure_image(execution, diagnostics)
                 create_env = self._create_environment(spec, self._cli_env)
                 with self._container_env_file(create_env) as env_file:
-                    rc, _stdout, stderr = await self._run_docker(
-                        self._create_argv(spec, lease, execution, name, attempt, env_file)
-                    )
+                    create_argv = self._create_argv(spec, lease, execution, name, attempt, env_file)
+                    if on_dispatch is not None:
+                        on_dispatch()
+                    rc, _stdout, stderr = await self._run_docker(create_argv)
                 if rc != 0:
                     return self._start_failed(
                         name, self._version_hint(stderr) or _bounded(stderr), started_at
                     )
                 created = True
+                # A vanished volume is silently auto-created by Docker on -v; detect
+                # the race after create and remove the container in finally.
+                await self._verify_created_volume(lease)
                 start_argv = ["start", "--attach"]
                 if spec.stdin is not None:
                     start_argv.append("--interactive")
@@ -690,7 +1131,6 @@ class DockerRunnerBackend:
                         resolved_command=spec.command,
                         duration_seconds=time.monotonic() - started_at,
                     )
-                started = True
                 rc, inspect_stdout, inspect_stderr = await self._run_docker(
                     ("inspect", "--format", "{{json .State}}", name)
                 )
@@ -716,6 +1156,8 @@ class DockerRunnerBackend:
                     resolved_command=spec.command,
                     duration_seconds=time.monotonic() - started_at,
                 )
+            except WorkspaceAttachError:
+                raise
             except (_DockerFailure, ExecutionSpecError) as exc:
                 return self._start_failed(name, str(exc), started_at)
             except OSError as exc:
@@ -723,11 +1165,10 @@ class DockerRunnerBackend:
             except json.JSONDecodeError as exc:
                 return self._start_failed(name, str(exc), started_at)
         except asyncio.CancelledError:
-            cleanup_task = asyncio.create_task(
-                self._cleanup_container(lease, name, kill=created or started)
-            )
-            await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
-            created = not cleanup_task.result()
+            if created:
+                cleanup_task = asyncio.create_task(self._cleanup_container(lease, name, kill=True))
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
+                created = not cleanup_task.result()
             raise
         finally:
             if created:
@@ -789,11 +1230,102 @@ class DockerRunnerBackend:
             )
         return removed or absent
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
-        """Fail-closed cleanup of containers and the run-scoped workspace volume."""
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
+        """Verify the existing volume without creating, staging, or removing resources."""
+        if identity.backend != "docker" or identity.lease_id != run.run_id:
+            raise WorkspaceAttachError("Docker workspace identity does not match the run")
+        lease = WorkspaceLease(
+            lease_id=identity.lease_id,
+            backend="docker",
+            incarnation=identity.incarnation,
+            location=identity.location,
+        )
+        state = _LeaseState(run=run, attached=True, expect_staged=expect_staged)
+        await self._ensure_volume(lease, state)
+        await self._refuse_orphaned_executions(lease)
+        self._lease_states[self._lease_key(lease)] = state
+        return lease
+
+    async def _refuse_orphaned_executions(self, lease: WorkspaceLease) -> None:
+        try:
+            rc, stdout, stderr = await self._run_docker(
+                (
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "label=io.conductor.managed=true",
+                    "--filter",
+                    f"label=io.conductor.run_id={lease.lease_id}",
+                    "--filter",
+                    "label=io.conductor.resource=exec",
+                )
+            )
+            if rc != 0:
+                raise WorkspaceAttachError(
+                    f"could not list Docker execution containers: {_bounded(stderr)}"
+                )
+            survivors: list[str] = []
+            for candidate in stdout.split():
+                rc, metadata, stderr = await self._run_docker(
+                    ("inspect", "--format", "{{json .}}", candidate)
+                )
+                if rc != 0:
+                    raise WorkspaceAttachError(
+                        f"could not inspect Docker execution container {candidate}: "
+                        f"{_bounded(stderr)}"
+                    )
+                try:
+                    container = json.loads(metadata)
+                    if isinstance(container, list):
+                        container = container[0]
+                    labels = container["Config"]["Labels"]
+                    name = container["Name"]
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has unverifiable metadata"
+                    ) from exc
+                if not isinstance(labels, dict):
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has unverifiable labels"
+                    )
+                if not all(labels.get(k) == v for k, v in self._labels(lease, "exec").items()):
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has mismatched ownership labels"
+                    )
+                if not isinstance(name, str) or _CONTAINER_NAME.match(name) is None:
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has unverifiable name"
+                    )
+                survivors.append(name.removeprefix("/"))
+            if survivors:
+                names = ", ".join(survivors)
+                raise WorkspaceAttachError(
+                    f"Docker workspace has surviving execution containers: {names}. "
+                    f"Inspect them and clean up manually with docker rm -f {' '.join(survivors)} "
+                    "before resuming"
+                )
+        except (OSError, _DockerFailure) as exc:
+            raise WorkspaceAttachError(
+                f"could not verify Docker execution containers: {exc}"
+            ) from exc
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
+        """Clean up containers and remove the workspace only when not retained."""
         del outcome
         key = self._lease_key(lease)
         self._closed_leases.add(key)
+        for cleanup in self._runner_cleanup.pop(key, set()):
+            await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+        for runner_key, tasks in tuple(self._runners.items()):
+            if runner_key[0] == key:
+                for runner in tuple(tasks):
+                    cleanup = self._retire_runner(lease, runner_key, runner)
+                    await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+        self._runner_cleanup.pop(key, None)
         task = self._staged.pop(key, None)
         caller = asyncio.current_task()
         cancelling_before = caller.cancelling() if caller is not None else 0
@@ -803,7 +1335,11 @@ class DockerRunnerBackend:
         cancelled = caller is not None and caller.cancelling() > cancelling_before
         self._attempts.pop(key, None)
         self._lease_states.pop(key, None)
-        cleanup_task = asyncio.create_task(self._finalize_resources(lease))
+        cleanup_task = asyncio.create_task(
+            self._finalize_resources(lease, retain=True)
+            if retain
+            else self._finalize_resources(lease)
+        )
         try:
             await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
@@ -814,7 +1350,7 @@ class DockerRunnerBackend:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def _finalize_resources(self, lease: WorkspaceLease) -> None:
+    async def _finalize_resources(self, lease: WorkspaceLease, *, retain: bool = False) -> None:
         try:
             rc, stdout, stderr = await self._run_docker(
                 (
@@ -831,7 +1367,8 @@ class DockerRunnerBackend:
             else:
                 for candidate in stdout.split():
                     await self._finalize_container(lease, candidate)
-            await self._finalize_volume(lease)
+            if not retain:
+                await self._finalize_volume(lease)
         except Exception as exc:
             self._warn_cleanup(lease, str(exc))
 
@@ -855,7 +1392,7 @@ class DockerRunnerBackend:
             self._warn_cleanup(lease, f"container {candidate} returned unverifiable metadata")
             return
         expected = self._labels(lease, cast(str, labels.get("io.conductor.resource")))
-        valid_resource = labels.get("io.conductor.resource") in {"exec", "scratch"}
+        valid_resource = labels.get("io.conductor.resource") in {"exec", "scratch", "runner"}
         valid_labels = valid_resource and all(labels.get(k) == v for k, v in expected.items())
         if not valid_labels or not isinstance(name, str) or _CONTAINER_NAME.match(name) is None:
             self._warn_cleanup(lease, f"container {candidate} failed label/name verification")

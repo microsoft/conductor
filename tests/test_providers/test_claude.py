@@ -131,7 +131,7 @@ class TestClaudeProviderInitialization:
 
         provider = ClaudeProvider()
 
-        assert provider._default_model == "claude-3-5-sonnet-latest"
+        assert provider._default_model == "claude-sonnet-4-6"
         assert provider._default_max_tokens == 16_384
         assert provider._max_tokens_user_configured is False
         assert provider._timeout == 600.0
@@ -935,7 +935,7 @@ class TestClaudeExecuteDialogTurn:
         kwargs = mock_agent.run.call_args.kwargs
         assert kwargs["user_prompt"] == "hello"
         assert kwargs.get("message_history") == []
-        assert mock_resolve_model.call_args.kwargs["agent"].model == "claude-3-5-sonnet-latest"
+        assert mock_resolve_model.call_args.kwargs["agent"].model == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
     async def test_dialog_turn_multi_turn_history_preserved_in_order(self) -> None:
@@ -972,7 +972,7 @@ class TestClaudeExecuteDialogTurn:
         assert history[0].parts[0].content == "first"
         assert isinstance(history[1], ModelResponse)
         assert history[1].parts[0].content == "second"
-        assert mock_resolve_model.call_args.kwargs["agent"].model == "claude-3-5-sonnet-latest"
+        assert mock_resolve_model.call_args.kwargs["agent"].model == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
     async def test_dialog_turn_model_override_used(self) -> None:

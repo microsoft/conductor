@@ -1495,7 +1495,36 @@ class TestWorkflowEngineHumanGates:
         assert gate_output["additional_input"]["selected"] == "user typed text"
 
     @pytest.mark.asyncio
-    async def test_human_gate_web_response_nests_additional_input(self) -> None:
+    @pytest.mark.parametrize(
+        ("field", "multiline", "payload", "expected"),
+        [
+            # Browser-style: the client already names the field.
+            pytest.param(
+                "comment", False, {"comment": "looks good"}, "looks good", id="browser-mapping"
+            ),
+            # CLI-style (`conductor gate respond --input`, and the Fleet TUI,
+            # which posts through the same `_gate_respond_impl`): a bare
+            # string the engine maps onto the choice's declared field.
+            pytest.param("comment", False, "looks good", "looks good", id="cli-string"),
+            pytest.param(
+                "feedback",
+                True,
+                "line one\nline two\n\n  indented",
+                "line one\nline two\n\n  indented",
+                id="cli-string-multiline-other-field",
+            ),
+            pytest.param(
+                "feedback",
+                True,
+                {"feedback": "first\nsecond"},
+                "first\nsecond",
+                id="browser-mapping-multiline",
+            ),
+        ],
+    )
+    async def test_human_gate_web_response_nests_additional_input(
+        self, field: str, multiline: bool, payload: object, expected: str
+    ) -> None:
         """Web-gate responses must land under the same nested ``additional_input`` key.
 
         The store-site at engine/workflow.py is shared between the CLI gate
@@ -1503,6 +1532,12 @@ class TestWorkflowEngineHumanGates:
         the web task wins the race and asserts the web-supplied
         ``additional_input`` is stored under ``output.additional_input``, not
         spread flat into ``output``.
+
+        Covers both payload shapes the HTTP endpoint receives: a browser's
+        field mapping, and the bare string ``conductor gate respond --input``
+        and the Fleet TUI's gate-input modal send (issue #620). The string
+        must land under the selected choice's *declared* field -- whatever it
+        is named -- with its newlines intact.
         """
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1517,7 +1552,8 @@ class TestWorkflowEngineHumanGates:
                             label="Approve",
                             value="approved",
                             route="next",
-                            prompt_for="comment",
+                            prompt_for=field,
+                            multiline=multiline,
                         ),
                     ],
                 ),
@@ -1533,12 +1569,12 @@ class TestWorkflowEngineHumanGates:
         )
 
         # Stub the web dashboard so the web task returns immediately with a
-        # realistic gate-response payload from a browser client.
+        # realistic gate-response payload from a client.
         mock_dashboard = MagicMock()
         mock_dashboard.wait_for_gate_response = AsyncMock(
             return_value={
                 "selected_value": "approved",
-                "additional_input": {"comment": "looks good"},
+                "additional_input": payload,
             }
         )
 
@@ -1571,9 +1607,9 @@ class TestWorkflowEngineHumanGates:
         assert isinstance(gate_output, dict)
         gate_output = gate_output.get("output", {})
         assert gate_output["selected"] == "approved"
-        assert gate_output["additional_input"] == {"comment": "looks good"}
+        assert gate_output["additional_input"] == {field: expected}
         # Belt-and-braces: web-supplied keys must not appear flat at the root.
-        assert "comment" not in gate_output
+        assert field not in gate_output
 
     @pytest.mark.asyncio
     async def test_human_gate_additional_input_readable_via_template(self) -> None:

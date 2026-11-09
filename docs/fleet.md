@@ -408,6 +408,37 @@ the exact same code path `conductor gate respond` uses, including its
 `CONDUCTOR_GATE_TOKEN` handling. No new endpoint, no new core resolution
 code.
 
+Some choices ask for text as well as a selection: a `questions` step's
+**✎ Write your own**, or any `human_gate` option that declares
+`prompt_for` (for example a "Request changes" option collecting
+`feedback`). Picking one of those does **not** respond yet — the TUI
+opens an editor showing the choice and the field it fills, and nothing is
+sent until you confirm the text:
+
+| Choice | Editor | Submit | Cancel |
+|--------|--------|--------|--------|
+| Single-line (`multiline: false`) | One-line input | `enter` (or `ctrl+s`) | `esc` |
+| Multi-line (`multiline: true`) | Text area — `enter` inserts a newline | `ctrl+s` | `esc` |
+
+Human-gate options default to `multiline: false`; questions default to
+`multiline: true`, so their free-text answers use `ctrl+s` to submit.
+While editing, `ctrl+↑/↓` scrolls the prompt and `ctrl+shift+↑/↓` pages it
+without moving focus out of the editor.
+
+The text is sent exactly as typed, as `conductor gate respond --input`
+would send it, and lands under the choice's declared field. Confirming an
+empty entry still submits it; the workflow decides whether that is
+acceptable (a required question is presented again with the reason).
+Pressing `esc` in the editor sends nothing: you return to the Runs screen
+with the question still pending, and `g` reopens it. Choices without
+`prompt_for` — suggested answers, Skip, Back, Abort — respond as soon as
+they are selected, as before.
+
+If submission fails, the error is shown and the same choice's editor
+reopens with your draft intact. Confirm again to retry, or press `esc` to
+cancel. Retries are never automatic: a connection failure can mean the
+response was delivered but its acknowledgement was lost.
+
 A plain foreground run's gate cannot be resolved remotely, and that is a
 hard property of how it works today, not a gap this feature could have
 closed: the gate blocks in a background thread around a synchronous

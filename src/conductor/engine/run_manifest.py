@@ -55,26 +55,97 @@ import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_serializer,
+    field_validator,
+    model_serializer,
+)
 
 from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
+    AgentDef,
     ExecutableStepBase,
+    RuntimeConfig,
     ScriptStepDef,
     StepSecretRef,
     WorkflowConfig,
     WorkflowDefaults,
+    WorkflowStepDef,
 )
+from conductor.digest import canonical_json_digest
 from conductor.exceptions import ConfigurationError
-from conductor.execution import LocalRunnerBackend, RunnerBackend
+from conductor.execution import LocalRunnerBackend
 from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.types import RunnerCapabilities
 from conductor.providers.resolution import (
     effective_mcp_consumer_providers,
     format_claude_agent_sdk_remote_env_error,
     format_remote_mcp_stdio_only_error,
+    provider_type_for_agent,
 )
+
+REMOTE_AGENT_PROVIDERS = frozenset({"copilot", "openai", "claude"})
+RESERVED_AGENT_ENV_NAMES = frozenset(
+    {
+        "base_url",
+        "api_key",
+        "bearer_token",
+        "github_token",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "COPILOT_PROVIDER_API_KEY",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    }
+)
+LOCAL_AGENT_SCOPE_ERROR = (
+    "local agent runtime inherits the control environment; scoped delivery for local "
+    "agents is not built — use a remote execution profile or mcp/script scope"
+)
+
+
+def agent_secret_name_error(name: str) -> str | None:
+    """Keep per-call MCP delivery disjoint from provider credentials."""
+    if name.casefold() in {reserved.casefold() for reserved in RESERVED_AGENT_ENV_NAMES}:
+        return (
+            f"Agent-scope delivery.env '{name}' is reserved for provider credentials; "
+            "choose a different MCP process environment variable."
+        )
+    return None
+
+
+def agent_has_stdio_mcp(config: WorkflowConfig, agent: AgentDef) -> bool:
+    """Conservatively identify MCP sources without resolving plugin contents."""
+    if agent.tools == []:
+        return False
+    if any(server.type == "stdio" for server in config.workflow.runtime.mcp_servers.values()):
+        return True
+    plugins = agent.plugins if agent.plugins is not None else config.workflow.runtime.plugins
+    return any(plugin.mcp for plugin in plugins)
+
+
+def agent_scope_stdio_error(key: str) -> str:
+    """Describe a per-call overlay that has no process to receive it."""
+    return (
+        f"Agent step '{key}' requests agent-scope delivery.env, but no stdio MCP server "
+        "can receive env_overlay: it reaches only the spawn-env of stdio MCP processes "
+        "in the remote realm, never the model SDK environment. Declare a stdio MCP server "
+        "in workflow.runtime.mcp_servers or enable an MCP-shipping plugin for this agent "
+        "(and enable its tools), or remove the agent-scope secret."
+    )
+
+
+class BackendCapabilityProvider(Protocol):
+    def capabilities(self) -> RunnerCapabilities: ...
+
 
 # Capability-introspection registry: backend name -> a backend instance asked
 # only for its static ``capabilities()`` declaration. The instances are
@@ -82,7 +153,7 @@ from conductor.providers.resolution import (
 # on when it is asked, because the manifest compiler asks at compile time and
 # the run may ask again later. ``LocalRunnerBackend`` satisfies this today (it
 # has no instance state at all); any future backend registered here must too.
-BACKEND_CAPABILITY_PROVIDERS: dict[str, RunnerBackend] = {
+BACKEND_CAPABILITY_PROVIDERS: dict[str, BackendCapabilityProvider] = {
     "local": LocalRunnerBackend(),
     # DockerRunnerBackend's constructor is I/O-free (it only stores the binary
     # name and an environment snapshot), so a module-level instance is safe to
@@ -141,7 +212,8 @@ class ManifestExecutionSpec(BaseModel):
 
 
 class ResolvedStepProfile(BaseModel):
-    """One executable step's resolved execution profile and backend."""
+    """One step's placement; realm_image records the requested image reference,
+    not the bytes selected by the daemon when the reference is a mutable tag."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -149,11 +221,16 @@ class ResolvedStepProfile(BaseModel):
     backend: str
     inherit_control_environment: bool = True
     execution: ManifestExecutionSpec | None = None
+    realm_image: str | None = None
+    inner_provider: str | None = None
 
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         dump = super().model_dump(*args, **kwargs)
         if dump.get("execution") is None:
             dump.pop("execution", None)
+        for name in ("realm_image", "inner_provider"):
+            if dump.get(name) is None:
+                dump.pop(name, None)
         return dump
 
 
@@ -162,7 +239,7 @@ class ResolvedSecretUse(BaseModel):
 
     consumer: str
     ref: str
-    scope: Literal["script", "mcp"]
+    scope: Literal["script", "mcp", "agent"]
     delivery_kind: Literal["env", "header"]
     delivery_name: str
 
@@ -182,6 +259,15 @@ class AuditInfo(BaseModel):
     classification: Literal["non-hermetic-compatibility"]
 
 
+class WorkspacePolicy(BaseModel):
+    """Run-global workspace mode and retention policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: str
+    persistence: str
+
+
 class ResolvedRunManifest(BaseModel):
     """The compiled, run-invariant execution manifest for one workflow run."""
 
@@ -197,9 +283,11 @@ class ResolvedRunManifest(BaseModel):
     with a handle to it may mutate execution resolution after compilation.
     Serialization still yields a plain ``dict`` (see the field serializer)."""
     secrets: tuple[ResolvedSecretUse, ...] = ()
+    workspace: WorkspacePolicy | None = None
     conductor_version: str
     audit: AuditInfo
     script_steps: tuple[str, ...] = Field(default=(), exclude=True)
+    script_steps_known: bool = Field(default=False, exclude=True)
     """Identities (``profiles`` keys) of the steps the compiler resolved as
     :class:`ScriptStepDef`, captured during compilation so
     :func:`script_step_backends` can restrict mixed-backend detection to
@@ -235,12 +323,33 @@ class ResolvedRunManifest(BaseModel):
         """
         return dict(value)
 
+    @model_serializer(mode="wrap")
+    def _serialize_workspace(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        dump = handler(self)
+        if dump.get("workspace") is None:
+            dump.pop("workspace", None)
+        return dump
+
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         dump = super().model_dump(*args, **kwargs)
+        if dump.get("workspace") is None:
+            dump.pop("workspace", None)
         for profile in dump.get("profiles", {}).values():
-            if isinstance(profile, dict) and profile.get("execution") is None:
-                profile.pop("execution", None)
+            if isinstance(profile, dict):
+                for name in ("execution", "realm_image", "inner_provider"):
+                    if profile.get(name) is None:
+                        profile.pop(name, None)
         return dump
+
+
+def manifest_semantic_digest(manifest: ResolvedRunManifest) -> str:
+    """Digest workflow, environment, profiles, secret references and workspace policy.
+
+    This does not prove the dynamic sub-workflow closure or image bytes selected by a tag.
+    """
+    return canonical_json_digest(
+        manifest.model_dump(mode="json", exclude={"conductor_version", "audit"})
+    )
 
 
 def executable_step_identity(name: str, *, for_each_group: str | None = None) -> str:
@@ -399,27 +508,13 @@ def resolve_execution_spec(definition: ProfileDefinition) -> ManifestExecutionSp
 def script_step_backends(manifest: ResolvedRunManifest) -> frozenset[str]:
     """Return the distinct backends the run's script steps resolve to.
 
-    Only profiles whose step identity the compiler recorded in
-    ``ResolvedRunManifest.script_steps`` count. Agent, workflow, and MCP steps
-    are compile-time pinned to ``local`` (a non-local backend there is a
-    reserved error), so reading backends off *every* profile would pollute
-    mixed-backend detection with a backend no script step uses — the dominant
-    shape, an agent-plus-Docker-script workflow, would always look "mixed".
-
-    Legacy fallback: an empty ``script_steps`` means either a genuinely
-    script-free compilation or a manifest without recorded identities — a v1
-    payload written by an earlier producer, or any manifest revalidated from
-    its serialized dump (``script_steps`` is never serialized). The two are
-    indistinguishable, and the second cannot afford a wrong "no": this
-    helper's only consumers are the mixed-backend run warning and the bundle
-    docker-presence gate, where silently dropping a diagnostic the run used
-    to emit is worse than the old over-inclusive answer. An empty set
-    therefore answers as the pre-recording implementation did — the backends
-    of ALL profiles. That fallback is exact for the script-free case anyway:
-    non-script steps pin to ``local``, so no Docker backend can appear in a
-    manifest that compiled no script steps.
+    A newly compiled run records script identities, including an empty set
+    for agent-only workflows. Its mixed-script warning never includes agent
+    backends. A reloaded legacy manifest has no identities, so it retains
+    the old over-inclusive fallback rather than hiding an earlier warning.
+    The presence bit and identities are both excluded from serialized dumps.
     """
-    if manifest.script_steps:
+    if manifest.script_steps_known:
         return frozenset(manifest.profiles[key].backend for key in manifest.script_steps)
     return frozenset(profile.backend for profile in manifest.profiles.values())
 
@@ -440,6 +535,72 @@ def _require_script_backend_capability(key: str, backend_name: str) -> None:
             suggestion="Map the step's execution profile to a backend that "
             "supports batch execution in this build of Conductor.",
         )
+
+
+def remote_dialog_error(key: str, backend_name: str) -> str:
+    """Name the unsupported boundary shared by compilation and runtime."""
+    return (
+        f"Agent step '{key}' cannot use dialog on remote backend '{backend_name}': "
+        "dialog evaluation and conversation require a local provider until the "
+        "runner supports dialog."
+    )
+
+
+def _require_agent_backend_capability(
+    key: str,
+    backend_name: str,
+    definition: ProfileDefinition,
+    *,
+    agent: AgentDef,
+    runtime: RuntimeConfig,
+) -> None:
+    """Require an agent-capable backend and a complete runtime profile."""
+    provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
+    if provider is None or not provider.capabilities().agent:
+        raise ConfigurationError(
+            f"Agent step '{key}' resolves to backend '{backend_name}' without agent capability.",
+            suggestion="Choose an agent-capable execution backend.",
+        )
+    effective_provider = provider_type_for_agent(agent, runtime.provider.name)
+    if backend_name != "local" and effective_provider not in REMOTE_AGENT_PROVIDERS:
+        raise ConfigurationError(
+            f"Agent step '{key}' resolves to remote backend '{backend_name}' with provider "
+            f"'{effective_provider}'; supported inner providers: copilot, openai, claude. "
+            "Other providers require a follow-up implementation."
+        )
+    if backend_name != "local" and agent.dialog is not None:
+        raise ConfigurationError(remote_dialog_error(key, backend_name))
+    if (
+        backend_name != "local"
+        and effective_provider == "copilot"
+        and runtime.max_tokens is not None
+    ):
+        raise ConfigurationError(
+            "Remote copilot does not support runtime.max_tokens; remove the output "
+            "token limit or use a provider that enforces it."
+        )
+    if backend_name == "docker" and (
+        definition.docker is None or not definition.docker.runner_image
+    ):
+        raise ConfigurationError(
+            f"Agent step '{key}' resolves to Docker without docker.runner_image.",
+            suggestion="Set docker.runner_image to an image containing the Conductor runner.",
+        )
+    if backend_name == "aca":
+        if agent.sandbox is not None and agent.sandbox.identifier_scope is not None:
+            raise ConfigurationError(
+                f"Agent step '{key}' cannot set sandbox.identifier_scope on an ACA profile; "
+                "set it on the profile's aca block."
+            )
+        skills = agent.skills if agent.skills is not None else runtime.skills
+        plugins = agent.plugins if agent.plugins is not None else runtime.plugins
+        discovery = agent.skills is None and runtime.skill_discovery.is_enabled
+        if skills or plugins or discovery:
+            raise ConfigurationError(
+                f"Agent step '{key}' resolves to ACA, which cannot stage skills or plugins.",
+                suggestion="Use a Docker agent profile for staged skills/plugins, or opt out "
+                "with skills: [] and plugins: [] on this agent.",
+            )
 
 
 def _require_known_secret_ref(
@@ -463,7 +624,7 @@ def _require_known_secret_ref(
 def _resolved_secret_use(
     consumer: str,
     secret: StepSecretRef,
-    scope: Literal["script", "mcp"],
+    scope: Literal["script", "mcp", "agent"],
 ) -> ResolvedSecretUse:
     if secret.delivery.env is not None:
         return ResolvedSecretUse(
@@ -528,19 +689,46 @@ def _compile_step_secret_uses(
     key: str,
     step: ExecutableStepBase,
     environment: ResolvedEnvironment,
+    backend_name: str,
+    config: WorkflowConfig,
 ) -> list[ResolvedSecretUse]:
     secrets = step.execution.secrets if step.execution is not None else []
     if not secrets:
         return []
-    if not isinstance(step, ScriptStepDef) or any(secret.scope == "agent" for secret in secrets):
-        raise ConfigurationError(
-            f"Step '{key}' requests secret delivery, but agent-scope delivery is reserved "
-            "until agent execution realms (step 7).",
-            suggestion="Remove the secret reference until agent execution realms are available.",
-        )
-
     uses: list[ResolvedSecretUse] = []
     for secret in secrets:
+        if isinstance(step, AgentDef):
+            if secret.scope != "agent":
+                raise ConfigurationError(
+                    f"Agent step '{key}' cannot consume secret '{secret.ref}' with scope "
+                    f"'{secret.scope}'; this position requires scope 'agent'."
+                )
+            if secret.delivery.env is not None and (
+                error := agent_secret_name_error(secret.delivery.env)
+            ):
+                raise ConfigurationError(error)
+            if backend_name == "local":
+                raise ConfigurationError(f"Agent step '{key}': {LOCAL_AGENT_SCOPE_ERROR}.")
+            if secret.delivery.env is None:
+                raise ConfigurationError(
+                    f"Agent step '{key}' requires delivery.env for secret '{secret.ref}': "
+                    "env_overlay reaches only the spawn-env of stdio MCP processes in the realm "
+                    "per call, never the model SDK environment."
+                )
+            if not agent_has_stdio_mcp(config, step):
+                raise ConfigurationError(agent_scope_stdio_error(key))
+            _require_known_secret_ref(secret, consumer=key, environment=environment)
+            uses.append(_resolved_secret_use(key, secret, "agent"))
+            continue
+        if not isinstance(step, ScriptStepDef):
+            raise ConfigurationError(
+                f"Step '{key}' does not support secret delivery; use an agent or script step."
+            )
+        if secret.scope == "agent":
+            raise ConfigurationError(
+                f"Script step '{key}' cannot consume secret '{secret.ref}' with scope "
+                "'agent'; this position requires scope 'script'."
+            )
         if secret.delivery.header is not None:
             raise ConfigurationError(
                 f"Script step '{key}' requests header delivery for secret '{secret.ref}', "
@@ -555,12 +743,9 @@ def _compile_step_secret_uses(
             )
         _require_known_secret_ref(secret, consumer=key, environment=environment)
         uses.append(_resolved_secret_use(key, secret, "script"))
-    # Non-script steps and agent-scope refs raised above, so the literal
-    # ``env`` keys to check against are the script step's own.
-    assert isinstance(step, ScriptStepDef)
     _check_delivery_collisions(
         key,
-        literal_env=step.env,
+        literal_env=step.env if isinstance(step, ScriptStepDef) else (),
         literal_headers=(),
         secrets=secrets,
     )
@@ -570,9 +755,17 @@ def _compile_step_secret_uses(
 def _compile_mcp_secret_uses(
     config: WorkflowConfig,
     environment: ResolvedEnvironment,
+    profiles: Mapping[str, ResolvedStepProfile],
 ) -> list[ResolvedSecretUse]:
     uses: list[ResolvedSecretUse] = []
     consumers = effective_mcp_consumer_providers(config)
+    local_consumer = any(
+        isinstance(step, AgentDef)
+        and step.tools != []
+        and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+        and profiles[key].backend == "local"
+        for key, step in _iter_executable_steps(config)
+    )
     for server_name in sorted(config.workflow.runtime.mcp_servers):
         server = config.workflow.runtime.mcp_servers[server_name]
         consumer = f"mcp:{server_name}"
@@ -590,11 +783,24 @@ def _compile_mcp_secret_uses(
                 )
         for secret in server.secrets:
             if secret.scope == "agent":
-                raise ConfigurationError(
-                    f"MCP server '{server_name}' requests agent-scope delivery, but agent-scope "
-                    "delivery is reserved until agent execution realms (step 7).",
-                    suggestion="Use scope 'mcp' for MCP server secret delivery.",
-                )
+                if secret.delivery.env is not None and (
+                    error := agent_secret_name_error(secret.delivery.env)
+                ):
+                    raise ConfigurationError(error)
+                if local_consumer:
+                    raise ConfigurationError(
+                        f"MCP server '{server_name}': {LOCAL_AGENT_SCOPE_ERROR}."
+                    )
+                if server.type != "stdio" or secret.delivery.env is None:
+                    raise ConfigurationError(
+                        f"MCP server '{server_name}' requires stdio and delivery.env for "
+                        f"agent-scope secret '{secret.ref}': env_overlay reaches the spawn-env "
+                        "of in-realm stdio MCP processes per call, never the model SDK "
+                        "environment."
+                    )
+                _require_known_secret_ref(secret, consumer=consumer, environment=environment)
+                uses.append(_resolved_secret_use(consumer, secret, "agent"))
+                continue
             if secret.scope != "mcp":
                 raise ConfigurationError(
                     f"MCP server '{server_name}' cannot consume secret '{secret.ref}' with scope "
@@ -629,6 +835,48 @@ def _compile_mcp_secret_uses(
             literal_headers=server.headers,
             secrets=server.secrets,
         )
+    agent_server_secrets = [
+        secret
+        for server in config.workflow.runtime.mcp_servers.values()
+        for secret in server.secrets
+        if secret.scope == "agent"
+    ]
+    literal_mcp_env = {
+        name
+        for server in config.workflow.runtime.mcp_servers.values()
+        if server.type == "stdio"
+        for name in server.env
+    }
+    for key, step in _iter_executable_steps(config):
+        if (
+            isinstance(step, AgentDef)
+            and step.tools != []
+            and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+        ):
+            step_secrets = (
+                [secret for secret in step.execution.secrets if secret.scope == "agent"]
+                if step.execution is not None
+                else []
+            )
+            if step_secrets or agent_server_secrets:
+                _check_delivery_collisions(
+                    key,
+                    literal_env=literal_mcp_env,
+                    literal_headers=(),
+                    secrets=[*step_secrets, *agent_server_secrets],
+                )
+                for server in config.workflow.runtime.mcp_servers.values():
+                    if server.type == "stdio":
+                        _check_delivery_collisions(
+                            key,
+                            literal_env=(
+                                secret.delivery.env
+                                for secret in server.secrets
+                                if secret.scope == "mcp" and secret.delivery.env is not None
+                            ),
+                            literal_headers=(),
+                            secrets=[*step_secrets, *agent_server_secrets],
+                        )
     return uses
 
 
@@ -663,10 +911,45 @@ def compile_run_manifest(
             the chain, names an undefined profile, or (for script steps)
             resolves to a backend without batch capability.
     """
+    workspace = config.workflow.workspace
+    if workspace is not None and workspace.mode == "isolated":
+        raise ConfigurationError(
+            "workspace.mode: isolated is reserved until the isolated workspace follow-up."
+        )
+    defaults_restart = config.workflow.defaults.restart
+    if defaults_restart is not None and defaults_restart.mode == "reuse":
+        raise ConfigurationError(
+            "workflow.defaults.restart.mode: reuse is reserved until the restart follow-up."
+        )
+
+    if workflow_path is not None:
+        for key, step in _iter_executable_steps(config):
+            if not isinstance(step, WorkflowStepDef):
+                continue
+            child_path = workflow_path.parent / step.workflow
+            if not child_path.is_file():
+                continue  # Registry and dynamic references are resolved at reach time.
+            from conductor.config.loader import load_config
+
+            try:
+                child = load_config(child_path)
+            except ConfigurationError:
+                # Broken children still fail at reach time, preserving subworkflow_failed events.
+                continue
+            if child.workflow.workspace is not None:
+                raise ConfigurationError(
+                    f"Sub-workflow '{key}' declares workflow.workspace; workspace policy is "
+                    "inherited from the root workflow and cannot be overridden."
+                )
+
     profiles: dict[str, ResolvedStepProfile] = {}
     script_keys: list[str] = []
     secrets: list[ResolvedSecretUse] = []
     for key, step in _iter_executable_steps(config):
+        if step.restart is not None and step.restart.mode == "reuse":
+            raise ConfigurationError(
+                f"Step '{key}' restart.mode: reuse is reserved until the restart follow-up."
+            )
         profile_name = effective_profile_name(
             step,
             key,
@@ -684,15 +967,32 @@ def compile_run_manifest(
                 "point the step at one of the defined profiles.",
             )
         backend_name = definition.backend
+        if workspace is not None and workspace.persistence != "ephemeral":
+            provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
+            if provider is not None and not provider.capabilities().retained_workspace:
+                raise ConfigurationError(
+                    f"Step '{key}': {backend_name} backend does not support retained workspaces; "
+                    "use docker profiles for every executable step or drop persistence; "
+                    "local retained workspace arrives in a later delivery. Until the agent "
+                    "realm follow-up, retained policy is available only for docker script "
+                    "workflows."
+                )
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)
+        elif isinstance(step, AgentDef):
+            _require_agent_backend_capability(
+                key, backend_name, definition, agent=step, runtime=config.workflow.runtime
+            )
+            execution = resolve_execution_spec(definition)
+            if execution is not None:
+                assert definition.docker is not None and definition.docker.runner_image is not None
+                execution = execution.model_copy(update={"image": definition.docker.runner_image})
         else:
             if backend_name != "local":
                 raise ConfigurationError(
-                    f"Step '{key}' resolves to backend '{backend_name}', but backend "
-                    f"'{backend_name}' is available for script steps only; agent execution "
-                    "realms arrive in step 7.",
+                    f"Step '{key}' resolves to backend '{backend_name}', but this step "
+                    "requires the local backend.",
                     suggestion="Move the step to a local profile or remove execution.profile.",
                 )
             execution = None
@@ -706,12 +1006,22 @@ def compile_run_manifest(
             backend=backend_name,
             inherit_control_environment=inherit_control_environment,
             execution=execution,
+            realm_image=(
+                definition.docker.runner_image
+                if isinstance(step, AgentDef) and backend_name == "docker" and definition.docker
+                else None
+            ),
+            inner_provider=(
+                provider_type_for_agent(step, config.workflow.runtime.provider.name)
+                if isinstance(step, AgentDef) and backend_name != "local"
+                else None
+            ),
         )
         if isinstance(step, ScriptStepDef):
             script_keys.append(key)
-        secrets.extend(_compile_step_secret_uses(key, step, environment))
+        secrets.extend(_compile_step_secret_uses(key, step, environment, backend_name, config))
 
-    secrets.extend(_compile_mcp_secret_uses(config, environment))
+    secrets.extend(_compile_mcp_secret_uses(config, environment, profiles))
 
     digest: str | None = None
     if workflow_path is not None:
@@ -727,7 +1037,13 @@ def compile_run_manifest(
         ),
         profiles=profiles,
         secrets=tuple(secrets),
+        workspace=(
+            WorkspacePolicy(mode=workspace.mode, persistence=workspace.persistence)
+            if workspace is not None
+            else None
+        ),
         conductor_version=_conductor_version(),
         audit=AuditInfo(hermetic=False, classification="non-hermetic-compatibility"),
         script_steps=tuple(script_keys),
+        script_steps_known=True,
     )

@@ -9,15 +9,20 @@ exact ``StartError`` fill-in/reconstruction rule the executor relies on for
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, get_args
 
 import pytest
 
 from conductor.execution import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     BundleRef,
     CommandOutcome,
     CommandResult,
@@ -29,8 +34,12 @@ from conductor.execution import (
     RunSpec,
     StartError,
     StartErrorKind,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
+from conductor.execution.local import LocalRunnerBackend
 
 
 def _fill_start_error(e: OSError) -> StartError:
@@ -61,6 +70,7 @@ class TestFrozenContract:
             CommandResult(outcome="completed"),
             StartError(kind="file_not_found", message="missing"),
             WorkspaceLease(lease_id="r1", backend="local", incarnation="i1"),
+            WorkspaceIdentity(backend="local", lease_id="r1", incarnation="i1"),
             RunSpec(run_id="r1"),
             RunnerCapabilities(batch=True, sessions=False, shared_workspace=True, snapshots=False),
         ],
@@ -117,15 +127,85 @@ class TestProtocolShape:
         # Requirement: structural typing — backends need not inherit anything.
         assert getattr(RunnerBackend, "_is_protocol", False) is True
 
-    def test_protocol_declares_exactly_four_methods(self) -> None:
-        # Requirement: the seam stays minimal — no run_agent/open_mcp/cancel,
-        # no close(), no context manager "for symmetry".
+    def test_protocol_declares_exactly_the_seam_methods(self) -> None:
+        # Requirement: run_agent and attach_run join the seam while open_mcp/cancel/close
+        # and context-manager symmetry methods remain outside it.
         method_names = {
             name
             for name, member in vars(RunnerBackend).items()
             if callable(member) and not name.startswith("_")
         }
-        assert method_names == {"capabilities", "prepare_run", "run_command", "finalize_run"}
+        assert method_names == {
+            "capabilities",
+            "prepare_run",
+            "attach_run",
+            "run_command",
+            "run_agent",
+            "finalize_run",
+        }
+
+    @pytest.mark.asyncio
+    async def test_local_protocol_rejects_missing_execute_local(self) -> None:
+        # Requirement: in-process invocation requires an explicit local closure.
+        from conductor.exceptions import ConfigurationError
+        from conductor.execution.local import LocalRunnerBackend
+
+        spec = AgentSpec("agent", "exec-1", "copilot", None, "prompt")
+        with pytest.raises(ConfigurationError, match="requires execute_local"):
+            await LocalRunnerBackend().run_agent(spec, None)
+
+
+class TestAgentContracts:
+    """Requirement: agent invocation contracts are frozen and default safely."""
+
+    def test_agent_spec_and_result_are_frozen(self) -> None:
+        # Requirement: callers cannot mutate invocation inputs or results.
+        spec = AgentSpec("agent", "exec-1", "copilot", None, "prompt")
+        result = AgentResult(content={"answer": "ok"})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.name = "other"  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.content = {}  # type: ignore[misc]
+
+    def test_capability_defaults_preserve_old_construction(self) -> None:
+        # Requirement: the two trailing capabilities default off for old callers.
+        legacy = RunnerCapabilities(
+            batch=True, sessions=False, shared_workspace=True, snapshots=False
+        )
+        explicit = RunnerCapabilities(
+            batch=True,
+            sessions=False,
+            shared_workspace=True,
+            snapshots=False,
+            agent=False,
+            interrupt=False,
+        )
+        assert legacy == explicit
+
+    def test_credential_values_are_omitted_from_repr(self) -> None:
+        # Requirement: credential-bearing fields are not exposed by repr().
+        spec = AgentSpec(
+            "agent",
+            "exec-1",
+            "copilot",
+            None,
+            "prompt",
+            env_overlay={"TOKEN": "overlay-secret"},
+            provider_credentials={"api_key": "provider-secret"},
+        )
+        result = AgentResult(content={}, raw_response="raw-secret")
+        rendered = repr(spec) + repr(result)
+        assert "overlay-secret" not in rendered
+        assert "provider-secret" not in rendered
+        assert "raw-secret" not in rendered
+
+    def test_agent_event_sink_is_structural(self) -> None:
+        # Requirement: callbacks accept an event name and structured data payload.
+        def sink(_name: str, _payload: Mapping[str, Any]) -> None:
+            return None
+
+        typed_sink: AgentEventSink = sink
+        typed_sink("agent_started", {})
 
 
 class TestLeafPurity:
@@ -180,9 +260,115 @@ class TestLeafPurity:
                 is_self = imported == "conductor.execution" or imported.startswith(
                     "conductor.execution."
                 )
-                if not is_self:
+                # Requirement: run_agent's contract raises conductor.exceptions.ConfigurationError;
+                # conductor.exceptions is a stdlib-only leaf, so the layer-hygiene guarantee
+                # (no cli/engine/executor/pydantic pulls) is unchanged.
+                if not is_self and imported != "conductor.exceptions":
                     offenders.append(f"{source_path.name}:{node.lineno}:{imported}")
         assert offenders == []
+
+    def test_agent_contract_fields_do_not_expose_transport_vocabulary(self) -> None:
+        # Requirement: core agent contracts stay neutral for future backends.
+        source = (
+            Path(__file__).resolve().parents[2] / "src/conductor/execution/types.py"
+        ).read_text(encoding="utf-8")
+        agent_types = source[source.index("class AgentSpec:") :]
+        assert not any(word in agent_types.lower() for word in ("http", "docker", "aca"))
+
+    def test_types_module_imports_only_stdlib(self) -> None:
+        # Requirement: serialized contract dataclasses remain independent of Conductor packages.
+        import sys
+
+        package_dir = Path(__file__).resolve().parents[2] / "src" / "conductor" / "execution"
+        stdlib_modules = set(sys.stdlib_module_names)
+        stdlib_modules.update(sys.builtin_module_names)
+        source_path = package_dir / "types.py"
+        import ast
+
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        imports = [
+            node.names[0].name.split(".")[0]
+            if isinstance(node, ast.Import)
+            else (node.module or "").split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            or isinstance(node, ast.ImportFrom)
+            and node.module is not None
+        ]
+        assert all(name in stdlib_modules for name in imports), imports
+
+    def test_workspace_identity_is_frozen_and_serializable(self) -> None:
+        # Requirement: retained identity is an immutable data-only checkpoint value.
+        identity = WorkspaceIdentity("docker", "lease", "incarnation", "volume")
+        assert dataclasses.asdict(identity) == {
+            "backend": "docker",
+            "lease_id": "lease",
+            "incarnation": "incarnation",
+            "location": "volume",
+        }
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            identity.backend = "local"
+
+    def test_lifecycle_type_defaults_preserve_legacy_construction(self) -> None:
+        # Requirement: additive fields preserve old constructors and ephemeral behavior.
+        assert CommandSpec("echo").attempt_id is None
+        assert RunSpec("x").workspace_persistence is None
+        assert RunnerCapabilities(True, False, True, False).retained_workspace is False
+        assert RunnerCapabilities(
+            batch=True, sessions=False, shared_workspace=True, snapshots=False
+        ) == RunnerCapabilities(True, False, True, False, retained_workspace=False)
+
+    @pytest.mark.asyncio
+    async def test_local_rejects_retained_workspaces(self) -> None:
+        # Requirement: local execution must not claim attach or retention support.
+        backend = LocalRunnerBackend()
+        identity = WorkspaceIdentity("local", "x", "i")
+        with pytest.raises(
+            ExecutionSpecError, match="^local backend does not support retained workspaces$"
+        ):
+            await backend.attach_run(RunSpec("x"), identity)
+        with pytest.raises(
+            ExecutionSpecError, match="^local backend does not support retained workspaces$"
+        ):
+            await backend.prepare_run(RunSpec("x", workspace_persistence="durable"))
+
+    @pytest.mark.asyncio
+    async def test_docker_retained_workspace_verifies_and_preserves_volume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: attach verifies without allocation; retained preparation and finalization
+        # create an owned volume eagerly and leave it in place without staging.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        helper = Path(__file__).with_name("docker_fake_stateful.py")
+        wrapper = bin_dir / ("docker.cmd" if sys.platform == "win32" else "docker")
+        if sys.platform == "win32":
+            wrapper.write_text(f'@"{sys.executable}" "{helper}" %*\n', encoding="utf-8")
+        else:
+            wrapper.write_text(
+                f"#!{sys.executable}\nexec(open({str(helper)!r}).read())\n", encoding="utf-8"
+            )
+            wrapper.chmod(wrapper.stat().st_mode | 0o100)
+        log = tmp_path / "docker.jsonl"
+        store = tmp_path / "daemon"
+        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
+        monkeypatch.setenv("FAKE_DOCKER_STORE", str(store))
+        backend = DockerRunnerBackend(wrapper.name)
+        with pytest.raises(WorkspaceAttachError, match="missing"):
+            await backend.attach_run(
+                RunSpec("missing"), WorkspaceIdentity("docker", "missing", "incarnation")
+            )
+        lease = await backend.prepare_run(RunSpec("retained", workspace_persistence="durable"))
+        volume = store / "volumes/conductor-ws-retained"
+        labels = json.loads((volume / "labels.json").read_text(encoding="utf-8"))
+        assert labels["io.conductor.retention"] == "durable"
+        assert labels["io.conductor.incarnation"] == lease.incarnation
+        await backend.finalize_run(lease, "succeeded", retain=True)
+        assert volume.exists()
+        commands = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert not any(argv[0] == "cp" or argv[:2] == ["volume", "rm"] for argv in commands)
+        assert sum(argv[:2] == ["volume", "create"] for argv in commands) == 1
 
 
 class TestLiteralVocabularies:
@@ -272,6 +458,39 @@ def test_aliases_are_typing_literals() -> None:
     # exception subclasses — house style, see RunMode in fleet/records.py.
     assert CommandOutcome.__origin__ is Literal  # type: ignore[attr-defined]
     assert RunOutcome.__origin__ is Literal  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_local_run_agent_preserves_result_identity() -> None:
+    # Requirement: local delegation returns the original opaque provider result.
+    from conductor.execution.local import LocalRunnerBackend
+
+    expected = AgentResult(content={"answer": "ok"}, continuation_state=object())
+
+    async def execute_local() -> AgentResult:
+        return expected
+
+    actual = await LocalRunnerBackend().run_agent(
+        AgentSpec("agent", "exec-1", "copilot", None, "prompt"),
+        None,
+        execute_local=execute_local,
+    )
+    assert actual is expected
+
+
+@pytest.mark.asyncio
+async def test_docker_agent_stub_reports_unavailable_realm() -> None:
+    # Requirement: Docker agent calls cannot run without a lease and runner image.
+    from conductor.exceptions import ConfigurationError
+    from conductor.execution.docker import DockerRunnerBackend
+
+    with pytest.raises(
+        ConfigurationError,
+        match="requires a Docker lease and runner image",
+    ):
+        await DockerRunnerBackend("docker").run_agent(
+            AgentSpec("agent", "exec-1", "copilot", None, "prompt"), None
+        )
 
 
 class TestResolvedExecutionSpecAndBundleRef:

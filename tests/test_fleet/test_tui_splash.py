@@ -41,12 +41,14 @@ def _with_animation(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
 
 
 class TestSplash:
+    @pytest.mark.usefixtures("hold_splash")
     async def test_is_shown_on_launch(self) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(app.screen, SplashScreen)
 
+    @pytest.mark.usefixtures("hold_splash")
     async def test_the_home_screen_is_already_mounted_behind_it(self) -> None:
         """Pushed *over* Runs rather than before it, so the fleet scan the
         splash exists to cover is actually underway while it is shown."""
@@ -82,6 +84,7 @@ class TestSplash:
             await asyncio.sleep(SPLASH_SECONDS + 0.4)
             assert isinstance(app.screen, RunsScreen)
 
+    @pytest.mark.usefixtures("hold_splash")
     async def test_renders_the_wordmark(self) -> None:
         app = FleetApp()
         async with app.run_test(size=(100, 30)) as pilot:
@@ -92,7 +95,7 @@ class TestSplash:
             # under load (which is exactly how this failed in a full run
             # while passing on its own).
             painted = ""
-            deadline = SPLASH_SECONDS
+            deadline = 10.0
             while deadline > 0 and isinstance(app.screen, SplashScreen):
                 painted = "".join(
                     "".join(segment.text for segment in strip)
@@ -115,6 +118,7 @@ class TestSplash:
             await pilot.pause()
             assert isinstance(app.screen, RunsScreen)
 
+    @pytest.mark.usefixtures("hold_splash")
     async def test_dismissing_never_pops_a_screen_it_does_not_own(self) -> None:
         """`_dismiss` pops whatever is on top, so it must only fire while the
         splash *is* what's on top.

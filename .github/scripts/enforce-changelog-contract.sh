@@ -14,6 +14,14 @@
 #                   "origin/$BASE_REF". Set CHANGELOG_BASE to a full ref to
 #                   override (the test harness uses this to point at a local
 #                   branch in a temporary repository).
+#   GITHUB_REF      set by Actions. When it is a pull request merge ref
+#                   (refs/pull/N/merge) and CHANGELOG_BASE is unset, the base
+#                   is HEAD^1 -- the exact base commit GitHub built the checked
+#                   out merge commit on -- rather than the live origin/$BASE_REF.
+#                   A re-run (for example a fork PR approved after main moved)
+#                   checks out the original merge commit, and comparing it with
+#                   a newer origin/$BASE_REF misreads the base's own changes
+#                   (such as a release's version bump) as the PR's.
 #   RUNNER_TEMP     scratch directory for intermediate files (defaults to a
 #                   private mktemp directory).
 #
@@ -48,7 +56,19 @@ fail() {
   exit 1
 }
 
-BASE="${CHANGELOG_BASE:-origin/${BASE_REF:?BASE_REF or CHANGELOG_BASE must be set}}"
+if [ -n "${CHANGELOG_BASE:-}" ]; then
+  BASE="$CHANGELOG_BASE"
+elif [[ "${GITHUB_REF:-}" =~ ^refs/pull/[0-9]+/merge$ ]]; then
+  git rev-parse --verify --quiet "HEAD^2" > /dev/null ||
+    fail "GITHUB_REF is $GITHUB_REF but HEAD is not a two-parent merge commit; check out the pull request merge ref."
+  BASE=$(git rev-parse HEAD^1)
+else
+  BASE="origin/${BASE_REF:?BASE_REF or CHANGELOG_BASE must be set}"
+fi
+# Remediation commands name the live base branch, not a pinned merge parent:
+# a branch is rebuilt on what the base branch is now.
+REBUILD_BASE="${BASE_REF:+origin/$BASE_REF}"
+REBUILD_BASE="${REBUILD_BASE:-$BASE}"
 PR_LABELS="${PR_LABELS:-[]}"
 PR_AUTHOR_LOGIN="${PR_AUTHOR_LOGIN:-}"
 
@@ -106,7 +126,7 @@ if [ "$BASE_VERSION" != "$VERSION" ]; then
   #    consumes them; README.md is the only permanent resident.
   leftovers=$(git ls-tree -r --name-only HEAD -- changelog.d/ | grep -v '^changelog.d/README.md$' || true)
   if [ -n "$leftovers" ]; then
-    fail "Release mode: fragments must be consumed by 'make changelog-build VERSION=$VERSION' but these remain in the merge result: $(echo "$leftovers" | tr '\n' ' ') Most often another PR merged a new fragment after this branch was built. Do not just re-run the build — towncrier refuses a version whose header already exists. Restore the pre-compile state and compile the full set in one pass: git rebase $BASE && git checkout $BASE -- CHANGELOG.md changelog.d/ && make changelog-build VERSION=$VERSION && uv lock — then commit and push. Contract: changelog.d/README.md"
+    fail "Release mode: fragments must be consumed by 'make changelog-build VERSION=$VERSION' but these remain in the merge result: $(echo "$leftovers" | tr '\n' ' ') Most often another PR merged a new fragment after this branch was built. Do not just re-run the build — towncrier refuses a version whose header already exists. Restore the pre-compile state and compile the full set in one pass: git rebase $REBUILD_BASE && git checkout $REBUILD_BASE -- CHANGELOG.md changelog.d/ && make changelog-build VERSION=$VERSION && uv lock — then commit and push. Contract: changelog.d/README.md"
   fi
 
   # 5. Rehearse the release-notes extraction with the trusted base

@@ -11,6 +11,94 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.44] - 2026-11-01
+
+### Added
+
+- **Agent execution realms and profiles**: run LLM agents in isolated Docker
+  containers or Azure Container Apps dynamic sessions via `execution.profile`.
+  Docker profiles accept `runner_image` to execute the agent loop, stdio MCP
+  tools, and staged workspace dependencies colocated in a long-lived runner
+  container. Remote runners support `/interrupt` for targeted mid-turn pauses,
+  multi-provider execution (Copilot, OpenAI, Claude), and per-call agent-scope
+  secret delivery (`env_overlay`) to stdio MCP processes without leaking into
+  the runner process environment.
+
+  Host-resolved credentials and endpoints stay authoritative inside the
+  runner. Docker interrupt delivery remains monitored through transport
+  shutdown, and a racing completion preserves its result. Retained Docker
+  workspaces record agent dispatch so resume refuses a missing staging
+  marker rather than overwriting agent-written files.
+
+  **ACA execution profiles**: configure the pool and session scope under an
+  environment profile's `aca` block, independently of the agent's model
+  provider. The legacy `provider: aca` form remains available with a
+  deprecation notice. (#598)
+
+### Fixed
+
+- **Fleet TUI gate text entry**: choosing **✎ Write your own** on a
+  `questions` step, or any gate option that declares `prompt_for`, now opens
+  an editor in the Fleet Manager and responds only once the text is
+  confirmed (`enter` for single-line, `ctrl+s` for multi-line). Previously
+  the selection was sent immediately with no text, advancing the question
+  unanswered. Pressing `esc` in the editor sends nothing and leaves the
+  question pending; `g` reopens it. (#620)
+
+### Removed
+
+- The obsolete `conductor.providers.aca_protocol` module has been removed;
+  import runner wire models from `conductor.runner.protocol` instead. (#598)
+
+
+## [0.1.43] - 2026-10-29
+
+### Added
+
+- **Retained workspace lifecycle, honest resume digest gate, and restart policy**:
+  Workflows running on the Docker execution backend can now retain container
+  workspace volumes across failures and resumptions using `workflow.workspace`
+  (`persistence: on-failure` or `durable`). On resume, Conductor enforces an
+  honest digest gate that verifies bundle content (when recorded) and manifest
+  semantic digests against the checkpoint's resume contract before attaching
+  or altering retained Docker volumes. Resumption also respects step-level
+  `restart:` policies (`rerun` or `fail`), controlling whether interrupted
+  in-flight steps re-execute or fail closed. (#597)
+
+### Fixed
+
+- The `copilot` provider now enforces per-agent tool allowlists on the SDK
+  session; previously every agent silently received the CLI's full tool catalog.
+  Explicit agent tool lists, including `tools: []`, are enforced. When agent tools
+  are omitted, a non-empty workflow tool list is inherited; an empty workflow list
+  retains the SDK's default tools. MCP tools named `server__tool` are translated
+  to the Copilot runtime's `server-tool` name, so allowing one no longer hides it. (#585)
+- **Claude Code plugin marketplace**: `/plugin install conductor@conductor` no
+  longer fails with `Source path does not exist`. The marketplace entry now points
+  at `./plugins/conductor`, relative to the repository root as Claude Code
+  resolves it, and the unused `metadata.pluginRoot` is removed. (#587)
+- Fleet now shows tokens and estimated costs for newly recorded runs whose
+  agents execute in sub-workflows, including usage on workflow-step detail rows. (#588)
+- **MCP registry defaults**: server startup now checks for a newer default-branch
+  commit even with a warm cache, while retaining the recorded SHA as a fallback
+  when ref resolution fails. (#595)
+
+### Changed
+
+- **Leaner agent instructions**: the root `AGENTS.md` is now a short set of
+  universal rules and a task router (about 7 KB, down from 238 KB), with
+  contributor detail moved to on-demand guides under `docs/development/`. A
+  `conductor run --workspace-instructions` launched in this repository now
+  injects that short router rather than the full architecture notes; pin a guide
+  explicitly with `--instructions` or a workflow's `instructions: [!file ...]`
+  when a run needs it. The Claude provider guide moved to
+  `docs/providers/claude-provider.md` (the old path is a short pointer, so it is
+  no longer auto-discovered as a 31 KB `CLAUDE.md` on case-insensitive
+  filesystems), and the workspace-instructions docs now describe how scoped
+  `.github/instructions/` files are actually selected and that YAML
+  `instructions:` entries are literal text unless loaded with `!file`. (#574)
+
+
 ## [0.1.42] - 2026-10-06
 
 ### Added

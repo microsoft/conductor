@@ -982,6 +982,13 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
         header = join(" ", header_bits)
 
         body_lines = [styled("⚠ Experimental provider in use: {}", header)]
+        if provider_name == "aca":
+            body_lines.append(
+                Text(
+                    "The legacy provider: aca form is deprecated. Use provider: copilot "
+                    "with execution.profile pointing to an aca environment profile."
+                )
+            )
         if limitations:
             body_lines.append(Text("Limitations: " + ", ".join(limitations) + "."))
         if meta.get("native_tools") == "claude_code":
@@ -1882,6 +1889,7 @@ async def _resume_with_stop_signal(
     engine: Any,
     current_agent: str,
     dashboard: Any | None,
+    checkpoint: Any | None = None,
 ) -> dict[str, Any]:
     """Resume the workflow engine, racing against a dashboard kill signal.
 
@@ -1898,7 +1906,12 @@ async def _resume_with_stop_signal(
     Raises:
         ExecutionError: If the workflow was killed via the dashboard.
     """
-    return await _execute_with_stop_signal(engine.resume(current_agent), dashboard, engine=engine)
+    resume_call = (
+        engine.resume(current_agent)
+        if checkpoint is None
+        else engine.resume(current_agent, checkpoint=checkpoint)
+    )
+    return await _execute_with_stop_signal(resume_call, dashboard, engine=engine)
 
 
 async def _execute_with_stop_signal(
@@ -3710,7 +3723,9 @@ async def resume_workflow_async(
                         Text.from_markup("[dim]Press Esc to interrupt and provide guidance[/dim]")
                     )
 
-                result = await _resume_with_stop_signal(engine, cp.current_agent, dashboard)
+                result = await _resume_with_stop_signal(
+                    engine, cp.current_agent, dashboard, checkpoint=cp
+                )
             except WorkflowTerminated as exc:
                 # Mirror of the matching arm in `run_workflow_async`: defer
                 # the raise so the dashboard stays alive for

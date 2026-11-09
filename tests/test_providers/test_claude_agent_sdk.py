@@ -102,7 +102,7 @@ class TestClaudeAgentSdkProviderInitialization:
     @patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
     def test_init_with_defaults(self) -> None:
         provider = ClaudeAgentSdkProvider()
-        assert provider._default_model == "claude-sonnet-4-5"
+        assert provider._default_model == "claude-sonnet-4-6"
         assert provider._default_max_turns == 50
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)

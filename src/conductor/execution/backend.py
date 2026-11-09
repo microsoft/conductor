@@ -1,25 +1,30 @@
 """The ``RunnerBackend`` protocol: the seam every execution backend implements.
 
-The protocol is intentionally minimal — one typed operation
-(:meth:`RunnerBackend.run_command`) plus the run-scoped lease lifecycle that
-the workflow engine drives. Operations such as ``run_agent``/``open_mcp``/
-``cancel`` are deliberately absent: they will arrive together with their
-consumers in later contract revisions, not ahead of them.
+The protocol exposes typed command and agent operations
+(:meth:`RunnerBackend.run_command` and :meth:`RunnerBackend.run_agent`) plus
+the run-scoped lease lifecycle that the workflow engine drives. Agent calls
+return a complete result or propagate cancellation after teardown; separate
+``open_mcp`` and ``cancel`` operations are not part of this contract.
 
 Like the contract types, this module imports nothing from Conductor.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from conductor.execution.types import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     CommandResult,
     CommandSpec,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -40,6 +45,7 @@ class RunnerBackend(Protocol):
             The capability set; ``batch`` is required for any backend the
             script executor will delegate to.
         """
+        ...
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         """Acquire the workspace handle for a run.
@@ -55,6 +61,7 @@ class RunnerBackend(Protocol):
         Returns:
             An opaque, backend-owned workspace lease.
         """
+        ...
 
     async def run_command(
         self,
@@ -62,6 +69,7 @@ class RunnerBackend(Protocol):
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         """Execute one command and return its data-shaped result.
 
@@ -77,12 +85,63 @@ class RunnerBackend(Protocol):
             diagnostics: Optional sink for human-facing progress lines
                 (e.g. verbose script logging); the backend calls it at its
                 own discretion.
+            on_dispatch: Optional notification fired after pre-dispatch checks,
+                immediately before creating the command process. Pre-dispatch
+                failures must not call it.
 
         Returns:
             The command's outcome, output, and timing as data.
         """
+        ...
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def run_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease | None,
+        *,
+        on_event: AgentEventSink | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> AgentResult:
+        """Execute one agent invocation in this backend's realm.
+
+        The call returns exactly one complete :class:`AgentResult` or raises a
+        typed execution/provider error. Cancellation propagates only as
+        ``asyncio.CancelledError`` after owned work has been torn down; it is
+        never converted into a fabricated partial result. In-process backends
+        require ``execute_local``; backends that execute outside this process
+        reject it. ``interrupt_signal=None`` means no mid-flight interrupt was
+        requested.
+
+        Args:
+            spec: Resolved inputs for one agent invocation.
+            lease: The run's workspace lease, or ``None``.
+            on_event: Optional sink for the invocation's ordinary agent events.
+            interrupt_signal: Optional signal for a graceful in-flight pause.
+            execute_local: In-process invocation closure, including the provider
+                call and its event/interrupt wiring.
+            on_dispatch: Notification after pre-dispatch checks, immediately
+                before invoking the agent. Pre-dispatch failures must not call it.
+
+        Returns:
+            The agent result without converting cancellation into data.
+        """
+        ...
+
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
+        """Verify a retained workspace and return its process-local lease.
+
+        This operation checks existence, labels, and incarnation only. It must not
+        create, stage, delete, or replace any resource.
+        """
+        ...
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         """Release the workspace held by a finished run.
 
         Idempotent cleanup keyed by the lease: safe to call exactly once per
@@ -90,3 +149,4 @@ class RunnerBackend(Protocol):
         cancellation has already propagated). Remote backends reclaim realm
         resources here.
         """
+        ...

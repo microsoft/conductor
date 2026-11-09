@@ -18,7 +18,12 @@ principle (D4): :func:`resolve_gate` presents a gated run's options via
 :class:`GateOptionsModal`, then posts the selection through the exact same
 :func:`conductor.cli.gate._gate_respond_impl` ``conductor gate respond``
 uses -- so ``CONDUCTOR_GATE_TOKEN`` handling and the ``/api/gate-status``
-auto-discovery come along unchanged, with no second HTTP client. That
+auto-discovery come along unchanged, with no second HTTP client. A choice
+that declares ``prompt_for`` (a ``questions`` node's "Write your own", or a
+``human_gate`` option asking for feedback) is never submitted on selection
+alone: :func:`resolve_gate` first collects the text in
+:class:`GateInputModal`, and only a confirmed entry is posted -- Escape
+there leaves the question unanswered (issue #620). That
 function is synchronous and blocks on ``httpx`` (5s/10s timeouts), so the
 call runs in a Textual worker thread (``App.run_worker(..., thread=True)``)
 rather than on the UI thread; its module-level ``stderr`` console is
@@ -54,14 +59,15 @@ import webbrowser
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import typer
 from rich.console import Console
 from rich.text import Text
+from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DirectoryTree, Input, OptionList, Static, Tree
+from textual.widgets import DirectoryTree, Input, OptionList, Static, TextArea, Tree
 from textual.widgets._directory_tree import DirEntry
 from textual.widgets.option_list import Option
 
@@ -476,6 +482,59 @@ def _option_label(gate: GateInfo, value: str) -> str:
     return value
 
 
+def _option_detail(gate: GateInfo, value: str) -> dict[str, Any] | None:
+    """Return the first ``option_details`` entry for ``value``, if any.
+
+    First match, for the same reason :func:`_option_label` uses it: option
+    values are not guaranteed unique, and an older event may carry no
+    details at all (``None`` then, which callers treat as "no extra input").
+    """
+    for detail in gate.option_details:
+        if detail.get("value") == value:
+            return detail
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class GateInputRequest:
+    """What :class:`GateInputModal` must collect for a selected choice.
+
+    Attributes:
+        label: The selected choice's display label.
+        field: The declared ``prompt_for`` key used in
+            ``GateResponse.additional_input``. Final output storage depends
+            on the step type.
+        multiline: Whether the choice accepts multi-line text.
+    """
+
+    label: str
+    field: str
+    multiline: bool
+
+
+def gate_input_request(gate: GateInfo, value: str) -> GateInputRequest | None:
+    """Return the input ``value``'s choice asks for, or ``None`` if none.
+
+    Driven solely by the choice's recorded metadata (a nonempty
+    ``prompt_for``), never by its label or a reserved value: an older event
+    without that metadata keeps today's select-and-submit behaviour, and an
+    ordinary ``human_gate`` option with ``prompt_for: feedback`` is handled
+    exactly like a ``questions`` node's "Write your own" (issue #620). A
+    missing ``multiline`` means single-line.
+    """
+    detail = _option_detail(gate, value)
+    if detail is None:
+        return None
+    field = detail.get("prompt_for")
+    if not isinstance(field, str) or not field:
+        return None
+    return GateInputRequest(
+        label=_option_label(gate, value),
+        field=field,
+        multiline=detail.get("multiline") is True,
+    )
+
+
 class GateOptionsModal(ModalScreen[str | None]):
     """Presents an open gate's prompt and options; dismisses with the
     selected option's value, or ``None`` if cancelled (D4, E13-T2).
@@ -598,6 +657,170 @@ class GateOptionsModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class GateInputModal(ModalScreen[str | None]):
+    """Collects the text a selected gate choice asks for (issue #620).
+
+    Pushed by :func:`resolve_gate` after :class:`GateOptionsModal` returns a
+    choice whose ``prompt_for`` is set. Dismisses with the confirmed text
+    -- verbatim, possibly empty -- or ``None`` if cancelled with Escape, so
+    a caller can tell "submitted nothing" from "did not submit" with
+    ``is None``. Nothing is sent from here; the caller only posts a
+    response once this returns a string.
+
+    Single-line choices use an :class:`~textual.widgets.Input` (Enter
+    submits). Multi-line choices use a plain
+    :class:`~textual.widgets.TextArea`, where Enter must insert a newline,
+    so submission is on ``ctrl+s`` -- the same key that launches from the
+    New Run screen -- which also works in single-line mode. Neither editor
+    binds ``ctrl+s`` or ``escape`` (``TextArea`` only consumes Escape with
+    ``tab_behavior="indent"``, which is not used here), so both screen
+    bindings fire while the editor holds focus; ``priority`` makes that
+    independent of the editor's own binding table anyway.
+
+    Layout follows :class:`GateOptionsModal`: a bounded dialog whose prompt
+    scroller absorbs the spare height, so the editor and the hint stay on
+    screen at 80x24 however long the question is.
+    """
+
+    DEFAULT_CSS = """
+    GateInputModal {
+        align: center middle;
+    }
+    #gate-input-modal {
+        /* Bounded for the same reason as `#gate-modal`: the prompt shown for
+           context can be far taller than the terminal. */
+        width: 90%;
+        max-width: 120;
+        height: 80%;
+        border: thick $warning;
+        padding: 1 2;
+    }
+    #gate-input-prompt-scroll {
+        /* 1fr: the prompt takes only what the controls below leave over. */
+        height: 1fr;
+        min-height: 1;
+        scrollbar-size-vertical: 1;
+    }
+    #gate-input-heading {
+        height: auto;
+        max-height: 3;
+        margin-top: 1;
+    }
+    #gate-input-editor {
+        /* Fixed rows for the multi-line editor so it never collapses under
+           a long prompt; `Input` keeps its own default height. */
+        margin-top: 1;
+    }
+    TextArea#gate-input-editor {
+        /* Leave room for a three-line heading and the submission hint
+           inside the content area even at 80x24. */
+        height: 5;
+    }
+    #gate-input-hint {
+        height: 1;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+s", "submit", "Submit", priority=True),
+        Binding("ctrl+down", "scroll_prompt_down", "Scroll prompt", priority=True),
+        Binding("ctrl+up", "scroll_prompt_up", "Scroll prompt up", priority=True),
+        Binding("ctrl+shift+down", "prompt_page_down", "Prompt page down", priority=True),
+        Binding("ctrl+shift+up", "prompt_page_up", "Prompt page up", priority=True),
+    ]
+
+    def __init__(
+        self,
+        gate: GateInfo,
+        request: GateInputRequest,
+        *,
+        draft: str = "",
+        retry: bool = False,
+    ) -> None:
+        super().__init__()
+        self._gate = gate
+        self._request = request
+        self._draft = draft
+        self._retry = retry
+
+    def compose(self) -> ComposeResult:
+        editor: Input | TextArea
+        if self._request.multiline:
+            # Plain `TextArea` (not `code_editor`): no line numbers or
+            # syntax highlighting for prose. Default `tab_behavior="focus"`
+            # leaves Escape to the screen binding.
+            editor = TextArea(self._draft, id="gate-input-editor", soft_wrap=True)
+            hint = Text(
+                f"enter newline · ctrl+s {'retry' if self._retry else 'submit'}"
+                " · ctrl+↑/↓ scroll · esc cancel",
+                style="dim",
+            )
+        else:
+            editor = Input(value=self._draft, id="gate-input-editor")
+            hint = Text(
+                f"enter {'retry' if self._retry else 'submit'} · ctrl+↑/↓ scroll · esc cancel",
+                style="dim",
+            )
+        yield Vertical(
+            VerticalScroll(
+                Static(self._gate.prompt, markup=False, id="gate-input-prompt"),
+                id="gate-input-prompt-scroll",
+                # Focus belongs to the editor -- see `GateOptionsModal`.
+                can_focus=False,
+            ),
+            # `Text`, never markup: the label and field name both come from
+            # the workflow (guard rule C, tests/test_cli/test_markup_guards.py).
+            Static(
+                Text.assemble(
+                    (self._request.label, "bold"),
+                    ("  ·  ", "dim"),
+                    (self._request.field, "italic"),
+                ),
+                id="gate-input-heading",
+            ),
+            editor,
+            Static(hint, id="gate-input-hint"),
+            id="gate-input-modal",
+        )
+
+    def on_mount(self) -> None:
+        """Put the cursor in the editor -- typing is the only thing to do here."""
+        self._editor().focus()
+
+    def _editor(self) -> Input | TextArea:
+        if self._request.multiline:
+            return self.query_one("#gate-input-editor", TextArea)
+        return self.query_one("#gate-input-editor", Input)
+
+    def action_scroll_prompt_down(self) -> None:
+        self.query_one("#gate-input-prompt-scroll", VerticalScroll).scroll_down()
+
+    def action_scroll_prompt_up(self) -> None:
+        self.query_one("#gate-input-prompt-scroll", VerticalScroll).scroll_up()
+
+    def action_prompt_page_down(self) -> None:
+        self.query_one("#gate-input-prompt-scroll", VerticalScroll).scroll_page_down()
+
+    def action_prompt_page_up(self) -> None:
+        self.query_one("#gate-input-prompt-scroll", VerticalScroll).scroll_page_up()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the single-line editor submits its value verbatim."""
+        if event.input.id == "gate-input-editor":
+            event.stop()
+            self.dismiss(event.value)
+
+    def action_submit(self) -> None:
+        """Submit the editor's current text verbatim -- bound to ``ctrl+s``."""
+        editor = self._editor()
+        self.dismiss(editor.text if isinstance(editor, TextArea) else editor.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 @dataclass(frozen=True, slots=True)
 class GateResolveOutcome:
     """Outcome of a :func:`resolve_gate` HTTP call.
@@ -625,7 +848,9 @@ class GateResolveOutcome:
 _gate_console_lock = threading.Lock()
 
 
-def _resolve_gate_sync(port: int, choice: str, agent: str) -> GateResolveOutcome:
+def _resolve_gate_sync(
+    port: int, choice: str, agent: str, input_text: str | None = None
+) -> GateResolveOutcome:
     """Call :func:`conductor.cli.gate._gate_respond_impl` synchronously,
     capturing its console output and translating any failure -- a raised
     ``typer.Exit``, or any other unexpected exception from the HTTP path
@@ -647,6 +872,10 @@ def _resolve_gate_sync(port: int, choice: str, agent: str) -> GateResolveOutcome
         port: The gated run's dashboard port.
         choice: The selected option's value.
         agent: The gate's agent name (from ``GateInfo.agent_name``).
+        input_text: Text collected by :class:`GateInputModal` for a choice
+            that declares ``prompt_for``, forwarded verbatim as the CLI's
+            ``--input`` -- the engine maps it onto the choice's declared
+            field. ``None`` sends no ``additional_input`` at all.
 
     Returns:
         A :class:`GateResolveOutcome` -- never raises.
@@ -658,7 +887,7 @@ def _resolve_gate_sync(port: int, choice: str, agent: str) -> GateResolveOutcome
         original_console = gate_module.console
         gate_module.console = captured
         try:
-            gate_module._gate_respond_impl(port, choice, agent, None, None)
+            gate_module._gate_respond_impl(port, choice, agent, input_text, None)
             success = True
         except typer.Exit:
             success = False
@@ -683,10 +912,16 @@ async def resolve_gate(app: App, record: RunRecord, gate: GateInfo) -> GateResol
     respond`` HTTP path (D4, E13-T2).
 
     Presents ``gate``'s options via :class:`GateOptionsModal` -- awaited
-    with ``app.push_screen_wait`` -- then posts the selection through
-    :func:`_resolve_gate_sync`, dispatched to a worker thread
+    with ``app.push_screen_wait``. If the selected choice declares
+    ``prompt_for`` (see :func:`gate_input_request`), the text it asks for is
+    collected next via :class:`GateInputModal`; nothing is posted until that
+    text is confirmed, and cancelling it abandons the whole resolution with
+    the gate still open (issue #620). The selection (and any text) is then
+    posted through :func:`_resolve_gate_sync`, dispatched to a worker thread
     (``App.run_worker(..., thread=True)``) and awaited so the blocking
-    ``httpx`` calls never stall the UI thread.
+    ``httpx`` calls never stall the UI thread. Failed text submissions show
+    the error and reopen the same choice with its draft intact; only explicit
+    confirmation retries, since delivery failures may be ambiguous.
 
     Args:
         app: The running Textual app (used to push the options modal and
@@ -698,16 +933,45 @@ async def resolve_gate(app: App, record: RunRecord, gate: GateInfo) -> GateResol
 
     Returns:
         A :class:`GateResolveOutcome`, or ``None`` if the user cancelled
-        the options modal (no HTTP call was attempted).
+        before any HTTP call. Cancelling a retry returns the last failure.
     """
     assert record.port is not None, "resolve_gate requires a run with a dashboard port"
     choice = await app.push_screen_wait(GateOptionsModal(gate))
     if choice is None:
         return None
 
+    input_text: str | None = None
+    outcome: GateResolveOutcome | None = None
+    request = gate_input_request(gate, choice)
     port = record.port
-    worker = app.run_worker(lambda: _resolve_gate_sync(port, choice, gate.agent_name), thread=True)
-    return await worker.wait()
+    while True:
+        if request is not None:
+            input_text = await app.push_screen_wait(
+                GateInputModal(gate, request, draft=input_text or "", retry=outcome is not None)
+            )
+            # `is None`, not falsiness: an explicitly confirmed empty entry is
+            # still a submission, left to the engine's own validation.
+            if input_text is None:
+                return outcome
+
+        worker = app.run_worker(
+            lambda input_text=input_text: _resolve_gate_sync(
+                port, choice, gate.agent_name, input_text
+            ),
+            thread=True,
+        )
+        outcome = await worker.wait()
+        if outcome.success or request is None:
+            return outcome
+        # Keep this gate's choice and draft, but never resend on failure:
+        # delivery may have succeeded even though its acknowledgement was lost.
+        app.notify(
+            outcome.message + "\nDelivery may have succeeded. Confirm the draft to retry.",
+            title="Gate submission failed",
+            severity="error",
+            timeout=15,
+            markup=False,
+        )
 
 
 # ---------------------------------------------------------------------------

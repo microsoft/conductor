@@ -96,6 +96,35 @@ class InputDef(BaseModel):
         return v
 
 
+class WorkspaceConfig(BaseModel):
+    """Run-global workspace policy, inherited by sub-workflows.
+
+    A sub-workflow declaring its own block is rejected at resolution time.
+    Environment documents do not override this policy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["shared", "isolated"] = "shared"
+    """Whether steps share one workspace or receive isolated workspaces."""
+
+    persistence: Literal["ephemeral", "durable", "on-failure"] = "ephemeral"
+    """How workspace contents persist after the run."""
+
+
+class RestartConfig(BaseModel):
+    """Restart policy for an interrupted step.
+
+    Applies ONLY to an interrupted in-flight step when resuming from a failure
+    checkpoint; it does not affect loop-back or periodic checkpoint boundaries.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["rerun", "reuse", "fail"] = "rerun"
+    """Action to take for an interrupted in-flight step."""
+
+
 class McpConfig(BaseModel):
     """Per-workflow configuration for exposure as an MCP tool.
 
@@ -1254,6 +1283,9 @@ class ExecutableStepBase(RoutableStepBase):
 
     execution: StepExecutionConfig | None = None
 
+    restart: RestartConfig | None = None
+    """Restart policy override for this executable step."""
+
 
 def _normalize_step_type(value: Any) -> Any:
     if isinstance(value, dict) and value.get("type") is None:
@@ -2096,12 +2128,10 @@ class ProviderSettings(BaseModel):
     """ACA management API version (e.g. ``"2025-07-01"``). Aca-only."""
 
     inner_provider: Literal["copilot", "claude-agent-sdk"] | None = None
-    """SDK the in-sandbox runner drives. Aca-only.
+    """Legacy ACA provider's inner SDK selection; defaults to ``copilot``.
 
-    Defaults to ``"copilot"`` when ``name: aca`` and unset. **MVP: ``copilot``
-    only.** Claude-inside requires the containerizable ``claude-agent-sdk``
-    CLI; the bare ``claude`` (Anthropic-API) provider has no in-process tool
-    runtime and is not a valid inner provider.
+    In the profile form, ``aca`` selects placement rather than the model:
+    the agent's provider (copilot, openai, or claude) supplies the SDK.
     """
 
     identifier_scope: Literal["workflow", "agent", "item", "none"] | None = None
@@ -3058,6 +3088,9 @@ class WorkflowDefaults(BaseModel):
     execution: StepExecutionConfig | None = None
     """Default execution profile for executable steps without their own block."""
 
+    restart: RestartConfig | None = None
+    """Default restart policy for executable steps without their own block."""
+
     @model_validator(mode="after")
     def _reject_default_secret_references(self) -> WorkflowDefaults:
         """Reject ``secrets`` under ``workflow.defaults.execution``.
@@ -3143,6 +3176,9 @@ class WorkflowDef(BaseModel):
     declare their own ``execution:`` block. Absent from the YAML behaves
     identically to an explicit empty block.
     """
+
+    workspace: WorkspaceConfig | None = None
+    """None means the legacy path with no new workspace contract keys in dumps."""
 
     bundle: BundleConfig | None = None
     """Run bundle packaging and asset inclusion settings.

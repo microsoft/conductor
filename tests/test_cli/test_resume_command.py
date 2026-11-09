@@ -1501,7 +1501,7 @@ class TestExecuteWithStopSignal:
 
         engine = MagicMock()
 
-        async def _resume(_agent: str) -> dict[str, str]:
+        async def _resume(_agent: str, *, checkpoint: object | None = None) -> dict[str, str]:
             await asyncio.Event().wait()  # blocks → gets cancelled
             return {}
 

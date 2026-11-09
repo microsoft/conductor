@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -106,13 +107,18 @@ class RecordingBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
+        if on_dispatch is not None:
+            on_dispatch()
         self.run_calls.append((spec, lease))
         if self.run_command_impl is not None:
             return await self.run_command_impl(spec, lease)
         return self.command_result
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         self.finalize_calls.append((lease, outcome))
 
 
@@ -462,11 +468,16 @@ class GuardedLeaseBackend(RecordingBackend):
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         assert lease not in self._finalized, "run_command received a finalized lease"
-        return await super().run_command(spec, lease, diagnostics=diagnostics)
+        return await super().run_command(
+            spec, lease, diagnostics=diagnostics, on_dispatch=on_dispatch
+        )
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         assert lease not in self._finalized, "lease finalized twice"
         self._finalized.add(lease)
         self.finalize_calls.append((lease, outcome))
@@ -512,7 +523,9 @@ class TestFinalizationUnderCancellation:
         finalize_release = asyncio.Event()
         completed: list[tuple[WorkspaceLease, RunOutcome]] = []
 
-        async def blocking_finalize(lease: WorkspaceLease, outcome: RunOutcome) -> None:
+        async def blocking_finalize(
+            lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+        ) -> None:
             finalize_started.set()
             await finalize_release.wait()
             completed.append((lease, outcome))

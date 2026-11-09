@@ -73,13 +73,16 @@ class TestSecretBinding:
         b3 = SecretBinding(source=SecretBindingSource(env="MY_SECRET"), allow=["script", "mcp"])
         assert b3.allow == ["script", "mcp"]
 
-        b4 = SecretBinding(source=SecretBindingSource(env="MY_SECRET"), allow=[])
-        assert b4.allow == []
+        b4 = SecretBinding(source=SecretBindingSource(env="MY_SECRET"), allow=["agent"])
+        assert b4.allow == ["agent"]
+
+        b5 = SecretBinding(source=SecretBindingSource(env="MY_SECRET"), allow=[])
+        assert b5.allow == []
 
     def test_binding_invalid_allow_rejected(self) -> None:
-        # Requirement: allow only accepts "script" or "mcp" literals.
+        # Requirement: allow rejects names outside the script, mcp, and agent consumer classes.
         with pytest.raises(ValidationError):
-            SecretBinding(source=SecretBindingSource(env="MY_SECRET"), allow=["agent"])  # type: ignore[list-item]
+            SecretBinding.model_validate({"source": {"env": "MY_SECRET"}, "allow": ["database"]})
 
     def test_binding_extra_forbidden(self) -> None:
         # Requirement: extra keys are forbidden on SecretBinding.

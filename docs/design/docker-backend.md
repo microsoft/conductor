@@ -32,6 +32,7 @@ The Docker backend implements the `RunnerBackend` contract defined in `conductor
   * `batch = True`: Supports one-shot command execution via `run_command()`.
   * `sessions = False`: Interactive persistent sessions are not supported.
   * `shared_workspace = True`: Steps within a run share the same named volume workspace.
+  * `retained_workspace = True`: Supports retaining and re-attaching named volumes across runs (see [Retained Workspace Lifecycle](./workspace-lifecycle.md)).
   * `snapshots = False`: Mid-run workspace checkpointing is deferred.
 * **CLI transport**: Uses the system `docker` CLI executable directly via `asyncio.subprocess` rather than a Docker Python SDK. This keeps the execution path compatible with the operator's active Docker context, credential helpers, environment variables, and remote `DOCKER_HOST` configurations.
 * **Engine floor**: Requires Docker Engine 20.10 or newer (Docker API 1.41+).
@@ -346,7 +347,7 @@ does not establish abandonment. Supply that variable to the step below.
 
 When a workflow is resumed using `conductor resume`:
 
-1. **Fresh materialization**: Conductor creates a fresh workspace lease and re-stages the content-addressed bundle into a newly created named volume. Retaining modified volumes across resumes is not supported in v1.
+1. **Workspace attachment or fresh materialization**: If the workflow configured a retained workspace policy (`persistence: durable` or `on-failure`), the Docker backend verifies and re-attaches the existing volume using `attach_run` without re-staging files. If the policy is `ephemeral`, Conductor provisions a fresh workspace lease and stages the bundle into a new volume. Full details live in [Retained Workspace Lifecycle](./workspace-lifecycle.md).
 2. **Resume seeding asymmetry**: When resuming from a checkpoint, the CLI seeds the initial `workflow_started` event from the existing checkpoint context before initializing the engine. Consequently, the seeded `workflow_started` event does not contain the newly prepared `system.bundle` metadata. The bundle digest remains visible in verbose execution diagnostics and the engine preparation logs.
 
 ## Mixed-Backend Workflow Semantics

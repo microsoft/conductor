@@ -10,3 +10,7 @@ from __future__ import annotations
 
 class ExecutionSpecError(ValueError):
     """An execution backend received an invalid or unusable specification."""
+
+
+class WorkspaceAttachError(ExecutionSpecError):
+    """A retained workspace could not be verified or attached."""

@@ -6,6 +6,7 @@ deprecated alias (still works, warns, and forwards to the shared impl).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -103,6 +104,18 @@ def _sample_checkpoints() -> list[CheckpointData]:
 
 class TestCheckpointListCommand:
     """Tests for the 'conductor checkpoint list' CLI command."""
+
+    def test_lifecycle_fields_do_not_change_table_columns(self) -> None:
+        # Requirement: new checkpoint protocol fields leave the six CLI columns intact.
+        with patch.object(
+            CheckpointManager, "list_checkpoints", return_value=_sample_checkpoints()
+        ):
+            result = runner.invoke(app, ["checkpoint", "list"])
+
+        assert result.exit_code == 0
+        header = next(line for line in result.output.splitlines() if "Timestamp" in line)
+        columns = [cell.strip() for cell in re.split(r"[┃│|]", header)[1:-1]]
+        assert columns == ["Workflow", "Timestamp", "Trigger", "Agent", "Error Type", "File"]
 
     def test_help(self) -> None:
         """`checkpoint list --help` works."""

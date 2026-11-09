@@ -455,7 +455,7 @@ _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 # one. The string must match a model alias accepted by the upstream
 # ``claude-agent-sdk`` package; revalidate when bumping the upstream pin
 # in pyproject.toml.
-_DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
+_DEFAULT_MODEL: Final[str] = "claude-sonnet-4-6"
 
 # Claude Code settings tiers, mirroring the SDK's own `SettingSource`. Kept as
 # a local alias rather than imported so the narrowing survives when the SDK is

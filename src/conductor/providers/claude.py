@@ -203,6 +203,8 @@ class ClaudeProvider(AgentProvider):
         max_session_seconds: float | None = None,
         default_reasoning_effort: ReasoningEffort | None = None,
         tool_output: ToolOutputConfig | None = None,
+        *,
+        resolve_environment: bool = True,
     ) -> None:
         """Initialize the Claude provider.
 
@@ -216,10 +218,8 @@ class ClaudeProvider(AgentProvider):
             base_url: Custom API endpoint (e.g. Databricks gateway URL).
                 If None, falls back to ANTHROPIC_BASE_URL env var then the
                 default Anthropic API endpoint.
-            model: Default model to use. Defaults to "claude-3-5-sonnet-latest".
-                This default is chosen for stability and to avoid dated model
-                deprecation risk. The "-latest" suffix ensures compatibility
-                with model updates without requiring configuration changes.
+            model: Default model to use. Defaults to "claude-sonnet-4-6"
+                (Anthropic retired the previous default, claude-3-5-sonnet-latest).
             temperature: Default temperature (0.0-1.0). SDK enforces range.
             max_tokens: Maximum output tokens. Defaults to 16384 when not
                 configured, applied uniformly across Claude and OpenAI providers.
@@ -240,6 +240,8 @@ class ClaudeProvider(AgentProvider):
             tool_output: MCP tool result output-size configuration. Defines the
                 per-result character limit and spill-to-file behavior for MCP
                 tool outputs. ``None`` means the default configuration is used.
+            resolve_environment: Resolve missing credentials and endpoint from
+                the environment. False preserves host-effective settings.
 
         Raises:
             ProviderError: If SDK is not installed.
@@ -253,13 +255,16 @@ class ClaudeProvider(AgentProvider):
         self._client: AsyncAnthropic | None = None
         self._api_key = api_key
         self._auth_token = auth_token
+        self._resolve_environment = resolve_environment
         # Fold the env fallback into the attribute (mirroring openai.py) so
         # downstream consumers (e.g. resolve_compaction_window's
         # has_custom_base_url) see a proxy endpoint even when it came from
         # ANTHROPIC_BASE_URL rather than an explicit argument.
-        self._base_url = base_url if base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
+        self._base_url = base_url
+        if self._base_url is None and resolve_environment:
+            self._base_url = os.environ.get("ANTHROPIC_BASE_URL")
         self._model_user_configured = model is not None
-        self._default_model = model or "claude-3-5-sonnet-latest"
+        self._default_model = model or "claude-sonnet-4-6"
 
         # Validate and store temperature (enforce schema bounds at instantiation)
         if temperature is not None:
@@ -335,9 +340,15 @@ class ClaudeProvider(AgentProvider):
             client_kwargs["auth_token"] = self._auth_token
         if self._base_url is not None:
             client_kwargs["base_url"] = self._base_url
-        both_passed = "api_key" in client_kwargs and "auth_token" in client_kwargs
+        if not self._resolve_environment:
+            # None would let the SDK read the runner's credentials and URL.
+            client_kwargs["api_key"] = self._api_key or ""
+            client_kwargs["auth_token"] = self._auth_token or ""
+            client_kwargs["base_url"] = self._base_url or "https://api.anthropic.com"
+        both_passed = bool(client_kwargs.get("api_key")) and bool(client_kwargs.get("auth_token"))
         both_from_env = (
-            self._api_key is None
+            self._resolve_environment
+            and self._api_key is None
             and self._auth_token is None
             and bool(os.environ.get("ANTHROPIC_API_KEY"))
             and bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
@@ -991,8 +1002,8 @@ class ClaudeProvider(AgentProvider):
                     f"but default_reasoning_effort={self._default_reasoning_effort!r} "
                     "was configured.",
                     suggestion=(
-                        "Use a Claude 3.7+ or 4.x model (e.g. claude-opus-4-20250514, "
-                        "claude-sonnet-4-20250514) or remove the reasoning config."
+                        "Use a model that supports extended thinking with budget_tokens, "
+                        "or remove the reasoning config."
                     ),
                 )
             budget = effort_to_budget_tokens(self._default_reasoning_effort)
@@ -1025,6 +1036,7 @@ class ClaudeProvider(AgentProvider):
                 base_url=self._base_url,
                 auth_token=self._auth_token,
                 timeout=self._timeout,
+                resolve_environment=self._resolve_environment,
             )
 
             pydantic_agent = Agent(
@@ -1192,6 +1204,7 @@ class ClaudeProvider(AgentProvider):
                 auth_token=self._auth_token,
                 base_url=self._base_url,
                 timeout=self._timeout,
+                resolve_environment=self._resolve_environment,
                 toolsets=toolsets,
                 compaction=compaction,
             )
