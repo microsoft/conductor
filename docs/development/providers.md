@@ -190,6 +190,9 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
   `max`; `openai` declares `("low", "medium", "high")`.
 - `claude-agent-sdk` forwards the resolved level as `ClaudeAgentOptions.effort`, whose
   `EffortLevel` is the same five literals, so nothing is mapped; the CLI receives `--effort`.
+  Because the CLI silently drops or downgrades an unsupported level, `_refuse_unsupported_effort`
+  refuses known model/level combinations with a non-retryable `ProviderError`, like the provider's
+  other run-time refusals.
 - Copilot validates per model against `supported_reasoning_efforts`
   (`CopilotProvider._validate_reasoning_effort_for_model`). Claude maps effort to an extended
   thinking budget via `EFFORT_TO_BUDGET_TOKENS` (low=2048, medium=8192, high=16384, xhigh=32768,

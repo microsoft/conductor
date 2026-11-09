@@ -580,10 +580,25 @@ agents (none of which call a model).
 - **Claude Agent SDK** — Forwards the chosen effort verbatim as
   `ClaudeAgentOptions.effort`, which the SDK passes to the `claude` CLI as
   `--effort <level>`. The SDK's own `EffortLevel` is the same five literals as
-  Conductor's, so there is no mapping table and no per-model pre-flight: the
-  CLI decides what a given model makes of the level. When neither
-  `reasoning.effort` nor `runtime.default_reasoning_effort` is set, the flag is
-  omitted entirely and the CLI's own default applies.
+  Conductor's, so there is no mapping table. The CLI never rejects a level a
+  model cannot use: it drops effort on models without it and runs an
+  unsupported `xhigh` or `max` at `high`. The provider therefore refuses those
+  combinations for explicit model ids before the session starts:
+
+  | Model | Unsupported levels |
+  |---|---|
+  | Claude 3.x, `claude-opus-4-0`, `claude-opus-4-1`, `claude-sonnet-4-0`, `claude-sonnet-4-5`, `claude-haiku-4-5` | all |
+  | `claude-opus-4-5` | `xhigh`, `max` |
+  | `claude-opus-4-6`, `claude-sonnet-4-6` (the provider default) | `xhigh` |
+
+  Model aliases such as `sonnet` or `opus` are resolved by the CLI and are not
+  checked. When effort is set, the provider also pins
+  `CLAUDE_CODE_EFFORT_LEVEL` to the same level in the child environment and in
+  `--settings`, because the CLI ranks that variable above `--effort`; only a
+  managed (policy) settings file can still override it. When neither
+  `reasoning.effort` nor `runtime.default_reasoning_effort` is set, nothing is
+  sent or pinned and the CLI's own default (including an inherited
+  `CLAUDE_CODE_EFFORT_LEVEL`) applies.
 
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and

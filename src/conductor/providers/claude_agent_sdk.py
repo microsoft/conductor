@@ -8,6 +8,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import types
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast, get_args
 
 from conductor.billing import BillingMode
 from conductor.exceptions import ProviderError
@@ -456,6 +457,93 @@ _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 # ``claude-agent-sdk`` package; revalidate when bumping the upstream pin
 # in pyproject.toml.
 _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-6"
+
+# The CLI reads this variable ahead of ``--effort``: a level set here replaces
+# the flag's, and ``unset``/``auto`` suppresses effort entirely. Pinned to the
+# resolved level whenever one is set (see ``_execute_session``).
+_EFFORT_ENV_VAR: Final[str] = "CLAUDE_CODE_EFFORT_LEVEL"
+
+_ALL_EFFORT_LEVELS: Final[tuple[ReasoningEffort, ...]] = get_args(ReasoningEffort)
+
+# Models whose effort support the CLI hard-codes, keyed (family, major, minor).
+# Transcribed from the CLI bundled with claude-agent-sdk 0.2.121 (Claude Code
+# 2.1.212). The CLI never rejects an unsupported level: on these models it drops
+# ``--effort`` entirely, and it downgrades an unsupported ``max`` or ``xhigh`` to
+# ``high``. Claude 3.x models take no effort either; see
+# ``_unsupported_effort_levels``. Re-check after an SDK bump.
+_ClaudeModelKey = tuple[str, int, int]
+_NO_EFFORT_MODELS: Final[frozenset[_ClaudeModelKey]] = frozenset(
+    {("opus", 4, 0), ("opus", 4, 1), ("sonnet", 4, 0), ("sonnet", 4, 5), ("haiku", 4, 5)}
+)
+_NO_MAX_EFFORT_MODELS: Final[frozenset[_ClaudeModelKey]] = _NO_EFFORT_MODELS | {("opus", 4, 5)}
+_NO_XHIGH_EFFORT_MODELS: Final[frozenset[_ClaudeModelKey]] = _NO_MAX_EFFORT_MODELS | {
+    ("opus", 4, 6),
+    ("sonnet", 4, 6),
+}
+# Searched, not matched, so provider-qualified ids (``us.anthropic.claude-…``,
+# ``claude-…@20250929``) resolve too. The minor version is one or two digits
+# not followed by another digit, so a dated id such as
+# ``claude-opus-4-20250514`` reads as 4.0 rather than 4.20.
+_CLAUDE_MODEL_VERSION: Final[re.Pattern[str]] = re.compile(
+    r"claude-(opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?"
+)
+
+
+def _unsupported_effort_levels(model: str) -> frozenset[ReasoningEffort]:
+    """Return the effort levels the ``claude`` CLI would not honor on ``model``.
+
+    Empty for aliases (``sonnet``, ``opus``) and unrecognized ids: the CLI
+    resolves those itself, possibly through ``ANTHROPIC_DEFAULT_*_MODEL``, so
+    only explicit model ids can be checked here.
+    """
+    lowered = model.lower()
+    if "claude-3-" in lowered:
+        return frozenset(_ALL_EFFORT_LEVELS)
+    match = _CLAUDE_MODEL_VERSION.search(lowered)
+    if match is None:
+        return frozenset()
+    key = (match[1], int(match[2]), int(match[3] or 0))
+    if key in _NO_EFFORT_MODELS:
+        return frozenset(_ALL_EFFORT_LEVELS)
+    unsupported: set[ReasoningEffort] = set()
+    if key in _NO_MAX_EFFORT_MODELS:
+        unsupported.add("max")
+    if key in _NO_XHIGH_EFFORT_MODELS:
+        unsupported.add("xhigh")
+    return frozenset(unsupported)
+
+
+def _refuse_unsupported_effort(agent: AgentDef, model: str, effort: ReasoningEffort | None) -> None:
+    """Refuse an effort level the CLI would silently drop or downgrade on ``model``.
+
+    Raises:
+        ProviderError: Non-retryable, when ``effort`` is a known-unsupported
+            level for ``model``.
+    """
+    if effort is None:
+        return
+    unsupported = _unsupported_effort_levels(model)
+    if effort not in unsupported:
+        return
+    source = (
+        "reasoning.effort" if agent.reasoning is not None else "runtime.default_reasoning_effort"
+    )
+    if len(unsupported) == len(_ALL_EFFORT_LEVELS):
+        consequence = "that model takes no effort level, so the claude CLI would ignore it"
+        suggestion = f"Remove {source} for this agent, or use a model that supports effort."
+    else:
+        supported = ", ".join(level for level in _ALL_EFFORT_LEVELS if level not in unsupported)
+        consequence = (
+            f"the claude CLI does not support {effort!r} on that model and would run it at "
+            "'high' instead"
+        )
+        suggestion = f"Use one of {supported} with this model, or a model that supports {effort!r}."
+    raise ProviderError(
+        f"Agent '{agent.name}' resolves {source}={effort!r} on model {model!r}, but {consequence}.",
+        suggestion=suggestion,
+        is_retryable=False,
+    )
+
 
 # Claude Code settings tiers, mirroring the SDK's own `SettingSource`. Kept as
 # a local alias rather than imported so the narrowing survives when the SDK is
@@ -1369,10 +1457,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         agent_reasoning_events=True,
         # ``ClaudeAgentOptions.effort`` takes the same five discrete levels
         # as Conductor's own ``ReasoningEffort``, so ``execute`` forwards the
-        # resolved value verbatim — no mapping table as Claude's token-budget
-        # translation needs, and no per-model pre-flight as Copilot's does:
-        # the level travels as an ``--effort`` argv flag and the CLI, not
-        # Conductor, decides what a given model makes of it. The field is
+        # resolved value verbatim as ``--effort``. The CLI silently drops or
+        # downgrades a level the model does not support, so
+        # ``_refuse_unsupported_effort`` refuses the known combinations first,
+        # and ``_execute_session`` pins ``CLAUDE_CODE_EFFORT_LEVEL`` so an
+        # inherited value cannot replace the level. An alias or unknown model
+        # id is resolved by the CLI and cannot be checked here. The field is
         # present at the ``upstream_pin`` floor declared below, so every
         # supported build has it and it needs no feature detection.
         reasoning_effort=("low", "medium", "high", "xhigh", "max"),
@@ -2101,6 +2191,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # refuses a ``{{ ... }}`` template that reached the provider
         # unrendered rather than casting it straight into the SDK.
         effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        _refuse_unsupported_effort(agent, model, effort)
 
         # The tiers the readiness probe ran with (see
         # ``_effective_setting_sources`` for the ``skills: []`` opt-out), read
@@ -2187,6 +2278,29 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 ", ".join(overridden),
             )
 
+        # The CLI ranks ``CLAUDE_CODE_EFFORT_LEVEL`` above ``--effort``, so a
+        # requested level is pinned in two places. The child environment beats
+        # an inherited value (including ``unset``, which would drop effort);
+        # ``--settings`` env beats a settings tier's or ``~/.claude.json``'s
+        # ``env`` block, which the CLI applies over the inherited environment.
+        # Only managed policy settings still outrank it. Unset effort leaves
+        # both alone so the ambient configuration applies. Not an auth input,
+        # so the readiness probe's environment does not need it.
+        child_env = dict(auth_context.finalized_child_env)
+        effort_settings: str | None = None
+        if effort is not None:
+            inherited_effort = child_env.get(_EFFORT_ENV_VAR, "").strip()
+            if inherited_effort and inherited_effort.lower() != effort:
+                logger.warning(
+                    "Agent %r: overriding inherited %s with reasoning effort %r for the "
+                    "Claude child process.",
+                    agent.name,
+                    _EFFORT_ENV_VAR,
+                    effort,
+                )
+            child_env[_EFFORT_ENV_VAR] = effort
+            effort_settings = json.dumps({"env": {_EFFORT_ENV_VAR: effort}})
+
         options = ClaudeAgentOptions(
             model=model,
             # Conductor's ``ReasoningEffort`` and the SDK's ``EffortLevel`` are
@@ -2196,6 +2310,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # workflow that configures nothing keeps the CLI's own default
             # rather than being pinned to one by Conductor.
             effort=effort,
+            settings=effort_settings,
             system_prompt=agent.system_prompt,
             resume=resume_session_id,
             # Explicit though it matches the SDK default: forking would mint a
@@ -2312,8 +2427,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so every key captured here wins over any later parent change;
             # only a key first set in the parent after capture can still pass
             # through, which is why explicit modes pin their neutralized keys
-            # even when absent. ``os.environ`` itself is never written.
-            env=dict(auth_context.finalized_child_env),
+            # even when absent. ``os.environ`` itself is never written. Plus
+            # the effort pin above, when a level is set.
+            env=child_env,
             # The binary the preflight vouched for. ``None`` (no CLI found)
             # leaves the SDK's own lookup in place, as before.
             cli_path=auth_context.cli_path,

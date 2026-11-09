@@ -785,9 +785,10 @@ class ReasoningConfig(BaseModel):
     Validation happens at execute time. Claude rejects models that don't
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
-    the request through to the SDK. The Claude Agent SDK provider has no
-    per-model pre-flight of its own — the CLI owns what each model makes of
-    the level.
+    the request through to the SDK. The Claude Agent SDK provider refuses an
+    explicit model id the ``claude`` CLI would silently drop effort on or
+    downgrade (e.g. ``xhigh`` on ``claude-sonnet-4-6``); aliases such as
+    ``sonnet`` are resolved by the CLI and pass through unchecked.
 
     Example YAML::
 

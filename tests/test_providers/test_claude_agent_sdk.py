@@ -5200,7 +5200,12 @@ class TestReasoningEffortWiring:
         from conductor.config.schema import ReasoningConfig
 
         options = await self._capture_options(
-            AgentDef(name="t", prompt="hi", reasoning=ReasoningConfig(effort=level))
+            AgentDef(
+                name="t",
+                prompt="hi",
+                model="claude-opus-4-7",
+                reasoning=ReasoningConfig(effort=level),
+            )
         )
 
         assert options.effort == level
@@ -5247,6 +5252,98 @@ class TestReasoningEffortWiring:
 
         assert options.effort is None
         assert "--effort" not in self._argv(options)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("inherited", ["low", "unset"])
+    async def test_inherited_effort_env_cannot_override_the_requested_level(
+        self, inherited: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The CLI reads ``CLAUDE_CODE_EFFORT_LEVEL`` ahead of ``--effort``:
+        ``low`` would replace the requested level and ``unset`` would drop
+        effort altogether. ``--settings`` carries the pin too, because a
+        settings tier's ``env`` block is applied over the child environment."""
+        monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", inherited)
+
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), default_reasoning_effort="high"
+        )
+
+        assert options.env["CLAUDE_CODE_EFFORT_LEVEL"] == "high"
+        assert json.loads(options.settings) == {"env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"}}
+        argv = self._argv(options)
+        assert json.loads(argv[argv.index("--settings") + 1]) == {
+            "env": {"CLAUDE_CODE_EFFORT_LEVEL": "high"}
+        }
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize("inherited", ["low", None])
+    async def test_unconfigured_effort_keeps_the_ambient_env(
+        self, inherited: str | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if inherited is None:
+            monkeypatch.delenv("CLAUDE_CODE_EFFORT_LEVEL", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", inherited)
+
+        options = await self._capture_options(AgentDef(name="t", prompt="hi"))
+
+        assert options.env.get("CLAUDE_CODE_EFFORT_LEVEL") == inherited
+        assert options.settings is None
+        assert "--settings" not in self._argv(options)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    @pytest.mark.parametrize(
+        ("model", "level", "per_agent"),
+        [
+            ("claude-sonnet-4-6", "xhigh", True),
+            ("claude-sonnet-4-6", "xhigh", False),
+            ("claude-opus-4-5-20251101", "max", True),
+            ("claude-haiku-4-5-20251001", "low", True),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "high", False),
+        ],
+    )
+    async def test_unsupported_model_and_effort_is_refused(
+        self, model: str, level: str, per_agent: bool
+    ) -> None:
+        """The CLI downgrades an unsupported ``xhigh``/``max`` to ``high`` and
+        drops effort on a model without it, never raising, so the provider
+        must refuse before a session starts."""
+        from conductor.config.schema import ReasoningConfig
+
+        agent = AgentDef(
+            name="t",
+            prompt="hi",
+            model=model,
+            reasoning=ReasoningConfig(effort=level) if per_agent else None,
+        )
+        source = "reasoning.effort" if per_agent else "runtime.default_reasoning_effort"
+
+        with pytest.raises(ProviderError, match=rf"{source}='{level}'") as excinfo:
+            await self._capture_options(
+                agent, default_reasoning_effort=None if per_agent else level
+            )
+
+        assert excinfo.value.is_retryable is False
+
+    @pytest.mark.parametrize(
+        ("model", "unsupported"),
+        [
+            ("claude-opus-4-20250514", {"low", "medium", "high", "xhigh", "max"}),
+            ("claude-opus-4-1-20250805", {"low", "medium", "high", "xhigh", "max"}),
+            ("claude-3-7-sonnet-20250219", {"low", "medium", "high", "xhigh", "max"}),
+            ("claude-opus-4-5", {"xhigh", "max"}),
+            ("claude-opus-4-6", {"xhigh"}),
+            ("claude-sonnet-4-6[1m]", {"xhigh"}),
+            ("claude-sonnet-4-6@20260101", {"xhigh"}),
+            ("claude-opus-4-7", set()),
+            ("claude-sonnet-5", set()),
+            ("sonnet", set()),
+        ],
+    )
+    def test_unsupported_effort_levels_by_model(self, model: str, unsupported: set[str]) -> None:
+        from conductor.providers.claude_agent_sdk import _unsupported_effort_levels
+
+        assert _unsupported_effort_levels(model) == unsupported
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_unrendered_template_is_refused_rather_than_forwarded(self) -> None:
