@@ -88,10 +88,14 @@ async def test_factory_executes_each_supported_provider(
 
 
 @pytest.mark.parametrize("provider", ["copilot", "openai", "claude"])
-async def test_declared_empty_tools_reach_inner_provider(
-    provider: str, runner_client_factory: RunnerClientFactory
+@pytest.mark.parametrize(("declared_tools", "expected"), [(None, None), ((), [])])
+async def test_declared_tools_reach_inner_provider_independently_of_resolution(
+    provider: str,
+    declared_tools: tuple[str, ...] | None,
+    expected: list[str] | None,
+    runner_client_factory: RunnerClientFactory,
 ) -> None:
-    # Requirement: every inner provider sees explicit tools: [], never an omitted declaration.
+    # Requirement: omitted and explicit empty declarations stay distinct from resolved [].
     spec = AgentSpec(
         name="tool-free",
         execution_id=f"{provider}-tool-free",
@@ -99,7 +103,7 @@ async def test_declared_empty_tools_reach_inner_provider(
         model="model",
         rendered_prompt="task",
         tools=(),
-        declared_tools=(),
+        declared_tools=declared_tools,
     )
 
     async with runner_client_factory() as client:
@@ -107,7 +111,7 @@ async def test_declared_empty_tools_reach_inner_provider(
 
     assert response.status_code == 200
     call = DeliveryProvider.instances[0].calls[0]
-    assert call["agent"].tools == []
+    assert call["agent"].tools == expected
     assert call["tools"] == []
 
 

@@ -141,7 +141,12 @@ class RunnerAgentRequest(BaseModel):
     agent: RunnerAgentPayload
     rendered_prompt: str
     tools: list[str] | None = None
-    """Per-agent tool allowlist. ``None`` = all workflow tools, ``[]`` = none."""
+    """Per-agent tool allowlist resolved against workflow-level tools.
+
+    ``None`` means all workflow tools. ``[]`` retains provider defaults when
+    ``agent.tools`` is omitted or ``None``, and grants no tools when
+    ``agent.tools`` is ``[]``. A nonempty list applies that exact allowlist.
+    """
 
     mcp_servers: dict[str, Any] | None = None
     """Full ``runtime.mcp_servers`` definitions (not just names). None

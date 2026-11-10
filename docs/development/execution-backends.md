@@ -191,6 +191,10 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   `RunnerAgentRequest.tools` allowlist: explicit `tools: []` must never become `None` and widen
   to the inner provider's default catalog. Protocol v1 cannot represent that distinction, so
   `agent_spec_to_wire_body` rejects an explicitly empty declared list instead of sending it.
+  Current v2 hosts include `agent.tools` in every request, including `null` when omitted;
+  older strict v2 images reject that field with HTTP 422 even when the workflow does not
+  declare `tools: []`. Host upgrades therefore require matching rebuilt Docker and ACA
+  runner images, although the protocol remains v2.
   The `/interrupt` endpoint targets specific invocations by `execution_id` without restarting the runner.
 - The Docker interrupt bridge exits 0 for an accepted signal and 3 for HTTP 409;
   other failures remain errors. The host uses these machine outcomes, not stderr

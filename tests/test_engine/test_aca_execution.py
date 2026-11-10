@@ -17,7 +17,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from conductor.config.environment import AcaProfileOptions
+from conductor.config.schema import AgentDef, OutputField, ValidatorConfig
 from conductor.engine.aca_execution import AcaIdentifierState, AcaRunnerBackend
+from conductor.engine.validator import OutputValidator
 from conductor.exceptions import ConfigurationError, ProviderError
 from conductor.execution.types import RunSpec
 from conductor.runner.protocol import RunnerAgentPayload
@@ -220,12 +222,10 @@ async def test_legacy_executes_against_strict_v1_runner(caplog: pytest.LogCaptur
     await provider.close()
 
 
-@pytest.mark.parametrize(("interrupt_requested", "addressed"), [(False, False), (True, True)])
+@pytest.mark.parametrize("interrupt_requested", [False, True])
 @pytest.mark.asyncio
-async def test_legacy_v2_wire_changes_only_for_addressed_interrupt(
-    interrupt_requested: bool, addressed: bool
-) -> None:
-    # Requirement: a newer runner changes legacy wire shape only to enable /interrupt.
+async def test_legacy_v2_wire_is_independent_of_interrupt(interrupt_requested: bool) -> None:
+    # Requirement: negotiated v2 delivers declared tools with or without an interrupt event.
     requests: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -243,13 +243,62 @@ async def test_legacy_v2_wire_changes_only_for_addressed_interrupt(
         assert await provider.validate_connection()
         with pytest.warns(DeprecationWarning):
             await provider.execute(
-                _agent(),
+                AgentDef(name="reviewer", prompt="review", tools=[]),
                 {},
                 "review",
+                tools=[],
                 interrupt_signal=asyncio.Event() if interrupt_requested else None,
             )
-    assert ("execution_id" in requests[0]) is addressed
+    assert "execution_id" in requests[0]
+    assert requests[0]["agent"]["tools"] == []
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_v2_validator_runs_without_interrupt() -> None:
+    # Requirement: a negotiated v2 runner grades tools=[] validators without fail-open.
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(
+                200, json={"ready": True, "protocol_version": 2, "features": ["interrupt"]}
+            )
+        requests.append(json.loads(request.content))
+        result = {"passed": False, "issues": ["needs detail"]}
+        return httpx.Response(
+            200, content=json.dumps({"type": "result", "data": {"content": result}}) + chr(10)
+        )
+
+    with patch.dict("os.environ", {"COPILOT_GITHUB_TOKEN": "host-token"}, clear=True):
+        transport = _provider(httpx.MockTransport(handler))
+        assert await transport.validate_connection()
+        backend = AcaRunnerBackend(transport=transport)
+        lease = await backend.prepare_run(RunSpec("run-validator"))
+        agent = AgentDef(
+            name="writer",
+            prompt="write",
+            output={"text": OutputField(type="string")},
+            validator=ValidatorConfig(criteria="Be detailed"),
+        )
+        spec = replace(_spec(), tools=(), declared_tools=())
+
+        outcome = await OutputValidator().validate(
+            agent,
+            "write",
+            {"text": "short"},
+            None,
+            execution_backend=backend,
+            workspace_lease=lease,
+            spec_factory=lambda _agent, _prompt: spec,
+        )
+
+    assert outcome.errored is False
+    assert outcome.passed is False
+    assert outcome.issues == ["needs detail"]
+    assert requests[0]["agent"]["tools"] == []
+    assert "execution_id" in requests[0]
+    await backend.finalize_run(lease, "succeeded")
 
 
 @pytest.mark.parametrize("stream_error", [False, True])

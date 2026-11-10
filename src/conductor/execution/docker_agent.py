@@ -228,8 +228,14 @@ async def stream_agent(
                     await asyncio.gather(interrupt_task, return_exceptions=True)
                     interrupt_task = None
             elif frame_type == "error":
+                message = str(data.get("message", "runner reported an error"))
+                if message == "runner HTTP 422":
+                    message += (
+                        ". Rebuild the runner image with matching Conductor code; older "
+                        "runner images may not recognize the request schema."
+                    )
                 raise ProviderError(
-                    _scrub(str(data.get("message", "runner reported an error")).encode(), spec),
+                    _scrub(message.encode(), spec),
                     provider_name=spec.model_provider,
                 )
             elif terminal is not None:

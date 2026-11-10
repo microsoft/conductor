@@ -218,6 +218,21 @@ async def test_agent_error_frame_scrubs_credentials(
 
 
 @pytest.mark.asyncio
+async def test_old_bridge_422_includes_runner_image_rebuild_guidance(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
+) -> None:
+    # Requirement: an old in-image bridge's generic 422 gets actionable host-side guidance.
+    backend, _log, _state = fake_realm
+    backend._cli_env["FAKE_DOCKER_SCENARIO"] = "realm-old-422"
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+
+    with pytest.raises(ProviderError, match="runner HTTP 422.*Rebuild the runner image"):
+        await backend.run_agent(_spec(), lease)
+
+    await backend.finalize_run(lease, "failed")
+
+
+@pytest.mark.asyncio
 async def test_malformed_ndjson_is_rejected(
     fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
 ) -> None:
