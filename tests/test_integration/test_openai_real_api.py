@@ -34,7 +34,7 @@ from conductor.providers.openai import OpenAIProvider
 # A custom endpoint requires an explicit api_key (the provider refuses to
 # forward an ambient OPENAI_API_KEY to a non-OpenAI endpoint), so read both.
 _TEST_BASE_URL = os.getenv("CONDUCTOR_TEST_OPENAI_BASE_URL")
-_TEST_MODEL = os.getenv("CONDUCTOR_TEST_OPENAI_MODEL", "gpt-5-mini")
+_TEST_MODEL = os.getenv("CONDUCTOR_TEST_OPENAI_MODEL")
 
 
 @pytest.mark.real_api
