@@ -176,7 +176,10 @@ class TestGetPricing:
             # Claude families (#266).
             ("claude-opus-4.8", 5.00, 25.00),
             ("claude-opus-4.7", 5.00, 25.00),
-            ("claude-sonnet-5", 3.00, 15.00),
+            ("claude-sonnet-5", 2.00, 10.00),
+            ("claude-opus-5-5", 4.00, 20.00),
+            ("claude-sonnet-5-5", 2.00, 10.00),
+            ("claude-fable-5-1", 10.00, 50.00),
             # Gemini (#266).
             ("gemini-3.5-flash", 0.30, 2.50),
         ],
@@ -563,6 +566,9 @@ class TestPricingIntegration:
             pytest.param(("claude-opus-4-5", "claude-opus-4.5", "opus-4.5"), id="opus-4.5"),
             pytest.param(("claude-sonnet-4-5", "claude-sonnet-4.5", "sonnet-4.5"), id="sonnet-4.5"),
             pytest.param(("claude-haiku-4-5", "claude-haiku-4.5", "haiku-4.5"), id="haiku-4.5"),
+            pytest.param(("claude-opus-5-5", "claude-opus-5.5"), id="opus-5.5"),
+            pytest.param(("claude-sonnet-5-5", "claude-sonnet-5.5"), id="sonnet-5.5"),
+            pytest.param(("claude-fable-5-1", "claude-fable-5.1"), id="fable-5.1"),
         ],
     )
     def test_alias_spellings_agree_on_every_rate(self, spellings: tuple[str, ...]) -> None:
@@ -579,3 +585,46 @@ class TestPricingIntegration:
         assert first is not None
         for name, pricing in zip(spellings, resolved, strict=True):
             assert pricing == first, f"{name} has drifted from {spellings[0]}"
+
+
+def test_claude_5_5_models_do_not_inherit_claude_5_rates() -> None:
+    """Claude 5.5 names must not fall back to the older ``claude-opus-5`` /
+    ``claude-sonnet-5`` rates through the versioned-suffix match."""
+    assert get_pricing("claude-opus-5-5") == ModelPricing(
+        input_per_mtok=4.00,
+        output_per_mtok=20.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=5.00,
+    )
+    assert get_pricing("claude-opus-5") == ModelPricing(
+        input_per_mtok=5.00,
+        output_per_mtok=25.00,
+        cache_read_per_mtok=0.50,
+        cache_write_per_mtok=6.25,
+    )
+    assert calculate_cost("claude-opus-5-5", 1_000_000, 1_000_000) == 24.0
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5.5"])
+def test_sonnet_5_5_cache_read_is_priced_at_published_rate(model: str) -> None:
+    """A fully cached million-token prompt costs $0.10 for Sonnet 5.5."""
+    assert get_pricing(model).cache_read_per_mtok == 0.10
+    assert calculate_cost(model, 1_000_000, 0, cache_read_tokens=1_000_000) == pytest.approx(0.10)
+
+
+@pytest.mark.parametrize(
+    ("model", "cache_read", "cache_write"),
+    [
+        ("claude-fable-5-1", 0.25, 12.50),
+        ("claude-fable-5.1", 0.25, 12.50),
+        ("claude-sonnet-5", 0.20, 2.50),
+        ("claude-opus-5-5", 0.20, 5.00),
+        ("claude-opus-5.5", 0.20, 5.00),
+    ],
+)
+def test_claude_5_cache_rates(model: str, cache_read: float, cache_write: float) -> None:
+    """Cache rates are asserted explicitly, not only input/output."""
+    pricing = get_pricing(model)
+    assert pricing is not None
+    assert pricing.cache_read_per_mtok == cache_read
+    assert pricing.cache_write_per_mtok == cache_write
