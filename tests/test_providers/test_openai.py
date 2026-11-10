@@ -74,10 +74,10 @@ def _build_text_agent(text: str) -> Agent[Any, str]:
 class TestProviderConstruction:
     """Tests for OpenAIProvider construction and validation."""
 
-    def test_default_model_is_gpt_5_mini(self) -> None:
+    def test_default_model_is_gpt_5_6_terra(self) -> None:
         """Requirement: omitted model uses the default; an unset cap stays off the wire."""
         p = OpenAIProvider(api_key="test-key")
-        assert p._default_model == "gpt-5-mini"
+        assert p._default_model == "gpt-5.6-terra"
         assert p._default_max_tokens is None
         assert p._max_tokens_user_configured is False
 
@@ -525,6 +525,98 @@ class TestExecuteDialogTurn:
             ValidationError, match="Default reasoning effort 'max' is not supported"
         ):
             await provider.execute_dialog_turn("system prompt", "user message")
+
+
+def _chat_completion_response(content: str) -> dict[str, Any]:
+    """Minimal OpenAI chat completion payload."""
+    return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt-5.6-terra",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+
+
+class TestDefaultModelOnTheWire:
+    """The default model reaches the HTTP request through the real provider and builder."""
+
+    @staticmethod
+    def _patch_transport(requests: list[dict[str, Any]]) -> Any:
+        import json
+
+        from conductor.providers._pydantic_ai import agent_builder
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            requests.append(body)
+            if body.get("stream"):
+                chunk = {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "gpt-5.6-terra",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "hello"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+                return httpx.Response(
+                    200, content=sse.encode(), headers={"content-type": "text/event-stream"}
+                )
+            return httpx.Response(200, json=_chat_completion_response("hello"))
+
+        real_client = agent_builder.AsyncOpenAI
+
+        def make_client(**kwargs: Any) -> Any:
+            kwargs["http_client"] = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            return real_client(**kwargs)
+
+        return patch.object(agent_builder, "AsyncOpenAI", side_effect=make_client)
+
+    async def test_execute_sends_default_model_without_output_cap(self) -> None:
+        """Requirement: with no model override, execute() requests gpt-5.6-terra and omits
+        an unset output cap.
+        """
+        provider = OpenAIProvider(api_key="test-key")
+        agent = AgentDef(name="test_agent", prompt="hi")
+        requests: list[dict[str, Any]] = []
+
+        with (
+            patch.object(provider, "_get_mcp_manager_for_cwd", return_value=None),
+            self._patch_transport(requests),
+        ):
+            await provider.execute(agent, {}, "say hi")
+
+        assert len(requests) == 1
+        assert requests[0]["model"] == "gpt-5.6-terra"
+        assert "max_tokens" not in requests[0]
+        assert "max_completion_tokens" not in requests[0]
+
+    async def test_dialog_turn_sends_default_model_with_output_cap(self) -> None:
+        """Requirement: dialog requests use the default model and still cap output at 4096."""
+        provider = OpenAIProvider(api_key="test-key")
+        requests: list[dict[str, Any]] = []
+
+        with self._patch_transport(requests):
+            reply = await provider.execute_dialog_turn("system prompt", "user message")
+
+        assert reply == "hello"
+        assert len(requests) == 1
+        assert requests[0]["model"] == "gpt-5.6-terra"
+        cap = requests[0].get("max_completion_tokens", requests[0].get("max_tokens"))
+        assert cap == 4096
 
 
 class TestConnectionHelpers:
