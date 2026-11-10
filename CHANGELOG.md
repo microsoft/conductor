@@ -11,6 +11,33 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.45] - 2026-11-10
+
+### Fixed
+
+- Fix Anthropic agents failing when no model is set: the default is now
+  `claude-sonnet-4-6` (agent builder and `ClaudeProvider`) instead of the retired
+  `claude-3-5-sonnet-latest`. (#621)
+- The `claude-agent-sdk` provider now defaults to `claude-sonnet-4-6` instead of
+  `claude-sonnet-4-5`, which Anthropic retires on 2026-11-30, when neither the
+  agent nor the workflow sets a model. (#628)
+- Default OpenAI model is now `gpt-5.6-terra` instead of `gpt-5-mini`, which
+  OpenAI retires on 2026-12-11 (agents without a model would fail after that
+  date).
+
+  If you rely on the implicit model default, review your budget or select a model
+  explicitly. See the
+  [GPT-5.6 Terra pricing](https://developers.openai.com/api/docs/models/gpt-5.6-terra). (#632)
+- Fix cost reports pricing Claude Opus 5.5 and Sonnet 5.5 at the older Claude 5
+  rates, and add pricing for Claude Fable 5.1; Claude Sonnet 5 now uses its
+  current $2/$10 per MTok standard price. (#633)
+
+### Changed
+
+- The Claude and Claude Agent SDK example workflows now use `claude-sonnet-4-6`
+  instead of `claude-sonnet-4-5`, which Anthropic retires on 2026-11-30. (#627)
+
+
 ## [0.1.44] - 2026-11-01
 
 ### Added
