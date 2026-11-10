@@ -602,5 +602,29 @@ def test_claude_5_5_models_do_not_inherit_claude_5_rates() -> None:
         cache_read_per_mtok=0.50,
         cache_write_per_mtok=6.25,
     )
-    assert get_pricing("claude-sonnet-5-5").cache_read_per_mtok == 0.20
     assert calculate_cost("claude-opus-5-5", 1_000_000, 1_000_000) == 24.0
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5.5"])
+def test_sonnet_5_5_cache_read_is_priced_at_published_rate(model: str) -> None:
+    """A fully cached million-token prompt costs $0.10 for Sonnet 5.5."""
+    assert get_pricing(model).cache_read_per_mtok == 0.10
+    assert calculate_cost(model, 1_000_000, 0, cache_read_tokens=1_000_000) == pytest.approx(0.10)
+
+
+@pytest.mark.parametrize(
+    ("model", "cache_read", "cache_write"),
+    [
+        ("claude-fable-5-1", 0.25, 12.50),
+        ("claude-fable-5.1", 0.25, 12.50),
+        ("claude-sonnet-5", 0.20, 2.50),
+        ("claude-opus-5-5", 0.20, 5.00),
+        ("claude-opus-5.5", 0.20, 5.00),
+    ],
+)
+def test_claude_5_cache_rates(model: str, cache_read: float, cache_write: float) -> None:
+    """Cache rates are asserted explicitly, not only input/output."""
+    pricing = get_pricing(model)
+    assert pricing is not None
+    assert pricing.cache_read_per_mtok == cache_read
+    assert pricing.cache_write_per_mtok == cache_write
