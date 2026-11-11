@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, NotRequired, TypedDict, TypeGuard
 
 import jinja2
 from jinja2 import Environment, meta, nodes
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 
     from conductor.config.environment import ResolvedEnvironment
     from conductor.config.schema import StepDef, WorkflowConfig
+    from conductor.engine.run_manifest import RunPreflight
     from conductor.plugins.registry import ResolvedPlugin
     from conductor.skills import ResolvedSkill
 
@@ -71,6 +72,7 @@ class _EnvironmentValidationContext(TypedDict):
     root_workflow_dir: Path | None
     warned_no_environments: bool
     warned_no_secret_environments: bool
+    preflights: NotRequired[dict[str, RunPreflight]]
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -326,6 +328,19 @@ def validate_workflow_config(
             "warned_no_environments": False,
             "warned_no_secret_environments": False,
         }
+
+    if _environment_context["explicit"] and _subworkflow_depth == 0:
+        preflights = _environment_context.setdefault("preflights", {})
+        for name, preflight in preflights.items():
+            environment = (_environment_context["environments"] or {}).get(name)
+            if (
+                environment is None
+                or workflow_path is None
+                or preflight.path
+                != Path(os.path.abspath(os.path.normpath(workflow_path.expanduser())))
+            ):
+                raise ConfigurationError("Run preflight does not match the validation root.")
+            preflight.require_matches(config, workflow_path, environment)
 
     profile_errors, profile_warnings = _validate_profile_references(
         config,
@@ -2147,15 +2162,18 @@ def _validate_workspace_policy(
     # Import after config initialization; the engine package imports the config loader.
     from conductor.engine.run_manifest import (
         BACKEND_CAPABILITY_PROVIDERS,
+        RunPreflight,
         _require_local_agent_runtime_ownership,
         _require_managed_local_consumer,
     )
 
-    for _environment_name, environment in sorted((context["environments"] or {}).items()):
+    for environment_name, environment in sorted((context["environments"] or {}).items()):
         if environment is None:
             continue
         default_execution = config.workflow.defaults.execution
         default_profile = default_execution.profile if default_execution is not None else None
+        has_local = False
+        local_checks_passed = True
         for key, step in _executable_steps(config):
             profile = step.execution.profile if step.execution is not None else None
             profile_name = profile or default_profile or environment.document.default
@@ -2165,10 +2183,12 @@ def _validate_workspace_policy(
             if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef, WorkflowStepDef)):
                 continue
             if definition.backend == "local":
+                has_local = True
                 try:
                     _require_local_agent_runtime_ownership(key, step, config)
-                    _require_managed_local_consumer(key, step, config, workflow_path, environment)
+                    _require_managed_local_consumer(key, step, config)
                 except ConfigurationError as exc:
+                    local_checks_passed = False
                     errors.append(str(exc))
                     continue
             if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef)):
@@ -2179,6 +2199,17 @@ def _validate_workspace_policy(
                     f"Step '{key}': {definition.backend} backend does not support retained "
                     "workspaces; choose a retaining backend or drop persistence."
                 )
+        if has_local and local_checks_passed and workflow_path is not None:
+            preflights = context.setdefault("preflights", {})
+            preflight = preflights.get(environment_name)
+            if preflight is None:
+                preflight = RunPreflight(config, workflow_path, environment)
+                preflights[environment_name] = preflight
+            try:
+                preflight.require_matches(config, workflow_path, environment)
+                preflight.validate_local()
+            except ConfigurationError as exc:
+                errors.append(str(exc))
     return errors, warnings
 
 
@@ -2406,7 +2437,18 @@ def _validate_subworkflow_refs(
         try:
             from conductor.config.loader import load_config
 
-            sub_config = load_config(sub_path)
+            sub_config = next(
+                (
+                    node.config
+                    for preflight in ((_environment_context or {}).get("preflights", {}).values())
+                    if preflight.collected is not None
+                    for node in preflight.nodes
+                    if node.path == sub_path or node.path.resolve() == sub_path
+                ),
+                None,
+            )
+            if sub_config is None:
+                sub_config = load_config(sub_path)
         except Exception as exc:
             errors.append(f"{label}: failed to load sub-workflow '{sub_path}': {exc}")
             continue

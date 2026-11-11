@@ -414,26 +414,64 @@ async def test_reserved_environment_rejected_before_launch(tmp_path: Path) -> No
         await controller.close()
 
 
+class DiagnosticHandler(logging.Handler):
+    """Record the actual diagnostic before optionally failing its delivery."""
+
+    def __init__(self, failure: type[BaseException] | None) -> None:
+        super().__init__()
+        self.failure = failure
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+        if self.failure is not None:
+            raise self.failure("secondary diagnostic failure")
+
+
 @pytest.mark.parametrize("operation", ["descriptor", "spawn"])
-async def test_fatal_infrastructure_logs_scrubbed_cause_before_fencing(
+@pytest.mark.parametrize("sink_failure", [None, ValueError, asyncio.CancelledError, BaseException])
+async def test_fatal_infrastructure_fences_before_optional_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
     operation: str,
+    sink_failure: type[BaseException] | None,
 ) -> None:
-    # Requirement: infrastructure failures expose scrubbed causes, never payload exits or reuse.
+    # Requirement: a failing diagnostic sink cannot prevent fatal fencing or owner accounting.
     secret = "registered-infrastructure-secret"
     redactor = RunRedactor()
     redactor.register([secret])
-    controller = LocalProcessScopeController(str(tmp_path), "inc", scrub=redactor.scrub)
+    clock = ControlledClock()
+    controller = LocalProcessScopeController(
+        str(tmp_path), "inc", scrub=redactor.scrub, _scheduler=clock
+    )
     descriptor = controller._descriptor
     payload = tmp_path / "payload-started"
+    primary = PermissionError(errno.EACCES, "custodian launch denied", secret)
+    callback_finished = asyncio.Event()
+    failed_tasks: list[asyncio.Task[process_core.Json]] = []
+    loop = asyncio.get_running_loop()
+    late_owner: asyncio.Future[None] = loop.create_future()
+    controller.owners.register("diagnostic", late_owner)
+    late_finished = asyncio.Event()
+    late_owner.add_done_callback(lambda _owner: late_finished.set())
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    handler = DiagnosticHandler(sink_failure)
+    logger = logging.getLogger(process_core.__name__)
+    handlers, propagate = logger.handlers[:], logger.propagate
+    logger.handlers, logger.propagate = [handler], False
+    command = None
 
     def fail() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        failed_tasks.append(task)
+        task.add_done_callback(lambda _task: callback_finished.set())
         try:
             raise OSError(errno.ENOSPC, "descriptor storage exhausted", f"/private/{secret}")
         except OSError as cause:
-            raise PermissionError(errno.EACCES, "custodian launch denied", secret) from cause
+            raise primary from cause
 
     def failed_descriptor(directory: Path, role: str, **values: str) -> Path:
         if role == "custodian":
@@ -449,22 +487,31 @@ async def test_fatal_infrastructure_logs_scrubbed_cause_before_fencing(
             monkeypatch.setattr(controller, "_descriptor", failed_descriptor)
         else:
             monkeypatch.setattr(process_core.asyncio, "create_subprocess_exec", failed_spawn)
-        result = await asyncio.wait_for(
+        command = asyncio.create_task(
             controller.spawn_script(
                 "diagnostic",
                 CommandSpec(
                     sys.executable,
                     ("-c", f"from pathlib import Path; Path({str(payload)!r}).touch()"),
                 ),
-            ),
-            10,
+            )
         )
+        await asyncio.wait_for(callback_finished.wait(), 5)
+        scope = next(iter(controller._scopes.values()))
+        assert handler.records
+        assert controller._root.sealed and controller._invocations["diagnostic"].sealed
+        assert not scope.resources and failed_tasks[0] not in controller._tasks
+        assert id(failed_tasks[0]) not in process_core._quarantine.get(loop, {})
+        done, _ = await asyncio.wait({command}, timeout=5)
+        assert command in done, "Fatal callback did not release the spawn caller"
+        result = command.result()
         assert result.outcome == "start_failed" and result.exit_code is None
         assert not payload.exists()
-        assert (await controller.await_release()).status == "unconfirmed"
+        assert (await asyncio.wait_for(controller.await_release(), 5)).status == "unconfirmed"
+        assert clock.now() == 0
         with pytest.raises(ExecutionSpecError, match="sealed"):
             controller.check_admission()
-        records = [record for record in caplog.records if record.name == process_core.__name__]
+        records = handler.records
         formatted = "\n".join(logging.Formatter().format(record) for record in records)
         assert "PermissionError" in formatted and "OSError" in formatted
         assert (
@@ -474,9 +521,101 @@ async def test_fatal_infrastructure_logs_scrubbed_cause_before_fencing(
         assert "diagnostic" in formatted and controller.proofs[0].scope_id in formatted
         assert "Traceback" in formatted and all(record.exc_info is None for record in records)
         assert not controller.owners.mutations_allowed("diagnostic")
+        assert not loop_errors
+        if sink_failure is not None:
+            assert primary.__notes__ == [
+                "Managed process infrastructure diagnostic could not be delivered."
+            ]
+        late_owner.set_result(None)
+        await asyncio.wait_for(late_finished.wait(), 5)
+        await asyncio.wait_for(_join_scope_task_callbacks(controller), 5)
+        assert not controller.owners.quarantined
+        assert (await controller.await_release()).status == "unconfirmed"
     finally:
-        await controller.close()
-        controller._accepting.join(timeout=5)
+        logger.handlers, logger.propagate = handlers, propagate
+        handler.close()
+        # Failure cleanup releases only this test's callers, without advancing its test clock.
+        controller._poison("Test cleanup after injected infrastructure failure")
+        if not late_owner.done():
+            late_owner.set_result(None)
+        try:
+            if command is not None:
+                await asyncio.wait_for(command, 5)
+            await asyncio.wait_for(controller.close(), 5)
+        finally:
+            loop.set_exception_handler(previous_handler)
+            controller._accepting.join(timeout=5)
+        assert not controller._accepting.is_alive()
+
+
+@pytest.mark.parametrize("pre_unconfirmed", [False, True])
+@pytest.mark.parametrize("sink_failure", [ValueError, asyncio.CancelledError, BaseException])
+async def test_owner_failure_sink_preserves_native_release_and_accounting(
+    tmp_path: Path, pre_unconfirmed: bool, sink_failure: type[BaseException]
+) -> None:
+    # Requirement: SDK failure diagnostics cannot retain joined owners or upgrade uncertainty.
+    secret = "registered-owner-secret"
+    redactor = RunRedactor()
+    redactor.register([secret])
+    clock = ControlledClock()
+    controller = LocalProcessScopeController(
+        str(tmp_path), "owner-diagnostic", scrub=redactor.scrub, _scheduler=clock
+    )
+    loop = asyncio.get_running_loop()
+    owner: asyncio.Future[None] = loop.create_future()
+    controller.owners.register("sdk", owner)
+    finished = asyncio.Event()
+    owner.add_done_callback(lambda _owner: finished.set())
+    primary = RuntimeError(f"SDK close failed: {secret}")
+    handler = DiagnosticHandler(sink_failure)
+    logger = logging.getLogger(process_core.__name__)
+    handlers, propagate = logger.handlers[:], logger.propagate
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    observation = asyncio.create_task(controller.owners.observe("sdk", owner))
+    try:
+        result = await asyncio.wait_for(
+            controller.spawn_script("sdk", CommandSpec(sys.executable, ("-c", "print('native')"))),
+            10,
+        )
+        assert result.exit_code == 0 and result.stdout == "native\n"
+        assert all(proof.kernel_empty and proof.custodian_reaped for proof in controller.proofs)
+        controller.begin_teardown()
+        if pre_unconfirmed:
+            clock.advance(30)
+            assert id(owner) in process_core._quarantine[loop]
+        logger.handlers, logger.propagate = [handler], False
+        owner.set_exception(primary)
+        await asyncio.wait_for(finished.wait(), 5)
+        assert handler.records
+        assert not controller.owners.tasks
+        assert id(owner) not in process_core._quarantine.get(loop, {})
+        assert await asyncio.wait_for(observation, 5) is not pre_unconfirmed
+        with pytest.raises(RuntimeError) as raised:
+            owner.result()
+        assert raised.value is primary
+        assert controller.owners.failures == [f"SDK close failed: {REDACTED_MARKER}"]
+        assert primary.__notes__ == ["Managed resource owner diagnostic could not be delivered."]
+        assert all(record.exc_info is None for record in handler.records)
+        assert secret not in logging.Formatter().format(handler.records[0])
+        assert not loop_errors
+        await asyncio.wait_for(_join_scope_task_callbacks(controller), 5)
+        assert not controller.owners.quarantined
+        expected = "unconfirmed" if pre_unconfirmed else "released"
+        assert (await asyncio.wait_for(controller.await_release(), 5)).status == expected
+        assert not controller.owners.mutations_allowed("sdk")
+    finally:
+        logger.handlers, logger.propagate = handlers, propagate
+        handler.close()
+        if not owner.done():
+            owner.set_result(None)
+        try:
+            await asyncio.wait_for(observation, 5)
+            await asyncio.wait_for(controller.close(), 5)
+        finally:
+            loop.set_exception_handler(previous_handler)
+            controller._accepting.join(timeout=5)
         assert not controller._accepting.is_alive()
 
 

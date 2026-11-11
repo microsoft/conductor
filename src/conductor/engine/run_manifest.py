@@ -54,7 +54,8 @@ import hashlib
 import logging
 import os
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -580,15 +581,21 @@ class RunPreflight:
     """Accumulate one generation's source snapshot without publishing any workspace."""
 
     def __init__(
-        self, config: WorkflowConfig, workflow_path: Path, environment: ResolvedEnvironment
+        self,
+        config: WorkflowConfig,
+        workflow_path: Path,
+        environment: ResolvedEnvironment,
+        *,
+        on_warning: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config.model_copy(deep=True)
         self.path = Path(os.path.abspath(os.path.normpath(workflow_path.expanduser())))
-        self.environment = environment
+        self.environment = replace(environment, document=environment.document.model_copy(deep=True))
         self.workspace: WorkspaceConfig | None = self.config.workflow.workspace
         self._collector: _Collector | None = None
         self.collected: CollectedBundle | None = None
         self._local_checked = False
+        self._on_warning = on_warning
 
     def matches(self, config: WorkflowConfig, workflow_path: Path) -> bool:
         """Reuse only this exact config or a known member of this generation's closure."""
@@ -599,6 +606,19 @@ class RunPreflight:
             node.path == path and node.config == config for node in self._collector.nodes
         )
 
+    def require_matches(
+        self, config: WorkflowConfig, workflow_path: Path | None, environment: ResolvedEnvironment
+    ) -> None:
+        """Reject a snapshot from another effective configuration or environment."""
+        if (
+            workflow_path is None
+            or not self.matches(config, workflow_path)
+            or self.environment != environment
+        ):
+            raise ConfigurationError(
+                "Run preflight does not match the workflow configuration, path, or environment."
+            )
+
     def collect(self) -> CollectedBundle:
         """Resolve and freeze the full closure once, leaving publication to materialization."""
         if self.collected is None:
@@ -608,7 +628,9 @@ class RunPreflight:
                 self.path,
                 self.environment,
                 False,
-                lambda _message: logging.getLogger(__name__).warning(
+                self._on_warning
+                if self._on_warning is not None
+                else lambda _message: logging.getLogger(__name__).warning(
                     "Source preflight reported a warning; run conductor validate for details."
                 ),
             )
@@ -694,8 +716,6 @@ def _require_managed_local_consumer(
     key: str,
     step: ExecutableStepBase,
     config: WorkflowConfig,
-    workflow_path: Path | None,
-    environment: ResolvedEnvironment,
 ) -> None:
     """Check effective managed consumers without granting host filesystem access."""
     from conductor.engine.local_workspace import _logical_directory
@@ -731,10 +751,6 @@ def _require_managed_local_consumer(
     for value in literal:
         if not Path(value).is_absolute():
             _logical_directory(value, (), "main", windows=os.name == "nt")
-    if workflow_path is not None:
-        # Static validator callers retain the complete check; compilation shares
-        # its generation snapshot separately after the cheap per-step checks.
-        RunPreflight(config, workflow_path, environment).validate_local()
 
 
 def _require_agent_backend_capability(
@@ -1103,6 +1119,8 @@ def compile_run_manifest(
             the chain, names an undefined profile, or (for script steps)
             resolves to a backend without batch capability.
     """
+    if _preflight is not None:
+        _preflight.require_matches(config, workflow_path, environment)
     workspace = config.workflow.workspace
     if workspace is not None and workspace.mode == "isolated":
         raise ConfigurationError(
@@ -1173,7 +1191,7 @@ def compile_run_manifest(
                     "choose a retaining backend or drop persistence."
                 )
             if backend_name == "local":
-                _require_managed_local_consumer(key, step, config, None, environment)
+                _require_managed_local_consumer(key, step, config)
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)

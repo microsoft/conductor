@@ -373,13 +373,21 @@ class OwnerRegistry:
         owner.add_done_callback(self._finished)
 
     def _finished(self, owner: _Owner) -> None:
-        if not owner.cancelled() and (error := owner.exception()) is not None:
-            message = self.controller.scrub(str(error))
-            self.failures.append(message)
-            _log.warning("Managed resource owner failed: %s", message)
+        error = None if owner.cancelled() else owner.exception()
         self.tasks.pop(id(owner), None)
         _quarantine.get(self.controller._loop, {}).pop(id(owner), None)
         self.controller._check()
+        if error is not None:
+            message = "Managed resource owner failure diagnostic unavailable."
+            try:
+                message = self.controller.scrub(str(error))
+                _log.warning("Managed resource owner failed: %s", message)
+            except BaseException:
+                # Optional diagnostics cannot replace the owner's original failure or join.
+                BaseException.add_note(
+                    error, "Managed resource owner diagnostic could not be delivered."
+                )
+            self.failures.append(message)
 
     def mutations_allowed(self, invocation_id: str | None) -> bool:
         """Owners must check this before checkpoint/terminal-state mutation."""
@@ -582,25 +590,33 @@ class LocalProcessScopeController:
             scope.resources.add(task)
 
         def finished(completed: asyncio.Task[Json]) -> None:
+            cancelled = completed.cancelled()
+            error = None if cancelled else completed.exception()
             self._tasks.discard(completed)
             _quarantine.get(self._loop, {}).pop(id(completed), None)
-            error = None if completed.cancelled() else completed.exception()
             if error is not None and fatal:
-                context = (
-                    f"scope={scope.scope_id}, invocation={scope.invocation}"
-                    if scope is not None
-                    else "root scope"
-                )
-                _log.warning(
-                    "Managed process infrastructure failure: %s",
-                    self.scrub(f"{context}\n{''.join(traceback.format_exception(error))}"),
-                )
                 self._poison("Managed process infrastructure failure")
             if scope is not None:
-                if completed.cancelled():
+                if cancelled:
                     self._poison("Process scope resource was cancelled before quiescence")
                 scope.resources.discard(completed)
             self._check()
+            if error is not None and fatal:
+                try:
+                    context = (
+                        f"scope={scope.scope_id}, invocation={scope.invocation}"
+                        if scope is not None
+                        else "root scope"
+                    )
+                    _log.warning(
+                        "Managed process infrastructure failure: %s",
+                        self.scrub(f"{context}\n{''.join(traceback.format_exception(error))}"),
+                    )
+                except BaseException:
+                    # A secondary sink failure, including cancellation, cannot undo fencing.
+                    BaseException.add_note(
+                        error, "Managed process infrastructure diagnostic could not be delivered."
+                    )
 
         task.add_done_callback(finished)
         if self._root.result is not None and self._root.result.status == "unconfirmed":

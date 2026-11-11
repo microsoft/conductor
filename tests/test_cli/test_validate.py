@@ -8,14 +8,407 @@ This module tests:
 
 from __future__ import annotations
 
+import importlib
+import re
+from dataclasses import replace
 from pathlib import Path
+from typing import Literal, assert_never
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
+from conductor.bundle.collector import CollectedBundle, _Collector
+from conductor.bundle.model import compute_bundle_digest
 from conductor.cli.app import app
+from conductor.config.environment import resolve_environment
+from conductor.config.loader import load_config
+from conductor.config.schema import WorkflowConfig
+from conductor.config.validator import _EnvironmentValidationContext, validate_workflow_config
+from conductor.console import MarkupFreeConsole, make_console
+from conductor.engine.run_manifest import RunPreflight, compile_run_manifest
+from conductor.exceptions import ConfigurationError
 
 runner = CliRunner()
+
+
+@pytest.fixture
+def retained_validation_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home[qa]"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        importlib.import_module("conductor.cli.app"),
+        "output_console",
+        make_console(force_terminal=True, color_system="standard", no_color=False, width=200),
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    workflow = project / "workflow.yaml"
+    workflow.write_text(
+        "workflow:\n  name: retained-validation\n  entry_point: first\n"
+        "  workspace: {persistence: durable}\n  bundle: {assets: [data.txt]}\n"
+        "agents:\n"
+        "  - {name: first, type: script, command: echo, routes: [{to: second}]}\n"
+        "  - {name: second, type: script, command: echo, routes: [{to: child}]}\n"
+        "  - {name: child, type: workflow, workflow: child.yaml, routes: [{to: $end}]}\n"
+    )
+    (project / "data.txt").write_text("original asset")
+    (project / "child.yaml").write_text(
+        "workflow:\n  name: child\n  entry_point: agent\n"
+        "  runtime:\n    provider: copilot\n    skill_discovery: {sources: [project]}\n"
+        "agents:\n  - {name: agent, prompt: fixture, routes: [{to: $end}]}\n"
+    )
+    skill = project / ".claude" / "skills" / "guide"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: guide\ndescription: Fixture.\n---\nGuide.")
+    environment = tmp_path / "environment.yaml"
+    environment.write_text("default: workstation\nprofiles:\n  workstation: {backend: local}\n")
+    return workflow, environment
+
+
+@pytest.fixture
+def collection_attempts(monkeypatch: pytest.MonkeyPatch) -> list[_Collector]:
+    attempts: list[_Collector] = []
+    original = _Collector.collect
+
+    def observed(collector: _Collector) -> CollectedBundle:
+        attempts.append(collector)
+        return original(collector)
+
+    monkeypatch.setattr(_Collector, "collect", observed)
+    return attempts
+
+
+def test_retained_validate_collects_once(
+    retained_validation_files: tuple[Path, Path], collection_attempts: list[_Collector]
+) -> None:
+    # Requirement: CLI compilation, recursive semantics, and reporting share one full closure.
+    workflow, environment = retained_validation_files
+    result = runner.invoke(app, ["validate", str(workflow), "--environment", str(environment)])
+
+    assert result.exit_code == 0, result.output
+    output = unstyle(result.output)
+    # Requirement: the assertions exercise ANSI output even on a no-color test host.
+    assert output != result.output
+    assert len(collection_attempts) == 1
+    collector = collection_attempts[0]
+    assert {node.path.name for node in collector.nodes} == {"workflow.yaml", "child.yaml"}
+    assert collector.files["tree/main/data.txt"] == b"original asset"
+    assert "Bundle Closure" in output and "Status: complete" in output
+    assert re.findall(r"Bundle digest:\s+(sha256:[0-9a-f]{64})", output) == [
+        compute_bundle_digest(
+            collector.entries.values(), collector.skills_topology, collector.plugins_topology
+        )
+    ]
+    for step in ("first", "second", "child"):
+        assert re.search(rf"{step}\s+workstation\s+local", output)
+    assert collector.warnings
+    flattened = " ".join(output.split())
+    positions = []
+    for warning in collector.warnings:
+        assert flattened.count(" ".join(warning.split())) == 1
+        positions.append(flattened.index(" ".join(warning.split())))
+    assert positions == sorted(positions)
+    assert "Source preflight reported a warning" not in output
+
+
+def test_retained_validate_refreshes_each_invocation(
+    retained_validation_files: tuple[Path, Path], collection_attempts: list[_Collector]
+) -> None:
+    # Requirement: an asset edit in the same process gets a fresh closure and digest.
+    workflow, environment = retained_validation_files
+    arguments = ["validate", str(workflow), "--environment", str(environment)]
+    before = runner.invoke(app, arguments)
+    (workflow.parent / "data.txt").write_text("changed asset")
+
+    after = runner.invoke(app, arguments)
+
+    assert before.exit_code == after.exit_code == 0
+    assert len(collection_attempts) == 2
+    assert collection_attempts[0].files["tree/main/data.txt"] == b"original asset"
+    assert collection_attempts[1].files["tree/main/data.txt"] == b"changed asset"
+    assert re.findall(
+        r"Bundle digest:\s+(sha256:[0-9a-f]{64})", unstyle(before.output)
+    ) != re.findall(r"Bundle digest:\s+(sha256:[0-9a-f]{64})", unstyle(after.output))
+
+
+def test_retained_validate_isolates_same_named_roots_and_environments(
+    retained_validation_files: tuple[Path, Path], collection_attempts: list[_Collector]
+) -> None:
+    # Requirement: equal workflow/environment names cannot reuse another invocation's grants.
+    workflow, environment = retained_validation_files
+    before = runner.invoke(app, ["validate", str(workflow), "--environment", str(environment)])
+    second = workflow.parent.parent / "second"
+    second.mkdir()
+    other_workflow = second / workflow.name
+    other_workflow.write_text(
+        workflow.read_text().replace(
+            "type: workflow, workflow: child.yaml", "type: script, command: echo"
+        )
+    )
+    (second / "data.txt").write_text("other root")
+    other_environment = second / environment.name
+    other_environment.write_text("default: alternate\nprofiles:\n  alternate: {backend: local}\n")
+
+    after = runner.invoke(
+        app, ["validate", str(other_workflow), "--environment", str(other_environment)]
+    )
+
+    assert before.exit_code == after.exit_code == 0
+    assert [attempt.root_workflow for attempt in collection_attempts] == [workflow, other_workflow]
+    assert re.search(r"first\s+alternate\s+local", unstyle(after.output))
+    assert collection_attempts[1].files["tree/main/data.txt"] == b"other root"
+
+
+def test_retained_validate_uses_frozen_child_semantics(
+    retained_validation_files: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: known children are semantically checked from the collected closure.
+    workflow, environment = retained_validation_files
+    child = workflow.parent / "child.yaml"
+    original = _Collector.collect
+    attempts = 0
+
+    def observed(collector: _Collector) -> CollectedBundle:
+        nonlocal attempts
+        attempts += 1
+        collected = original(collector)
+        child.write_text(
+            child.read_text().replace("prompt: fixture", "prompt: '{{ ghost.output }}'")
+        )
+        return collected
+
+    monkeypatch.setattr(_Collector, "collect", observed)
+    result = runner.invoke(app, ["validate", str(workflow), "--environment", str(environment)])
+
+    assert result.exit_code == 0, result.output
+    assert attempts == 1
+    assert "ghost" not in unstyle(result.output)
+
+
+@pytest.mark.parametrize("refusal", ["provider", "path"])
+def test_retained_validate_keeps_cheap_refusals(
+    retained_validation_files: tuple[Path, Path], refusal: Literal["provider", "path"]
+) -> None:
+    # Requirement: sharing a preflight never admits unsupported providers or escaping cwd.
+    workflow, environment = retained_validation_files
+    child = workflow.parent / "child.yaml"
+    match refusal:
+        case "provider":
+            child.write_text(
+                child.read_text()
+                .replace("provider: copilot", "provider: hermes")
+                .replace("    skill_discovery: {sources: [project]}\n", "")
+            )
+            expected = "managed_local_workspace"
+        case "path":
+            workflow.write_text(
+                workflow.read_text().replace(
+                    "command: echo", "command: echo, working_dir: ../escape"
+                )
+            )
+            expected = "escape"
+        case unreachable:
+            assert_never(unreachable)
+
+    result = runner.invoke(app, ["validate", str(workflow), "--environment", str(environment)])
+
+    assert result.exit_code == 1
+    output = unstyle(result.output)
+    assert expected in output
+    assert "Bundle digest:" not in output
+
+
+@pytest.mark.parametrize("mismatch", ["path", "config", "environment", "document"])
+def test_preflight_rejects_incompatible_validation_inputs(
+    retained_validation_files: tuple[Path, Path],
+    mismatch: Literal["path", "config", "environment", "document"],
+) -> None:
+    # Requirement: compile and semantic boundaries reject mismatched snapshots without recollection.
+    workflow, environment_path = retained_validation_files
+    config = load_config(workflow)
+    environment = resolve_environment(str(environment_path), workflow_dir=workflow.parent)
+    preflight = RunPreflight(config, workflow, environment)
+    match mismatch:
+        case "path":
+            workflow = workflow.with_name("other.yaml")
+        case "config":
+            config = config.model_copy(
+                update={"workflow": config.workflow.model_copy(update={"name": "override"})}
+            )
+        case "environment":
+            environment = replace(environment, path=environment_path.with_name("other.yaml"))
+        case "document":
+            environment.document.default = "other-profile"
+        case unreachable:
+            assert_never(unreachable)
+    context: _EnvironmentValidationContext = {
+        "refs_found": False,
+        "environments": {environment.name: environment},
+        "explicit": True,
+        "root_workflow_dir": workflow.parent,
+        "warned_no_environments": False,
+        "warned_no_secret_environments": False,
+        "preflights": {environment.name: preflight},
+    }
+
+    with pytest.raises(ConfigurationError, match="preflight does not match"):
+        compile_run_manifest(
+            config, workflow_path=workflow, environment=environment, _preflight=preflight
+        )
+    with pytest.raises(ConfigurationError, match="preflight does not match"):
+        validate_workflow_config(config, workflow_path=workflow, _environment_context=context)
+    assert preflight.collected is None
+
+
+def test_direct_validator_lazily_shares_effective_root_preflight(
+    retained_validation_files: tuple[Path, Path], collection_attempts: list[_Collector]
+) -> None:
+    # Requirement: old explicit contexts collect once and preserve valid effective config overrides.
+    workflow, environment_path = retained_validation_files
+    config = load_config(workflow)
+    config = config.model_copy(
+        update={"workflow": config.workflow.model_copy(update={"name": "effective-name"})}
+    )
+    environment = resolve_environment(str(environment_path), workflow_dir=workflow.parent)
+    context: _EnvironmentValidationContext = {
+        "refs_found": False,
+        "environments": {environment.name: environment},
+        "explicit": True,
+        "root_workflow_dir": workflow.parent,
+        "warned_no_environments": False,
+        "warned_no_secret_environments": False,
+    }
+
+    validate_workflow_config(config, workflow_path=workflow, _environment_context=context)
+    assert "preflights" in context
+    manifest = compile_run_manifest(
+        config,
+        workflow_path=workflow,
+        environment=environment,
+        _preflight=context["preflights"][environment.name],
+    )
+
+    assert len(collection_attempts) == 1
+    assert manifest.workflow.name == "effective-name"
+    assert context["preflights"][environment.name].config.workflow.name == "effective-name"
+
+
+def test_direct_validator_cheap_refusal_collects_nothing(
+    retained_validation_files: tuple[Path, Path], collection_attempts: list[_Collector]
+) -> None:
+    # Requirement: one cheap root refusal needs no collection and retains independent diagnostics.
+    workflow, environment_path = retained_validation_files
+    workflow.write_text(
+        workflow.read_text()
+        .replace("command: echo", "command: echo, working_dir: ../escape", 1)
+        .replace("command: echo, routes", "command: '{{ ghost.output }}', routes", 1)
+    )
+    config = load_config(workflow)
+    environment = resolve_environment(str(environment_path), workflow_dir=workflow.parent)
+    context: _EnvironmentValidationContext = {
+        "refs_found": False,
+        "environments": {environment.name: environment},
+        "explicit": True,
+        "root_workflow_dir": workflow.parent,
+        "warned_no_environments": False,
+        "warned_no_secret_environments": False,
+    }
+
+    with pytest.raises(ConfigurationError) as failure:
+        validate_workflow_config(config, workflow_path=workflow, _environment_context=context)
+
+    message = str(failure.value)
+    assert "ghost" in message
+    assert (
+        message.count("Managed local directory refused (namespace_escape)."),
+        len(collection_attempts),
+    ) == (1, 0)
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "escape", "semantic", "report"])
+def test_retained_validate_preserves_failure_warnings(
+    retained_validation_files: tuple[Path, Path],
+    collection_attempts: list[_Collector],
+    failure: str,
+) -> None:
+    # Requirement: failed closure/semantics preserves detailed warnings once, without publication.
+    workflow, environment = retained_validation_files
+    original = workflow.read_text()
+    workflow.write_text(
+        original.replace(
+            "  entry_point: first\n",
+            "  entry_point: first\n  runtime:\n    plugin_sources:\n"
+            "      one: acme/plugins#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "      two: acme/other#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+    )
+    if failure in {"escape", "report"}:
+        (workflow.parent.parent / "outside.txt").write_text("outside")
+        child = workflow.parent / "child.yaml"
+        child.write_text(
+            child.read_text().replace(
+                "  entry_point: agent\n",
+                "  entry_point: agent\n  bundle: {assets: [../outside.txt]}\n",
+            )
+        )
+        if failure == "report":
+            workflow.write_text(
+                workflow.read_text().replace("  workspace: {persistence: durable}\n", "")
+            )
+    elif failure == "semantic":
+        workflow.write_text(original.replace("command: echo", "command: '{{ ghost.output }}'"))
+
+    result = runner.invoke(app, ["validate", str(workflow), "--environment", str(environment)])
+
+    assert result.exit_code == 1, result.output
+    assert len(collection_attempts) == 1, result.output
+    output = unstyle(result.output)
+    flattened = " ".join(output.split())
+    assert collection_attempts[0].warnings
+    positions = []
+    for warning in collection_attempts[0].warnings:
+        assert flattened.count(" ".join(warning.split())) == 1
+        assert flattened.index(" ".join(warning.split())) < flattened.index("Validation Failed")
+        positions.append(flattened.index(" ".join(warning.split())))
+    assert positions == sorted(positions)
+    if failure == "report":
+        assert "BundleRootEscapeError" in output
+    assert "Bundle digest:" not in output
+    assert "Status: complete" not in output
+    assert not list(workflow.parent.parent.rglob("bundle.json"))
+
+
+def test_later_report_failure_keeps_bundle_warnings_once(
+    retained_validation_files: tuple[Path, Path],
+    collection_attempts: list[_Collector],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: a later reporter failure preserves its error without replaying bundle warnings.
+    workflow, environment = retained_validation_files
+    error = ConfigurationError("Post-bundle reporter failed [original].")
+
+    def fail_after_bundle(_config: WorkflowConfig, _console: MarkupFreeConsole) -> None:
+        raise error
+
+    monkeypatch.setattr("conductor.cli.validate._report_mcp", fail_after_bundle)
+
+    result = runner.invoke(app, ["validate", str(workflow), "--environment", str(environment)])
+
+    assert result.exit_code == 1, result.output
+    output = unstyle(result.output)
+    assert "Status: complete" in output
+    assert re.search(r"Bundle digest:\s+sha256:[0-9a-f]{64}", output)
+    assert "ConfigurationError" in output
+    assert output.count(str(error)) == 1
+    assert len(collection_attempts) == 1
+    assert collection_attempts[0].warnings
+    flattened = " ".join(output.split())
+    for warning in collection_attempts[0].warnings:
+        text = " ".join(warning.split())
+        assert flattened.count(text) == 1
+        assert flattened.index(text) < flattened.index("Validation Failed")
 
 
 class TestValidateCommand:
