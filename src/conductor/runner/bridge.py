@@ -71,11 +71,35 @@ def main() -> int:
             return INTERRUPT_CONFLICT_EXIT_CODE if exc.code == 409 else 1
         try:
             payload = json.loads(exc.read(65536))
-            message = payload["error"]["message"]
-            if not isinstance(message, str):
-                raise ValueError("invalid error message")
-        except (ValueError, KeyError, TypeError):
+        except ValueError:
+            payload = None
+        message = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                message = error["message"]
+            details = payload.get("detail")
+            if message is None and isinstance(details, list):
+                validation_messages = []
+                for item in details:
+                    if not isinstance(item, dict) or not isinstance(item.get("msg"), str):
+                        continue
+                    location = item.get("loc")
+                    location_text = (
+                        ".".join(str(part) for part in location if isinstance(part, str | int))
+                        if isinstance(location, list)
+                        else "body"
+                    )
+                    validation_messages.append(f"{location_text}: {item['msg']}")
+                if validation_messages:
+                    message = (
+                        f"runner HTTP {exc.code}: {'; '.join(validation_messages)}. "
+                        "Rebuild the runner image with matching Conductor code so its "
+                        "request schema matches the host."
+                    )
+        if message is None:
             message = f"runner HTTP {exc.code}"
+        # FastAPI detail handling omits the submitted input field.
         # The host redacts credential-bearing messages before raising them.
         sys.stdout.buffer.write(
             json.dumps({"type": "error", "data": {"message": message}}).encode("utf-8") + b"\n"

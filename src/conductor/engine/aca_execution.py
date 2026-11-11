@@ -211,10 +211,7 @@ class AcaRunnerBackend:
         logical_id = state.identifier_for(spec.name, dict(spec.context), scope)
         identifier, slot = state.acquire(logical_id)
         try:
-            wire_version = self._protocol_version
-            if self.options is None and (interrupt_signal is None or not self._interrupt_available):
-                wire_version = 1
-            body = agent_spec_to_wire_body(spec, protocol_version=wire_version)
+            body = agent_spec_to_wire_body(spec, protocol_version=self._protocol_version)
             if on_dispatch is not None:
                 on_dispatch()
             return await transport.execute_request(

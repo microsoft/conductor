@@ -241,6 +241,13 @@ def main() -> int:
             )
             sys.stdout.buffer.flush()
             return 0
+        if scenario == "realm-old-422":
+            sys.stdout.buffer.write(
+                json.dumps({"type": "error", "data": {"message": "runner HTTP 422"}}).encode()
+                + b"\n"
+            )
+            sys.stdout.buffer.flush()
+            return 0
         event = {"type": "agent_message", "data": {"text": "streamed"}}
         sys.stdout.buffer.write(json.dumps(event).encode() + b"\n")
         sys.stdout.buffer.flush()

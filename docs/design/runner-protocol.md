@@ -38,12 +38,18 @@ smuggle undeclared fields past receiver validation.
 
 - `agent: RunnerAgentPayload` — the subset of `AgentDef` the runner needs to
   reconstruct the inner agent: `name`, `model`, `system_prompt`, `output`,
-  `max_agent_iterations`, `max_session_seconds`, `reasoning_effort`,
+  `tools`, `max_agent_iterations`, `max_session_seconds`, `reasoning_effort`,
   `working_dir`, `retry`, `context_tier`. Routing, dependencies, and
-  validator configuration stay host-side.
+  validator configuration stay host-side. `agent.tools` is the declared agent
+  list: `None` means omitted and `[]` means explicitly tool-free.
 - `rendered_prompt: str` — the fully rendered prompt.
-- `tools: list[str] | None` — per-agent tool allowlist (`None` = all, `[]` =
-  none).
+- `tools: list[str] | None` — per-agent tool allowlist resolved against the
+  workflow-level list (`None` = all workflow tools). `[]` = provider defaults
+  when `agent.tools` is omitted or `null`; no tools when `agent.tools` is `[]`.
+  A nonempty resolved list applies that allowlist. The resolved envelope list
+  and declared `agent.tools` list are both required: inner providers use the
+  declared value to distinguish explicit `tools: []` from an omitted agent
+  list with no workflow tools.
 - `mcp_servers: dict | None` — full `runtime.mcp_servers` definitions.
 - `context: dict` — accumulated workflow context.
 - `inner_provider: str` — the SDK the runner drives (`"copilot"` today).
@@ -101,6 +107,13 @@ translation. The model is a documenting shape: the host parses frames with
 differs from its own `RUNNER_PROTOCOL_VERSION`, it keeps working and logs a
 warning only. A missing `protocol_version` (`None`, from a runner that
 predates version advertisement) skips the check entirely.
+
+**Runner-image requirement for declared tools:** current v2 hosts include
+`agent.tools` in every v2 request, including `null` when the declaration is
+omitted. Older v2 runner images use a strict payload without that field and
+respond with HTTP 422, even for workflows that do not declare `tools: []`.
+Upgrading the host therefore requires rebuilding the Docker or ACA runner
+image with matching Conductor code, although the protocol version remains 2.
 
 ### Transport-token header
 

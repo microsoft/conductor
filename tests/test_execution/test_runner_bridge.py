@@ -118,6 +118,60 @@ async def test_bridge_preserves_runner_preflight_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bridge_preserves_fastapi_validation_details_without_input_values() -> None:
+    # Requirement: strict-runner 422 names the rejected field and rebuild remedy, not its input.
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            payload = json.dumps(
+                {
+                    "detail": [
+                        {
+                            "type": "extra_forbidden",
+                            "loc": ["body", "agent", "tools"],
+                            "msg": "Extra inputs are not permitted",
+                            "input": "submitted-secret-value",
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(422)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "conductor.runner.bridge",
+            "--port",
+            str(server.server_port),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        output, stderr = await asyncio.wait_for(process.communicate(b"{}"), 20)
+        assert process.returncode == 0 and stderr == b""
+        message = json.loads(output)["data"]["message"]
+        assert "body.agent.tools" in message
+        assert "Extra inputs are not permitted" in message
+        assert "Rebuild the runner image" in message
+        assert "submitted-secret-value" not in message
+    finally:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_bridge_ready_follows_execute_registration_before_targeted_interrupt() -> None:
     # Requirement: an early 404 cannot lose an interrupt once the execute bridge reports ready.
     registered = threading.Event()

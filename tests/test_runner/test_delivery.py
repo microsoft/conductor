@@ -87,6 +87,34 @@ async def test_factory_executes_each_supported_provider(
     assert DeliveryProvider.instances[0].closed
 
 
+@pytest.mark.parametrize("provider", ["copilot", "openai", "claude"])
+@pytest.mark.parametrize(("declared_tools", "expected"), [(None, None), ((), [])])
+async def test_declared_tools_reach_inner_provider_independently_of_resolution(
+    provider: str,
+    declared_tools: tuple[str, ...] | None,
+    expected: list[str] | None,
+    runner_client_factory: RunnerClientFactory,
+) -> None:
+    # Requirement: omitted and explicit empty declarations stay distinct from resolved [].
+    spec = AgentSpec(
+        name="tool-free",
+        execution_id=f"{provider}-tool-free",
+        model_provider=provider,
+        model="model",
+        rendered_prompt="task",
+        tools=(),
+        declared_tools=declared_tools,
+    )
+
+    async with runner_client_factory() as client:
+        response = await client.post("/execute", json=agent_spec_to_wire_body(spec))
+
+    assert response.status_code == 200
+    call = DeliveryProvider.instances[0].calls[0]
+    assert call["agent"].tools == expected
+    assert call["tools"] == []
+
+
 @pytest.mark.parametrize("provider", ["claude-agent-sdk", "hermes"])
 async def test_unknown_provider_returns_named_follow_up(
     provider: str, runner_client_factory: RunnerClientFactory

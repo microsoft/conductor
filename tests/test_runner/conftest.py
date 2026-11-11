@@ -31,7 +31,7 @@ class DeliveryProvider:
         self.instances.append(self)
 
     async def execute(self, agent: Any, context: Any, prompt: str, **kwargs: Any) -> AgentOutput:
-        self.calls.append(kwargs)
+        self.calls.append({"agent": agent, **kwargs})
         callback = kwargs["event_callback"]
         callback("agent_turn_start", {"turn": "awaiting_model"})
         mcp = self.settings["mcp_servers"]

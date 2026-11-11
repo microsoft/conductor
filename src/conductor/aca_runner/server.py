@@ -130,6 +130,7 @@ def _build_agent(payload: RunnerAgentPayload) -> AgentDef:
         model=payload.model,
         system_prompt=payload.system_prompt,
         output=output,
+        tools=payload.tools,
         max_agent_iterations=payload.max_agent_iterations,
         max_session_seconds=payload.max_session_seconds,
         timeout_seconds=None,

@@ -69,6 +69,28 @@ def test_realm_spec_uses_effective_copilot_temperature() -> None:
     assert spec.max_tokens is None
 
 
+@pytest.mark.parametrize(("declared_tools", "expected"), [(None, None), ([], ())])
+def test_realm_spec_preserves_declared_tools_independently_of_resolution(
+    declared_tools: list[str] | None, expected: tuple[str, ...] | None
+) -> None:
+    # Requirement: omitted and explicit empty declarations stay distinct from resolved [].
+    spec = AgentExecutor(CopilotProvider(mock_handler=lambda *_: {})).build_realm_spec(
+        AgentDef(
+            name="remote",
+            prompt="task",
+            tools=declared_tools,
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+        ),
+        "task",
+        {},
+        tools=[],
+    )
+
+    assert spec.declared_tools == expected
+
+
 @pytest.fixture
 def simple_agent() -> AgentDef:
     """Create a simple agent definition."""
