@@ -108,7 +108,21 @@ outside. Read [providers](../providers.md) first for the shared contract.
 
 ### Runtime config and working directory (#348)
 
-- `temperature` and `max_tokens` are rejected at the factory; `reasoning_effort=None` (not wired).
+- `temperature` and `max_tokens` are rejected at the factory.
+- `reasoning_effort=("low", "medium", "high", "xhigh", "max")`: `resolve_reasoning_effort`
+  (per-agent `reasoning.effort` over `runtime.default_reasoning_effort`) is forwarded verbatim as
+  `ClaudeAgentOptions.effort`, and `__init__` takes `default_reasoning_effort` like every other
+  provider. Unset stays out of argv and pins nothing, so the CLI keeps its own default.
+- The CLI never rejects an effort level: it drops effort on models without it and runs an
+  unsupported `xhigh`/`max` at `high`. `_refuse_unsupported_effort` refuses the known combinations
+  (`_NO_EFFORT_MODELS`, `_NO_MAX_EFFORT_MODELS`, `_NO_XHIGH_EFFORT_MODELS`, transcribed from the
+  CLI bundled with SDK 0.2.121) before the auth preflight, non-retryable. Aliases and unknown ids
+  pass through because the CLI resolves them.
+- The CLI ranks `CLAUDE_CODE_EFFORT_LEVEL` above `--effort` (`unset`/`auto` drops effort), and
+  applies settings `env` blocks (`~/.claude.json`, enabled tiers, then `--settings`, then managed
+  policy) over the inherited environment. A set effort is therefore pinned both in the child env
+  and in `ClaudeAgentOptions.settings` (`{"env": {"CLAUDE_CODE_EFFORT_LEVEL": <level>}}`); only
+  managed policy outranks it. Tests assert both at the options level and in argv.
 - The engine-resolved `working_dir` is forwarded verbatim as `ClaudeAgentOptions.cwd`; do not
   re-resolve (it would collapse symlink aliases the engine preserves). Build options inside
   `execute`'s `try` so an `os.getcwd()` failure becomes a `ProviderError`. There is no provider-side

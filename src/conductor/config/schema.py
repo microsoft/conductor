@@ -779,11 +779,16 @@ class ReasoningConfig(BaseModel):
     - **Copilot SDK** sets ``reasoning_effort`` on the session.
     - **Anthropic SDK** enables extended thinking with a budget mapped from
       the effort level (low=2k, medium=8k, high=16k, xhigh=32k, max=59904 tokens).
+    - **Claude Agent SDK** sets ``ClaudeAgentOptions.effort``, which takes the
+      same five levels and reaches the ``claude`` CLI as ``--effort``.
 
     Validation happens at execute time. Claude rejects models that don't
     match the supported prefix list; Copilot consults the SDK's advertised
     ``supported_reasoning_efforts`` (when available) and otherwise allows
-    the request through to the SDK.
+    the request through to the SDK. The Claude Agent SDK provider refuses an
+    explicit model id the ``claude`` CLI would silently drop effort on or
+    downgrade (e.g. ``xhigh`` on ``claude-sonnet-4-6``); aliases such as
+    ``sonnet`` are resolved by the CLI and pass through unchecked.
 
     Example YAML::
 
