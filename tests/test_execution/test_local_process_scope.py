@@ -575,8 +575,15 @@ async def test_owner_failure_sink_preserves_native_release_and_accounting(
     loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
     observation = asyncio.create_task(controller.owners.observe("sdk", owner))
     try:
+        # Keep raw output independent of the child's platform newline translation.
         result = await asyncio.wait_for(
-            controller.spawn_script("sdk", CommandSpec(sys.executable, ("-c", "print('native')"))),
+            controller.spawn_script(
+                "sdk",
+                CommandSpec(
+                    sys.executable,
+                    ("-c", "import sys; sys.stdout.buffer.write(b'native\\n')"),
+                ),
+            ),
             10,
         )
         assert result.exit_code == 0 and result.stdout == "native\n"
