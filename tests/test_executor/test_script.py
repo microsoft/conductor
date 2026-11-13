@@ -19,6 +19,7 @@ import asyncio
 import os
 import sys
 import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -205,6 +206,49 @@ class TestScriptExecutorWorkingDir:
             )
             output = await executor.execute(agent, {"target_dir": tmpdir})
             assert os.path.realpath(output.stdout.strip()) == os.path.realpath(tmpdir)
+
+    @pytest.mark.parametrize("raw", [None, "{{ directory }}"])
+    async def test_mapper_receives_once_rendered_cwd(self, executor, tmp_path: Path, raw):
+        # Requirement: map exactly once after rendering, including the unset default.
+        received = []
+
+        def mapper(value: str | None) -> str:
+            received.append(value)
+            return str(tmp_path)
+
+        step = ScriptStepDef(
+            name="mapped",
+            command=sys.executable,
+            args=["-c", "import os; print(os.getcwd())"],
+            working_dir=raw,
+        )
+        result = await executor.execute(
+            step,
+            {"directory": "{{ literal }}"},
+            working_directory_mapper=mapper,
+        )
+        assert received == [None if raw is None else "{{ literal }}"]
+        assert Path(result.stdout.strip()) == tmp_path
+
+    async def test_mapper_refusal_never_dispatches(self, executor):
+        # Requirement: mapping failure occurs before process creation or dispatch accounting.
+        dispatched = []
+
+        def refuse(_value: str | None) -> str:
+            raise ExecutionError("refused")
+
+        with (
+            patch("asyncio.create_subprocess_exec") as spawn,
+            pytest.raises(ExecutionError, match="refused"),
+        ):
+            await executor.execute(
+                ScriptStepDef(name="mapped", command=sys.executable),
+                {},
+                working_directory_mapper=refuse,
+                on_dispatch=lambda: dispatched.append(True),
+            )
+        spawn.assert_not_called()
+        assert dispatched == []
 
 
 class TestScriptExecutorTemplating:

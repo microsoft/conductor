@@ -16,6 +16,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, get_args
+from unittest.mock import Mock
 
 import pytest
 
@@ -40,6 +41,13 @@ from conductor.execution import (
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.local import LocalRunnerBackend
+from conductor.execution.types import (
+    LocalWorkspaceBinding,
+    ManagedWorkspaceContext,
+    ProcessLaunchSpec,
+    ProcessScopeController,
+    ShutdownResult,
+)
 
 
 def _fill_start_error(e: OSError) -> StartError:
@@ -118,6 +126,88 @@ class TestDefaults:
         # Requirement: lease location and workflow name are optional hints.
         assert WorkspaceLease(lease_id="r1", backend="local", incarnation="i1").location is None
         assert RunSpec(run_id="r1").workflow_name is None
+
+
+class TestLocalWorkspaceContracts:
+    """Internal managed handles stay separate from serialized workspace identity."""
+
+    def test_binding_is_frozen_and_keeps_explicit_runtime_context(self) -> None:
+        # Requirement: runtime context is explicit, immutable and absent from binding repr.
+        scopes = Mock(spec=ProcessScopeController)
+        context = ManagedWorkspaceContext("/owned", "incarnation", scopes)
+        bundle = BundleRef("sha256:abc", "/bundle")
+        binding = LocalWorkspaceBinding(
+            "run", "incarnation", "/owned", "/owned/work", bundle, context
+        )
+
+        assert binding.runtime_context is context
+        assert context.process_scopes is scopes
+        assert binding.bundle is bundle
+        assert "runtime_context=" not in repr(binding)
+        for value, attribute in (
+            (binding, "run_id"),
+            (context, "root"),
+            (ShutdownResult("unconfirmed", ("owner-not-joined",)), "status"),
+            (ProcessLaunchSpec(("tool",), {}, "/work"), "working_dir"),
+        ):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(value, attribute, "changed")
+
+    def test_launch_configuration_hides_argv_env_and_control_token(self) -> None:
+        # Requirement: launch secrets cannot leak through nested dataclass reprs.
+        launch = ProcessLaunchSpec(
+            ("tool", "argv-secret"), {"TOKEN": "env-secret"}, "/work", "nonce"
+        )
+
+        assert launch.argv == ("tool", "argv-secret")
+        assert launch.env == {"TOKEN": "env-secret"}
+        assert launch.control_token == "nonce"
+        assert all(secret not in repr(launch) for secret in ("argv-secret", "env-secret", "nonce"))
+
+    def test_run_spec_adds_only_optional_local_root(self) -> None:
+        # Requirement: old positional constructors retain defaults and accept an opt-in root.
+        legacy = RunSpec("run", "workflow", None, None)
+
+        assert legacy == RunSpec(run_id="run", workflow_name="workflow")
+        assert legacy.local_workspace_root is None
+        assert dataclasses.asdict(legacy) == {
+            "run_id": "run",
+            "workflow_name": "workflow",
+            "bundle": None,
+            "workspace_persistence": None,
+            "local_workspace_root": None,
+        }
+        managed = dataclasses.replace(legacy, local_workspace_root="/owned")
+        assert managed.local_workspace_root == "/owned"
+
+    def test_shutdown_proof_does_not_extend_serialized_outcomes(self) -> None:
+        # Requirement: uncertain release is an internal result, not a command/run outcome.
+        result = ShutdownResult("unconfirmed", ("missing-kernel-proof",))
+
+        assert result.status == "unconfirmed"
+        assert result.reasons == ("missing-kernel-proof",)
+        assert ShutdownResult("released").reasons == ()
+        assert result.status not in get_args(CommandOutcome)
+        assert result.status not in get_args(RunOutcome)
+
+    def test_process_scope_controller_is_a_separate_protocol(self) -> None:
+        # Requirement: process custody never widens the backend-neutral RunnerBackend API.
+        assert getattr(ProcessScopeController, "_is_protocol", False) is True
+        assert {
+            name
+            for name, member in vars(ProcessScopeController).items()
+            if callable(member) and not name.startswith("_")
+        } == {
+            "register_launcher",
+            "register_process",
+            "wrap_stdio",
+            "spawn_script",
+            "begin_teardown",
+            "force_stop",
+            "await_release",
+            "check_admission",
+        }
+        assert "local_workspace_binding" not in vars(RunnerBackend)
 
 
 class TestProtocolShape:
@@ -399,7 +489,7 @@ class TestLiteralVocabularies:
 
 
 class TestStartErrorRoundTrip:
-    """Requirement: StartError reconstructs the original exception for chaining."""
+    """Requirement: StartError preserves causes representable by its portable projection."""
 
     @pytest.mark.parametrize(
         "original",
@@ -410,8 +500,8 @@ class TestStartErrorRoundTrip:
         ],
     )
     def test_errno_bearing_round_trip(self, original: OSError) -> None:
-        # Requirement: with a structured errno the reconstructed exception
-        # matches the original on type/str/errno/filename (CPython's
+        # Requirement: for these representable structured errors, the reconstructed
+        # cause matches the original on type/str/errno/filename (CPython's
         # OSError(errno, ...) constructor auto-selects the built-in subclass,
         # e.g. PermissionError for errno 13).
         start_error = _fill_start_error(original)

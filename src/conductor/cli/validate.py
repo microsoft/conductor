@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from rich.panel import Panel
 from rich.table import Table
@@ -24,7 +24,8 @@ from conductor.telemetry.guards import OTEL_SDK_AVAILABLE
 if TYPE_CHECKING:
     from conductor.config.environment import ResolvedEnvironment
     from conductor.config.schema import StepSecretRef, WorkflowConfig
-    from conductor.engine.run_manifest import ResolvedRunManifest
+    from conductor.config.validator import _EnvironmentValidationContext
+    from conductor.engine.run_manifest import ResolvedRunManifest, RunPreflight
 
 
 def validate_workflow(
@@ -70,21 +71,29 @@ def validate_workflow(
 
     resolved_environment = None
     manifest = None
+    preflight = None
+    collection_warnings: list[str] = []
     if environment is not None:
         try:
             from conductor.config.environment import resolve_environment
-            from conductor.engine.run_manifest import compile_run_manifest
+            from conductor.engine.run_manifest import RunPreflight, compile_run_manifest
 
             resolved_environment = resolve_environment(
                 environment,
                 workflow_dir=workflow_path.parent,
             )
+            preflight = RunPreflight(
+                config, workflow_path, resolved_environment, on_warning=collection_warnings.append
+            )
             manifest = compile_run_manifest(
                 config,
                 workflow_path=workflow_path,
                 environment=resolved_environment,
+                _preflight=preflight,
             )
         except ConductorError as e:
+            for warning in collection_warnings:
+                output_console.print(styled("  [yellow]⚠[/yellow] {}", warning))
             display_validation_error(e, workflow_path, output_console)
             return False, None
 
@@ -92,8 +101,8 @@ def validate_workflow(
     try:
         from conductor.config.validator import _has_secret_references, validate_workflow_config
 
-        environment_context = None
-        if environment is not None and resolved_environment is not None:
+        environment_context: _EnvironmentValidationContext | None = None
+        if resolved_environment is not None and preflight is not None:
             environment_context = {
                 "refs_found": False,
                 "environments": {resolved_environment.name: resolved_environment},
@@ -101,34 +110,40 @@ def validate_workflow(
                 "root_workflow_dir": workflow_path.parent,
                 "warned_no_environments": False,
                 "warned_no_secret_environments": False,
+                "preflights": {resolved_environment.name: preflight},
             }
         warnings = validate_workflow_config(
             config,
             workflow_path=workflow_path,
-            _environment_context=cast(Any, environment_context),
+            _environment_context=environment_context,
         )
         if warnings:
             for warning in warnings:
                 output_console.print(styled("  [yellow]⚠[/yellow] {}", warning))
     except ConductorError as e:
+        for warning in collection_warnings:
+            output_console.print(styled("  [yellow]⚠[/yellow] {}", warning))
         display_validation_error(e, workflow_path, output_console)
         return False, None
 
-    _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
-    _report_plugins(config, workflow_path, output_console)
-    if manifest is not None and resolved_environment is not None:
-        _report_execution_resolution(manifest, resolved_environment, output_console)
-        if not _report_bundle_closure(
-            config,
-            workflow_path,
-            resolved_environment,
-            output_console,
-        ):
-            return False, None
-        if _has_secret_references(config):
-            _report_secret_bindings(config, resolved_environment, output_console)
-    _report_mcp(config, output_console)
-    _report_telemetry_sdk(output_console)
+    try:
+        _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
+        _report_plugins(config, workflow_path, output_console)
+        if manifest is not None and resolved_environment is not None and preflight is not None:
+            _report_execution_resolution(manifest, resolved_environment, output_console)
+            _report_bundle_closure(preflight, output_console)
+            collection_warnings.clear()
+            if _has_secret_references(config):
+                _report_secret_bindings(config, resolved_environment, output_console)
+        _report_mcp(config, output_console)
+        _report_telemetry_sdk(output_console)
+    except ConductorError as e:
+        for warning in collection_warnings:
+            output_console.print(styled("  [yellow]⚠[/yellow] {}", warning))
+        display_validation_error(
+            e, preflight.path if preflight is not None else workflow_path, output_console
+        )
+        return False, None
 
     return True, config
 
@@ -149,6 +164,12 @@ def _report_execution_resolution(
     if manifest.workspace is not None:
         details.add_row("Workspace mode", manifest.workspace.mode)
         details.add_row("Workspace persistence", manifest.workspace.persistence)
+        if manifest.workspace.persistence != "ephemeral":
+            details.add_row(
+                "File realms",
+                "Retained local/Docker workspaces are independent; no filesystem "
+                "synchronization. Context JSON outputs are shared unchanged.",
+            )
     console.print(details)
     console.print(
         styled("  [dim]Path:[/dim] {}", environment.path if environment.path is not None else "—"),
@@ -214,39 +235,19 @@ def _report_execution_resolution(
 
 
 def _report_bundle_closure(
-    _config: WorkflowConfig,
-    workflow_path: Path,
-    environment: ResolvedEnvironment,
+    preflight: RunPreflight,
     console: MarkupFreeConsole,
-) -> bool:
-    """Collect and report the workflow's offline bundle closure.
+) -> None:
+    """Report the invocation's offline bundle closure.
 
     Args:
-        _config: The validated workflow configuration. The collector reloads it
-            with include provenance, so this argument documents that the report
-            belongs to the already validated configuration.
-        workflow_path: Path to the root workflow file.
-        environment: Resolved execution environment linked to the closure.
+        preflight: The snapshot shared with compilation and semantic validation.
         console: Rich console for output.
 
-    Returns:
-        ``True`` when collection completed or was deferred only by uncached
-        plugin sources; ``False`` for a validation-blocking bundle error.
+    Raises:
+        BundleError: If the closure cannot be collected.
     """
-    from conductor.bundle.collector import collect_bundle
-    from conductor.bundle.errors import BundleError
-
-    warnings: list[str] = []
-    try:
-        collected = collect_bundle(
-            workflow_path,
-            environment=environment,
-            allow_network=False,
-            on_warning=warnings.append,
-        )
-    except BundleError as error:
-        display_validation_error(error, workflow_path, console)
-        return False
+    collected = preflight.collect()
 
     console.print(Text.from_markup("\n[bold]Bundle Closure[/bold]"))
     descriptor = collected.descriptor
@@ -254,9 +255,9 @@ def _report_bundle_closure(
         console.print(styled("  [yellow]Status:[/yellow] incomplete"))
         for dependency in descriptor.incomplete:
             console.print(styled("  [yellow]⚠[/yellow] Missing from cache: {}", dependency))
-        for warning in warnings:
+        for warning in descriptor.warnings:
             console.print(styled("  [yellow]⚠[/yellow] {}", warning))
-        return True
+        return
 
     console.print(styled("  [green]Status:[/green] complete"))
     console.print(styled("  [dim]Bundle digest:[/dim] {}", descriptor.bundle_digest))
@@ -282,9 +283,8 @@ def _report_bundle_closure(
     else:
         console.print(Text.from_markup("  [dim]Dirty: clean[/dim]"))
 
-    for warning in warnings:
+    for warning in descriptor.warnings:
         console.print(styled("  [yellow]⚠[/yellow] {}", warning))
-    return True
 
 
 def _bundle_entry_root(logical_path: str) -> str:

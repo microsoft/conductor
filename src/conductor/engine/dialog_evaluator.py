@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from conductor.execution.types import ManagedWorkspaceContext
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -90,6 +93,10 @@ class DialogEvaluator:
         agent: AgentDef,
         output: dict[str, Any],
         provider: AgentProvider,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> DialogEvaluation:
         """Evaluate whether an agent's output should trigger dialog.
 
@@ -104,6 +111,15 @@ class DialogEvaluator:
         if not agent.dialog:
             return DialogEvaluation(trigger=False, reason="No dialog config")
 
+        if managed_workspace is not None:
+            return await self._run_evaluator(
+                agent,
+                output,
+                provider,
+                managed_workspace=managed_workspace,
+                working_dir=working_dir,
+                on_dispatch=on_dispatch,
+            )
         return await self._run_evaluator(agent, output, provider)
 
     async def _run_evaluator(
@@ -111,6 +127,10 @@ class DialogEvaluator:
         agent: AgentDef,
         output: dict[str, Any],
         provider: AgentProvider,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> DialogEvaluation:
         """Run the LLM evaluator to decide whether dialog is needed.
 
@@ -141,12 +161,24 @@ class DialogEvaluator:
         )
 
         try:
-            result = await provider.execute_dialog_turn(
-                system_prompt=system_prompt,
-                user_message=user_prompt,
-                history=[],
-                model=agent.model,
-            )
+            if managed_workspace is not None:
+                if on_dispatch is not None:
+                    on_dispatch()
+                result = await provider.execute_dialog_turn(
+                    system_prompt,
+                    user_prompt,
+                    [],
+                    agent.model,
+                    managed_workspace=managed_workspace,
+                    working_dir=working_dir,
+                )
+            else:
+                result = await provider.execute_dialog_turn(
+                    system_prompt=system_prompt,
+                    user_message=user_prompt,
+                    history=[],
+                    model=agent.model,
+                )
             return self._parse_evaluation(result)
         except Exception:
             logger.warning(

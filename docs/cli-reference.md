@@ -79,6 +79,24 @@ conductor run <workflow.yaml> [OPTIONS]
 > [root-level options](#root-level-options), which must appear *before* the
 > `run` subcommand: `conductor --quiet run workflow.yaml`.
 
+### Retained local example
+
+From the repository root, validate and run the deterministic two-script
+example:
+
+```bash
+uv run conductor validate examples/local-retained-workspace.yaml
+uv run conductor run examples/local-retained-workspace.yaml --no-interactive --skip-gates
+```
+
+It reads a declared asset and writes `generated.txt` in the copied tree. With
+`durable` persistence, the tree remains after successful runtime release.
+Source files and the cached bundle aren't updated. The retained tree lives
+under `$CONDUCTOR_HOME/workspaces/<run_id>/local/`, or under
+`~/.conductor/workspaces/<run_id>/local/` when `CONDUCTOR_HOME` is unset.
+The internal marker and layout aren't a public storage API. See
+[local retained workspaces](design/local-retained-workspace.md).
+
 ### Examples
 
 #### Basic Execution
@@ -365,11 +383,17 @@ When called with a workflow file (`conductor resume workflow.yaml`) or without a
 
 When resuming with `--environment`, resume resolves execution profiles against the specified environment document or file path. Always supply the matching `--environment` when resuming workflows that use non-default environments or containerized backends.
 
-Resuming also validates capability cross-checks. If a workflow declares retained workspace persistence (`durable` or `on-failure`), the resolved environment must configure runner backends that support persistent workspaces (such as the `docker` runner backend).
+Resuming also validates capability cross-checks. For `durable` or `on-failure`,
+participating backends must support retained workspaces. The local and Docker
+backends support retention; local agents have additional provider and runtime
+ownership requirements described in the
+[local retained workspace design](design/local-retained-workspace.md).
 
 ### Resume Digest-Gate
 
-When resuming a workflow configured with retained workspace persistence, Conductor enforces an honest resume digest gate before attaching or altering the retained Docker volume. The engine verifies the checkpoint against the current configuration:
+When resuming a workflow configured with retained workspace persistence,
+Conductor checks the checkpoint against the current configuration before
+attaching the retained workspace:
 
 1. **Workflow Digest**: Compares the root workflow digest against recorded `resume_contract.workflow_digest`.
 2. **Environment Identity**: Compares the environment name and digest against `resume_contract.environment_name` and `resume_contract.environment_digest`.
@@ -383,6 +407,11 @@ When resuming a workflow configured with retained workspace persistence, Conduct
   * *Remedy*: Run a fresh execution with `conductor run` instead of resuming from the older checkpoint.
 * **Digest Mismatch**: If workflow definitions, environment settings, or manifest configuration changed since the checkpoint was written, or if a non-null recorded bundle digest differs from the current bundle, resume fails closed. Conductor reports the exact mismatch (such as `manifest_digest` or `bundle_digest`), displaying the recorded digest versus the current digest.
   * *Remedy*: Restore the matching git commit or environment configuration, or start a fresh execution with `conductor run`.
+* **Missing or unconfirmed local workspace**: A missing identity or tree, an
+  identity mismatch, or an active or uncertain runtime marker prevents
+  attachment. Conductor doesn't recreate or restage that workspace. A
+  checkpoint alone isn't proof that its former consumers stopped; don't
+  override the marker to force a resume.
 
 ### Interrupted Step and Attempt Tracking
 
@@ -393,7 +422,8 @@ current step is known. The corresponding `checkpoint_saved` event includes
 workflows without retained workspace persistence omit it.
 
 * **`name`**: The current step at failure; it may not have dispatched a command yet.
-* **`status`**: Set to `"unknown"`, because external container actions cannot be verified after an interruption.
+* **`status`**: Set to `"unknown"`, because side effects of interrupted
+  external actions cannot be established from the checkpoint.
 * **`attempt_id`**: The in-flight attempt identifier, or `null` if no attempt was active for that step.
 
 Checkpoints without `interrupted_step` can still have an interrupted step; resume
@@ -418,6 +448,71 @@ conductor resume --from ~/.conductor/checkpoints/workflow-20260922-120000.json
 # Resume with mid-run guidance
 conductor resume workflow.yaml --guidance "Use Python 3.12 syntax"
 ```
+
+### Direct engine callers
+
+The `WorkflowEngine` constructor accepts `config`, an optional `provider` or
+`registry`, and a file-backed `workflow_path` for bundle collection. Call
+`await engine.run(inputs)` for a fresh run.
+
+For retained resume, construct the engine with
+`run_context=RunContext(run_id=checkpoint.run_id)`, the file-backed
+`workflow_path`, and an `execution_environment` whose name and digest match
+the checkpoint's resume contract. `resume()` does not adopt the checkpoint's
+run ID. Set these constructor arguments before restoring the context and
+limits. With the config, checkpoint, workflow path, matching resolved
+environment, and provider registry already loaded, use this sequence inside
+the caller's async code:
+
+```python
+from conductor.engine.context import WorkflowContext
+from conductor.engine.limits import LimitEnforcer
+from conductor.engine.workflow import RunContext, WorkflowEngine
+
+engine = WorkflowEngine(
+    config,
+    registry=registry,
+    workflow_path=workflow_path,
+    execution_environment=execution_environment,
+    run_context=RunContext(run_id=checkpoint.run_id),
+)
+engine.set_context(WorkflowContext.from_dict(checkpoint.context))
+engine.set_limits(
+    LimitEnforcer.from_dict(
+        checkpoint.limits,
+        timeout_seconds=config.workflow.limits.timeout_seconds,
+        budget_usd=config.workflow.limits.budget_usd,
+        budget_mode=config.workflow.limits.budget_mode,
+    )
+)
+await engine.resume(checkpoint.current_agent, checkpoint=checkpoint)
+```
+
+The timeout and budget arguments to `LimitEnforcer.from_dict()` are required
+and come from the current workflow configuration.
+
+The root engine coordinates targeted release before finalizing its
+lease. An injected provider is not globally closed by that release; its caller
+owns the provider's eventual `close()`.
+
+A caller that directly owns backend resources must preserve the original
+backend-issued `WorkspaceLease`, not reconstruct it from a checkpoint's
+serializable `WorkspaceIdentity`. The targeted hooks
+`await provider.release_workspace(workspace_root)` and
+`await registry.release_workspace(workspace_root)` don't replace the native
+process and owner barrier. `LocalRunnerBackend.confirm_workspace_released(lease)`
+accepts that existing proof. Its `finalize_run(lease, outcome, *, retain=False)`
+also uses the original lease. See
+the [ownership and shutdown contract](design/local-retained-workspace.md#ownership-and-shutdown)
+before using these lower-level methods.
+
+The direct caller owns its event loop. The engine doesn't cancel unrelated
+tasks or close that loop. After unconfirmed cleanup the engine returns within
+its managed deadline on a responsive loop, but uncertain Python owners may
+remain. The synchronous CLI owns its loop and, on quarantine, uses one
+additional 30-second episode for tasks, async generators, and the default
+executor together. Neither path guarantees a hard process exit if Python or C
+code blocks the loop, or if threads or interpreter shutdown hooks remain.
 
 ## `conductor status`
 

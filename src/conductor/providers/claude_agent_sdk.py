@@ -13,14 +13,17 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 import types
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal, cast, get_args
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, assert_never, cast, get_args
+from uuid import uuid4
 
 from conductor.billing import BillingMode
 from conductor.exceptions import ProviderError
+from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec, ShutdownResult
 from conductor.install_hint import install_command
 from conductor.providers._schema import (
     SchemaDepthError,
@@ -57,10 +60,28 @@ try:
         ClaudeSDKClient,
     )
 
+    class _OwnedClaudeClient(ClaudeSDKClient):
+        """Begin custody teardown before every public native disconnect."""
+
+        resource: _ManagedClaudeResource
+
+        async def disconnect(self) -> None:
+            match sys.exc_info()[1]:
+                case (Exception() | asyncio.CancelledError()) as primary:
+                    self.resource.primary_error = primary
+                case BaseException() | None:
+                    pass
+                case unreachable:
+                    assert_never(unreachable)
+            self.resource.begin_teardown()
+            await super().disconnect()
+
+    _managed_client_type: type[_OwnedClaudeClient] | None = _OwnedClaudeClient
     CLAUDE_AGENT_SDK_AVAILABLE = True
 except ImportError:
     CLAUDE_AGENT_SDK_AVAILABLE = False
     ClaudeSDKClient: Any = None
+    _managed_client_type = None
     ClaudeAgentOptions: Any = None
     AgentDefinition: Any = None
 
@@ -706,6 +727,8 @@ async def _run_auth_status_subprocess(
     child_env: Mapping[str, str],
     cwd: str,
     setting_sources: Sequence[SettingSource],
+    *,
+    on_teardown: Callable[[], None] | None = None,
 ) -> tuple[bytes, bytes, int]:
     """Run ``claude --setting-sources=<tiers> auth status --json`` with a hard timeout.
 
@@ -757,6 +780,8 @@ async def _run_auth_status_subprocess(
     try:
         process = await asyncio.shield(spawn_task)
     except asyncio.CancelledError:
+        if on_teardown is not None:
+            on_teardown()
         # Our own await was cancelled, but the shielded spawn keeps running.
         # Recover the process handle (if the spawn itself did not also fail)
         # so it can be reaped instead of leaked, then re-raise.
@@ -778,10 +803,14 @@ async def _run_auth_status_subprocess(
             timeout=_CLAUDE_AUTH_TIMEOUT,
         )
     except TimeoutError:
+        if on_teardown is not None:
+            on_teardown()
         process.kill()
         await process.wait()
         raise
     except BaseException:
+        if on_teardown is not None:
+            on_teardown()
         with contextlib.suppress(Exception):
             process.kill()
         with contextlib.suppress(Exception):
@@ -1421,6 +1450,214 @@ def _resolve_skill_plugins(
     return skill_names, [{"type": "local", "path": path} for path in plugin_paths]
 
 
+class _ManagedSDKClient(Protocol):
+    async def connect(self) -> None: ...
+
+    async def disconnect(self) -> None: ...
+
+
+class _ManagedSDKOptions(Protocol):
+    cli_path: str | Path | None
+
+
+class _ManagedClaudeResource:
+    """Own one invocation's native operations through terminal process proof.
+
+    Mutable state records attempted startup, not just successful connections.
+    The native client owner is separate from the calling session so its release
+    barrier never contains the task awaiting that barrier.
+    """
+
+    def __init__(self, workspace: ManagedWorkspaceContext) -> None:
+        self.workspace = workspace
+        self.invocation = "claude-sdk-" + uuid4().hex
+        self.stop = asyncio.Event()
+        self.ready = asyncio.Event()
+        self.owner: asyncio.Future[None] | None = None
+        self.connect_error: BaseException | None = None
+        self.primary_error: Exception | asyncio.CancelledError | None = None
+        self.cleanup_error: BaseException | None = None
+        self.uncertain = False
+
+    def begin_teardown(self) -> None:
+        scopes = self.workspace.process_scopes
+        scopes.begin_teardown(self.invocation, deadline=scopes.owners.deadline(self.invocation))
+        self.stop.set()
+
+    def register[T](self, operation: Awaitable[T]) -> asyncio.Future[T]:
+        task = asyncio.ensure_future(operation)
+        try:
+            self.workspace.process_scopes.owners.register(self.invocation, task)
+        except Exception:
+            # Registration is synchronous: cancellation here precedes first spawn.
+            task.cancel()
+            raise
+        return task
+
+    async def observe[T](self, task: asyncio.Future[T]) -> T:
+        """Observe a registered owner without waiting for cancellation acknowledgement."""
+        scopes = self.workspace.process_scopes
+        terminal = asyncio.create_task(scopes.owners.wait_terminal(self.invocation))
+        try:
+            try:
+                await asyncio.wait({task, terminal}, return_when=asyncio.FIRST_COMPLETED)
+                if not await scopes.owners.observe(self.invocation, task):
+                    self.uncertain = True
+                    raise ProviderError(
+                        "Managed Claude SDK owner release is unconfirmed", is_retryable=False
+                    )
+                return task.result()
+            except asyncio.CancelledError:
+                self.begin_teardown()
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await scopes.owners.observe(self.invocation, task)
+                raise
+        finally:
+            terminal.cancel()
+
+    async def run[T](self, operation: Awaitable[T]) -> T:
+        return await self.observe(self.register(operation))
+
+    async def start_client(
+        self, client: _ManagedSDKClient, options: _ManagedSDKOptions, auth: EffectiveAuthContext
+    ) -> None:
+        async def own_client() -> None:
+            try:
+                if auth.cli_path is None:
+                    raise ProviderError(
+                        "Managed Claude SDK requires a resolved CLI", is_retryable=False
+                    )
+                launch = await self.workspace.process_scopes.wrap_stdio(
+                    self.invocation,
+                    ProcessLaunchSpec(
+                        (str(auth.cli_path),), auth.finalized_child_env, auth.resolved_cwd
+                    ),
+                )
+                options.cli_path = launch.argv[0]
+                await client.connect()
+            except (Exception, asyncio.CancelledError) as exc:
+                self.connect_error = exc
+            finally:
+                self.ready.set()
+            try:
+                if self.connect_error is None:
+                    await self.stop.wait()
+            finally:
+                self.begin_teardown()
+                try:
+                    await client.disconnect()
+                except (Exception, asyncio.CancelledError) as exc:
+                    self.cleanup_error = exc
+                    logger.warning(
+                        "claude-agent-sdk: managed native disconnect failed (invocation=%s): %s",
+                        self.invocation,
+                        self.workspace.process_scopes.scrub(
+                            "".join(traceback.format_exception(exc))
+                        ),
+                    )
+
+        self.owner = self.register(own_client())
+        await self.run(self.ready.wait())
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    async def race[T](
+        self,
+        operation: Awaitable[T],
+        interrupt: asyncio.Event | None,
+        deadline: float | None,
+    ) -> T | _ReadOutcome:
+        """Race execution signals while retaining the actual SDK operation owner."""
+        task = self.register(operation)
+        terminal = asyncio.create_task(
+            self.workspace.process_scopes.owners.wait_terminal(self.invocation)
+        )
+        signal = asyncio.create_task(interrupt.wait()) if interrupt is not None else None
+        watchers: set[asyncio.Future[T] | asyncio.Task[ShutdownResult] | asyncio.Task[bool]] = {
+            task,
+            terminal,
+        }
+        if signal is not None:
+            watchers.add(signal)
+        try:
+            try:
+                done, _ = await asyncio.wait(
+                    watchers,
+                    timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if task in done:
+                    result = await self.observe(task)
+                    if self.stop.is_set():
+                        raise ProviderError(
+                            "Managed Claude SDK invocation closed during execution",
+                            is_retryable=False,
+                        )
+                    return result
+                self.begin_teardown()
+                task.cancel()
+                if not await self.workspace.process_scopes.owners.observe(self.invocation, task):
+                    self.uncertain = True
+                    raise ProviderError(
+                        "Managed Claude SDK operation did not join", is_retryable=False
+                    )
+                if not task.cancelled():
+                    task.result()
+                return _READ_INTERRUPTED if signal in done else _READ_TIMED_OUT
+            except asyncio.CancelledError:
+                self.begin_teardown()
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.observe(task)
+                raise
+        finally:
+            terminal.cancel()
+            if signal is not None:
+                signal.cancel()
+
+    async def close(self) -> None:
+        self.begin_teardown()
+        scopes = self.workspace.process_scopes
+        cancelled: asyncio.CancelledError | None = None
+        if self.owner is not None:
+            try:
+                if not await scopes.owners.observe(self.invocation, self.owner):
+                    self.uncertain = True
+                else:
+                    self.owner.result()
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        try:
+            result = await scopes.await_release(self.invocation)
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+            # await_release only re-raises after the terminal event was observed.
+            result = await scopes.owners.wait_terminal(self.invocation)
+        if result.status != "released" or self.uncertain:
+            self.uncertain = True
+            if cancelled is not None:
+                raise cancelled
+            raise ProviderError("Managed Claude SDK release is unconfirmed", is_retryable=False)
+        if cancelled is not None:
+            raise cancelled
+
+
+@dataclasses.dataclass(slots=True)
+class _ManagedClaudeWorkspace:
+    """Keep attempted resources and sticky release state for one incarnation."""
+
+    context: ManagedWorkspaceContext
+    resources: list[_ManagedClaudeResource] = dataclasses.field(default_factory=list)
+    sealed: bool = False
+    failed: bool = False
+
+    def resource(self) -> _ManagedClaudeResource:
+        resource = _ManagedClaudeResource(self.context)
+        self.resources.append(resource)
+        return resource
+
+
 class ClaudeAgentSdkProvider(AgentProvider):
     """Claude Agent SDK provider.
 
@@ -1502,6 +1739,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # rather than being stamped individually as they are for Copilot:
         # the SDK's ``McpStdioServerConfig`` has no cwd field.
         working_dir=True,
+        managed_local_workspace=True,
         # ``settings_dir`` reaches ``ClaudeAgentOptions.add_dirs``, the CLI's
         # ``--add-dir``. It is the only provider that has anywhere to put it.
         settings_dir=True,
@@ -1632,6 +1870,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # Slots currently executing, so a second execution cannot resume a
         # session the first still has open — see :meth:`_claim_session_slot`.
         self._in_flight_sessions: set[tuple[str, str]] = set()
+        self._managed_workspaces: dict[str, _ManagedClaudeWorkspace] = {}
         if get_session_info is None or project_key_for_directory is None:
             _warn_if_session_lookup_unavailable()
 
@@ -1768,7 +2007,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         )
 
     async def _check_auth_readiness(
-        self, context: EffectiveAuthContext | None = None
+        self,
+        context: EffectiveAuthContext | None = None,
+        *,
+        managed: _ManagedClaudeResource | None = None,
     ) -> ClaudeAuthStatus:
         """Return whether ``context``'s authentication path is ready.
 
@@ -1878,12 +2120,34 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
 
         try:
-            stdout_bytes, stderr_bytes, returncode = await _run_auth_status_subprocess(
-                cli_path,
-                context.finalized_child_env,
-                context.resolved_cwd,
-                context.setting_sources,
-            )
+            if managed is None:
+                stdout_bytes, stderr_bytes, returncode = await _run_auth_status_subprocess(
+                    cli_path,
+                    context.finalized_child_env,
+                    context.resolved_cwd,
+                    context.setting_sources,
+                )
+            else:
+
+                async def own_auth() -> tuple[bytes, bytes, int]:
+                    launch = await managed.workspace.process_scopes.wrap_stdio(
+                        managed.invocation,
+                        ProcessLaunchSpec(
+                            (str(cli_path),), context.finalized_child_env, context.resolved_cwd
+                        ),
+                    )
+                    return await _run_auth_status_subprocess(
+                        Path(launch.argv[0]),
+                        context.finalized_child_env,
+                        context.resolved_cwd,
+                        context.setting_sources,
+                        on_teardown=managed.begin_teardown,
+                    )
+
+                try:
+                    stdout_bytes, stderr_bytes, returncode = await managed.run(own_auth())
+                finally:
+                    await managed.close()
         except TimeoutError:
             return ClaudeAuthStatus(
                 requested_mode=mode,
@@ -2009,6 +2273,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Run one agent, holding its ``session_key`` slot for the duration.
 
@@ -2036,6 +2301,75 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # different environments, cwds, settings tiers, or CLI binaries. The
         # agent is passed so its ``skills: []`` opt-out shapes both.
         auth_context = self._capture_auth_context(resolved_cwd, agent)
+
+        if managed_workspace is not None:
+            workspace = self._managed_workspaces.get(managed_workspace.root)
+            if workspace is None:
+                workspace = _ManagedClaudeWorkspace(managed_workspace)
+                self._managed_workspaces[managed_workspace.root] = workspace
+            if (
+                workspace.sealed
+                or workspace.failed
+                or any(resource.uncertain for resource in workspace.resources)
+                or workspace.context.incarnation != managed_workspace.incarnation
+                or workspace.context.process_scopes is not managed_workspace.process_scopes
+            ):
+                raise ProviderError("Stale or sealed managed Claude workspace", is_retryable=False)
+            slot = (session_key, resolved_cwd) if session_key is not None else None
+            if slot is not None:
+                self._claim_session_slot(agent, slot)
+            call = workspace.resource()
+            session = workspace.resource()
+            auth = workspace.resource()
+            try:
+                return await call.run(
+                    self._execute_session(
+                        agent=agent,
+                        resolved_cwd=resolved_cwd,
+                        rendered_prompt=rendered_prompt,
+                        tools=tools,
+                        interrupt_signal=interrupt_signal,
+                        event_callback=event_callback,
+                        skill_directories=skill_directories,
+                        custom_agents=custom_agents,
+                        extra_mcp_servers=extra_mcp_servers,
+                        suppress_mcp_servers=suppress_mcp_servers,
+                        auth_context=auth_context,
+                        managed_session=session,
+                        managed_auth=auth,
+                    )
+                )
+            except ProviderError:
+                if call.uncertain and session.primary_error is not None:
+                    match session.primary_error:
+                        case (ProviderError() | asyncio.CancelledError()) as error:
+                            raise error from error.__cause__
+                        case Exception() as error:
+                            raise ProviderError(
+                                f"Claude Agent SDK execution error: {error}",
+                                suggestion=_classify_error_suggestion(error),
+                                is_retryable=_is_retryable_exception(error),
+                            ) from error
+                        case unreachable:
+                            assert_never(unreachable)
+                raise
+            finally:
+                try:
+                    primary = sys.exc_info()[1]
+                    try:
+                        await call.close()
+                    except ProviderError as error:
+                        if primary is None:
+                            raise
+                        logger.warning(
+                            "claude-agent-sdk: managed execution cleanup unconfirmed: %s",
+                            call.workspace.process_scopes.scrub(
+                                "".join(traceback.format_exception(error))
+                            ),
+                        )
+                finally:
+                    if slot is not None:
+                        self._in_flight_sessions.discard(slot)
 
         if session_key is None:
             return await self._execute_session(
@@ -2148,6 +2482,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         suppress_mcp_servers: bool = False,
+        managed_session: _ManagedClaudeResource | None = None,
+        managed_auth: _ManagedClaudeResource | None = None,
     ) -> AgentOutput:
         if ClaudeSDKClient is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
@@ -2224,9 +2560,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
         )
 
         session_key = agent.session_key
-        resume_session_id = (
-            await self._resolve_resume_session(session_key, resolved_cwd) if session_key else None
-        )
+        if session_key and managed_session is not None:
+            resume_session_id = await self._resolve_resume_session(
+                session_key, resolved_cwd, managed=True
+            )
+        else:
+            resume_session_id = (
+                await self._resolve_resume_session(session_key, resolved_cwd)
+                if session_key
+                else None
+            )
 
         content_parts: list[str] = []
         structured_output: Any = None
@@ -2237,22 +2580,30 @@ class ClaudeAgentSdkProvider(AgentProvider):
         last_call_input_tokens: int | None = None
         result_model: str | None = model
 
-        auth_task = asyncio.create_task(self._check_auth_readiness(context=auth_context))
-        try:
-            await auth_task
-        except asyncio.CancelledError:
-            # Outer task cancellation (Esc/Ctrl+G, workflow timeout, etc.) must
-            # still terminate and reap the preflight subprocess rather than
-            # leaking it — but the preflight is no longer raced against
-            # interrupt_signal (see module docstring / ticket
-            # TICKET-20260816-0002): interrupt-vs-preflight *ordering* is
-            # deliberately out of scope here (TICKET-20260816-0004).
-            auth_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+        if managed_auth is not None:
+            try:
+                auth_status = await self._check_auth_readiness(
+                    context=auth_context, managed=managed_auth
+                )
+            finally:
+                await managed_auth.close()
+        else:
+            auth_task = asyncio.create_task(self._check_auth_readiness(context=auth_context))
+            try:
                 await auth_task
-            raise
+            except asyncio.CancelledError:
+                # Outer task cancellation (Esc/Ctrl+G, workflow timeout, etc.) must
+                # still terminate and reap the preflight subprocess rather than
+                # leaking it — but the preflight is no longer raced against
+                # interrupt_signal (see module docstring / ticket
+                # TICKET-20260816-0002): interrupt-vs-preflight *ordering* is
+                # deliberately out of scope here (TICKET-20260816-0004).
+                auth_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await auth_task
+                raise
 
-        auth_status = auth_task.result()
+            auth_status = auth_task.result()
         if not auth_status.ready:
             raise ProviderError(
                 f"Agent '{agent.name}' authentication preflight failed: "
@@ -2556,7 +2907,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
             if deadline is not None and time.monotonic() > deadline:
                 raise _session_timeout_error(agent.name, max_session_seconds, turn_count)
 
-            client = ClaudeSDKClient(options)
+            if managed_session is not None:
+                if _managed_client_type is None:
+                    raise ProviderError("Managed Claude SDK client unavailable", is_retryable=False)
+                client = _managed_client_type(options)
+                client.resource = managed_session
+            else:
+                client = ClaudeSDKClient(options)
 
             # S1 -- connect. Never cancelled by a signal, and this is the one
             # place that asymmetry is load-bearing: the SDK adds the spawned
@@ -2566,9 +2923,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # leave a live CLI with no public handle to reach it. The cost is
             # that a signal raised during startup is honoured once the CLI has
             # finished starting, which the SDK does not bound.
-            connect_task = asyncio.ensure_future(client.connect())
-            connect_cancelled = await _await_uncancellable(connect_task)
-            connect_error = _task_failure(connect_task)
+            if managed_session is not None:
+                await managed_session.start_client(client, options, auth_context)
+                connect_cancelled = None
+                connect_error = None
+            else:
+                connect_task = asyncio.ensure_future(client.connect())
+                connect_cancelled = await _await_uncancellable(connect_task)
+                connect_error = _task_failure(connect_task)
 
             if connect_cancelled is not None:
                 # Outer cancellation outranks everything, including an SDK error
@@ -2596,12 +2958,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # S2 -- send the prompt. Safe to cancel: the session exists now, so
             # ``disconnect()`` owns cleanup, and a half-written stdin line is
             # harmless once stdin is closed and the session abandoned.
-            sent = await _race_signals(
-                lambda: client.query(rendered_prompt, session_id=""),
-                interrupt_signal,
-                deadline,
-                describe="send",
-            )
+            if managed_session is not None:
+                sent = await managed_session.race(
+                    client.query(rendered_prompt, session_id=""), interrupt_signal, deadline
+                )
+            else:
+                sent = await _race_signals(
+                    lambda: client.query(rendered_prompt, session_id=""),
+                    interrupt_signal,
+                    deadline,
+                    describe="send",
+                )
             if sent is _READ_INTERRUPTED:
                 return _partial_output()
             if sent is _READ_TIMED_OUT:
@@ -2614,7 +2981,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
             while True:
                 # Reads the next message, pre-empting a blocked read when the
                 # interrupt fires or the absolute deadline passes.
-                message = await _next_message_or_sentinel(agen, interrupt_signal, deadline)
+                if managed_session is not None:
+                    message = await managed_session.race(
+                        anext(agen, _READ_EXHAUSTED), interrupt_signal, deadline
+                    )
+                else:
+                    message = await _next_message_or_sentinel(agen, interrupt_signal, deadline)
                 if message is _READ_EXHAUSTED:
                     break
                 if message is _READ_INTERRUPTED:
@@ -2750,18 +3122,25 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
             completed_normally = True
 
-        except ProviderError:
+        except ProviderError as exc:
+            if managed_session is not None:
+                managed_session.primary_error = exc
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             # Do NOT translate into ProviderError — upstream interrupt
             # handlers rely on CancelledError to unwind cleanly.
+            if managed_session is not None:
+                managed_session.primary_error = exc
             raise
         except Exception as e:
-            raise ProviderError(
+            error = ProviderError(
                 f"Claude Agent SDK execution error: {e}",
                 suggestion=_classify_error_suggestion(e),
                 is_retryable=_is_retryable_exception(e),
-            ) from e
+            )
+            if managed_session is not None:
+                managed_session.primary_error = error
+            raise error from e
         finally:
             # S4 then S5. The nesting is what makes the ordering a guarantee
             # rather than a happy path: the config file holds resolved MCP
@@ -2785,9 +3164,24 @@ class ClaudeAgentSdkProvider(AgentProvider):
                             await aclose()
 
                 if client is not None:
-                    shutdown_failure, shutdown_cancelled = await _shutdown_sdk_client(
-                        client, agent_name=agent.name
-                    )
+                    if managed_session is not None:
+                        primary = sys.exc_info()[1]
+                        try:
+                            await managed_session.close()
+                        except ProviderError as error:
+                            if primary is None:
+                                raise
+                            logger.warning(
+                                "claude-agent-sdk: managed session cleanup unconfirmed: %s",
+                                managed_session.workspace.process_scopes.scrub(
+                                    "".join(traceback.format_exception(error))
+                                ),
+                            )
+                        shutdown_cancelled = None
+                    else:
+                        shutdown_failure, shutdown_cancelled = await _shutdown_sdk_client(
+                            client, agent_name=agent.name
+                        )
                     if shutdown_cancelled is not None:
                         # Outer cancellation outranks every other outcome, but
                         # only now that the CLI has actually been shut down.
@@ -2853,6 +3247,68 @@ class ClaudeAgentSdkProvider(AgentProvider):
     async def close(self) -> None:
         pass
 
+    async def release_workspace(self, workspace_root: str) -> None:
+        """Release this provider's invocation resources, never the outer root barrier."""
+        workspace = self._managed_workspaces.get(workspace_root)
+        if workspace is None or workspace.failed:
+            raise ProviderError(
+                "Unknown or unconfirmed managed Claude workspace", is_retryable=False
+            )
+        workspace.sealed = True
+        for resource in workspace.resources:
+            resource.begin_teardown()
+        try:
+            for resource in workspace.resources:
+                await resource.close()
+        except (Exception, asyncio.CancelledError):
+            workspace.failed = True
+            raise
+
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
+    ) -> str:
+        """Run a fresh managed dialog in the caller's explicitly selected namespace.
+
+        ``working_dir`` is the already-mapped native staged cwd, required for
+        managed calls. The ownership context does not select a namespace.
+        Legacy calls keep the original four positional arguments.
+        """
+        if managed_workspace is None:
+            return await super().execute_dialog_turn(system_prompt, user_message, history, model)
+        if not working_dir:
+            raise ProviderError(
+                "Managed Claude SDK dialog requires an explicit working_dir", is_retryable=False
+            )
+        from conductor.config.schema import AgentDef
+
+        prompt = "\n".join(
+            [*(f"{item['role']}: {item['content']}" for item in history or []), user_message]
+        )
+        output = await self.execute(
+            AgentDef(
+                name="dialog",
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=model,
+                working_dir=working_dir,
+                timeout_seconds=None,
+                max_session_seconds=None,
+                max_agent_iterations=None,
+            ),
+            {},
+            prompt,
+            suppress_mcp_servers=True,
+            managed_workspace=managed_workspace,
+        )
+        return str(output.content["response"])
+
     def get_session_ids(self) -> dict[str, str]:
         """Return the Claude session id recorded for each session.
 
@@ -2911,7 +3367,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
             restored[(key, cwd)] = sid
         self._resume_session_ids = restored
 
-    async def _resolve_resume_session(self, session_key: str, cwd: str) -> str | None:
+    async def _resolve_resume_session(
+        self, session_key: str, cwd: str, *, managed: bool = False
+    ) -> str | None:
         """Return the session id to resume for ``session_key``, if usable.
 
         A session recorded this run takes precedence over one restored from a
@@ -2946,7 +3404,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # Off the event loop: on a miss ``get_session_info`` falls through to
         # a `git worktree list` subprocess (5s timeout), which would otherwise
         # stall every concurrently running agent.
-        if not await asyncio.to_thread(self._session_transcript_exists, session_id, cwd):
+        if managed:
+            # The SDK fallback may run an unowned `git worktree list` process.
+            # Managed sessions require the exact same-cwd transcript instead.
+            exists = self._session_transcript_exists(session_id, cwd, exact_only=True)
+        else:
+            exists = await asyncio.to_thread(self._session_transcript_exists, session_id, cwd)
+        if not exists:
             logger.warning(
                 "Claude session %s for session_key '%s' could not be found under %s "
                 "(the CLI prunes transcripts on its own schedule); starting a fresh session.",
@@ -2965,7 +3429,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         return session_id
 
     @staticmethod
-    def _session_transcript_exists(session_id: str, cwd: str) -> bool:
+    def _session_transcript_exists(session_id: str, cwd: str, *, exact_only: bool = False) -> bool:
         """Report whether ``session_id`` has a transcript resumable from ``cwd``.
 
         Checks the exact on-disk path the CLI uses,
@@ -2986,7 +3450,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 if transcript.is_file():
                     return True
 
-            if get_session_info is None:
+            if exact_only or get_session_info is None:
                 return False
             info = get_session_info(session_id, directory=cwd)
             if info is None:

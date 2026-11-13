@@ -19,6 +19,7 @@ from conductor.exceptions import ProviderError
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
     from conductor.engine.pricing import ModelPricing
+    from conductor.execution.types import ManagedWorkspaceContext
     from conductor.providers.capabilities import ProviderCapabilities
 
 # Type alias for event callbacks that receive structured SDK events.
@@ -424,6 +425,21 @@ class AgentProvider(ABC):
                 f"with `class {cls.__name__}(AgentProvider, abstract=True)`."
             )
 
+        if caps.managed_local_workspace:
+            import inspect
+
+            parameter = inspect.signature(cls.execute).parameters.get("managed_workspace")
+            if parameter is None or parameter.kind is not inspect.Parameter.KEYWORD_ONLY:
+                raise TypeError(
+                    f"{cls.__name__} declares managed_local_workspace=True "
+                    "but execute() lacks keyword-only managed_workspace"
+                )
+            if cls.release_workspace is AgentProvider.release_workspace:
+                raise TypeError(
+                    f"{cls.__name__} declares managed_local_workspace=True "
+                    "but does not implement release_workspace()"
+                )
+
         if caps.plugins:
             import inspect
 
@@ -469,6 +485,7 @@ class AgentProvider(ABC):
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -528,6 +545,12 @@ class AgentProvider(ABC):
                 authored call keeps its current behavior. Providers that
                 declare ``mcp_tools`` MUST honor it; providers without MCP
                 support ignore it.
+            managed_workspace: Explicit managed-local ownership context, including
+                continuation calls. Pass only for opted-in managed execution;
+                omit the keyword entirely on legacy calls. A supporting adapter
+                must register resources before startup under root and incarnation,
+                retain failed/cancelled startup handles, and never silently ignore
+                this context. Providers without the capability must refuse it.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -544,6 +567,9 @@ class AgentProvider(ABC):
         user_message: str,
         history: list[dict[str, str]] | None = None,
         model: str | None = None,
+        *,
+        managed_workspace: ManagedWorkspaceContext | None = None,
+        working_dir: str | None = None,
     ) -> str:
         """Execute a single dialog turn for agent-user conversation.
 
@@ -558,6 +584,13 @@ class AgentProvider(ABC):
                 ``{"role": "user"|"assistant", "content": "..."}`` dicts.
             model: Optional model override. If not provided, uses the
                 provider's default model.
+            managed_workspace: The same explicit ownership context as execute;
+                omitted on legacy calls. Supporting dialog adapters must retain
+                its cwd and resource ownership guarantees.
+            working_dir: Explicit resolved native cwd inside the staged work tree,
+                required for managed dialog calls. The caller maps the selected
+                namespace before dispatch; the ownership context does not select
+                a cwd. Omit this keyword on legacy calls.
 
         Returns:
             The agent's response text.
@@ -566,6 +599,25 @@ class AgentProvider(ABC):
             ProviderError: If the dialog turn fails.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support dialog turns")
+
+    async def release_workspace(self, workspace_root: str) -> None:
+        """Release only the registered resources belonging to this managed root.
+
+        Normal return confirms sealed launches, complete process proofs and joined
+        resource owners, including failed/cancelled startup attempts. Empty
+        successful-session pools do not establish release. Uncertainty must raise
+        and remain sticky; late completion cannot reverse a terminal failure.
+        API close errors with complete proof and owner join remain visible warnings,
+        not missing-proof failures. Never close the provider, shared HTTP clients
+        or another root. Direct injected providers use this same hook.
+
+        Raises:
+            ProviderError: Targeted managed release is unsupported by default.
+        """
+        raise ProviderError(
+            f"{type(self).__name__} does not support managed workspace release",
+            is_retryable=False,
+        )
 
     @abstractmethod
     async def validate_connection(self) -> bool:

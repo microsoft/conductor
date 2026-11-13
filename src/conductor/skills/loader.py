@@ -123,12 +123,14 @@ def _cached_skill_payload(skill_dir_str: str, name: str) -> str:
     return f'<skill name="{name}">\n{body}\n</skill>'
 
 
-def load_skill_content(skills: list[tuple[str, Path]]) -> str:
+def load_skill_content(skills: list[tuple[str, Path]], *, cache: bool = True) -> str:
     """Load and concatenate skill content for eager preamble injection.
 
     Args:
         skills: List of ``(skill_name, skill_dir)`` tuples in
             presentation order.
+        cache: Reuse immutable host payloads. Mutable managed work trees
+            read their selected files afresh without clearing the host cache.
 
     Returns:
         A single string containing every skill's ``SKILL.md`` plus
@@ -136,11 +138,8 @@ def load_skill_content(skills: list[tuple[str, Path]]) -> str:
         tags and prefaced with a header describing the section. Returns
         an empty string when no skills produce any content.
     """
-    payloads = [
-        payload
-        for name, skill_dir in skills
-        if (payload := _cached_skill_payload(str(skill_dir), name))
-    ]
+    load = _cached_skill_payload if cache else _cached_skill_payload.__wrapped__
+    payloads = [payload for name, skill_dir in skills if (payload := load(str(skill_dir), name))]
     if not payloads:
         return ""
     body = "\n\n".join(payloads)

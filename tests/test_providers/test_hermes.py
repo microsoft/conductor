@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
@@ -102,6 +103,29 @@ class TestHermesValidateConnection:
 
 
 class TestHermesExecute:
+    async def test_managed_workspace_refused_before_sdk(self, tmp_path: Path) -> None:
+        # Requirement: managed context is refused before model resolution or SDK construction.
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext
+
+        controller = LocalProcessScopeController(str(tmp_path), "unsupported-hermes")
+        context = ManagedWorkspaceContext(str(tmp_path), "unsupported-hermes", controller)
+        provider = object.__new__(HermesProvider)
+        try:
+            with (
+                patch("conductor.providers.hermes.AIAgent") as sdk,
+                pytest.raises(ProviderError) as error,
+            ):
+                await provider.execute(_make_agent(), {}, "hello", managed_workspace=context)
+            assert error.value.is_retryable is False
+            assert error.value.provider_name == "hermes"
+            assert provider.CAPABILITIES is not None
+            assert not provider.CAPABILITIES.managed_local_workspace
+            sdk.assert_not_called()
+            assert controller.proofs == ()
+        finally:
+            assert (await controller.close()).status == "released"
+
     @pytest.fixture()
     def provider(self) -> HermesProvider:
         with (
@@ -113,7 +137,9 @@ class TestHermesExecute:
     def _run(self, coro: Any) -> Any:
         return asyncio.run(coro)
 
-    def test_plain_text_no_schema(self, provider: HermesProvider) -> None:
+    @pytest.mark.parametrize("explicit_none", [False, True])
+    def test_plain_text_no_schema(self, provider: HermesProvider, explicit_none: bool) -> None:
+        # Requirement: explicit None keeps the legacy SDK payload and output.
         agent = _make_agent()
         result_dict = _make_result(final_response="world")
 
@@ -122,7 +148,13 @@ class TestHermesExecute:
             mock_instance.run_conversation.return_value = result_dict
             mock_cls.return_value = mock_instance
 
-            output = self._run(provider.execute(agent, {}, "say hello"))
+            if explicit_none:
+                output = self._run(provider.execute(agent, {}, "say hello", managed_workspace=None))
+            else:
+                output = self._run(provider.execute(agent, {}, "say hello"))
+            mock_cls.assert_called_once_with(
+                quiet_mode=True, model="anthropic/claude-sonnet-4", max_iterations=10
+            )
 
         assert output.content == {"text": "world"}
         assert output.raw_response["final_response"] == "world"

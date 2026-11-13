@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -350,7 +351,10 @@ def _validate_servers(servers: dict[str, Any], source: Path) -> dict[str, Any]:
 
 
 def _load_mcp_servers(
-    root: Path, parsed: dict[str, Any], manifest: Path
+    root: Path,
+    parsed: dict[str, Any],
+    manifest: Path,
+    source_mapper: Callable[[Path, Path], Path] | None = None,
 ) -> tuple[dict[str, Any], Path | None]:
     """Resolve a plugin's MCP server declarations.
 
@@ -383,6 +387,8 @@ def _load_mcp_servers(
                 f"Plugin manifest at {manifest} declares an empty 'mcpServers' path."
             )
         source = root / declared
+        if source_mapper is not None:
+            source = source_mapper(root, source)
         try:
             payload = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -409,6 +415,8 @@ def _load_mcp_servers(
         # resolving an unreadable declaration as "no servers" (issue #540).
         if not is_file_strict(fallback):
             return {}, None
+        if source_mapper is not None:
+            fallback = source_mapper(root, fallback)
         payload = json.loads(fallback.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise PluginManifestError(
@@ -439,7 +447,12 @@ def read_manifest_name(manifest: Path) -> str:
     return _read_manifest_name(manifest, _parse_manifest_json(manifest))
 
 
-def read_plugin_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> PluginManifest:
+def read_plugin_manifest(
+    root: Path,
+    *,
+    prefer: PluginFlavor | None = None,
+    mcp_source_mapper: Callable[[Path, Path], Path] | None = None,
+) -> PluginManifest:
     """Read the manifest of the plugin rooted at ``root``.
 
     Args:
@@ -449,6 +462,8 @@ def read_plugin_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> P
             convention. Only meaningful when both actually exist, which
             no observed plugin does; passed through to :func:`find_manifest`
             regardless so the probe order is consistent either way.
+        mcp_source_mapper: Per-call translation/validation of the typed MCP
+            config-file source before reading it. Does not transform server values.
 
     Returns:
         The parsed :class:`PluginManifest`, with :attr:`PluginManifest.flavor`
@@ -465,7 +480,7 @@ def read_plugin_manifest(root: Path, *, prefer: PluginFlavor | None = None) -> P
         conventions = ", ".join(str(candidate) for candidate in PLUGIN_MANIFESTS)
         raise PluginManifestError(f"{root} is not a plugin: it contains none of {conventions}.")
     parsed = _parse_manifest_json(manifest)
-    mcp_servers, mcp_source = _load_mcp_servers(root, parsed, manifest)
+    mcp_servers, mcp_source = _load_mcp_servers(root, parsed, manifest, mcp_source_mapper)
     return PluginManifest(
         name=_read_manifest_name(manifest, parsed),
         root=root,

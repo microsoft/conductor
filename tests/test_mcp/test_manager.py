@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -77,6 +79,9 @@ class _TaskAffineMCP:
         self.exit_started = asyncio.Event()
         self.exit_blocker: asyncio.Event | None = None
         self.exit_error: RuntimeError | None = None
+        self.exit_finished = asyncio.Event()
+        self.exit_cancelled = asyncio.Event()
+        self.ignore_exit_cancellation = False
 
     @asynccontextmanager
     async def stdio(self, _params: Any) -> AsyncIterator[tuple[MagicMock, MagicMock]]:
@@ -87,8 +92,15 @@ class _TaskAffineMCP:
             finally:
                 self.exit_started.set()
                 if self.exit_blocker is not None:
-                    await self.exit_blocker.wait()
+                    while not self.exit_blocker.is_set():
+                        try:
+                            await self.exit_blocker.wait()
+                        except asyncio.CancelledError:
+                            self.exit_cancelled.set()
+                            if not self.ignore_exit_cancellation:
+                                raise
                 self.exits.append(asyncio.current_task())
+                self.exit_finished.set()
                 if self.exit_error is not None:
                     raise self.exit_error
 
@@ -126,6 +138,22 @@ async def _task_affine_manager() -> AsyncIterator[tuple[Any, _TaskAffineMCP]]:
         from conductor.mcp.manager import MCPManager
 
         yield MCPManager(), environment
+
+
+@pytest.fixture
+def owner_waits(monkeypatch: pytest.MonkeyPatch) -> asyncio.Queue[None]:
+    """Signal entry into each real owner observation, including cancellation re-entry."""
+    original_wait = asyncio.wait
+    entries: asyncio.Queue[None] = asyncio.Queue()
+
+    async def observed_wait(
+        tasks: Iterable[asyncio.Task[None]], *, timeout: float | None = None
+    ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+        entries.put_nowait(None)
+        return await original_wait(tasks, timeout=timeout)
+
+    monkeypatch.setattr("conductor.mcp.manager.asyncio.wait", observed_wait)
+    return entries
 
 
 class TestMCPManagerImport:
@@ -428,6 +456,55 @@ class TestMCPManagerConnectServer:
             assert manager.tool_to_server["web-search__search"] == "web-search"
             await manager.close()
 
+    async def test_managed_windows_preserves_declared_selector_and_overlay(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: managed Windows forwards declared context without ambient SDK resolution.
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
+        from conductor.mcp import manager as manager_module
+
+        controller = LocalProcessScopeController(str(tmp_path), "windows-routing")
+        manager = manager_module.MCPManager(
+            managed_workspace=ManagedWorkspaceContext(str(tmp_path), "windows-routing", controller)
+        )
+        transport = _TaskAffineMCP()
+        launches: list[ProcessLaunchSpec] = []
+
+        async def capture(_invocation: str, launch: ProcessLaunchSpec) -> ProcessLaunchSpec:
+            launches.append(launch)
+            return launch
+
+        monkeypatch.setattr(controller, "wrap_stdio", capture)
+        monkeypatch.setattr(manager_module, "sys", SimpleNamespace(platform="win32"))
+        with (
+            patch("mcp.client.stdio.get_default_environment", return_value={"PATH": r"C:\parent"}),
+            patch(
+                "mcp.os.win32.utilities.get_windows_executable_command",
+                return_value=r"C:\parent\npx.cmd",
+            ) as ambient_resolver,
+            patch.object(manager_module, "stdio_client", side_effect=transport.stdio),
+            patch.object(manager_module, "ClientSession", side_effect=transport.session),
+        ):
+            try:
+                await manager.connect_server(
+                    "fixture",
+                    "npx",
+                    ["-y", "@scope/pkg", ""],
+                    env={"Path": r"C:\declared", "MARKER": "overlay"},
+                    cwd=str(tmp_path),
+                )
+                (launch,) = launches
+                assert launch.argv == ("npx", "-y", "@scope/pkg", "")
+                assert dict(launch.env) == {"PATH": r"C:\declared", "MARKER": "overlay"}
+                assert launch.working_dir == str(tmp_path)
+                ambient_resolver.assert_not_called()
+            finally:
+                await manager.close(strict=True)
+                assert (await controller.close()).status == "released"
+                controller._accepting.join(timeout=3)
+                assert not controller._accepting.is_alive()
+
     async def test_connect_server_forwards_cwd(self, manager: Any) -> None:
         """Requirement: agent working_dir must reach the MCP server subprocess.
 
@@ -629,7 +706,9 @@ class TestMCPManagerTaskAffinity:
         assert environment.exits == environment.entries
         assert "Error cancelling MCP connection 'fs': cleanup failed" in caplog.messages
 
-    async def test_double_cancelled_connection_clears_bookkeeping(self) -> None:
+    async def test_double_cancelled_connection_clears_bookkeeping(
+        self, owner_waits: asyncio.Queue[None]
+    ) -> None:
         # Requirement: a repeated cancellation cannot leave a stale _connection_tasks entry.
         async with _task_affine_manager() as (manager, environment):
             environment.initialize_blocker = asyncio.Event()
@@ -639,8 +718,9 @@ class TestMCPManagerTaskAffinity:
 
             connection.cancel()
             await environment.exit_started.wait()
+            await owner_waits.get()
             connection.cancel()
-            await asyncio.sleep(0)
+            await owner_waits.get()
             assert not connection.done()
 
             environment.exit_blocker.set()
@@ -651,7 +731,9 @@ class TestMCPManagerTaskAffinity:
         assert "fs" not in manager._connection_tasks
         assert "fs" not in manager._connection_stops
 
-    async def test_cancelled_close_finishes_owner_task_cleanup(self) -> None:
+    async def test_cancelled_close_finishes_owner_task_cleanup(
+        self, owner_waits: asyncio.Queue[None]
+    ) -> None:
         # Requirement: cancelling shutdown cannot interrupt task-affine owner cleanup.
         async with _task_affine_manager() as (manager, environment):
             environment.exit_blocker = asyncio.Event()
@@ -659,8 +741,9 @@ class TestMCPManagerTaskAffinity:
 
             closing = asyncio.create_task(manager.close())
             await environment.exit_started.wait()
+            await owner_waits.get()
             closing.cancel()
-            await asyncio.sleep(0)
+            await owner_waits.get()
             assert not closing.done()
 
             environment.exit_blocker.set()
@@ -670,7 +753,9 @@ class TestMCPManagerTaskAffinity:
         assert manager.sessions == {}
         assert manager._connection_tasks == {}
 
-    async def test_double_cancelled_close_still_finishes_cleanup(self) -> None:
+    async def test_double_cancelled_close_still_finishes_cleanup(
+        self, owner_waits: asyncio.Queue[None]
+    ) -> None:
         # Requirement: a repeated cancellation of close() cannot orphan teardown either.
         async with _task_affine_manager() as (manager, environment):
             environment.exit_blocker = asyncio.Event()
@@ -678,16 +763,18 @@ class TestMCPManagerTaskAffinity:
 
             closing = asyncio.create_task(manager.close())
             await environment.exit_started.wait()
+            await owner_waits.get()
             closing.cancel()
-            await asyncio.sleep(0)
+            await owner_waits.get()
             closing.cancel()
-            await asyncio.sleep(0)
+            await owner_waits.get()
             assert not closing.done()
 
             environment.exit_blocker.set()
             await closing
 
         assert environment.exits == environment.entries
+
         assert manager.sessions == {}
         assert manager._connection_tasks == {}
 
@@ -701,3 +788,255 @@ class TestMCPManagerTaskAffinity:
             await manager.close()
 
         assert environment.exits == environment.entries
+
+
+class TestMCPManagerStrictLifecycle:
+    async def test_strict_close_joins_owner_and_seals_connections(self) -> None:
+        # Requirement: strict success joins the actual owner and rejects subsequent launches.
+        async with _task_affine_manager() as (manager, environment):
+            await manager.connect_server(name="fs", command="server")
+            owner_task = manager._connection_tasks["fs"]
+
+            await manager.close(strict=True)
+
+            assert owner_task.done()
+            assert environment.exits == environment.entries
+            assert manager.sessions == {}
+            assert not manager._cleanup_uncertain
+            await manager.close(strict=True)
+            with pytest.raises(RuntimeError):
+                await manager.connect_server(name="new", command="server")
+
+    async def test_strict_close_without_attempts_succeeds(self) -> None:
+        # Requirement: a manager with no attempted lifecycle has nothing to join.
+        async with _task_affine_manager() as (manager, _):
+            await manager.close(strict=True)
+            assert not manager._cleanup_uncertain
+
+    async def test_failed_startup_keeps_primary_and_failed_teardown_record(self) -> None:
+        # Requirement: failed startup retains cleanup failure even with an empty successful pool.
+        async with _task_affine_manager() as (manager, environment):
+            primary = RuntimeError("initialization failed")
+            cleanup = RuntimeError("teardown failed")
+            environment.initialize_error = primary
+            environment.exit_error = cleanup
+
+            with pytest.raises(RuntimeError) as caught:
+                await manager.connect_server(name="fs", command="server")
+
+            assert caught.value.__cause__ is primary
+            assert manager.sessions == manager._connection_tasks == {}
+            owner = next(iter(manager._owners.values()))
+            assert owner.cleanup_error is cleanup
+            assert owner.resources
+            await manager.close()
+            for _ in range(2):
+                with pytest.raises(RuntimeError):
+                    await manager.close(strict=True)
+            assert manager._cleanup_uncertain
+
+    @pytest.mark.parametrize("cancel_startup", [False, True])
+    async def test_primary_startup_failure_allows_strict_close_after_clean_unwind(
+        self, cancel_startup: bool
+    ) -> None:
+        # Requirement: a primary startup failure or cancel is not uncertain after proven cleanup.
+        async with _task_affine_manager() as (manager, environment):
+            primary = RuntimeError("initialization failed")
+            if cancel_startup:
+                environment.initialize_blocker = asyncio.Event()
+                connection = asyncio.create_task(
+                    manager.connect_server(name="fs", command="server")
+                )
+                await environment.initialize_started.wait()
+                connection.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await connection
+            else:
+                environment.initialize_error = primary
+                with pytest.raises(RuntimeError) as caught:
+                    await manager.connect_server(name="fs", command="server")
+                assert caught.value.__cause__ is primary
+
+            task, owner = next(iter(manager._owners.items()))
+            assert task.done()
+            assert owner.observed
+            assert owner.cleanup_complete
+            assert owner.cleanup_error is None
+            assert owner.finished_at is not None
+            assert owner.deadline is not None
+            assert owner.finished_at <= owner.deadline
+            assert environment.exits == environment.entries
+            assert manager.sessions == manager._connection_tasks == {}
+
+            await manager.close(strict=True)
+            await manager.close(strict=True)
+
+            assert not manager._cleanup_uncertain
+            assert owner.resources == []
+
+    async def test_cancelled_startup_keeps_failed_cleanup_sticky(self) -> None:
+        # Requirement: startup cancellation remains primary while strict release sees failed unwind.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_blocker = asyncio.Event()
+            environment.exit_error = RuntimeError("teardown failed")
+            connection = asyncio.create_task(manager.connect_server(name="fs", command="server"))
+            await environment.initialize_started.wait()
+
+            connection.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await connection
+
+            assert manager.sessions == manager._connection_tasks == {}
+            with pytest.raises(RuntimeError):
+                await manager.close(strict=True)
+            assert manager._cleanup_uncertain
+
+    async def test_legacy_warning_cannot_become_strict_success(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Requirement: successful connect and empty maps cannot hide a failed transport exit.
+        async with _task_affine_manager() as (manager, environment):
+            await manager.connect_server(name="fs", command="server")
+            environment.exit_error = RuntimeError("teardown failed")
+
+            await manager.close()
+
+            assert manager.sessions == manager._connection_tasks == {}
+            assert any(record.levelno >= logging.WARNING for record in caplog.records)
+            with pytest.raises(RuntimeError):
+                await manager.close(strict=True)
+
+    @pytest.mark.parametrize("cancel_startup", [False, True])
+    async def test_startup_cleanup_timeout_preserves_primary(
+        self, monkeypatch: pytest.MonkeyPatch, cancel_startup: bool
+    ) -> None:
+        # Requirement: stuck startup unwind is bounded without losing the primary failure or cancel.
+        async with _task_affine_manager() as (manager, environment):
+            primary = RuntimeError("initialization failed")
+            if cancel_startup:
+                environment.initialize_blocker = asyncio.Event()
+            else:
+                environment.initialize_error = primary
+            environment.exit_blocker = asyncio.Event()
+            environment.ignore_exit_cancellation = True
+            environment.exit_error = RuntimeError("late teardown failure")
+            monkeypatch.setattr("conductor.mcp.manager._CLEANUP_TIMEOUT_SECONDS", 0.0)
+            connection = asyncio.create_task(manager.connect_server(name="fs", command="server"))
+            await environment.initialize_started.wait()
+            if cancel_startup:
+                connection.cancel()
+            try:
+                done, pending = await asyncio.wait({connection}, timeout=1)
+                assert done == {connection}
+                assert not pending
+                if cancel_startup:
+                    with pytest.raises(asyncio.CancelledError):
+                        await connection
+                else:
+                    with pytest.raises(RuntimeError) as caught:
+                        await connection
+                    assert caught.value.__cause__ is primary
+                assert manager.sessions == {}
+                with pytest.raises(RuntimeError):
+                    await manager.close(strict=True)
+            finally:
+                environment.exit_blocker.set()
+                _, pending = await asyncio.wait(set(manager._owners), timeout=1)
+                assert not pending
+
+            owner = next(iter(manager._owners.values()))
+            assert owner.observed
+            assert owner.cleanup_error is environment.exit_error
+            with pytest.raises(RuntimeError):
+                await manager.close(strict=True)
+
+    @pytest.mark.parametrize("late_failure", [False, True])
+    async def test_expired_owner_stays_uncertain_after_late_completion(
+        self, monkeypatch: pytest.MonkeyPatch, late_failure: bool
+    ) -> None:
+        # Requirement: bounded observation retains resistant owners and never upgrades late proof.
+        from conductor.mcp.manager import _PENDING_LIFECYCLES
+
+        async with _task_affine_manager() as (manager, environment):
+            await manager.connect_server(name="fs", command="server")
+            task = manager._connection_tasks["fs"]
+            environment.exit_blocker = asyncio.Event()
+            environment.ignore_exit_cancellation = True
+            if late_failure:
+                environment.exit_error = RuntimeError("late teardown failure")
+            monkeypatch.setattr("conductor.mcp.manager._CLEANUP_TIMEOUT_SECONDS", 0.0)
+
+            with pytest.raises(RuntimeError):
+                await manager.close(strict=True)
+
+            try:
+                await environment.exit_started.wait()
+                assert task in _PENDING_LIFECYCLES
+                assert manager._owners[task].resources
+                task.cancel()
+                await environment.exit_cancelled.wait()
+                assert not task.done()
+                with pytest.raises(RuntimeError):
+                    await manager.close(strict=True)
+            finally:
+                environment.exit_blocker.set()
+                done, pending = await asyncio.wait({task}, timeout=1)
+                assert done == {task}
+                assert not pending
+
+            assert task not in _PENDING_LIFECYCLES
+            assert manager._owners[task].observed
+            assert manager._cleanup_uncertain
+            assert bool(manager._owners[task].cleanup_error) is late_failure
+            with pytest.raises(RuntimeError):
+                await manager.close(strict=True)
+
+    async def test_repeated_cancel_does_not_replace_primary_failure(
+        self, owner_waits: asyncio.Queue[None]
+    ) -> None:
+        # Requirement: repeated cancellation while unwinding cannot replace the startup error.
+        async with _task_affine_manager() as (manager, environment):
+            primary = RuntimeError("initialization failed")
+            environment.initialize_error = primary
+            environment.exit_error = RuntimeError("teardown failed")
+            environment.exit_blocker = asyncio.Event()
+            connection = asyncio.create_task(manager.connect_server(name="fs", command="server"))
+            await environment.exit_started.wait()
+            await owner_waits.get()
+
+            for _ in range(2):
+                connection.cancel()
+                await owner_waits.get()
+            environment.exit_blocker.set()
+            with pytest.raises(RuntimeError) as caught:
+                await connection
+
+            assert caught.value.__cause__ is primary
+            with pytest.raises(RuntimeError):
+                await manager.close(strict=True)
+
+    async def test_strict_close_preserves_cancellation_after_join(
+        self, owner_waits: asyncio.Queue[None]
+    ) -> None:
+        # Requirement: strict close joins through repeated cancellation but never reports success.
+        async with _task_affine_manager() as (manager, environment):
+            environment.exit_blocker = asyncio.Event()
+            await manager.connect_server(name="fs", command="server")
+            task = manager._connection_tasks["fs"]
+            closing = asyncio.create_task(manager.close(strict=True))
+            await environment.exit_started.wait()
+            await owner_waits.get()
+
+            for _ in range(2):
+                closing.cancel()
+                await owner_waits.get()
+            environment.exit_blocker.set()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+
+            assert task.done()
+            assert environment.exits == environment.entries
+            assert not manager._cleanup_uncertain
+            await manager.close(strict=True)
+        assert manager.sessions == {}
+        assert manager._connection_tasks == {}

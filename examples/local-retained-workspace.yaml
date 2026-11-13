@@ -1,0 +1,52 @@
+# Validate and run from the repository root:
+#   uv run conductor validate examples/local-retained-workspace.yaml
+#   uv run conductor run examples/local-retained-workspace.yaml --no-interactive --skip-gates
+#
+# The source asset and bundle cache stay unchanged. The generated file is
+# written under the durable local workspace's copied workflow directory.
+
+workflow:
+  name: local-retained-workspace
+  description: Share a copied file between two local script steps
+  entry_point: write_file
+  workspace:
+    mode: shared
+    persistence: durable
+  bundle:
+    assets:
+      - local-retained-workspace-input.txt
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: write_file
+    type: script
+    command: python
+    args:
+      - "-c"
+      - 'from pathlib import Path; value = Path("local-retained-workspace-input.txt").read_text(encoding="utf-8").strip(); Path("generated.txt").write_bytes((value + "\nCreated in the retained copy.\n").encode("utf-8"))'
+    routes:
+      - to: read_file
+        when: "exit_code == 0"
+      - to: script_failed
+
+  - name: read_file
+    type: script
+    command: python
+    args:
+      - "-c"
+      - 'from pathlib import Path; import sys; sys.stdout.buffer.write(Path("generated.txt").read_bytes())'
+    routes:
+      - to: $end
+        when: "exit_code == 0"
+      - to: script_failed
+
+  - name: script_failed
+    type: terminate
+    status: failed
+    reason: A script returned a non-zero exit code
+    output_template:
+      result: Script execution failed
+
+output:
+  result: "{{ read_file.output.stdout | trim }}"

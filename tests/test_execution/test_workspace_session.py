@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import pytest
 
 from conductor.config.environment import builtin_local_environment
+from conductor.config.loader import load_config
 from conductor.engine.execution_resolution import BACKEND_FACTORIES, ExecutionResolverSession
+from conductor.engine.run_manifest import compile_run_manifest
+from conductor.engine.workspace_claim import acquire_workspace_claim
 from conductor.exceptions import ConfigurationError
 from conductor.execution import (
     LocalRunnerBackend,
@@ -16,7 +21,7 @@ from conductor.execution import (
     WorkspaceIdentity,
     WorkspaceLease,
 )
-from conductor.execution.types import BundleRef
+from conductor.execution.types import BundleRef, CommandSpec
 
 
 @dataclass
@@ -112,3 +117,91 @@ def test_executed_backend_history_is_union() -> None:
     session.record_backend_execution("local")
     session.restore_executed_backends([])
     assert session.executed_backends() == frozenset({"docker", "local"})
+
+
+async def test_technical_local_is_not_retained_even_when_capable(monkeypatch) -> None:
+    # Requirement: capability alone never creates or exports a technical local filesystem identity.
+    original = LocalRunnerBackend.capabilities
+    monkeypatch.setattr(
+        LocalRunnerBackend,
+        "capabilities",
+        lambda self: replace(original(self), retained_workspace=True),
+    )
+    docker = RetainedBackend()
+    session = _session(docker)
+    await session.prepare_leases(RunSpec("technical", workspace_persistence="durable"))
+    assert session.leases["local"].location is None
+    assert set(session.workspace_identities()) == {"docker"}
+    await session.finalize_leases("succeeded")
+
+
+@pytest.mark.parametrize("claim_active", [False, True])
+async def test_late_local_consumer_uses_original_bundle_under_claim(
+    tmp_path: Path, monkeypatch, claim_active: bool
+) -> None:
+    # Requirement: late preparation is claim-fenced and binds its original published topology.
+    original = LocalRunnerBackend.capabilities
+    monkeypatch.setattr(
+        LocalRunnerBackend,
+        "capabilities",
+        lambda self: replace(original(self), retained_workspace=True),
+    )
+    path = tmp_path / "root.yaml"
+    path.write_text(
+        "workflow:\n  name: late\n  entry_point: mark\n"
+        "  bundle: {assets: [late.py]}\n"
+        "agents:\n  - {name: mark, type: set, value: ok, routes: [{to: $end}]}\n"
+    )
+    (tmp_path / "late.py").write_text(
+        "from pathlib import Path\nPath('late-result').write_text('late bytes')\n"
+    )
+    child_path = tmp_path / "child.yaml"
+    child_path.write_text(
+        "workflow: {name: child, entry_point: script}\n"
+        "agents:\n  - name: script\n    type: script\n    command: python\n"
+        "    routes: [{to: $end}]\n"
+    )
+    environment = builtin_local_environment()
+    session = ExecutionResolverSession(environment)
+    claim = acquire_workspace_claim("late-local") if claim_active else None
+    try:
+        await session.prepare_leases(
+            RunSpec("late-local", workspace_persistence="durable"),
+            workflow_path=path,
+            claim_active=claim is not None,
+        )
+        technical = session.leases["local"]
+        assert technical.location is None and not session.workspace_identities()
+        child = load_config(child_path)
+        session.note_participants(
+            child, compile_run_manifest(child, workflow_path=child_path, environment=environment)
+        )
+        if not claim_active:
+            with pytest.raises(ConfigurationError, match="claim"):
+                await session.ensure_backends(["local"])
+            assert session.leases["local"] is technical
+            assert session.workspace_identities() == {}
+        else:
+            await session.ensure_backends(["local"])
+            backend = session.backends["local"]
+            assert isinstance(backend, LocalRunnerBackend)
+            lease = session.leases["local"]
+            binding = backend.local_workspace_binding(lease)
+            assert binding is not None and session.run_bundle is binding.bundle
+            assert session.agent_dependencies == ()
+            result = await backend.run_command(
+                CommandSpec(
+                    str(Path(sys.executable)),
+                    ("./late.py",),
+                    working_dir=str(Path(binding.work_root) / "main"),
+                ),
+                lease,
+                on_dispatch=lambda: session.record_backend_execution("local"),
+            )
+            assert result.exit_code == 0
+            assert (Path(binding.work_root) / "main/late-result").read_text() == "late bytes"
+            assert session.executed_backends() == {"local"}
+    finally:
+        await session.finalize_leases("failed", retain=True)
+        if claim is not None:
+            claim.release()

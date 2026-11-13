@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import stat
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -675,6 +675,7 @@ def resolve_plugin(
     declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
     flavor: PluginFlavor | None = None,
+    mcp_source_mapper: Callable[[Path, Path], Path] | None = None,
 ) -> ResolvedPlugin:
     """Resolve one ``plugins:`` entry to a plugin and its components.
 
@@ -708,6 +709,8 @@ def resolve_plugin(
             (:attr:`~conductor.plugins.manifest.PluginManifest.flavor`),
             so an agent handed the "wrong" build still gets every
             subagent that build ships.
+        mcp_source_mapper: Per-call mapper for the manifest's typed MCP
+            config-file path, applied before its content is read.
 
     Returns:
         The resolved plugin, with disabled components left empty and
@@ -729,7 +732,7 @@ def resolve_plugin(
         on_warning=on_warning,
         flavor=flavor,
     )
-    manifest = read_plugin_manifest(root, prefer=flavor)
+    manifest = read_plugin_manifest(root, prefer=flavor, mcp_source_mapper=mcp_source_mapper)
 
     skills = _plugin_skills(root, entry, on_warning) if want_skills else []
     # The agent file convention comes from the manifest that actually
@@ -821,6 +824,7 @@ def resolve_plugins(
     declared_sources: Collection[str] | None = None,
     on_warning: WarningSink | None = None,
     flavor: PluginFlavor | None = None,
+    mcp_source_mapper: Callable[[Path, Path], Path] | None = None,
 ) -> list[ResolvedPlugin]:
     """Resolve a whole ``plugins:`` list.
 
@@ -837,6 +841,7 @@ def resolve_plugins(
         on_warning: Optional sink for non-fatal diagnostics.
         flavor: The requesting agent's provider's plugin flavor. See
             :func:`resolve_plugin` for what this does and does not gate.
+        mcp_source_mapper: Per-call typed config-file mapper, forwarded unchanged.
 
     Returns:
         One :class:`ResolvedPlugin` per entry, in order, with duplicate
@@ -875,6 +880,7 @@ def resolve_plugins(
             declared_sources=declared_sources,
             on_warning=on_warning,
             flavor=flavor,
+            mcp_source_mapper=mcp_source_mapper,
         )
         if plugin.root in by_root:
             # The same plugin reached twice — a name and its equivalent path,

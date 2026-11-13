@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, NotRequired, TypedDict, TypeGuard
 
 import jinja2
 from jinja2 import Environment, meta, nodes
@@ -20,6 +20,7 @@ from conductor.config.schema import (
     AgentDef,
     ExecutableStepBase,
     HumanGateStepDef,
+    MCPStepDef,
     QuestionsStepDef,
     RoutableStepBase,
     ScriptStepDef,
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
 
     from conductor.config.environment import ResolvedEnvironment
     from conductor.config.schema import StepDef, WorkflowConfig
+    from conductor.engine.run_manifest import RunPreflight
     from conductor.plugins.registry import ResolvedPlugin
     from conductor.skills import ResolvedSkill
 
@@ -70,6 +72,7 @@ class _EnvironmentValidationContext(TypedDict):
     root_workflow_dir: Path | None
     warned_no_environments: bool
     warned_no_secret_environments: bool
+    preflights: NotRequired[dict[str, RunPreflight]]
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -326,6 +329,19 @@ def validate_workflow_config(
             "warned_no_secret_environments": False,
         }
 
+    if _environment_context["explicit"] and _subworkflow_depth == 0:
+        preflights = _environment_context.setdefault("preflights", {})
+        for name, preflight in preflights.items():
+            environment = (_environment_context["environments"] or {}).get(name)
+            if (
+                environment is None
+                or workflow_path is None
+                or preflight.path
+                != Path(os.path.abspath(os.path.normpath(workflow_path.expanduser())))
+            ):
+                raise ConfigurationError("Run preflight does not match the validation root.")
+            preflight.require_matches(config, workflow_path, environment)
+
     profile_errors, profile_warnings = _validate_profile_references(
         config,
         _environment_context,
@@ -347,7 +363,7 @@ def validate_workflow_config(
         )
     else:
         workspace_errors, workspace_warnings = _validate_workspace_policy(
-            config, _environment_context
+            config, _environment_context, workflow_path
         )
         errors.extend(workspace_errors)
         warnings.extend(workspace_warnings)
@@ -2113,6 +2129,7 @@ def _executable_steps(config: WorkflowConfig) -> list[tuple[str, ExecutableStepB
 def _validate_workspace_policy(
     config: WorkflowConfig,
     context: _EnvironmentValidationContext,
+    workflow_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     """Check reserved modes and resolved backend retention without contacting a daemon."""
     errors: list[str] = []
@@ -2143,28 +2160,56 @@ def _validate_workspace_policy(
         return errors, warnings
 
     # Import after config initialization; the engine package imports the config loader.
-    from conductor.engine.run_manifest import BACKEND_CAPABILITY_PROVIDERS
+    from conductor.engine.run_manifest import (
+        BACKEND_CAPABILITY_PROVIDERS,
+        RunPreflight,
+        _require_local_agent_runtime_ownership,
+        _require_managed_local_consumer,
+    )
 
-    for _environment_name, environment in sorted((context["environments"] or {}).items()):
+    for environment_name, environment in sorted((context["environments"] or {}).items()):
         if environment is None:
             continue
         default_execution = config.workflow.defaults.execution
         default_profile = default_execution.profile if default_execution is not None else None
+        has_local = False
+        local_checks_passed = True
         for key, step in _executable_steps(config):
             profile = step.execution.profile if step.execution is not None else None
             profile_name = profile or default_profile or environment.document.default
             definition = environment.document.profiles.get(profile_name) if profile_name else None
             if definition is None:
                 continue  # Profile resolution already reports the missing profile.
+            if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef, WorkflowStepDef)):
+                continue
+            if definition.backend == "local":
+                has_local = True
+                try:
+                    _require_local_agent_runtime_ownership(key, step, config)
+                    _require_managed_local_consumer(key, step, config)
+                except ConfigurationError as exc:
+                    local_checks_passed = False
+                    errors.append(str(exc))
+                    continue
+            if not isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef)):
+                continue
             provider = BACKEND_CAPABILITY_PROVIDERS.get(definition.backend)
             if provider is not None and not provider.capabilities().retained_workspace:
                 errors.append(
                     f"Step '{key}': {definition.backend} backend does not support retained "
-                    "workspaces; use docker profiles for every executable step or drop "
-                    "persistence; local retained workspace arrives in a later delivery. "
-                    "Until the agent realm follow-up, retained policy is available only "
-                    "for docker script workflows."
+                    "workspaces; choose a retaining backend or drop persistence."
                 )
+        if has_local and local_checks_passed and workflow_path is not None:
+            preflights = context.setdefault("preflights", {})
+            preflight = preflights.get(environment_name)
+            if preflight is None:
+                preflight = RunPreflight(config, workflow_path, environment)
+                preflights[environment_name] = preflight
+            try:
+                preflight.require_matches(config, workflow_path, environment)
+                preflight.validate_local()
+            except ConfigurationError as exc:
+                errors.append(str(exc))
     return errors, warnings
 
 
@@ -2222,19 +2267,32 @@ def _validate_docker_profiles(
                     f"'{environment_name}', but this step requires the local backend."
                 )
 
+        retained = config.workflow.workspace is not None and (
+            config.workflow.workspace.persistence != "ephemeral"
+        )
+        consumer_types = (AgentDef, ScriptStepDef, MCPStepDef) if retained else (ScriptStepDef,)
         script_backends = {
-            backend for _, step, _, backend in resolved if isinstance(step, ScriptStepDef)
+            backend for _, step, _, backend in resolved if isinstance(step, consumer_types)
         }
         if "local" in script_backends and "docker" in script_backends:
             assignments = ", ".join(
                 f"{key} ({backend})"
                 for key, step, _, backend in resolved
-                if isinstance(step, ScriptStepDef) and backend in {"local", "docker"}
+                if isinstance(step, consumer_types) and backend in {"local", "docker"}
             )
             warnings.append(
-                f"environment '{environment_name}' mixes local and docker script backends: "
-                f"{assignments}. Docker steps see the bundle snapshot collected before the run, "
-                "not host filesystem mutations made by local steps."
+                (
+                    f"environment '{environment_name}' declares independent local/Docker "
+                    f"file consumers: {assignments}. There is no filesystem synchronization "
+                    "between realms; context JSON outputs are shared unchanged."
+                )
+                if retained
+                else (
+                    f"environment '{environment_name}' mixes local and docker script backends: "
+                    f"{assignments}. Docker steps see the bundle snapshot collected "
+                    "before the run, "
+                    "not host filesystem mutations made by local steps."
+                )
             )
 
         used_docker_profiles = {
@@ -2379,7 +2437,18 @@ def _validate_subworkflow_refs(
         try:
             from conductor.config.loader import load_config
 
-            sub_config = load_config(sub_path)
+            sub_config = next(
+                (
+                    node.config
+                    for preflight in ((_environment_context or {}).get("preflights", {}).values())
+                    if preflight.collected is not None
+                    for node in preflight.nodes
+                    if node.path == sub_path or node.path.resolve() == sub_path
+                ),
+                None,
+            )
+            if sub_config is None:
+                sub_config = load_config(sub_path)
         except Exception as exc:
             errors.append(f"{label}: failed to load sub-workflow '{sub_path}': {exc}")
             continue

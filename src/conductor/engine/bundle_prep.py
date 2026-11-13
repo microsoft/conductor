@@ -1,4 +1,4 @@
-"""Prepare content-addressed run bundles for Docker-backed steps.
+"""Prepare content-addressed run bundles for managed execution.
 
 Bundle materialization is an execution preflight concern, not an execution
 backend concern: this module may depend on ``conductor.bundle`` while the leaf
@@ -20,16 +20,30 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
-from conductor.bundle.collector import MAX_SUBWORKFLOW_DEPTH, _Collector, collect_bundle
+from conductor.bundle.collector import (
+    MAX_SUBWORKFLOW_DEPTH,
+    CollectedAgentDependencies,
+    _Collector,
+    collect_bundle,
+)
 from conductor.bundle.errors import BundleError
 from conductor.bundle.store import publish_bundle
 from conductor.config.environment import ResolvedEnvironment
 from conductor.config.loader import load_config
-from conductor.config.schema import ExecutableStepBase, WorkflowConfig, WorkflowStepDef
+from conductor.config.schema import (
+    AgentDef,
+    ExecutableStepBase,
+    MCPStepDef,
+    ScriptStepDef,
+    WorkflowConfig,
+    WorkflowStepDef,
+)
 from conductor.engine.run_manifest import (
     ResolvedRunManifest,
+    RunPreflight,
     effective_profile_name,
     executable_step_identity,
 )
@@ -40,7 +54,7 @@ from conductor.filesystem import stat_or_none
 logger = logging.getLogger(__name__)
 
 _PROGRAMMATIC_BUNDLE_ERROR = (
-    "docker-backed steps require a workflow file on disk for bundle collection; "
+    "bundle-backed steps require a workflow file on disk for bundle collection; "
     "programmatic engine construction cannot collect a run bundle"
 )
 _CACHE_REMEDY = "run conductor plugin fetch / conductor bundle build to prime the cache"
@@ -74,10 +88,20 @@ def scan_subworkflow_docker_usage(
     workflow_path: Path,
     environment: ResolvedEnvironment,
 ) -> bool | None:
-    """Scan a workflow closure for Docker-backed executable steps offline.
+    """Scan a workflow closure for Docker-backed executable steps offline."""
+    return scan_subworkflow_bundle_usage(workflow_path, environment)
 
-    Returns ``True`` when Docker is found, ``False`` when the complete scanned
-    closure is local-only, and ``None`` when an offline sub-workflow reference
+
+def scan_subworkflow_bundle_usage(
+    workflow_path: Path,
+    environment: ResolvedEnvironment,
+    *,
+    retained_local: bool = False,
+) -> bool | None:
+    """Scan the closure once for Docker or actual retained-local consumers.
+
+    Returns ``True`` when a consumer is found, ``False`` when the complete scanned
+    closure needs no bundle, and ``None`` when an offline sub-workflow reference
     cannot be resolved. The unknown result deliberately triggers full bundle
     collection, whose typed ``BundleUnfetchedError`` gives the actionable hard
     failure instead of letting a potentially Docker-backed child go unnoticed.
@@ -113,7 +137,11 @@ def scan_subworkflow_docker_usage(
                     suggestion="Define the profile in the environment document, or point the "
                     "step at one of the defined profiles.",
                 )
-            if profile.backend == "docker":
+            if profile.backend == "docker" or (
+                retained_local
+                and profile.backend == "local"
+                and isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef))
+            ):
                 return True
 
         if depth >= MAX_SUBWORKFLOW_DEPTH and _workflow_steps(config):
@@ -134,8 +162,11 @@ def scan_subworkflow_docker_usage(
 async def materialize_run_bundle(
     workflow_path: Path | None,
     environment: ResolvedEnvironment,
+    *,
+    on_topology: Callable[[tuple[CollectedAgentDependencies, ...]], None] | None = None,
+    _preflight: RunPreflight | None = None,
 ) -> BundleRef:
-    """Collect and publish one complete offline run bundle."""
+    """Collect and publish one offline bundle, exposing run-local selections separately."""
     if workflow_path is None:
         raise ConfigurationError(_PROGRAMMATIC_BUNDLE_ERROR)
 
@@ -143,13 +174,16 @@ async def materialize_run_bundle(
         logger.warning("Bundle collection: %s", message)
 
     try:
-        collected = await asyncio.to_thread(
-            collect_bundle,
-            workflow_path,
-            environment=environment,
-            allow_network=False,
-            on_warning=warning_sink,
-        )
+        if _preflight is not None:
+            collected = await asyncio.to_thread(_preflight.collect)
+        else:
+            collected = await asyncio.to_thread(
+                collect_bundle,
+                workflow_path,
+                environment=environment,
+                allow_network=False,
+                on_warning=warning_sink,
+            )
     except BundleError as exc:
         exc.suggestion = _CACHE_REMEDY
         raise
@@ -168,6 +202,8 @@ async def materialize_run_bundle(
         collected.links,
         on_warning=warning_sink,
     )
+    if on_topology is not None:
+        on_topology(collected.agent_dependencies)
     return BundleRef(
         digest=collected.manifest.bundle_digest,
         store_path=str(store_path),
@@ -181,22 +217,52 @@ async def prepare_run_bundle(
     manifest: ResolvedRunManifest,
     workflow_path: Path | None,
     environment: ResolvedEnvironment,
+    *,
+    on_topology: Callable[[tuple[CollectedAgentDependencies, ...]], None] | None = None,
 ) -> BundleRef | None:
-    """Prepare a bundle when this run's statically known closure may use Docker.
+    """Prepare a bundle when the closure may use managed files.
 
     The first gate examines the already-resolved in-memory environment and is
     intentionally before every path probe or loader call. An environment with
-    no Docker profile therefore preserves the local-only path with zero bundle
-    I/O.
+    no Docker profile and no retention therefore preserves the ordinary local
+    path with zero bundle I/O. A workflow step's technical local placement is
+    not a filesystem consumer; only its child's actual placement can opt in.
     """
-    if not any(profile.backend == "docker" for profile in environment.document.profiles.values()):
+    retained_local = manifest.workspace is not None and manifest.workspace.persistence in {
+        "durable",
+        "on-failure",
+    }
+    if not retained_local and not any(
+        profile.backend == "docker" for profile in environment.document.profiles.values()
+    ):
         return None
 
     needs_bundle = any(profile.backend == "docker" for profile in manifest.profiles.values())
+    preflight = manifest._preflight
     if not needs_bundle:
         if workflow_path is None:
             raise ConfigurationError(_PROGRAMMATIC_BUNDLE_ERROR)
-        needs_bundle = scan_subworkflow_docker_usage(workflow_path, environment) is not False
+        if preflight is not None and preflight.collected is not None:
+            for index, node in enumerate(preflight.nodes):
+                active = preflight.config if index == 0 else node.config
+                for key, step in _executable_steps(active):
+                    name = effective_profile_name(step, key, active.workflow.defaults, environment)
+                    backend = environment.document.profiles[name].backend
+                    if backend == "docker" or (
+                        retained_local
+                        and backend == "local"
+                        and isinstance(step, (AgentDef, ScriptStepDef, MCPStepDef))
+                    ):
+                        needs_bundle = True
+        elif retained_local:
+            needs_bundle = (
+                scan_subworkflow_bundle_usage(workflow_path, environment, retained_local=True)
+                is not False
+            )
+        else:
+            needs_bundle = scan_subworkflow_docker_usage(workflow_path, environment) is not False
     if not needs_bundle:
         return None
-    return await materialize_run_bundle(workflow_path, environment)
+    return await materialize_run_bundle(
+        workflow_path, environment, on_topology=on_topology, _preflight=preflight
+    )

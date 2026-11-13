@@ -43,6 +43,7 @@ from conductor.engine.context import WorkflowContext
 from conductor.engine.execution_resolution import ExecutionResolver, ExecutionResolverSession
 from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
+from conductor.engine.local_workspace import LocalWorkspacePathMapper
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.engine.router import Router, RouteResult
@@ -82,6 +83,8 @@ from conductor.execution import (
     WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution.local import LocalRunnerBackend
+from conductor.execution.types import LocalWorkspaceBinding, ManagedWorkspaceContext
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -117,7 +120,12 @@ from conductor.providers.capabilities import native_otel_spans_active
 from conductor.redaction import RunRedactor
 from conductor.telemetry import guards
 
+if TYPE_CHECKING:
+    from conductor.bundle.collector import CollectedAgentDependencies
+
 logger = logging.getLogger(__name__)
+
+_McpStepPoolKey = tuple[str, str] | tuple[str, str, str, str]
 
 
 def _release_workspace_claim(claim: WorkspaceClaim) -> None:
@@ -186,6 +194,8 @@ class AgentRealm:
     image: str | None
     name: str
     on_dispatch: Callable[[], None] | None = None
+    binding: LocalWorkspaceBinding | None = field(default=None, repr=False)
+    dependencies: CollectedAgentDependencies | None = None
 
 
 class _RealmKwargs(TypedDict, total=False):
@@ -195,6 +205,12 @@ class _RealmKwargs(TypedDict, total=False):
     agent_env_overlay: Mapping[str, str]
     realm_credential_resolver: Callable[[str], Mapping[str, Any] | None]
     on_dispatch: Callable[[], None] | None
+
+
+class _ManagedDialogKwargs(TypedDict, total=False):
+    managed_workspace: ManagedWorkspaceContext
+    working_dir: str | None
+    on_dispatch: Callable[[], None]
 
 
 def _realm_kwargs(realm: AgentRealm | None) -> _RealmKwargs:
@@ -751,7 +767,13 @@ class WorkflowEngine:
         # only ever covers dict mutation and the admission reservation, never
         # I/O, so distinct servers connect concurrently; the per-server slot
         # lock is held across the lazy connect + call by _run_mcp_step.
-        self._mcp_step_managers: dict[tuple[str, str], MCPManager] = {}
+        self._mcp_step_managers: dict[_McpStepPoolKey, MCPManager] = {}
+        # Keep failed/cancelled startup independently of successful pool insertion.
+        # MCPManager itself registers its lifetime owner in the root controller.
+        self._managed_mcp_step_managers: dict[MCPManager, LocalWorkspaceBinding] = {}
+        self._terminal_write = False
+        self._pending_terminal_event: tuple[str, dict[str, Any]] | None = None
+        self._pending_checkpoint_error: BaseException | None = None
         self._mcp_step_locks: dict[str, asyncio.Lock] = {}
         self._mcp_step_pool_guard: asyncio.Lock = asyncio.Lock()
         # Count of in-flight pool connects (reserved slots). Checked together
@@ -936,6 +958,35 @@ class WorkflowEngine:
         """Resolved parent directory of the workflow file, or None if unset."""
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
+    def _local_workspace_binding(self) -> LocalWorkspaceBinding | None:
+        """Obtain authority only from the backend's original issued lease."""
+        if self._execution_session.sealed:
+            raise ExecutionError("Managed root admission is sealed.")
+        backend = self._execution_session.backends["local"]
+        lease = self._execution_session.lease_for_backend("local")
+        if isinstance(backend, LocalRunnerBackend) and lease is not None:
+            return backend.local_workspace_binding(lease)
+        return None
+
+    def _local_workspace_mapper(self, binding: LocalWorkspaceBinding) -> LocalWorkspacePathMapper:
+        """Use the current child workflow's staged namespace, not the root's cwd."""
+        mapper = LocalWorkspacePathMapper(binding)
+        if self.workflow_path is None:
+            return mapper
+        # Retained translation is lexical; deleted or replaced original sources
+        # cannot redirect a prepared run back to a host namespace.
+        directory = mapper(os.path.abspath(self.workflow_path.parent))
+        namespace = Path(directory).relative_to(binding.work_root).as_posix()
+        return LocalWorkspacePathMapper(binding, namespace)
+
+    def _mark_local_workspace_dispatch(self, step: str | None = None) -> None:
+        """Persist active and execution history before a direct MCP launch/call."""
+        backend = self._execution_session.backends["local"]
+        lease = self._execution_session.lease_for_backend("local")
+        assert isinstance(backend, LocalRunnerBackend) and lease is not None
+        backend.mark_workspace_in_use(lease)
+        self._execution_session.record_backend_execution("local", step=step)
+
     async def _mcp_step_slot(self, server_name: str) -> asyncio.Lock:
         """Return the per-server slot lock for an MCP step, creating it if needed.
 
@@ -978,10 +1029,17 @@ class WorkflowEngine:
         # this module is imported by cli/app.py on every conductor invocation.
         from conductor.mcp.manager import MCPManager
 
-        key = (server_name, resolved_cwd)
+        binding = self._local_workspace_binding()
+        key: _McpStepPoolKey = (
+            (server_name, resolved_cwd, binding.workspace_root, binding.incarnation)
+            if binding is not None
+            else (server_name, resolved_cwd)
+        )
 
         while True:
             async with self._mcp_step_pool_guard:
+                if binding is not None:
+                    binding.runtime_context.process_scopes.check_admission()
                 manager = self._mcp_step_managers.get(key)
                 if manager is not None:
                     return manager
@@ -1028,36 +1086,58 @@ class WorkflowEngine:
             secret_uses=self._execution_resolver.secret_uses,
         )
 
+        connected: MCPManager | None = None
         try:
-            manager = MCPManager(tool_output=self.config.workflow.runtime.tool_output)
-            await manager.connect_server(
-                name=server_name,
-                command=resolved["command"],
-                args=resolved.get("args"),
-                env=resolved.get("env"),
-                timeout=resolved.get("timeout"),
-                cwd=resolved_cwd,
-                # Deterministic mcp-step connections take the redacted logging
-                # path: a stdio failure's exception can embed server-supplied
-                # stderr (values the step's no-values policy excludes), so the
-                # manager logs safe metadata only; the raw exception still
-                # chains into the RuntimeError below, and _run_mcp_step's
-                # diagnostic sink is the only place the full traceback lands.
-                redact_errors=True,
+            if binding is None:
+                manager = MCPManager(tool_output=self.config.workflow.runtime.tool_output)
+            else:
+                manager = MCPManager(
+                    tool_output=self.config.workflow.runtime.tool_output,
+                    managed_workspace=binding.runtime_context,
+                )
+                self._managed_mcp_step_managers[manager] = binding
+                self._execution_session.register_resource(
+                    manager, lambda: manager.close(strict=True)
+                )
+                self._mark_local_workspace_dispatch()
+            await self._execution_session.invoke(
+                manager.connect_server(
+                    name=server_name,
+                    command=resolved["command"],
+                    args=resolved.get("args"),
+                    env=resolved.get("env"),
+                    timeout=resolved.get("timeout"),
+                    cwd=resolved_cwd,
+                    # Deterministic mcp-step connections take the redacted logging
+                    # path: a stdio failure's exception can embed server-supplied
+                    # stderr (values the step's no-values policy excludes), so the
+                    # manager logs safe metadata only; the raw exception still
+                    # chains into the RuntimeError below, and _run_mcp_step's
+                    # diagnostic sink is the only place the full traceback lands.
+                    redact_errors=True,
+                )
             )
+            connected = manager
+            async with self._mcp_step_pool_guard:
+                if binding is not None:
+                    binding.runtime_context.process_scopes.check_admission()
+                self._mcp_step_pending -= 1
+                self._mcp_step_managers[key] = manager
+            return manager
         except BaseException:
             # Release the reservation on failure AND cancellation — a leak
             # here would shrink the effective pool capacity for the rest of
             # the run.
             async with self._mcp_step_pool_guard:
                 self._mcp_step_pending -= 1
+            if connected is not None and binding is not None:
+                # Native close bounded-observes its registered owners before
+                # re-raising cancellation; retain the primary admission failure.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._close_evicted_mcp_step_manager(key, connected)
             raise
-        async with self._mcp_step_pool_guard:
-            self._mcp_step_pending -= 1
-            self._mcp_step_managers[key] = manager
-        return manager
 
-    def _pick_mcp_eviction_target(self, current_server: str) -> tuple[str, str] | None:
+    def _pick_mcp_eviction_target(self, current_server: str) -> _McpStepPoolKey | None:
         """Choose one pool entry to evict for ``current_server``, or None.
 
         CALLER HOLDS ``_mcp_step_pool_guard``. Eviction order:
@@ -1075,7 +1155,7 @@ class WorkflowEngine:
         3. None — every entry is locked; the caller allows the overflow
            rather than blocking (the cap is a soft threshold).
         """
-        target: tuple[str, str] | None = next(
+        target: _McpStepPoolKey | None = next(
             (key for key in self._mcp_step_managers if key[0] == current_server),
             None,
         )
@@ -1088,7 +1168,7 @@ class WorkflowEngine:
         return target
 
     async def _close_evicted_mcp_step_manager(
-        self, evicted_key: tuple[str, str], evicted: MCPManager
+        self, evicted_key: _McpStepPoolKey, evicted: MCPManager
     ) -> None:
         """Close an evicted pool manager without swallowing task cancellation.
 
@@ -1103,6 +1183,18 @@ class WorkflowEngine:
         on to connect or invoke anything. The close itself stays best-effort:
         a failing close is logged and never fails the run.
         """
+        binding = self._managed_mcp_step_managers.get(evicted)
+        if binding is not None:
+            try:
+                # The native manager observes its registered lifetime/connection
+                # owners and process proofs under their original deadlines.
+                # It also re-raises cancellation after that bounded observation.
+                await evicted.close(strict=True)
+            except Exception:
+                # The registered owner keeps cleanup failure sticky at the root;
+                # a primary startup error must not be replaced by teardown.
+                logger.warning("Managed MCP cleanup is unconfirmed for server '%s'", evicted_key[0])
+            return
         cleanup = asyncio.ensure_future(evicted.close())
         cancelled = False
         while True:
@@ -1128,7 +1220,12 @@ class WorkflowEngine:
         managers = list(self._mcp_step_managers.items())
         self._mcp_step_managers.clear()
         self._mcp_step_locks.clear()
+        managed = set(self._managed_mcp_step_managers)
+        for manager in managed:
+            await self._close_evicted_mcp_step_manager(("<managed>", ""), manager)
         for key, manager in managers:
+            if manager in managed:
+                continue
             try:
                 await manager.close()
             except Exception as e:  # noqa: BLE001 - cleanup must not mask the run outcome
@@ -1141,6 +1238,7 @@ class WorkflowEngine:
         *,
         field: Literal["working_dir", "settings_dir"],
         raw: str,
+        mapper: LocalWorkspacePathMapper | None = None,
     ) -> str:
         """Render and absolutize one authored directory value.
 
@@ -1185,6 +1283,8 @@ class WorkflowEngine:
                     f"{field} produced a path."
                 ),
             )
+        if mapper is not None:
+            return mapper(rendered)
         path = Path(rendered).expanduser()
         if not path.is_absolute():
             base = self._workflow_dir if self._workflow_dir is not None else Path.cwd()
@@ -1204,7 +1304,7 @@ class WorkflowEngine:
         return resolved
 
     def _resolve_agent_working_dir(
-        self, agent: AgentDef, agent_context: dict[str, Any]
+        self, agent: AgentDef, agent_context: dict[str, Any], realm: AgentRealm | None = None
     ) -> AgentDef:
         """Resolve an agent's ``working_dir`` and ``settings_dir``, returning a copy.
 
@@ -1227,18 +1327,25 @@ class WorkflowEngine:
         narrower target repository's skills.
         """
         update: dict[str, Any] = {}
+        mapper = (
+            self._local_workspace_mapper(realm.binding)
+            if realm is not None and realm.binding is not None
+            else None
+        )
 
         raw = agent.working_dir
         if raw is None:
             raw = self.config.workflow.runtime.working_dir
         if raw is not None:
             update["working_dir"] = self._resolve_agent_directory(
-                agent, agent_context, field="working_dir", raw=raw
+                agent, agent_context, field="working_dir", raw=raw, mapper=mapper
             )
+        elif mapper is not None:
+            update["working_dir"] = mapper(None)
 
         if agent.settings_dir is not None:
             update["settings_dir"] = self._resolve_agent_directory(
-                agent, agent_context, field="settings_dir", raw=agent.settings_dir
+                agent, agent_context, field="settings_dir", raw=agent.settings_dir, mapper=mapper
             )
 
         if not update:
@@ -1278,6 +1385,16 @@ class WorkflowEngine:
             event_type: The event type identifier (e.g., "agent_started").
             data: Event-specific payload data.
         """
+        if not self._terminal_write:
+            if self._execution_session.sealed:
+                return
+            if (
+                self._subworkflow_depth == 0
+                and self._execution_session.managed
+                and event_type in ("workflow_completed", "workflow_failed")
+            ):
+                self._pending_terminal_event = (event_type, data)
+                return
         if self._event_emitter is None:
             return
         # Auto-stamp subworkflow_path on every event from sub-engines so the
@@ -1887,6 +2004,8 @@ class WorkflowEngine:
             return None
 
         def _callback(event_type: str, data: dict[str, Any]) -> None:
+            if self._execution_session.sealed:
+                return
             data_with_agent = {"agent_name": agent_name, **data}
             self._emit(event_type, data_with_agent)
 
@@ -1899,11 +2018,12 @@ class WorkflowEngine:
 
         Remote realms use static registry configuration without constructing
         a host provider. Local registry agents still obtain their provider;
-        local single-provider mode returns the shared executor.
+        unmanaged local single-provider mode returns the shared executor.
+        Managed local calls receive a fresh executor over their frozen selection.
 
         Args:
             agent: The agent definition.
-            realm: Resolved remote placement, if any.
+            realm: Fixed placement, including the prepared local binding when managed.
 
         Returns:
             AgentExecutor configured for the agent's provider.
@@ -1921,7 +2041,7 @@ class WorkflowEngine:
             )
 
         remote_kwargs: dict[str, Any] = {}
-        if realm is not None:
+        if realm is not None and realm.binding is None:
             runtime = (
                 self._registry.runtime
                 if self._registry is not None
@@ -1938,8 +2058,16 @@ class WorkflowEngine:
             }
             provider = None
         else:
-            assert self._registry is not None
-            provider = await self._registry.get_provider(agent)
+            if self._registry is None:
+                provider = self._single_provider
+            elif realm is not None and realm.binding is not None:
+                provider = await self._registry.get_provider(
+                    agent, managed_workspace=realm.binding.runtime_context
+                )
+            else:
+                provider = await self._registry.get_provider(agent)
+            if realm is not None and realm.binding is not None and provider is not None:
+                self._execution_session.register_provider(provider, self._registry)
         return AgentExecutor(
             provider,
             workflow_tools=self.config.tools,
@@ -1951,6 +2079,8 @@ class WorkflowEngine:
             workflow_plugins=self._workflow_plugins,
             plugin_marketplaces=self._plugin_marketplaces,
             declared_plugin_sources=self._declared_plugin_sources,
+            managed_binding=realm.binding if realm is not None else None,
+            managed_dependencies=realm.dependencies if realm is not None else None,
             **remote_kwargs,
         )
 
@@ -1968,7 +2098,40 @@ class WorkflowEngine:
         key = executable_step_identity(name, for_each_group=for_each_group)
         profile = self._execution_resolver.manifest.profiles[key]
         if profile.backend == "local":
-            return None
+            binding = self._local_workspace_binding()
+            if binding is None:
+                return None
+            if self.workflow_path is None or self._execution_session.agent_dependencies is None:
+                raise ConfigurationError(
+                    "Managed agents require a run-local frozen dependency view."
+                )
+            mapper = self._local_workspace_mapper(binding)
+            namespace = Path(mapper(None)).relative_to(binding.work_root).as_posix()
+            workflow = f"{namespace}/{self.workflow_path.name}"
+            selected = [
+                item
+                for item in self._execution_session.agent_dependencies
+                if (item.workflow, item.step, item.for_each_group)
+                == (workflow, name, for_each_group)
+            ]
+            if len(selected) != 1:
+                raise ConfigurationError("Managed agent has no unique frozen workflow selection.")
+            return AgentRealm(
+                backend=self._execution_session.backends["local"],
+                lease=self._execution_session.lease_for_backend("local"),
+                execution=self._execution_resolver.execution_spec_for_step(
+                    name, for_each_group=for_each_group
+                ),
+                env_overlay={},
+                credential_resolver=self._realm_credentials_for,
+                image=None,
+                name="local",
+                on_dispatch=lambda: self._execution_session.record_backend_execution(
+                    "local", step=key
+                ),
+                binding=binding,
+                dependencies=selected[0],
+            )
         backend = self._execution_resolver.backend_for_step(name, for_each_group=for_each_group)
         if not backend.capabilities().agent:
             raise ConfigurationError(
@@ -1992,7 +2155,9 @@ class WorkflowEngine:
             credential_resolver=self._realm_credentials_for,
             image=image,
             name=profile.backend,
-            on_dispatch=(lambda: self._execution_session.record_backend_execution(profile.backend))
+            on_dispatch=(
+                lambda: self._execution_session.record_backend_execution(profile.backend, step=key)
+            )
             if backend.capabilities().retained_workspace
             else None,
         )
@@ -2041,32 +2206,59 @@ class WorkflowEngine:
         backend_name = self._execution_resolver.manifest.profiles[
             executable_step_identity(agent.name, for_each_group=for_each_group)
         ].backend
+        binding = (
+            backend.local_workspace_binding(lease)
+            if isinstance(backend, LocalRunnerBackend) and lease is not None
+            else None
+        )
+        mapper = self._local_workspace_mapper(binding) if binding is not None else None
+        if binding is not None:
+            agent = agent.model_copy(
+                update={
+                    "working_dir": agent.working_dir
+                    if agent.working_dir is not None
+                    else self.config.workflow.runtime.working_dir
+                }
+            )
         attempt_id = self._in_flight_attempts.get(agent.name)
-        if attempt_id is None and self._workspace_persistence() is not None:
+        if attempt_id is None and (
+            binding is not None or self._workspace_persistence() is not None
+        ):
             attempt_id = self._mint_attempt(agent.name)
         return await self.limits.wait_for_with_timeout(
-            self.script_executor.execute(
-                agent,
-                context,
-                attempt_id=(
-                    attempt_id
-                    if self._workspace_persistence() is not None and backend_name != "local"
-                    else None
-                ),
-                on_dispatch=(lambda: self._execution_session.record_backend_execution(backend_name))
-                if backend.capabilities().retained_workspace
-                else None,
-                lease=lease,
-                backend=backend,
-                secret_env=secret_env,
-                execution=self._execution_resolver.execution_spec_for_step(
-                    agent.name,
-                    for_each_group=for_each_group,
-                ),
-                inherit_control_environment=self._execution_resolver.inherit_env_for_step(
-                    agent.name,
-                    for_each_group=for_each_group,
-                ),
+            self._execution_session.invoke(
+                self.script_executor.execute(
+                    agent,
+                    context,
+                    attempt_id=(
+                        attempt_id
+                        if binding is not None
+                        or (self._workspace_persistence() is not None and backend_name != "local")
+                        else None
+                    ),
+                    on_dispatch=(
+                        lambda: self._execution_session.record_backend_execution(
+                            backend_name,
+                            step=executable_step_identity(
+                                agent.name, for_each_group=for_each_group
+                            ),
+                        )
+                    )
+                    if binding is not None or backend.capabilities().retained_workspace
+                    else None,
+                    lease=lease,
+                    backend=backend,
+                    secret_env=secret_env,
+                    working_directory_mapper=mapper,
+                    execution=self._execution_resolver.execution_spec_for_step(
+                        agent.name,
+                        for_each_group=for_each_group,
+                    ),
+                    inherit_control_environment=self._execution_resolver.inherit_env_for_step(
+                        agent.name,
+                        for_each_group=for_each_group,
+                    ),
+                )
             ),
             operation_name=f"script '{agent.name}'",
         )
@@ -2299,7 +2491,13 @@ class WorkflowEngine:
             # check). Per-step working_dir is forbidden by the schema, so
             # only the runtime-level value renders.
             raw_cwd = self.config.workflow.runtime.working_dir
-            if raw_cwd is None:
+            binding = self._local_workspace_binding()
+            if binding is not None:
+                rendered_cwd = (
+                    self.renderer.render(raw_cwd, agent_context) if raw_cwd is not None else None
+                )
+                resolved_cwd = self._local_workspace_mapper(binding)(rendered_cwd)
+            elif raw_cwd is None:
                 resolved_cwd = os.path.normpath(
                     str(self._workflow_dir) if self._workflow_dir is not None else os.getcwd()
                 )
@@ -2333,6 +2531,8 @@ class WorkflowEngine:
 
             async def _invoke_under_slot() -> dict[str, Any]:
                 async with await self._mcp_step_slot(server):
+                    if binding is not None:
+                        self._mark_local_workspace_dispatch(agent.name)
                     manager = await self._get_mcp_step_manager(server, resolved_cwd)
                     # The static validator cannot check this: the tool must
                     # actually exist on the connected server.
@@ -2346,7 +2546,11 @@ class WorkflowEngine:
                             f"on server '{server}'",
                             agent_name=agent.name,
                         )
-                    return await self.mcp_step_executor.execute(agent, agent_context, manager)
+                    if binding is not None:
+                        self._mark_local_workspace_dispatch()
+                    return await self._execution_session.invoke(
+                        self.mcp_step_executor.execute(agent, agent_context, manager)
+                    )
 
             if allow_interrupt and self._interrupt_event is not None:
                 envelope = await self._invoke_mcp_interruptible(agent, _invoke_under_slot())
@@ -2619,9 +2823,9 @@ class WorkflowEngine:
     ) -> Any:
         """Wrap an agent execution coroutine with the agent's timeout_seconds.
 
-        If the agent has ``timeout_seconds`` configured, this wraps the coroutine
-        in ``asyncio.wait_for()`` with an effective timeout that is the minimum of
-        the agent's timeout and any remaining workflow-level timeout.
+        If the agent has ``timeout_seconds`` configured, a public timeout context
+        distinguishes its expiry from cancellation of the root. The effective
+        timeout is the minimum of the agent and workflow limits.
 
         When the remaining workflow timeout is stricter, the coroutine runs
         without the agent timeout wrapper so the existing workflow timeout
@@ -2640,16 +2844,17 @@ class WorkflowEngine:
             AgentTimeoutError: If the agent exceeds its timeout_seconds.
         """
         if agent.timeout_seconds is None:
-            return await coro
+            return await self._execution_session.invoke(coro)
 
         # If workflow remaining timeout is stricter, let it own the error
         remaining = self.limits.get_remaining_timeout()
         if remaining is not None and remaining <= agent.timeout_seconds:
-            return await coro
+            return await self._execution_session.invoke(coro)
 
         start = _time.monotonic()
         try:
-            return await asyncio.wait_for(coro, timeout=agent.timeout_seconds)
+            async with asyncio.timeout(agent.timeout_seconds) as local_timeout:
+                return await self._execution_session.invoke(coro, nested_timeout=local_timeout)
         except TimeoutError as e:
             elapsed = _time.monotonic() - start
             self._emit(
@@ -3159,6 +3364,8 @@ class WorkflowEngine:
         Raises:
             ExecutionError: If a declared source cannot be resolved.
         """
+        if self._execution_session.agent_dependencies is not None:
+            return
         declared = self.config.workflow.runtime.plugin_sources
         # Tested by coverage rather than emptiness: a sub-workflow inherits
         # a non-empty table from its parent, and asking whether the table is
@@ -3661,6 +3868,8 @@ class WorkflowEngine:
     def _resume_contract(self, bundle: BundleRef | None = None) -> dict[str, Any]:
         manifest = self._execution_resolver.manifest
         environment = self._execution_session.environment
+        if bundle is None:
+            bundle = self._execution_session.run_bundle
         return {
             "workflow_digest": manifest.workflow.digest,
             "environment_name": environment.name,
@@ -3691,6 +3900,11 @@ class WorkflowEngine:
             ValidationError: If agent output doesn't match schema.
             TemplateError: If template rendering fails.
         """
+        if self._subworkflow_depth == 0:
+            self._execution_session.begin_generation()
+            self._execution_session.root_task = asyncio.current_task()
+            self._pending_terminal_event = None
+            self._pending_checkpoint_error = None
         await self._ensure_plugin_marketplaces()
         self._explicit_terminal_failure = False
         self._dashboard_stop_handled = False
@@ -3710,6 +3924,8 @@ class WorkflowEngine:
         redaction_token = None
         claim = None
         try:
+            if self._subworkflow_depth == 0:
+                self._execution_resolver.refresh_manifest()
             persistence = self._workspace_persistence()
             if self._subworkflow_depth == 0 and persistence is not None:
                 if not self._run_id:
@@ -3718,8 +3934,20 @@ class WorkflowEngine:
             backend_names = {
                 profile.backend for profile in self._execution_resolver.manifest.profiles.values()
             }
+            # Child configs inherit retention from the root; legacy runs need no inventory.
+            root_spec = self._execution_session._root_run_spec
+            if persistence is not None or (
+                root_spec is not None and root_spec.workspace_persistence is not None
+            ):
+                self._execution_session.note_participants(
+                    self.config, self._execution_resolver.manifest
+                )
+            if self._subworkflow_depth == 0 and persistence is not None:
+                self._execution_session.note_known_children(self.config, self.workflow_path)
+                backend_names |= self._execution_session.retained_participants
             await self._execution_session.ensure_backends(backend_names)
             if self._subworkflow_depth == 0:
+                self._execution_session._registry = self._registry
                 if self._execution_session.owns_secrets:
                     self._execution_session.reset_secrets()
                     self._execution_resolver.refresh_secret_uses()
@@ -3727,10 +3955,11 @@ class WorkflowEngine:
                     self._execution_resolver.manifest,
                     self.workflow_path,
                     self._execution_session.environment,
+                    on_topology=self._execution_session.set_agent_dependencies,
                 )
                 self._run_bundle = bundle
                 backends = script_step_backends(self._execution_resolver.manifest)
-                if len(backends) > 1:
+                if persistence is None and len(backends) > 1:
                     message = "Workflow uses mixed script execution backends: " + ", ".join(
                         sorted(backends)
                     )
@@ -3769,7 +3998,8 @@ class WorkflowEngine:
             # The backend finalization sits in an inner finally: a cancellation
             # landing mid-close must not skip the realm cleanup below.
             try:
-                await self._close_mcp_step_managers()
+                if not self._execution_session.managed:
+                    await self._close_mcp_step_managers()
                 # The pricing verdict belongs to the run ending, not to anyone
                 # asking for a summary. Drawing it here covers the run that dies
                 # part way -- the case where "these numbers came from the static
@@ -3784,9 +4014,7 @@ class WorkflowEngine:
                                 self._execution_session.workspace_identities(),
                                 self._execution_session.executed_backends(),
                             )
-                        await self._execution_session.finalize_leases(
-                            outcome, retain=self._compute_workspace_retain(outcome)
-                        )
+                        await self._finish_root(outcome, sys.exc_info()[1])
                     finally:
                         self._workspace_lease = None
                         if redaction_token is not None:
@@ -3818,6 +4046,11 @@ class WorkflowEngine:
             MaxIterationsError: If max iterations limit is exceeded.
             TimeoutError: If timeout limit is exceeded.
         """
+        if self._subworkflow_depth == 0:
+            self._execution_session.begin_generation()
+            self._execution_session.root_task = asyncio.current_task()
+            self._pending_terminal_event = None
+            self._pending_checkpoint_error = None
         await self._ensure_plugin_marketplaces()
         self._explicit_terminal_failure = False
         self._dashboard_stop_handled = False
@@ -3838,7 +4071,18 @@ class WorkflowEngine:
         redaction_token = None
         claim = None
         try:
+            if self._subworkflow_depth == 0:
+                self._execution_resolver.refresh_manifest()
             persistence = self._workspace_persistence()
+            root_spec = self._execution_session._root_run_spec
+            if persistence is not None or (
+                root_spec is not None and root_spec.workspace_persistence is not None
+            ):
+                self._execution_session.note_participants(
+                    self.config, self._execution_resolver.manifest
+                )
+            if self._subworkflow_depth == 0 and persistence is not None:
+                self._execution_session.note_known_children(self.config, self.workflow_path)
             if checkpoint is None and persistence is not None:
                 raise CheckpointError(
                     "Retained workspace resume requires checkpoint data; start a fresh run."
@@ -3891,11 +4135,9 @@ class WorkflowEngine:
                                 "start a fresh run."
                             )
                         resume_identities[name] = identity
-                    retained_names = {
-                        profile.backend
-                        for profile in self._execution_resolver.manifest.profiles.values()
-                        if profile.backend != "local"
-                    }
+                    retained_names = self._execution_session.retained_participants | set(
+                        workspace.get("executed_backends") or ()
+                    )
                     if not retained_names.issubset(resume_identities):
                         raise CheckpointError(
                             "Checkpoint is missing an identity for a retained backend; "
@@ -3944,7 +4186,9 @@ class WorkflowEngine:
             backend_names = {
                 profile.backend for profile in self._execution_resolver.manifest.profiles.values()
             }
+            backend_names |= self._execution_session.retained_participants
             if self._subworkflow_depth == 0:
+                self._execution_session._registry = self._registry
                 if self._execution_session.owns_secrets:
                     self._execution_session.reset_secrets()
                     self._execution_resolver.refresh_secret_uses()
@@ -3952,6 +4196,7 @@ class WorkflowEngine:
                     self._execution_resolver.manifest,
                     self.workflow_path,
                     self._execution_session.environment,
+                    on_topology=self._execution_session.set_agent_dependencies,
                 )
                 self._run_bundle = bundle
                 if checkpoint is not None and checkpoint.resume_contract is not None:
@@ -3964,7 +4209,7 @@ class WorkflowEngine:
                         )
                 await self._execution_session.ensure_backends(backend_names)
                 backends = script_step_backends(self._execution_resolver.manifest)
-                if len(backends) > 1:
+                if persistence is None and len(backends) > 1:
                     message = "Workflow uses mixed script execution backends: " + ", ".join(
                         sorted(backends)
                     )
@@ -4005,7 +4250,8 @@ class WorkflowEngine:
             # Same inner-finally reasoning as :meth:`run` -- a cancellation
             # landing mid-close must not skip the backend finalization.
             try:
-                await self._close_mcp_step_managers()
+                if not self._execution_session.managed:
+                    await self._close_mcp_step_managers()
                 # Same reasoning as :meth:`run` -- a resumed run that dies part way
                 # is still a run that priced nothing.
                 self._warn_if_pricing_hook_silent()
@@ -4017,9 +4263,7 @@ class WorkflowEngine:
                                 self._execution_session.workspace_identities(),
                                 self._execution_session.executed_backends(),
                             )
-                        await self._execution_session.finalize_leases(
-                            outcome, retain=self._compute_workspace_retain(outcome)
-                        )
+                        await self._finish_root(outcome, sys.exc_info()[1])
                     finally:
                         self._workspace_lease = None
                         if redaction_token is not None:
@@ -4029,6 +4273,53 @@ class WorkflowEngine:
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
+
+    async def _finish_root(self, outcome: RunOutcome, primary: BaseException | None) -> None:
+        """Finish the sole root episode, then publish terminal state synchronously."""
+        session = self._execution_session
+        try:
+            await session.finalize_leases(outcome, retain=self._compute_workspace_retain(outcome))
+        except asyncio.CancelledError:
+            if primary is None:
+                raise
+        if not session.managed:
+            return
+        cleanup_error = (
+            ExecutionError(
+                "Managed workspace cleanup is unconfirmed; retained workspace cannot be reused.",
+                suggestion="Inspect and release the remaining owners before manual cleanup.",
+            )
+            if session.cleanup_uncertain
+            else None
+        )
+        error = primary or cleanup_error
+        self._terminal_write = True
+        try:
+            checkpoint_error = self._pending_checkpoint_error or (
+                cleanup_error if primary is None else None
+            )
+            self._pending_checkpoint_error = None
+            if checkpoint_error is not None and not self._explicit_terminal_failure:
+                self._save_checkpoint_on_failure(checkpoint_error)
+            pending = self._pending_terminal_event
+            self._pending_terminal_event = None
+            if primary is None and cleanup_error is not None:
+                self._emit(
+                    "workflow_failed",
+                    {
+                        "error_type": type(cleanup_error).__name__,
+                        "message": str(cleanup_error),
+                        "agent_name": self._current_agent_name,
+                    },
+                )
+            elif pending is not None:
+                self._emit(*pending)
+        finally:
+            self._terminal_write = False
+            if session.owns_secrets and self._registry is None:
+                session.reset_secrets()
+        if primary is None and error is not None:
+            raise error
 
     def set_context(self, context: WorkflowContext) -> None:
         """Replace the engine's workflow context with a restored one.
@@ -4084,6 +4375,16 @@ class WorkflowEngine:
             Path to the saved checkpoint, or ``None`` when no ``workflow_path``
             is set or saving failed.
         """
+        if not self._terminal_write and self._execution_session.sealed:
+            return None
+        if (
+            self._execution_session.managed
+            and trigger == "failure"
+            and self._subworkflow_depth == 0
+            and not self._terminal_write
+        ):
+            self._pending_checkpoint_error = error
+            return None
         if self.workflow_path is None:
             logger.debug("No workflow_path set; skipping checkpoint save")
             return None
@@ -4412,8 +4713,10 @@ class WorkflowEngine:
         # ``checkpoint_saved`` on success; harmless here since the dashboard
         # reads the path inline from ``workflow_failed``.
         try:
+            self._terminal_write = True
             checkpoint_path = self._save_checkpoint_on_failure(error)
         finally:
+            self._terminal_write = False
             self._dashboard_stop_workspace = None
         if checkpoint_path is None and self._compute_workspace_retain("cancelled"):
             logger.warning(
@@ -4437,7 +4740,11 @@ class WorkflowEngine:
                 if self.workflow_path is None
                 else "the checkpoint could not be written"
             )
-        self._emit("workflow_failed", fail_data)
+        self._terminal_write = True
+        try:
+            self._emit("workflow_failed", fail_data)
+        finally:
+            self._terminal_write = False
 
         return checkpoint_path
 
@@ -5384,6 +5691,7 @@ class WorkflowEngine:
         agent: AgentDef,
         executor: AgentExecutor,
         guidance_text: str,
+        realm: AgentRealm | None = None,
     ) -> AgentOutput | None:
         """Send guidance as a follow-up to an interrupted Copilot session.
 
@@ -5409,6 +5717,17 @@ class WorkflowEngine:
         if isinstance(provider, CopilotProvider):
             session = provider.get_interrupted_session()
             if session is not None:
+                if realm is not None and realm.binding is not None:
+                    self._mark_local_workspace_dispatch(agent.name)
+                    return await self._execution_session.invoke(
+                        provider.send_followup(
+                            session,
+                            guidance_text,
+                            agent_name=agent.name,
+                            agent_model=agent.model,
+                            managed_workspace=realm.binding.runtime_context,
+                        )
+                    )
                 return await provider.send_followup(
                     session,
                     guidance_text,
@@ -5477,8 +5796,8 @@ class WorkflowEngine:
 
         # Try Copilot follow-up if provider supports it
         followup = (
-            await self._send_guidance_followup(agent, executor, interrupt_result.guidance)
-            if realm is None
+            await self._send_guidance_followup(agent, executor, interrupt_result.guidance, realm)
+            if realm is None or realm.binding is not None
             else None
         )
         if followup is not None:
@@ -5486,11 +5805,13 @@ class WorkflowEngine:
 
         # Fallback: re-execute the agent with guidance appended to prompt
         new_guidance_section = self.context.get_guidance_prompt_section()
-        return await executor.execute(
-            agent,
-            agent_context,
-            guidance_section=new_guidance_section,
-            **_realm_kwargs(realm),
+        return await self._execution_session.invoke(
+            executor.execute(
+                agent,
+                agent_context,
+                guidance_section=new_guidance_section,
+                **_realm_kwargs(realm),
+            )
         )
 
     async def _handle_dialog(
@@ -5519,7 +5840,7 @@ class WorkflowEngine:
             The original output if dialog was not triggered or declined,
             or an updated output after re-execution with dialog context.
         """
-        if realm is not None:
+        if realm is not None and realm.binding is None:
             raise ConfigurationError(remote_dialog_error(agent.name, realm.name))
 
         provider = executor.provider
@@ -5530,7 +5851,16 @@ class WorkflowEngine:
             await self._keyboard_listener.suspend()
 
         try:
-            evaluation = await self._dialog_evaluator.evaluate(agent, output.content, provider)
+            dialog_kwargs: _ManagedDialogKwargs = {}
+            if realm is not None and realm.binding is not None:
+                dialog_kwargs = {
+                    "managed_workspace": realm.binding.runtime_context,
+                    "working_dir": agent.working_dir,
+                    "on_dispatch": lambda: self._mark_local_workspace_dispatch(agent.name),
+                }
+            evaluation = await self._execution_session.invoke(
+                self._dialog_evaluator.evaluate(agent, output.content, provider, **dialog_kwargs)
+            )
 
             if not evaluation.trigger:
                 logger.debug("Dialog not triggered for '%s': %s", agent.name, evaluation.reason)
@@ -5538,12 +5868,15 @@ class WorkflowEngine:
 
             logger.info("Dialog triggered for '%s': %s", agent.name, evaluation.reason)
 
-            dialog_result = await self._dialog_handler.handle_dialog(
-                agent=agent,
-                agent_output=output.content,
-                opening_question=evaluation.question,
-                provider=provider,
-                base_dir=self.workflow_path.parent if self.workflow_path else None,
+            dialog_result = await self._execution_session.invoke(
+                self._dialog_handler.handle_dialog(
+                    agent=agent,
+                    agent_output=output.content,
+                    opening_question=evaluation.question,
+                    provider=provider,
+                    base_dir=self.workflow_path.parent if self.workflow_path else None,
+                    **dialog_kwargs,
+                )
             )
 
             # If user declined or no meaningful dialog occurred, keep original output
@@ -5570,11 +5903,13 @@ class WorkflowEngine:
             guidance_section = self.context.get_guidance_prompt_section() or ""
             guidance_section += dialog_guidance
 
-            new_output = await executor.execute(
-                agent,
-                agent_context,
-                guidance_section=guidance_section,
-                **_realm_kwargs(realm),
+            new_output = await self._execution_session.invoke(
+                executor.execute(
+                    agent,
+                    agent_context,
+                    guidance_section=guidance_section,
+                    **_realm_kwargs(realm),
+                )
             )
             return new_output
 
@@ -5689,7 +6024,19 @@ class WorkflowEngine:
         # workflow — failing open on timeout rather than hanging. A direct
         # ``wait_for`` is used (not ``_execute_with_agent_timeout``) to avoid
         # emitting a misleading ``agent_timeout`` event for the primary agent.
-        if realm is None:
+        if realm is not None and realm.binding is not None:
+            validate_coro = self._output_validator.validate(
+                agent,
+                primary_prompt,
+                output.content,
+                provider,
+                interrupt_signal=self._interrupt_event,
+                execution_backend=realm.backend,
+                workspace_lease=realm.lease,
+                on_dispatch=realm.on_dispatch,
+                managed_binding=realm.binding,
+            )
+        elif realm is None:
             validate_coro = self._output_validator.validate(
                 agent,
                 primary_prompt,
@@ -5731,12 +6078,17 @@ class WorkflowEngine:
             )
         try:
             if agent.timeout_seconds is not None:
-                outcome = await asyncio.wait_for(validate_coro, timeout=agent.timeout_seconds)
+                async with asyncio.timeout(agent.timeout_seconds) as local_timeout:
+                    outcome = await self._execution_session.invoke(
+                        validate_coro, nested_timeout=local_timeout
+                    )
             else:
-                outcome = await validate_coro
+                outcome = await self._execution_session.invoke(validate_coro)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if self._execution_session.sealed:
+                raise
             logger.warning(
                 "Validator call for '%s' timed out or failed; treating as pass (%s: %s)",
                 agent.name,
@@ -5909,6 +6261,8 @@ class WorkflowEngine:
                 _workflow_start = _time.time()
 
                 while True:
+                    if self._execution_session.sealed:
+                        raise ExecutionError("Managed root cannot continue after teardown.")
                     self._current_agent_name = current_agent_name
 
                     # Periodic checkpoint at this step boundary (opt-in,
@@ -6130,9 +6484,13 @@ class WorkflowEngine:
                         # workflow are schema-rejected from declaring one, and
                         # script resolves its own in ScriptExecutor.
                         resolved_agent: AgentDef | None = None
+                        agent_realm = (
+                            self._agent_realm(agent.name) if isinstance(agent, AgentDef) else None
+                        )
                         if isinstance(agent, AgentDef):
-                            resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
-                        agent_realm = self._agent_realm(agent.name) if resolved_agent else None
+                            resolved_agent = self._resolve_agent_working_dir(
+                                agent, agent_context, agent_realm
+                            )
                         event_provider = (
                             self._provider_name_for(resolved_agent)
                             if resolved_agent is not None
@@ -6975,7 +7333,7 @@ class WorkflowEngine:
                                 if pause_outcome.guidance:
                                     combined_guidance = "\n".join(pause_outcome.guidance)
                                     followup = await self._send_guidance_followup(
-                                        resolved_agent, executor, combined_guidance
+                                        resolved_agent, executor, combined_guidance, agent_realm
                                     )
                                 if followup is None:
                                     # Plain Resume, or guidance with no
@@ -7160,8 +7518,14 @@ class WorkflowEngine:
                 # renders a calm "Workflow Stopped" banner, matching the
                 # hard-Kill path handled by ``handle_dashboard_stop``. #245.
                 fail_data["stopped_by_user"] = True
-            self._emit("workflow_failed", fail_data)
-            self._save_checkpoint_on_failure(e)
+            if self._subworkflow_depth == 0 and self._execution_session.managed:
+                # Root orchestration owns this intent even if its timeout sealed admission.
+                # Resource callbacks still pass through the sealed event/checkpoint guards.
+                self._pending_terminal_event = ("workflow_failed", fail_data)
+                self._pending_checkpoint_error = e
+            else:
+                self._emit("workflow_failed", fail_data)
+                self._save_checkpoint_on_failure(e)
             raise
         except Exception as e:
             self._emit(
@@ -8056,8 +8420,8 @@ class WorkflowEngine:
                         f"Step '{agent.name}' of type {agent.type!r} cannot execute "
                         "in a parallel group"
                     )
-                resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
                 realm = self._agent_realm(agent.name)
+                resolved_agent = self._resolve_agent_working_dir(agent, agent_context, realm)
 
                 # LLM-only per-member start event: emitted only here (after the
                 # per-agent resolution) so ``working_dir`` is the resolved value;
@@ -8658,8 +9022,10 @@ class WorkflowEngine:
                 # Resolve working_dir / settings_dir AFTER loop variables were injected into
                 # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
                 # the path resolves to this iteration's value.
-                qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
                 realm = self._agent_realm(inline_agent.name, for_each_group=for_each_group.name)
+                qualified_agent = self._resolve_agent_working_dir(
+                    qualified_agent, agent_context, realm
+                )
                 if self._workspace_persistence() is not None:
                     self._mint_attempt(qualified_agent.name)
 

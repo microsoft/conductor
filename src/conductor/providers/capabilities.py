@@ -149,6 +149,13 @@ class ProviderCapabilities(BaseModel):
     the directory would run the agent in the wrong repository. Defaults to
     ``False`` (conservative)."""
 
+    managed_local_workspace: bool = False
+    """``True`` only when managed execution and targeted release are implemented.
+
+    Requires staged cwd, pre-start resource accounting (including failed startup),
+    process custody and joined owners. Ordinary cwd support alone is insufficient.
+    """
+
     settings_dir: bool = False
     """``True`` when the provider applies an agent's resolved ``settings_dir``.
 

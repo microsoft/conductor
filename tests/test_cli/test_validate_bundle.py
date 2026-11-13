@@ -137,7 +137,7 @@ def test_bare_validate_byte_identical_without_environment(tmp_path: Path) -> Non
     workflow.write_text(_SET_WORKFLOW)
     before_code, before_output = _invoke_validate(workflow)
 
-    with patch("conductor.bundle.collector.collect_bundle") as collect_spy:
+    with patch("conductor.bundle.collector._Collector.collect") as collect_spy:
         after_code, after_output = _invoke_validate(workflow)
 
     assert before_code == after_code == 0

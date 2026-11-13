@@ -36,6 +36,7 @@ from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_eff
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, OutputField
+    from conductor.execution.types import ManagedWorkspaceContext
 
 # The hermes-agent package ships its public API under the top-level module
 # name "run_agent" (not "hermes_agent"). Catch only ModuleNotFoundError so
@@ -217,6 +218,7 @@ class HermesProvider(AgentProvider):
         extra_mcp_servers: dict[str, Any] | None = None,
         continuation_state: object | None = None,
         suppress_mcp_servers: bool = False,
+        managed_workspace: ManagedWorkspaceContext | None = None,
     ) -> AgentOutput:
         """Execute an agent via the hermes-agent library.
 
@@ -252,6 +254,8 @@ class HermesProvider(AgentProvider):
                 (``supports_continuation`` is ``True``). It wins over the
                 checkpoint-resume history file: in-memory state from this
                 run is always newer.
+            managed_workspace: Non-None contexts are refused before model
+                resolution or SDK construction; managed workspaces are unsupported.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -261,6 +265,12 @@ class HermesProvider(AgentProvider):
                 error state.
             ValidationError: If output doesn't match the declared schema.
         """
+        if managed_workspace is not None:
+            raise ProviderError(
+                "hermes does not support managed local workspaces",
+                provider_name="hermes",
+                is_retryable=False,
+            )
         del skill_directories  # Hermes relies on eager preamble injection (see docstring).
         del suppress_mcp_servers  # No MCP surface to suppress (see docstring).
         # Resolve per-agent overrides

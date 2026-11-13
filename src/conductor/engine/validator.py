@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, Any
 
 from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ConfigurationError
+from conductor.execution import AgentResult, AgentSpec, LocalRunnerBackend
+from conductor.execution.types import LocalWorkspaceBinding
 from conductor.executor.agent import AgentExecutor
 
 if TYPE_CHECKING:
@@ -155,6 +157,7 @@ class OutputValidator:
         workspace_lease: WorkspaceLease | None = None,
         spec_factory: Callable[[AgentDef, str], AgentSpec] | None = None,
         on_dispatch: Callable[[], None] | None = None,
+        managed_binding: LocalWorkspaceBinding | None = None,
     ) -> ValidationOutcome:
         """Validate ``primary_output`` against ``agent.validator.criteria``.
 
@@ -194,7 +197,46 @@ class OutputValidator:
         )
 
         try:
-            if execution_backend is not None and spec_factory is not None:
+            if managed_binding is not None:
+                if (
+                    not isinstance(execution_backend, LocalRunnerBackend)
+                    or workspace_lease is None
+                    or execution_backend.local_workspace_binding(workspace_lease)
+                    is not managed_binding
+                ):
+                    raise ConfigurationError("Managed grader requires its original prepared lease.")
+                assert provider is not None
+                local_output: AgentOutput | None = None
+
+                async def execute_local() -> AgentResult:
+                    nonlocal local_output
+                    local_output = await provider.execute(
+                        agent=validator_agent,
+                        context={},
+                        rendered_prompt=rendered_prompt,
+                        tools=[],
+                        interrupt_signal=interrupt_signal,
+                        suppress_mcp_servers=True,
+                        managed_workspace=managed_binding.runtime_context,
+                    )
+                    return AgentResult(content=local_output.content)
+
+                await execution_backend.run_agent(
+                    AgentSpec(
+                        name=validator_agent.name,
+                        execution_id=validator_agent.name,
+                        model_provider=agent.provider or "",
+                        model=validator_agent.model,
+                        rendered_prompt=rendered_prompt,
+                    ),
+                    workspace_lease,
+                    execute_local=execute_local,
+                    interrupt_signal=interrupt_signal,
+                    on_dispatch=on_dispatch,
+                )
+                assert local_output is not None
+                output = local_output
+            elif execution_backend is not None and spec_factory is not None:
                 spec = spec_factory(validator_agent, rendered_prompt)
                 result = await execution_backend.run_agent(
                     spec,
