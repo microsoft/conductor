@@ -1256,7 +1256,8 @@ async def test_release_joins_output_producer_and_late_native_result_writer(
                     sys.executable,
                     "-u",
                     "-c",
-                    "import sys;print('READY',flush=True);sys.stdin.read()",
+                    "import sys; sys.stdout.buffer.write(b'READY\\n'); sys.stdout.buffer.flush(); "
+                    "sys.stdin.read()",
                 ),
                 dict(os.environ),
                 str(tmp_path),
