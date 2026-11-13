@@ -636,7 +636,11 @@ class TestMCPManagerTaskAffinity:
             with pytest.raises(RuntimeError, match="Failed to connect"):
                 await manager.connect_server(name="fs", command="server", redact_errors=True)
 
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        error_records = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.mcp.manager" and r.levelno == logging.ERROR
+        ]
         assert len(error_records) == 1
         assert error_records[0].exc_info is None
         assert "SECRET_CANARY" not in caplog.text
@@ -654,7 +658,11 @@ class TestMCPManagerTaskAffinity:
             with pytest.raises(RuntimeError, match="Failed to connect"):
                 await manager.connect_server(name="fs", command="server")
 
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        error_records = [
+            r
+            for r in caplog.records
+            if r.name == "conductor.mcp.manager" and r.levelno == logging.ERROR
+        ]
         assert len(error_records) == 1
         assert "plain failure text" in caplog.text
         assert error_records[0].exc_info is not None
