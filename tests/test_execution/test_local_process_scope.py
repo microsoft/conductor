@@ -2084,7 +2084,7 @@ async def test_terminal_sigint_cancels_parent_without_destroying_custody(tmp_pat
         assert result["descendant_group"] == result["descendant"]
         assert result["sigint_default"]
         assert result["original_deadline"] == result["final_deadline"]
-        assert result["original_deadline"] - result["started"] == 30
+        assert result["original_deadline"] - result["started"] == pytest.approx(30)
         assert result["fallback_kills"] == 0
         assert result["owned_fds"] == result["owned_threads"] == result["owned_tasks"] == 0
     finally:
