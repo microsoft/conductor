@@ -1105,7 +1105,10 @@ async def test_windows_nonbreakaway_job_cleans_redirected_descendant(tmp_path: P
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Requires native Windows breakaway enforcement")
 async def test_windows_job_refuses_breakaway_payload(tmp_path: Path) -> None:
-    # Requirement: the assigned job does not allow descendants to break custody.
+    # Requirement: the directly assigned base interpreter must refuse breakaway.
+    # A venv redirector adds a permissive nested job that allows partial breakaway.
+    base_executable: object = vars(sys)["_base_executable"]
+    assert isinstance(base_executable, str)
     controller = LocalProcessScopeController(str(tmp_path), "inc")
     payload = (
         "import subprocess,sys\n"
@@ -1120,7 +1123,7 @@ async def test_windows_job_refuses_breakaway_payload(tmp_path: Path) -> None:
     try:
         result = await asyncio.wait_for(
             controller.spawn_script(
-                "script", CommandSpec(sys.executable, ("-c", payload), stdin=b"")
+                "script", CommandSpec(base_executable, ("-c", payload), stdin=b"")
             ),
             10,
         )
