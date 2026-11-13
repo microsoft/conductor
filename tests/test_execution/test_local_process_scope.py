@@ -25,6 +25,7 @@ from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.local_process_scope import LocalProcessScopeController
 from conductor.execution.local_scope_launcher import connect
 from conductor.execution.types import CommandSpec, ManagedWorkspaceContext, ProcessLaunchSpec
+from conductor.executor.script import ScriptExecutor
 from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 
@@ -1022,11 +1023,14 @@ async def test_active_eof_does_not_start_cleanup_episode(
 
 
 async def test_target_oserror_round_trips_real_native_fields(tmp_path: Path) -> None:
-    # Requirement: non-ENOENT target start failures preserve native reconstructed causes.
+    # Requirement: start failures preserve declared native fields and their portable cause.
     bad_cwd = tmp_path / "file-not-directory"
     bad_cwd.write_bytes(b"preserve")
     with pytest.raises(OSError) as expected:
         subprocess.run([sys.executable, "-c", ""], cwd=str(bad_cwd), capture_output=True, timeout=5)
+    native = expected.value
+    assert native.errno is not None
+    projected = OSError(native.errno, native.strerror, native.filename)
     controller = LocalProcessScopeController(str(tmp_path), "inc")
     try:
         result = await asyncio.wait_for(
@@ -1038,11 +1042,16 @@ async def test_target_oserror_round_trips_real_native_fields(tmp_path: Path) -> 
         )
         assert result.outcome == "start_failed" and result.start_error is not None
         error = result.start_error
-        reconstructed = OSError(error.errno, error.message, error.filename)
-        assert type(reconstructed) is type(expected.value)
-        assert str(reconstructed) == str(expected.value)
-        assert reconstructed.errno == expected.value.errno
-        assert reconstructed.filename == expected.value.filename
+        assert error.kind == "os_error"
+        assert error.errno == native.errno
+        assert error.message == native.strerror
+        assert error.filename == native.filename
+        reconstructed = ScriptExecutor._reconstruct_start_error(result)
+        assert type(reconstructed) is type(native)
+        assert str(reconstructed) == str(projected)
+        assert reconstructed.errno == native.errno
+        assert reconstructed.strerror == native.strerror
+        assert reconstructed.filename == native.filename
         assert (await controller.await_release()).status == "released"
     finally:
         await controller.close()

@@ -489,7 +489,7 @@ class TestLiteralVocabularies:
 
 
 class TestStartErrorRoundTrip:
-    """Requirement: StartError reconstructs the original exception for chaining."""
+    """Requirement: StartError preserves causes representable by its portable projection."""
 
     @pytest.mark.parametrize(
         "original",
@@ -500,8 +500,8 @@ class TestStartErrorRoundTrip:
         ],
     )
     def test_errno_bearing_round_trip(self, original: OSError) -> None:
-        # Requirement: with a structured errno the reconstructed exception
-        # matches the original on type/str/errno/filename (CPython's
+        # Requirement: for these representable structured errors, the reconstructed
+        # cause matches the original on type/str/errno/filename (CPython's
         # OSError(errno, ...) constructor auto-selects the built-in subclass,
         # e.g. PermissionError for errno 13).
         start_error = _fill_start_error(original)

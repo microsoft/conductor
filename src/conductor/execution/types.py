@@ -315,7 +315,7 @@ class StartError:
     rebuild it) and ``str(e)`` otherwise; ``errno`` is ``e.errno``;
     ``filename`` is ``e.filename``.
 
-    The executor reconstructs the original exception for
+    The executor builds a cause from these recorded fields for
     ``raise ... from ...`` chaining with::
 
         cause_type = FileNotFoundError if kind == "file_not_found" else OSError
@@ -325,12 +325,14 @@ class StartError:
             else cause_type(message)
         )
 
-    Reconstructed and original exceptions match on ``type``/``str``/
-    ``errno``/``filename`` (CPython's ``OSError(errno, ...)`` constructor
-    auto-selects the matching built-in subclass, e.g. ``PermissionError``
-    for errno 13). The only residual divergence is the type identity of a
-    custom ``OSError`` subclass, which is accepted: raw exception objects
-    never travel in this contract.
+    The cause's type and text follow this portable projection. CPython's
+    ``OSError(errno, ...)`` constructor selects the matching built-in
+    subclass, e.g. ``PermissionError`` for errno 13. Native ``winerror``,
+    ``filename2`` and custom exception subclass identity are not represented.
+    Consequently, the cause's string need not equal the original exception's
+    string, including its native Windows error prefix. The recorded
+    ``errno``, ``message`` and ``filename`` retain their original values;
+    raw exception objects never travel in this contract.
     """
 
     kind: StartErrorKind
