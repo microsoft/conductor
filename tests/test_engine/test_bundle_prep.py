@@ -27,6 +27,7 @@ from conductor.config.environment import (
     builtin_local_environment,
 )
 from conductor.config.loader import load_config
+from conductor.config.schema import WorkflowConfig
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.execution_resolution import ExecutionResolver, ExecutionResolverSession
 from conductor.engine.run_manifest import (
@@ -41,11 +42,17 @@ from conductor.execution import (
     BundleRef,
     CommandResult,
     CommandSpec,
+    LocalRunnerBackend,
+    ResolvedExecutionSpec,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution import errors as execution_errors
+from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.types import McpServerSpec, McpStdioTarget
 from conductor.registry.cache import CACHE_LAYOUT_VERSION, _readiness_marker_payload, _sentinel_path
 
 
@@ -63,6 +70,11 @@ class StubBackend:
         return RunnerCapabilities(
             batch=True, sessions=False, shared_workspace=True, snapshots=False
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        raise execution_errors.ExecutionSpecError("Test backend does not support direct stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         self.prepare_calls.append(run)
@@ -93,6 +105,39 @@ class StubBackend:
         self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
     ) -> None:
         self.finalize_calls.append((lease, outcome))
+
+
+class RecordingLocalBackend(LocalRunnerBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepare_calls: list[RunSpec] = []
+
+    async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
+        self.prepare_calls.append(run)
+        return await super().prepare_run(run)
+
+
+class RecordingDockerBackend(StubBackend):
+    def __init__(self) -> None:
+        super().__init__("docker")
+        self.attach_calls: list[tuple[RunSpec, WorkspaceIdentity, bool]] = []
+
+    def capabilities(self) -> RunnerCapabilities:
+        return replace(super().capabilities(), retained_workspace=True)
+
+    async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
+        self.prepare_calls.append(run)
+        return WorkspaceLease(run.run_id, "docker", "one")
+
+    async def attach_run(
+        self,
+        run: RunSpec,
+        identity: WorkspaceIdentity,
+        *,
+        expect_staged: bool = False,
+    ) -> WorkspaceLease:
+        self.attach_calls.append((run, identity, expect_staged))
+        return WorkspaceLease(identity.lease_id, "docker", identity.incarnation)
 
 
 @pytest.fixture
@@ -144,6 +189,41 @@ def _write_script_workflow(
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_mcp_workflow(path: Path, *, profile: str, mcp_name: str = "mcp") -> Path:
+    path.write_text(
+        textwrap.dedent(
+            f"""\
+            workflow:
+              name: {path.stem}
+              entry_point: done
+              runtime:
+                mcp_servers:
+                  tools:
+                    type: stdio
+                    command: not-spawned
+            agents:
+              - name: done
+                type: set
+                value: ok
+                routes:
+                  - to: $end
+              - name: {mcp_name}
+                type: mcp
+                server: tools
+                tool: read
+                execution:
+                  profile: {profile}
+                routes:
+                  - to: $end
+            output:
+              result: "{{{{ done.output }}}}"
+            """
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -864,6 +944,233 @@ async def test_programmatic_late_discovery_requires_root_workflow_file(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_before_checkpoint", [False, True])
+async def test_docker_mcp_fence_intent_precedes_run_and_resume_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker_environment: ResolvedEnvironment,
+    cancel_before_checkpoint: bool,
+) -> None:
+    # Requirement: failure/cancellation checkpoints restore fencing before resumed workspace access.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "docker", DockerRunnerBackend())
+    docker_backend = RecordingDockerBackend()
+    local_backend = RecordingLocalBackend()
+    monkeypatch.setitem(resolution_module.BACKEND_FACTORIES, "docker", lambda: docker_backend)
+    workflow = _write_mcp_workflow(tmp_path / "workflow.yaml", profile="docker")
+    workflow.write_text(
+        workflow.read_text().replace(
+            "  entry_point: done\n",
+            "  entry_point: done\n  workspace: {persistence: durable}\n",
+        ),
+        encoding="utf-8",
+    )
+    session = ExecutionResolverSession(docker_environment, default_backend=local_backend)
+    engine = WorkflowEngine(
+        load_config(workflow),
+        workflow_path=workflow,
+        run_context=RunContext(run_id="docker-mcp-fence"),
+        _execution_session=session,
+    )
+    if cancel_before_checkpoint:
+        entered_loop = asyncio.Event()
+        original_loop = engine._execute_loop
+
+        async def pause_after_preparation(_current_agent_name: str) -> dict[str, Any]:
+            engine._current_agent_name = _current_agent_name
+            entered_loop.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable after cancellation")
+
+        monkeypatch.setattr(engine, "_execute_loop", pause_after_preparation)
+        run_task = asyncio.create_task(engine.run({}))
+        await asyncio.wait_for(entered_loop.wait(), timeout=5)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        monkeypatch.setattr(engine, "_execute_loop", original_loop)
+        checkpoint_path = engine.handle_dashboard_stop("fixture cancellation after preparation")
+        assert checkpoint_path is not None
+    else:
+        original_store = engine.context.store
+        fail_once = True
+
+        def fail_after_first_preparation(name: str, value: Any) -> None:
+            nonlocal fail_once
+            if name == "done" and fail_once:
+                fail_once = False
+                raise ExecutionError("fixture stop after preparation")
+            original_store(name, value)
+
+        monkeypatch.setattr(engine.context, "store", fail_after_first_preparation)
+        with pytest.raises(ExecutionError, match="fixture stop"):
+            await engine.run({})
+        checkpoint_path = engine._last_checkpoint_path
+    assert checkpoint_path is not None
+    checkpoint = CheckpointManager.load_checkpoint(checkpoint_path)
+
+    result = await engine.resume(checkpoint.current_agent, checkpoint=checkpoint)
+
+    assert result == {"result": "ok"}
+    assert len(docker_backend.prepare_calls) == 1
+    assert len(docker_backend.attach_calls) == 1
+    assert len(local_backend.prepare_calls) == 2
+    attached = docker_backend.attach_calls[0][0]
+    assert attached.workspace_persistence == "durable"
+    for run in (docker_backend.prepare_calls[0], attached, *local_backend.prepare_calls):
+        assert run.mcp_fence_execution == ResolvedExecutionSpec(image="python:3.12")
+        assert run.bundle is not None
+
+
+async def test_docker_mcp_child_fence_intent_precedes_root_docker_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker_environment: ResolvedEnvironment,
+) -> None:
+    # Requirement: a compiled Docker-only MCP child selects fencing before root workspace mutation.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "docker", DockerRunnerBackend())
+    docker_backend = StubBackend("docker")
+    local_backend = RecordingLocalBackend()
+    monkeypatch.setitem(resolution_module.BACKEND_FACTORIES, "docker", lambda: docker_backend)
+    document = docker_environment.document.model_copy(deep=True)
+    document.profiles["child-docker"] = ProfileDefinition(
+        backend="docker",
+        docker=DockerProfileOptions(image="child:image"),
+    )
+    environment = replace(docker_environment, document=document)
+    child = _write_mcp_workflow(tmp_path / "child.yaml", profile="child-docker")
+    root = tmp_path / "root.yaml"
+    root.write_text(
+        textwrap.dedent(
+            """\
+            workflow:
+              name: root
+              entry_point: done
+            agents:
+              - name: done
+                type: set
+                value: ok
+                routes:
+                  - to: $end
+              - name: root_script
+                type: script
+                command: not-run
+                execution:
+                  profile: docker
+                routes:
+                  - to: $end
+              - name: child
+                type: workflow
+                workflow: child.yaml
+                execution:
+                  profile: local
+                routes:
+                  - to: $end
+            output:
+              result: "{{ done.output }}"
+            """
+        ),
+        encoding="utf-8",
+    )
+    session = ExecutionResolverSession(environment, default_backend=local_backend)
+    engine = WorkflowEngine(
+        load_config(root),
+        workflow_path=root,
+        _execution_session=session,
+    )
+
+    result = await engine.run({})
+
+    assert result == {"result": "ok"}
+    assert len(docker_backend.prepare_calls) == 1
+    assert docker_backend.prepare_calls[0].mcp_fence_execution == ResolvedExecutionSpec(
+        image="child:image"
+    )
+    assert local_backend.prepare_calls[0].mcp_fence_execution == ResolvedExecutionSpec(
+        image="child:image"
+    )
+    assert docker_backend.run_calls == []
+    assert engine._run_bundle is not None
+    assert (Path(engine._run_bundle.store_path) / "tree/main" / child.name).is_file()
+
+
+async def test_local_mcp_has_no_fence_intent_or_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker_environment: ResolvedEnvironment,
+) -> None:
+    # Requirement: local MCP keeps zero bundle I/O and does not acquire a Docker fence.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    local_backend = RecordingLocalBackend()
+    workflow = _write_mcp_workflow(tmp_path / "local.yaml", profile="local")
+    session = ExecutionResolverSession(docker_environment, default_backend=local_backend)
+    engine = WorkflowEngine(
+        load_config(workflow),
+        workflow_path=workflow,
+        _execution_session=session,
+    )
+
+    result = await engine.run({})
+
+    assert result == {"result": "ok"}
+    assert engine._run_bundle is None
+    assert local_backend.prepare_calls[0].mcp_fence_execution is None
+
+
+def test_fence_intent_uses_first_qualified_docker_mcp_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    docker_environment: ResolvedEnvironment,
+) -> None:
+    # Requirement: qualified step identity deterministically selects the fencing image.
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "docker", DockerRunnerBackend())
+    document = docker_environment.document.model_copy(deep=True)
+    document.profiles["alternate"] = ProfileDefinition(
+        backend="docker",
+        docker=DockerProfileOptions(image="alternate:image"),
+    )
+    environment = replace(docker_environment, document=document)
+    config = WorkflowConfig.model_validate(
+        {
+            "workflow": {
+                "name": "identity",
+                "entry_point": "z_top",
+                "runtime": {"mcp_servers": {"tools": {"type": "stdio", "command": "not-spawned"}}},
+            },
+            "agents": [
+                {
+                    "name": "z_top",
+                    "type": "mcp",
+                    "server": "tools",
+                    "tool": "read",
+                    "execution": {"profile": "docker"},
+                }
+            ],
+            "for_each": [
+                {
+                    "name": "a_group",
+                    "type": "for_each",
+                    "source": "workflow.input.items",
+                    "as": "item",
+                    "agent": {
+                        "name": "inner",
+                        "type": "mcp",
+                        "server": "tools",
+                        "tool": "read",
+                        "execution": {"profile": "alternate"},
+                    },
+                }
+            ],
+        }
+    )
+    manifest = compile_run_manifest(config, workflow_path=None, environment=environment)
+    session = ExecutionResolverSession(environment)
+
+    assert session.mcp_fence_execution(config, manifest) == ResolvedExecutionSpec(
+        image="alternate:image"
+    )
+
+
 async def test_root_preflight_bundles_child_docker_before_child_construction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -912,6 +1219,8 @@ async def test_root_preflight_bundles_child_docker_before_child_construction(
     assert started.data["system"]["bundle"]["digest"].startswith("sha256:")
     assert len(docker_backend.prepare_calls) == 1
     assert docker_backend.prepare_calls[0].bundle is not None
+    # Requirement: Docker scripts without direct MCP never acquire an MCP fence.
+    assert docker_backend.prepare_calls[0].mcp_fence_execution is None
     assert [call.command for call in docker_backend.run_calls] == ["ok"]
 
 

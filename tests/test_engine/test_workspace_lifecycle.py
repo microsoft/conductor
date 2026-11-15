@@ -49,8 +49,10 @@ from conductor.execution import (
     WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution import errors as execution_errors
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.execution.errors import WorkspaceAttachError
+from conductor.execution.types import McpServerSpec, McpStdioTarget
 from conductor.providers.copilot import CopilotProvider
 from tests.test_execution.test_workspace_retention import (
     bundle as retained_bundle,
@@ -712,6 +714,11 @@ class _RetainedDocker:
             snapshots=False,
             retained_workspace=True,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        raise execution_errors.ExecutionSpecError("Test backend does not support direct stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         assert not self.volume

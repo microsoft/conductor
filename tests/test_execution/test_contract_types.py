@@ -44,6 +44,8 @@ from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import (
     LocalWorkspaceBinding,
     ManagedWorkspaceContext,
+    McpServerSpec,
+    McpStdioTarget,
     ProcessLaunchSpec,
     ProcessScopeController,
     ShutdownResult,
@@ -176,6 +178,9 @@ class TestLocalWorkspaceContracts:
             "bundle": None,
             "workspace_persistence": None,
             "local_workspace_root": None,
+            "check_mcp_admission": None,
+            "on_prepare_attempt": None,
+            "mcp_fence_execution": None,
         }
         managed = dataclasses.replace(legacy, local_workspace_root="/owned")
         assert managed.local_workspace_root == "/owned"
@@ -218,8 +223,7 @@ class TestProtocolShape:
         assert getattr(RunnerBackend, "_is_protocol", False) is True
 
     def test_protocol_declares_exactly_the_seam_methods(self) -> None:
-        # Requirement: run_agent and attach_run join the seam while open_mcp/cancel/close
-        # and context-manager symmetry methods remain outside it.
+        # Requirement: every backend implements the owned direct stdio target operation.
         method_names = {
             name
             for name, member in vars(RunnerBackend).items()
@@ -232,6 +236,7 @@ class TestProtocolShape:
             "run_command",
             "run_agent",
             "finalize_run",
+            "open_mcp_stdio",
         }
 
     @pytest.mark.asyncio
@@ -548,6 +553,42 @@ def test_aliases_are_typing_literals() -> None:
     # exception subclasses — house style, see RunMode in fleet/records.py.
     assert CommandOutcome.__origin__ is Literal  # type: ignore[attr-defined]
     assert RunOutcome.__origin__ is Literal  # type: ignore[attr-defined]
+
+
+async def test_mcp_contracts_hide_secrets_and_reject_unsupported_backends() -> None:
+    # Requirement: frozen stdio contracts hide payload and unsupported realms never spawn.
+    from conductor.engine.aca_execution import AcaRunnerBackend
+    from conductor.engine.execution_resolution import BACKEND_FACTORIES
+
+    async def close() -> None:
+        return None
+
+    spec = McpServerSpec("files", ("tool",), {"TOKEN": "TOP_SECRET"})
+    target = McpStdioTarget(
+        "docker", ("run",), {"TOKEN": "TOP_SECRET"}, "id", close, lambda: None, close
+    )
+    for value in (spec, target):
+        assert "TOP_SECRET" not in repr(value)
+        attribute = "env"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(value, attribute, {})
+    assert target.cwd is None
+    assert {
+        name: factory().capabilities().mcp_stdio for name, factory in BACKEND_FACTORIES.items()
+    } == {"local": False, "docker": True, "aca": False}
+    for backend in (LocalRunnerBackend(), AcaRunnerBackend()):
+        with pytest.raises(ExecutionSpecError, match="open_mcp_stdio"):
+            await backend.open_mcp_stdio(spec, None)
+
+
+def test_mcp_run_callbacks_are_ephemeral_and_equality_neutral() -> None:
+    # Requirement: callback ownership does not alter run identity or expose callbacks in repr.
+    run = RunSpec(
+        "run", check_mcp_admission=lambda: None, on_prepare_attempt=lambda _lease, _release: None
+    )
+    assert run == RunSpec("run")
+    assert "check_mcp_admission" not in repr(run)
+    assert "on_prepare_attempt" not in repr(run)
 
 
 @pytest.mark.asyncio

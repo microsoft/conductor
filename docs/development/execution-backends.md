@@ -49,6 +49,10 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 - The `run_agent` seam on `RunnerBackend` (`src/conductor/execution/backend.py`) executes agent steps
   across backends using `AgentSpec` and `AgentResult` contract types (`src/conductor/execution/types.py`).
   Backends declare capability flags via `RunnerCapabilities.agent` and `RunnerCapabilities.interrupt`.
+- The direct MCP seam uses `McpServerSpec` and `McpStdioTarget` from
+  `src/conductor/execution/types.py`. Docker declares `mcp_stdio=True` and supplies an owned
+  stdio target; local direct MCP keeps its existing engine path, and ACA refuses the operation.
+  The execution package doesn't import the MCP SDK.
 - `AgentExecutor` (`src/conductor/executor/agent.py`) calls the provider directly for ordinary
   local execution without a managed binding. Managed local uses `RunnerBackend.run_agent` with
   an in-process closure, while remote calls use the corresponding backend without one. Remote
@@ -104,14 +108,15 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 
 - Uses the Docker CLI via subprocess, not an SDK, so the operator's context, credential helpers
   and remote `DOCKER_HOST` keep working. Requires Docker Engine 20.10+ (API 1.41).
-- Each run gets one named volume `conductor-ws-<lease_id>`; commands run in short-lived
-  containers over it. Containers and volumes carry deterministic `io.conductor.*` labels.
+- Each run gets one named volume `conductor-ws-<lease_id>`; script commands and direct MCP
+  servers use it. Containers and volumes carry `io.conductor.*` ownership labels.
 - The bundle is staged with `docker cp -a` under the scratch container's resolved `--user`
   (`_STAGING_COPY_MODE = "archive-to-container-user"`); plain `cp` left uid 65532 unable to
   write. Change this only with a new real-daemon spike.
-- Finalization is fail-closed: only resources whose labels (and container name) verify are
-  removed; anything unverifiable is left in place with a warning that prints the manual cleanup
-  command. Cleanup is shielded and re-raises an absorbed cancellation afterward.
+- Finalization is fail-closed: only verified resources are deliberately removed, and
+  unconfirmed cleanup produces a warning. For fenced or uncertain MCP leases, the warning
+  requires terminal original controllers and owners, followed by independent ownership and
+  immutable-ID verification; it doesn't suggest a run-wide deletion command.
 - Retained volumes use marker protocol v2: publish `.conductor-staged` with the bundle digest
   in a separate `docker cp` only after copying the tree. On attached leases, verify the volume
   identity and marker before execution; a missing or mismatched marker after prior execution
@@ -123,6 +128,37 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 - Docker agent realms execute in lease-lived runner containers when `runner_image` is configured
   in `DockerProfileOptions` (`docker.runner_image`). Each active call owns a runner; idle runners
   can be reused, and cancellation retires only its runner. Script steps keep using `image`.
+- Direct Docker MCP uses `docker.image`, the shared container options, `docker run --rm -i`,
+  and the lease volume. Its rendered `runtime.working_dir` goes through `_map_working_dir`;
+  the Docker CLI target sets `cwd=None` rather than using the mapped container path as a host
+  cwd. A successful SDK connection is followed by target and volume ownership verification
+  before pool publication or the first tool call.
+- The engine's Docker MCP pool key includes server, profile, resolved execution, lease identity
+  and incarnation, and mapped cwd. It serializes by server name and has a soft 16-entry
+  threshold. Only a classified tool transport failure invalidates its entry; timeout, output
+  validation, cancellation, and `is_error` don't themselves invalidate it or trigger a retry.
+- `RunSpec.mcp_fence_execution` is internal intent derived before lease preparation, not a
+  workflow field or a `WorkspaceIdentity` or checkpoint schema change. `prepare_run` and
+  `attach_run` acquire the same deterministic, never-started daemon guard before workspace
+  verification or staging. The guard has an owner token, contains no MCP payload, and doesn't
+  mount the volume. Failed or uncertain image, guard, volume, and inventory checks refuse fenced
+  attachment; an empty MCP inventory isn't a release proof.
+- `src/conductor/engine/mcp_lifecycle.py` retains preparation attempts and all MCP entries across
+  eviction and cancellation. Root teardown seals admission and shares one absolute deadline
+  with staging and SDK/target cleanup. `src/conductor/execution/docker_mcp.py::ContainerOwner`
+  verifies ownership and immutable IDs. Only after all required proofs and finalization may the
+  owning lease release its guard. Unconfirmed owner cleanup or inventory blocks workspace and
+  guard removal; late completion doesn't clear that uncertainty. The finalizer skips volume
+  removal with `retain=True`; with `retain=False`, it can remove the verified volume before
+  releasing the guard. Once removal has been requested, an unconfirmed response doesn't prove
+  the resource remains. In particular, a guard release can fail after an ephemeral volume was
+  removed.
+- Docker direct MCP resolves server environment entries and server-scoped secrets into a
+  temporary env-file. The payload isn't added to Docker CLI argv or its environment. The CLI
+  retains the operator's ambient Docker, SSH, proxy, credential-helper context, and any secret
+  sources already present. Docker server stderr is suppressed, SDK transport logs are sanitized,
+  and private failure diagnostics are metadata-only; successful result data isn't universally
+  redacted.
 - Path mapping in `src/conductor/execution/docker_paths.py` checks that host skill and plugin
   directories exist in the bundle manifest or additional roots, translating host paths to staged
   locations under `/workspace`. Unbundled dependencies raise actionable configuration errors.
@@ -180,7 +216,8 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   `agent` capability, checks supported inner providers for remote realms (`copilot`, `openai`,
   `claude`), requires `docker.runner_image` on Docker agent profiles, and validates ACA constraints
   (rejects `sandbox.identifier_scope` on steps, rejects skills/plugins/discovery since ACA sandboxes
-  cannot read host paths).
+  cannot read host paths). `_require_mcp_backend_capability` preserves the local path and
+  requires `mcp_stdio` on other backends for direct MCP steps.
 - `script_step_backends` restricts mixed-backend script warnings to actual script steps.
 - `prepare_run_bundle` checks the manifest and statically knowable child closure for Docker or
   retained local file consumers before collecting the bundle.
@@ -280,7 +317,7 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   each engine (root and child) gets its own immutable index over one shared cache.
 - Static checks (scope placement, delivery transport, collisions, `allow` policies) live in
   `src/conductor/config/validator.py::_validate_secret_references`; Docker and ACA profile checks
-  (capability checks, non-script Docker steps without `runner_image`, provider cross-checks allowing copilot,
+  (capability checks, Docker agent steps without `runner_image`, provider cross-checks allowing copilot,
   openai, and claude on remote realms, reserved environment names, mixed backends, multi-user staging,
   `inherit_control_environment`, `read_only` without tmpfs, `network: host`) in
   `src/conductor/config/validator.py::_validate_docker_profiles`. Because `conductor run` skips the
@@ -361,8 +398,8 @@ volumes. Tests: `tests/test_execution/test_resolver.py`,
 `tests/test_execution/test_engine_integration.py`.
 
 **Fail-closed Docker cleanup.** Removing by label alone could delete another run's or a user's
-resources; verifying labels and names first and otherwise warning with a manual command keeps
-deletion safe.
+resources. Direct MCP targets and guards require ownership and immutable-ID proof. Unconfirmed
+owner cleanup blocks workspace removal rather than suggesting a broad deletion command.
 
 **Content zone (#527).** Keeping provenance out of the digest makes cache reuse depend only on
 content. Writing the sentinel last and renaming atomically means a reader that sees

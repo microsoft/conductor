@@ -2217,7 +2217,10 @@ def _validate_docker_profiles(
     config: WorkflowConfig,
     context: _EnvironmentValidationContext,
 ) -> tuple[list[str], list[str]]:
-    from conductor.engine.run_manifest import _require_agent_backend_capability
+    from conductor.engine.run_manifest import (
+        _require_agent_backend_capability,
+        _require_mcp_backend_capability,
+    )
 
     if not context["explicit"] and not _profile_references(config):
         return [], []
@@ -2259,6 +2262,11 @@ def _validate_docker_profiles(
                         agent=step,
                         runtime=config.workflow.runtime,
                     )
+                except ConfigurationError as exc:
+                    errors.append(f"environment '{environment_name}': {exc}")
+            elif isinstance(step, MCPStepDef):
+                try:
+                    _require_mcp_backend_capability(key, definition.backend)
                 except ConfigurationError as exc:
                     errors.append(f"environment '{environment_name}': {exc}")
             elif definition.backend != "local" and not isinstance(step, ScriptStepDef):

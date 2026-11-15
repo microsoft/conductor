@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from asyncio import Future
 from asyncio.subprocess import Process
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -303,6 +303,37 @@ class CommandSpec:
     attempt_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class McpServerSpec:
+    """Resolved direct stdio server inputs; environment values are private."""
+
+    server: str
+    argv: tuple[str, ...] = field(repr=False)
+    env: Mapping[str, str] = field(repr=False)
+    working_dir: str | None = None
+    inherit_control_environment: bool = False
+    execution: ResolvedExecutionSpec | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class McpStdioTarget:
+    """Owned launcher configuration, independent of any client SDK.
+
+    Mark the single launch attempt before spawning. Validate after initialization
+    and before publishing or calling tools. Close the client before ``aclose``;
+    an exception from either close means workspace release is unconfirmed.
+    """
+
+    command: str
+    args: tuple[str, ...] = field(repr=False)
+    env: Mapping[str, str] = field(repr=False)
+    identity: str
+    aclose: Callable[[], Awaitable[None]] = field(repr=False, compare=False)
+    mark_launch_attempted: Callable[[], None] = field(repr=False, compare=False)
+    validate_started: Callable[[], Awaitable[None]] = field(repr=False, compare=False)
+    cwd: None = None
+
+
 @dataclass(frozen=True)
 class StartError:
     """Serializable, transport-neutral description of a command start failure.
@@ -434,6 +465,11 @@ class RunSpec:
     bundle: BundleRef | None = None
     workspace_persistence: Literal["durable", "on-failure"] | None = None
     local_workspace_root: str | None = None
+    check_mcp_admission: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    on_prepare_attempt: (
+        Callable[[WorkspaceLease, Callable[[float], Awaitable[None]]], None] | None
+    ) = field(default=None, repr=False, compare=False)
+    mcp_fence_execution: ResolvedExecutionSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -462,6 +498,7 @@ class RunnerCapabilities:
     agent: bool = False
     interrupt: bool = False
     retained_workspace: bool = False
+    mcp_stdio: bool = False
 
 
 AgentEventSink = Callable[[str, Mapping[str, Any]], None]

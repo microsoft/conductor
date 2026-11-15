@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from conductor.config.environment import (
+    AcaProfileOptions,
     DockerProfileOptions,
     DockerResources,
     EnvironmentDocument,
@@ -24,7 +25,9 @@ from conductor.config.schema import (
     RestartConfig,
     RouteDef,
     ScriptStepDef,
+    SecretDelivery,
     StepExecutionConfig,
+    StepSecretRef,
     WorkflowConfig,
     WorkflowDef,
     WorkflowDefaults,
@@ -41,7 +44,13 @@ from conductor.engine.run_manifest import (
     script_step_backends,
 )
 from conductor.exceptions import ConfigurationError
-from conductor.execution.types import RunnerCapabilities
+from conductor.execution import errors as execution_errors
+from conductor.execution.types import (
+    McpServerSpec,
+    McpStdioTarget,
+    RunnerCapabilities,
+    WorkspaceLease,
+)
 
 
 class _BatchBackend:
@@ -52,6 +61,11 @@ class _BatchBackend:
             shared_workspace=False,
             snapshots=False,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        raise execution_errors.ExecutionSpecError("Test backend does not support direct stdio")
 
     async def prepare_run(self, run: Any) -> Any:
         raise NotImplementedError
@@ -472,20 +486,108 @@ def test_legacy_payload_without_script_steps_uses_all_backends_fallback() -> Non
             execution=StepExecutionConfig(profile="container"),
             routes=[RouteDef(to="$end")],
         ),
-        MCPStepDef(
-            name="mcp",
-            server="tools",
-            tool="read",
-            timeout=None,
-            execution=StepExecutionConfig(profile="container"),
-            routes=[RouteDef(to="$end")],
-        ),
     ],
-    ids=["agent", "workflow", "mcp"],
+    ids=["agent", "workflow"],
 )
 def test_reserved_non_script_docker_profiles_fail(step: Any) -> None:
-    # Requirement: Docker agents need runner_image; workflow and MCP steps stay local.
+    # Requirement: Docker agents need runner_image; workflow steps stay local.
     with pytest.raises(ConfigurationError, match="docker.runner_image|requires the local backend"):
+        compile_run_manifest(
+            _config(step),
+            workflow_path=None,
+            environment=_environment(docker=DockerProfileOptions(image="busybox")),
+        )
+
+
+def test_docker_mcp_records_image_without_runner_image() -> None:
+    # Requirement: direct Docker MCP uses docker.image and never requires an agent runner image.
+    manifest = compile_run_manifest(
+        _config(
+            MCPStepDef(
+                name="mcp",
+                server="tools",
+                tool="read",
+                timeout=None,
+                execution=StepExecutionConfig(profile="container"),
+                routes=[RouteDef(to="$end")],
+            )
+        ),
+        workflow_path=None,
+        environment=_environment(docker=DockerProfileOptions(image="busybox")),
+    )
+
+    profile = manifest.profiles["mcp"]
+    assert profile.backend == "docker"
+    assert profile.execution is not None
+    assert profile.execution.image == "busybox"
+    assert profile.realm_image is None
+
+
+def test_local_mcp_retains_local_special_case() -> None:
+    # Requirement: local direct MCP keeps its existing engine path and no execution payload.
+    manifest = compile_run_manifest(
+        _config(
+            MCPStepDef(
+                name="mcp",
+                server="tools",
+                tool="read",
+                timeout=None,
+                execution=StepExecutionConfig(profile="local"),
+                routes=[RouteDef(to="$end")],
+            )
+        ),
+        workflow_path=None,
+        environment=_environment(),
+    )
+
+    assert manifest.profiles["mcp"].backend == "local"
+    assert manifest.profiles["mcp"].execution is None
+
+
+def test_aca_mcp_capability_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: run-path compilation refuses ACA before dispatch when mcp_stdio is absent.
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "aca", _BatchBackend())
+    environment = _environment()
+    environment.document.profiles["cloud"] = ProfileDefinition(
+        backend="aca",
+        aca=AcaProfileOptions(pool_endpoint="https://pool.example.test"),
+    )
+    step = MCPStepDef(
+        name="mcp",
+        server="tools",
+        tool="read",
+        timeout=None,
+        execution=StepExecutionConfig(profile="cloud"),
+        routes=[RouteDef(to="$end")],
+    )
+
+    with pytest.raises(ConfigurationError, match="aca.*mcp_stdio"):
+        compile_run_manifest(_config(step), workflow_path=None, environment=environment)
+
+
+def test_docker_mcp_step_secrets_remain_refused() -> None:
+    # Requirement: accepting Docker placement never enables direct MCP step-level secrets.
+    step = MCPStepDef(
+        name="mcp",
+        server="tools",
+        tool="read",
+        timeout=None,
+        execution=StepExecutionConfig(
+            profile="container",
+            secrets=[
+                StepSecretRef(
+                    ref="token",
+                    scope="mcp",
+                    delivery=SecretDelivery(env="TOKEN"),
+                )
+            ],
+        ),
+        routes=[RouteDef(to="$end")],
+    )
+
+    with pytest.raises(ConfigurationError, match="does not support secret delivery"):
         compile_run_manifest(
             _config(step),
             workflow_path=None,

@@ -30,6 +30,8 @@ from conductor.execution.types import (
     CommandSpec,
     LocalWorkspaceBinding,
     ManagedWorkspaceContext,
+    McpServerSpec,
+    McpStdioTarget,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -121,6 +123,12 @@ class LocalRunnerBackend:
             agent=True,
             retained_workspace=True,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        """Local direct MCP uses the engine's existing client lifecycle."""
+        raise ExecutionSpecError("Local backend does not support open_mcp_stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         """Issue a managed active workspace; idle is restored only after confirmed release."""

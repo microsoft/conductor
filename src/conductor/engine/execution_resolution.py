@@ -20,11 +20,13 @@ from weakref import WeakKeyDictionary
 from conductor.config.environment import AcaProfileOptions, ResolvedEnvironment
 from conductor.config.schema import AgentDef, MCPStepDef, ScriptStepDef, WorkflowConfig
 from conductor.engine.bundle_prep import materialize_run_bundle
+from conductor.engine.mcp_lifecycle import McpRunLifecycle
 from conductor.engine.run_manifest import (
     BACKEND_CAPABILITY_PROVIDERS,
     ManifestExecutionSpec,
     ResolvedRunManifest,
     RunPreflight,
+    _iter_executable_steps,
     compile_run_manifest,
     executable_step_identity,
 )
@@ -178,6 +180,7 @@ class ExecutionResolverSession:
         self.cleanup_uncertain = False
         self.cli_cleanup_pending = False
         self.cleanup_deadline: float | None = None
+        self.mcp_lifecycle = McpRunLifecycle(self._mark_mcp_uncertain)
         self._managed_binding: LocalWorkspaceBinding | None = None
         self._terminal_identities: dict[str, WorkspaceIdentity] = {}
         self._providers: list[AgentProvider] = []
@@ -245,6 +248,7 @@ class ExecutionResolverSession:
             )
         self.sealed = False
         self.cleanup_deadline = None
+        self.mcp_lifecycle = McpRunLifecycle(self._mark_mcp_uncertain)
         self._cleanup_expired = asyncio.Event()
         self._cleanup_task = None
         self._managed_binding = None
@@ -265,6 +269,18 @@ class ExecutionResolverSession:
     def quarantined(self) -> bool:
         """Whether either root resources or later CLI-owned leaves need a retained scrubber."""
         return self.cleanup_uncertain or self.cli_cleanup_pending
+
+    def _mark_mcp_uncertain(self) -> None:
+        """Latch root uncertainty as soon as any direct transport loses release proof."""
+        self.cleanup_uncertain = True
+        if not self.sealed:
+            self._terminal_identities = self.workspace_identities()
+            self.sealed = True
+        deadline = self.mcp_lifecycle.deadline
+        assert deadline is not None
+        self.cleanup_deadline = (
+            deadline if self.cleanup_deadline is None else min(deadline, self.cleanup_deadline)
+        )
 
     def retain_registry_cleanup(self) -> None:
         """Keep pending owned registry leaves out of pools and alive through loop close."""
@@ -309,12 +325,15 @@ class ExecutionResolverSession:
             raise ExecutionError("Managed root admission is sealed.")
         self._resource_releases.setdefault(id(resource), release)
 
-    def _track[T](self, task: asyncio.Future[T]) -> asyncio.Future[T]:
+    def _track[T](self, task: asyncio.Future[T], *, mcp: bool = False) -> asyncio.Future[T]:
         self._resource_tasks.add(task)
 
         def finished(owner: asyncio.Future[T]) -> None:
             self._resource_tasks.discard(owner)
             if not owner.cancelled() and (error := owner.exception()) is not None:
+                if mcp:
+                    logger.warning("Docker MCP invocation failed: %s", type(error).__name__)
+                    return
                 logger.warning(
                     "Managed resource finished with an error: %s", self.redactor.scrub(str(error))
                 )
@@ -327,14 +346,15 @@ class ExecutionResolverSession:
         coroutine: Coroutine[Any, Any, T],
         *,
         nested_timeout: asyncio.Timeout | None = None,
+        mcp: bool = False,
     ) -> T:
         """Own a resource leaf, never a detached engine orchestration continuation."""
-        if not self.managed:
+        if not self.managed and not self.mcp_lifecycle.active:
             return await coroutine
         if self.sealed:
             coroutine.close()
             raise ExecutionError("Managed root admission is sealed.")
-        owner = self._track(asyncio.create_task(coroutine))
+        owner = self._track(asyncio.create_task(coroutine), mcp=mcp)
         try:
             return await asyncio.shield(owner)
         except asyncio.CancelledError:
@@ -365,28 +385,33 @@ class ExecutionResolverSession:
         if self._cleanup_task is not None:
             return
         binding = self._managed_binding
-        if binding is None:
+        if binding is None and not self.mcp_lifecycle.active:
             return
+        loop = asyncio.get_running_loop()
+        controller = binding.runtime_context.process_scopes if binding is not None else None
+        earlier = controller.owners.deadline() if controller is not None else None
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = loop.time() + 30
+        if self.mcp_lifecycle.deadline is not None:
+            self.cleanup_deadline = min(self.cleanup_deadline, self.mcp_lifecycle.deadline)
+        if earlier is not None:
+            self.cleanup_deadline = min(self.cleanup_deadline, earlier)
+        if controller is not None:
+            controller.begin_teardown(deadline=self.cleanup_deadline)
+        native_deadline = controller.owners.deadline() if controller is not None else None
+        if native_deadline is not None:
+            self.cleanup_deadline = min(self.cleanup_deadline, native_deadline)
+        self.mcp_lifecycle.seal(self.cleanup_deadline)
         self._terminal_identities = self.workspace_identities()
         self.sealed = True
         leases, self.leases = self.leases, {}
         invocations = tuple(self._resource_tasks)
-        controller = binding.runtime_context.process_scopes
-        loop = asyncio.get_running_loop()
-        earlier = controller.owners.deadline()
-        self.cleanup_deadline = loop.time() + 30
-        if earlier is not None:
-            self.cleanup_deadline = min(self.cleanup_deadline, earlier)
-        controller.begin_teardown(deadline=self.cleanup_deadline)
-        native_deadline = controller.owners.deadline()
-        if native_deadline is not None:
-            self.cleanup_deadline = min(self.cleanup_deadline, native_deadline)
         self._cleanup_timer = loop.call_at(self.cleanup_deadline, self._cleanup_expired.set)
         attempts: set[asyncio.Future[Any]] = set()
         finalized: set[int] = set()
         local = self.backends["local"]
-        local_lease = leases["local"]
-        if self._registry is not None:
+        local_lease = leases.get("local")
+        if self._registry is not None and binding is not None:
             self._registry.account_workspace_cleanup(
                 binding.workspace_root,
                 deadline=self.cleanup_deadline,
@@ -398,13 +423,24 @@ class ExecutionResolverSession:
             if id(backend) in finalized:
                 continue
             finalized.add(id(backend))
-            if backend is local:
+            if (backend is local and binding is not None) or any(
+                owner.backend is backend for owner in self.mcp_lifecycle.attempts
+            ):
                 continue
             attempts.add(
                 self._track(
                     asyncio.create_task(backend.finalize_run(lease, outcome, retain=retain))
                 )
             )
+        if self.mcp_lifecycle.active:
+            attempts.add(self._track(asyncio.create_task(self._finish_mcp(outcome, retain=retain))))
+        if binding is None:
+            self._cleanup_task = asyncio.create_task(self._finish_docker_only(attempts))
+            for invocation in invocations:
+                if not invocation.done():
+                    invocation.cancel()
+            return
+        assert local_lease is not None
         if self._registry is not None:
             attempts.add(
                 self._track(
@@ -426,6 +462,22 @@ class ExecutionResolverSession:
         self._cleanup_task = asyncio.create_task(
             self._finish_managed(local, local_lease, outcome, retain, attempts)
         )
+
+    async def _finish_mcp(self, outcome: RunOutcome, *, retain: bool) -> None:
+        await self.mcp_lifecycle.finish(outcome, retain=retain)
+        self.cleanup_uncertain = self.cleanup_uncertain or self.mcp_lifecycle.uncertain
+
+    async def _finish_docker_only(self, attempts: set[asyncio.Future[Any]]) -> None:
+        assert self.cleanup_deadline is not None
+        while attempts:
+            remaining = self.cleanup_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self.mcp_lifecycle.mark_uncertain()
+                self.cleanup_uncertain = True
+                break
+            _done, attempts = await asyncio.wait(attempts, timeout=remaining)
+        if self._cleanup_timer is not None:
+            self._cleanup_timer.cancel()
 
     async def _finish_managed(
         self,
@@ -457,7 +509,9 @@ class ExecutionResolverSession:
             and not proof_task.cancelled()
             and proof_task.result().status == "released"
         )
-        self.cleanup_uncertain = bool(pending) or not proven
+        self.cleanup_uncertain = self.cleanup_uncertain or bool(pending) or not proven
+        if self.cleanup_uncertain and self.mcp_lifecycle.active:
+            self.mcp_lifecycle.mark_uncertain()
         if not self.cleanup_uncertain:
             confirmation = self._track(asyncio.create_task(local.confirm_workspace_released(lease)))
             expiry = asyncio.create_task(self._cleanup_expired.wait())
@@ -527,6 +581,50 @@ class ExecutionResolverSession:
             preflight.workspace = self._preflights[0].workspace
         self._preflights.append(preflight)
         return preflight
+
+    def mcp_fence_execution(
+        self,
+        config: WorkflowConfig,
+        manifest: ResolvedRunManifest,
+    ) -> ResolvedExecutionSpec | None:
+        """Select the first Docker MCP execution by qualified identity before leases.
+
+        Bundle preflight has already proved that an uncollected closure has no
+        Docker-only child, so local-only runs retain their zero-collection path.
+        """
+        manifests = [(config, manifest)]
+        preflight = manifest._preflight
+        if preflight is not None and preflight.collected is not None:
+            for index, node in enumerate(preflight.nodes):
+                if index == 0:
+                    continue
+                child = node.config
+                manifests.append(
+                    (
+                        child,
+                        compile_run_manifest(
+                            child,
+                            workflow_path=node.path,
+                            environment=self.environment,
+                            _preflight=preflight,
+                        ),
+                    )
+                )
+
+        candidates: list[tuple[str, ManifestExecutionSpec]] = []
+        for active_config, active_manifest in manifests:
+            for key, step in _iter_executable_steps(active_config):
+                if not isinstance(step, MCPStepDef):
+                    continue
+                profile = active_manifest.profiles[key]
+                if profile.backend != "docker":
+                    continue
+                assert profile.execution is not None
+                candidates.append((key, profile.execution))
+        if not candidates:
+            return None
+        selected = min(candidates, key=lambda candidate: candidate[0])[1]
+        return _spec_to_contract(selected)
 
     def note_participants(self, config: WorkflowConfig, manifest: ResolvedRunManifest) -> None:
         """Distinguish actual file consumers from technical workflow placement."""
@@ -630,7 +728,8 @@ class ExecutionResolverSession:
                     )
                     identity = (self._resume_identities or {}).get(name)
                     if identity is not None:
-                        lease = await backend.attach_run(
+                        lease = await self._prepare_backend(
+                            backend,
                             backend_spec,
                             identity,
                             expect_staged=(self._expect_staged or {}).get(name, False),
@@ -644,7 +743,7 @@ class ExecutionResolverSession:
                             raise ConfigurationError(
                                 f"Cannot prepare late backend {name!r} without a workspace claim."
                             )
-                        lease = await backend.prepare_run(backend_spec)
+                        lease = await self._prepare_backend(backend, backend_spec, None)
                     self.leases[name] = lease
                 self.backends[name] = backend
             if upgrade_local and (
@@ -741,13 +840,14 @@ class ExecutionResolverSession:
             if lease is None:
                 identity = (resume_identities or {}).get(name)
                 if identity is not None:
-                    lease = await backend.attach_run(
+                    lease = await self._prepare_backend(
+                        backend,
                         backend_spec,
                         identity,
                         expect_staged=(expect_staged or {}).get(name, False),
                     )
                 else:
-                    lease = await backend.prepare_run(backend_spec)
+                    lease = await self._prepare_backend(backend, backend_spec, None)
                 leases_by_backend[id(backend)] = lease
             self.leases[name] = lease
             if backend_spec.workspace_persistence is not None:
@@ -775,6 +875,40 @@ class ExecutionResolverSession:
                     # The whole root is active even before a reachable local step.
                     # A later uncertain-marker write failure must leave active, not idle.
                     backend.mark_workspace_in_use(lease)
+
+    async def _prepare_backend(
+        self,
+        backend: RunnerBackend,
+        spec: RunSpec,
+        identity: WorkspaceIdentity | None,
+        *,
+        expect_staged: bool = False,
+    ) -> WorkspaceLease:
+        fenced = isinstance(backend, DockerRunnerBackend) and spec.mcp_fence_execution is not None
+        attempt = self.mcp_lifecycle.attempt(backend) if fenced else None
+        if attempt is not None:
+            spec = replace(
+                spec,
+                check_mcp_admission=self.mcp_lifecycle.check_admission,
+                on_prepare_attempt=attempt.register,
+            )
+        operation = (
+            backend.attach_run(spec, identity, expect_staged=expect_staged)
+            if identity is not None
+            else backend.prepare_run(spec)
+        )
+        try:
+            if attempt is not None:
+                return await self.mcp_lifecycle.prepare(attempt, operation)
+            return await operation
+        except BaseException:
+            if attempt is not None:
+                try:
+                    await self.finalize_leases("failed", retain=True)
+                except asyncio.CancelledError:
+                    # Root cleanup must not replace the original preparation outcome.
+                    self.cleanup_uncertain = self.cleanup_uncertain or self.mcp_lifecycle.uncertain
+            raise
 
     def lease_for_backend(self, name: str) -> WorkspaceLease | None:
         """Return the prepared lease for ``name``, if one exists."""
@@ -838,7 +972,7 @@ class ExecutionResolverSession:
         racing cancellation; cancellation is re-raised only after every
         backend has had its chance to finalize.
         """
-        if self.managed:
+        if self.managed or self.mcp_lifecycle.active:
             self.begin_teardown(outcome, retain=retain)
             assert self._cleanup_task is not None
             managed_cancel: asyncio.CancelledError | None = None
@@ -850,6 +984,10 @@ class ExecutionResolverSession:
             self._cleanup_task.result()
             if managed_cancel is not None:
                 raise managed_cancel
+            # An engine root still owns terminal serialization after this barrier;
+            # a standalone MCP session has no later owner to dispose its secrets.
+            if not self.managed and self._owns_secrets and self.root_task is None:
+                self.reset_secrets()
             return
         leases = self.leases
         self.leases = {}

@@ -996,7 +996,7 @@ secrets:
 Each profile under `profiles` supports:
 
 - `backend` (required): The runner backend implementing this profile (`local`, `docker`, or `aca`).
-- `inherit_control_environment` (optional, boolean): Controls whether script subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while the `docker` backend defaults to effective `false`. Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to daemon administrators. For local profiles, this flag applies only to script steps; local agent runtimes and direct MCP consumers use provider/SDK-specific environment inheritance and explicit overrides instead.
+- `inherit_control_environment` (optional, boolean): Controls environment inheritance for script subprocesses and for direct MCP servers on Docker profiles. When omitted (`None`), the local subprocess runner defaults to effective `true`, while the Docker container payload defaults to effective `false`. Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to daemon administrators. For local profiles, this flag applies only to script steps; local agent runtimes and direct MCP consumers use provider/SDK-specific environment inheritance and explicit overrides instead.
 - `docker` (optional, object): Configuration options required when `backend: docker` is selected. Rejected when `backend` is not `docker`.
 - `aca` (optional, object): Configuration options required when `backend: aca` is selected. Rejected when `backend` is not `aca`.
 
@@ -1060,8 +1060,8 @@ profiles:
 
 | Field | Type | Default | Validation Bounds and Description |
 |-------|------|---------|-----------------------------------|
-| `image` | string (required) | (none) | Container image reference (tag or digest). Must be a non-empty string without whitespace. |
-| `runner_image` | string (optional) | `None` | OCI reference of the agent-realm runtime image (an image with Conductor installed). When set, the profile becomes agent-capable. Script steps keep using `image`. |
+| `image` | string (required) | (none) | Container image reference (tag or digest) for script steps and direct MCP servers. Must be a non-empty string without whitespace. |
+| `runner_image` | string (optional) | `None` | OCI reference of the agent-realm runtime image (an image with Conductor installed). When set, the profile becomes agent-capable. Script and direct MCP steps keep using `image`. |
 | `platform` | string (optional) | `None` | Target platform: `linux/amd64` or `linux/arm64`. When omitted, the platform is auto-resolved by Docker. |
 | `network` | string (optional) | `None` | Container network mode: `none`, `bridge`, or `host`. `None` keeps the daemon default. `host` triggers a validation warning. |
 | `user` | string (optional) | `None` | Container user in Docker syntax `<name\|uid>[:<group\|gid>]`. When omitted, uses the image `USER`. |
@@ -1083,6 +1083,33 @@ The `resources` mapping configures resource constraints on the container:
 | `pids` | integer (optional) | `None` | Process limit. Bounded between `16` and `65536`. |
 
 When omitted, resource constraints are not set on the container and it shares host resources unconstrained. On shared CI environments, setting resource bounds is recommended.
+
+##### Direct MCP servers
+
+A direct `type: mcp` step can select a Docker profile through its
+`execution.profile`, the workflow default, or the environment default.
+Conductor starts the configured stdio server command in `docker.image` with
+the profile options above and the run's shared Docker workspace. The image
+must contain that command. `runner_image` isn't needed for a direct MCP
+step. HTTP and SSE servers aren't supported by direct MCP steps.
+
+The container payload includes the server's resolved `env` entries and
+server-scoped `scope: mcp` secret deliveries. Direct MCP steps don't accept
+step-level `execution.secrets`; declare `delivery.env` under the server's
+`runtime.mcp_servers.<name>.secrets` instead. With
+`inherit_control_environment: true`, the host environment is included before
+the server entries are applied. With the default `false`, it isn't included
+in the payload. On Windows, a server entry replaces an inherited entry with
+the same name ignoring case.
+
+Conductor writes the payload to a temporary env-file, mode `0600` on POSIX,
+and passes its path to Docker. This delivery doesn't add the payload to the
+Docker CLI environment or command-line arguments. The CLI still receives the operator's
+ambient environment, including Docker and SSH configuration, proxy and
+credential-helper settings, and secret source variables already present
+there. Container environment values are visible to authorized Docker daemon
+administrators. See [MCP steps](workflow-syntax.md#mcp-steps) for pooling,
+working directories, timeouts, and failure handling.
 
 #### ACA Profile Configuration (`aca`)
 

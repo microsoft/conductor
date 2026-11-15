@@ -1449,6 +1449,7 @@ agents:
 | `tool` | `string` | **Required.** Tool name as exposed by the server. Literal string only; templates are rejected. |
 | `arguments` | `mapping` | Optional tool arguments dict. Recursively Jinja2-rendered against workflow context. |
 | `timeout` | `integer` | Optional per-call timeout in seconds. Raises `ExecutionError` if exceeded. |
+| `execution` | `mapping` | Optional execution profile override. The workflow or environment default applies when omitted. |
 | `output` | `mapping` | Optional output schema for validating the merged result envelope. |
 | `routes` | `list` | Optional route list evaluated against the merged result envelope. |
 | `input` | `list` | Optional input reference declarations used in explicit context mode. |
@@ -1531,13 +1532,62 @@ In contrast, transport failures, unknown server names, unlisted tools, server la
 
 MCP steps currently support `stdio` servers only. Configuring an `http` or `sse` server for an MCP step is rejected during validation and runtime with an explicit error: `type: mcp supports stdio servers only (http/sse support is not implemented yet)`.
 
+**Docker placement and workspace:**
+
+Select a Docker profile with the same precedence as other executable steps:
+the step's `execution.profile`, then `workflow.defaults.execution.profile`,
+then the environment document's `default`. The server command and arguments
+run in the profile's `docker.image`, using its container options. The image
+must contain the declared server command. Direct MCP steps don't require
+`docker.runner_image`; that setting is for Docker agent steps.
+
+For example, add an explicit profile to the `read_spec` step above:
+
+```yaml
+agents:
+  - name: read_spec
+    type: mcp
+    server: filesystem
+    tool: read_file
+    execution:
+      profile: containerized
+```
+
+Declare `filesystem` under `runtime.mcp_servers` and define `containerized`
+as a Docker profile in the selected environment document.
+
+The server shares the run's Docker workspace volume with other Docker steps.
+Its rendered `runtime.working_dir` uses the Docker script mapping: an omitted
+value maps to `/workspace`, a relative path maps beneath the bundle's root
+directory, and a POSIX absolute path stays absolute inside the container.
+Relative paths can't escape the bundle root. This mapping can refer to a
+directory made by an earlier Docker step; Conductor doesn't check it on the
+host or fall back to a host-local server. Local and Docker workspace files
+aren't synchronized. See [Docker profile configuration](configuration.md#docker-profile-configuration-docker)
+and [workspace lifecycle](#workspace-lifecycle).
+
 **Concurrency and slot serialization:**
 
-Calls to the same MCP server process are serialized via an internal per-server slot lock to protect the stdio stream. Calls to different MCP servers run in parallel when placed in parallel groups. The engine pools one server process per `(server, working_dir)` pair, bounded by `_MCP_STEP_POOL_MAX` (16) as a *soft* threshold: when the pool is at the cap, the oldest entry not currently serving a call is closed to make room, so a for_each rendering many unique working directories cannot spawn unbounded server processes within a single run. If every entry is busy serving a call, the overflow is allowed rather than blocking or failing the step — the cap bounds idle connections, not in-flight work.
+Calls to the same server name are serialized, including calls with different
+profiles or working directories. Calls to different servers can run in
+parallel. The engine reuses a connection when its pool key matches. For
+ordinary local execution the key includes the server and resolved working
+directory; a retained local workspace also contributes its identity. For
+Docker, the key includes the server, profile and resolved execution options,
+workspace lease and incarnation, and mapped container working directory.
+For-each item identity and resolved server environment values aren't separate
+key components. A different rendered working directory still changes the key.
+
+The pool has a soft threshold of 16 entries. At the threshold, it closes the
+oldest idle entry for the current server first, or an idle entry for another
+server if available. If every candidate is busy, the pool allows overflow
+rather than blocking or failing the call. A Docker tool transport failure
+invalidates that connection without retrying the call. A later explicit call
+can create a new connection.
 
 **Timeouts:**
 
-The step-level `timeout` field sets a per-call timeout in seconds for the MCP tool invocation. It is independent of the overall `workflow.limits.timeout_seconds`, which bounds the entire workflow execution.
+The step-level `timeout` field sets a per-call timeout in seconds for the MCP tool invocation. It starts after the slot wait and connection, and is independent of the overall `workflow.limits.timeout_seconds`, which bounds the entire workflow execution. A timeout alone doesn't invalidate a pooled Docker connection.
 
 **Composition:**
 
@@ -1566,7 +1616,20 @@ MCP steps emit three lifecycle events:
 - `for_each` item identifiers: the `key_by` value of each item is copied onto that item's `mcp_*` events as `item_key`. Do not use a sensitive value as `key_by` (e.g. a token that is also a tool argument) — it will appear in event streams and the dashboard.
 - Anything you *explicitly* surface: writing an MCP result into the workflow's final `output:` publishes it in `workflow_completed`, and referencing it in a later step's `prompt`/`arguments` sends it onward. The redaction governs automatic event metadata, not data you route yourself.
 
-When a call fails with anything but an authored value-free error, the step's raw exception (which can embed argument or result values) is written only to a private per-run diagnostic file — `*.mcp-diagnostics.log` next to the run's `*.events.jsonl` log — and the `mcp_failed` event plus the raised error point at that path. The redaction extends downstream: the step re-raises a generic error, so `workflow_failed` and group failure events (`parallel_agent_failed`, `for_each_item_failed`) also carry only the sanitized message. The diagnostic file may contain secrets; it is not deleted automatically and is covered by the same temp-directory hygiene as `runtime.tool_output` spill files.
+When a call fails with anything but an authored value-free error, Conductor
+tries to write a private per-run `*.mcp-diagnostics.log` next to the
+`*.events.jsonl` log. The `mcp_failed` event and raised error point to it if
+the write succeeds; otherwise a warning reports the failure. For local
+direct MCP, the diagnostic can contain the raw exception and traceback,
+including secrets. It isn't deleted automatically and needs the same
+temporary-file care as `runtime.tool_output` spill files.
+
+For Docker direct MCP, server stderr is suppressed, SDK transport
+diagnostics are sanitized, and the private failure diagnostic records
+metadata rather than the exception text or traceback. The raised error and
+failure events remain value-free. This doesn't mean arbitrary successful
+tool results are redacted: treat results, workflow outputs, and spill files
+according to their contents.
 
 **Cancellation and interrupt semantics:**
 
@@ -3201,10 +3264,13 @@ The following table summarizes step type support across execution backends:
 |---|---|---|---|
 | `agent` | Supported | Supported (requires `runner_image`) | Supported |
 | `script` | Supported | Supported (uses `image`) | Rejected |
-| `mcp` | Supported | Rejected | Rejected |
+| `mcp` | Supported | Supported (uses `image`) | Rejected |
 | `workflow` | Supported | Rejected | Rejected |
 
-Direct MCP tool steps (`type: mcp`) and sub-workflows (`type: workflow`) require the local backend. Assigning either step type to a remote backend (`docker` or `aca`) fails validation and manifest compilation:
+Direct MCP steps accept local or Docker profiles. ACA doesn't provide the
+direct stdio capability and is rejected before dispatch. Sub-workflow steps
+(`type: workflow`) require the local backend. Assigning a sub-workflow step
+to a remote backend fails validation and manifest compilation:
 
 ```
 Step '<name>' resolves to backend '<backend>', but this step requires the local backend.
@@ -3230,8 +3296,14 @@ session merely to resolve a remote agent's settings.
 The `inherit_control_environment` setting behaves differently depending on the backend:
 
 * **Local backend**: Defaults to effective `true` (subprocesses inherit the host `os.environ`).
-* **Docker backend**: Defaults to effective `false` (containers do not inherit the host environment; only declared secret deliveries and step `env` entries are passed).
+* **Docker backend**: Defaults to effective `false` for the container payload. Script steps receive their declared `env` and secret deliveries; direct MCP servers receive their declared server `env` and server-scoped secret deliveries.
 * **Validation warning**: Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to Docker daemon administrators via `docker inspect`.
+
+The Docker CLI itself keeps the operator's ambient environment independently
+of this setting, including Docker, SSH, proxy, credential-helper context, and
+any secret sources already present there. Conductor passes the container
+payload through an environment file instead of adding it to the Docker CLI
+environment or command-line arguments.
 
 ### Engine-Local Steps
 
@@ -3893,6 +3965,16 @@ place. See [local retained workspaces](design/local-retained-workspace.md)
 for paths, provider requirements, cleanup, and resume restrictions. The
 [example](../examples/local-retained-workspace.yaml) demonstrates two script
 steps using the same copied tree.
+
+For Docker direct MCP, retention applies to workspace files rather than
+preserving reusable server connections. Conductor attempts to close the
+server owners before finalizing the lease; an unconfirmed owner may still
+be running.
+If owner cleanup or inventory can't be confirmed before workspace removal,
+it leaves the workspace and guard in place and refuses attachment, even if
+no MCP container is listed. A removal request with an unconfirmed outcome
+doesn't prove that the resource still exists; inspect it independently.
+See the [Docker backend recovery guidance](design/docker-backend.md#orphaned-resource-cleanup).
 
 #### Sub-workflow Inheritance
 
