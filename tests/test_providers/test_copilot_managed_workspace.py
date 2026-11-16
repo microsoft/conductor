@@ -46,8 +46,16 @@ class Timer:
 
 
 class Clock:
+    """Move only the cleanup driver; native readiness keeps real time.
+
+    It starts at the loop's real time because the provider bounds its reader
+    joins with ``deadline - time.monotonic()``. A clock starting at zero gives
+    those joins no budget, so a reader that has not yet exited skips the pipe
+    close the stdio cases wait for.
+    """
+
     def __init__(self) -> None:
-        self.value = 0.0
+        self.start = self.value = asyncio.get_running_loop().time()
         self.timers: list[Timer] = []
 
     def now(self) -> float:
@@ -58,8 +66,9 @@ class Clock:
         self.timers.append(timer)
         return timer
 
-    def advance(self, value: float) -> None:
-        self.value = value
+    def advance(self, elapsed: float) -> None:
+        """Move to ``elapsed`` seconds after the start and fire due timers."""
+        self.value = value = self.start + elapsed
         for timer in sorted(self.timers, key=lambda item: item.deadline):
             if not timer.cancelled and timer.deadline <= value:
                 timer.cancelled = True
@@ -132,10 +141,14 @@ async def workspace(
     try:
         yield ManagedWorkspaceContext(str(root), "test-incarnation", controller)
     finally:
-        controller.begin_teardown()
-        await controller.force_stop(tuple(proof.scope_id for proof in controller.proofs))
-        await controller.await_release()
-        await controller.close()
+        # A test may swap in a fake Clock and fail before advancing it; its
+        # cleanup timers would then never fire. Fail the teardown instead of
+        # wedging the xdist worker until the CI step timeout.
+        async with asyncio.timeout(60):
+            controller.begin_teardown()
+            await controller.force_stop(tuple(proof.scope_id for proof in controller.proofs))
+            await controller.await_release()
+            await controller.close()
 
 
 def receipts(tmp_path: Path) -> list[list[dict[str, Any]]]:
@@ -717,7 +730,7 @@ async def test_native_stuck_shutdown_force_is_independent(
     try:
         await method_received(wire_events, "runtime.shutdown")
         deadline = controller.owners.deadline()
-        assert deadline == 30
+        assert deadline == clock.start + 30
         clock.advance(20)
         async with asyncio.timeout(10):
             result = await call
@@ -760,8 +773,8 @@ async def test_unjoined_owner_is_sticky_after_late_failure(
         release = asyncio.create_task(provider.release_workspace(context.root))
         await asyncio.wait_for(interrupted.wait(), 10)
         deadline = controller.owners.deadline()
-        controller.begin_teardown(deadline=100)
-        assert controller.owners.deadline() == deadline == 30
+        controller.begin_teardown(deadline=clock.start + 100)
+        assert controller.owners.deadline() == deadline == clock.start + 30
         clock.advance(30)
         async with asyncio.timeout(10):
             with pytest.raises(ProviderError, match="unconfirmed"):
